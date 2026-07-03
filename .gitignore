@@ -1,0 +1,50 @@
+/target/
+node_modules/
+build/
+packages/*/dist/
+*.tsbuildinfo
+.DS_Store
+/tmp/
+*.db
+package-lock.json
+gh-cli-cache/
+tasks/
+AGENTS.md
+.claude/worktrees/
+.claude-worktrees/
+.vibetree/
+.cw/
+/.cocoindex_code/
+/.kilo/
+.omc/
+meta.json
+.env
+/data/
+
+# cargo install artifacts
+.crates.toml
+.crates2.json
+.context-mode/
+
+# untracked / wip artifacts
+formalization/.lake/
+formalization/.lake-build.log
+
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+tests/
+
+# checkpoints and model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.log
+torch-compile.bat
+profile_*
+profiler_logs/

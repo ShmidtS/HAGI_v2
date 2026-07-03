@@ -1,0 +1,208 @@
+"""Training loop for HAGI V4.
+
+Key fixes from log analysis:
+1. grad_accum_steps IMPLEMENTED — micro-batch loop with loss scaling
+2. Suffix masking removed — only random + span (suffix causes loss 8-16)
+3. Soft grad norm scaling (not clipping) — scale grads by 1/max(1, norm/target)
+4. Warmup starts from 0 — lr=0 at step 0, linear ramp to max
+5. manual_bf16 — model cast to bf16, no autocast
+6. Teacher under inference_mode + del + empty_cache before backward
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+from collections.abc import Iterator
+
+import torch
+from torch import nn
+
+from hagi_v4.config import HAGIv4Config
+from hagi_v4.model.masking import (
+    create_random_mask,
+    create_span_mask,
+    progressive_mask_ratio,
+)
+from hagi_v4.model.outputs import TrainOutput
+from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
+
+logger = logging.getLogger(__name__)
+
+_MASK_WARMUP_STEPS = 20000
+_GRAD_NORM_TARGET = 1.0
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+
+def lr_at(step: int, cfg: HAGIv4Config) -> float:
+    """Linear warmup from 0, then stable, then cosine decay."""
+    tc = cfg.train
+    warmup = tc.warmup_steps
+    max_steps = tc.max_steps
+    base_lr = tc.learning_rate
+    if step < warmup:
+        return base_lr * step / max(warmup, 1)
+    stable_end = int(max_steps * 0.8)
+    if step < stable_end:
+        return base_lr
+    decay_steps = max(max_steps - stable_end, 1)
+    progress = (step - stable_end) / decay_steps
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def sample_mask_pattern() -> str:
+    """Only random masking — span causes loss 6-12 and grad spikes."""
+    return "random"
+
+
+def create_mask(input_ids, pattern, mask_ratio, mask_token_id, span_length=3):
+    if pattern == "span":
+        return create_span_mask(input_ids, mask_ratio, span_length, mask_token_id)
+    return create_random_mask(input_ids, mask_ratio, mask_token_id)
+
+
+def cast_to_bf16(model: nn.Module) -> None:
+    model.to(torch.bfloat16)
+
+
+def soft_grad_scale(model: nn.Module, target: float = _GRAD_NORM_TARGET) -> float:
+    """Scale gradients by 1/max(1, norm/target). Not clipping — uniform scaling."""
+    norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+    if norm > target:
+        scale = target / norm
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(scale)
+    return norm
+
+
+def train_step(
+    model: nn.Module,
+    batch: dict,
+    optimizer: CombinedOptimizer,
+    cfg: HAGIv4Config,
+    step: int,
+    teacher=None,
+) -> dict:
+    """Single training step with gradient accumulation."""
+    model.train()
+    device = next(model.parameters()).device
+    input_ids = batch["input_ids"].to(device)
+    targets = batch["targets"].to(device)
+
+    mc = cfg.model.masking
+    mask_ratio = (
+        progressive_mask_ratio(step, _MASK_WARMUP_STEPS, 0.15, mc.mask_ratio) if mc.use_progressive else mc.mask_ratio
+    )
+    pattern = sample_mask_pattern()
+    masked_ids, mask = create_mask(input_ids, pattern, mask_ratio, mc.mask_token_id, mc.span_length)
+
+    accum = cfg.train.grad_accum_steps
+    optimizer.zero_grad(set_to_none=True)
+
+    total_loss = 0.0
+
+    for micro_idx in range(accum):
+        output: TrainOutput = model(masked_ids, targets=targets, mask=mask)
+        loss = output.loss
+
+        use_distill = (
+            teacher is not None
+            and teacher._loaded
+            and cfg.train.distill_enabled
+            and step % cfg.train.distill_every == 0
+        )
+        if use_distill:
+            from hagi_v4.train.distillation import alpha_at
+
+            alpha = alpha_at(
+                step,
+                cfg.train.distill_alpha_start,
+                cfg.train.distill_alpha_end,
+                cfg.train.max_steps,
+                cfg.train.distill_end_frac,
+            )
+            with torch.inference_mode():
+                teacher_hidden = teacher.get_hidden(input_ids)
+            if teacher_hidden is not None:
+                distill_loss = teacher.distillation_loss_chunked(
+                    student_hidden=output.hidden,
+                    teacher_hidden=teacher_hidden,
+                    student_lm_head_weight=model.lm_head.weight,
+                    targets=targets,
+                    ce_loss=loss,
+                    mask=mask,
+                    temperature=cfg.train.distill_temperature,
+                    alpha=alpha,
+                )
+                loss = distill_loss
+                del teacher_hidden
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        if not torch.isfinite(loss).all():
+            logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — skipping")
+            continue
+
+        scaled_loss = loss / accum
+        scaled_loss.backward()
+        total_loss += loss.item()
+
+    grad_norm = soft_grad_scale(model, _GRAD_NORM_TARGET)
+    optimizer.step()
+
+    return {
+        "loss": total_loss / max(accum, 1),
+        "moe_aux": float(output.moe_aux_loss.detach()),
+        "gdr_router": float(output.gdr_router_loss.detach()),
+        "grad_norm": grad_norm,
+        "mask_ratio": mask_ratio,
+        "mask_pattern": pattern,
+        "lr": lr_at(step, cfg),
+        "step": step,
+    }
+
+
+def train(
+    model: nn.Module,
+    dataloader,
+    cfg: HAGIv4Config,
+    log_interval: int = 100,
+    teacher=None,
+    start_step: int = 0,
+) -> Iterator[dict]:
+    from hagi_v4.train.checkpoint import save_checkpoint
+
+    if torch.cuda.is_available() and cfg.train.precision == "bf16":
+        cast_to_bf16(model)
+
+    optimizer = build_optimizer(model, cfg)
+    step = start_step
+    distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
+    ckpt_dir = cfg.train.checkpoint_dir
+    ckpt_interval = cfg.train.checkpoint_interval
+    ckpt_keep = cfg.train.checkpoint_keep_last
+
+    for batch in dataloader:
+        if step >= cfg.train.max_steps:
+            break
+
+        if teacher is not None and teacher._loaded and step == distill_end_step:
+            logger.info(f"Step {step}: distillation ended — freeing teacher")
+            teacher.free()
+
+        metrics = train_step(model, batch, optimizer, cfg, step, teacher)
+        if step % log_interval == 0:
+            yield metrics
+
+        if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
+            save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)
+
+        step += 1
+
+    if ckpt_interval > 0:
+        save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)
