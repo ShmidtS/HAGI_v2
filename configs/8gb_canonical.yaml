@@ -1,0 +1,113 @@
+# HAGI V4 — 8GB canonical config (RTX 3070)
+# Plane prediction SLM with Cl(3,0,0) geometric algebra.
+# All parameters configurable here — no hardcoded values in scripts.
+
+model:
+  vocab_size: 49154          # 49152 BPE + EOS + mask token
+  hidden_size: 576            # total hidden = 64+96+96+64+256 (grade dims)
+  perception_layers: 2        # bidirectional blocks before refinement
+  reasoning_layers: 7         # shared blocks, reused per refinement iteration
+  expression_layers: 2        # bidirectional blocks after refinement
+  norm_eps: 1.0e-6
+
+  algebra:
+    blade_count: 8            # Cl(3,0,0): 1 + 3 + 3 + 1 = 8 basis blades
+    grade_dims: [64, 96, 96, 64, 256]   # scalar, vector, bivector, trivector, residual
+    hidden_size: 576
+
+  attention:
+    num_query_heads: 8
+    num_kv_heads: 4           # GQA: 2:1 ratio
+    head_dim: 72              # 8 * 72 = 576
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    bidirectional: true       # V4: no causal mask (plane prediction)
+    fp16_attention: true      # fp16 QKV for better softmax resolution
+    fp32_rmsnorm: true        # fp32 variance for numerical stability
+
+  gp2d:
+    window: 1                 # temporal kernel: t-1, t, t+1 (3 positions)
+    gate_init: -2.0           # sigmoid(-2) ≈ 0.12
+
+  refinement:
+    num_iterations: 4         # refinement iterations (train + inference)
+    min_iterations: 1         # minimum before adaptive halting
+    use_adaptive_halt: true   # per-token early stopping
+    halt_threshold: 0.9       # convergence: relative_delta < 0.01
+    use_deep_supervision: true
+    deep_supervision_decay: 0.1   # 0.1^iter: 1.0, 0.1, 0.01, 0.001
+    deep_supervision_weight: 0.1  # overall weight (0.1 = 10% of main CE)
+
+  masking:
+    mask_ratio: 0.30          # 30% of tokens masked (progressive: 15% → 30%)
+    mask_token_id: 49153      # vocab_size - 1
+    use_span_masking: true    # span masking (contiguous blocks of 3)
+    span_length: 3
+    use_progressive: true     # ramp mask ratio during training
+
+  hrm:
+    h_state_dim: 256          # z_H spatial plane dim
+    l_state_dim: 256          # z_L per-token dim
+    h_stride: 4               # z_H operates at T//4 resolution
+
+  gdr:
+    scalar_momentum: 0.8      # grade 0: slow (confidence accumulates)
+    vector_momentum: 0.5      # grade 1: medium (entities)
+    bivector_momentum: 0.0    # grade 2: full update (relations)
+    trivector_momentum: 0.0   # grade 3: full update (higher-order)
+    use_grade_router: true    # MoE-style capacity gate
+    grade_router_alpha: 0.01  # load-balance aux weight
+
+  msa:
+    max_slots: 4096           # ring buffer capacity
+    slot_chunk_size: 4        # tokens per slot (compression)
+    top_k: 6                  # slots to attend per query
+    routing_key_dim: 64       # Clifford scalar routing key
+    local_window: 32          # local 2D routing: ±32 positions
+    mla_compress_dim: 128     # KV latent compression
+    mla_up_dim: 288           # 4 kv_heads * 72 head_dim
+
+  moe:
+    num_experts: 4
+    top_k: 1                  # top-1 routing (Switch style)
+    intermediate_size: 384    # per-expert FFN dim (V1 exact)
+    use_mod_skip: true        # MoD: skip slot for trivial tokens
+    alpha: 0.01               # load-balance aux weight
+
+  cast:
+    use_coherence: true       # geometric coherence regularizer
+    coherence_gate_init: -5.0 # sigmoid(-5) ≈ 0.007 (near-off at init)
+
+train:
+  max_steps: 150000           # 3x V1 (masked CE has ~3x lower signal density)
+  warmup_steps: 5000          # linear warmup from 0 (longer = more stable)
+  learning_rate: 3.0e-4       # AdamW lr (embed, norms, routers, 1D)
+  muon_lr: 0.02               # Muon lr (2D weights)
+  muon_momentum: 0.95
+  muon_weight_decay: 0.5      # scale-aware: wd_eff = wd * min(sqrt(fan_out/fan_in), 2)
+  weight_decay: 0.1           # AdamW weight decay
+  precision: "bf16"           # manual_bf16: model cast to bf16, no autocast
+  grad_accum_steps: 2         # gradient accumulation for stability (effective batch = 16)
+  batch_size: 8               # fits 8GB with bf16 + gradient checkpointing
+  seq_len: 512                # training sequence length
+  w_ce: 1.0                   # masked CE weight
+  w_moe_aux: 0.01             # MoE load-balance weight
+  w_gdr_router: 0.01          # GDR grade router weight
+  w_coherence: 0.001          # geometric coherence weight (small — regularizer)
+  # Distillation (knowledge transfer from SmolLM2)
+  distill_enabled: true
+  distill_teacher: "HuggingFaceTB/SmolLM2-360M"    # KL teacher (360M, bf16 ~720MB)
+  distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"  # embedding transfer only
+  distill_alpha_start: 0.5    # start: 50% CE + 50% KL
+  distill_alpha_end: 0.3      # end: 30% CE + 70% KL (more teacher signal)
+  distill_temperature: 2.0    # softmax temperature for KL
+  distill_end_frac: 0.6       # distillation ends at 60% of training, then pure CE
+  distill_every: 2            # run teacher every N steps (KL signal persists)
+  # Checkpointing
+  checkpoint_dir: "checkpoints"    # directory for .pt checkpoint files
+  checkpoint_interval: 500        # save checkpoint every N steps
+  checkpoint_keep_last: 3          # keep only last N checkpoints (delete older)
+  # Sequential cycling (v1-style curriculum: easy -> hard)
+  sequential_cycles: 3             # cycles per dataset before advancing
+  curriculum_enabled: true         # stage1 -> stage2 switch at threshold
+  curriculum_stage2_start: 100000  # step to switch to hard-reasoning subset
