@@ -27,18 +27,39 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
     Teacher is loaded, embeddings copied, then immediately freed.
     """
     try:
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModel, AutoModelForCausalLM
     except ImportError:
         logger.warning("transformers not installed — skipping embedding transfer")
         return False
 
     try:
         teacher = AutoModelForCausalLM.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
-    except Exception as e:
-        logger.warning(f"Could not load {teacher_name}: {e}")
+    except Exception:
+        try:
+            teacher = AutoModel.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+        except Exception as e:
+            logger.warning(f"Could not load {teacher_name}: {e}")
+            return False
+
+    # Try common embedding attribute paths
+    teacher_emb = None
+    for path in [
+        lambda m: m.model.embed_tokens.weight,
+        lambda m: m.embed_tokens.weight,
+        lambda m: m.model.embed_tokens.weight,
+        lambda m: m.get_input_embeddings().weight,
+    ]:
+        try:
+            teacher_emb = path(teacher).data
+            break
+        except (AttributeError, KeyError):
+            continue
+    if teacher_emb is None:
+        logger.warning(f"Could not find embeddings in {teacher_name} — skipping")
+        del teacher
+        gc.collect()
         return False
 
-    teacher_emb = teacher.model.embed_tokens.weight.data  # [V_teacher, H]
     embed_weight = model.embed.weight  # [V_student, H]
 
     if teacher_emb.shape[1] != embed_weight.shape[1]:
@@ -79,7 +100,7 @@ class DistillationTeacher:
         if self._loaded:
             return
         try:
-            from transformers import AutoModelForCausalLM
+            from transformers import AutoModel, AutoModelForCausalLM
         except ImportError:
             logger.warning("transformers not installed — distillation disabled")
             return
@@ -91,12 +112,48 @@ class DistillationTeacher:
             self._model.eval()
             for param in self._model.parameters():
                 param.requires_grad_(False)
-            self._base_model = self._model.model
-            self._lm_head_weight = self._model.lm_head.weight
+
+            # Gemma 4 multimodal: access language_model submodel for text-only
+            if hasattr(self._model, "language_model"):
+                self._base_model = self._model.language_model
+            elif hasattr(self._model, "model"):
+                self._base_model = self._model.model
+            else:
+                self._base_model = self._model
+
+            # lm_head: try multiple paths
+            self._lm_head_weight = None
+            for obj in [self._model, self._base_model]:
+                if hasattr(obj, "lm_head") and hasattr(obj.lm_head, "weight"):
+                    self._lm_head_weight = obj.lm_head.weight
+                    break
+                if hasattr(obj, "get_output_embeddings"):
+                    emb = obj.get_output_embeddings()
+                    if emb is not None and hasattr(emb, "weight"):
+                        self._lm_head_weight = emb.weight
+                        break
+
+            if self._lm_head_weight is None:
+                # Fallback: use input embeddings as pseudo lm_head
+                if hasattr(self._base_model, "get_input_embeddings"):
+                    self._lm_head_weight = self._base_model.get_input_embeddings().weight
+                elif hasattr(self._base_model, "embed_tokens"):
+                    self._lm_head_weight = self._base_model.embed_tokens.weight
+
             self._loaded = True
             logger.info(f"Teacher loaded: {self.teacher_name}")
-        except Exception as e:
-            logger.warning(f"Could not load teacher {self.teacher_name}: {e}")
+        except Exception:
+            try:
+                self._model = AutoModel.from_pretrained(self.teacher_name, dtype=torch.bfloat16, local_files_only=True)
+                self._model.eval()
+                for param in self._model.parameters():
+                    param.requires_grad_(False)
+                self._base_model = self._model
+                self._lm_head_weight = self._model.get_input_embeddings().weight
+                self._loaded = True
+                logger.info(f"Teacher loaded (AutoModel): {self.teacher_name}")
+            except Exception as e:
+                logger.warning(f"Could not load teacher {self.teacher_name}: {e}")
 
     @torch.no_grad()
     def get_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -106,9 +163,20 @@ class DistillationTeacher:
             return None
         device = input_ids.device
         self._base_model = self._base_model.to(device)
-        self._lm_head_weight = self._lm_head_weight.to(device)
-        output = self._base_model(input_ids)
-        return output.last_hidden_state
+        if self._lm_head_weight is not None:
+            self._lm_head_weight = self._lm_head_weight.to(device)
+        try:
+            output = self._base_model(input_ids)
+            if hasattr(output, "last_hidden_state"):
+                return output.last_hidden_state
+            if hasattr(output, "hidden_states") and output.hidden_states is not None:
+                return output.hidden_states[-1]
+            if isinstance(output, tuple):
+                return output[0]
+            return output
+        except Exception as e:
+            logger.warning(f"Teacher forward failed: {e}")
+            return None
 
     def distillation_loss_chunked(
         self,
@@ -120,7 +188,7 @@ class DistillationTeacher:
         mask: torch.Tensor | None,
         temperature: float = 2.0,
         alpha: float = 0.5,
-        chunk_size: int = 1024,
+        chunk_size: int = 512,
     ) -> torch.Tensor:
         """Compute alpha * CE + (1 - alpha) * T^2 * KL(student || teacher).
 

@@ -9,24 +9,35 @@ from torch.utils.data import Dataset
 
 
 class MemmapDataset(Dataset):
-    """Binary memmap dataset. Token IDs stored as uint16 (2 bytes each).
+    """Binary memmap dataset. Token IDs stored as uint16 or uint32.
 
-    Files: e:\\HAGI_v2\\data\\*.bin (edu, slimpajama, wikipedia_en, etc.)
-    Format: flat uint16 array, no headers.
+    Files: e:\\HAGI_v2\\data\\*.bin
+    Format: flat array, no headers. dtype detected from vocab_size:
+      vocab <= 65535 → uint16 (2 bytes)
+      vocab >  65535 → uint32 (4 bytes)
     """
 
-    def __init__(self, path: str, seq_len: int = 512, vocab_size: int = 49154):
+    def __init__(self, path: str, seq_len: int = 512, vocab_size: int = 49154, dtype: str = "auto"):
         self.path = Path(path)
         self.seq_len = seq_len
         self.vocab_size = vocab_size
+        if dtype == "auto":
+            self._dtype = torch.uint16 if vocab_size <= 65535 else torch.uint32
+            self._byte_width = 2 if vocab_size <= 65535 else 4
+        elif dtype == "uint32":
+            self._dtype = torch.uint32
+            self._byte_width = 4
+        else:
+            self._dtype = torch.uint16
+            self._byte_width = 2
         file_size = self.path.stat().st_size
-        self.num_tokens = file_size // 2
+        self.num_tokens = file_size // self._byte_width
         self._data = None
 
     def _load(self):
         if self._data is None:
             with open(self.path, "rb") as f:
-                self._data = torch.frombuffer(f.read(), dtype=torch.uint16).long().clone()
+                self._data = torch.frombuffer(f.read(), dtype=self._dtype).long().clone()
 
     def __len__(self) -> int:
         return max(0, self.num_tokens - self.seq_len - 1)

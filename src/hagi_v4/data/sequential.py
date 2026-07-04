@@ -63,6 +63,7 @@ class SequentialCyclingIterator:
         batch_size: int = 8,
         samples_per_cycle: int = 5000,
         num_workers: int = 0,
+        dtype: str = "auto",
     ):
         self.entries = entries  # [(name, path), ...]
         self.seq_len = seq_len
@@ -71,6 +72,7 @@ class SequentialCyclingIterator:
         self.batch_size = batch_size
         self.samples_per_cycle = samples_per_cycle
         self.num_workers = num_workers
+        self.dtype = dtype
 
         self.current_idx = 0
         self.current_cycle = 0
@@ -85,7 +87,7 @@ class SequentialCyclingIterator:
 
     def _build_loader(self) -> DataLoader:
         name, path = self.entries[self.current_idx]
-        ds = MemmapDataset(path, self.seq_len, self.vocab_size)
+        ds = MemmapDataset(path, self.seq_len, self.vocab_size, dtype=self.dtype)
         subset = RandomSubsetDataset(ds, self.samples_per_cycle)
         loader = DataLoader(
             subset,
@@ -228,8 +230,9 @@ def build_sequential_dataloader(
             if Path(path).exists():
                 stage1_entries.append((name, path))
 
-    cycles = 3
+    cycles = cfg.train.sequential_cycles
     samples_per_cycle = max(1000, cfg.train.max_steps * cfg.train.batch_size // (len(stage1_entries) * cycles))
+    dtype = getattr(cfg.train, "data_dtype", "auto")
 
     stage1 = SequentialCyclingIterator(
         entries=stage1_entries,
@@ -238,12 +241,13 @@ def build_sequential_dataloader(
         cycles_per_dataset=cycles,
         batch_size=cfg.train.batch_size,
         samples_per_cycle=samples_per_cycle,
+        dtype=dtype,
     )
 
     # Stage 2: hard-reasoning subset (openwebmath, edu, slimpajama)
     stage2_entries = [(n, p) for n, p in stage1_entries if n in ("openwebmath", "edu", "slimpajama")]
     stage2 = None
-    stage2_start = 100000
+    stage2_start = cfg.train.curriculum_stage2_start if cfg.train.curriculum_enabled else 999999999
     if stage2_entries and start_step < stage2_start:
         stage2 = SequentialCyclingIterator(
             entries=stage2_entries,
@@ -252,6 +256,7 @@ def build_sequential_dataloader(
             cycles_per_dataset=2,
             batch_size=cfg.train.batch_size,
             samples_per_cycle=samples_per_cycle,
+            dtype=dtype,
         )
 
     return CurriculumBatchProvider(
