@@ -1,9 +1,8 @@
 """Download google/gemma-4-E2B-it using HF_TOKEN from .env."""
 
 import os
-from pathlib import Path
 
-env_path = Path("E:/HAGI_v2/.env")
+env_path = os.path.join(os.path.dirname(__file__), ".env")
 token = None
 if env_path.exists():
     for line in env_path.read_text().splitlines():
@@ -22,4 +21,5 @@ from huggingface_hub import snapshot_download
 
 print("Downloading google/gemma-4-E2B-it...")
 path = snapshot_download("google/gemma-4-E2B-it", token=token)
+path2 = snapshot_download("google/t5gemma-2-1b-1b", token=token)
 print(f"Downloaded to: {path}")
