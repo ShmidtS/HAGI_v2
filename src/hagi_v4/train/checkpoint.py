@@ -74,12 +74,11 @@ def save_checkpoint(
     torch.save(state, path)
     logger.info(f"Checkpoint saved: {path}")
 
-    # Cleanup old checkpoints
-    checkpoints = sorted(ckpt_dir.glob("step-*.pt"))
-    if len(checkpoints) > keep_last:
-        for old in checkpoints[:-keep_last]:
-            old.unlink()
-            logger.info(f"Old checkpoint deleted: {old}")
+    # Cleanup old checkpoints (by mtime — newest survive, never delete the one just saved)
+    checkpoints = sorted(ckpt_dir.glob("step-*.pt"), key=lambda p: p.stat().st_mtime)
+    for old in checkpoints[:-keep_last]:
+        old.unlink()
+        logger.info(f"Old checkpoint deleted: {old}")
 
     return str(path)
 

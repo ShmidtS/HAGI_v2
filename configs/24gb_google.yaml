@@ -1,0 +1,119 @@
+# HAGI V4 — 24gb_google config
+# Target: 24 GB VRAM, ~300M params (hidden 1152, vocab 262144).
+# Embedding: google/t5gemma-2-1b-1b (hidden=1152, vocab=262144)
+# Teacher: google/gemma-4-E2B-it-qat-w4a16-ct (W4A16, ~10GB bf16)
+# Data: uint32 (262144 > 65535), Gemma tokenizer
+
+model:
+  vocab_size: 262146          # 262144 Gemma + EOS + mask
+  hidden_size: 1152           # matches t5gemma-2-1b-1b for embedding transfer
+  perception_layers: 3
+  reasoning_layers: 10
+  expression_layers: 3
+  norm_eps: 1.0e-6
+
+  algebra:
+    blade_count: 8
+    # 96+144+144+96+672 = 1152, all divisible by 8
+    grade_dims: [96, 144, 144, 96, 672]
+    hidden_size: 1152
+
+  attention:
+    num_query_heads: 16
+    num_kv_heads: 4           # GQA 16/4=4
+    head_dim: 72              # 1152/16
+    rope_theta: 500000.0      # Gemma uses 500000
+    max_seq_len: 4096
+    bidirectional: true
+    fp16_attention: true
+    fp32_rmsnorm: true
+
+  gp2d:
+    window: 1
+    gate_init: -2.0
+
+  refinement:
+    num_iterations: 4
+    min_iterations: 1
+    use_adaptive_halt: true
+    halt_threshold: 0.9
+    use_deep_supervision: true
+    deep_supervision_decay: 0.1
+    deep_supervision_weight: 0.1
+
+  masking:
+    mask_ratio: 0.30
+    mask_token_id: 262145     # vocab_size - 1
+    use_span_masking: false   # random only (span causes instability)
+    span_length: 3
+    use_progressive: true
+
+  hrm:
+    h_state_dim: 256
+    l_state_dim: 256
+    h_stride: 4
+
+  gdr:
+    scalar_momentum: 0.8
+    vector_momentum: 0.5
+    bivector_momentum: 0.0
+    trivector_momentum: 0.0
+    use_grade_router: true
+    grade_router_alpha: 0.01
+
+  msa:
+    max_slots: 4096
+    slot_chunk_size: 4
+    top_k: 6
+    routing_key_dim: 64
+    local_window: 32
+    mla_compress_dim: 128
+    mla_up_dim: 288           # 4 kv_heads * 72 head_dim
+
+  moe:
+    num_experts: 4
+    top_k: 1
+    intermediate_size: 768   # 1152 * 2/3, per-expert
+    use_mod_skip: true
+    alpha: 0.01
+
+  cast:
+    use_coherence: true
+    coherence_gate_init: -5.0
+
+train:
+  max_steps: 91553            # 3B tokens / (16 * 2 * 1024)
+  warmup_steps: 1000
+  learning_rate: 0.0004
+  muon_lr: 0.02
+  muon_momentum: 0.97
+  muon_weight_decay: 0.5
+  weight_decay: 0.1
+  precision: "bf16"
+  grad_accum_steps: 2
+  batch_size: 16
+  seq_len: 1024
+  w_ce: 1.0
+  w_moe_aux: 0.005
+  w_gdr_router: 0.005
+  w_coherence: 0.001
+  # Distillation — Google teacher + embedding
+  distill_enabled: true
+  distill_teacher: "google/gemma-4-E2B-it"
+  distill_embed_teacher: "google/t5gemma-2-1b-1b"
+  distill_alpha_start: 0.5
+  distill_alpha_end: 0.3
+  distill_temperature: 2.0
+  distill_end_frac: 0.6
+  distill_every: 1            # every step (24GB has room)
+  # Checkpointing
+  checkpoint_dir: "checkpoints"
+  checkpoint_interval: 500
+  checkpoint_keep_last: 3
+  # Sequential cycling
+  sequential_cycles: 3
+  curriculum_enabled: true
+  curriculum_stage2_start: 60000
+  # Data format
+  data_dtype: "uint32"        # 262144 > 65535 → uint32
+  data_dir: "data"

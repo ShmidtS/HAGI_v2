@@ -104,30 +104,26 @@ class HAGIv4(nn.Module):
 
         if targets is not None:
             if mask is not None and mask.any():
-                # Chunked masked CE — avoid materializing [B*T, V] logits
                 h_masked = h_normed[mask]
                 t_masked = targets[mask]
                 ce_loss = F.cross_entropy(
                     F.linear(h_masked, self.lm_head.weight),
                     t_masked,
                 )
-                # Unmask CE at 0.3 weight for signal density
-                unmask = ~mask
-                if unmask.any():
-                    h_unmasked = h_normed[unmask]
-                    t_unmasked = targets[unmask]
-                    unmask_loss = 0.3 * F.cross_entropy(
-                        F.linear(h_unmasked, self.lm_head.weight),
-                        t_unmasked,
-                    )
-                else:
-                    unmask_loss = torch.tensor(0.0, device=h.device)
+                del h_masked, t_masked
             else:
-                ce_loss = F.cross_entropy(
-                    F.linear(h_normed.reshape(-1, h_normed.size(-1)), self.lm_head.weight),
-                    targets.reshape(-1),
-                )
-                unmask_loss = torch.tensor(0.0, device=h.device)
+                flat_h = h_normed.reshape(-1, h_normed.size(-1))
+                flat_t = targets.reshape(-1)
+                chunk = 4096
+                total_ce = torch.tensor(0.0, device=h.device)
+                for i in range(0, flat_h.size(0), chunk):
+                    end = min(i + chunk, flat_h.size(0))
+                    logits_c = F.linear(flat_h[i:end], self.lm_head.weight)
+                    total_ce = total_ce + F.cross_entropy(logits_c, flat_t[i:end], reduction="sum")
+                ce_loss = total_ce / flat_t.size(0)
+                del flat_h, flat_t
+
+            unmask_loss = torch.tensor(0.0, device=h.device)
 
             coh_loss = self.coherence.coherence_loss(h)
 

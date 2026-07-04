@@ -180,6 +180,9 @@ class TrainConfig:
     sequential_cycles: int = 3
     curriculum_enabled: bool = True
     curriculum_stage2_start: int = 100000
+    # Data format
+    data_dtype: str = "auto"  # auto/uint16/uint32
+    data_dir: str = "data"
 
 
 @dataclass

@@ -1,0 +1,116 @@
+# HAGI V4 — 8gb_google config (RTX 3070)
+# Google models: T5Gemma embedding + Gemma 4 teacher
+# Scaled down for 8GB VRAM: batch=4, seq=512, grad_accum=4
+
+model:
+  vocab_size: 262146
+  hidden_size: 1152
+  perception_layers: 3
+  reasoning_layers: 10
+  expression_layers: 3
+  norm_eps: 1.0e-6
+
+  algebra:
+    blade_count: 8
+    grade_dims: [96, 144, 144, 96, 672]
+    hidden_size: 1152
+
+  attention:
+    num_query_heads: 16
+    num_kv_heads: 4
+    head_dim: 72
+    rope_theta: 500000.0
+    max_seq_len: 4096
+    bidirectional: true
+    fp16_attention: true
+    fp32_rmsnorm: true
+
+  gp2d:
+    window: 1
+    gate_init: -2.0
+
+  refinement:
+    num_iterations: 4
+    min_iterations: 1
+    use_adaptive_halt: true
+    halt_threshold: 0.9
+    use_deep_supervision: true
+    deep_supervision_decay: 0.1
+    deep_supervision_weight: 0.1
+
+  masking:
+    mask_ratio: 0.30
+    mask_token_id: 262145
+    use_span_masking: false
+    span_length: 3
+    use_progressive: true
+
+  hrm:
+    h_state_dim: 256
+    l_state_dim: 256
+    h_stride: 4
+
+  gdr:
+    scalar_momentum: 0.8
+    vector_momentum: 0.5
+    bivector_momentum: 0.0
+    trivector_momentum: 0.0
+    use_grade_router: true
+    grade_router_alpha: 0.01
+
+  msa:
+    max_slots: 4096
+    slot_chunk_size: 4
+    top_k: 6
+    routing_key_dim: 64
+    local_window: 32
+    mla_compress_dim: 128
+    mla_up_dim: 288
+
+  moe:
+    num_experts: 4
+    top_k: 1
+    intermediate_size: 768
+    use_mod_skip: true
+    alpha: 0.01
+
+  cast:
+    use_coherence: true
+    coherence_gate_init: -5.0
+
+train:
+  max_steps: 91553
+  warmup_steps: 5000
+  learning_rate: 0.0004
+  muon_lr: 0.02
+  muon_momentum: 0.97
+  muon_weight_decay: 0.5
+  weight_decay: 0.1
+  precision: "bf16"
+  grad_accum_steps: 4         # effective batch = 4*4 = 16
+  batch_size: 4               # 8GB: smaller batch
+  seq_len: 512               # 8GB: shorter sequences
+  w_ce: 1.0
+  w_moe_aux: 0.005
+  w_gdr_router: 0.005
+  w_coherence: 0.001
+  # Distillation
+  distill_enabled: true
+  distill_teacher: "google/gemma-4-E2B-it"
+  distill_embed_teacher: "google/t5gemma-2-1b-1b"
+  distill_alpha_start: 0.5
+  distill_alpha_end: 0.3
+  distill_temperature: 2.0
+  distill_end_frac: 0.6
+  distill_every: 2            # every 2 steps (8GB: teacher shares VRAM)
+  # Checkpointing
+  checkpoint_dir: "checkpoints"
+  checkpoint_interval: 500
+  checkpoint_keep_last: 3
+  # Sequential cycling
+  sequential_cycles: 3
+  curriculum_enabled: true
+  curriculum_stage2_start: 60000
+  # Data
+  data_dtype: "uint32"
+  data_dir: "data"
