@@ -35,6 +35,10 @@ class AttentionConfig:
     bidirectional: bool = True
     fp16_attention: bool = True
     fp32_rmsnorm: bool = True
+    use_geometric: bool = True
+    n_geo: int = 0
+    geo_gate_init: float = -2.0
+    geo_grade_weights_init: tuple = (1.0, 0.0, 0.0, 0.0)
 
 
 @dataclass

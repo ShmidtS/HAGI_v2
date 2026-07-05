@@ -24,6 +24,10 @@ model:
     bidirectional: true       # V4: no causal mask (plane prediction)
     fp16_attention: true      # fp16 QKV for better softmax resolution
     fp32_rmsnorm: true        # fp32 variance for numerical stability
+    use_geometric: true       # O(T) geometric enrichment before attention
+    n_geo: 8                  # 8 multivectors (64-dim geo space, ~1% param overhead)
+    geo_gate_init: -2.0       # sigmoid(-2)~0.12 (low start, learnable)
+    geo_grade_weights_init: [1.0, 0.0, 0.0, 0.0]  # scalar, vector, bivector, trivector
 
   gp2d:
     window: 1                 # temporal kernel: t-1, t, t+1 (3 positions)

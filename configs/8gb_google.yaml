@@ -24,6 +24,10 @@ model:
     bidirectional: true
     fp16_attention: true
     fp32_rmsnorm: true
+    use_geometric: true       # O(T) geometric enrichment before attention
+    n_geo: 8                  # 8 multivectors (smaller for 8GB)
+    geo_gate_init: -2.0       # sigmoid(-2)~0.12 (low start, learnable)
+    geo_grade_weights_init: [1.0, 0.0, 0.0, 0.0]  # scalar, vector, bivector, trivector
 
   gp2d:
     window: 1
