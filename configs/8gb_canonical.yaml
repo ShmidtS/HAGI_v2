@@ -28,15 +28,26 @@ model:
   gp2d:
     window: 1                 # temporal kernel: t-1, t, t+1 (3 positions)
     gate_init: -2.0           # sigmoid(-2) ≈ 0.12
+    use_whiteness_loss: true  # penalize lag-1 autocorrelation of residual
+    whiteness_weight: 0.01
 
   refinement:
     num_iterations: 4         # refinement iterations (train + inference)
     min_iterations: 1         # minimum before adaptive halting
     use_adaptive_halt: true   # per-token early stopping
-    halt_threshold: 0.9       # convergence: relative_delta < 0.01
+    halt_threshold: 0.9       # legacy fixed threshold
+    halt_threshold_start: 0.05  # early training: coarse, stop early
+    halt_threshold_end: 0.001   # late training: fine, iterate longer
     use_deep_supervision: true
     deep_supervision_decay: 0.1   # 0.1^iter: 1.0, 0.1, 0.01, 0.001
     deep_supervision_weight: 0.1  # overall weight (0.1 = 10% of main CE)
+    use_adaptive_ds_weight: true    # EMA-based adaptive deep supervision weights
+    ds_ema_decay: 0.99
+    use_entropy_adaptive_refinement: true  # iterations depend on input entropy
+    entropy_low_threshold: 0.01
+    entropy_high_threshold: 0.1
+    entropy_low_iterations: 2
+    entropy_high_iterations: 6
 
   masking:
     mask_ratio: 0.30          # 30% of tokens masked (progressive: 15% → 30%)
@@ -60,7 +71,10 @@ model:
 
   msa:
     max_slots: 4096           # ring buffer capacity
-    slot_chunk_size: 4        # tokens per slot (compression)
+    slot_chunk_size: 4        # default tokens per slot (compression)
+    use_adaptive_chunk_size: true  # adaptive: 8 for low-entropy, 2 for high-entropy
+    chunk_size_low_entropy: 8
+    chunk_size_high_entropy: 2
     top_k: 6                  # slots to attend per query
     routing_key_dim: 64       # Clifford scalar routing key
     local_window: 32          # local 2D routing: ±32 positions
@@ -73,10 +87,15 @@ model:
     intermediate_size: 384    # per-expert FFN dim (V1 exact)
     use_mod_skip: true        # MoD: skip slot for trivial tokens
     alpha: 0.01               # load-balance aux weight
+    use_grade_specialization: true  # correlate expert routing with grade dominance
+    grade_specialization_weight: 0.01
 
   cast:
     use_coherence: true       # geometric coherence regularizer
     coherence_gate_init: -5.0 # sigmoid(-5) ≈ 0.007 (near-off at init)
+    use_per_grade_coherence: true  # only scalar+vector grades
+    scalar_dim: 64
+    vector_dim: 96
 
 train:
   max_steps: 150000           # 3x V1 (masked CE has ~3x lower signal density)
@@ -94,13 +113,32 @@ train:
   w_moe_aux: 0.01             # MoE load-balance weight
   w_gdr_router: 0.01          # GDR grade router weight
   w_coherence: 0.001          # geometric coherence weight (small — regularizer)
+  w_ib: 0.01                  # Information Bottleneck regularizer weight
+  ib_beta: 1.0                # IB trade-off parameter
+  w_whiteness: 0.01           # GP2D residual whiteness weight
+  w_grade_specialization: 0.01  # MoE grade specialization weight
+  # Two-phase training schedule (fitting → compression)
+  use_two_phase_schedule: true
+  two_phase_split: 0.5        # split at 50% of training
+  phase1_mask_ratio: 0.15     # fitting: low mask, high signal density
+  phase2_mask_ratio: 0.35     # compression: high mask, force compression
+  phase1_w_coherence: 0.0001  # fitting: minimal smoothness
+  phase2_w_coherence: 0.001   # compression: enforce smoothness
+  phase1_gp2d_gate_init: -1.0 # fitting: moderate prediction (sigmoid(-1)≈0.27)
+  phase2_gp2d_gate_init: -2.0 # compression: minimal prediction (sigmoid(-2)≈0.12)
+  # Per-grade variance logging
+  log_grade_variance: true
+  grade_log_interval: 100
   # Distillation (knowledge transfer from SmolLM2)
   distill_enabled: true
   distill_teacher: "HuggingFaceTB/SmolLM2-360M"    # KL teacher (360M, bf16 ~720MB)
   distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"  # embedding transfer only
   distill_alpha_start: 0.5    # start: 50% CE + 50% KL
   distill_alpha_end: 0.3      # end: 30% CE + 70% KL (more teacher signal)
-  distill_temperature: 2.0    # softmax temperature for KL
+  distill_temperature: 2.0    # fallback softmax temperature for KL
+  distill_temp_start: 4.0     # anneal: start high (coarse structure)
+  distill_temp_end: 1.0       # anneal: end low (fine details)
+  distill_use_temp_anneal: true  # enable temperature annealing
   distill_end_frac: 0.6       # distillation ends at 60% of training, then pure CE
   distill_every: 2            # run teacher every N steps (KL signal persists)
   # Checkpointing

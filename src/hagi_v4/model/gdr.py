@@ -137,6 +137,7 @@ class GradeDecomposedRecurrence(nn.Module):
                 num_grades=4,
                 alpha=cfg.grade_router_alpha,
             )
+        self._last_gate: torch.Tensor | None = None
 
     def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         b = self._bounds
@@ -154,6 +155,7 @@ class GradeDecomposedRecurrence(nn.Module):
         router_aux: torch.Tensor | None = None
         if self.grade_router is not None:
             gate, router_aux = self.grade_router(graded_ctx)
+            self._last_gate = gate.detach()
             s_upd = s_upd * gate[..., 0:1]
             v_upd = v_upd * gate[..., 1:2]
             b_upd = b_upd * gate[..., 2:3]

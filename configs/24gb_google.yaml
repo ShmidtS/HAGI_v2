@@ -31,15 +31,26 @@ model:
   gp2d:
     window: 1
     gate_init: -2.0
+    use_whiteness_loss: true
+    whiteness_weight: 0.01
 
   refinement:
     num_iterations: 4
     min_iterations: 1
     use_adaptive_halt: true
     halt_threshold: 0.9
+    halt_threshold_start: 0.05
+    halt_threshold_end: 0.001
     use_deep_supervision: true
     deep_supervision_decay: 0.1
     deep_supervision_weight: 0.1
+    use_adaptive_ds_weight: true
+    ds_ema_decay: 0.99
+    use_entropy_adaptive_refinement: true
+    entropy_low_threshold: 0.01
+    entropy_high_threshold: 0.1
+    entropy_low_iterations: 2
+    entropy_high_iterations: 6
 
   masking:
     mask_ratio: 0.30
@@ -64,6 +75,9 @@ model:
   msa:
     max_slots: 4096
     slot_chunk_size: 4
+    use_adaptive_chunk_size: true
+    chunk_size_low_entropy: 8
+    chunk_size_high_entropy: 2
     top_k: 6
     routing_key_dim: 64
     local_window: 32
@@ -76,10 +90,15 @@ model:
     intermediate_size: 768   # 1152 * 2/3, per-expert
     use_mod_skip: true
     alpha: 0.01
+    use_grade_specialization: true
+    grade_specialization_weight: 0.01
 
   cast:
     use_coherence: true
     coherence_gate_init: -5.0
+    use_per_grade_coherence: true
+    scalar_dim: 96
+    vector_dim: 144
 
 train:
   max_steps: 91553            # 3B tokens / (16 * 2 * 1024)
@@ -97,6 +116,20 @@ train:
   w_moe_aux: 0.005
   w_gdr_router: 0.005
   w_coherence: 0.001
+  w_ib: 0.01
+  ib_beta: 1.0
+  w_whiteness: 0.01
+  w_grade_specialization: 0.01
+  use_two_phase_schedule: true
+  two_phase_split: 0.5
+  phase1_mask_ratio: 0.15
+  phase2_mask_ratio: 0.35
+  phase1_w_coherence: 0.0001
+  phase2_w_coherence: 0.001
+  phase1_gp2d_gate_init: -1.0
+  phase2_gp2d_gate_init: -2.0
+  log_grade_variance: true
+  grade_log_interval: 100
   # Distillation — Google teacher + embedding
   distill_enabled: true
   distill_teacher: "google/gemma-4-E2B-it"
@@ -104,6 +137,9 @@ train:
   distill_alpha_start: 0.5
   distill_alpha_end: 0.3
   distill_temperature: 2.0
+  distill_temp_start: 4.0
+  distill_temp_end: 1.0
+  distill_use_temp_anneal: true
   distill_end_frac: 0.6
   distill_every: 1            # every step (24GB has room)
   # Checkpointing
