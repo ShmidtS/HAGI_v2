@@ -43,18 +43,36 @@ class MoESwiGLU(nn.Module):
 
     def __init__(self, cfg: MoEConfig, hidden_size: int = 576):
         super().__init__()
+        self.cfg = cfg
         self.num_experts = cfg.num_experts
         self.top_k = cfg.top_k
         self.hidden_size = hidden_size
         self.intermediate_size = cfg.intermediate_size
         self.alpha = cfg.alpha
         self.use_mod_skip = cfg.use_mod_skip
+        self.use_grade_specialization = cfg.use_grade_specialization
         router_out = self.num_experts + (1 if self.use_mod_skip else 0)
         self.skip_idx = self.num_experts if self.use_mod_skip else -1
 
         self.router = nn.Linear(hidden_size, router_out, bias=False)
         nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
         self.experts = nn.ModuleList(SwiGLUExpert(hidden_size, self.intermediate_size) for _ in range(self.num_experts))
+        self._last_router_probs: torch.Tensor | None = None
+
+    def grade_specialization_loss(self, grade_gate: torch.Tensor) -> torch.Tensor:
+        """Correlation between expert routing and grade dominance.
+
+        Expert 0 ↔ scalar (grade 0), Expert 1 ↔ vector (grade 1), etc.
+        """
+        if self._last_router_probs is None or not self.use_grade_specialization:
+            return self.router.weight.new_zeros(())
+        probs = self._last_router_probs[:, : self.num_experts]
+        if grade_gate.shape[0] != probs.shape[0]:
+            n = min(grade_gate.shape[0], probs.shape[0])
+            grade_gate = grade_gate[:n]
+            probs = probs[:n]
+        target = grade_gate[:, : self.num_experts]
+        return self.cfg.grade_specialization_weight * F.cross_entropy(probs, target.argmax(dim=-1))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
@@ -66,6 +84,8 @@ class MoESwiGLU(nn.Module):
             router_logits = router_logits + noise.detach()
 
         router_probs = F.softmax(router_logits, dim=-1)
+        if self.training and self.use_grade_specialization:
+            self._last_router_probs = router_probs.detach()
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         if self.top_k > 1:
             top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)

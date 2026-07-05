@@ -23,6 +23,7 @@ from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
 from hagi_v4.model.outputs import InferenceOutput, TrainOutput
 from hagi_v4.model.transformer_block import TransformerBlock
+from hagi_v4.train.losses import information_bottleneck_loss
 
 
 class HAGIv4(nn.Module):
@@ -37,8 +38,9 @@ class HAGIv4(nn.Module):
         self.reasoning = nn.ModuleList(TransformerBlock(m) for _ in range(m.reasoning_layers))
         self.gdr = GradeDecomposedRecurrence(m.gdr, m.hidden_size)
         self.hrm = RefinementCore(m.hrm, m.refinement, m.hidden_size)
+        self.hrm.set_max_steps(cfg.train.max_steps)
         self.msa = MSAModule(m.msa, m.hidden_size)
-        self.coherence = CoherenceHead(m.hidden_size, gate_init=m.cast.coherence_gate_init)
+        self.coherence = CoherenceHead(m.cast, m.hidden_size)
         self.expression = nn.ModuleList(TransformerBlock(m) for _ in range(m.expression_layers))
         self.final_norm = RMSNorm(m.hidden_size, eps=m.norm_eps)
         self.lm_head = nn.Linear(m.hidden_size, m.vocab_size, bias=False)
@@ -65,6 +67,7 @@ class HAGIv4(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
+        step: int = 0,
     ) -> TrainOutput | InferenceOutput:
         B, T = input_ids.shape
         h = self.embed(input_ids)
@@ -95,6 +98,7 @@ class HAGIv4(nn.Module):
             self.final_norm,
             training=self.training,
             mask=mask,
+            step=step,
         )
 
         for blk in self.expression:
@@ -115,7 +119,7 @@ class HAGIv4(nn.Module):
                 flat_h = h_normed.reshape(-1, h_normed.size(-1))
                 flat_t = targets.reshape(-1)
                 chunk = 4096
-                total_ce = torch.tensor(0.0, device=h.device)
+                total_ce = h_normed.new_zeros(())
                 for i in range(0, flat_h.size(0), chunk):
                     end = min(i + chunk, flat_h.size(0))
                     logits_c = F.linear(flat_h[i:end], self.lm_head.weight)
@@ -123,9 +127,27 @@ class HAGIv4(nn.Module):
                 ce_loss = total_ce / flat_t.size(0)
                 del flat_h, flat_t
 
-            unmask_loss = torch.tensor(0.0, device=h.device)
+            unmask_loss = h.new_zeros(())
 
             coh_loss = self.coherence.coherence_loss(h)
+
+            whiteness_loss = self.gp2d.whiteness_loss() if self.cfg.model.gp2d.use_whiteness_loss else h.new_zeros(())
+
+            ib_loss = h.new_zeros(())
+            if self.cfg.train.w_ib > 0:
+                ib_loss = information_bottleneck_loss(
+                    h,
+                    targets,
+                    self.lm_head.weight,
+                    beta=self.cfg.train.ib_beta,
+                )
+
+            grade_spec_loss = h.new_zeros(())
+            if self.cfg.model.moe.use_grade_specialization and self.gdr._last_gate is not None:
+                gate_flat = self.gdr._last_gate.reshape(-1, 4)
+                for blk in self.reasoning:
+                    gs = blk.moe.grade_specialization_loss(gate_flat)
+                    grade_spec_loss = grade_spec_loss + gs
 
             total = (
                 ce_loss
@@ -135,6 +157,9 @@ class HAGIv4(nn.Module):
                 + 0.01 * losses["msa_lb"]
                 + losses["deep_supervision"]
                 + self.cfg.train.w_coherence * coh_loss
+                + self.cfg.train.w_whiteness * whiteness_loss
+                + self.cfg.train.w_ib * ib_loss
+                + self.cfg.train.w_grade_specialization * grade_spec_loss
             )
             return TrainOutput(
                 loss=total,

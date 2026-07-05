@@ -43,6 +43,8 @@ class GP2DConfig:
 
     window: int = 1
     gate_init: float = -2.0
+    use_whiteness_loss: bool = True
+    whiteness_weight: float = 0.01
 
 
 @dataclass
@@ -53,9 +55,18 @@ class RefinementConfig:
     min_iterations: int = 1
     use_adaptive_halt: bool = True
     halt_threshold: float = 0.9
+    halt_threshold_start: float = 0.05
+    halt_threshold_end: float = 0.001
     use_deep_supervision: bool = True
     deep_supervision_decay: float = 0.1
     deep_supervision_weight: float = 0.1
+    use_adaptive_ds_weight: bool = True
+    ds_ema_decay: float = 0.99
+    use_entropy_adaptive_refinement: bool = True
+    entropy_low_threshold: float = 0.01
+    entropy_high_threshold: float = 0.1
+    entropy_low_iterations: int = 2
+    entropy_high_iterations: int = 6
 
 
 @dataclass
@@ -96,6 +107,9 @@ class MSAConfig:
 
     max_slots: int = 4096
     slot_chunk_size: int = 4
+    use_adaptive_chunk_size: bool = True
+    chunk_size_low_entropy: int = 8
+    chunk_size_high_entropy: int = 2
     top_k: int = 6
     routing_key_dim: int = 64
     local_window: int = 32
@@ -112,6 +126,8 @@ class MoEConfig:
     intermediate_size: int = 384
     use_mod_skip: bool = True
     alpha: float = 0.01
+    use_grade_specialization: bool = True
+    grade_specialization_weight: float = 0.01
 
 
 @dataclass
@@ -120,6 +136,9 @@ class CASTConfig:
 
     use_coherence: bool = True
     coherence_gate_init: float = -5.0
+    use_per_grade_coherence: bool = True
+    scalar_dim: int = 64
+    vector_dim: int = 96
 
 
 @dataclass
@@ -163,6 +182,20 @@ class TrainConfig:
     w_moe_aux: float = 0.01
     w_gdr_router: float = 0.01
     w_coherence: float = 0.001
+    w_ib: float = 0.01
+    ib_beta: float = 1.0
+    w_whiteness: float = 0.01
+    w_grade_specialization: float = 0.01
+    use_two_phase_schedule: bool = True
+    two_phase_split: float = 0.5
+    phase1_mask_ratio: float = 0.15
+    phase2_mask_ratio: float = 0.35
+    phase1_w_coherence: float = 0.0001
+    phase2_w_coherence: float = 0.001
+    phase1_gp2d_gate_init: float = -1.0
+    phase2_gp2d_gate_init: float = -2.0
+    log_grade_variance: bool = True
+    grade_log_interval: int = 100
     # Distillation
     distill_enabled: bool = True
     distill_teacher: str = "HuggingFaceTB/SmolLM2-360M"
@@ -170,6 +203,9 @@ class TrainConfig:
     distill_alpha_start: float = 0.5
     distill_alpha_end: float = 0.3
     distill_temperature: float = 2.0
+    distill_temp_start: float = 4.0
+    distill_temp_end: float = 1.0
+    distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
     distill_every: int = 2
     # Checkpointing

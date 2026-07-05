@@ -72,10 +72,25 @@ class MSAModule(nn.Module):
         self.registry = TensorSlotRegistry(cfg.max_slots, cfg.routing_key_dim, cfg.mla_compress_dim)
         self._n_kv_heads = 4
         self._head_dim = 72
+        self._adaptive_chunk = cfg.use_adaptive_chunk_size
+        self._chunk_low = cfg.chunk_size_low_entropy
+        self._chunk_high = cfg.chunk_size_high_entropy
+        self._default_chunk = cfg.slot_chunk_size
+
+    def _select_chunk_size(self, h: torch.Tensor) -> int:
+        if not self._adaptive_chunk:
+            return self._default_chunk
+        scalar_var = h[..., :64].float().var(dim=1).mean().item()
+        bivector_var = h[..., 160:256].float().var(dim=1).mean().item()
+        if bivector_var > scalar_var * 2:
+            return self._chunk_high
+        if scalar_var > bivector_var * 2:
+            return self._chunk_low
+        return self._default_chunk
 
     def write(self, h: torch.Tensor) -> None:
         B, T, _ = h.shape
-        chunk = self.cfg.slot_chunk_size
+        chunk = self._select_chunk_size(h)
         flat_h = h.reshape(B * T, -1)
         n = flat_h.shape[0]
         n_slots = n // chunk

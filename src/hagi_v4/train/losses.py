@@ -81,3 +81,48 @@ def compute_total_loss(
         + deep_supervision
         + w_coherence * coherence
     )
+
+
+def information_bottleneck_loss(
+    h: torch.Tensor,
+    targets: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    beta: float = 1.0,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Information Bottleneck regularizer: I(X;Z) - beta * I(Y;Z).
+
+    I(X;Z) proxy: hidden state variance (complexity — how much input info is stored).
+    I(Y;Z) proxy: negative cross-entropy (predictive information — how much target info is captured).
+
+    Minimizing this loss drives the model toward the IB bound:
+    reduce complexity while maintaining predictive information.
+    """
+    complexity = h.float().var(dim=(0, 1)).sum()
+
+    flat_h = h.reshape(-1, h.size(-1))
+    flat_t = targets.reshape(-1)
+    total_ce = h.new_zeros(())
+    for i in range(0, flat_h.size(0), chunk_size):
+        end = min(i + chunk_size, flat_h.size(0))
+        logits_c = F.linear(flat_h[i:end], lm_head_weight)
+        total_ce = total_ce + F.cross_entropy(logits_c, flat_t[i:end], reduction="sum")
+    ce = total_ce / flat_t.size(0)
+    del flat_h, flat_t
+
+    predictive_info = -ce
+    return complexity - beta * predictive_info
+
+
+def gp2d_whiteness_loss(residual: torch.Tensor) -> torch.Tensor:
+    """Penalize lag-1 autocorrelation of GP2D residual along temporal axis.
+
+    Optimal predictive coding produces white (uncorrelated) residuals.
+    Nonzero autocorrelation means remaining structure is not exploited.
+    """
+    if residual.size(1) < 2:
+        return residual.new_zeros(())
+    r_t = residual[:, :-1].reshape(-1, residual.size(-1))
+    r_t1 = residual[:, 1:].reshape(-1, residual.size(-1))
+    cos_sim = F.cosine_similarity(r_t.float(), r_t1.float(), dim=-1)
+    return cos_sim.abs().mean()

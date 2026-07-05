@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hagi_v4.algebra.clifford import BLADE_COUNT, geometric_product
+from hagi_v4.config import CASTConfig
 
 
 class CoherenceHead(nn.Module):
@@ -24,26 +25,37 @@ class CoherenceHead(nn.Module):
     2. Coherence loss: mean squared norm of geometric product between
        adjacent positions h[t] and h[t+1]. This encourages smooth
        predictions across the temporal plane.
+    3. Per-grade coherence: when enabled, only applies to scalar + vector
+       grades (smooth signals), skipping bivector/trivector (can vary sharply).
     """
 
-    def __init__(self, hidden_size: int = 576, gate_init: float = -5.0):
+    def __init__(self, cfg: CASTConfig, hidden_size: int = 576):
         super().__init__()
+        self.cfg = cfg
         self.n_heads = hidden_size // BLADE_COUNT
-        self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gate_logit = nn.Parameter(torch.tensor(float(cfg.coherence_gate_init)))
+        self._scalar_dim = cfg.scalar_dim
+        self._vector_dim = cfg.vector_dim
+        self._sv_dim = cfg.scalar_dim + cfg.vector_dim
+        self._sv_heads = self._sv_dim // BLADE_COUNT
 
     def coherence_loss(self, h: torch.Tensor) -> torch.Tensor:
         """Geometric coherence loss between adjacent positions.
 
         coherence_loss = mean(||geometric_product(h[t], h[t+1])||^2)
 
-        The bivector "area" between adjacent positions measures
-        relational smoothness. Minimizing this encourages coherent
-        predictions across the temporal plane.
+        When per_grade_coherence is enabled, only scalar + vector grades
+        are used — bivector and trivector can legitimately vary sharply.
         """
         B, T, H = h.shape
         if T < 2:
             return h.new_zeros(())
-        mv = h.reshape(B, T, self.n_heads, BLADE_COUNT)
+        if self.cfg.use_per_grade_coherence and self._sv_dim < H:
+            sv = h[..., : self._sv_dim]
+            n_heads = self._sv_heads
+            mv = sv.reshape(B, T, n_heads, BLADE_COUNT)
+        else:
+            mv = h.reshape(B, T, self.n_heads, BLADE_COUNT)
         area = geometric_product(mv[:, :-1], mv[:, 1:])
         gate = torch.sigmoid(self.gate_logit)
         return gate * (area.float() ** 2).mean()

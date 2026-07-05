@@ -26,6 +26,7 @@ from hagi_v4.model.masking import (
     progressive_mask_ratio,
 )
 from hagi_v4.model.outputs import TrainOutput
+from hagi_v4.train.distillation import alpha_at, temperature_at
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,46 @@ def soft_grad_scale(model: nn.Module, target: float = _GRAD_NORM_TARGET) -> floa
     return norm
 
 
+def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
+    """Two-phase mask ratio: low in fitting phase, high in compression phase."""
+    if not cfg.train.use_two_phase_schedule:
+        return cfg.model.masking.mask_ratio
+    split_step = int(cfg.train.max_steps * cfg.train.two_phase_split)
+    if step < split_step:
+        return cfg.train.phase1_mask_ratio
+    return cfg.train.phase2_mask_ratio
+
+
+def _two_phase_coherence_weight(step: int, cfg: HAGIv4Config) -> float:
+    """Two-phase coherence weight: minimal early, stronger late."""
+    if not cfg.train.use_two_phase_schedule:
+        return cfg.train.w_coherence
+    split_step = int(cfg.train.max_steps * cfg.train.two_phase_split)
+    if step < split_step:
+        return cfg.train.phase1_w_coherence
+    return cfg.train.phase2_w_coherence
+
+
+def _log_grade_variance(model: nn.Module, hidden: torch.Tensor, step: int, cfg: HAGIv4Config) -> dict:
+    """Log per-grade activation variance for capacity monitoring."""
+    if not cfg.train.log_grade_variance:
+        return {}
+    if step % cfg.train.grade_log_interval != 0:
+        return {}
+    gdr = model.gdr
+    b = gdr._bounds
+    var_scalar = hidden[..., b[0] : b[1]].float().var(dim=(0, 1)).sum().item()
+    var_vector = hidden[..., b[1] : b[2]].float().var(dim=(0, 1)).sum().item()
+    var_bivector = hidden[..., b[2] : b[3]].float().var(dim=(0, 1)).sum().item()
+    var_trivector = hidden[..., b[3] : b[4]].float().var(dim=(0, 1)).sum().item()
+    return {
+        "var_scalar": var_scalar,
+        "var_vector": var_vector,
+        "var_bivector": var_bivector,
+        "var_trivector": var_trivector,
+    }
+
+
 def train_step(
     model: nn.Module,
     batch: dict,
@@ -96,19 +137,26 @@ def train_step(
     targets = batch["targets"].to(device)
 
     mc = cfg.model.masking
-    mask_ratio = (
-        progressive_mask_ratio(step, _MASK_WARMUP_STEPS, 0.15, mc.mask_ratio) if mc.use_progressive else mc.mask_ratio
-    )
+    if cfg.train.use_two_phase_schedule:
+        mask_ratio = _two_phase_mask_ratio(step, cfg)
+    elif mc.use_progressive:
+        mask_ratio = progressive_mask_ratio(step, _MASK_WARMUP_STEPS, 0.15, mc.mask_ratio)
+    else:
+        mask_ratio = mc.mask_ratio
     pattern = sample_mask_pattern()
     masked_ids, mask = create_mask(input_ids, pattern, mask_ratio, mc.mask_token_id, mc.span_length)
+
+    if cfg.train.use_two_phase_schedule:
+        cfg.train.w_coherence = _two_phase_coherence_weight(step, cfg)
 
     accum = cfg.train.grad_accum_steps
     optimizer.zero_grad(set_to_none=True)
 
     total_loss = 0.0
+    output: TrainOutput | None = None
 
     for micro_idx in range(accum):
-        output: TrainOutput = model(masked_ids, targets=targets, mask=mask)
+        output = model(masked_ids, targets=targets, mask=mask, step=step)
         loss = output.loss
 
         use_distill = (
@@ -118,8 +166,6 @@ def train_step(
             and step % cfg.train.distill_every == 0
         )
         if use_distill:
-            from hagi_v4.train.distillation import alpha_at
-
             alpha = alpha_at(
                 step,
                 cfg.train.distill_alpha_start,
@@ -127,6 +173,16 @@ def train_step(
                 cfg.train.max_steps,
                 cfg.train.distill_end_frac,
             )
+            if cfg.train.distill_use_temp_anneal:
+                temperature = temperature_at(
+                    step,
+                    cfg.train.max_steps,
+                    cfg.train.distill_temp_start,
+                    cfg.train.distill_temp_end,
+                    cfg.train.distill_end_frac,
+                )
+            else:
+                temperature = cfg.train.distill_temperature
             with torch.inference_mode():
                 teacher_hidden = teacher.get_hidden(input_ids)
             if teacher_hidden is not None:
@@ -137,7 +193,7 @@ def train_step(
                     targets=targets,
                     ce_loss=loss,
                     mask=mask,
-                    temperature=cfg.train.distill_temperature,
+                    temperature=temperature,
                     alpha=alpha,
                 )
                 loss = distill_loss
@@ -155,7 +211,12 @@ def train_step(
     grad_norm = soft_grad_scale(model, _GRAD_NORM_TARGET)
     optimizer.step()
 
-    return {
+    if output is None:
+        return {"loss": 0.0, "step": step, "grad_norm": grad_norm}
+
+    grade_vars = _log_grade_variance(model, output.hidden, step, cfg)
+
+    result = {
         "loss": total_loss / max(accum, 1),
         "moe_aux": float(output.moe_aux_loss.detach()),
         "gdr_router": float(output.gdr_router_loss.detach()),
@@ -165,6 +226,8 @@ def train_step(
         "lr": lr_at(step, cfg),
         "step": step,
     }
+    result.update(grade_vars)
+    return result
 
 
 def train(

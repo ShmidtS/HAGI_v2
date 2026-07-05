@@ -262,3 +262,22 @@ def alpha_at(
         return 1.0
     progress = min(1.0, step / max(1, distill_end_step))
     return alpha_start + (alpha_end - alpha_start) * progress
+
+
+def temperature_at(
+    step: int,
+    max_steps: int,
+    temp_start: float = 4.0,
+    temp_end: float = 1.0,
+    distill_end_frac: float = 0.6,
+) -> float:
+    """Anneal temperature from high (coarse) to low (fine).
+
+    Early training: high T → soft targets, student learns coarse structure.
+    Late training: low T → sharp targets, student refines fine details.
+    """
+    distill_end_step = int(max_steps * distill_end_frac)
+    if step > distill_end_step:
+        return temp_end
+    progress = min(1.0, step / max(1, distill_end_step))
+    return temp_start + (temp_end - temp_start) * progress
