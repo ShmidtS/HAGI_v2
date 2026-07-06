@@ -61,7 +61,7 @@ def generate(
         if not mask.any():
             break
 
-        output = model(full_ids)
+        output = model(full_ids, mask=mask)
         logits = output.logits
         probs = F.softmax(logits.float(), dim=-1)
         confidence, predicted = probs.max(dim=-1)
@@ -98,7 +98,7 @@ def generate(
 
     mask = full_ids == mask_token_id
     if mask.any():
-        output = model(full_ids)
+        output = model(full_ids, mask=mask)
         logits = output.logits
         predicted = logits.argmax(dim=-1)
         full_ids[mask] = predicted[mask]
