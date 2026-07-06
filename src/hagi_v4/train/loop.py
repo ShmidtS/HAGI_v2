@@ -32,13 +32,13 @@ logger = logging.getLogger(__name__)
 
 
 def configure_runtime() -> None:
-    """Set CUDA runtime flags. Call once at startup, not at import time."""
     import os
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
 
 def lr_at(step: int, cfg: HAGIv4Config) -> float:
@@ -71,13 +71,15 @@ def cast_to_bf16(model: nn.Module) -> None:
 
 
 def soft_grad_scale(model: nn.Module, target: float = 1.0) -> float:
-    """Scale gradients by 1/max(1, norm/target). Not clipping — uniform scaling."""
-    norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+    total_sq = sum(g.pow(2).sum() for g in grads)
+    norm = total_sq.sqrt().item()
     if norm > target:
         scale = target / norm
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(scale)
+        for g in grads:
+            g.mul_(scale)
     return norm
 
 

@@ -98,7 +98,8 @@ class EntropyScheduler:
     def compute_n_iters(self, h: torch.Tensor) -> int:
         if not self.use_entropy_adaptive:
             return self.n_iterations
-        entropy_proxy = h.float().var(dim=1).mean().item()
+        with torch.no_grad():
+            entropy_proxy = h.float().var(dim=1).mean().item()
         if entropy_proxy < self.entropy_low_threshold:
             return self.entropy_low_iterations
         if entropy_proxy > self.entropy_high_threshold:
@@ -299,7 +300,14 @@ class RefinementCore(nn.Module):
             if router_loss is not None:
                 total_gdr_router = total_gdr_router + router_loss
 
-            h, gp2d_residual = gp2d(h)
+            if training:
+
+                def _gp2d_run(h_inner):
+                    return gp2d(h_inner)
+
+                h, gp2d_residual = torch_checkpoint(_gp2d_run, h, use_reentrant=False)
+            else:
+                h, gp2d_residual = gp2d(h)
 
             msa.write(h)
 
