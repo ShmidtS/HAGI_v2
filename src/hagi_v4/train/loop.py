@@ -16,10 +16,12 @@ import math
 from collections.abc import Iterator
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.masking import (
+    adaptive_mask_ratio,
     create_random_mask,
     progressive_mask_ratio,
 )
@@ -133,6 +135,7 @@ def train_step(
     loss_aggregator: LossAggregator | None = None,
     mask_warmup_steps: int = 20000,
     grad_norm_target: float = 1.0,
+    adaptive_mask_state: dict | None = None,
 ) -> dict:
     """Single training step with gradient accumulation."""
     model.train()
@@ -141,7 +144,9 @@ def train_step(
     targets = batch["targets"].to(device)
 
     mc = cfg.model.masking
-    if cfg.train.use_two_phase_schedule:
+    if mc.use_adaptive_erasure and adaptive_mask_state is not None:
+        mask_ratio = adaptive_mask_state.get("ratio", mc.mask_ratio)
+    elif cfg.train.use_two_phase_schedule:
         mask_ratio = _two_phase_mask_ratio(step, cfg)
     elif mc.use_progressive:
         mask_ratio = progressive_mask_ratio(step, mask_warmup_steps, 0.15, mc.mask_ratio)
@@ -224,13 +229,29 @@ def train_step(
 
     grade_vars = _log_grade_variance(model, output.hidden, step, cfg)
 
+    with torch.no_grad():
+        if output.logits is not None:
+            max_logits = output.logits.max(dim=-1).values
+            avg_confidence = (max_logits / output.logits.shape[-1]).float().mean().item()
+        else:
+            avg_confidence = 0.5
+    if mc.use_adaptive_erasure and adaptive_mask_state is not None:
+        adaptive_mask_state["ratio"] = adaptive_mask_ratio(
+            avg_confidence,
+            adaptive_mask_state.get("ratio", mc.mask_ratio),
+            adaptation_rate=mc.adaptation_rate,
+        )
+
     result = {
         "loss": total_loss / max(accum, 1),
         "moe_aux": float(output.aux.moe_lb.detach()) if output.aux.moe_lb is not None else 0.0,
         "gdr_router": float(output.aux.gdr_router.detach()) if output.aux.gdr_router is not None else 0.0,
+        "parity": float(output.aux.parity.detach()) if output.aux.parity is not None else 0.0,
+        "extrinsic_info": float(output.aux.extrinsic_info.detach()) if output.aux.extrinsic_info is not None else 0.0,
+        "efficiency": float(output.aux.efficiency.detach()) if output.aux.efficiency is not None else 0.0,
+        "avg_confidence": avg_confidence,
         "grad_norm": grad_norm,
         "mask_ratio": mask_ratio,
-        "mask_pattern": pattern,
         "lr": lr_at(step, cfg),
         "step": step,
     }
@@ -255,6 +276,7 @@ def train(
 
     optimizer = build_optimizer(model, cfg)
     loss_aggregator = LossAggregator(cfg)
+    adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
     step = start_step
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
@@ -269,7 +291,16 @@ def train(
             logger.info(f"Step {step}: distillation ended — freeing teacher")
             teacher.free()
 
-        metrics = train_step(model, batch, optimizer, cfg, step, teacher, loss_aggregator=loss_aggregator)
+        metrics = train_step(
+            model,
+            batch,
+            optimizer,
+            cfg,
+            step,
+            teacher,
+            loss_aggregator=loss_aggregator,
+            adaptive_mask_state=adaptive_mask_state,
+        )
         if step % log_interval == 0:
             yield metrics
 

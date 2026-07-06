@@ -39,17 +39,29 @@ class AttentionConfig:
 
 @dataclass
 class GP2DConfig:
-    """2D Geometric Product — cross-token Clifford convolution."""
+    """2D Geometric Product — systematic parity channel code.
+
+    V5: GP2D acts as a channel encoder — geometric product between
+    adjacent positions generates parity bits for error correction.
+    The decoder can check consistency via inverse GP.
+    """
 
     window: int = 1
     gate_init: float = -2.0
     use_whiteness_loss: bool = True
     whiteness_weight: float = 0.01
+    use_systematic_parity: bool = True
+    parity_weight: float = 0.1
 
 
 @dataclass
 class RefinementConfig:
-    """Iterative refinement loop configuration."""
+    """Iterative refinement loop — channel decoder (belief propagation).
+
+    V5: extrinsic information separation prevents information recycling.
+    Each iteration computes extrinsic = h_out - h_prior and passes only
+    extrinsic forward. Convergence halt based on extrinsic norm.
+    """
 
     num_iterations: int = 4
     min_iterations: int = 1
@@ -67,17 +79,28 @@ class RefinementConfig:
     entropy_high_threshold: float = 0.1
     entropy_low_iterations: int = 2
     entropy_high_iterations: int = 6
+    extrinsic_alpha: float = 1.0
+    convergence_threshold: float = 0.01
+    use_convergence_halt: bool = True
 
 
 @dataclass
 class MaskingConfig:
-    """Masking strategy for plane prediction training."""
+    """Adaptive erasure channel for V5 codec training.
+
+    V5: mask ratio adapts to model confidence (capacity matching).
+    mask_embed initialized as max-entropy vector (not zero) so the
+    model receives a clear "erasure here" signal.
+    """
 
     mask_ratio: float = 0.3
     mask_token_id: int = 49153
     use_span_masking: bool = True
     span_length: int = 3
     use_progressive: bool = True
+    use_adaptive_erasure: bool = True
+    mask_embed_init: str = "max_entropy"
+    adaptation_rate: float = 0.01
 
 
 @dataclass
@@ -153,6 +176,8 @@ class ModelConfig:
     reasoning_layers: int = 7
     expression_layers: int = 2
     norm_eps: float = 1e-6
+    bottleneck_ratio: float = 0.5
+    core_hidden_size: int = 288
     algebra: AlgebraConfig = field(default_factory=AlgebraConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     gp2d: GP2DConfig = field(default_factory=GP2DConfig)
@@ -188,6 +213,9 @@ class TrainConfig:
     ib_beta: float = 1.0
     w_whiteness: float = 0.01
     w_grade_specialization: float = 0.01
+    w_parity: float = 0.1
+    w_extrinsic_info: float = 0.01
+    w_efficiency: float = 0.001
     use_two_phase_schedule: bool = True
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15

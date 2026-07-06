@@ -147,10 +147,15 @@ def main() -> int:
         )
 
     for metrics in train(model, dataloader, cfg, log_interval=1, teacher=teacher, start_step=start_step):
+        loss = metrics["loss"]
+        bits_per_token = loss / 0.6931
+        conf = metrics.get("avg_confidence", 0.0)
+        ext = metrics.get("extrinsic_info", 0.0)
+        par = metrics.get("parity", 0.0)
         logger.info(
-            f"step {metrics['step']} | loss={metrics['loss']:.4f} | "
+            f"step {metrics['step']} | loss={loss:.4f} | bpt={bits_per_token:.2f} | "
             f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
-            f"mask={metrics['mask_pattern']}"
+            f"conf={conf:.3f} | ext={ext:.2f} | par={par:.4f}"
         )
     logger.info("Training complete.")
     return 0

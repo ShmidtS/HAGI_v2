@@ -1,11 +1,13 @@
 """Mixture of Experts (MoE) with MoD skip — Switch Transformer style.
 
+V5: Entropy-aware routing. Router input includes per-position entropy
+as an uncertainty signal. Low-entropy positions route to simple experts
+(few bits needed), high-entropy positions route to complex experts
+(variable-rate capacity allocation).
+
 4 experts, top-1 routing. Optional MoD skip slot for trivial tokens
 (residual identity). Load-balance aux loss (Shazeer/Switch) over real
 experts only. Fused gate+up weight (gu_weight) for efficiency.
-
-Uses mask-based dispatch (not sort/unique_consecutive) for vectorized
-expert routing.
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ class MoESwiGLU(nn.Module):
         router_out = self.num_experts + (1 if self.use_mod_skip else 0)
         self.skip_idx = self.num_experts if self.use_mod_skip else -1
 
-        self.router = nn.Linear(hidden_size, router_out, bias=False)
+        self.router = nn.Linear(hidden_size + 1, router_out, bias=False)
         nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
         self.experts = nn.ModuleList(SwiGLUExpert(hidden_size, self.intermediate_size) for _ in range(self.num_experts))
 
@@ -62,7 +64,12 @@ class MoESwiGLU(nn.Module):
         B, T, D = x.shape
         flat = x.reshape(B * T, D)
 
-        router_logits = self.router(flat)
+        with torch.no_grad():
+            h_norm = flat.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            entropy_proxy = (flat.float().var(dim=-1, keepdim=True) / h_norm).to(flat.dtype)
+        router_input = torch.cat([flat, entropy_proxy], dim=-1)
+
+        router_logits = self.router(router_input)
         if self.training:
             noise = torch.randn_like(router_logits) * 0.01
             router_logits = router_logits + noise.detach()

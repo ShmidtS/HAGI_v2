@@ -241,10 +241,12 @@ class RefinementCore(nn.Module):
         sin: torch.Tensor,
         targets: torch.Tensor | None,
         lm_head_weight: torch.Tensor,
-        final_norm: nn.Module,
         training: bool,
         mask: torch.Tensor | None,
         step: int = 0,
+        extrinsic_alpha: float = 1.0,
+        convergence_threshold: float = 0.01,
+        use_convergence_halt: bool = True,
     ) -> tuple[torch.Tensor, RefinementSideInfo]:
         B, T, H = h.shape
         device = h.device
@@ -261,8 +263,9 @@ class RefinementCore(nn.Module):
         total_gdr_router = h.new_zeros(())
         total_msa_lb = h.new_zeros(())
         total_deep_supervision = h.new_zeros(())
+        total_parity = h.new_zeros(())
 
-        h_prev = h.clone()
+        h_prev = h
         halted = torch.zeros(B, T, dtype=torch.bool, device=device)
         iterations_used = torch.full((B, T), n_iters, dtype=torch.long, device=device)
 
@@ -274,8 +277,12 @@ class RefinementCore(nn.Module):
         last_gate_probs: torch.Tensor | None = None
         last_gp2d_residual: torch.Tensor | None = None
         last_router_probs_list: list[torch.Tensor] | None = None
+        extrinsic_norms: list[float] = []
+        converged_at = n_iters
 
         for iteration in range(n_iters):
+            h_prior = h
+
             if iteration > 0:
                 msa_out, lb = msa.read(h, top_k=6)
                 h = h + msa_out
@@ -308,7 +315,19 @@ class RefinementCore(nn.Module):
             else:
                 h, gp2d_residual = gp2d(h)
 
+            total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
+
             msa.write(h)
+
+            if extrinsic_alpha < 1.0:
+                extrinsic = h - h_prior
+                ext_norm = extrinsic.float().norm(dim=-1).mean().item()
+                extrinsic_norms.append(ext_norm)
+                h = h_prior + extrinsic * extrinsic_alpha
+            else:
+                with torch.no_grad():
+                    ext_norm = (h - h_prior).float().norm(dim=-1).mean().item()
+                    extrinsic_norms.append(ext_norm)
 
             if self.adaptive_halt is not None:
                 new_halts = self.adaptive_halt(h, h_prev, iteration, halted, current_threshold=halt_threshold)
@@ -338,6 +357,18 @@ class RefinementCore(nn.Module):
             if rp_stacked.numel() > 0:
                 last_router_probs_list = list(rp_stacked.unbind(0))
 
+            if use_convergence_halt and iteration >= self.refinement_cfg.min_iterations:
+                if ext_norm < convergence_threshold:
+                    converged_at = iteration + 1
+                    not_halted = ~halted
+                    iterations_used = torch.where(
+                        not_halted & (iterations_used == n_iters),
+                        torch.full_like(iterations_used, iteration + 1),
+                        iterations_used,
+                    )
+                    break
+
+        actual_iters = max(converged_at, 1)
         n = max(n_iters, 1)
         side_info = RefinementSideInfo(
             deep_supervision_loss=self.deep_supervisor.finalize(total_deep_supervision, deep_weight_sum),
@@ -348,5 +379,7 @@ class RefinementCore(nn.Module):
             moe_lb=total_moe_aux / n,
             msa_lb=total_msa_lb / n,
             iterations_used=iterations_used,
+            extrinsic_norms=extrinsic_norms,
+            parity_strength=total_parity / actual_iters,
         )
         return h, side_info
