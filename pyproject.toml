@@ -12,9 +12,6 @@ dependencies = ["numpy", "torch>=2.0", "pyyaml"]
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
-[project.scripts]
-hagi4-train = "hagi_v4.train.cli:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 

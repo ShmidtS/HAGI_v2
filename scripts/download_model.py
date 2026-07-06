@@ -17,9 +17,9 @@ if not token:
 print(f"Token: {token[:10]}...")
 os.environ["HF_TOKEN"] = token
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download  # noqa: E402
 
 print("Downloading google/gemma-4-E2B-it...")
 path = snapshot_download("google/gemma-4-E2B-it", token=token)
 path2 = snapshot_download("google/t5gemma-2-1b-1b", token=token)
-print(f"Downloaded to: {path}")
+print(f"Downloaded to: {path}, {path2}")

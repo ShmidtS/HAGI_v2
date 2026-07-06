@@ -30,6 +30,12 @@ class TensorSlotRegistry(nn.Module):
         self.register_buffer("num_written", torch.zeros(1, dtype=torch.long), persistent=False)
 
     def write(self, keys: torch.Tensor, kv_compressed: torch.Tensor) -> None:
+        """Write keys and compressed KV into the ring buffer.
+
+        .detach() on keys/kv prevents gradients from flowing through the
+        memory write path — slots are treated as fixed context, not as
+        differentiable parameters of the current forward pass.
+        """
         n = keys.shape[0]
         ptr = int(self.write_ptr.item())
         idx = torch.arange(n, device=keys.device)
@@ -70,8 +76,10 @@ class MSAModule(nn.Module):
         self.o_proj = nn.Linear(cfg.mla_up_dim, hidden_size, bias=False)
         self.attn_norm = RMSNorm(hidden_size)
         self.registry = TensorSlotRegistry(cfg.max_slots, cfg.routing_key_dim, cfg.mla_compress_dim)
-        self._n_kv_heads = 4
-        self._head_dim = 72
+        self._n_kv_heads = cfg.n_kv_heads
+        self._head_dim = cfg.head_dim
+        self._scalar_slice = (0, cfg.grade_dims[0])
+        self._bivector_slice = (sum(cfg.grade_dims[:2]), sum(cfg.grade_dims[:2]) + cfg.grade_dims[2])
         self._adaptive_chunk = cfg.use_adaptive_chunk_size
         self._chunk_low = cfg.chunk_size_low_entropy
         self._chunk_high = cfg.chunk_size_high_entropy
@@ -80,8 +88,10 @@ class MSAModule(nn.Module):
     def _select_chunk_size(self, h: torch.Tensor) -> int:
         if not self._adaptive_chunk:
             return self._default_chunk
-        scalar_var = h[..., :64].float().var(dim=1).mean().item()
-        bivector_var = h[..., 160:256].float().var(dim=1).mean().item()
+        s_start, s_end = self._scalar_slice
+        b_start, b_end = self._bivector_slice
+        scalar_var = h[..., s_start:s_end].float().var(dim=1).mean().item()
+        bivector_var = h[..., b_start:b_end].float().var(dim=1).mean().item()
         if bivector_var > scalar_var * 2:
             return self._chunk_high
         if scalar_var > bivector_var * 2:
@@ -122,6 +132,14 @@ class MSAModule(nn.Module):
         return msa_out, lb
 
     def _load_balance_loss(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """Auxiliary loss encouraging uniform slot usage.
+
+        f = slot visit frequency, P = mean routing probability (softmaxed scores
+        averaged across queries, then across slots). The double mean on P
+        first averages over queries (dim=0) yielding per-slot probabilities,
+        then averages over slots to produce a scalar — this is intentional
+        to match the Switch Transformer load-balancing formulation.
+        """
         counts = torch.bincount(indices.reshape(-1), minlength=self.cfg.max_slots).float()
         total = counts.sum()
         f = counts / total if total > 0 else counts

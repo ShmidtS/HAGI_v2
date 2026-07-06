@@ -90,7 +90,13 @@ class Muon(Optimizer):
 
 
 class CombinedOptimizer:
-    """Steps Muon and AdamW together with a unified interface."""
+    """Steps Muon and AdamW together with a unified interface.
+
+    Deliberately does not inherit from torch.optim.Optimizer because the two
+    sub-optimizers manage disjoint parameter groups with different update rules.
+    Implements step, zero_grad, state_dict, and load_state_dict for compatibility
+    with checkpoint save/load and training loops.
+    """
 
     def __init__(self, muon: Muon, adamw: torch.optim.AdamW):
         self.muon = muon
@@ -117,26 +123,37 @@ class CombinedOptimizer:
         self.adamw.load_state_dict(state_dict["adamw"])
 
 
-_MUON_EXCLUDE = (
-    "embed",
-    "lm_head",
-    "mask_embed",
-    "norm",
-    "router",
-    "gate",
-    "halt",
-    "block_proj",
-    "w_time",
-    "coherence",
+_MUON_EXCLUDE = frozenset(
+    {
+        "embed",
+        "lm_head",
+        "mask_embed",
+        "norm",
+        "router",
+        "gate",
+        "halt",
+        "block_proj",
+        "w_time",
+        "coherence",
+    }
 )
 
 
 def is_muon_param(name: str, param: nn.Parameter) -> bool:
-    """True if param should use Muon (2D weight, not in exclude list)."""
+    """True if param should use Muon (2D weight, not in exclude list).
+
+    Uses exact word matching on dot/underscore-separated segments to avoid
+    false positives (e.g. 'gate' matching 'aggregate', 'norm' matching 'transform').
+    """
     if param.ndim != 2:
         return False
-    lowered = name.lower()
-    return not any(tok in lowered for tok in _MUON_EXCLUDE)
+    for seg in name.lower().split("."):
+        if seg in _MUON_EXCLUDE:
+            return False
+        for part in seg.split("_"):
+            if part in _MUON_EXCLUDE:
+                return False
+    return True
 
 
 def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:

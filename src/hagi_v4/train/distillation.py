@@ -46,7 +46,6 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
     for path in [
         lambda m: m.model.embed_tokens.weight,
         lambda m: m.embed_tokens.weight,
-        lambda m: m.model.embed_tokens.weight,
         lambda m: m.get_input_embeddings().weight,
     ]:
         try:
@@ -78,7 +77,6 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
     del teacher
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    logger.info(f"Embedding weights transferred from {teacher_name}")
     return True
 
 
@@ -95,6 +93,13 @@ class DistillationTeacher:
         self._base_model = None
         self._lm_head_weight = None
         self._loaded = False
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def load(self):
+        return self._load()
 
     def _load(self):
         if self._loaded:
@@ -156,17 +161,15 @@ class DistillationTeacher:
                 logger.warning(f"Could not load teacher {self.teacher_name}: {e}")
 
     @torch.no_grad()
-    def get_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def get_hidden(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         """Run teacher forward, return hidden states [B, T, H_teacher]."""
         self._load()
         if not self._loaded:
             return None
         device = input_ids.device
-        self._base_model = self._base_model.to(device)
-        if self._lm_head_weight is not None:
-            self._lm_head_weight = self._lm_head_weight.to(device)
+        base_model = self._base_model.to(device)
         try:
-            output = self._base_model(input_ids)
+            output = base_model(input_ids)
             if hasattr(output, "last_hidden_state"):
                 return output.last_hidden_state
             if hasattr(output, "hidden_states") and output.hidden_states is not None:
@@ -219,7 +222,7 @@ class DistillationTeacher:
             mask_c = flat_mask[i:end]
 
             s_logits = F.linear(sh_c, student_lm_head_weight.to(sh_c.dtype))
-            t_logits = F.linear(th_c, self._lm_head_weight.to(th_c.dtype))
+            t_logits = F.linear(th_c, self._lm_head_weight.to(th_c.device, dtype=th_c.dtype))
 
             # Align vocab sizes: use min(s, t) dimensions
             v_min = min(s_logits.shape[-1], t_logits.shape[-1])

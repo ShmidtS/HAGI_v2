@@ -109,9 +109,13 @@ def main() -> int:
             mask_ratio=cfg.model.masking.mask_ratio,
             mask_token_id=cfg.model.masking.mask_token_id,
         )
+        from hagi_v4.train.losses import LossAggregator
+
+        aggregator = LossAggregator(cfg)
         model.train()
         output = model(masked_ids, targets=targets, mask=mask)
-        logger.info(f"Loss: {output.loss.item():.4f}")
+        total_loss = aggregator(output, targets, mask)
+        logger.info(f"Loss: {total_loss.item():.4f}")
         if device.type == "cuda":
             logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
         return 0
@@ -122,8 +126,8 @@ def main() -> int:
         from hagi_v4.train.distillation import DistillationTeacher
 
         teacher = DistillationTeacher(cfg.train.distill_teacher)
-        teacher._load()
-        if teacher._loaded and device.type == "cuda":
+        teacher.load()
+        if teacher.is_loaded and device.type == "cuda":
             logger.info(f"Teacher VRAM: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
 
     # Build sequential cycling dataloader (v1-style curriculum)
@@ -135,7 +139,7 @@ def main() -> int:
     from hagi_v4.train.loop import train
 
     logger.info(f"Training: {cfg.train.max_steps} steps, B={cfg.train.batch_size} T={cfg.train.seq_len}")
-    if teacher is not None and teacher._loaded:
+    if teacher is not None and teacher.is_loaded:
         distill_end = int(cfg.train.max_steps * cfg.train.distill_end_frac)
         logger.info(
             f"Distillation: steps 0->{distill_end} "

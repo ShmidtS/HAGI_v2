@@ -112,7 +112,9 @@ class MSAConfig:
     chunk_size_high_entropy: int = 2
     top_k: int = 6
     routing_key_dim: int = 64
-    local_window: int = 32
+    n_kv_heads: int = 4
+    head_dim: int = 72
+    grade_dims: tuple = (64, 96, 96, 64, 256)
     mla_compress_dim: int = 128
     mla_up_dim: int = 288
 
@@ -216,6 +218,20 @@ class TrainConfig:
     sequential_cycles: int = 3
     curriculum_enabled: bool = True
     curriculum_stage2_start: int = 100000
+    curriculum_order: list[str] = field(
+        default_factory=lambda: [
+            "tinystories",
+            "python_instruct",
+            "smoltalk",
+            "wikipedia_en",
+            "wikipedia_ru",
+            "openwebmath",
+            "oscar_ru",
+            "slimpajama",
+            "edu",
+        ]
+    )
+    stage2_datasets: list[str] = field(default_factory=lambda: ["openwebmath", "edu", "slimpajama"])
     # Data format
     data_dtype: str = "auto"  # auto/uint16/uint32
     data_dir: str = "data"
