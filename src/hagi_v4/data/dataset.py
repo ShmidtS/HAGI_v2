@@ -46,7 +46,7 @@ class MemmapDataset(Dataset):
         self._load()
         chunk = self._data[idx : idx + self.seq_len + 1]
         ids = chunk[: self.seq_len].clone()
-        tgt = chunk[1 : self.seq_len + 1].clone()
+        tgt = chunk[: self.seq_len].clone()
         ids[ids >= self.vocab_size] = 0
         tgt[tgt >= self.vocab_size] = 0
         return {"input_ids": ids, "targets": tgt}
