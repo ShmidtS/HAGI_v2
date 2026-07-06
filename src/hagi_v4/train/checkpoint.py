@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -14,24 +15,15 @@ from hagi_v4.train.optim import CombinedOptimizer
 logger = logging.getLogger(__name__)
 
 
-def _cfg_to_dict(cfg: HAGIv4Config) -> dict:
-    result: dict = {}
-    for key in ["model", "train"]:
-        val = getattr(cfg, key)
-        d: dict = {}
-        for f_name in val.__dataclass_fields__:
-            fv = getattr(val, f_name)
-            if hasattr(fv, "__dataclass_fields__"):
-                d[f_name] = {sf: getattr(fv, sf) for sf in fv.__dataclass_fields__}
-            else:
-                d[f_name] = fv
-        result[key] = d
-    return result
+def cfg_to_dict(cfg: HAGIv4Config) -> dict:
+    """Serialize config to a plain dict via dataclasses.asdict."""
+    return dataclasses.asdict(cfg)
 
 
-def _cfg_from_dict(data: dict) -> HAGIv4Config:
+def cfg_from_dict(data: dict) -> HAGIv4Config:
+    """Reconstruct config from a plain dict, preserving nested dataclass structure."""
     cfg = HAGIv4Config()
-    for top_key in ["model", "train"]:
+    for top_key in ("model", "train"):
         if top_key not in data:
             continue
         top_val = getattr(cfg, top_key)
@@ -64,7 +56,7 @@ def save_checkpoint(
     state = {
         "model": model.state_dict(),
         "step": step,
-        "config": _cfg_to_dict(cfg),
+        "config": cfg_to_dict(cfg),
     }
     if optimizer is not None:
         state["optimizer"] = optimizer.state_dict()
@@ -94,7 +86,7 @@ def load_checkpoint(
     model.load_state_dict(state["model"])
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
-    cfg = _cfg_from_dict(state["config"])
+    cfg = cfg_from_dict(state["config"])
     step = state["step"]
     logger.info(f"Checkpoint loaded: {path} (step {step})")
     return step, cfg

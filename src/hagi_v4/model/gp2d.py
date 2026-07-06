@@ -14,7 +14,6 @@ A sigmoid gate on a learnable parameter controls residual blending.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hagi_v4.algebra.clifford import geometric_product
@@ -41,9 +40,8 @@ class GeometricProduct2D(nn.Module):
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.gate = nn.Parameter(torch.tensor(float(cfg.gate_init)))
         self.norm = RMSNorm(hidden_size)
-        self._last_residual: torch.Tensor | None = None
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, H = h.shape
         mv = h.reshape(B, T, self.n_heads, 8)
         accumulated = torch.zeros_like(mv)
@@ -55,20 +53,4 @@ class GeometricProduct2D(nn.Module):
         out = self.norm(self.proj(out))
         gate = torch.sigmoid(self.gate)
         residual = gate * out
-        if self.cfg.use_whiteness_loss and self.training:
-            self._last_residual = residual
-        return h + residual
-
-    def whiteness_loss(self) -> torch.Tensor:
-        """Lag-1 autocorrelation of the GP2D residual along temporal axis."""
-        if self._last_residual is None or not self.cfg.use_whiteness_loss:
-            return self.gate.new_zeros(())
-        r = self._last_residual
-        if r.size(1) < 2:
-            return r.new_zeros(())
-        r_t = r[:, :-1].reshape(-1, r.size(-1))
-        r_t1 = r[:, 1:].reshape(-1, r.size(-1))
-        cos_sim = F.cosine_similarity(r_t.float(), r_t1.float(), dim=-1)
-        loss = cos_sim.abs().mean()
-        self._last_residual = None
-        return loss
+        return h + residual, residual

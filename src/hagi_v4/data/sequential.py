@@ -1,11 +1,10 @@
 """Sequential cycling dataset iterator — ported from HAGI v1.
 
-Cycles through datasets in list order (curriculum: easy→hard),
+Cycles through datasets in list order (curriculum: easy->hard),
 N cycles per dataset before advancing to the next. Loops forever.
 
-Stage 1: tinystories → python_instruct → smoltalk → wikipedia_en
-         → wikipedia_ru → openwebmath → oscar_ru → slimpajama → edu
-Stage 2 (at step threshold): openwebmath → edu → slimpajama
+Stage 1: curriculum_order from config (default: tinystories -> edu)
+Stage 2 (at step threshold): stage2_datasets from config
 """
 
 from __future__ import annotations
@@ -208,20 +207,8 @@ def build_sequential_dataloader(
     with open(Path(data_dir) / "mix.json") as f:
         mix = json.load(f)
 
-    # Build stage1 entries in curriculum order (easy → hard)
-    # v1 order: tinystories, python_instruct, smoltalk, wikipedia_en, wikipedia_ru,
-    #           openwebmath, oscar_ru, slimpajama, edu
-    curriculum_order = [
-        "tinystories",
-        "python_instruct",
-        "smoltalk",
-        "wikipedia_en",
-        "wikipedia_ru",
-        "openwebmath",
-        "oscar_ru",
-        "slimpajama",
-        "edu",
-    ]
+    # Build stage1 entries in curriculum order (easy -> hard)
+    curriculum_order = cfg.train.curriculum_order
     available = {s["name"]: s for s in mix["sources"]}
     stage1_entries = []
     for name in curriculum_order:
@@ -244,11 +231,12 @@ def build_sequential_dataloader(
         dtype=dtype,
     )
 
-    # Stage 2: hard-reasoning subset (openwebmath, edu, slimpajama)
-    stage2_entries = [(n, p) for n, p in stage1_entries if n in ("openwebmath", "edu", "slimpajama")]
+    # Stage 2: hard-reasoning subset from config
+    stage2_names = set(cfg.train.stage2_datasets)
+    stage2_entries = [(n, p) for n, p in stage1_entries if n in stage2_names]
     stage2 = None
-    stage2_start = cfg.train.curriculum_stage2_start if cfg.train.curriculum_enabled else 999999999
-    if stage2_entries and start_step < stage2_start:
+    stage2_start = cfg.train.curriculum_stage2_start if cfg.train.curriculum_enabled else None
+    if stage2_entries and stage2_start is not None and start_step < stage2_start:
         stage2 = SequentialCyclingIterator(
             entries=stage2_entries,
             seq_len=cfg.train.seq_len,
@@ -262,7 +250,7 @@ def build_sequential_dataloader(
     return CurriculumBatchProvider(
         stage1_iter=stage1,
         stage2_iter=stage2,
-        stage2_start_step=stage2_start,
+        stage2_start_step=stage2_start if stage2_start is not None else 0,
         start_step=start_step,
         grad_accum_steps=cfg.train.grad_accum_steps,
     )

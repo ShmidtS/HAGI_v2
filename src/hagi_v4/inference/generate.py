@@ -1,14 +1,12 @@
 """Progressive unmasking inference for HAGI V4.
 
 V4 generates text through iterative mask-predict with progressive
-left-to-right unmasking:
+unmasking:
 
 1. Start with prompt + mask tokens for max_new_tokens
 2. Run model -> get predictions for all masked positions
-3. Unmask highest-confidence predictions
+3. Unmask highest-confidence predictions (or sample with temperature)
 4. Repeat until all unmasked or EOS detected
-
-Section 8 of ARCHITECTURE_V4.md.
 """
 
 from __future__ import annotations
@@ -26,6 +24,8 @@ def generate(
     confidence_schedule: tuple[float, ...] = (0.9, 0.7, 0.5, 0.1),
     mask_token_id: int = 49153,
     eos_token_id: int = 49154,
+    temperature: float = 0.0,
+    top_k: int = 0,
 ) -> torch.Tensor:
     """Generate text through progressive unmasking.
 
@@ -37,6 +37,8 @@ def generate(
         confidence_schedule: decreasing thresholds for each round.
         mask_token_id: token ID for masked positions.
         eos_token_id: token ID for end-of-sequence.
+        temperature: 0 for argmax, >0 for sampling.
+        top_k: if >0, sample from top-k logits.
 
     Returns:
         [B, T_prompt + generated] token IDs.
@@ -45,10 +47,10 @@ def generate(
     B = prompt_ids.shape[0]
     T_prompt = prompt_ids.shape[1]
     device = prompt_ids.device
+    V = model.cfg.model.vocab_size
 
     mask_tokens = torch.full((B, max_new_tokens), mask_token_id, dtype=torch.long, device=device)
     full_ids = torch.cat([prompt_ids, mask_tokens], dim=1)
-    T = full_ids.shape[1]
 
     schedule = confidence_schedule[:max_iterations]
     if len(schedule) < max_iterations:
@@ -64,13 +66,30 @@ def generate(
         probs = F.softmax(logits.float(), dim=-1)
         confidence, predicted = probs.max(dim=-1)
 
-        fill_mask = mask & (confidence > conf_threshold)
-        if fill_mask.any():
-            full_ids[fill_mask] = predicted[fill_mask]
+        if temperature > 0:
+            for b in range(B):
+                masked_positions = mask[b].nonzero(as_tuple=True)[0]
+                if len(masked_positions) == 0:
+                    continue
+                for pos in masked_positions:
+                    logit = logits[b, pos] / temperature
+                    if top_k > 0:
+                        v, _ = torch.topk(logit, min(top_k, V))
+                        logit = logit.clone()
+                        logit[logit < v[-1]] = float("-inf")
+                    sampled = torch.multinomial(torch.softmax(logit, dim=-1), 1)
+                    full_ids[b, pos] = sampled
+                    confidence[b, pos] = probs[b, pos, sampled]
+        else:
+            fill_mask = mask & (confidence > conf_threshold)
+            if fill_mask.any():
+                full_ids[fill_mask] = predicted[fill_mask]
 
-        for pos in range(T_prompt, T):
-            if full_ids[0, pos].item() == eos_token_id:
-                full_ids = full_ids[:, :pos]
+        if eos_token_id is not None:
+            eos_mask = full_ids[:, T_prompt:] == eos_token_id
+            if eos_mask.any():
+                min_eos = eos_mask.nonzero(as_tuple=False)[:, 1].min().item() + T_prompt
+                full_ids = full_ids[:, :min_eos]
                 return full_ids
 
         remaining = (full_ids == mask_token_id).any()

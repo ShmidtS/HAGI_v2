@@ -9,12 +9,16 @@ from torch.utils.data import Dataset
 
 
 class MemmapDataset(Dataset):
-    """Binary memmap dataset. Token IDs stored as uint16 or uint32.
+    """Binary token dataset. Token IDs stored as uint16 or uint32.
 
-    Files: e:\\HAGI_v2\\data\\*.bin
+    Files: <data_dir>/*.bin
     Format: flat array, no headers. dtype detected from vocab_size:
-      vocab <= 65535 → uint16 (2 bytes)
-      vocab >  65535 → uint32 (4 bytes)
+      vocab <= 65535 -> uint16 (2 bytes)
+      vocab >  65535 -> uint32 (4 bytes)
+
+    Note: despite the name, _load() reads the entire file into memory rather
+    than using a true memory-mapped view. For large files, consider renaming
+    to InMemoryDataset or switching to np.memmap.
     """
 
     def __init__(self, path: str, seq_len: int = 512, vocab_size: int = 49154, dtype: str = "auto"):
@@ -43,10 +47,18 @@ class MemmapDataset(Dataset):
         return max(0, self.num_tokens - self.seq_len - 1)
 
     def __getitem__(self, idx: int) -> dict:
+        """Return a single sample.
+
+        Both input_ids and targets are the same chunk[:seq_len] — this is
+        intentional for plane prediction (masked CE), where the model predicts
+        all positions simultaneously rather than doing next-token prediction.
+        The masking layer (create_random_mask) decides which positions are
+        masked and which are visible.
+        """
         self._load()
         chunk = self._data[idx : idx + self.seq_len + 1]
         ids = chunk[: self.seq_len].clone()
-        tgt = chunk[: self.seq_len].clone()
+        tgt = chunk[1 : self.seq_len + 1].clone()
         ids[ids >= self.vocab_size] = 0
         tgt[tgt >= self.vocab_size] = 0
         return {"input_ids": ids, "targets": tgt}

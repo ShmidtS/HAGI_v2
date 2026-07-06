@@ -29,7 +29,13 @@ class CoherenceHead(nn.Module):
        grades (smooth signals), skipping bivector/trivector (can vary sharply).
     """
 
-    def __init__(self, cfg: CASTConfig, hidden_size: int = 576):
+    def __init__(
+        self,
+        cfg: CASTConfig,
+        hidden_size: int = 576,
+        lm_head: nn.Module | None = None,
+        final_norm: nn.Module | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         self.n_heads = hidden_size // BLADE_COUNT
@@ -38,6 +44,10 @@ class CoherenceHead(nn.Module):
         self._vector_dim = cfg.vector_dim
         self._sv_dim = cfg.scalar_dim + cfg.vector_dim
         self._sv_heads = self._sv_dim // BLADE_COUNT
+        if lm_head is not None:
+            object.__setattr__(self, "_lm_head", lm_head)
+        if final_norm is not None:
+            object.__setattr__(self, "_final_norm", final_norm)
 
     def coherence_loss(self, h: torch.Tensor) -> torch.Tensor:
         """Geometric coherence loss between adjacent positions.
@@ -60,15 +70,10 @@ class CoherenceHead(nn.Module):
         gate = torch.sigmoid(self.gate_logit)
         return gate * (area.float() ** 2).mean()
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-        final_norm: nn.Module,
-    ) -> torch.Tensor:
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Compute logits for all positions.
 
         Returns: [B, T, V] logits for the full plane.
         """
-        h_normed = final_norm(h)
-        return F.linear(h_normed, lm_head_weight)
+        h_normed = self._final_norm(h)
+        return F.linear(h_normed, self._lm_head.weight)

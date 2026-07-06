@@ -27,8 +27,6 @@ BLADE_COUNT = 8
 METRIC = [1, 1, 1]
 
 GRADE = [0, 1, 1, 2, 1, 2, 2, 3]
-GRADE_DIMS = (64, 96, 96, 64, 256)
-GRADE_SLICES = [(0, 64), (64, 160), (160, 256), (256, 320), (320, 576)]
 
 REVERSE_SIGNS = [1, 1, 1, -1, 1, -1, -1, -1]
 
@@ -87,7 +85,23 @@ _GRADE_MASK_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {
 _REVERSE_SIGNS_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
-def _prime_caches() -> None:
+def _get_cached(cache: dict, key, factory) -> torch.Tensor:
+    if key not in cache:
+        cache[key] = factory()
+    return cache[key]
+
+
+def compute_grade_slices(grade_dims: tuple) -> list[tuple[int, int]]:
+    """Compute (start, end) slices for each grade from grade_dims."""
+    slices = []
+    start = 0
+    for dim in grade_dims:
+        slices.append((start, start + dim))
+        start += dim
+    return slices
+
+
+def prime_caches() -> None:
     """Pre-fill caches for the default CUDA device to avoid recompilation."""
     if not torch.cuda.is_available():
         return
@@ -105,48 +119,6 @@ def _prime_caches() -> None:
             )
 
 
-_prime_caches()
-
-
-def _get_struct(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    if key not in _STRUCT_CACHE:
-        _STRUCT_CACHE[key] = _STRUCT_TRITON.to(device=device, dtype=dtype)
-    return _STRUCT_CACHE[key]
-
-
-def _get_self_prod_struct(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    if key not in _SELF_PROD_G02_CACHE:
-        _SELF_PROD_G02_CACHE[key] = _SELF_PROD_G02_STRUCT.to(device=device, dtype=dtype)
-    return _SELF_PROD_G02_CACHE[key]
-
-
-def _get_scatter(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    if key not in _SCATTER_G02_CACHE:
-        _SCATTER_G02_CACHE[key] = _SCATTER_G02.to(device=device, dtype=dtype)
-    return _SCATTER_G02_CACHE[key]
-
-
-def _get_grade_mask(device: torch.device, dtype: torch.dtype, grade: int) -> torch.Tensor:
-    key = (device, dtype, grade)
-    if key not in _GRADE_MASK_CACHE:
-        _GRADE_MASK_CACHE[key] = torch.tensor(
-            [1.0 if GRADE[i] == grade else 0.0 for i in range(BLADE_COUNT)],
-            dtype=dtype,
-            device=device,
-        )
-    return _GRADE_MASK_CACHE[key]
-
-
-def _get_reverse_signs(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    if key not in _REVERSE_SIGNS_CACHE:
-        _REVERSE_SIGNS_CACHE[key] = torch.tensor(REVERSE_SIGNS, dtype=dtype, device=device)
-    return _REVERSE_SIGNS_CACHE[key]
-
-
 def geometric_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Geometric product of two batched multivectors.
 
@@ -157,7 +129,7 @@ def geometric_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     Returns:
         [..., 8] product coefficients.
     """
-    struct = _get_struct(a.device, a.dtype)
+    struct = _get_cached(_STRUCT_CACHE, (a.device, a.dtype), lambda: _STRUCT_TRITON.to(device=a.device, dtype=a.dtype))
     return torch.einsum("cab,...a,...b->...c", struct, a, b)
 
 
@@ -174,22 +146,48 @@ def geometric_product_self_g02(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
         (g0, g2) as full 8-blade tensors. g0 has only blade 0 non-zero;
         g2 has only blades 3,5,6 non-zero.
     """
-    struct = _get_self_prod_struct(x.device, x.dtype)
-    scatter = _get_scatter(x.device, x.dtype)
+    struct = _get_cached(
+        _SELF_PROD_G02_CACHE, (x.device, x.dtype), lambda: _SELF_PROD_G02_STRUCT.to(device=x.device, dtype=x.dtype)
+    )
+    scatter = _get_cached(
+        _SCATTER_G02_CACHE, (x.device, x.dtype), lambda: _SCATTER_G02.to(device=x.device, dtype=x.dtype)
+    )
     reduced = torch.einsum("rab,...a,...b->...r", struct, x, x)
     full = torch.einsum("cr,...r->...c", scatter, reduced)
-    g0_mask = _get_grade_mask(x.device, x.dtype, 0)
-    g2_mask = _get_grade_mask(x.device, x.dtype, 2)
+    g0_mask = _get_cached(
+        _GRADE_MASK_CACHE,
+        (x.device, x.dtype, 0),
+        lambda: torch.tensor(
+            [1.0 if GRADE[i] == 0 else 0.0 for i in range(BLADE_COUNT)], dtype=x.dtype, device=x.device
+        ),
+    )
+    g2_mask = _get_cached(
+        _GRADE_MASK_CACHE,
+        (x.device, x.dtype, 2),
+        lambda: torch.tensor(
+            [1.0 if GRADE[i] == 2 else 0.0 for i in range(BLADE_COUNT)], dtype=x.dtype, device=x.device
+        ),
+    )
     return full * g0_mask, full * g2_mask
 
 
 def grade_projection(x: torch.Tensor, grade: int) -> torch.Tensor:
     """Zero out all blades not of the given grade. Returns [..., 8]."""
-    mask = _get_grade_mask(x.device, x.dtype, grade)
+    mask = _get_cached(
+        _GRADE_MASK_CACHE,
+        (x.device, x.dtype, grade),
+        lambda: torch.tensor(
+            [1.0 if GRADE[i] == grade else 0.0 for i in range(BLADE_COUNT)], dtype=x.dtype, device=x.device
+        ),
+    )
     return x * mask
 
 
 def reverse_mv(x: torch.Tensor) -> torch.Tensor:
     """Clifford reverse: sign (-1)^(k(k-1)/2) per grade k. Returns [..., 8]."""
-    signs = _get_reverse_signs(x.device, x.dtype)
+    signs = _get_cached(
+        _REVERSE_SIGNS_CACHE,
+        (x.device, x.dtype),
+        lambda: torch.tensor(REVERSE_SIGNS, dtype=x.dtype, device=x.device),
+    )
     return x * signs

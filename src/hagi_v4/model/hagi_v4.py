@@ -21,9 +21,36 @@ from hagi_v4.model.gp2d import GeometricProduct2D
 from hagi_v4.model.hrm import RefinementCore
 from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
-from hagi_v4.model.outputs import InferenceOutput, TrainOutput
+from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_grade_spec_loss, compute_whiteness_loss
 from hagi_v4.model.transformer_block import TransformerBlock
-from hagi_v4.train.losses import information_bottleneck_loss
+
+
+def _information_bottleneck_loss(
+    h: torch.Tensor,
+    targets: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    beta: float = 1.0,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Information Bottleneck regularizer: I(X;Z) - beta * I(Y;Z).
+
+    I(X;Z) proxy: hidden state variance (complexity).
+    I(Y;Z) proxy: negative cross-entropy (predictive information).
+    """
+    complexity = h.float().var(dim=(0, 1)).sum()
+
+    flat_h = h.reshape(-1, h.size(-1))
+    flat_t = targets.reshape(-1)
+    total_ce = h.new_zeros(())
+    for i in range(0, flat_h.size(0), chunk_size):
+        end = min(i + chunk_size, flat_h.size(0))
+        logits_c = F.linear(flat_h[i:end], lm_head_weight)
+        total_ce = total_ce + F.cross_entropy(logits_c, flat_t[i:end], reduction="sum")
+    ce = total_ce / flat_t.size(0)
+    del flat_h, flat_t
+
+    predictive_info = -ce
+    return complexity - beta * predictive_info
 
 
 class HAGIv4(nn.Module):
@@ -40,11 +67,11 @@ class HAGIv4(nn.Module):
         self.hrm = RefinementCore(m.hrm, m.refinement, m.hidden_size)
         self.hrm.set_max_steps(cfg.train.max_steps)
         self.msa = MSAModule(m.msa, m.hidden_size)
-        self.coherence = CoherenceHead(m.cast, m.hidden_size)
         self.expression = nn.ModuleList(TransformerBlock(m) for _ in range(m.expression_layers))
         self.final_norm = RMSNorm(m.hidden_size, eps=m.norm_eps)
         self.lm_head = nn.Linear(m.hidden_size, m.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+        self.coherence = CoherenceHead(m.cast, m.hidden_size, lm_head=self.lm_head, final_norm=self.final_norm)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -58,7 +85,7 @@ class HAGIv4(nn.Module):
         with torch.no_grad():
             self.mask_embed.fill_(0.0)
 
-    def _rope(self, T: int, device, dtype):
+    def _rope(self, T: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         a = self.cfg.model.attention
         return build_rope_cache(T, a.head_dim, a.rope_theta, device, dtype)
 
@@ -68,7 +95,7 @@ class HAGIv4(nn.Module):
         targets: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         step: int = 0,
-    ) -> TrainOutput | InferenceOutput:
+    ) -> ModelOutput:
         B, T = input_ids.shape
         h = self.embed(input_ids)
         if mask is not None:
@@ -80,12 +107,12 @@ class HAGIv4(nn.Module):
         cos, sin = self._rope(T, h.device, h.dtype)
 
         for blk in self.perception:
-            h, _ = blk(h, cos, sin)
+            h, _, _ = blk(h, cos, sin)
 
-        h = self.gp2d(h)
+        h, _ = self.gp2d(h)
 
         self.msa.clear()
-        h, losses, iterations_used = self.hrm(
+        h, side_info = self.hrm(
             h,
             self.reasoning,
             self.gdr,
@@ -102,78 +129,48 @@ class HAGIv4(nn.Module):
         )
 
         for blk in self.expression:
-            h, _ = blk(h, cos, sin)
+            h, _, _ = blk(h, cos, sin)
 
-        h_normed = self.final_norm(h)
+        logits = self.coherence(h)
 
+        aux = AuxLosses()
         if targets is not None:
-            if mask is not None and mask.any():
-                h_masked = h_normed[mask]
-                t_masked = targets[mask]
-                ce_loss = F.cross_entropy(
-                    F.linear(h_masked, self.lm_head.weight),
-                    t_masked,
-                )
-                del h_masked, t_masked
-            else:
-                flat_h = h_normed.reshape(-1, h_normed.size(-1))
-                flat_t = targets.reshape(-1)
-                chunk = 4096
-                total_ce = h_normed.new_zeros(())
-                for i in range(0, flat_h.size(0), chunk):
-                    end = min(i + chunk, flat_h.size(0))
-                    logits_c = F.linear(flat_h[i:end], self.lm_head.weight)
-                    total_ce = total_ce + F.cross_entropy(logits_c, flat_t[i:end], reduction="sum")
-                ce_loss = total_ce / flat_t.size(0)
-                del flat_h, flat_t
+            aux.deep_supervision = side_info.deep_supervision_loss
+            aux.moe_lb = side_info.moe_lb
+            aux.msa_lb = side_info.msa_lb
+            aux.gdr_router = side_info.gdr_router_loss
 
-            unmask_loss = h.new_zeros(())
+            aux.coherence = self.coherence.coherence_loss(h)
 
-            coh_loss = self.coherence.coherence_loss(h)
+            if self.cfg.model.gp2d.use_whiteness_loss and side_info.gp2d_residual is not None:
+                aux.whiteness = compute_whiteness_loss(side_info.gp2d_residual)
 
-            whiteness_loss = self.gp2d.whiteness_loss() if self.cfg.model.gp2d.use_whiteness_loss else h.new_zeros(())
-
-            ib_loss = h.new_zeros(())
             if self.cfg.train.w_ib > 0:
-                ib_loss = information_bottleneck_loss(
+                aux.ib = _information_bottleneck_loss(
                     h,
                     targets,
                     self.lm_head.weight,
                     beta=self.cfg.train.ib_beta,
                 )
 
-            grade_spec_loss = h.new_zeros(())
-            if self.cfg.model.moe.use_grade_specialization and self.gdr._last_gate is not None:
-                gate_flat = self.gdr._last_gate.reshape(-1, 4)
-                for blk in self.reasoning:
-                    gs = blk.moe.grade_specialization_loss(gate_flat)
-                    grade_spec_loss = grade_spec_loss + gs
+            if (
+                self.cfg.model.moe.use_grade_specialization
+                and side_info.gdr_gate_probs is not None
+                and side_info.moe_router_probs is not None
+            ):
+                grade_spec = h.new_zeros(())
+                for rp in side_info.moe_router_probs:
+                    gs = compute_grade_spec_loss(
+                        side_info.gdr_gate_probs,
+                        rp,
+                        num_experts=self.cfg.model.moe.num_experts,
+                    )
+                    grade_spec = grade_spec + self.cfg.model.moe.grade_specialization_weight * gs
+                aux.grade_spec = grade_spec
 
-            total = (
-                ce_loss
-                + unmask_loss
-                + self.cfg.train.w_moe_aux * losses["moe_aux"]
-                + self.cfg.train.w_gdr_router * losses["gdr_router"]
-                + 0.01 * losses["msa_lb"]
-                + losses["deep_supervision"]
-                + self.cfg.train.w_coherence * coh_loss
-                + self.cfg.train.w_whiteness * whiteness_loss
-                + self.cfg.train.w_ib * ib_loss
-                + self.cfg.train.w_grade_specialization * grade_spec_loss
-            )
-            return TrainOutput(
-                loss=total,
-                moe_aux_loss=losses["moe_aux"],
-                gdr_router_loss=losses["gdr_router"],
-                coherence_loss=coh_loss,
-                deep_supervision_loss=losses["deep_supervision"],
-                hidden=h,
-                mask=mask if mask is not None else torch.zeros_like(input_ids, dtype=torch.bool),
-            )
-
-        logits = F.linear(h_normed, self.lm_head.weight)
-        return InferenceOutput(
+        return ModelOutput(
             logits=logits,
             hidden=h,
-            iterations_used=iterations_used,
+            aux=aux,
+            iterations_used=side_info.iterations_used,
         )
