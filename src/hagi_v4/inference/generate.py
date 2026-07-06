@@ -1,17 +1,19 @@
-"""Masked autoregressive generation for HAGI V4.
+"""Noisy-context autoregressive generation for HAGI V5 codec model.
 
-The model is a denoising codec: mask tokens are noise, the model learns to
-reconstruct the signal (next-token) from partially-masked input. At inference
-we preserve this denoising dynamic instead of bypassing it.
+The model is a denoising codec: mask tokens are erasure noise, the model
+learns to reconstruct signal from partially-noised input through
+bidirectional attention (belief propagation).
 
-Each new token goes through a mask-predict cycle:
-1. Append mask token at the end
-2. Run model with mask on that position
-3. Model denoises: predicts the next token using bidirectional context
-4. Replace mask with prediction, repeat
+At inference we preserve this denoising dynamic:
+1. Predict next token at the last position (clean, no mask on generation pos)
+2. Inject noise: replace ~15% of random CONTEXT positions with mask_token
+3. Model denoises through attention — prediction benefits from denoising
+4. Restore noised context, append predicted token, repeat
 
-Mask ratio during generation matches training (~30%) to stay in-distribution:
-we inject extra mask tokens into the visible context as noise.
+This is a proper communication channel: context noise = erasure,
+model denoises through belief propagation (attention + refinement).
+The generation position itself is never masked — the model always sees
+the full clean signal at the prediction point.
 """
 
 from __future__ import annotations
@@ -28,24 +30,24 @@ def generate(
     max_iterations: int = 4,
     mask_token_id: int = 49153,
     eos_token_id: int = 49154,
-    temperature: float = 0.0,
-    top_k: int = 0,
+    temperature: float = 0.8,
+    top_k: int = 50,
     min_tokens: int = 2,
     noise_ratio: float = 0.15,
 ) -> torch.Tensor:
-    """Generate text through masked autoregressive denoising.
+    """Generate text with noisy-context denoising.
 
     Args:
         model: HAGIv4 model (eval mode).
         prompt_ids: [B, T_prompt] prompt token IDs.
         max_new_tokens: hard cap on generated tokens.
-        max_iterations: denoise iterations per token (refine prediction).
-        mask_token_id: token ID for masked positions.
+        max_iterations: unused (kept for API compatibility).
+        mask_token_id: token ID for masked (erased) positions.
         eos_token_id: token ID for end-of-sequence.
         temperature: 0 for argmax, >0 for sampling.
         top_k: if >0, sample from top-k logits.
         min_tokens: minimum generated tokens before EOS is accepted.
-        noise_ratio: fraction of visible context to mask as noise (matches training).
+        noise_ratio: fraction of context positions to erase (erasure rate).
 
     Returns:
         [B, T_prompt + generated] token IDs (truncated at EOS).
@@ -64,57 +66,41 @@ def generate(
         full_ids = prompt_ids.clone()
 
     for step in range(max_new_tokens):
-        gen_mask = torch.zeros_like(full_ids, dtype=torch.bool)
-        gen_mask[:, -1:] = True
+        noisy_ids = full_ids.clone()
+        noise_mask = torch.zeros_like(noisy_ids, dtype=torch.bool)
 
-        noise_positions = None
-        saved = None
-        if noise_ratio > 0 and full_ids.shape[1] > min_len:
-            visible = (~gen_mask).nonzero(as_tuple=False)
-            n_visible = visible.shape[0]
-            n_noise = max(1, int(n_visible * noise_ratio))
-            noise_idx = torch.randperm(n_visible, device=device)[:n_noise]
-            noise_positions = visible[noise_idx]
-            saved = full_ids[noise_positions[:, 0], noise_positions[:, 1]].clone()
-            full_ids[noise_positions[:, 0], noise_positions[:, 1]] = mask_token_id
-            gen_mask[noise_positions[:, 0], noise_positions[:, 1]] = True
+        if noise_ratio > 0 and noisy_ids.shape[1] > min_len:
+            n_ctx = noisy_ids.shape[1]
+            n_noise = max(1, int(n_ctx * noise_ratio))
+            for b in range(B):
+                idx = torch.randperm(n_ctx, device=device)[:n_noise]
+                noise_mask[b, idx] = True
+            noisy_ids[noise_mask] = mask_token_id
 
-        next_tok = None
-        for it in range(max_iterations):
-            output = model(full_ids, targets=None, mask=gen_mask)
-            logits = output.logits[:, -1, :]
+        output = model(noisy_ids, targets=None, mask=noise_mask)
+        logits = output.logits[:, -1, :]
 
-            block_eos = eos_token_id is not None and step < min_tokens
-            if block_eos:
-                logits = logits.clone()
-                logits[:, eos_token_id] = float("-inf")
+        if logits is None:
+            break
 
-            if temperature > 0:
-                lt = logits / temperature
-                if top_k > 0:
-                    v, _ = torch.topk(lt, min(top_k, V), dim=-1)
-                    lt = torch.where(lt < v[:, -1:], float("-inf"), lt)
-                probs = F.softmax(lt, dim=-1)
-                next_tok = torch.multinomial(probs, 1)
-            else:
-                next_tok = logits.argmax(dim=-1, keepdim=True)
+        block_eos = eos_token_id is not None and step < min_tokens
+        if block_eos:
+            logits = logits.clone()
+            logits[:, eos_token_id] = float("-inf")
 
-            full_ids[:, -1:] = next_tok
-            gen_mask[:, -1:] = False
+        if temperature > 0:
+            lt = logits / temperature
+            if top_k > 0:
+                v, _ = torch.topk(lt, min(top_k, V), dim=-1)
+                lt = torch.where(lt < v[:, -1:], float("-inf"), lt)
+            probs = F.softmax(lt, dim=-1)
+            next_tok = torch.multinomial(probs, 1)
+        else:
+            next_tok = logits.argmax(dim=-1, keepdim=True)
 
-            if noise_ratio > 0 and it < max_iterations - 1:
-                output2 = model(full_ids, targets=None, mask=None)
-                conf = F.softmax(output2.logits[:, -1, :].float(), dim=-1).max(dim=-1).values
-                if conf.item() > 0.5:
-                    break
-
-        if noise_ratio > 0 and noise_positions is not None:
-            full_ids[noise_positions[:, 0], noise_positions[:, 1]] = saved
+        full_ids = torch.cat([full_ids, next_tok], dim=1)
 
         if eos_token_id is not None and next_tok[0].item() == eos_token_id:
             return full_ids[:, : T_prompt + step]
-
-        next_mask = torch.full((B, 1), mask_token_id, dtype=torch.long, device=device)
-        full_ids = torch.cat([full_ids, next_mask], dim=1)
 
     return full_ids[:, : T_prompt + max_new_tokens]

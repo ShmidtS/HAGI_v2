@@ -1,4 +1,9 @@
-"""Loss functions and aggregator for HAGI V4.
+"""Multi-objective CodecLoss for HAGI V5.
+
+V5 loss is aligned with communication theory:
+  Loss = CE (fidelity) + IB (compression) + Parity (redundancy)
+       + ExtrinsicInfo (decoding) + Efficiency (convergence)
+       + aux losses (MoE/GDR/MSA load balance, coherence, whiteness)
 
 LossAggregator replaces inline loss aggregation formerly in hagi_v4.py.
 Stateless loss helpers (compute_whiteness_loss, compute_grade_spec_loss)
@@ -41,16 +46,18 @@ def masked_cross_entropy_chunked(
 class LossAggregator:
     """Computes total loss from ModelOutput + targets + mask.
 
-    Replaces inline loss aggregation in hagi_v4.py forward().
+    V5: multi-objective CodecLoss aligned with communication theory.
     """
 
     def __init__(self, cfg: HAGIv4Config):
         self.w_moe_aux = cfg.train.w_moe_aux
         self.w_gdr_router = cfg.train.w_gdr_router
         self.w_coherence = cfg.train.w_coherence
-        self.w_ib = cfg.train.w_ib
         self.w_whiteness = cfg.train.w_whiteness
         self.w_grade_spec = cfg.train.w_grade_specialization
+        self.w_parity = cfg.train.w_parity
+        self.w_extrinsic_info = cfg.train.w_extrinsic_info
+        self.w_efficiency = cfg.train.w_efficiency
         self.w_msa_lb = 0.01
 
     def __call__(
@@ -60,8 +67,10 @@ class LossAggregator:
         mask: torch.Tensor | None,
         w_coherence_override: float | None = None,
     ) -> torch.Tensor:
-        logits = model_output.logits
-        ce_loss = masked_cross_entropy_chunked(logits, targets, mask)
+        if model_output.ce_loss is not None:
+            ce_loss = model_output.ce_loss
+        else:
+            ce_loss = masked_cross_entropy_chunked(model_output.logits, targets, mask)
 
         w_coh = w_coherence_override if w_coherence_override is not None else self.w_coherence
 
@@ -80,9 +89,13 @@ class LossAggregator:
             total = total + w_coh * aux.coherence
         if aux.whiteness is not None:
             total = total + self.w_whiteness * aux.whiteness
-        if aux.ib is not None:
-            total = total + self.w_ib * aux.ib
         if aux.grade_spec is not None:
             total = total + self.w_grade_spec * aux.grade_spec
+        if aux.parity is not None:
+            total = total - self.w_parity * aux.parity
+        if aux.extrinsic_info is not None:
+            total = total - self.w_extrinsic_info * aux.extrinsic_info
+        if aux.efficiency is not None:
+            total = total + self.w_efficiency * aux.efficiency
 
         return total

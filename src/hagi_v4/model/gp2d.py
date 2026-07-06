@@ -1,8 +1,12 @@
-"""2D Geometric Product — cross-token Clifford convolution.
+"""2D Geometric Product — systematic parity channel code.
 
-The V4 innovation: apply the geometric product between adjacent token
-positions in the temporal dimension. This creates a temporal "convolution"
-in the Clifford algebra, capturing cross-token geometric structure.
+V5: GP2D acts as a channel encoder. The geometric product between
+adjacent token positions generates parity information — redundant data
+that the decoder can use for error correction (consistency checking).
+
+Structure: h = data + gate * GP(data[t-1], data[t], data[t+1])
+where GP output = parity bits. The residual returned is the parity
+contribution, tracked as parity_strength for the channel coding loss.
 
 With window w=1, three positions are considered: t-1, t, t+1.
 The hidden state [B, T, H] is reshaped to [B, T, n_heads, 8] multivectors,

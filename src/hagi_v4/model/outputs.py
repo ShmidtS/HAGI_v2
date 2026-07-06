@@ -42,15 +42,19 @@ class AuxLosses:
     moe_lb: torch.Tensor | None = None
     msa_lb: torch.Tensor | None = None
     gdr_router: torch.Tensor | None = None
+    parity: torch.Tensor | None = None
+    extrinsic_info: torch.Tensor | None = None
+    efficiency: torch.Tensor | None = None
 
 
 @dataclass
 class ModelOutput:
     """Unified output from model forward pass (training and inference)."""
 
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     hidden: torch.Tensor
     aux: AuxLosses
+    ce_loss: torch.Tensor | None = None
     iterations_used: torch.Tensor | None = None
 
 
@@ -66,6 +70,8 @@ class RefinementSideInfo:
     moe_lb: torch.Tensor | None = None
     msa_lb: torch.Tensor | None = None
     iterations_used: torch.Tensor | None = None
+    extrinsic_norms: list[float] | None = None
+    parity_strength: torch.Tensor | None = None
 
 
 def compute_whiteness_loss(residual: torch.Tensor) -> torch.Tensor:
