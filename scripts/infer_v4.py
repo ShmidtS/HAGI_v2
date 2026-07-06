@@ -69,7 +69,7 @@ def main() -> int:
     parser.add_argument("--interactive", action="store_true", help="Interactive REPL mode")
     parser.add_argument("--config", default="configs/8gb_canonical.yaml")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=512, help="Hard cap on generated tokens")
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
