@@ -21,7 +21,6 @@ def generate(
     prompt_ids: torch.Tensor,
     max_new_tokens: int = 256,
     max_iterations: int = 4,
-    confidence_schedule: tuple[float, ...] = (0.9, 0.7, 0.5, 0.1),
     mask_token_id: int = 49153,
     eos_token_id: int = 49154,
     temperature: float = 0.0,
@@ -34,7 +33,6 @@ def generate(
         prompt_ids: [B, T_prompt] prompt token IDs.
         max_new_tokens: maximum tokens to generate.
         max_iterations: max mask-predict rounds.
-        confidence_schedule: decreasing thresholds for each round.
         mask_token_id: token ID for masked positions.
         eos_token_id: token ID for end-of-sequence.
         temperature: 0 for argmax, >0 for sampling.
@@ -52,11 +50,7 @@ def generate(
     mask_tokens = torch.full((B, max_new_tokens), mask_token_id, dtype=torch.long, device=device)
     full_ids = torch.cat([prompt_ids, mask_tokens], dim=1)
 
-    schedule = confidence_schedule[:max_iterations]
-    if len(schedule) < max_iterations:
-        schedule = schedule + (0.1,) * (max_iterations - len(schedule))
-
-    for round_idx, conf_threshold in enumerate(schedule):
+    for round_idx in range(max_iterations):
         mask = full_ids == mask_token_id
         if not mask.any():
             break
@@ -64,26 +58,26 @@ def generate(
         output = model(full_ids, mask=mask)
         logits = output.logits
         probs = F.softmax(logits.float(), dim=-1)
-        confidence, predicted = probs.max(dim=-1)
 
-        if temperature > 0:
-            for b in range(B):
-                masked_positions = mask[b].nonzero(as_tuple=True)[0]
-                if len(masked_positions) == 0:
-                    continue
-                for pos in masked_positions:
-                    logit = logits[b, pos] / temperature
+        for b in range(B):
+            masked_positions = mask[b].nonzero(as_tuple=True)[0]
+            if len(masked_positions) == 0:
+                continue
+            for pos in masked_positions:
+                logit = logits[b, pos]
+                if temperature > 0:
+                    logit = logit / temperature
                     if top_k > 0:
                         v, _ = torch.topk(logit, min(top_k, V))
                         logit = logit.clone()
                         logit[logit < v[-1]] = float("-inf")
                     sampled = torch.multinomial(torch.softmax(logit, dim=-1), 1)
-                    full_ids[b, pos] = sampled
-                    confidence[b, pos] = probs[b, pos, sampled]
-        else:
-            fill_mask = mask & (confidence > conf_threshold)
-            if fill_mask.any():
-                full_ids[fill_mask] = predicted[fill_mask]
+                else:
+                    sampled = logit.argmax(dim=-1, keepdim=True)
+                full_ids[b, pos] = sampled
+                if eos_token_id is not None and sampled.item() == eos_token_id:
+                    full_ids[b, pos + 1 :] = mask_token_id
+                    break
 
         if eos_token_id is not None:
             eos_mask = full_ids[:, T_prompt:] == eos_token_id
@@ -92,15 +86,23 @@ def generate(
                 full_ids = full_ids[:, :min_eos]
                 return full_ids
 
-        remaining = (full_ids == mask_token_id).any()
-        if not remaining:
-            break
-
-    mask = full_ids == mask_token_id
-    if mask.any():
-        output = model(full_ids, mask=mask)
-        logits = output.logits
-        predicted = logits.argmax(dim=-1)
-        full_ids[mask] = predicted[mask]
+        if round_idx < max_iterations - 1:
+            mask = full_ids == mask_token_id
+            if mask.any():
+                output = model(full_ids, mask=mask)
+                logits = output.logits
+                probs = F.softmax(logits.float(), dim=-1)
+                confidence = probs.max(dim=-1).values
+                for b in range(B):
+                    masked_positions = mask[b].nonzero(as_tuple=True)[0]
+                    if len(masked_positions) <= 1:
+                        continue
+                    confs = confidence[b, masked_positions]
+                    n_remask = len(masked_positions) // 2
+                    if n_remask > 0:
+                        _, low_conf_idx = torch.topk(confs, n_remask, largest=False)
+                        for idx in low_conf_idx:
+                            pos = masked_positions[idx]
+                            full_ids[b, pos] = mask_token_id
 
     return full_ids

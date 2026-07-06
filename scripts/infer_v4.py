@@ -71,8 +71,8 @@ def main() -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=4)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--tokenizer", default="HuggingFaceTB/SmolLM2-135M")
     args = parser.parse_args()
 

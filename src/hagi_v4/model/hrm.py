@@ -129,7 +129,6 @@ class DeepSupervisor:
         targets: torch.Tensor | None,
         mask: torch.Tensor | None,
         lm_head_weight: torch.Tensor,
-        final_norm: nn.Module,
         iteration: int,
         training: bool,
     ) -> tuple[torch.Tensor | None, float]:
@@ -138,7 +137,7 @@ class DeepSupervisor:
 
         h_masked = h[mask]
         t_masked = targets[mask]
-        logits_masked = F.linear(final_norm(h_masked), lm_head_weight)
+        logits_masked = F.linear(h_masked, lm_head_weight)
         ce = F.cross_entropy(logits_masked, t_masked)
 
         if self.use_adaptive_ds_weight:
@@ -324,7 +323,7 @@ class RefinementCore(nn.Module):
             h_prev = h
 
             ds_loss, ds_weight = self.deep_supervisor.compute(
-                h, h_prev, targets, mask, lm_head_weight, final_norm, iteration, training
+                h, h_prev, targets, mask, lm_head_weight, iteration, training
             )
             if ds_loss is not None:
                 total_deep_supervision = total_deep_supervision + ds_loss
