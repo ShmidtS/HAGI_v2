@@ -69,10 +69,10 @@ def main() -> int:
     parser.add_argument("--interactive", action="store_true", help="Interactive REPL mode")
     parser.add_argument("--config", default="configs/8gb_canonical.yaml")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Hard cap on generated tokens")
+    parser.add_argument("--max-tokens", type=int, default=128, help="Hard cap on generated tokens")
     parser.add_argument("--iterations", type=int, default=4)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--tokenizer", default="HuggingFaceTB/SmolLM2-135M")
     args = parser.parse_args()
 
@@ -106,6 +106,7 @@ def main() -> int:
                 eos_token_id=eos_token_id,
                 temperature=args.temperature,
                 top_k=args.top_k,
+                verbose=True,
             )
             generated = gen_ids[0, prompt_ids.shape[1] :]
             response = tokens_to_text(generated, args.tokenizer)
@@ -123,6 +124,7 @@ def main() -> int:
         eos_token_id=eos_token_id,
         temperature=args.temperature,
         top_k=args.top_k,
+        verbose=True,
     )
     generated = gen_ids[0, prompt_ids.shape[1] :]
     response = tokens_to_text(generated, args.tokenizer)

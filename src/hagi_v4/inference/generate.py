@@ -1,19 +1,14 @@
-"""Noisy-context autoregressive generation for HAGI V5 codec model.
+"""Autoregressive generation for HAGI V5 codec model.
 
-The model is a denoising codec: mask tokens are erasure noise, the model
-learns to reconstruct signal from partially-noised input through
-bidirectional attention (belief propagation).
+Bidirectional model: no KV-cache, each token recomputes the full sequence.
+The refinement loop (7 layers × N iterations) is the dominant cost.
 
-At inference we preserve this denoising dynamic:
-1. Predict next token at the last position (clean, no mask on generation pos)
-2. Inject noise: replace ~15% of random CONTEXT positions with mask_token
-3. Model denoises through attention — prediction benefits from denoising
-4. Restore noised context, append predicted token, repeat
-
-This is a proper communication channel: context noise = erasure,
-model denoises through belief propagation (attention + refinement).
-The generation position itself is never masked — the model always sees
-the full clean signal at the prediction point.
+Optimisations:
+- noise_ratio=0 by default: skip erasure injection at inference (the model
+  already learned to predict; noise is a training regulariser, not needed
+  for greedy/sampled decoding)
+- Greedy mode (temperature=0) for fast deterministic generation
+- Progress logging every 25 tokens for interactive feedback
 """
 
 from __future__ import annotations
@@ -26,31 +21,33 @@ import torch.nn.functional as F
 def generate(
     model: torch.nn.Module,
     prompt_ids: torch.Tensor,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 128,
     max_iterations: int = 4,
     mask_token_id: int = 49153,
-    eos_token_id: int = 49154,
-    temperature: float = 0.8,
-    top_k: int = 50,
+    eos_token_id: int | None = None,
+    temperature: float = 0.0,
+    top_k: int = 0,
     min_tokens: int = 2,
-    noise_ratio: float = 0.15,
+    noise_ratio: float = 0.0,
+    verbose: bool = False,
 ) -> torch.Tensor:
-    """Generate text with noisy-context denoising.
+    """Generate text autoregressively.
 
     Args:
         model: HAGIv4 model (eval mode).
         prompt_ids: [B, T_prompt] prompt token IDs.
         max_new_tokens: hard cap on generated tokens.
         max_iterations: unused (kept for API compatibility).
-        mask_token_id: token ID for masked (erased) positions.
-        eos_token_id: token ID for end-of-sequence.
-        temperature: 0 for argmax, >0 for sampling.
+        mask_token_id: token ID for masked positions.
+        eos_token_id: token ID for end-of-sequence (None = no EOS).
+        temperature: 0 for greedy, >0 for sampling.
         top_k: if >0, sample from top-k logits.
-        min_tokens: minimum generated tokens before EOS is accepted.
-        noise_ratio: fraction of context positions to erase (erasure rate).
+        min_tokens: minimum generated tokens before EOS accepted.
+        noise_ratio: fraction of context to erase (0 = clean inference).
+        verbose: print progress every 25 tokens.
 
     Returns:
-        [B, T_prompt + generated] token IDs (truncated at EOS).
+        [B, T_prompt + generated] token IDs.
     """
     model.eval()
     B = prompt_ids.shape[0]
@@ -66,25 +63,25 @@ def generate(
         full_ids = prompt_ids.clone()
 
     for step in range(max_new_tokens):
-        noisy_ids = full_ids.clone()
-        noise_mask = torch.zeros_like(noisy_ids, dtype=torch.bool)
-
-        if noise_ratio > 0 and noisy_ids.shape[1] > min_len:
+        if noise_ratio > 0 and full_ids.shape[1] > min_len:
+            noisy_ids = full_ids.clone()
+            noise_mask = torch.zeros_like(noisy_ids, dtype=torch.bool)
             n_ctx = noisy_ids.shape[1]
             n_noise = max(1, int(n_ctx * noise_ratio))
             for b in range(B):
                 idx = torch.randperm(n_ctx, device=device)[:n_noise]
                 noise_mask[b, idx] = True
             noisy_ids[noise_mask] = mask_token_id
+            output = model(noisy_ids, targets=None, mask=noise_mask)
+        else:
+            output = model(full_ids, targets=None, mask=None)
 
-        output = model(noisy_ids, targets=None, mask=noise_mask)
         logits = output.logits[:, -1, :]
 
         if logits is None:
             break
 
-        block_eos = eos_token_id is not None and step < min_tokens
-        if block_eos:
+        if eos_token_id is not None and step < min_tokens:
             logits = logits.clone()
             logits[:, eos_token_id] = float("-inf")
 
@@ -99,6 +96,9 @@ def generate(
             next_tok = logits.argmax(dim=-1, keepdim=True)
 
         full_ids = torch.cat([full_ids, next_tok], dim=1)
+
+        if verbose and (step + 1) % 25 == 0:
+            print(f"  ...{step + 1}/{max_new_tokens} tokens", flush=True)
 
         if eos_token_id is not None and next_tok[0].item() == eos_token_id:
             return full_ids[:, : T_prompt + step]
