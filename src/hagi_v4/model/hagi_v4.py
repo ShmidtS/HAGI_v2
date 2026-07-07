@@ -30,9 +30,13 @@ from hagi_v4.model.gdr import GradeDecomposedRecurrence
 from hagi_v4.model.gp2d import GeometricProduct2D
 from hagi_v4.model.hrm import RefinementCore
 from hagi_v4.model.msa import MSAModule
+from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_grade_spec_loss, compute_whiteness_loss
 from hagi_v4.model.transformer_block import TransformerBlock
+from hagi_v4.model.turbo_decoder import TurboDecoder
+from hagi_v4.model.variational_bottleneck import VariationalBottleneck
+from hagi_v4.model.water_filling import WaterFillingAllocator
 
 
 class HAGIv4(nn.Module):
@@ -48,17 +52,55 @@ class HAGIv4(nn.Module):
 
         self.perception = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.perception_layers))
 
-        self.bottleneck_down = nn.Linear(H, C, bias=False)
-        self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
-        self.bottleneck_up = nn.Linear(C, H, bias=False)
+        self.use_variational_bottleneck = m.variational_bottleneck.enabled
+        if self.use_variational_bottleneck:
+            self.variational_bottleneck = VariationalBottleneck(
+                input_dim=H,
+                compressed_dim=C,
+                kl_weight=m.variational_bottleneck.kl_weight,
+                norm_eps=m.norm_eps,
+            )
+            self.bottleneck_down = None
+            self.bottleneck_up = None
+        else:
+            self.bottleneck_down = nn.Linear(H, C, bias=False)
+            self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
+            self.bottleneck_up = nn.Linear(C, H, bias=False)
 
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
-        self.gp2d = GeometricProduct2D(m.gp2d, C)
+
+        if m.gp2d.use_multiscale:
+            self.gp2d = MultiScaleGP2D(
+                m.gp2d,
+                C,
+                scales=m.gp2d.multiscale_windows,
+                gate_inits=m.gp2d.multiscale_gate_inits,
+                use_interleave=m.gp2d.use_interleave,
+            )
+        else:
+            self.gp2d = GeometricProduct2D(m.gp2d, C)
+
         self.reasoning = nn.ModuleList(TransformerBlock(m, hidden_size=C) for _ in range(m.reasoning_layers))
         self.gdr = GradeDecomposedRecurrence(m.gdr, C)
-        self.hrm = RefinementCore(m.hrm, m.refinement, C)
-        self.hrm.set_max_steps(cfg.train.max_steps)
+
+        self.use_turbo_decoder = m.turbo_decoder.enabled
+        if self.use_turbo_decoder:
+            self.hrm = TurboDecoder(m.hrm, m.refinement, hidden_size=C)
+            self.hrm.set_max_steps(cfg.train.max_steps)
+        else:
+            self.hrm = RefinementCore(m.hrm, m.refinement, C)
+            self.hrm.set_max_steps(cfg.train.max_steps)
+
         self.msa = MSAModule(m.msa, C)
+
+        self.use_water_filling = m.water_filling.enabled
+        if self.use_water_filling:
+            self.water_filling = WaterFillingAllocator(
+                total_dims=C,
+                num_grades=4,
+                min_dims=m.water_filling.min_dims,
+                temperature=m.water_filling.temperature,
+            )
 
         self.core_lm_head = nn.Linear(C, m.vocab_size, bias=False)
         nn.init.normal_(self.core_lm_head.weight, mean=0.0, std=0.02)
@@ -97,8 +139,6 @@ class HAGIv4(nn.Module):
         step: int = 0,
     ) -> ModelOutput:
         B, T = input_ids.shape
-        H = self.cfg.model.hidden_size
-        C = self.cfg.model.core_hidden_size
 
         h = self.embed(input_ids)
         if mask is not None:
@@ -109,8 +149,12 @@ class HAGIv4(nn.Module):
         for blk in self.perception:
             h, _, _ = blk(h, cos, sin)
 
-        z = self.bottleneck_down(h)
-        z = self.bottleneck_norm(z)
+        kl_loss: torch.Tensor | None = None
+        if self.use_variational_bottleneck:
+            z, _, kl_loss = self.variational_bottleneck(h)
+        else:
+            z = self.bottleneck_down(h)
+            z = self.bottleneck_norm(z)
 
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
@@ -134,13 +178,17 @@ class HAGIv4(nn.Module):
             use_convergence_halt=self.cfg.model.refinement.use_convergence_halt,
         )
 
-        h = self.bottleneck_up(z)
+        if self.use_variational_bottleneck:
+            h = self.variational_bottleneck.decode(z)
+        else:
+            h = self.bottleneck_up(z)
 
         for blk in self.expression:
             h, _, _ = blk(h, cos, sin)
 
         h_normed = self.final_norm(h)
-        if targets is not None and mask is not None and mask.any():
+        mask_any = mask is not None and mask.any().item() if mask is not None else False
+        if targets is not None and mask_any:
             h_masked = h_normed[mask]
             t_masked = targets[mask]
             logits_masked = F.linear(h_masked, self.lm_head.weight)
@@ -187,6 +235,13 @@ class HAGIv4(nn.Module):
 
             if side_info.iterations_used is not None:
                 aux.efficiency = side_info.iterations_used.float().mean()
+
+            if kl_loss is not None:
+                aux.ib = kl_loss
+
+            if self.use_water_filling:
+                _, wf_reg = self.water_filling()
+                aux.grade_spec = (aux.grade_spec if aux.grade_spec is not None else h.new_zeros(())) + wf_reg
 
         return ModelOutput(
             logits=logits,

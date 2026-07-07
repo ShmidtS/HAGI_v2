@@ -51,6 +51,7 @@ model:
     entropy_high_threshold: 0.1
     entropy_low_iterations: 2
     entropy_high_iterations: 6
+    use_gradient_checkpointing: false
 
   masking:
     mask_ratio: 0.30
@@ -107,6 +108,7 @@ train:
   muon_lr: 0.02
   muon_momentum: 0.97
   muon_weight_decay: 0.5
+  muon_ns_steps: 5
   weight_decay: 0.1
   precision: "bf16"
   grad_accum_steps: 2
@@ -141,7 +143,8 @@ train:
   distill_temp_end: 1.0
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
-  distill_every: 1            # every step (24GB has room)
+  distill_every: 2            # run teacher every N steps
+  tokenizer: "google/gemma-4-E2B-it"  # Gemma tokenizer for inference decoding
   # Checkpointing
   checkpoint_dir: "checkpoints"
   checkpoint_interval: 500

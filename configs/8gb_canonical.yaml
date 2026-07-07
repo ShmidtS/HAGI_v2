@@ -48,6 +48,7 @@ model:
     entropy_high_threshold: 0.1
     entropy_low_iterations: 2
     entropy_high_iterations: 6
+    use_gradient_checkpointing: true
 
   masking:
     mask_ratio: 0.30          # 30% of tokens masked (progressive: 15% → 30%)
@@ -104,6 +105,7 @@ train:
   muon_lr: 0.02               # Muon lr (2D weights)
   muon_momentum: 0.95
   muon_weight_decay: 0.5      # scale-aware: wd_eff = wd * min(sqrt(fan_out/fan_in), 2)
+  muon_ns_steps: 5
   weight_decay: 0.1           # AdamW weight decay
   precision: "bf16"           # manual_bf16: model cast to bf16, no autocast
   grad_accum_steps: 2         # gradient accumulation for stability (effective batch = 16)
@@ -140,7 +142,8 @@ train:
   distill_temp_end: 1.0       # anneal: end low (fine details)
   distill_use_temp_anneal: true  # enable temperature annealing
   distill_end_frac: 0.6       # distillation ends at 60% of training, then pure CE
-  distill_every: 2            # run teacher every N steps (KL signal persists)
+  distill_every: 2            # run teacher every N steps
+  tokenizer: "HuggingFaceTB/SmolLM2-135M"  # tokenizer for inference decoding
   # Checkpointing
   checkpoint_dir: "checkpoints"    # directory for .pt checkpoint files
   checkpoint_interval: 500        # save checkpoint every N steps

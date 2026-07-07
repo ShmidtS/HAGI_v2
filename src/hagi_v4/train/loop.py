@@ -168,16 +168,17 @@ def train_step(
     total_loss = 0.0
     output: ModelOutput | None = None
 
+    use_distill = (
+        teacher is not None
+        and getattr(teacher, "_loaded", False)
+        and cfg.train.distill_enabled
+        and step % cfg.train.distill_every == 0
+    )
+
     for micro_idx in range(accum):
         output = model(masked_ids, targets=targets, mask=mask, step=step)
         loss = loss_aggregator(output, targets, mask, w_coherence_override=w_coherence)
 
-        use_distill = (
-            teacher is not None
-            and getattr(teacher, "_loaded", False)
-            and cfg.train.distill_enabled
-            and step % cfg.train.distill_every == 0
-        )
         if use_distill:
             alpha = alpha_at(
                 step,
