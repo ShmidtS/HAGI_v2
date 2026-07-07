@@ -25,11 +25,10 @@ def generate(
     max_iterations: int = 4,
     mask_token_id: int = 49153,
     eos_token_id: int | None = None,
-    temperature: float = 0.0,
-    top_k: int = 0,
+    temperature: float = 0.8,
+    top_k: int = 50,
     min_tokens: int = 2,
     noise_ratio: float = 0.0,
-    verbose: bool = False,
 ) -> torch.Tensor:
     """Generate text autoregressively.
 
@@ -96,9 +95,6 @@ def generate(
             next_tok = logits.argmax(dim=-1, keepdim=True)
 
         full_ids = torch.cat([full_ids, next_tok], dim=1)
-
-        if verbose and (step + 1) % 25 == 0:
-            print(f"  ...{step + 1}/{max_new_tokens} tokens", flush=True)
 
         if eos_token_id is not None and next_tok[0].item() == eos_token_id:
             return full_ids[:, : T_prompt + step]
