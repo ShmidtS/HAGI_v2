@@ -131,8 +131,9 @@ class DeepSupervisor:
         lm_head_weight: torch.Tensor,
         iteration: int,
         training: bool,
+        mask_valid: bool = True,
     ) -> tuple[torch.Tensor | None, float]:
-        if not (training and self.use_deep_supervision and targets is not None and mask is not None and mask.any()):
+        if not (training and self.use_deep_supervision and targets is not None and mask is not None and mask_valid):
             return None, 0.0
 
         h_masked = h[mask]
@@ -278,7 +279,11 @@ class RefinementCore(nn.Module):
         last_gp2d_residual: torch.Tensor | None = None
         last_router_probs_list: list[torch.Tensor] | None = None
         extrinsic_norms: list[float] = []
+        ext_norm_acc = h.new_zeros(())  # GPU accumulator — 1 sync at end
         converged_at = n_iters
+
+        # Precompute mask validity once (1 sync instead of N per-iteration syncs)
+        mask_valid = mask is not None and mask.any().item() if mask is not None else False
 
         for iteration in range(n_iters):
             h_prior = h
@@ -317,13 +322,14 @@ class RefinementCore(nn.Module):
 
             if extrinsic_alpha < 1.0:
                 extrinsic = h - h_prior
-                ext_norm = extrinsic.float().norm(dim=-1).mean().item()
-                extrinsic_norms.append(ext_norm)
+                with torch.no_grad():
+                    iter_ext = extrinsic.float().norm(dim=-1).mean()
+                    ext_norm_acc = ext_norm_acc + iter_ext
                 h = h_prior + extrinsic * extrinsic_alpha
             else:
                 with torch.no_grad():
-                    ext_norm = (h - h_prior).float().norm(dim=-1).mean().item()
-                    extrinsic_norms.append(ext_norm)
+                    iter_ext = (h - h_prior).float().norm(dim=-1).mean()
+                    ext_norm_acc = ext_norm_acc + iter_ext
 
             if self.adaptive_halt is not None:
                 new_halts = self.adaptive_halt(h, h_prev, iteration, halted, current_threshold=halt_threshold)
@@ -338,7 +344,7 @@ class RefinementCore(nn.Module):
             h_prev = h
 
             ds_loss, ds_weight = self.deep_supervisor.compute(
-                h, h_prev, targets, mask, lm_head_weight, iteration, training
+                h, h_prior, targets, mask, lm_head_weight, iteration, training, mask_valid=mask_valid
             )
             if ds_loss is not None:
                 total_deep_supervision = total_deep_supervision + ds_loss
@@ -354,6 +360,8 @@ class RefinementCore(nn.Module):
                 last_router_probs_list = list(rp_stacked.unbind(0))
 
             if use_convergence_halt and iteration >= self.refinement_cfg.min_iterations:
+                ext_norm = iter_ext.item()
+                extrinsic_norms.append(ext_norm)
                 if ext_norm < convergence_threshold:
                     converged_at = iteration + 1
                     not_halted = ~halted
@@ -363,6 +371,13 @@ class RefinementCore(nn.Module):
                         iterations_used,
                     )
                     break
+            elif not training:
+                extrinsic_norms.append(iter_ext.item())
+
+        # Training: convert GPU accumulator to list (1 sync instead of N)
+        if training and not extrinsic_norms:
+            avg_ext = (ext_norm_acc / max(n_iters, 1)).item()
+            extrinsic_norms = [avg_ext] * n_iters
 
         actual_iters = max(converged_at, 1)
         n = max(n_iters, 1)

@@ -187,7 +187,8 @@ class HAGIv4(nn.Module):
             h, _, _ = blk(h, cos, sin)
 
         h_normed = self.final_norm(h)
-        if targets is not None and mask is not None and mask.any():
+        mask_valid = mask is not None and mask.any().item() if mask is not None else False
+        if targets is not None and mask_valid:
             h_masked = h_normed[mask]
             t_masked = targets[mask]
             logits_masked = F.linear(h_masked, self.lm_head.weight)

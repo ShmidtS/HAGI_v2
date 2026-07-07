@@ -81,33 +81,39 @@ class MoESwiGLU(nn.Module):
 
         output = torch.zeros_like(flat)
 
-        for k_idx in range(self.top_k):
-            expert_idx = top_k_indices[:, k_idx]
-            probs = top_k_probs[:, k_idx]
+        if self.top_k == 1:
+            expert_idx = top_k_indices[:, 0]
+            probs_k = top_k_probs[:, 0]
 
             if self.use_mod_skip:
-                skip_mask = expert_idx == self.skip_idx
-                if skip_mask.any():
-                    skip_out = flat[skip_mask] * probs[skip_mask].unsqueeze(-1)
-                    if self.top_k == 1:
-                        output[skip_mask] = skip_out
-                    else:
-                        indices = torch.where(skip_mask)[0]
-                        idx_exp = indices.unsqueeze(-1).expand(-1, D)
-                        output.scatter_add_(0, idx_exp, skip_out)
+                skip_mask = (expert_idx == self.skip_idx).unsqueeze(-1).to(flat.dtype)
+                output = output + flat * probs_k.unsqueeze(-1) * skip_mask
 
             for e in range(self.num_experts):
-                mask = expert_idx == e
-                if not mask.any():
-                    continue
-                tokens = flat[mask]
-                expert_out = self.experts[e](tokens)
+                expert_out = self.experts[e](flat)
                 if expert_out.dtype != output.dtype:
                     expert_out = expert_out.to(output.dtype)
-                weighted = expert_out * probs[mask].unsqueeze(-1)
-                if self.top_k == 1:
-                    output[mask] = weighted
-                else:
+                emask = (expert_idx == e).unsqueeze(-1).to(output.dtype)
+                output = output + expert_out * probs_k.unsqueeze(-1) * emask
+        else:
+            for k_idx in range(self.top_k):
+                expert_idx = top_k_indices[:, k_idx]
+                probs = top_k_probs[:, k_idx]
+
+                if self.use_mod_skip:
+                    skip_mask = expert_idx == self.skip_idx
+                    skip_out = flat[skip_mask] * probs[skip_mask].unsqueeze(-1)
+                    indices = torch.where(skip_mask)[0]
+                    idx_exp = indices.unsqueeze(-1).expand(-1, D)
+                    output.scatter_add_(0, idx_exp, skip_out)
+
+                for e in range(self.num_experts):
+                    mask = expert_idx == e
+                    tokens = flat[mask]
+                    expert_out = self.experts[e](tokens)
+                    if expert_out.dtype != output.dtype:
+                        expert_out = expert_out.to(output.dtype)
+                    weighted = expert_out * probs[mask].unsqueeze(-1)
                     indices = torch.where(mask)[0]
                     idx_exp = indices.unsqueeze(-1).expand(-1, D)
                     output.scatter_add_(0, idx_exp, weighted)
