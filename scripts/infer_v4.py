@@ -72,7 +72,9 @@ def main() -> int:
     parser.add_argument("--config", default="configs/8gb_canonical.yaml")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-tokens", type=int, default=128, help="Hard cap on generated tokens")
-    parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument(
+        "--iterations", type=int, default=4, help="Refinement iterations (more = better quality, slower)"
+    )
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--tokenizer", default=None, help="Tokenizer name (auto-detected from checkpoint config)")

@@ -74,7 +74,7 @@ def generate(
     orig_n_iters = model.hrm.entropy_scheduler.n_iterations
     orig_adaptive = model.hrm.entropy_scheduler.use_entropy_adaptive
     model.hrm.entropy_scheduler.use_entropy_adaptive = False
-    model.hrm.entropy_scheduler.n_iterations = 1
+    model.hrm.entropy_scheduler.n_iterations = max(max_iterations, 2)
 
     def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
         """Echo cancellation (G.168 analog): subtract echo of recently
