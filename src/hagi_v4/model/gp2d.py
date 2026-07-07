@@ -48,11 +48,13 @@ class GeometricProduct2D(nn.Module):
     def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, H = h.shape
         mv = h.reshape(B, T, self.n_heads, 8)
-        accumulated = torch.zeros_like(mv)
-        for i, delta in enumerate(range(-self.w, self.w + 1)):
-            shifted = torch.roll(mv, shifts=delta, dims=1)
-            prod = geometric_product(mv, shifted)
-            accumulated = accumulated + prod * self.temporal_weights[i]
+        deltas = list(range(-self.w, self.w + 1))
+        if len(deltas) > 1:
+            shifted_stack = torch.stack([torch.roll(mv, shifts=d, dims=1) for d in deltas], dim=0)
+            prods = geometric_product(mv.unsqueeze(0), shifted_stack)
+            accumulated = (prods * self.temporal_weights.view(-1, 1, 1, 1, 1)).sum(0)
+        else:
+            accumulated = geometric_product(mv, mv) * self.temporal_weights[0]
         out = accumulated.reshape(B, T, H)
         out = self.norm(self.proj(out))
         gate = torch.sigmoid(self.gate)

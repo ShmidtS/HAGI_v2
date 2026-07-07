@@ -294,26 +294,22 @@ class RefinementCore(nn.Module):
 
             if training:
 
-                def _run(h_inner):
-                    return self._run_reasoning_blocks(h_inner, reasoning_blocks, cos, sin)
+                def _run_fused(h_inner):
+                    h_r, moe_aux_r, rp_r = self._run_reasoning_blocks(h_inner, reasoning_blocks, cos, sin)
+                    h_g, router_loss_r, gate_probs_r = gdr(h_r)
+                    h_g, gp2d_residual_r = gp2d(h_g)
+                    return h_g, moe_aux_r, rp_r, router_loss_r, gate_probs_r, gp2d_residual_r
 
-                h, moe_aux, rp_stacked = torch_checkpoint(_run, h, use_reentrant=False)
+                h, moe_aux, rp_stacked, router_loss, gate_probs, gp2d_residual = torch_checkpoint(
+                    _run_fused, h, use_reentrant=False
+                )
             else:
                 h, moe_aux, rp_stacked = self._run_reasoning_blocks(h, reasoning_blocks, cos, sin)
+                h, router_loss, gate_probs = gdr(h)
+                h, gp2d_residual = gp2d(h)
             total_moe_aux = total_moe_aux + moe_aux
-
-            h, router_loss, gate_probs = gdr(h)
             if router_loss is not None:
                 total_gdr_router = total_gdr_router + router_loss
-
-            if training:
-
-                def _gp2d_run(h_inner):
-                    return gp2d(h_inner)
-
-                h, gp2d_residual = torch_checkpoint(_gp2d_run, h, use_reentrant=False)
-            else:
-                h, gp2d_residual = gp2d(h)
 
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 

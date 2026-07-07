@@ -81,16 +81,8 @@ class GroupedQueryAttention(nn.Module):
             v = v.to(torch.float16)
 
         if self.repeat > 1:
-            k = (
-                k.unsqueeze(2)
-                .expand(B, self.n_kv, self.repeat, T, self.head_dim)
-                .reshape(B, self.n_q, T, self.head_dim)
-            )
-            v = (
-                v.unsqueeze(2)
-                .expand(B, self.n_kv, self.repeat, T, self.head_dim)
-                .reshape(B, self.n_q, T, self.head_dim)
-            )
+            k = k.repeat_interleave(self.repeat, dim=1)
+            v = v.repeat_interleave(self.repeat, dim=1)
 
         is_causal = not self.bidirectional
         out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)

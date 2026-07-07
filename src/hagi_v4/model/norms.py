@@ -56,15 +56,13 @@ def build_rope_cache(
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embeddings using rotate_half convention.
+    """Apply rotary position embeddings using slice-based even/odd rotation.
 
     x: [B, H, T, D] or [..., T, D]
     cos/sin: [T, D // 2]
-
-    Uses contiguous reshape to pairs for efficient even/odd rotation.
     """
-    x_pairs = x.reshape(*x.shape[:-1], -1, 2)
-    x1, x2 = x_pairs.unbind(-1)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
     rx1 = x1 * cos - x2 * sin
