@@ -44,7 +44,7 @@ class HAGIv4(nn.Module):
         C = m.core_hidden_size
 
         self.embed = nn.Embedding(m.vocab_size, H)
-        self.mask_embed = nn.Parameter(torch.randn(H) * 0.02)
+        self.mask_embed = nn.Parameter(torch.zeros(H))
 
         self.perception = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.perception_layers))
 
@@ -52,7 +52,7 @@ class HAGIv4(nn.Module):
         self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
         self.bottleneck_up = nn.Linear(C, H, bias=False)
 
-        self.core_mask_embed = nn.Parameter(torch.randn(C) * 0.02)
+        self.core_mask_embed = nn.Parameter(torch.zeros(C))
         self.gp2d = GeometricProduct2D(m.gp2d, C)
         self.reasoning = nn.ModuleList(TransformerBlock(m, hidden_size=C) for _ in range(m.reasoning_layers))
         self.gdr = GradeDecomposedRecurrence(m.gdr, C)
@@ -69,6 +69,7 @@ class HAGIv4(nn.Module):
         self.lm_head.weight = self.embed.weight
         self.coherence = CoherenceHead(m.cast, H, lm_head=self.lm_head, final_norm=self.final_norm)
         self._init_weights()
+        self._init_mask_embeds()
 
     def _init_weights(self) -> None:
         for mod in self.modules():
@@ -78,6 +79,11 @@ class HAGIv4(nn.Module):
                     nn.init.zeros_(mod.bias)
             elif isinstance(mod, nn.Embedding):
                 nn.init.normal_(mod.weight, mean=0.0, std=0.02)
+
+    def _init_mask_embeds(self) -> None:
+        with torch.no_grad():
+            self.mask_embed.data.copy_(self.embed.weight.mean(dim=0))
+            self.core_mask_embed.data.zero_()
 
     def _rope(self, T: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         a = self.cfg.model.attention
