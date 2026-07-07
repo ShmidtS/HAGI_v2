@@ -231,8 +231,10 @@ def train_step(
 
     with torch.no_grad():
         if output.logits is not None:
-            max_logits = output.logits.max(dim=-1).values
-            avg_confidence = (max_logits / output.logits.shape[-1]).float().mean().item()
+            probs = F.softmax(output.logits, dim=-1)
+            avg_confidence = probs.max(dim=-1).values.float().mean().item()
+        elif output.ce_loss is not None:
+            avg_confidence = max(0.0, 1.0 - output.ce_loss.item() / 10.0)
         else:
             avg_confidence = 0.5
     if mc.use_adaptive_erasure and adaptive_mask_state is not None:
