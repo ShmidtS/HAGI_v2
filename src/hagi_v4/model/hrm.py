@@ -144,6 +144,9 @@ class DeepSupervisor:
         ce = F.cross_entropy(logits_masked, t_masked)
 
         if self.use_adaptive_ds_weight and iteration < len(self._ds_ema):
+            with torch.no_grad():
+                delta_norm = (h - h_prev).float().norm(dim=-1).mean().item()
+            self._ds_ema[iteration] = self.ds_ema_decay * self._ds_ema[iteration] + (1 - self.ds_ema_decay) * delta_norm
             weight = self._ds_ema[iteration]
             if weight == 0.0:
                 weight = self.deep_supervision_decay**iteration
@@ -281,6 +284,7 @@ class RefinementCore(nn.Module):
         last_gp2d_residual: torch.Tensor | None = None
         last_router_probs_list: list[torch.Tensor] | None = None
         extrinsic_norms: list[float] = []
+        ext_norm_sum = h.new_zeros(())  # GPU accumulator — 1 sync at end
         converged_at = n_iters
 
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
@@ -334,6 +338,11 @@ class RefinementCore(nn.Module):
                 extrinsic = h - h_prior
                 h = h_prior + extrinsic * extrinsic_alpha
 
+            # Extrinsic norm tracking — GPU accumulator (no per-iter sync)
+            with torch.no_grad():
+                iter_ext_norm = (h - h_prior).float().norm(dim=-1).mean()
+                ext_norm_sum = ext_norm_sum + iter_ext_norm
+
             if not training and self.adaptive_halt is not None:
                 new_halts = self.adaptive_halt(h, h_prev, iteration, halted, current_threshold=halt_threshold)
                 h = torch.where(new_halts.unsqueeze(-1), h_prev, h)
@@ -363,8 +372,7 @@ class RefinementCore(nn.Module):
                 last_router_probs_list = list(rp_stacked.unbind(0))
 
             if not training and use_convergence_halt and iteration >= self.refinement_cfg.min_iterations:
-                with torch.no_grad():
-                    ext_norm = (h - h_prior).float().norm(dim=-1).mean().item()
+                ext_norm = iter_ext_norm.item()
                 extrinsic_norms.append(ext_norm)
                 if ext_norm < convergence_threshold:
                     converged_at = iteration + 1
@@ -376,9 +384,12 @@ class RefinementCore(nn.Module):
                     )
                     break
             elif not training:
-                with torch.no_grad():
-                    ext_norm = (h - h_prior).float().norm(dim=-1).mean().item()
-                extrinsic_norms.append(ext_norm)
+                extrinsic_norms.append(iter_ext_norm.item())
+
+        # 1 sync: convert GPU accumulator to extrinsic_norms for training
+        if training and not extrinsic_norms:
+            avg_ext = (ext_norm_sum / max(n_iters, 1)).item()
+            extrinsic_norms = [avg_ext] * n_iters
 
         actual_iters = max(converged_at, 1)
         n = max(n_iters, 1)
