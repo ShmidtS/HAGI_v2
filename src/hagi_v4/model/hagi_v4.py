@@ -61,6 +61,7 @@ class HAGIv4(nn.Module):
                 norm_eps=m.norm_eps,
             )
             self.bottleneck_down = None
+            self.bottleneck_norm = None
             self.bottleneck_up = None
         else:
             self.bottleneck_down = nn.Linear(H, C, bias=False)
@@ -86,10 +87,9 @@ class HAGIv4(nn.Module):
         self.use_turbo_decoder = m.turbo_decoder.enabled
         if self.use_turbo_decoder:
             self.hrm = TurboDecoder(m.hrm, m.refinement, hidden_size=C)
-            self.hrm.set_max_steps(cfg.train.max_steps)
         else:
             self.hrm = RefinementCore(m.hrm, m.refinement, C)
-            self.hrm.set_max_steps(cfg.train.max_steps)
+        self.hrm.set_max_steps(cfg.train.max_steps)
 
         self.msa = MSAModule(m.msa, C)
 
@@ -187,8 +187,7 @@ class HAGIv4(nn.Module):
             h, _, _ = blk(h, cos, sin)
 
         h_normed = self.final_norm(h)
-        mask_any = mask is not None and mask.any().item() if mask is not None else False
-        if targets is not None and mask_any:
+        if targets is not None and mask is not None and mask.any():
             h_masked = h_normed[mask]
             t_masked = targets[mask]
             logits_masked = F.linear(h_masked, self.lm_head.weight)

@@ -165,13 +165,11 @@ def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:
     decay = [p for n, p in rest if p.ndim >= 2 and "norm" not in n.lower()]
     no_decay = [p for n, p in rest if not (p.ndim >= 2 and "norm" not in n.lower())]
 
-    ns_steps = getattr(tc, "muon_ns_steps", 5)
     muon = Muon(
         muon_params,
         lr=tc.muon_lr,
         momentum=tc.muon_momentum,
         weight_decay=tc.muon_weight_decay,
-        ns_steps=ns_steps,
     )
     adamw = torch.optim.AdamW(
         [
