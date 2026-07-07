@@ -1,14 +1,17 @@
-"""Autoregressive generation for HAGI V5 codec model.
+"""Block-parallel generation for HAGI V5 codec model.
 
-Bidirectional model: no KV-cache, each token recomputes the full sequence.
-The refinement loop (7 layers × N iterations) is the dominant cost.
+5G analogies:
+- Block coding: 5G LDPC decodes an entire codeword in parallel, not 1 bit
+  at a time. We generate block_size tokens per forward pass using the
+  model's native masking capability.
+- Fixed iterations at inference: 5G LDPC hardware uses a fixed small
+  iteration count (not adaptive). We force 1 refinement iteration at
+  inference — multiple iterations are a training regulariser.
+- Successive blocks: each block's predictions become frozen context for
+  the next block (polar code successive cancellation analog).
 
-Optimisations:
-- noise_ratio=0 by default: skip erasure injection at inference (the model
-  already learned to predict; noise is a training regulariser, not needed
-  for greedy/sampled decoding)
-- Greedy mode (temperature=0) for fast deterministic generation
-- Progress logging every 25 tokens for interactive feedback
+Speed: block_size=8 with 1 iteration gives ~8x fewer forward passes
+and ~4-6x fewer iterations per pass vs autoregressive with 4-6 iters.
 """
 
 from __future__ import annotations
@@ -29,8 +32,9 @@ def generate(
     top_k: int = 50,
     min_tokens: int = 2,
     noise_ratio: float = 0.0,
+    block_size: int = 8,
 ) -> torch.Tensor:
-    """Generate text autoregressively.
+    """Generate text block-parallel with fixed 1-iteration inference.
 
     Args:
         model: HAGIv4 model (eval mode).
@@ -38,12 +42,12 @@ def generate(
         max_new_tokens: hard cap on generated tokens.
         max_iterations: unused (kept for API compatibility).
         mask_token_id: token ID for masked positions.
-        eos_token_id: token ID for end-of-sequence (None = no EOS).
+        eos_token_id: token ID for EOS (None = no EOS check).
         temperature: 0 for greedy, >0 for sampling.
         top_k: if >0, sample from top-k logits.
-        min_tokens: minimum generated tokens before EOS accepted.
-        noise_ratio: fraction of context to erase (0 = clean inference).
-        verbose: print progress every 25 tokens.
+        min_tokens: minimum tokens before EOS accepted.
+        noise_ratio: unused (kept for API compatibility).
+        block_size: tokens generated per forward pass (5G block coding).
 
     Returns:
         [B, T_prompt + generated] token IDs.
@@ -61,42 +65,54 @@ def generate(
     else:
         full_ids = prompt_ids.clone()
 
-    for step in range(max_new_tokens):
-        if noise_ratio > 0 and full_ids.shape[1] > min_len:
-            noisy_ids = full_ids.clone()
-            noise_mask = torch.zeros_like(noisy_ids, dtype=torch.bool)
-            n_ctx = noisy_ids.shape[1]
-            n_noise = max(1, int(n_ctx * noise_ratio))
-            for b in range(B):
-                idx = torch.randperm(n_ctx, device=device)[:n_noise]
-                noise_mask[b, idx] = True
-            noisy_ids[noise_mask] = mask_token_id
-            output = model(noisy_ids, targets=None, mask=noise_mask)
-        else:
-            output = model(full_ids, targets=None, mask=None)
+    orig_n_iters = model.hrm.entropy_scheduler.n_iterations
+    orig_adaptive = model.hrm.entropy_scheduler.use_entropy_adaptive
+    model.hrm.entropy_scheduler.use_entropy_adaptive = False
+    model.hrm.entropy_scheduler.n_iterations = 1
 
-        logits = output.logits[:, -1, :]
+    generated = 0
+    try:
+        while generated < max_new_tokens:
+            n_block = min(block_size, max_new_tokens - generated)
+            mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
+            seq = torch.cat([full_ids, mask_tokens], dim=1)
+            T = seq.shape[1]
 
-        if logits is None:
-            break
+            mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+            mask[:, T - n_block :] = True
 
-        if eos_token_id is not None and step < min_tokens:
-            logits = logits.clone()
-            logits[:, eos_token_id] = float("-inf")
+            output = model(seq, targets=None, mask=mask)
+            logits = output.logits
 
-        if temperature > 0:
-            lt = logits / temperature
-            if top_k > 0:
-                v, _ = torch.topk(lt, min(top_k, V), dim=-1)
-                lt = torch.where(lt < v[:, -1:], float("-inf"), lt)
-            probs = F.softmax(lt, dim=-1)
-            next_tok = torch.multinomial(probs, 1)
-        else:
-            next_tok = logits.argmax(dim=-1, keepdim=True)
+            if logits is None:
+                break
 
-        full_ids = torch.cat([full_ids, next_tok], dim=1)
+            block_logits = logits[:, T - n_block :, :]
 
-        if eos_token_id is not None and next_tok[0].item() == eos_token_id:
-            return full_ids[:, : T_prompt + step]
+            if temperature > 0:
+                lt = block_logits / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(lt, min(top_k, V), dim=-1)
+                    lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
+                probs = F.softmax(lt, dim=-1)
+                new_tokens = torch.multinomial(probs.reshape(-1, V), 1).reshape(B, n_block)
+            else:
+                new_tokens = block_logits.argmax(dim=-1)
 
-    return full_ids[:, : T_prompt + max_new_tokens]
+            if eos_token_id is not None and generated < min_tokens:
+                new_tokens[:, 0] = torch.where(
+                    new_tokens[:, 0] == eos_token_id,
+                    torch.full_like(new_tokens[:, 0], mask_token_id),
+                    new_tokens[:, 0],
+                )
+
+            full_ids = torch.cat([full_ids, new_tokens], dim=1)
+            generated += n_block
+
+            if eos_token_id is not None and (new_tokens == eos_token_id).any():
+                break
+    finally:
+        model.hrm.entropy_scheduler.n_iterations = orig_n_iters
+        model.hrm.entropy_scheduler.use_entropy_adaptive = orig_adaptive
+
+    return full_ids[:, : T_prompt + generated]
