@@ -161,6 +161,7 @@ class MoEConfig:
     alpha: float = 0.01
     use_grade_specialization: bool = True
     grade_specialization_weight: float = 0.01
+    n_shared_bases: int = 0
 
 
 @dataclass

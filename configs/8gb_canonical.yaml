@@ -90,6 +90,7 @@ model:
     alpha: 0.01               # load-balance aux weight
     use_grade_specialization: true  # correlate expert routing with grade dominance
     grade_specialization_weight: 0.01
+    n_shared_bases: 2  # PAW-style: 2 shared gu bases instead of 4 independent experts (saves 5M params)
 
   cast:
     use_coherence: true       # geometric coherence regularizer

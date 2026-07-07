@@ -90,6 +90,7 @@ model:
     alpha: 0.01
     use_grade_specialization: true
     grade_specialization_weight: 0.01
+    n_shared_bases: 2  # PAW-style shared basis decomposition
 
   cast:
     use_coherence: true

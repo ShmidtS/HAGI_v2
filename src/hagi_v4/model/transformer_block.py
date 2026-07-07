@@ -42,6 +42,7 @@ class TransformerBlock(nn.Module):
             alpha=m.moe.alpha,
             use_grade_specialization=m.moe.use_grade_specialization,
             grade_specialization_weight=m.moe.grade_specialization_weight,
+            n_shared_bases=m.moe.n_shared_bases,
         )
         self.ffn_norm = RMSNorm(H, m.norm_eps, fp32_variance=m.attention.fp32_rmsnorm)
         self.moe = MoESwiGLU(cfg=moe_cfg, hidden_size=H)
