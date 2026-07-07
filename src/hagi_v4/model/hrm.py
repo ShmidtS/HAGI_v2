@@ -99,12 +99,10 @@ class EntropyScheduler:
         if not self.use_entropy_adaptive:
             return self.n_iterations
         with torch.no_grad():
-            entropy_proxy = h.float().var(dim=1).mean()
-        threshold_low = self.entropy_low_threshold
-        threshold_high = self.entropy_high_threshold
-        if entropy_proxy < threshold_low:
+            entropy_proxy = h.float().var(dim=1).mean().item()
+        if entropy_proxy < self.entropy_low_threshold:
             return self.entropy_low_iterations
-        if entropy_proxy > threshold_high:
+        if entropy_proxy > self.entropy_high_threshold:
             return self.entropy_high_iterations
         return self.n_iterations
 
@@ -133,9 +131,8 @@ class DeepSupervisor:
         lm_head_weight: torch.Tensor,
         iteration: int,
         training: bool,
-        mask_valid: bool = True,
     ) -> tuple[torch.Tensor | None, float]:
-        if not (training and self.use_deep_supervision and targets is not None and mask is not None and mask_valid):
+        if not (training and self.use_deep_supervision and targets is not None and mask is not None and mask.any()):
             return None, 0.0
 
         h_masked = h[mask]
@@ -143,13 +140,10 @@ class DeepSupervisor:
         logits_masked = F.linear(h_masked, lm_head_weight)
         ce = F.cross_entropy(logits_masked, t_masked)
 
-        if self.use_adaptive_ds_weight and iteration < len(self._ds_ema):
-            with torch.no_grad():
-                delta_norm = (h - h_prev).float().norm(dim=-1).mean().item()
+        if self.use_adaptive_ds_weight:
+            delta_norm = (h - h_prev).float().norm(dim=-1).mean().item()
             self._ds_ema[iteration] = self.ds_ema_decay * self._ds_ema[iteration] + (1 - self.ds_ema_decay) * delta_norm
             weight = self._ds_ema[iteration]
-            if weight == 0.0:
-                weight = self.deep_supervision_decay**iteration
         else:
             weight = self.deep_supervision_decay**iteration
 
@@ -284,16 +278,7 @@ class RefinementCore(nn.Module):
         last_gp2d_residual: torch.Tensor | None = None
         last_router_probs_list: list[torch.Tensor] | None = None
         extrinsic_norms: list[float] = []
-        ext_norm_sum = h.new_zeros(())  # GPU accumulator — 1 sync at end
         converged_at = n_iters
-
-        mask_valid = mask is not None and mask.any().item() if mask is not None else False
-
-        use_grad_ckpt = (
-            self.refinement_cfg.use_gradient_checkpointing
-            if hasattr(self.refinement_cfg, "use_gradient_checkpointing")
-            else True
-        )
 
         for iteration in range(n_iters):
             h_prior = h
@@ -307,7 +292,7 @@ class RefinementCore(nn.Module):
             h_bias = self.z_h_to_hidden(z_H_up) + self.z_l_to_hidden(z_L)
             h = h + h_bias
 
-            if training and use_grad_ckpt:
+            if training:
 
                 def _run(h_inner):
                     return self._run_reasoning_blocks(h_inner, reasoning_blocks, cos, sin)
@@ -321,7 +306,7 @@ class RefinementCore(nn.Module):
             if router_loss is not None:
                 total_gdr_router = total_gdr_router + router_loss
 
-            if training and use_grad_ckpt:
+            if training:
 
                 def _gp2d_run(h_inner):
                     return gp2d(h_inner)
@@ -336,14 +321,15 @@ class RefinementCore(nn.Module):
 
             if extrinsic_alpha < 1.0:
                 extrinsic = h - h_prior
+                ext_norm = extrinsic.float().norm(dim=-1).mean().item()
+                extrinsic_norms.append(ext_norm)
                 h = h_prior + extrinsic * extrinsic_alpha
+            else:
+                with torch.no_grad():
+                    ext_norm = (h - h_prior).float().norm(dim=-1).mean().item()
+                    extrinsic_norms.append(ext_norm)
 
-            # Extrinsic norm tracking — GPU accumulator (no per-iter sync)
-            with torch.no_grad():
-                iter_ext_norm = (h - h_prior).float().norm(dim=-1).mean()
-                ext_norm_sum = ext_norm_sum + iter_ext_norm
-
-            if not training and self.adaptive_halt is not None:
+            if self.adaptive_halt is not None:
                 new_halts = self.adaptive_halt(h, h_prev, iteration, halted, current_threshold=halt_threshold)
                 h = torch.where(new_halts.unsqueeze(-1), h_prev, h)
                 halted = halted | new_halts
@@ -356,7 +342,7 @@ class RefinementCore(nn.Module):
             h_prev = h
 
             ds_loss, ds_weight = self.deep_supervisor.compute(
-                h, h_prior, targets, mask, lm_head_weight, iteration, training, mask_valid=mask_valid
+                h, h_prev, targets, mask, lm_head_weight, iteration, training
             )
             if ds_loss is not None:
                 total_deep_supervision = total_deep_supervision + ds_loss
@@ -371,9 +357,7 @@ class RefinementCore(nn.Module):
             if rp_stacked.numel() > 0:
                 last_router_probs_list = list(rp_stacked.unbind(0))
 
-            if not training and use_convergence_halt and iteration >= self.refinement_cfg.min_iterations:
-                ext_norm = iter_ext_norm.item()
-                extrinsic_norms.append(ext_norm)
+            if use_convergence_halt and iteration >= self.refinement_cfg.min_iterations:
                 if ext_norm < convergence_threshold:
                     converged_at = iteration + 1
                     not_halted = ~halted
@@ -383,13 +367,6 @@ class RefinementCore(nn.Module):
                         iterations_used,
                     )
                     break
-            elif not training:
-                extrinsic_norms.append(iter_ext_norm.item())
-
-        # 1 sync: convert GPU accumulator to extrinsic_norms for training
-        if training and not extrinsic_norms:
-            avg_ext = (ext_norm_sum / max(n_iters, 1)).item()
-            extrinsic_norms = [avg_ext] * n_iters
 
         actual_iters = max(converged_at, 1)
         n = max(n_iters, 1)
