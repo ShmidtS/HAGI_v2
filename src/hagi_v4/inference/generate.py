@@ -34,8 +34,8 @@ def generate(
     noise_ratio: float = 0.0,
     block_size: int = 16,
     refine_passes: int = 2,
-    repetition_penalty: float = 1.5,
-    repetition_window: int = 16,
+    repetition_penalty: float = 0.8,
+    repetition_window: int = 32,
 ) -> torch.Tensor:
     """Generate text block-parallel with Turbo-style iterative refinement.
 
@@ -76,14 +76,22 @@ def generate(
     model.hrm.entropy_scheduler.use_entropy_adaptive = False
     model.hrm.entropy_scheduler.n_iterations = 1
 
-    def apply_repetition_penalty(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
-        if repetition_penalty <= 1.0 or context_ids.numel() == 0:
+    def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
+        """Echo cancellation (G.168 analog): subtract echo of recently
+        transmitted tokens proportional to frequency. Division is weak;
+        subtraction is the standard echo canceller operation.
+
+        Echo strength grows with token frequency in the echo window:
+        token appearing 3x gets 3x the subtraction (multipath summation).
+        """
+        if repetition_penalty <= 0.0 or context_ids.numel() == 0:
             return logits
         window = context_ids[:, -repetition_window:] if context_ids.shape[1] >= repetition_window else context_ids
         for b in range(B):
-            used = window[b].unique()
-            used = used[used < V]
-            logits[b, :, used] = logits[b, :, used] / repetition_penalty
+            unique, counts = window[b].unique(return_counts=True)
+            unique = unique[unique < V]
+            counts = counts[: len(unique)].to(logits.dtype)
+            logits[b, :, unique] = logits[b, :, unique] - counts * repetition_penalty
         return logits
 
     def sample_tokens(logits: torch.Tensor, n_block: int, gen_count: int) -> torch.Tensor:
@@ -92,8 +100,8 @@ def generate(
         else:
             lt = logits
 
-        if repetition_penalty > 1.0 and full_ids.shape[1] > 0:
-            lt = apply_repetition_penalty(lt.clone(), full_ids)
+        if repetition_penalty > 0.0 and full_ids.shape[1] > 0:
+            lt = apply_echo_cancellation(lt.clone(), full_ids)
 
         if top_k > 0:
             v, _ = torch.topk(lt, min(top_k, V), dim=-1)
