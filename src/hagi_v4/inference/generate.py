@@ -34,8 +34,8 @@ def generate(
     noise_ratio: float = 0.0,
     block_size: int = 16,
     refine_passes: int = 2,
-    repetition_penalty: float = 1.3,
-    repetition_window: int = 32,
+    repetition_penalty: float = 1.5,
+    repetition_window: int = 16,
 ) -> torch.Tensor:
     """Generate text block-parallel with Turbo-style iterative refinement.
 
@@ -130,7 +130,8 @@ def generate(
                 output = model(seq, targets=None, mask=mask_refined)
                 if output.logits is None:
                     break
-                block_logits = output.logits[:, T - n_block :, :]
+                refined_logits = output.logits[:, T - n_block :, :]
+                block_logits = 0.5 * block_logits + 0.5 * refined_logits
                 new_tokens = sample_tokens(block_logits, n_block, generated)
 
             if eos_token_id is not None and generated < min_tokens:
