@@ -1,17 +1,17 @@
-"""Block-parallel generation for HAGI V5 codec model.
+"""Block-parallel generation with iterative refinement for HAGI V5.
 
 5G analogies:
-- Block coding: 5G LDPC decodes an entire codeword in parallel, not 1 bit
-  at a time. We generate block_size tokens per forward pass using the
-  model's native masking capability.
-- Fixed iterations at inference: 5G LDPC hardware uses a fixed small
-  iteration count (not adaptive). We force 1 refinement iteration at
-  inference — multiple iterations are a training regulariser.
-- Successive blocks: each block's predictions become frozen context for
-  the next block (polar code successive cancellation analog).
-
-Speed: block_size=8 with 1 iteration gives ~8x fewer forward passes
-and ~4-6x fewer iterations per pass vs autoregressive with 4-6 iters.
+- Block coding (LDPC): generate block_size tokens per forward pass using
+  the model's native masking, not 1 token at a time.
+- Turbo iterative refinement: after generating tokens with masks (rough
+  decode), run a second pass with tokens unmasked so they attend to each
+  other (refined decode). Two component passes exchange information.
+- Fixed 1-iteration inference: 5G LDPC hardware uses fixed small iteration
+  counts. We force 1 refinement iteration at inference.
+- Repetition penalty: 5G rate matching avoids repeating coded bits.
+  Penalize recently used tokens to prevent degenerate loops.
+- Successive blocks: each block becomes frozen context for the next
+  (polar code successive cancellation analog).
 """
 
 from __future__ import annotations
@@ -32,9 +32,12 @@ def generate(
     top_k: int = 50,
     min_tokens: int = 2,
     noise_ratio: float = 0.0,
-    block_size: int = 8,
+    block_size: int = 16,
+    refine_passes: int = 2,
+    repetition_penalty: float = 1.3,
+    repetition_window: int = 32,
 ) -> torch.Tensor:
-    """Generate text block-parallel with fixed 1-iteration inference.
+    """Generate text block-parallel with Turbo-style iterative refinement.
 
     Args:
         model: HAGIv4 model (eval mode).
@@ -48,6 +51,9 @@ def generate(
         min_tokens: minimum tokens before EOS accepted.
         noise_ratio: unused (kept for API compatibility).
         block_size: tokens generated per forward pass (5G block coding).
+        refine_passes: total forward passes per block (Turbo iterative).
+        repetition_penalty: divide logit of recently used tokens by this.
+        repetition_window: number of recent tokens to penalize.
 
     Returns:
         [B, T_prompt + generated] token IDs.
@@ -70,6 +76,35 @@ def generate(
     model.hrm.entropy_scheduler.use_entropy_adaptive = False
     model.hrm.entropy_scheduler.n_iterations = 1
 
+    def apply_repetition_penalty(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
+        if repetition_penalty <= 1.0 or context_ids.numel() == 0:
+            return logits
+        window = context_ids[:, -repetition_window:] if context_ids.shape[1] >= repetition_window else context_ids
+        for b in range(B):
+            used = window[b].unique()
+            used = used[used < V]
+            logits[b, :, used] = logits[b, :, used] / repetition_penalty
+        return logits
+
+    def sample_tokens(logits: torch.Tensor, n_block: int, gen_count: int) -> torch.Tensor:
+        if temperature > 0:
+            lt = logits / temperature
+        else:
+            lt = logits
+
+        if repetition_penalty > 1.0 and full_ids.shape[1] > 0:
+            lt = apply_repetition_penalty(lt.clone(), full_ids)
+
+        if top_k > 0:
+            v, _ = torch.topk(lt, min(top_k, V), dim=-1)
+            lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
+
+        if temperature > 0:
+            probs = F.softmax(lt, dim=-1)
+            return torch.multinomial(probs.reshape(-1, V), 1).reshape(B, n_block)
+        else:
+            return lt.argmax(dim=-1)
+
     generated = 0
     try:
         while generated < max_new_tokens:
@@ -82,22 +117,21 @@ def generate(
             mask[:, T - n_block :] = True
 
             output = model(seq, targets=None, mask=mask)
-            logits = output.logits
-
-            if logits is None:
+            if output.logits is None:
                 break
 
-            block_logits = logits[:, T - n_block :, :]
+            block_logits = output.logits[:, T - n_block :, :]
 
-            if temperature > 0:
-                lt = block_logits / temperature
-                if top_k > 0:
-                    v, _ = torch.topk(lt, min(top_k, V), dim=-1)
-                    lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
-                probs = F.softmax(lt, dim=-1)
-                new_tokens = torch.multinomial(probs.reshape(-1, V), 1).reshape(B, n_block)
-            else:
-                new_tokens = block_logits.argmax(dim=-1)
+            new_tokens = sample_tokens(block_logits, n_block, generated)
+
+            for pass_idx in range(1, refine_passes):
+                seq[:, T - n_block :] = new_tokens
+                mask_refined = torch.zeros_like(mask)
+                output = model(seq, targets=None, mask=mask_refined)
+                if output.logits is None:
+                    break
+                block_logits = output.logits[:, T - n_block :, :]
+                new_tokens = sample_tokens(block_logits, n_block, generated)
 
             if eos_token_id is not None and generated < min_tokens:
                 new_tokens[:, 0] = torch.where(
