@@ -127,6 +127,7 @@ _MUON_EXCLUDE = frozenset(
     {
         "embed",
         "lm_head",
+        "core_lm_head",
         "mask_embed",
         "norm",
         "router",
