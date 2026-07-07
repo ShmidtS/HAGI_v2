@@ -84,19 +84,26 @@ class MSAModule(nn.Module):
         self._chunk_low = cfg.chunk_size_low_entropy
         self._chunk_high = cfg.chunk_size_high_entropy
         self._default_chunk = cfg.slot_chunk_size
+        self._cached_chunk: int = 0
 
     def _select_chunk_size(self, h: torch.Tensor) -> int:
         if not self._adaptive_chunk:
             return self._default_chunk
+        if self._cached_chunk > 0:
+            return self._cached_chunk
         s_start, s_end = self._scalar_slice
         b_start, b_end = self._bivector_slice
-        scalar_var = h[..., s_start:s_end].float().var(dim=1).mean().item()
-        bivector_var = h[..., b_start:b_end].float().var(dim=1).mean().item()
+        with torch.no_grad():
+            scalar_var = h[..., s_start:s_end].float().var(dim=1).mean()
+            bivector_var = h[..., b_start:b_end].float().var(dim=1).mean()
         if bivector_var > scalar_var * 2:
-            return self._chunk_high
-        if scalar_var > bivector_var * 2:
-            return self._chunk_low
-        return self._default_chunk
+            chunk = self._chunk_high
+        elif scalar_var > bivector_var * 2:
+            chunk = self._chunk_low
+        else:
+            chunk = self._default_chunk
+        self._cached_chunk = chunk
+        return chunk
 
     def write(self, h: torch.Tensor) -> None:
         B, T, _ = h.shape
@@ -141,10 +148,11 @@ class MSAModule(nn.Module):
         to match the Switch Transformer load-balancing formulation.
         """
         counts = torch.bincount(indices.reshape(-1), minlength=self.cfg.max_slots).float()
-        total = counts.sum()
-        f = counts / total if total > 0 else counts
+        total = counts.sum().clamp(min=1.0)
+        f = counts / total
         P = (scores.softmax(dim=-1).mean(dim=0)).mean()
         return 0.01 * (f * P).sum()
 
     def clear(self) -> None:
         self.registry.clear()
+        self._cached_chunk = 0

@@ -44,6 +44,9 @@ class GP2DConfig:
     V5: GP2D acts as a channel encoder — geometric product between
     adjacent positions generates parity bits for error correction.
     The decoder can check consistency via inverse GP.
+
+    V6: Multi-scale GP2D with interleaving (LDPC-like). Multiple window
+    sizes provide parity at different frequency bands.
     """
 
     window: int = 1
@@ -52,6 +55,10 @@ class GP2DConfig:
     whiteness_weight: float = 0.01
     use_systematic_parity: bool = True
     parity_weight: float = 0.1
+    use_multiscale: bool = False
+    multiscale_windows: tuple = (1, 4, 16)
+    multiscale_gate_inits: tuple = (-2.0, -3.0, -4.0)
+    use_interleave: bool = True
 
 
 @dataclass
@@ -82,6 +89,7 @@ class RefinementConfig:
     extrinsic_alpha: float = 1.0
     convergence_threshold: float = 0.01
     use_convergence_halt: bool = True
+    use_gradient_checkpointing: bool = True
 
 
 @dataclass
@@ -167,6 +175,51 @@ class CASTConfig:
 
 
 @dataclass
+class VariationalBottleneckConfig:
+    """Variational Information Bottleneck — optimal source coding (V6).
+
+    Replaces deterministic linear bottleneck with stochastic encoding:
+    z = mu + eps * sigma, where KL(q(z|x)||N(0,I)) controls compression.
+    """
+
+    enabled: bool = False
+    kl_weight: float = 0.01
+    prior: str = "standard_normal"
+
+
+@dataclass
+class TurboDecoderConfig:
+    """Turbo decoder — dual-component iterative BP (V6).
+
+    Component A: attention-based (local parity).
+    Component B: MSA-based (long-range parity).
+    Extrinsic exchange between components with adaptive alpha.
+    """
+
+    enabled: bool = False
+    alpha_a_init: float = 0.8
+    alpha_b_init: float = 0.8
+    convergence_threshold: float = 0.01
+    min_iterations: int = 1
+    max_iterations: int = 6
+
+
+@dataclass
+class WaterFillingConfig:
+    """Water-filling capacity allocation across grades (V6).
+
+    Dynamic dimension allocation based on per-grade variance.
+    High-variance grades get more dims (more capacity).
+    """
+
+    enabled: bool = False
+    adaptation_rate: float = 0.001
+    min_dims: int = 8
+    temperature: float = 1.0
+    reg_weight: float = 0.001
+
+
+@dataclass
 class ModelConfig:
     """Full model architecture configuration."""
 
@@ -188,6 +241,9 @@ class ModelConfig:
     msa: MSAConfig = field(default_factory=MSAConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
     cast: CASTConfig = field(default_factory=CASTConfig)
+    variational_bottleneck: VariationalBottleneckConfig = field(default_factory=VariationalBottleneckConfig)
+    turbo_decoder: TurboDecoderConfig = field(default_factory=TurboDecoderConfig)
+    water_filling: WaterFillingConfig = field(default_factory=WaterFillingConfig)
 
 
 @dataclass
@@ -200,6 +256,7 @@ class TrainConfig:
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.5
+    muon_ns_steps: int = 5
     weight_decay: float = 0.1
     precision: str = "bf16"
     grad_accum_steps: int = 2
@@ -216,6 +273,8 @@ class TrainConfig:
     w_parity: float = 0.1
     w_extrinsic_info: float = 0.01
     w_efficiency: float = 0.001
+    w_kl_variational: float = 0.01
+    w_water_filling_reg: float = 0.001
     use_two_phase_schedule: bool = True
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15
@@ -238,6 +297,7 @@ class TrainConfig:
     distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
     distill_every: int = 2
+    tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 5000

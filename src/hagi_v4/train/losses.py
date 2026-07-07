@@ -58,6 +58,8 @@ class LossAggregator:
         self.w_parity = cfg.train.w_parity
         self.w_extrinsic_info = cfg.train.w_extrinsic_info
         self.w_efficiency = cfg.train.w_efficiency
+        self.w_ib = cfg.train.w_ib
+        self.w_kl_variational = cfg.train.w_kl_variational
         self.w_msa_lb = 0.01
 
     def __call__(
@@ -97,5 +99,7 @@ class LossAggregator:
             total = total - self.w_extrinsic_info * aux.extrinsic_info
         if aux.efficiency is not None:
             total = total + self.w_efficiency * aux.efficiency
+        if aux.ib is not None:
+            total = total + self.w_kl_variational * aux.ib
 
         return total
