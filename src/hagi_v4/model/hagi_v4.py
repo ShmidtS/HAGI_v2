@@ -33,6 +33,7 @@ from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
 from hagi_v4.model.transformer_block import TransformerBlock
 from hagi_v4.model.freq_layer import FreqBlock
 from hagi_v4.model.kalman import KalmanFilter
+from hagi_v4.model.cqi import CQIEstimator
 
 
 class TurboLoop(nn.Module):
@@ -128,6 +129,7 @@ class TurboLoop(nn.Module):
         step: int,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
+        cqi_mean: float = 0.5,
     ) -> tuple[torch.Tensor, dict]:
         B, T, C = z.shape
 
@@ -141,6 +143,13 @@ class TurboLoop(nn.Module):
         # Kalman state: diagonal covariance P per dimension
         p = torch.ones(C, device=z.device, dtype=z.dtype)
 
+        # Adaptive DFE taps: bad channel -> more feedback taps (5G adaptive equalizer)
+        base_k = self.msa.cfg.top_k
+        adaptive_k = base_k + int((1.0 - cqi_mean) * 4)
+
+        # Adaptive process noise: bad channel -> higher Q (5G adaptive coding)
+        q_scale = 1.0 + (1.0 - cqi_mean)
+
         self.msa.clear()
 
         for iteration in range(self.n_iters):
@@ -148,7 +157,7 @@ class TurboLoop(nn.Module):
 
             # DFE: read channel memory from previous iterations (cancel ISI)
             if iteration > 0:
-                msa_out, lb = self.msa.read(z, top_k=self.msa.cfg.top_k)
+                msa_out, lb = self.msa.read(z, top_k=adaptive_k)
                 z = z + msa_out
                 total_msa_lb = total_msa_lb + lb
 
@@ -158,8 +167,9 @@ class TurboLoop(nn.Module):
 
             z_pred = z
 
-            # Kalman prediction step: uncertainty grows
+            # Kalman prediction: adaptive Q (bad channel -> more uncertainty)
             p_pred = self.kalman.predict(p)
+            p_pred = p_pred * q_scale
 
             # Component B: GP2D parity check (measurement)
             z_meas, gp2d_residual = self.gp2d(z_pred)
@@ -221,6 +231,9 @@ class HAGIv4(nn.Module):
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
         self._H = H
         self._C = C
+
+        # CQI estimator (5G adaptive modulation/coding)
+        self.cqi = CQIEstimator(H)
 
         n_bins_down = C // 2 + 1
         rolloff_start = int(n_bins_down * 0.75)
@@ -324,16 +337,21 @@ class HAGIv4(nn.Module):
         for blk in self.perception:
             h, _, _ = blk(h, cos, sin)
 
+        # CQI: channel quality indicator (5G adaptive modulation/coding)
+        cqi = self.cqi(h)  # [B, T] in [0, 1]
+        cqi_mean = cqi.mean().item()
+
         # 3. Rate matching: raised-cosine FFT truncation H -> C
+        # Adaptive: high CQI -> wider bandwidth (keep more freq), low CQI -> narrower
         h_f = torch.fft.rfft(h.float(), dim=-1)
-        gate = torch.sigmoid(self.bottleneck_gate)
+        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi.mean())
         h_f_c = h_f[:, :, : self._C // 2 + 1] * gate.float()
         z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
 
-        # 4. LDPC iterative decoding (turbo loop)
+        # 4. LDPC iterative decoding (turbo loop, adaptive parameters)
         z, side_info = self.turbo(
             z,
             targets,
@@ -343,6 +361,7 @@ class HAGIv4(nn.Module):
             step=step,
             cos=cos,
             sin=sin,
+            cqi_mean=cqi_mean,
         )
 
         # 5. Rate dematching: raised-cosine zero-padding C -> H
