@@ -145,7 +145,7 @@ class GDRConfig:
 class MSAConfig:
     """Memory-Augmented Attention — slot registry + local 2D routing."""
 
-    max_slots: int = 4096
+    max_slots: int = 2048
     slot_chunk_size: int = 4
     use_adaptive_chunk_size: bool = True
     chunk_size_low_entropy: int = 8

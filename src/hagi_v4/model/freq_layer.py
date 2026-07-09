@@ -22,6 +22,13 @@ import torch.nn.functional as F
 
 from hagi_v4.model.norms import RMSNorm
 
+try:
+    from hagi_v4.model.triton_kernels import triton_freq_gating
+
+    _HAS_TRITON = True
+except Exception:
+    _HAS_TRITON = False
+
 
 class FactoredLinear(nn.Module):
     """Low-rank factored linear: Linear(in, r) -> Linear(r, out).
@@ -151,36 +158,43 @@ class FreqCoding2D(nn.Module):
             h = x_n.view(B, T, self.n_heads, self.head_dim)
         h = h.permute(0, 2, 1, 3).contiguous()
 
-        # Cyclic prefix (5G OFDM): prepend last CP tokens to prevent ISI
-        cp = max(1, min(4, T // 16))
-        h_cp = torch.cat([h[:, :, -cp:], h], dim=2)
-        T_cp = T + cp
-
-        X_f = torch.fft.rfft2(h_cp.float())
+        # FFT is inherently periodic — no cyclic prefix needed (unlike time-domain OFDM)
+        X_f = torch.fft.rfft2(h.float())
 
         F_t = X_f.shape[2]
         F_h = X_f.shape[3]
-        gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
-        gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())
-        gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
-
         Kt = min(self.n_modes_t, F_t)
         Kh = min(self.n_modes_h, F_h)
-        low = X_f[:, :, :Kt, :Kh]
 
-        phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
-        low = low * phase.unsqueeze(0)
+        gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
+        gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())
 
-        w_re = self.w_re_a.float() @ self.w_re_b.float()
-        w_im = self.w_im_a.float() @ self.w_im_b.float()
-        w = torch.complex(w_re, w_im)
-        low = low @ w[:, :Kh, :F_h]
+        if _HAS_TRITON and X_f.is_cuda and not torch.is_grad_enabled():
+            out_f = triton_freq_gating(
+                X_f,
+                gate_t,
+                gate_h,
+                self.phase[:, :Kt, :Kh].float(),
+                self.w_re_a.float(),
+                self.w_im_a.float(),
+                self.w_re_b.float(),
+                self.w_im_b.float(),
+                Kt,
+                Kh,
+            )
+        else:
+            gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
+            low = X_f[:, :, :Kt, :Kh]
+            phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
+            low = low * phase.unsqueeze(0)
+            w_re = self.w_re_a.float() @ self.w_re_b.float()
+            w_im = self.w_im_a.float() @ self.w_im_b.float()
+            w = torch.complex(w_re, w_im)
+            low = low @ w[:, :Kh, :F_h]
+            out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
+            out_f[:, :, :Kt, :] = low
 
-        out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
-        out_f[:, :, :Kt, :] = low
-
-        x_out = torch.fft.irfft2(out_f, s=(T_cp, self.head_dim)).to(orig_dtype)
-        x_out = x_out[:, :, cp:].contiguous()  # remove cyclic prefix
+        x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
 
         if self.proj_out is not None:
