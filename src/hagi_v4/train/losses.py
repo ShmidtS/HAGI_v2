@@ -60,6 +60,8 @@ class LossAggregator:
         self.w_efficiency = cfg.train.w_efficiency
         self.w_kl_variational = getattr(cfg.train, "w_kl_variational", 0.01)
         self.w_msa_lb = 0.01
+        self.w_contrastive = getattr(cfg.train, "w_contrastive", 0.0)
+        self.w_cross_modal_coherence = getattr(cfg.train, "w_cross_modal_coherence", 0.0)
 
     def __call__(
         self,
@@ -93,12 +95,14 @@ class LossAggregator:
         if aux.grade_spec is not None:
             total = total + self.w_grade_spec * aux.grade_spec
         if aux.parity is not None:
-            total = total - self.w_parity * aux.parity
+            total = total - self.w_parity * aux.parity.clamp(max=1.0)
         if aux.extrinsic_info is not None:
             total = total - self.w_extrinsic_info * aux.extrinsic_info
         if aux.efficiency is not None:
             total = total + self.w_efficiency * aux.efficiency
         if aux.ib is not None:
             total = total + self.w_kl_variational * aux.ib
+        if aux.contrastive is not None:
+            total = total + self.w_contrastive * aux.contrastive
 
         return total

@@ -1,21 +1,19 @@
-"""HAGI V5 — Codec Language Model.
+"""HAGI V7 — 5G NR-style pipeline (simplified).
 
-Architecture as communication channel (Shannon separation theorem):
+5G NR physical layer mapping:
+  Embed + Mask     = Transport block + CRC (source coding + erasure)
+  FreqBlock × N    = OFDM modulation (FFT/IFFT + equalization + QAM)
+  Linear bottleneck = Rate matching (deterministic puncturing, H→C)
+  Turbo loop × K   = LDPC iterative decoding
+    FreqBlock      = Component A (local OFDM equalization)
+    GP2D           = Component B (parity check)
+    Extrinsic      = Soft-information exchange
+  Linear up        = Rate dematching (C→H)
+  LM head          = Demodulation → bits
 
-  Source Encoder: embed → perception (H) → bottleneck_down (H→H/2)
-  Channel Encoder: GP2D parity in compressed space (H/2)
-  Channel: adaptive erasure (masking)
-  Channel Decoder: HRM iterative belief propagation in compressed space (H/2)
-  Source Decoder: bottleneck_up (H/2→H) → expression (H) → lm_head (H→V)
-
-Key insight: the refinement loop (7 layers × 4 iterations = 28 layer-apps,
-the most expensive part) operates in compressed space H/2=288.
-Only perception (2 layers) and expression (2 layers) run at full H=576.
-This gives 4x compute reduction and 2x memory reduction in the core.
-
-The bottleneck IS the information bottleneck — no separate IB loss needed.
-Deep supervision uses a lightweight core_lm_head (H/2→V) projected directly
-from compressed space, avoiding full H materialization at intermediate stages.
+Removed (no 5G analog):
+  GDR, MSA, z_H/z_L state machine, water_filling,
+  coherence head, deep supervision, VIB, perception/expression split
 """
 
 from __future__ import annotations
@@ -25,21 +23,153 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hagi_v4.config import HAGIv4Config
-from hagi_v4.model.cast import CoherenceHead
-from hagi_v4.model.gdr import GradeDecomposedRecurrence
 from hagi_v4.model.gp2d import GeometricProduct2D
-from hagi_v4.model.hrm import RefinementCore
-from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
+from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
-from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_grade_spec_loss, compute_whiteness_loss
+from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
 from hagi_v4.model.transformer_block import TransformerBlock
-from hagi_v4.model.turbo_decoder import TurboDecoder
-from hagi_v4.model.variational_bottleneck import VariationalBottleneck
-from hagi_v4.model.water_filling import WaterFillingAllocator
+from hagi_v4.model.freq_layer import FreqBlock
+from hagi_v4.model.kalman import KalmanFilter
+
+
+class TurboLoop(nn.Module):
+    """Simplified turbo decoding loop — 5G LDPC + channel memory + Kalman.
+
+    Channel memory techniques:
+      MSA read (iter>0) = Decision Feedback Equalizer (DFE) — past decisions cancel ISI
+      MSA write          = HARQ buffer — store parity-checked states for combining
+      Kalman filter      = Optimal channel estimation (blend prediction + measurement)
+      GP2D               = LDPC parity check
+      Convergence halt   = EXIT chart stopping criterion
+
+    No z_H/z_L, no GDR, no deep supervision, no coherence, no water_filling.
+    """
+
+    def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
+        super().__init__()
+        m = cfg.model
+        self.n_iters = m.refinement.num_iterations
+        self.min_iters = m.refinement.min_iterations
+        self.convergence_threshold = m.refinement.convergence_threshold
+        self.use_convergence_halt = m.refinement.use_convergence_halt
+
+        n_modes_t = m.freq_coding.n_modes_t
+        n_modes_h = m.freq_coding.n_modes_h
+        ffn_int = max(64, m.moe.intermediate_size * hidden_size // m.hidden_size)
+
+        self.reasoning = nn.ModuleList(
+            FreqBlock(
+                hidden_size,
+                n_heads=m.attention.num_query_heads,
+                head_dim=m.attention.head_dim,
+                n_modes_t=n_modes_t,
+                n_modes_h=n_modes_h,
+                ffn_intermediate=ffn_int,
+                T_max=m.attention.max_seq_len,
+                norm_eps=m.norm_eps,
+            )
+            for _ in range(m.reasoning_layers)
+        )
+
+        if m.gp2d.use_multiscale:
+            self.gp2d = MultiScaleGP2D(
+                m.gp2d,
+                hidden_size,
+                scales=m.gp2d.multiscale_windows,
+                gate_inits=m.gp2d.multiscale_gate_inits,
+                use_interleave=m.gp2d.use_interleave,
+            )
+        else:
+            self.gp2d = GeometricProduct2D(m.gp2d, hidden_size)
+
+        self.msa = MSAModule(m.msa, hidden_size)
+
+        self.kalman = KalmanFilter(hidden_size)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        targets: torch.Tensor | None,
+        lm_head_weight: torch.Tensor,
+        mask: torch.Tensor | None,
+        training: bool,
+        step: int,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        B, T, C = z.shape
+
+        total_parity = z.new_zeros(())
+        total_msa_lb = z.new_zeros(())
+        extrinsic_norms: list[float] = []
+        converged_at = self.n_iters
+        iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
+        gp2d_residual = torch.zeros_like(z)
+
+        # Kalman state: diagonal covariance P per dimension
+        p = torch.ones(C, device=z.device, dtype=z.dtype)
+
+        self.msa.clear()
+
+        for iteration in range(self.n_iters):
+            h_prior = z
+
+            # DFE: read channel memory from previous iterations (cancel ISI)
+            if iteration > 0:
+                msa_out, lb = self.msa.read(z, top_k=self.msa.cfg.top_k)
+                z = z + msa_out
+                total_msa_lb = total_msa_lb + lb
+
+            # Component A: reasoning blocks (prediction = OFDM equalization)
+            for blk in self.reasoning:
+                z, _, _ = blk(z, cos, sin)
+
+            z_pred = z
+
+            # Kalman prediction step: uncertainty grows
+            p_pred = self.kalman.predict(p)
+
+            # Component B: GP2D parity check (measurement)
+            z_meas, gp2d_residual = self.gp2d(z_pred)
+            total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
+
+            # Kalman update step: optimal blend of prediction and measurement
+            z, p = self.kalman.update(z_pred, z_meas, p_pred)
+
+            # Innovation norm for convergence check
+            ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().item()
+            extrinsic_norms.append(ext_norm)
+
+            # HARQ: write parity-checked state to channel memory buffer
+            self.msa.write(z)
+
+            combined_ext = ext_norm
+            if self.use_convergence_halt and iteration >= self.min_iters:
+                if combined_ext < self.convergence_threshold:
+                    converged_at = iteration + 1
+                    iterations_used = torch.full_like(iterations_used, iteration + 1)
+                    break
+
+        side_info = {
+            "parity_strength": total_parity / max(converged_at, 1),
+            "extrinsic_norms": extrinsic_norms,
+            "iterations_used": iterations_used,
+            "moe_lb": z.new_zeros(()),
+            "msa_lb": total_msa_lb / max(converged_at, 1),
+            "gdr_router_loss": z.new_zeros(()),
+            "gdr_gate_probs": None,
+            "moe_router_probs": None,
+            "gp2d_residual": gp2d_residual,
+            "deep_supervision_loss": None,
+        }
+
+        return z, side_info
 
 
 class HAGIv4(nn.Module):
+    """HAGI V7 — 5G NR-style codec language model."""
+
     def __init__(self, cfg: HAGIv4Config) -> None:
         super().__init__()
         self.cfg = cfg
@@ -50,66 +180,47 @@ class HAGIv4(nn.Module):
         self.embed = nn.Embedding(m.vocab_size, H)
         self.mask_embed = nn.Parameter(torch.zeros(H))
 
-        self.perception = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.perception_layers))
-
-        self.use_variational_bottleneck = m.variational_bottleneck.enabled
-        if self.use_variational_bottleneck:
-            self.variational_bottleneck = VariationalBottleneck(
-                input_dim=H,
-                compressed_dim=C,
-                kl_weight=m.variational_bottleneck.kl_weight,
-                norm_eps=m.norm_eps,
-            )
-            self.bottleneck_down = None
-            self.bottleneck_norm = None
-            self.bottleneck_up = None
-        else:
-            self.bottleneck_down = nn.Linear(H, C, bias=False)
-            self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
-            self.bottleneck_up = nn.Linear(C, H, bias=False)
-
+        # Rate matching: deterministic bottleneck (no VIB)
+        self.bottleneck_down = nn.Linear(H, C, bias=False)
+        self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
+        self.bottleneck_up = nn.Linear(C, H, bias=False)
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
 
-        if m.gp2d.use_multiscale:
-            self.gp2d = MultiScaleGP2D(
-                m.gp2d,
-                C,
-                scales=m.gp2d.multiscale_windows,
-                gate_inits=m.gp2d.multiscale_gate_inits,
-                use_interleave=m.gp2d.use_interleave,
+        # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
+        self.use_freq_coding = m.freq_coding.enabled
+        n_modes_t = m.freq_coding.n_modes_t
+        n_modes_h = m.freq_coding.n_modes_h
+        ffn_int_h = max(64, m.moe.intermediate_size * H // m.hidden_size)
+        ffn_int_c = max(64, m.moe.intermediate_size * C // m.hidden_size)
+
+        if self.use_freq_coding:
+            self.perception = nn.ModuleList(
+                FreqBlock(
+                    H,
+                    n_heads=m.attention.num_query_heads,
+                    head_dim=m.attention.head_dim,
+                    n_modes_t=n_modes_t,
+                    n_modes_h=n_modes_h,
+                    ffn_intermediate=ffn_int_h,
+                    T_max=m.attention.max_seq_len,
+                    norm_eps=m.norm_eps,
+                )
+                for _ in range(m.perception_layers)
             )
         else:
-            self.gp2d = GeometricProduct2D(m.gp2d, C)
+            self.perception = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.perception_layers))
 
-        self.reasoning = nn.ModuleList(TransformerBlock(m, hidden_size=C) for _ in range(m.reasoning_layers))
-        self.gdr = GradeDecomposedRecurrence(m.gdr, C)
+        # Turbo decoding loop (LDPC iterative decode)
+        self.turbo = TurboLoop(cfg, C)
 
-        self.use_turbo_decoder = m.turbo_decoder.enabled
-        if self.use_turbo_decoder:
-            self.hrm = TurboDecoder(m.hrm, m.refinement, hidden_size=C)
-        else:
-            self.hrm = RefinementCore(m.hrm, m.refinement, C)
-        self.hrm.set_max_steps(cfg.train.max_steps)
-
-        self.msa = MSAModule(m.msa, C)
-
-        self.use_water_filling = m.water_filling.enabled
-        if self.use_water_filling:
-            self.water_filling = WaterFillingAllocator(
-                total_dims=C,
-                num_grades=4,
-                min_dims=m.water_filling.min_dims,
-                temperature=m.water_filling.temperature,
-            )
-
+        # LM head (demodulation → bits)
         self.core_lm_head = nn.Linear(C, m.vocab_size, bias=False)
         nn.init.normal_(self.core_lm_head.weight, mean=0.0, std=0.02)
 
-        self.expression = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.expression_layers))
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
         self.lm_head = nn.Linear(H, m.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
-        self.coherence = CoherenceHead(m.cast, H, lm_head=self.lm_head, final_norm=self.final_norm)
+
         self._init_weights()
         self._init_mask_embeds()
 
@@ -125,67 +236,52 @@ class HAGIv4(nn.Module):
     def _init_mask_embeds(self) -> None:
         with torch.no_grad():
             self.mask_embed.data.copy_(self.embed.weight.mean(dim=0))
-            self.core_mask_embed.data.zero_()
-
-    def _rope(self, T: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        a = self.cfg.model.attention
-        return build_rope_cache(T, a.head_dim, a.rope_theta, device, dtype)
+            self.core_mask_embed.data.copy_(self.bottleneck_down(self.mask_embed.data))
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         step: int = 0,
+        images: torch.Tensor | None = None,
+        spectrograms: torch.Tensor | None = None,
+        modality_ids: torch.Tensor | None = None,
     ) -> ModelOutput:
         B, T = input_ids.shape
 
+        # 1. Source coding: token → embedding
         h = self.embed(input_ids)
         if mask is not None:
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
-        cos, sin = self._rope(T, h.device, h.dtype)
-
+        # 2. OFDM pre-equalization (perception)
+        cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
         for blk in self.perception:
             h, _, _ = blk(h, cos, sin)
 
-        kl_loss: torch.Tensor | None = None
-        if self.use_variational_bottleneck:
-            z, _, kl_loss = self.variational_bottleneck(h)
-        else:
-            z = self.bottleneck_down(h)
-            z = self.bottleneck_norm(z)
-
+        # 3. Rate matching: H → C (deterministic)
+        z = self.bottleneck_down(h)
+        z = self.bottleneck_norm(z)
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
 
-        self.msa.clear()
-        z, side_info = self.hrm(
+        # 4. LDPC iterative decoding (turbo loop)
+        z, side_info = self.turbo(
             z,
-            self.reasoning,
-            self.gdr,
-            self.gp2d,
-            self.msa,
-            cos,
-            sin,
             targets,
             self.core_lm_head.weight,
+            mask,
             training=self.training,
-            mask=mask,
             step=step,
-            extrinsic_alpha=self.cfg.model.refinement.extrinsic_alpha,
-            convergence_threshold=self.cfg.model.refinement.convergence_threshold,
-            use_convergence_halt=self.cfg.model.refinement.use_convergence_halt,
+            cos=cos,
+            sin=sin,
         )
 
-        if self.use_variational_bottleneck:
-            h = self.variational_bottleneck.decode(z)
-        else:
-            h = self.bottleneck_up(z)
+        # 5. Rate dematching: C → H
+        h = self.bottleneck_up(z)
 
-        for blk in self.expression:
-            h, _, _ = blk(h, cos, sin)
-
+        # 6. Demodulation → bits
         h_normed = self.final_norm(h)
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
         if targets is not None and mask_valid:
@@ -201,52 +297,26 @@ class HAGIv4(nn.Module):
             logits = F.linear(h_normed, self.lm_head.weight)
             ce = None
 
+        # 7. Auxiliary losses (minimal — only parity + whiteness)
         aux = AuxLosses()
         if targets is not None:
-            aux.deep_supervision = side_info.deep_supervision_loss
-            aux.moe_lb = side_info.moe_lb
-            aux.msa_lb = side_info.msa_lb
-            aux.gdr_router = side_info.gdr_router_loss
-            aux.coherence = self.coherence.coherence_loss(h)
-
-            if self.cfg.model.gp2d.use_whiteness_loss and side_info.gp2d_residual is not None:
-                aux.whiteness = compute_whiteness_loss(side_info.gp2d_residual)
-
-            if (
-                self.cfg.model.moe.use_grade_specialization
-                and side_info.gdr_gate_probs is not None
-                and side_info.moe_router_probs is not None
-            ):
-                grade_spec = h.new_zeros(())
-                for rp in side_info.moe_router_probs:
-                    gs = compute_grade_spec_loss(
-                        side_info.gdr_gate_probs,
-                        rp,
-                        num_experts=self.cfg.model.moe.num_experts,
-                    )
-                    grade_spec = grade_spec + self.cfg.model.moe.grade_specialization_weight * gs
-                aux.grade_spec = grade_spec
-
-            if side_info.parity_strength is not None:
-                aux.parity = side_info.parity_strength
-
-            if side_info.extrinsic_norms and len(side_info.extrinsic_norms) > 1:
-                aux.extrinsic_info = h.new_tensor(sum(side_info.extrinsic_norms) / len(side_info.extrinsic_norms))
-
-            if side_info.iterations_used is not None:
-                aux.efficiency = side_info.iterations_used.float().mean()
-
-            if kl_loss is not None:
-                aux.ib = kl_loss
-
-            if self.use_water_filling:
-                _, wf_reg = self.water_filling()
-                aux.grade_spec = (aux.grade_spec if aux.grade_spec is not None else h.new_zeros(())) + wf_reg
+            if side_info["parity_strength"] is not None:
+                aux.parity = side_info["parity_strength"]
+            if self.cfg.model.gp2d.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
+                aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"])
+            if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
+                aux.extrinsic_info = h.new_tensor(sum(side_info["extrinsic_norms"]) / len(side_info["extrinsic_norms"]))
+            if side_info.get("iterations_used") is not None:
+                aux.efficiency = side_info["iterations_used"].float().mean()
 
         return ModelOutput(
             logits=logits,
             hidden=h,
             aux=aux,
             ce_loss=ce,
-            iterations_used=side_info.iterations_used,
+            iterations_used=side_info.get("iterations_used"),
         )
+
+    def _rope(self, T: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        a = self.cfg.model.attention
+        return build_rope_cache(T, a.head_dim, a.rope_theta, device, dtype)

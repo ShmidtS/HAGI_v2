@@ -289,7 +289,7 @@ class RefinementCore(nn.Module):
             h_prior = h
 
             if iteration > 0:
-                msa_out, lb = msa.read(h, top_k=6)
+                msa_out, lb = msa.read(h, top_k=msa.cfg.top_k)
                 h = h + msa_out
                 total_msa_lb = total_msa_lb + lb
 

@@ -23,11 +23,14 @@ class TransformerBlock(nn.Module):
         hd = m.attention.head_dim
         if H < nh * hd:
             nh = max(1, H // hd)
+        nkh = max(1, nh // 2)
+        while nh % nkh != 0:
+            nkh -= 1
         self.attn_norm = RMSNorm(H, m.norm_eps, fp32_variance=m.attention.fp32_rmsnorm)
         self.attn = GroupedQueryAttention(
             hidden_size=H,
             num_q_heads=nh,
-            num_kv_heads=max(1, nh // 2),
+            num_kv_heads=nkh,
             head_dim=hd,
             rope_theta=m.attention.rope_theta,
             bidirectional=m.attention.bidirectional,

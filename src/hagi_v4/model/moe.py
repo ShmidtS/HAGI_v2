@@ -66,7 +66,7 @@ class MoESwiGLU(nn.Module):
         self.skip_idx = self.num_experts if self.use_mod_skip else -1
 
         self.router = nn.Linear(hidden_size + 1, router_out, bias=False)
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.router.weight, mean=0.0, std=cfg.router_init_std)
 
         if self.n_shared_bases > 0:
             N = self.n_shared_bases
@@ -136,7 +136,7 @@ class MoESwiGLU(nn.Module):
 
         router_logits = self.router(router_input)
         if self.training:
-            noise = torch.randn_like(router_logits) * 0.01
+            noise = torch.randn_like(router_logits) * self.cfg.router_noise
             router_logits = router_logits + noise.detach()
 
         router_probs = F.softmax(router_logits, dim=-1)
