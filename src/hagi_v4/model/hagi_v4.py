@@ -18,6 +18,8 @@ Removed (no 5G analog):
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -76,6 +78,11 @@ class TurboLoop(nn.Module):
         self.shared_w = nn.ParameterList(shared_w)
         self.shared_phase = shared_phase
 
+        from hagi_v4.model.freq_layer import FactoredSwiGLU
+
+        shared_ffn = FactoredSwiGLU(hidden_size, ffn_int, ffn_rank)
+        self.shared_ffn = shared_ffn
+
         self.reasoning = nn.ModuleList(
             FreqBlock(
                 hidden_size,
@@ -90,6 +97,7 @@ class TurboLoop(nn.Module):
                 ffn_rank=ffn_rank,
                 shared_weights=shared_w,
                 shared_phase=shared_phase,
+                shared_ffn=shared_ffn,
                 norm_eps=m.norm_eps,
             )
             for _ in range(m.reasoning_layers)
@@ -157,15 +165,18 @@ class TurboLoop(nn.Module):
             z_meas, gp2d_residual = self.gp2d(z_pred)
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 
-            # Kalman update step: optimal blend of prediction and measurement
-            z, p = self.kalman.update(z_pred, z_meas, p_pred)
+            # Kalman update: iteration-dependent R (5G iterative channel estimation)
+            # R decreases with iteration: trust measurement more as decoding converges
+            r_decay = 0.5**iteration
+            z, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay)
 
             # Innovation norm for convergence check
             ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().item()
             extrinsic_norms.append(ext_norm)
 
-            # HARQ: write parity-checked state to channel memory buffer
-            self.msa.write(z)
+            # HARQ Type II: store INNOVATION (incremental redundancy), not full state
+            innovation = z - h_prior
+            self.msa.write(innovation.detach() if not training else innovation)
 
             combined_ext = ext_norm
             if self.use_convergence_halt and iteration >= self.min_iters:
@@ -203,11 +214,31 @@ class HAGIv4(nn.Module):
         self.embed = nn.Embedding(m.vocab_size, H)
         self.mask_embed = nn.Parameter(torch.zeros(H))
 
-        # Rate matching: deterministic bottleneck (no VIB)
-        self.bottleneck_down = nn.Linear(H, C, bias=False)
+        # Rate matching: raised-cosine FFT truncation (5G pulse shaping)
+        # Hard truncation = brick-wall filter = Gibbs ringing (echo)
+        # Raised-cosine = smooth rolloff = no echo (5G standard)
         self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
-        self.bottleneck_up = nn.Linear(C, H, bias=False)
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
+        self._H = H
+        self._C = C
+
+        n_bins_down = C // 2 + 1
+        rolloff_start = int(n_bins_down * 0.75)
+        t = torch.arange(n_bins_down - rolloff_start, dtype=torch.float32)
+        t = t / max(n_bins_down - rolloff_start, 1)
+        rc = torch.ones(n_bins_down)
+        rc[rolloff_start:] = 0.5 * (1 + torch.cos(t * math.pi))
+        self.bottleneck_gate = nn.Parameter(rc)
+
+        n_bins_up = H // 2 + 1
+        c_bins = C // 2 + 1
+        rc_up = torch.zeros(n_bins_up)
+        rc_up[:c_bins] = 1.0
+        rolloff_up = max(1, int(c_bins * 0.25))
+        n_rolloff = c_bins - rolloff_up
+        t_up = torch.arange(n_rolloff, dtype=torch.float32) / max(n_rolloff, 1)
+        rc_up[rolloff_up:c_bins] = 0.5 * (1 + torch.cos(t_up * math.pi))
+        self.bottleneck_up_gate = nn.Parameter(rc_up)
 
         # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
         self.use_freq_coding = m.freq_coding.enabled
@@ -261,7 +292,10 @@ class HAGIv4(nn.Module):
     def _init_mask_embeds(self) -> None:
         with torch.no_grad():
             self.mask_embed.data.copy_(self.embed.weight.mean(dim=0))
-            self.core_mask_embed.data.copy_(self.bottleneck_down(self.mask_embed.data))
+            me_f = torch.fft.rfft(self.mask_embed.data.float())
+            gate = torch.sigmoid(self.bottleneck_gate)
+            me_f_c = me_f[: self._C // 2 + 1] * gate.float()
+            self.core_mask_embed.data.copy_(torch.fft.irfft(me_f_c, n=self._C).to(self.mask_embed.dtype))
 
     def forward(
         self,
@@ -275,9 +309,14 @@ class HAGIv4(nn.Module):
     ) -> ModelOutput:
         B, T = input_ids.shape
 
-        # 1. Source coding: token → embedding
+        # 1. Source coding: token -> embedding
         h = self.embed(input_ids)
         if mask is not None:
+            # Pilot symbols (5G): every 8th position is never masked
+            # These serve as channel estimation references for MSA/Kalman
+            pilot_mask = torch.ones(T, dtype=torch.bool, device=input_ids.device)
+            pilot_mask[::8] = False  # every 8th position is pilot
+            mask = mask & pilot_mask.unsqueeze(0)
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
         # 2. OFDM pre-equalization (perception)
@@ -285,8 +324,11 @@ class HAGIv4(nn.Module):
         for blk in self.perception:
             h, _, _ = blk(h, cos, sin)
 
-        # 3. Rate matching: H → C (deterministic)
-        z = self.bottleneck_down(h)
+        # 3. Rate matching: raised-cosine FFT truncation H -> C
+        h_f = torch.fft.rfft(h.float(), dim=-1)
+        gate = torch.sigmoid(self.bottleneck_gate)
+        h_f_c = h_f[:, :, : self._C // 2 + 1] * gate.float()
+        z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
@@ -303,8 +345,13 @@ class HAGIv4(nn.Module):
             sin=sin,
         )
 
-        # 5. Rate dematching: C -> H
-        h = self.bottleneck_up(z)
+        # 5. Rate dematching: raised-cosine zero-padding C -> H
+        z_f = torch.fft.rfft(z.float(), dim=-1)
+        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
+        c_bins = self._C // 2 + 1
+        gate_up = torch.sigmoid(self.bottleneck_up_gate)
+        z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins].float()
+        h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
         # 6. Demodulation refinement (expression = 5G demapper)
         for blk in self.expression:
