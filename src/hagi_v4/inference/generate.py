@@ -34,8 +34,8 @@ def generate(
     noise_ratio: float = 0.0,
     block_size: int = 16,
     refine_passes: int = 2,
-    repetition_penalty: float = 0.8,
-    repetition_window: int = 32,
+    repetition_penalty: float = 1.5,
+    repetition_window: int = 64,
 ) -> torch.Tensor:
     """Generate text block-parallel with Turbo-style iterative refinement.
 

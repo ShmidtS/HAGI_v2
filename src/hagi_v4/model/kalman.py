@@ -64,23 +64,20 @@ class KalmanFilter(nn.Module):
         z_pred: torch.Tensor,
         z_meas: torch.Tensor,
         p_pred: torch.Tensor,
+        r_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Measurement update: optimal Bayesian blend.
 
-        K = P_pred / (P_pred + R)
+        K = P_pred / (P_pred + R * r_scale)
         z = z_pred + K * (z_meas - z_pred)
         P = (1 - K) * P_pred
 
-        Args:
-            z_pred: [B, T, C] predicted state (from FreqBlock)
-            z_meas: [B, T, C] measured state (from GP2D)
-            p_pred: [C] predicted diagonal covariance
-
-        Returns:
-            z_corrected: [B, T, C] optimally estimated state
-            p_corrected: [C] updated diagonal covariance
+        r_scale: iteration-dependent measurement noise scaling.
+        Early iterations: r_scale=1.0 (high noise, trust prediction).
+        Late iterations: r_scale<1.0 (low noise, trust measurement).
+        This is 5G iterative channel estimation: uncertainty decreases.
         """
-        r = torch.exp(self.log_r).to(p_pred.dtype)
+        r = torch.exp(self.log_r).to(p_pred.dtype) * r_scale
 
         # Kalman gain (diagonal, broadcast over B,T)
         k = p_pred / (p_pred + r + 1e-8)

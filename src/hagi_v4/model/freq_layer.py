@@ -151,7 +151,12 @@ class FreqCoding2D(nn.Module):
             h = x_n.view(B, T, self.n_heads, self.head_dim)
         h = h.permute(0, 2, 1, 3).contiguous()
 
-        X_f = torch.fft.rfft2(h.float())
+        # Cyclic prefix (5G OFDM): prepend last CP tokens to prevent ISI
+        cp = max(1, min(4, T // 16))
+        h_cp = torch.cat([h[:, :, -cp:], h], dim=2)
+        T_cp = T + cp
+
+        X_f = torch.fft.rfft2(h_cp.float())
 
         F_t = X_f.shape[2]
         F_h = X_f.shape[3]
@@ -174,7 +179,8 @@ class FreqCoding2D(nn.Module):
         out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
         out_f[:, :, :Kt, :] = low
 
-        x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
+        x_out = torch.fft.irfft2(out_f, s=(T_cp, self.head_dim)).to(orig_dtype)
+        x_out = x_out[:, :, cp:].contiguous()  # remove cyclic prefix
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
 
         if self.proj_out is not None:
@@ -203,6 +209,7 @@ class FreqBlock(nn.Module):
         ffn_rank: int | None = None,
         shared_weights: tuple | None = None,
         shared_phase: nn.Parameter | None = None,
+        shared_ffn: nn.Module | None = None,
         norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -223,7 +230,10 @@ class FreqBlock(nn.Module):
             norm_eps=norm_eps,
         )
         self.ffn_norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.ffn = FactoredSwiGLU(hidden_size, ffn_intermediate, ffn_rank)
+        if shared_ffn is not None:
+            self.ffn = shared_ffn
+        else:
+            self.ffn = FactoredSwiGLU(hidden_size, ffn_intermediate, ffn_rank)
 
     def forward(
         self,
