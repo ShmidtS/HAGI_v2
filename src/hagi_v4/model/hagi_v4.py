@@ -151,57 +151,57 @@ class TurboLoop(nn.Module):
 
         self.msa.clear()
 
+        w_shared = None
+        phase_shared = None
+        if self.shared_w is not None:
+            w_re = self.shared_w[0].float() @ self.shared_w[2].float()
+            w_im = self.shared_w[1].float() @ self.shared_w[3].float()
+            w_shared = torch.complex(w_re, w_im)
+        if self.shared_phase is not None:
+            Kt = min(self.shared_phase.shape[1], T)
+            Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
+            phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
+        tanh_scale = 10.0
+
         for iteration in range(self.n_iters):
             h_prior = z
 
-            # DFE: read channel memory from previous iterations (cancel ISI)
             if iteration > 0:
                 msa_out, lb = self.msa.read(z, top_k=adaptive_k)
                 z = z + msa_out
                 total_msa_lb = total_msa_lb + lb
 
-            # Component A: reasoning blocks — layered decoding (5G LDPC)
-            # Not all layers every iteration: cycle through subsets for faster convergence
             layers_per_iter = max(2, len(self.reasoning) // 2)
             start = (iteration * layers_per_iter) % len(self.reasoning)
             for i in range(layers_per_iter):
                 idx = (start + i) % len(self.reasoning)
                 blk = self.reasoning[idx]
                 if training:
-                    z = z + blk.freq(z, cos, sin)
+                    z = z + blk.freq(z, cos, sin, cached_w=w_shared, cached_phase=phase_shared)
                     z = z + checkpoint(blk.ffn, blk.ffn_norm(z), use_reentrant=False)
                 else:
-                    z, _, _ = blk(z, cos, sin)
+                    z, _, _ = blk(z, cos, sin, cached_w=w_shared, cached_phase=phase_shared)
 
             z_pred = z
 
-            # Kalman prediction: adaptive Q (bad channel -> more uncertainty)
             p_pred = self.kalman.predict(p)
             p_pred = p_pred * q_scale
 
-            # Component B: GP2D parity check (measurement)
             z_meas, gp2d_residual = self.gp2d(z_pred)
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 
-            # Kalman update: iteration-dependent R (5G iterative channel estimation)
             r_decay = 0.5**iteration
             z_kalman, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay)
 
-            # Soft syndrome (5G LDPC): only correct dimensions where residual is large
-            # Small residual = dimension already correct = no correction needed
             correction = z_kalman - z_pred
             correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
             z = z_pred + correction_gate * correction
 
-            # Soft limiter (5G PA Rapp model): tanh saturation, no hard clipping
-            # Small z: linear (no distortion). Large z: asymptotically approaches ±10.
-            z = 10.0 * torch.tanh(z / 10.0)
+            z = tanh_scale * torch.tanh(z / tanh_scale)
 
-            # Innovation norm for convergence check
             ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().detach()
             extrinsic_norms.append(ext_norm)
 
-            # HARQ Type II: store gated INNOVATION (soft threshold, 5G incremental redundancy)
             innovation = z - h_prior
             inn_mag = innovation.float().norm(dim=-1, keepdim=True)
             write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * 5).to(innovation.dtype)
@@ -269,6 +269,7 @@ class HAGIv4(nn.Module):
         t_up = torch.arange(n_rolloff, dtype=torch.float32) / max(n_rolloff, 1)
         rc_up[rolloff_up:c_bins] = 0.5 * (1 + torch.cos(t_up * math.pi))
         self.bottleneck_up_gate = nn.Parameter(rc_up)
+        self.register_buffer("_z_pad_template", torch.zeros(1, 1, H // 2 + 1, dtype=torch.complex64), persistent=False)
 
         # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
         self.use_freq_coding = m.freq_coding.enabled
@@ -414,7 +415,7 @@ class HAGIv4(nn.Module):
         # 5. Rate dematching: raised-cosine zero-padding C -> H
         # CQI-adaptive (symmetric with Stage 3): high CQI -> wider reconstruction
         z_f = torch.fft.rfft(z.float(), dim=-1)
-        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
+        z_pad = self._z_pad_template.to(torch.complex64).expand(B, T, -1).clone()
         c_bins = self._C // 2 + 1
         gate_up = torch.sigmoid(self.bottleneck_up_gate) * (0.5 + 0.5 * cqi_mean_t)
         z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins].float()
