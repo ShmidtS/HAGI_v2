@@ -147,6 +147,8 @@ class FreqCoding2D(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
+        cached_w: torch.Tensor | None = None,
+        cached_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, H = x.shape
         orig_dtype = x.dtype
@@ -158,7 +160,6 @@ class FreqCoding2D(nn.Module):
             h = x_n.view(B, T, self.n_heads, self.head_dim)
         h = h.permute(0, 2, 1, 3).contiguous()
 
-        # FFT is inherently periodic — no cyclic prefix needed (unlike time-domain OFDM)
         X_f = torch.fft.rfft2(h.float())
 
         F_t = X_f.shape[2]
@@ -185,17 +186,21 @@ class FreqCoding2D(nn.Module):
         else:
             gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
             low = X_f[:, :, :Kt, :Kh]
-            phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
+            if cached_phase is not None:
+                phase = cached_phase
+            else:
+                phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
             low = low * phase.unsqueeze(0)
-            w_re = self.w_re_a.float() @ self.w_re_b.float()
-            w_im = self.w_im_a.float() @ self.w_im_b.float()
-            w = torch.complex(w_re, w_im)
+            if cached_w is not None:
+                w = cached_w
+            else:
+                w_re = self.w_re_a.float() @ self.w_re_b.float()
+                w_im = self.w_im_a.float() @ self.w_im_b.float()
+                w = torch.complex(w_re, w_im)
             low = low @ w[:, :Kh, :F_h]
             out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
             out_f[:, :, :Kt, :] = low
 
-        # PAPR reduction (5G OFDM): soft magnitude limiter on frequency bins
-        # tanh-based: smooth, differentiable, preserves phase, no hard clipping
         mag = out_f.abs()
         mag_soft = 10.0 * torch.tanh(mag / 10.0)
         out_f = out_f * (mag_soft / (mag + 1e-8))
@@ -262,7 +267,9 @@ class FreqBlock(nn.Module):
         sin: torch.Tensor | None = None,
         modality_ids: torch.Tensor | None = None,
         all_outputs: list | None = None,
+        cached_w: torch.Tensor | None = None,
+        cached_phase: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = x + self.freq(x, cos, sin)
+        x = x + self.freq(x, cos, sin, cached_w=cached_w, cached_phase=cached_phase)
         x = x + self.ffn(self.ffn_norm(x))
         return x, torch.tensor(0.0, device=x.device), x.new_zeros((0,))
