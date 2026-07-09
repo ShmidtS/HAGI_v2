@@ -248,11 +248,13 @@ def train_step(
 
     result = {
         "loss": total_loss / max(accum, 1),
-        "moe_aux": float(output.aux.moe_lb.detach()) if output.aux.moe_lb is not None else 0.0,
-        "gdr_router": float(output.aux.gdr_router.detach()) if output.aux.gdr_router is not None else 0.0,
         "parity": float(output.aux.parity.detach()) if output.aux.parity is not None else 0.0,
         "extrinsic_info": float(output.aux.extrinsic_info.detach()) if output.aux.extrinsic_info is not None else 0.0,
         "efficiency": float(output.aux.efficiency.detach()) if output.aux.efficiency is not None else 0.0,
+        "msa_lb": float(output.aux.msa_lb.detach()) if output.aux.msa_lb is not None else 0.0,
+        "rate_distortion": float(output.aux.rate_distortion.detach())
+        if output.aux.rate_distortion is not None
+        else 0.0,
         "avg_confidence": avg_confidence,
         "grad_norm": grad_norm,
         "mask_ratio": mask_ratio,

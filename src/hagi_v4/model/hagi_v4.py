@@ -48,7 +48,6 @@ class TurboLoop(nn.Module):
       Convergence halt   = EXIT chart stopping criterion
 
     No z_H/z_L, no GDR, no deep supervision, no coherence.
-    Per-position Kalman P: masked positions get higher initial uncertainty.
     """
 
     def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
@@ -162,6 +161,8 @@ class TurboLoop(nn.Module):
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
         tanh_scale = 10.0
+        q_cached = torch.exp(self.kalman.log_q).to(z.dtype)
+        r_cached = torch.exp(self.kalman.log_r).to(z.dtype)
 
         for iteration in range(self.n_iters):
             h_prior = z
@@ -184,14 +185,14 @@ class TurboLoop(nn.Module):
 
             z_pred = z
 
-            p_pred = self.kalman.predict(p)
+            p_pred = self.kalman.predict(p, q=q_cached)
             p_pred = p_pred * q_scale
 
             z_meas, gp2d_residual = self.gp2d(z_pred)
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 
             r_decay = 0.5**iteration
-            z_kalman, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay)
+            z_kalman, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay, r=r_cached)
 
             correction = z_kalman - z_pred
             correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
@@ -269,7 +270,7 @@ class HAGIv4(nn.Module):
         t_up = torch.arange(n_rolloff, dtype=torch.float32) / max(n_rolloff, 1)
         rc_up[rolloff_up:c_bins] = 0.5 * (1 + torch.cos(t_up * math.pi))
         self.bottleneck_up_gate = nn.Parameter(rc_up)
-        self.register_buffer("_z_pad_template", torch.zeros(1, 1, H // 2 + 1, dtype=torch.complex64), persistent=False)
+        self._pilot_idx_cache: dict[int, torch.Tensor] = {}
 
         # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
         self.use_freq_coding = m.freq_coding.enabled
@@ -346,6 +347,20 @@ class HAGIv4(nn.Module):
             me_f_c = me_f[: self._C // 2 + 1] * gate.float()
             self.core_mask_embed.data.copy_(torch.fft.irfft(me_f_c, n=self._C).to(self.mask_embed.dtype))
 
+    def _freq_blocks_forward(self, h: torch.Tensor, cos, sin) -> torch.Tensor:
+        for blk in self.perception:
+            if self.training:
+                h = h + blk.freq(h, cos, sin)
+                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
+            else:
+                h, _, _ = blk(h, cos, sin)
+        return h
+
+    def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
+        if T not in self._pilot_idx_cache:
+            self._pilot_idx_cache[T] = torch.arange(0, T, 8, device=device)
+        return self._pilot_idx_cache[T]
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -370,16 +385,10 @@ class HAGIv4(nn.Module):
 
         # 2. OFDM pre-equalization (perception)
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
-        for blk in self.perception:
-            if self.training:
-                h = h + blk.freq(h, cos, sin)
-                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
-            else:
-                h, _, _ = blk(h, cos, sin)
+        h = self._freq_blocks_forward(h, cos, sin)
 
-        # Pilot-aided equalization (5G): use clean pilot positions to correct non-pilots
         if mask is not None and T >= 8:
-            pilot_idx = torch.arange(0, T, 8, device=h.device)
+            pilot_idx = self._get_pilot_idx(T, h.device)
             h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
             h_mean = h.mean(dim=1, keepdim=True)
             h = h + self.pilot_eq_strength * (h_pilot_ref - h_mean)
@@ -415,21 +424,15 @@ class HAGIv4(nn.Module):
         # 5. Rate dematching: raised-cosine zero-padding C -> H
         # CQI-adaptive (symmetric with Stage 3): high CQI -> wider reconstruction
         z_f = torch.fft.rfft(z.float(), dim=-1)
-        z_pad = self._z_pad_template.to(torch.complex64).expand(B, T, -1).clone()
+        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
         c_bins = self._C // 2 + 1
         gate_up = torch.sigmoid(self.bottleneck_up_gate) * (0.5 + 0.5 * cqi_mean_t)
         z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins].float()
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
         # 6. Demodulation refinement (expression = 5G demapper)
-        for blk in self.expression:
-            if self.training:
-                h = h + blk.freq(h, cos, sin)
-                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
-            else:
-                h, _, _ = blk(h, cos, sin)
+        h = self._freq_blocks_forward(h, cos, sin)
 
-        # Rate-distortion loss (5G): penalize information loss through bottleneck
         rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
 
         # 7. Final demod -> bits (chunked to avoid materializing full logits)
@@ -455,7 +458,11 @@ class HAGIv4(nn.Module):
             if self.cfg.model.gp2d.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
                 aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"])
             if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
-                aux.extrinsic_info = h.new_tensor(sum(side_info["extrinsic_norms"]) / len(side_info["extrinsic_norms"]))
+                aux.extrinsic_info = torch.tensor(
+                    sum(side_info["extrinsic_norms"]) / len(side_info["extrinsic_norms"]),
+                    device=h.device,
+                    dtype=h.dtype,
+                )
             if side_info.get("iterations_used") is not None:
                 aux.efficiency = side_info["iterations_used"].float().mean()
             aux.rate_distortion = rd_loss
