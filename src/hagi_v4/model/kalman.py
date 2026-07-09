@@ -52,11 +52,9 @@ class KalmanFilter(nn.Module):
         nn.init.normal_(self.log_r, mean=-2.0, std=0.5)
 
     def predict(self, p_prev: torch.Tensor) -> torch.Tensor:
-        """Prediction step: uncertainty grows by process noise Q.
-
-        P_pred = P_prev + Q
-        """
         q = torch.exp(self.log_q).to(p_prev.dtype)
+        if p_prev.dim() == 3:
+            return p_prev + q.unsqueeze(0).unsqueeze(0)
         return p_prev + q
 
     def update(
@@ -66,29 +64,11 @@ class KalmanFilter(nn.Module):
         p_pred: torch.Tensor,
         r_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Measurement update: optimal Bayesian blend.
-
-        K = P_pred / (P_pred + R * r_scale)
-        z = z_pred + K * (z_meas - z_pred)
-        P = (1 - K) * P_pred
-
-        r_scale: iteration-dependent measurement noise scaling.
-        Early iterations: r_scale=1.0 (high noise, trust prediction).
-        Late iterations: r_scale<1.0 (low noise, trust measurement).
-        This is 5G iterative channel estimation: uncertainty decreases.
-        """
         r = torch.exp(self.log_r).to(p_pred.dtype) * r_scale
-
-        # Kalman gain (diagonal, broadcast over B,T)
+        if p_pred.dim() == 3:
+            r = r.unsqueeze(0).unsqueeze(0)
         k = p_pred / (p_pred + r + 1e-8)
-
-        # Innovation
         innovation = z_meas - z_pred
-
-        # Optimal blend
-        z_corrected = z_pred + k.unsqueeze(0).unsqueeze(0) * innovation
-
-        # Updated covariance
+        z_corrected = z_pred + k * innovation
         p_corrected = (1 - k) * p_pred
-
         return z_corrected, p_corrected
