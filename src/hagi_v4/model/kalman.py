@@ -61,7 +61,7 @@ class KalmanFilter(nn.Module):
     def update(
         self,
         z_pred: torch.Tensor,
-        z_meas: torch.Tensor,
+        innovation: torch.Tensor,
         p_pred: torch.Tensor,
         r_scale: float = 1.0,
         r: torch.Tensor | None = None,
@@ -73,7 +73,6 @@ class KalmanFilter(nn.Module):
         if p_pred.dim() == 3:
             r = r.unsqueeze(0).unsqueeze(0)
         k = p_pred / (p_pred + r + 1e-8)
-        innovation = z_meas - z_pred
         z_corrected = z_pred + k * innovation
         p_corrected = (1 - k) * p_pred
         return z_corrected, p_corrected

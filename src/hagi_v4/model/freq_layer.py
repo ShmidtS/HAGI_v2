@@ -22,13 +22,6 @@ import torch.nn.functional as F
 
 from hagi_v4.model.norms import RMSNorm
 
-try:
-    from hagi_v4.model.triton_kernels import triton_freq_gating
-
-    _HAS_TRITON = True
-except Exception:
-    _HAS_TRITON = False
-
 
 class FactoredLinear(nn.Module):
     """Low-rank factored linear: Linear(in, r) -> Linear(r, out).
@@ -170,38 +163,24 @@ class FreqCoding2D(nn.Module):
         gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
         gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())
 
-        if False and _HAS_TRITON and X_f.is_cuda and not torch.is_grad_enabled():
-            out_f = triton_freq_gating(
-                X_f,
-                gate_t,
-                gate_h,
-                self.phase[:, :Kt, :Kh].float(),
-                self.w_re_a.float(),
-                self.w_im_a.float(),
-                self.w_re_b.float(),
-                self.w_im_b.float(),
-                Kt,
-                Kh,
-            )
+        gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
+        low = X_f[:, :, :Kt, :Kh]
+        if cached_phase is not None:
+            phase = cached_phase
         else:
-            gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
-            low = X_f[:, :, :Kt, :Kh]
-            if cached_phase is not None:
-                phase = cached_phase
-            else:
-                phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
-            low = low * phase.unsqueeze(0)
-            if cached_w is not None:
-                w = cached_w
-            else:
-                w_re = self.w_re_a.float() @ self.w_re_b.float()
-                w_im = self.w_im_a.float() @ self.w_im_b.float()
-                w = torch.complex(w_re, w_im)
-            low = low @ w[:, :Kh, :F_h]
-            out_f = torch.empty_like(X_f)
-            out_f[:, :, :Kt, :] = low
-            if Kt < F_t:
-                out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
+            phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
+        low = low * phase.unsqueeze(0)
+        if cached_w is not None:
+            w = cached_w
+        else:
+            w_re = self.w_re_a.float() @ self.w_re_b.float()
+            w_im = self.w_im_a.float() @ self.w_im_b.float()
+            w = torch.complex(w_re, w_im)
+        low = low @ w[:, :Kh, :F_h]
+        out_f = torch.empty_like(X_f)
+        out_f[:, :, :Kt, :] = low
+        if Kt < F_t:
+            out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
 
         mag = out_f.abs()
         scale = torch.tanh(mag / 10.0) / (mag / 10.0 + 1e-9)
@@ -273,4 +252,4 @@ class FreqBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = x + self.freq(x, cos, sin, cached_w=cached_w, cached_phase=cached_phase)
         x = x + self.ffn(self.ffn_norm(x))
-        return x, torch.tensor(0.0, device=x.device), x.new_zeros((0,))
+        return x, None, None
