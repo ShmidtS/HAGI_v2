@@ -170,7 +170,7 @@ class TurboLoop(nn.Module):
                 idx = (start + i) % len(self.reasoning)
                 blk = self.reasoning[idx]
                 if training:
-                    z = z + checkpoint(blk.freq, z, cos, sin, use_reentrant=False)
+                    z = z + blk.freq(z, cos, sin)
                     z = z + checkpoint(blk.ffn, blk.ffn_norm(z), use_reentrant=False)
                 else:
                     z, _, _ = blk(z, cos, sin)
@@ -378,7 +378,7 @@ class HAGIv4(nn.Module):
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
         for blk in self.perception:
             if self.training:
-                h = h + checkpoint(blk.freq, h, cos, sin, use_reentrant=False)
+                h = h + blk.freq(h, cos, sin)
                 h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
             else:
                 h, _, _ = blk(h, cos, sin)
@@ -433,7 +433,7 @@ class HAGIv4(nn.Module):
         # 6. Demodulation refinement (expression = 5G demapper)
         for blk in self.expression:
             if self.training:
-                h = h + checkpoint(blk.freq, h, cos, sin, use_reentrant=False)
+                h = h + blk.freq(h, cos, sin)
                 h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
             else:
                 h, _, _ = blk(h, cos, sin)
