@@ -1,4 +1,4 @@
-# HAGI V4 — 24GB Google TPU config
+# HAGI V7 — 24GB Google TPU config
 # target_params: auto-computes all model sizes from optimal ratios
 # Vocab: Gemma tokenizer (262146 tokens)
 
@@ -30,17 +30,6 @@ model:
     halt_threshold: 0.9
     halt_threshold_start: 0.05
     halt_threshold_end: 0.001
-    use_deep_supervision: true
-    deep_supervision_decay: 0.1
-    deep_supervision_weight: 0.1
-    use_adaptive_ds_weight: true
-    ds_ema_decay: 0.99
-    use_entropy_adaptive_refinement: true
-    entropy_low_threshold: 0.01
-    entropy_high_threshold: 0.1
-    entropy_low_iterations: 2
-    entropy_high_iterations: 6
-    use_gradient_checkpointing: true
 
   masking:
     mask_ratio: 0.3
@@ -49,38 +38,10 @@ model:
     span_length: 3
     use_progressive: true
 
-  hrm:
-    h_stride: 4
-
-  gdr:
-    scalar_momentum: 0.8
-    vector_momentum: 0.5
-    bivector_momentum: 0.0
-    trivector_momentum: 0.0
-    use_grade_router: true
-    grade_router_alpha: 0.01
-
   msa:
-    max_slots: 4096
-    slot_chunk_size: 4
-    use_adaptive_chunk_size: true
-    chunk_size_low_entropy: 8
-    chunk_size_high_entropy: 2
+    max_slots: 2048
     top_k: 6
     routing_key_dim: 64
-
-  moe:
-    num_experts: 4
-    top_k: 1
-    use_mod_skip: true
-    alpha: 0.01
-    use_grade_specialization: true
-    grade_specialization_weight: 0.01
-
-  cast:
-    use_coherence: true
-    coherence_gate_init: -5.0
-    use_per_grade_coherence: true
 
 train:
   max_steps: 150000
@@ -140,7 +101,7 @@ inference:
   min_tokens: 2
   block_size: 16
   refine_passes: 2
-  repetition_penalty: 0.8
-  repetition_window: 32
+  repetition_penalty: 1.5
+  repetition_window: 64
   max_iterations: 4
   max_new_tokens: 128

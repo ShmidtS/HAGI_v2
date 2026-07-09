@@ -23,6 +23,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.gp2d import GeometricProduct2D
@@ -162,8 +163,12 @@ class TurboLoop(nn.Module):
                 total_msa_lb = total_msa_lb + lb
 
             # Component A: reasoning blocks (prediction = OFDM equalization)
-            for blk in self.reasoning:
-                z, _, _ = blk(z, cos, sin)
+            for i, blk in enumerate(self.reasoning):
+                if training:
+                    z = z + checkpoint(blk.freq, z, cos, sin, use_reentrant=False)
+                    z = z + checkpoint(blk.ffn, blk.ffn_norm(z), use_reentrant=False)
+                else:
+                    z, _, _ = blk(z, cos, sin)
 
             z_pred = z
 
@@ -300,6 +305,24 @@ class HAGIv4(nn.Module):
         self._init_weights()
         self._init_mask_embeds()
 
+    def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
+        """Chunked cross-entropy — avoids materializing full [B,T,V] logits.
+
+        5G analog: block-wise demodulation — process subcarriers in chunks
+        to fit in receiver buffer. Full logits [B,T,V] = 805MB at B=8,T=512.
+        Chunked: only [chunk, V] in memory at a time.
+        """
+        B, T, H = h.shape
+        h_flat = h.reshape(B * T, H)
+        t_flat = targets.reshape(B * T)
+        total_loss = h_flat.new_zeros(())
+        n = h_flat.shape[0]
+        for i in range(0, n, chunk):
+            end = min(i + chunk, n)
+            logits_chunk = F.linear(h_flat[i:end], self.lm_head.weight)
+            total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end], reduction="sum")
+        return total_loss / n
+
     def _init_weights(self) -> None:
         for mod in self.modules():
             if isinstance(mod, nn.Linear):
@@ -342,7 +365,11 @@ class HAGIv4(nn.Module):
         # 2. OFDM pre-equalization (perception)
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
         for blk in self.perception:
-            h, _, _ = blk(h, cos, sin)
+            if self.training:
+                h = h + checkpoint(blk.freq, h, cos, sin, use_reentrant=False)
+                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
+            else:
+                h, _, _ = blk(h, cos, sin)
 
         # Pilot-aided equalization (5G): use clean pilot positions to correct non-pilots
         # Pilot positions were never masked -> their hidden states are "channel estimates"
@@ -390,20 +417,23 @@ class HAGIv4(nn.Module):
 
         # 6. Demodulation refinement (expression = 5G demapper)
         for blk in self.expression:
-            h, _, _ = blk(h, cos, sin)
+            if self.training:
+                h = h + checkpoint(blk.freq, h, cos, sin, use_reentrant=False)
+                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
+            else:
+                h, _, _ = blk(h, cos, sin)
 
-        # 7. Final demod -> bits
+        # 7. Final demod -> bits (chunked to avoid materializing full logits)
         h_normed = self.final_norm(h)
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
         if targets is not None and mask_valid:
             h_masked = h_normed[mask]
             t_masked = targets[mask]
-            logits_masked = F.linear(h_masked, self.lm_head.weight)
-            ce = F.cross_entropy(logits_masked, t_masked)
+            ce = F.cross_entropy(F.linear(h_masked, self.lm_head.weight), t_masked)
             logits = None
         elif targets is not None:
-            logits = F.linear(h_normed, self.lm_head.weight)
-            ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            ce = self._chunked_ce(h_normed, targets)
+            logits = None
         else:
             logits = F.linear(h_normed, self.lm_head.weight)
             ce = None
