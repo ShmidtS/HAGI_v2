@@ -176,17 +176,24 @@ class TurboLoop(nn.Module):
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 
             # Kalman update: iteration-dependent R (5G iterative channel estimation)
-            # R decreases with iteration: trust measurement more as decoding converges
             r_decay = 0.5**iteration
-            z, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay)
+            z_kalman, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay)
+
+            # Soft syndrome (5G LDPC): only correct dimensions where residual is large
+            # Small residual = dimension already correct = no correction needed
+            correction = z_kalman - z_pred
+            correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
+            z = z_pred + correction_gate * correction
 
             # Innovation norm for convergence check
             ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().item()
             extrinsic_norms.append(ext_norm)
 
-            # HARQ Type II: store INNOVATION (incremental redundancy), not full state
+            # HARQ Type II: store gated INNOVATION (soft threshold, 5G incremental redundancy)
             innovation = z - h_prior
-            self.msa.write(innovation.detach() if not training else innovation)
+            inn_mag = innovation.float().norm(dim=-1, keepdim=True)
+            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * 5).to(innovation.dtype)
+            self.msa.write(innovation * write_gate)
 
             combined_ext = ext_norm
             if self.use_convergence_halt and iteration >= self.min_iters:
@@ -336,6 +343,15 @@ class HAGIv4(nn.Module):
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
         for blk in self.perception:
             h, _, _ = blk(h, cos, sin)
+
+        # Pilot-aided equalization (5G): use clean pilot positions to correct non-pilots
+        # Pilot positions were never masked -> their hidden states are "channel estimates"
+        # Nudge all positions toward the pilot-derived channel reference
+        if mask is not None:
+            pilot_idx = torch.arange(0, T, 8, device=h.device)
+            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)  # [B, 1, H]
+            h_mean = h.mean(dim=1, keepdim=True)
+            h = h + 0.1 * (h_pilot_ref - h_mean)  # gentle equalization pull
 
         # CQI: channel quality indicator (5G adaptive modulation/coding)
         cqi = self.cqi(h)  # [B, T] in [0, 1]
