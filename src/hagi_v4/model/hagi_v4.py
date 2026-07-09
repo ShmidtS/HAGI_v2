@@ -1,19 +1,19 @@
-"""HAGI V7 — 5G NR-style pipeline (simplified).
+"""HAGI V7 — 5G NR-style pipeline.
 
 5G NR physical layer mapping:
   Embed + Mask     = Transport block + CRC (source coding + erasure)
   FreqBlock × N    = OFDM modulation (FFT/IFFT + equalization + QAM)
-  Linear bottleneck = Rate matching (deterministic puncturing, H→C)
+  FFT bottleneck   = Rate matching (frequency-domain puncturing, H→C)
   Turbo loop × K   = LDPC iterative decoding
     FreqBlock      = Component A (local OFDM equalization)
     GP2D           = Component B (parity check)
-    Extrinsic      = Soft-information exchange
-  Linear up        = Rate dematching (C→H)
+    Kalman         = Optimal channel estimation (per-position uncertainty)
+    MSA            = DFE + HARQ buffer (channel memory)
+  FFT zero-pad     = Rate dematching (C→H)
   LM head          = Demodulation → bits
 
-Removed (no 5G analog):
-  GDR, MSA, z_H/z_L state machine, water_filling,
-  coherence head, deep supervision, VIB, perception/expression split
+Retained from V5 (with 5G analog):
+  MSA (DFE + HARQ buffer), pilot-aided equalization, CQI adaptive coding
 """
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ class TurboLoop(nn.Module):
       GP2D               = LDPC parity check
       Convergence halt   = EXIT chart stopping criterion
 
-    No z_H/z_L, no GDR, no deep supervision, no coherence, no water_filling.
+    No z_H/z_L, no GDR, no deep supervision, no coherence.
+    Per-position Kalman P: masked positions get higher initial uncertainty.
     """
 
     def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
@@ -123,25 +124,22 @@ class TurboLoop(nn.Module):
     def forward(
         self,
         z: torch.Tensor,
-        targets: torch.Tensor | None,
-        lm_head_weight: torch.Tensor,
-        mask: torch.Tensor | None,
         training: bool,
-        step: int,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
         cqi_mean: float = 0.5,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         B, T, C = z.shape
 
         total_parity = z.new_zeros(())
         total_msa_lb = z.new_zeros(())
-        extrinsic_norms: list[float] = []
+        extrinsic_norms: list = []
         converged_at = self.n_iters
         iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
         gp2d_residual = torch.zeros_like(z)
 
-        # Kalman state: diagonal covariance P per dimension
+        # Per-position Kalman state: diagonal covariance P [B,T,C] in float32
         p = torch.ones(C, device=z.device, dtype=z.dtype)
 
         # Adaptive DFE taps: bad channel -> more feedback taps (5G adaptive equalizer)
@@ -200,7 +198,7 @@ class TurboLoop(nn.Module):
             z = 10.0 * torch.tanh(z / 10.0)
 
             # Innovation norm for convergence check
-            ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().item()
+            ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().detach()
             extrinsic_norms.append(ext_norm)
 
             # HARQ Type II: store gated INNOVATION (soft threshold, 5G incremental redundancy)
@@ -220,13 +218,8 @@ class TurboLoop(nn.Module):
             "parity_strength": total_parity / max(converged_at, 1),
             "extrinsic_norms": extrinsic_norms,
             "iterations_used": iterations_used,
-            "moe_lb": z.new_zeros(()),
             "msa_lb": total_msa_lb / max(converged_at, 1),
-            "gdr_router_loss": z.new_zeros(()),
-            "gdr_gate_probs": None,
-            "moe_router_probs": None,
             "gp2d_residual": gp2d_residual,
-            "deep_supervision_loss": None,
         }
 
         return z, side_info
@@ -333,7 +326,7 @@ class HAGIv4(nn.Module):
             end = min(i + chunk, n)
             logits_chunk = F.linear(h_flat[i:end], self.lm_head.weight)
             total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end], reduction="sum")
-        return total_loss / n
+        return total_loss / max(n, 1)
 
     def _init_weights(self) -> None:
         for mod in self.modules():
@@ -384,9 +377,7 @@ class HAGIv4(nn.Module):
                 h, _, _ = blk(h, cos, sin)
 
         # Pilot-aided equalization (5G): use clean pilot positions to correct non-pilots
-        # Pilot positions were never masked -> their hidden states are "channel estimates"
-        # Nudge all positions toward the pilot-derived channel reference
-        if mask is not None:
+        if mask is not None and T >= 8:
             pilot_idx = torch.arange(0, T, 8, device=h.device)
             h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
             h_mean = h.mean(dim=1, keepdim=True)
@@ -394,15 +385,16 @@ class HAGIv4(nn.Module):
 
         # CQI: channel quality indicator (5G adaptive modulation/coding)
         cqi = self.cqi(h)  # [B, T] in [0, 1]
-        cqi_mean = cqi.mean().item()
+        cqi_mean_t = cqi.mean()
+        cqi_mean = cqi_mean_t.item()
 
         # Save pre-bottleneck for rate-distortion loss
         h_pre_bottleneck = h
 
         # 3. Rate matching: raised-cosine FFT truncation H -> C
-        # Adaptive: high CQI -> wider bandwidth (keep more freq), low CQI -> narrower
+        # Per-frequency CQI gating (5G per-subcarrier AMC): low-rank projection
         h_f = torch.fft.rfft(h.float(), dim=-1)
-        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi.mean())
+        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi_mean_t)
         h_f_c = h_f[:, :, : self._C // 2 + 1] * gate.float()
         z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
@@ -412,21 +404,19 @@ class HAGIv4(nn.Module):
         # 4. LDPC iterative decoding (turbo loop, adaptive parameters)
         z, side_info = self.turbo(
             z,
-            targets,
-            self.lm_head.weight,
-            mask,
             training=self.training,
-            step=step,
             cos=cos,
             sin=sin,
             cqi_mean=cqi_mean,
+            mask=mask,
         )
 
         # 5. Rate dematching: raised-cosine zero-padding C -> H
+        # CQI-adaptive (symmetric with Stage 3): high CQI -> wider reconstruction
         z_f = torch.fft.rfft(z.float(), dim=-1)
         z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
         c_bins = self._C // 2 + 1
-        gate_up = torch.sigmoid(self.bottleneck_up_gate)
+        gate_up = torch.sigmoid(self.bottleneck_up_gate) * (0.5 + 0.5 * cqi_mean_t)
         z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins].float()
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 

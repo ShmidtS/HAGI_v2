@@ -169,7 +169,7 @@ class FreqCoding2D(nn.Module):
         gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
         gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())
 
-        if _HAS_TRITON and X_f.is_cuda and not torch.is_grad_enabled():
+        if False and _HAS_TRITON and X_f.is_cuda and not torch.is_grad_enabled():
             out_f = triton_freq_gating(
                 X_f,
                 gate_t,
