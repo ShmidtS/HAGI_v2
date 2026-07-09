@@ -162,8 +162,13 @@ class TurboLoop(nn.Module):
                 z = z + msa_out
                 total_msa_lb = total_msa_lb + lb
 
-            # Component A: reasoning blocks (prediction = OFDM equalization)
-            for i, blk in enumerate(self.reasoning):
+            # Component A: reasoning blocks — layered decoding (5G LDPC)
+            # Not all layers every iteration: cycle through subsets for faster convergence
+            layers_per_iter = max(2, len(self.reasoning) // 2)
+            start = (iteration * layers_per_iter) % len(self.reasoning)
+            for i in range(layers_per_iter):
+                idx = (start + i) % len(self.reasoning)
+                blk = self.reasoning[idx]
                 if training:
                     z = z + checkpoint(blk.freq, z, cos, sin, use_reentrant=False)
                     z = z + checkpoint(blk.ffn, blk.ffn_norm(z), use_reentrant=False)
@@ -189,6 +194,10 @@ class TurboLoop(nn.Module):
             correction = z_kalman - z_pred
             correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
             z = z_pred + correction_gate * correction
+
+            # Soft limiter (5G PA Rapp model): tanh saturation, no hard clipping
+            # Small z: linear (no distortion). Large z: asymptotically approaches ±10.
+            z = 10.0 * torch.tanh(z / 10.0)
 
             # Innovation norm for convergence check
             ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().item()
@@ -246,6 +255,9 @@ class HAGIv4(nn.Module):
 
         # CQI estimator (5G adaptive modulation/coding)
         self.cqi = CQIEstimator(H)
+
+        # Learnable pilot equalization strength (5G channel estimation weight)
+        self.pilot_eq_strength = nn.Parameter(torch.tensor(0.1))
 
         n_bins_down = C // 2 + 1
         rolloff_start = int(n_bins_down * 0.75)
@@ -376,13 +388,16 @@ class HAGIv4(nn.Module):
         # Nudge all positions toward the pilot-derived channel reference
         if mask is not None:
             pilot_idx = torch.arange(0, T, 8, device=h.device)
-            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)  # [B, 1, H]
+            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
             h_mean = h.mean(dim=1, keepdim=True)
-            h = h + 0.1 * (h_pilot_ref - h_mean)  # gentle equalization pull
+            h = h + self.pilot_eq_strength * (h_pilot_ref - h_mean)
 
         # CQI: channel quality indicator (5G adaptive modulation/coding)
         cqi = self.cqi(h)  # [B, T] in [0, 1]
         cqi_mean = cqi.mean().item()
+
+        # Save pre-bottleneck for rate-distortion loss
+        h_pre_bottleneck = h
 
         # 3. Rate matching: raised-cosine FFT truncation H -> C
         # Adaptive: high CQI -> wider bandwidth (keep more freq), low CQI -> narrower
@@ -423,6 +438,9 @@ class HAGIv4(nn.Module):
             else:
                 h, _, _ = blk(h, cos, sin)
 
+        # Rate-distortion loss (5G): penalize information loss through bottleneck
+        rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
+
         # 7. Final demod -> bits (chunked to avoid materializing full logits)
         h_normed = self.final_norm(h)
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
@@ -449,6 +467,7 @@ class HAGIv4(nn.Module):
                 aux.extrinsic_info = h.new_tensor(sum(side_info["extrinsic_norms"]) / len(side_info["extrinsic_norms"]))
             if side_info.get("iterations_used") is not None:
                 aux.efficiency = side_info["iterations_used"].float().mean()
+            aux.rate_distortion = rd_loss
 
         return ModelOutput(
             logits=logits,

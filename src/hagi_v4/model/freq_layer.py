@@ -194,6 +194,12 @@ class FreqCoding2D(nn.Module):
             out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
             out_f[:, :, :Kt, :] = low
 
+        # PAPR reduction (5G OFDM): soft magnitude limiter on frequency bins
+        # tanh-based: smooth, differentiable, preserves phase, no hard clipping
+        mag = out_f.abs()
+        mag_soft = 10.0 * torch.tanh(mag / 10.0)
+        out_f = out_f * (mag_soft / (mag + 1e-8))
+
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
 
