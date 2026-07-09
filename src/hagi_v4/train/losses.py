@@ -62,6 +62,7 @@ class LossAggregator:
         self.w_msa_lb = 0.01
         self.w_contrastive = getattr(cfg.train, "w_contrastive", 0.0)
         self.w_cross_modal_coherence = getattr(cfg.train, "w_cross_modal_coherence", 0.0)
+        self.w_rate_distortion = getattr(cfg.train, "w_rate_distortion", 0.01)
 
     def __call__(
         self,
@@ -104,5 +105,7 @@ class LossAggregator:
             total = total + self.w_kl_variational * aux.ib
         if aux.contrastive is not None:
             total = total + self.w_contrastive * aux.contrastive
+        if aux.rate_distortion is not None:
+            total = total + self.w_rate_distortion * aux.rate_distortion
 
         return total

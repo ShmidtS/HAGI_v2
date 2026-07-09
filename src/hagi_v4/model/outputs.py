@@ -46,6 +46,7 @@ class AuxLosses:
     extrinsic_info: torch.Tensor | None = None
     efficiency: torch.Tensor | None = None
     contrastive: torch.Tensor | None = None
+    rate_distortion: torch.Tensor | None = None
 
 
 @dataclass
