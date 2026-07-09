@@ -119,6 +119,7 @@ class TurboLoop(nn.Module):
         self.msa = MSAModule(m.msa, hidden_size)
 
         self.kalman = KalmanFilter(hidden_size)
+        self._layers_per_iter = max(2, m.reasoning_layers // 2)
 
     def forward(
         self,
@@ -172,7 +173,7 @@ class TurboLoop(nn.Module):
                 z = z + msa_out
                 total_msa_lb = total_msa_lb + lb
 
-            layers_per_iter = max(2, len(self.reasoning) // 2)
+            layers_per_iter = self._layers_per_iter
             start = (iteration * layers_per_iter) % len(self.reasoning)
             for i in range(layers_per_iter):
                 idx = (start + i) % len(self.reasoning)
@@ -191,8 +192,9 @@ class TurboLoop(nn.Module):
             z_meas, gp2d_residual = self.gp2d(z_pred)
             total_parity = total_parity + gp2d_residual.pow(2).mean().to(total_parity.dtype)
 
+            innovation = z_meas - z_pred
             r_decay = 0.5**iteration
-            z_kalman, p = self.kalman.update(z_pred, z_meas, p_pred, r_scale=r_decay, r=r_cached)
+            z_kalman, p = self.kalman.update(z_pred, innovation, p_pred, r_scale=r_decay, r=r_cached)
 
             correction = z_kalman - z_pred
             correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
@@ -200,13 +202,13 @@ class TurboLoop(nn.Module):
 
             z = tanh_scale * torch.tanh(z / tanh_scale)
 
-            ext_norm = (z_meas - z_pred).float().norm(dim=-1).mean().detach()
+            ext_norm = innovation.float().norm(dim=-1).mean().detach()
             extrinsic_norms.append(ext_norm)
 
-            innovation = z - h_prior
-            inn_mag = innovation.float().norm(dim=-1, keepdim=True)
-            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * 5).to(innovation.dtype)
-            self.msa.write(innovation * write_gate)
+            innovation_harq = z - h_prior
+            inn_mag = innovation_harq.float().norm(dim=-1, keepdim=True)
+            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * 5).to(innovation_harq.dtype)
+            self.msa.write(innovation_harq * write_gate)
 
             combined_ext = ext_norm
             if self.use_convergence_halt and iteration >= self.min_iters:
@@ -271,6 +273,7 @@ class HAGIv4(nn.Module):
         rc_up[rolloff_up:c_bins] = 0.5 * (1 + torch.cos(t_up * math.pi))
         self.bottleneck_up_gate = nn.Parameter(rc_up)
         self._pilot_idx_cache: dict[int, torch.Tensor] = {}
+        self._pilot_mask_cache: dict[int, torch.Tensor] = {}
 
         # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
         self.use_freq_coding = m.freq_coding.enabled
@@ -361,6 +364,13 @@ class HAGIv4(nn.Module):
             self._pilot_idx_cache[T] = torch.arange(0, T, 8, device=device)
         return self._pilot_idx_cache[T]
 
+    def _get_pilot_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        if T not in self._pilot_mask_cache:
+            pm = torch.ones(T, dtype=torch.bool, device=device)
+            pm[::8] = False
+            self._pilot_mask_cache[T] = pm
+        return self._pilot_mask_cache[T]
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -376,10 +386,7 @@ class HAGIv4(nn.Module):
         # 1. Source coding: token -> embedding
         h = self.embed(input_ids)
         if mask is not None:
-            # Pilot symbols (5G): every 8th position is never masked
-            # These serve as channel estimation references for MSA/Kalman
-            pilot_mask = torch.ones(T, dtype=torch.bool, device=input_ids.device)
-            pilot_mask[::8] = False  # every 8th position is pilot
+            pilot_mask = self._get_pilot_mask(T, input_ids.device)
             mask = mask & pilot_mask.unsqueeze(0)
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
@@ -405,7 +412,7 @@ class HAGIv4(nn.Module):
         # Per-frequency CQI gating (5G per-subcarrier AMC): low-rank projection
         h_f = torch.fft.rfft(h.float(), dim=-1)
         gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi_mean_t)
-        h_f_c = h_f[:, :, : self._C // 2 + 1] * gate.float()
+        h_f_c = h_f[:, :, : self._C // 2 + 1] * gate
         z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
         if mask is not None:
@@ -427,7 +434,7 @@ class HAGIv4(nn.Module):
         z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
         c_bins = self._C // 2 + 1
         gate_up = torch.sigmoid(self.bottleneck_up_gate) * (0.5 + 0.5 * cqi_mean_t)
-        z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins].float()
+        z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins]
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
         # 6. Demodulation refinement (expression = 5G demapper)

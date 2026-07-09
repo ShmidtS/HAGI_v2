@@ -85,16 +85,6 @@ class MSAModule(nn.Module):
         self._default_chunk = cfg.slot_chunk_size
 
     def _select_chunk_size(self, h: torch.Tensor) -> int:
-        if not self._adaptive_chunk:
-            return self._default_chunk
-        s_start, s_end = self._scalar_slice
-        b_start, b_end = self._bivector_slice
-        scalar_var = h[..., s_start:s_end].float().var(dim=1).mean().item()
-        bivector_var = h[..., b_start:b_end].float().var(dim=1).mean().item()
-        if bivector_var > scalar_var * 2:
-            return self._chunk_high
-        if scalar_var > bivector_var * 2:
-            return self._chunk_low
         return self._default_chunk
 
     def write(self, h: torch.Tensor) -> None:
