@@ -198,12 +198,14 @@ class FreqCoding2D(nn.Module):
                 w_im = self.w_im_a.float() @ self.w_im_b.float()
                 w = torch.complex(w_re, w_im)
             low = low @ w[:, :Kh, :F_h]
-            out_f = X_f * gate_2d.unsqueeze(0).unsqueeze(0)
+            out_f = torch.empty_like(X_f)
             out_f[:, :, :Kt, :] = low
+            if Kt < F_t:
+                out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
 
         mag = out_f.abs()
-        mag_soft = 10.0 * torch.tanh(mag / 10.0)
-        out_f = out_f * (mag_soft / (mag + 1e-8))
+        scale = torch.tanh(mag / 10.0) / (mag / 10.0 + 1e-9)
+        out_f = out_f * scale
 
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
@@ -216,8 +218,7 @@ class FreqCoding2D(nn.Module):
 class FreqBlock(nn.Module):
     """Frequency-domain block — drop-in replacement for TransformerBlock.
 
-    Compatible with HRM: blk(h, cos, sin) -> (h, aux, rp).
-    Uses factored FFN (SVD compression) for 3x param reduction.
+    V7: uses factored FFN (SVD compression) for 3x param reduction.
     """
 
     def __init__(

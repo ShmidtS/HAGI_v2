@@ -51,8 +51,9 @@ class KalmanFilter(nn.Module):
         self.log_r = nn.Parameter(torch.zeros(dim))
         nn.init.normal_(self.log_r, mean=-2.0, std=0.5)
 
-    def predict(self, p_prev: torch.Tensor) -> torch.Tensor:
-        q = torch.exp(self.log_q).to(p_prev.dtype)
+    def predict(self, p_prev: torch.Tensor, q: torch.Tensor | None = None) -> torch.Tensor:
+        if q is None:
+            q = torch.exp(self.log_q).to(p_prev.dtype)
         if p_prev.dim() == 3:
             return p_prev + q.unsqueeze(0).unsqueeze(0)
         return p_prev + q
@@ -63,8 +64,12 @@ class KalmanFilter(nn.Module):
         z_meas: torch.Tensor,
         p_pred: torch.Tensor,
         r_scale: float = 1.0,
+        r: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r = torch.exp(self.log_r).to(p_pred.dtype) * r_scale
+        if r is None:
+            r = torch.exp(self.log_r).to(p_pred.dtype) * r_scale
+        else:
+            r = r * r_scale
         if p_pred.dim() == 3:
             r = r.unsqueeze(0).unsqueeze(0)
         k = p_pred / (p_pred + r + 1e-8)

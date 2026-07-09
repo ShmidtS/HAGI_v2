@@ -1,7 +1,6 @@
 """MSA — Memory Sparse Attention with pure-tensor ring buffer + MLA.
 
-Zero @torch.compiler.disable. All tensor ops. Replaces v1's SlotRegistry.
-V4 port: identical architecture to V3, updated imports.
+V7: DFE (read) + HARQ buffer (write) for channel memory in turbo loop.
 """
 
 from __future__ import annotations
