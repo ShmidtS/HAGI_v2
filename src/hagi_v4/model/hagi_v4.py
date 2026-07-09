@@ -56,17 +56,40 @@ class TurboLoop(nn.Module):
 
         n_modes_t = m.freq_coding.n_modes_t
         n_modes_h = m.freq_coding.n_modes_h
-        ffn_int = max(64, m.moe.intermediate_size * hidden_size // m.hidden_size)
+        ffn_int = hidden_size * 2
+        rank = 16
+        head_dim = m.attention.head_dim
+        n_heads = max(1, hidden_size // head_dim)
+        proj_rank = hidden_size // 4
+        ffn_rank = max(32, hidden_size // 4)
+
+        shared_w = (
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+        )
+        for p in shared_w:
+            nn.init.normal_(p, std=0.02)
+        shared_phase = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+        nn.init.normal_(shared_phase, std=0.1)
+        self.shared_w = nn.ParameterList(shared_w)
+        self.shared_phase = shared_phase
 
         self.reasoning = nn.ModuleList(
             FreqBlock(
                 hidden_size,
-                n_heads=m.attention.num_query_heads,
-                head_dim=m.attention.head_dim,
+                n_heads=n_heads,
+                head_dim=head_dim,
                 n_modes_t=n_modes_t,
                 n_modes_h=n_modes_h,
                 ffn_intermediate=ffn_int,
                 T_max=m.attention.max_seq_len,
+                rank=rank,
+                proj_rank=proj_rank,
+                ffn_rank=ffn_rank,
+                shared_weights=shared_w,
+                shared_phase=shared_phase,
                 norm_eps=m.norm_eps,
             )
             for _ in range(m.reasoning_layers)
@@ -190,19 +213,19 @@ class HAGIv4(nn.Module):
         self.use_freq_coding = m.freq_coding.enabled
         n_modes_t = m.freq_coding.n_modes_t
         n_modes_h = m.freq_coding.n_modes_h
-        ffn_int_h = max(64, m.moe.intermediate_size * H // m.hidden_size)
-        ffn_int_c = max(64, m.moe.intermediate_size * C // m.hidden_size)
-
+        ffn_int_h = H * 2
         if self.use_freq_coding:
+            n_heads_h = H // m.attention.head_dim
             self.perception = nn.ModuleList(
                 FreqBlock(
                     H,
-                    n_heads=m.attention.num_query_heads,
+                    n_heads=n_heads_h,
                     head_dim=m.attention.head_dim,
                     n_modes_t=n_modes_t,
                     n_modes_h=n_modes_h,
                     ffn_intermediate=ffn_int_h,
                     T_max=m.attention.max_seq_len,
+                    ffn_rank=H // 4,
                     norm_eps=m.norm_eps,
                 )
                 for _ in range(m.perception_layers)
@@ -213,9 +236,11 @@ class HAGIv4(nn.Module):
         # Turbo decoding loop (LDPC iterative decode)
         self.turbo = TurboLoop(cfg, C)
 
-        # LM head (demodulation → bits)
-        self.core_lm_head = nn.Linear(C, m.vocab_size, bias=False)
-        nn.init.normal_(self.core_lm_head.weight, mean=0.0, std=0.02)
+        # Expression: tied with perception (shared OFDM tx/rx hardware)
+        if self.use_freq_coding:
+            self.expression = self.perception
+        else:
+            self.expression = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.expression_layers))
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
         self.lm_head = nn.Linear(H, m.vocab_size, bias=False)
@@ -270,7 +295,7 @@ class HAGIv4(nn.Module):
         z, side_info = self.turbo(
             z,
             targets,
-            self.core_lm_head.weight,
+            self.lm_head.weight,
             mask,
             training=self.training,
             step=step,
@@ -278,10 +303,14 @@ class HAGIv4(nn.Module):
             sin=sin,
         )
 
-        # 5. Rate dematching: C → H
+        # 5. Rate dematching: C -> H
         h = self.bottleneck_up(z)
 
-        # 6. Demodulation → bits
+        # 6. Demodulation refinement (expression = 5G demapper)
+        for blk in self.expression:
+            h, _, _ = blk(h, cos, sin)
+
+        # 7. Final demod -> bits
         h_normed = self.final_norm(h)
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
         if targets is not None and mask_valid:
