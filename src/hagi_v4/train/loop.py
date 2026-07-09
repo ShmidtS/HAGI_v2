@@ -111,7 +111,9 @@ def _log_grade_variance(model: nn.Module, hidden: torch.Tensor, step: int, cfg: 
         return {}
     if step % cfg.train.grade_log_interval != 0:
         return {}
-    gdr = model.gdr
+    gdr = getattr(model, "gdr", None)
+    if gdr is None:
+        return {}
     b = gdr._bounds
     var_scalar = hidden[..., b[0] : b[1]].float().var(dim=(0, 1)).sum().item()
     var_vector = hidden[..., b[1] : b[2]].float().var(dim=(0, 1)).sum().item()

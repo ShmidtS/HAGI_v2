@@ -39,11 +39,13 @@ class GradeRouter(nn.Module):
         num_grades: int = 4,
         alpha: float = 0.01,
         temperature: float = 1.0,
+        router_noise: float = 0.01,
     ):
         super().__init__()
         self.num_grades = num_grades
         self.alpha = float(alpha)
         self.temperature = float(temperature)
+        self.router_noise = float(router_noise)
         self.gate_proj = nn.Linear(ctx_size, num_grades, bias=False)
         nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.01)
 
@@ -51,8 +53,8 @@ class GradeRouter(nn.Module):
         logits = self.gate_proj(graded_ctx)
         if self.temperature != 1.0:
             logits = logits / self.temperature
-        if self.training:
-            noise = torch.randn_like(logits) * 0.01
+        if self.training and self.router_noise > 0:
+            noise = torch.randn_like(logits) * self.router_noise
             logits = logits + noise.detach()
         probs = torch.softmax(logits, dim=-1)
         aux = None
@@ -136,6 +138,7 @@ class GradeDecomposedRecurrence(nn.Module):
                 ctx,
                 num_grades=4,
                 alpha=cfg.grade_router_alpha,
+                router_noise=cfg.router_noise,
             )
 
     def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:

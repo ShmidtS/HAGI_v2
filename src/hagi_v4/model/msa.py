@@ -144,7 +144,7 @@ class MSAModule(nn.Module):
         total = counts.sum()
         f = counts / total if total > 0 else counts
         P = (scores.softmax(dim=-1).mean(dim=0)).mean()
-        return 0.01 * (f * P).sum()
+        return self.cfg.load_balance_weight * (f * P).sum()
 
     def clear(self) -> None:
         self.registry.clear()

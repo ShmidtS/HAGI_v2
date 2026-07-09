@@ -75,8 +75,8 @@ def main() -> int:
     parser.add_argument(
         "--iterations", type=int, default=4, help="Refinement iterations (more = better quality, slower)"
     )
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=None, help="Override config temperature")
+    parser.add_argument("--top-k", type=int, default=None, help="Override config top_k")
     parser.add_argument("--tokenizer", default=None, help="Tokenizer name (auto-detected from checkpoint config)")
     args = parser.parse_args()
 
@@ -89,6 +89,20 @@ def main() -> int:
 
     mask_token_id = cfg.model.masking.mask_token_id
     eos_token_id = cfg.model.vocab_size - 2
+
+    icfg = cfg.inference
+    gen_kwargs = dict(
+        max_new_tokens=args.max_tokens,
+        max_iterations=args.iterations,
+        mask_token_id=mask_token_id,
+        eos_token_id=eos_token_id,
+        temperature=args.temperature if args.temperature is not None else icfg.temperature,
+        top_k=args.top_k if args.top_k is not None else icfg.top_k,
+        block_size=icfg.block_size,
+        refine_passes=icfg.refine_passes,
+        repetition_penalty=icfg.repetition_penalty,
+        repetition_window=icfg.repetition_window,
+    )
 
     if args.interactive:
         logger.info("Interactive mode. Type 'quit' to exit.")
@@ -104,16 +118,7 @@ def main() -> int:
             prompt_ids = text_to_tokens(prompt, tokenizer_name, str(dev))
             if prompt_ids.shape[1] == 0:
                 continue
-            gen_ids = generate(
-                model,
-                prompt_ids,
-                max_new_tokens=args.max_tokens,
-                max_iterations=args.iterations,
-                mask_token_id=mask_token_id,
-                eos_token_id=eos_token_id,
-                temperature=args.temperature,
-                top_k=args.top_k,
-            )
+            gen_ids = generate(model, prompt_ids, **gen_kwargs)
             generated = gen_ids[0, prompt_ids.shape[1] :]
             response = tokens_to_text(generated, tokenizer_name)
             print(f"HAGI: {response}")
@@ -121,16 +126,7 @@ def main() -> int:
 
     prompt_ids = text_to_tokens(args.prompt, tokenizer_name, str(dev))
     logger.info(f"Prompt: {args.prompt} ({prompt_ids.shape[1]} tokens)")
-    gen_ids = generate(
-        model,
-        prompt_ids,
-        max_new_tokens=args.max_tokens,
-        max_iterations=args.iterations,
-        mask_token_id=mask_token_id,
-        eos_token_id=eos_token_id,
-        temperature=args.temperature,
-        top_k=args.top_k,
-    )
+    gen_ids = generate(model, prompt_ids, **gen_kwargs)
     generated = gen_ids[0, prompt_ids.shape[1] :]
     response = tokens_to_text(generated, tokenizer_name)
     logger.info(f"Generated {generated.shape[0]} tokens:")

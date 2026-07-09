@@ -71,10 +71,18 @@ def generate(
     else:
         full_ids = prompt_ids.clone()
 
-    orig_n_iters = model.hrm.entropy_scheduler.n_iterations
-    orig_adaptive = model.hrm.entropy_scheduler.use_entropy_adaptive
-    model.hrm.entropy_scheduler.use_entropy_adaptive = False
-    model.hrm.entropy_scheduler.n_iterations = max(max_iterations, 2)
+    turbo = getattr(model, "turbo", None)
+    hrm = getattr(model, "hrm", None)
+    sched = turbo if turbo is not None else hrm
+    if sched is not None:
+        orig_n_iters = sched.n_iters if turbo is not None else sched.entropy_scheduler.n_iterations
+        if turbo is not None:
+            orig_n_iters_backup = turbo.n_iters
+            turbo.n_iters = max(max_iterations, 2)
+        else:
+            orig_adaptive = sched.entropy_scheduler.use_entropy_adaptive
+            sched.entropy_scheduler.use_entropy_adaptive = False
+            sched.entropy_scheduler.n_iterations = max(max_iterations, 2)
 
     def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
         """Echo cancellation (G.168 analog): subtract echo of recently
@@ -155,7 +163,10 @@ def generate(
             if eos_token_id is not None and (new_tokens == eos_token_id).any():
                 break
     finally:
-        model.hrm.entropy_scheduler.n_iterations = orig_n_iters
-        model.hrm.entropy_scheduler.use_entropy_adaptive = orig_adaptive
+        if turbo is not None:
+            turbo.n_iters = orig_n_iters_backup
+        elif hrm is not None:
+            hrm.entropy_scheduler.n_iterations = orig_n_iters
+            hrm.entropy_scheduler.use_entropy_adaptive = orig_adaptive
 
     return full_ids[:, : T_prompt + generated]

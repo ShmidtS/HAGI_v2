@@ -68,6 +68,11 @@ class TurboDecoder(nn.Module):
         self.deep_supervisor = DeepSupervisor(refinement_cfg)
         self._max_steps: int = 150000
 
+        from hagi_v4.model.hrm import HTransition, LTransition
+
+        self._l_transition = LTransition(self.l_dim, hidden_size)
+        self._h_transition = HTransition(self.h_dim, self.l_dim)
+
     def set_max_steps(self, max_steps: int) -> None:
         self._max_steps = max_steps
 
@@ -202,14 +207,6 @@ class TurboDecoder(nn.Module):
                 deep_weight_sum += ds_weight
 
             # HRM state transitions
-            from hagi_v4.model.hrm import HTransition, LTransition
-
-            if not hasattr(self, "_l_transition"):
-                self._l_transition = LTransition(self.l_dim, self.hidden_size)
-                self._h_transition = HTransition(self.h_dim, self.l_dim)
-                self._l_transition = self._l_transition.to(device)
-                self._h_transition = self._h_transition.to(device)
-
             z_L = self._l_transition(z_L, h)
             z_L_coarse = z_L[:, : T_c * S].view(B, T_c, S, self.l_dim).mean(dim=2)
             z_H = self._h_transition(z_H, z_L_coarse)

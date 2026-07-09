@@ -43,7 +43,9 @@ class CoherenceHead(nn.Module):
         self._scalar_dim = cfg.scalar_dim
         self._vector_dim = cfg.vector_dim
         self._sv_dim = cfg.scalar_dim + cfg.vector_dim
-        self._sv_heads = self._sv_dim // BLADE_COUNT
+        self._sv_heads = max(1, self._sv_dim // BLADE_COUNT)
+        # Ensure _sv_dim is divisible by BLADE_COUNT
+        self._sv_dim = self._sv_heads * BLADE_COUNT
         if lm_head is not None:
             object.__setattr__(self, "_lm_head", lm_head)
         if final_norm is not None:
