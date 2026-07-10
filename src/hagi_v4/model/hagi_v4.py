@@ -1,19 +1,26 @@
-"""HAGI V7 — 5G NR-style pipeline.
+"""HAGI V7.1 — 5G NR-style pipeline with multimodal + spectral cache.
 
 5G NR physical layer mapping:
   Embed + Mask     = Transport block + CRC (source coding + erasure)
-  FreqBlock × N    = OFDM modulation (FFT/IFFT + equalization + QAM)
-  FFT bottleneck   = Rate matching (frequency-domain puncturing, H→C)
-  Turbo loop × K   = LDPC iterative decoding
+  FreqBlock x N    = OFDM modulation (FFT/IFFT + equalization + QAM)
+  FFT bottleneck   = Rate matching (frequency-domain puncturing, H->C)
+  Turbo loop x K   = LDPC iterative decoding
     FreqBlock      = Component A (local OFDM equalization)
     GP2D           = Component B (parity check)
     Kalman         = Optimal channel estimation (per-position uncertainty)
     MSA            = DFE + HARQ buffer (channel memory)
-  FFT zero-pad     = Rate dematching (C→H)
-  LM head          = Demodulation → bits
+  FFT zero-pad     = Rate dematching (C->H)
+  LM head          = Demodulation -> bits
 
-Retained from V5 (with 5G analog):
-  MSA (DFE + HARQ buffer), pilot-aided equalization, CQI adaptive coding
+Multimodal (5G MIMO analog):
+  MultimodalInput   = Separate source encoders per modality (CDMA)
+  CrossModalFreqMix = MIMO cross-spectrum channel estimation
+  CrossModalGP2D    = Multiple Description Coding parity
+  CrossModalMSA     = Wyner-Ziv side information
+  ContrastiveAlign  = InfoNCE modality alignment (Slepian-Wolf)
+
+Spectral cache:
+  SpectralCache = OFDM cyclic prefix analog for block-parallel inference
 """
 
 from __future__ import annotations
@@ -26,28 +33,25 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hagi_v4.config import HAGIv4Config
+from hagi_v4.model.cqi import CQIEstimator
+from hagi_v4.model.freq_layer import FreqBlock
 from hagi_v4.model.gp2d import GeometricProduct2D
-from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
+from hagi_v4.model.kalman import KalmanFilter
 from hagi_v4.model.msa import MSAModule
+from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
-from hagi_v4.model.transformer_block import TransformerBlock
-from hagi_v4.model.freq_layer import FreqBlock
-from hagi_v4.model.kalman import KalmanFilter
-from hagi_v4.model.cqi import CQIEstimator
 
 
 class TurboLoop(nn.Module):
-    """Simplified turbo decoding loop — 5G LDPC + channel memory + Kalman.
+    """Turbo decoding loop — 5G LDPC + channel memory + Kalman.
 
     Channel memory techniques:
-      MSA read (iter>0) = Decision Feedback Equalizer (DFE) — past decisions cancel ISI
-      MSA write          = HARQ buffer — store parity-checked states for combining
-      Kalman filter      = Optimal channel estimation (blend prediction + measurement)
+      MSA read (iter>0) = Decision Feedback Equalizer (DFE)
+      MSA write          = HARQ buffer
+      Kalman filter      = Optimal channel estimation
       GP2D               = LDPC parity check
       Convergence halt   = EXIT chart stopping criterion
-
-    No z_H/z_L, no GDR, no deep supervision, no coherence.
     """
 
     def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
@@ -57,11 +61,12 @@ class TurboLoop(nn.Module):
         self.min_iters = m.refinement.min_iterations
         self.convergence_threshold = m.refinement.convergence_threshold
         self.use_convergence_halt = m.refinement.use_convergence_halt
+        self.tanh_scale = m.refinement.tanh_scale
 
         n_modes_t = m.freq_coding.n_modes_t
         n_modes_h = m.freq_coding.n_modes_h
         ffn_int = hidden_size * 2
-        rank = 16
+        rank = m.freq_coding.complex_rank
         head_dim = m.attention.head_dim
         n_heads = max(1, hidden_size // head_dim)
         proj_rank = hidden_size // 4
@@ -129,7 +134,8 @@ class TurboLoop(nn.Module):
         sin: torch.Tensor | None = None,
         cqi_mean: float = 0.5,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+        cached_p: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
         B, T, C = z.shape
 
         total_parity = z.new_zeros(())
@@ -139,14 +145,11 @@ class TurboLoop(nn.Module):
         iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
         gp2d_residual = torch.zeros_like(z)
 
-        # Per-position Kalman state: diagonal covariance P [B,T,C] in float32
         p = torch.ones(C, device=z.device, dtype=z.dtype)
 
-        # Adaptive DFE taps: bad channel -> more feedback taps (5G adaptive equalizer)
         base_k = self.msa.cfg.top_k
         adaptive_k = base_k + int((1.0 - cqi_mean) * 4)
 
-        # Adaptive process noise: bad channel -> higher Q (5G adaptive coding)
         q_scale = 1.0 + (1.0 - cqi_mean)
 
         self.msa.clear()
@@ -161,7 +164,6 @@ class TurboLoop(nn.Module):
             Kt = min(self.shared_phase.shape[1], T)
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
-        tanh_scale = 10.0
         q_cached = torch.exp(self.kalman.log_q).to(z.dtype)
         r_cached = torch.exp(self.kalman.log_r).to(z.dtype)
 
@@ -200,7 +202,7 @@ class TurboLoop(nn.Module):
             correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
             z = z_pred + correction_gate * correction
 
-            z = tanh_scale * torch.tanh(z / tanh_scale)
+            z = self.tanh_scale * torch.tanh(z / self.tanh_scale)
 
             ext_norm = innovation.float().norm(dim=-1).mean().detach()
             extrinsic_norms.append(ext_norm)
@@ -225,11 +227,11 @@ class TurboLoop(nn.Module):
             "gp2d_residual": gp2d_residual,
         }
 
-        return z, side_info
+        return z, side_info, None
 
 
 class HAGIv4(nn.Module):
-    """HAGI V7 — 5G NR-style codec language model."""
+    """HAGI V7.1 — 5G NR-style codec language model with multimodal."""
 
     def __init__(self, cfg: HAGIv4Config) -> None:
         super().__init__()
@@ -237,22 +239,25 @@ class HAGIv4(nn.Module):
         m = cfg.model
         H = m.hidden_size
         C = m.core_hidden_size
+        self.use_multimodal = m.multimodal.enabled
 
-        self.embed = nn.Embedding(m.vocab_size, H)
+        if self.use_multimodal:
+            from hagi_v4.model.multimodal_input import MultimodalInput
+
+            self.mm_input = MultimodalInput(cfg)
+            self.embed = self.mm_input.text_embed
+        else:
+            self.embed = nn.Embedding(m.vocab_size, H)
+
         self.mask_embed = nn.Parameter(torch.zeros(H))
 
-        # Rate matching: raised-cosine FFT truncation (5G pulse shaping)
-        # Hard truncation = brick-wall filter = Gibbs ringing (echo)
-        # Raised-cosine = smooth rolloff = no echo (5G standard)
         self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
         self._H = H
         self._C = C
 
-        # CQI estimator (5G adaptive modulation/coding)
         self.cqi = CQIEstimator(H)
 
-        # Learnable pilot equalization strength (5G channel estimation weight)
         self.pilot_eq_strength = nn.Parameter(torch.tensor(0.1))
 
         n_bins_down = C // 2 + 1
@@ -275,7 +280,6 @@ class HAGIv4(nn.Module):
         self._pilot_idx_cache: dict[int, torch.Tensor] = {}
         self._pilot_mask_cache: dict[int, torch.Tensor] = {}
 
-        # OFDM modulation: FreqBlocks at full bandwidth (perception merged)
         self.use_freq_coding = m.freq_coding.enabled
         n_modes_t = m.freq_coding.n_modes_t
         n_modes_h = m.freq_coding.n_modes_h
@@ -297,31 +301,42 @@ class HAGIv4(nn.Module):
                 for _ in range(m.perception_layers)
             )
         else:
-            self.perception = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.perception_layers))
+            raise ValueError("V7.1 requires freq_coding.enabled=True (attention fallback removed)")
 
-        # Turbo decoding loop (LDPC iterative decode)
         self.turbo = TurboLoop(cfg, C)
 
-        # Expression: tied with perception (shared OFDM tx/rx hardware)
-        if self.use_freq_coding:
-            self.expression = self.perception
-        else:
-            self.expression = nn.ModuleList(TransformerBlock(m, hidden_size=H) for _ in range(m.expression_layers))
+        self.expression = self.perception
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
         self.lm_head = nn.Linear(H, m.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
 
+        if self.use_multimodal:
+            from hagi_v4.model.contrastive import ContrastiveAlignment
+            from hagi_v4.model.cross_modal_attention import CrossModalFreqMix
+            from hagi_v4.model.cross_modal_gp2d import CrossModalGP2D
+            from hagi_v4.model.cross_modal_msa import CrossModalMSA
+
+            self.cross_freq = CrossModalFreqMix(
+                H,
+                n_heads=n_heads_h,
+                head_dim=m.attention.head_dim,
+                gate_init=m.multimodal.cross_freq_gate_init,
+                norm_eps=m.norm_eps,
+            )
+            self.cross_gp2d = CrossModalGP2D(
+                m.gp2d,
+                C,
+                num_modalities=m.multimodal.num_modalities,
+                gate_init=m.multimodal.cross_gp2d_gate_init,
+            )
+            self.cross_msa = CrossModalMSA(m.msa, C, num_modalities=m.multimodal.num_modalities)
+            self.contrastive = ContrastiveAlignment(C, temperature=m.multimodal.contrastive_temperature)
+
         self._init_weights()
         self._init_mask_embeds()
 
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
-        """Chunked cross-entropy — avoids materializing full [B,T,V] logits.
-
-        5G analog: block-wise demodulation — process subcarriers in chunks
-        to fit in receiver buffer. Full logits [B,T,V] = 805MB at B=8,T=512.
-        Chunked: only [chunk, V] in memory at a time.
-        """
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
         t_flat = targets.reshape(B * T)
@@ -360,14 +375,16 @@ class HAGIv4(nn.Module):
         return h
 
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
+        spacing = self.cfg.model.pilot_spacing
         if T not in self._pilot_idx_cache:
-            self._pilot_idx_cache[T] = torch.arange(0, T, 8, device=device)
+            self._pilot_idx_cache[T] = torch.arange(0, T, spacing, device=device)
         return self._pilot_idx_cache[T]
 
     def _get_pilot_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        spacing = self.cfg.model.pilot_spacing
         if T not in self._pilot_mask_cache:
             pm = torch.ones(T, dtype=torch.bool, device=device)
-            pm[::8] = False
+            pm[::spacing] = False
             self._pilot_mask_cache[T] = pm
         return self._pilot_mask_cache[T]
 
@@ -380,36 +397,38 @@ class HAGIv4(nn.Module):
         images: torch.Tensor | None = None,
         spectrograms: torch.Tensor | None = None,
         modality_ids: torch.Tensor | None = None,
+        cached_p: torch.Tensor | None = None,
     ) -> ModelOutput:
-        B, T = input_ids.shape
+        if self.use_multimodal and (images is not None or spectrograms is not None):
+            h, modality_ids, lengths = self.mm_input(input_ids, images, spectrograms)
+            B, T, H = h.shape
+        else:
+            B, T = input_ids.shape
+            h = self.embed(input_ids)
 
-        # 1. Source coding: token -> embedding
-        h = self.embed(input_ids)
         if mask is not None:
-            pilot_mask = self._get_pilot_mask(T, input_ids.device)
+            pilot_mask = self._get_pilot_mask(T, h.device)
             mask = mask & pilot_mask.unsqueeze(0)
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
-        # 2. OFDM pre-equalization (perception)
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
         h = self._freq_blocks_forward(h, cos, sin)
 
-        if mask is not None and T >= 8:
+        if self.use_multimodal and modality_ids is not None:
+            h = self.cross_freq(h, modality_ids, num_modalities=self.cfg.model.multimodal.num_modalities)
+
+        if mask is not None and T >= self.cfg.model.pilot_spacing:
             pilot_idx = self._get_pilot_idx(T, h.device)
             h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
             h_mean = h.mean(dim=1, keepdim=True)
             h = h + self.pilot_eq_strength * (h_pilot_ref - h_mean)
 
-        # CQI: channel quality indicator (5G adaptive modulation/coding)
-        cqi = self.cqi(h)  # [B, T] in [0, 1]
+        cqi = self.cqi(h)
         cqi_mean_t = cqi.mean()
         cqi_mean = cqi_mean_t.item()
 
-        # Save pre-bottleneck for rate-distortion loss
         h_pre_bottleneck = h
 
-        # 3. Rate matching: raised-cosine FFT truncation H -> C
-        # Per-frequency CQI gating (5G per-subcarrier AMC): low-rank projection
         h_f = torch.fft.rfft(h.float(), dim=-1)
         gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi_mean_t)
         h_f_c = h_f[:, :, : self._C // 2 + 1] * gate
@@ -418,18 +437,27 @@ class HAGIv4(nn.Module):
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
 
-        # 4. LDPC iterative decoding (turbo loop, adaptive parameters)
-        z, side_info = self.turbo(
+        z, side_info, p_final = self.turbo(
             z,
             training=self.training,
             cos=cos,
             sin=sin,
             cqi_mean=cqi_mean,
             mask=mask,
+            cached_p=cached_p,
         )
 
-        # 5. Rate dematching: raised-cosine zero-padding C -> H
-        # CQI-adaptive (symmetric with Stage 3): high CQI -> wider reconstruction
+        if self.use_multimodal and modality_ids is not None:
+            z_cross, cross_residual = self.cross_gp2d(z, modality_ids)
+            z = z_cross
+
+            self.cross_msa.clear()
+            self.cross_msa.write(z, modality_ids)
+            side_info_q = z + self.cross_msa.read_cross(
+                z, modality_ids, target_modality=0, top_k=self.cfg.model.msa.top_k
+            )
+            z = z + 0.1 * (side_info_q - z)
+
         z_f = torch.fft.rfft(z.float(), dim=-1)
         z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
         c_bins = self._C // 2 + 1
@@ -437,12 +465,10 @@ class HAGIv4(nn.Module):
         z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins]
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
-        # 6. Demodulation refinement (expression = 5G demapper)
         h = self._freq_blocks_forward(h, cos, sin)
 
         rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
 
-        # 7. Final demod -> bits (chunked to avoid materializing full logits)
         h_normed = self.final_norm(h)
         mask_valid = mask is not None and mask.any().item() if mask is not None else False
         if targets is not None and mask_valid:
@@ -457,7 +483,6 @@ class HAGIv4(nn.Module):
             logits = F.linear(h_normed, self.lm_head.weight)
             ce = None
 
-        # 7. Auxiliary losses (minimal — only parity + whiteness)
         aux = AuxLosses()
         if targets is not None:
             if side_info["parity_strength"] is not None:
@@ -465,14 +490,14 @@ class HAGIv4(nn.Module):
             if self.cfg.model.gp2d.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
                 aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"])
             if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
-                aux.extrinsic_info = torch.tensor(
-                    sum(side_info["extrinsic_norms"]) / len(side_info["extrinsic_norms"]),
-                    device=h.device,
-                    dtype=h.dtype,
-                )
+                ext_sum = sum(side_info["extrinsic_norms"])
+                aux.extrinsic_info = (ext_sum / len(side_info["extrinsic_norms"])).to(h.dtype)
             if side_info.get("iterations_used") is not None:
                 aux.efficiency = side_info["iterations_used"].float().mean()
             aux.rate_distortion = rd_loss
+
+            if self.use_multimodal and modality_ids is not None and hasattr(self, "contrastive"):
+                aux.contrastive = self.contrastive(h, modality_ids)
 
         return ModelOutput(
             logits=logits,

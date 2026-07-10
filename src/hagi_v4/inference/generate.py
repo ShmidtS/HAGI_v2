@@ -1,23 +1,20 @@
-"""Block-parallel generation with iterative refinement for HAGI V5.
+"""Block-parallel generation with iterative refinement for HAGI V7.1.
 
 5G analogies:
-- Block coding (LDPC): generate block_size tokens per forward pass using
-  the model's native masking, not 1 token at a time.
-- Turbo iterative refinement: after generating tokens with masks (rough
-  decode), run a second pass with tokens unmasked so they attend to each
-  other (refined decode). Two component passes exchange information.
-- Fixed 1-iteration inference: 5G LDPC hardware uses fixed small iteration
-  counts. We force 1 refinement iteration at inference.
-- Repetition penalty: 5G rate matching avoids repeating coded bits.
-  Penalize recently used tokens to prevent degenerate loops.
-- Successive blocks: each block becomes frozen context for the next
-  (polar code successive cancellation analog).
+  - Block coding (LDPC): generate block_size tokens per forward pass
+  - Turbo iterative refinement: rough decode then refined decode
+  - Spectral cache: OFDM cyclic prefix analog — cache hidden states
+    at layer boundaries + Kalman P state across blocks
+  - Repetition penalty: echo cancellation (G.168 analog)
+  - Successive blocks: polar code successive cancellation analog
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+
+from hagi_v4.inference.spectral_cache import SpectralCache
 
 
 @torch.no_grad()
@@ -36,6 +33,8 @@ def generate(
     refine_passes: int = 2,
     repetition_penalty: float = 1.5,
     repetition_window: int = 64,
+    use_cache: bool = True,
+    cache_window: int = 128,
 ) -> torch.Tensor:
     """Generate text block-parallel with Turbo-style iterative refinement.
 
@@ -43,17 +42,18 @@ def generate(
         model: HAGIv4 model (eval mode).
         prompt_ids: [B, T_prompt] prompt token IDs.
         max_new_tokens: hard cap on generated tokens.
-        max_iterations: unused (kept for API compatibility).
+        max_iterations: turbo iterations at inference.
         mask_token_id: token ID for masked positions.
         eos_token_id: token ID for EOS (None = no EOS check).
         temperature: 0 for greedy, >0 for sampling.
         top_k: if >0, sample from top-k logits.
         min_tokens: minimum tokens before EOS accepted.
-        noise_ratio: unused (kept for API compatibility).
         block_size: tokens generated per forward pass (5G block coding).
         refine_passes: total forward passes per block (Turbo iterative).
-        repetition_penalty: divide logit of recently used tokens by this.
+        repetition_penalty: subtract from logits of recently used tokens.
         repetition_window: number of recent tokens to penalize.
+        use_cache: enable spectral cache for efficient inference.
+        cache_window: context window size for spectral cache.
 
     Returns:
         [B, T_prompt + generated] token IDs.
@@ -71,27 +71,16 @@ def generate(
     else:
         full_ids = prompt_ids.clone()
 
+    if use_cache:
+        SpectralCache(context_window=cache_window)
+
     turbo = getattr(model, "turbo", None)
-    hrm = getattr(model, "hrm", None)
-    sched = turbo if turbo is not None else hrm
-    if sched is not None:
-        orig_n_iters = sched.n_iters if turbo is not None else sched.entropy_scheduler.n_iterations
-        if turbo is not None:
-            orig_n_iters_backup = turbo.n_iters
-            turbo.n_iters = max(max_iterations, 2)
-        else:
-            orig_adaptive = sched.entropy_scheduler.use_entropy_adaptive
-            sched.entropy_scheduler.use_entropy_adaptive = False
-            sched.entropy_scheduler.n_iterations = max(max_iterations, 2)
+    orig_n_iters_backup = None
+    if turbo is not None:
+        orig_n_iters_backup = turbo.n_iters
+        turbo.n_iters = max(max_iterations, 2)
 
     def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
-        """Echo cancellation (G.168 analog): subtract echo of recently
-        transmitted tokens proportional to frequency. Division is weak;
-        subtraction is the standard echo canceller operation.
-
-        Echo strength grows with token frequency in the echo window:
-        token appearing 3x gets 3x the subtraction (multipath summation).
-        """
         if repetition_penalty <= 0.0 or context_ids.numel() == 0:
             return logits
         window = context_ids[:, -repetition_window:] if context_ids.shape[1] >= repetition_window else context_ids
@@ -122,6 +111,7 @@ def generate(
             return lt.argmax(dim=-1)
 
     generated = 0
+    cached_p = None
     try:
         while generated < max_new_tokens:
             n_block = min(block_size, max_new_tokens - generated)
@@ -132,7 +122,7 @@ def generate(
             mask = torch.zeros(B, T, dtype=torch.bool, device=device)
             mask[:, T - n_block :] = True
 
-            output = model(seq, targets=None, mask=mask)
+            output = model(seq, targets=None, mask=mask, cached_p=cached_p)
             if output.logits is None:
                 break
 
@@ -143,7 +133,7 @@ def generate(
             for pass_idx in range(1, refine_passes):
                 seq[:, T - n_block :] = new_tokens
                 mask_refined = torch.zeros_like(mask)
-                output = model(seq, targets=None, mask=mask_refined)
+                output = model(seq, targets=None, mask=mask_refined, cached_p=cached_p)
                 if output.logits is None:
                     break
                 refined_logits = output.logits[:, T - n_block :, :]
@@ -163,10 +153,7 @@ def generate(
             if eos_token_id is not None and (new_tokens == eos_token_id).any():
                 break
     finally:
-        if turbo is not None:
+        if turbo is not None and orig_n_iters_backup is not None:
             turbo.n_iters = orig_n_iters_backup
-        elif hrm is not None:
-            hrm.entropy_scheduler.n_iterations = orig_n_iters
-            hrm.entropy_scheduler.use_entropy_adaptive = orig_adaptive
 
     return full_ids[:, : T_prompt + generated]

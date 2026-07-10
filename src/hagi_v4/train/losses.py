@@ -1,8 +1,9 @@
-"""Multi-objective CodecLoss for HAGI V7.
+"""Multi-objective CodecLoss for HAGI V7.1.
 
 Loss = CE (fidelity) + Parity (redundancy reward) + Whiteness (decorrelation)
      + ExtrinsicInfo (decoding reward) + Efficiency (convergence cost)
-     + RateDistortion (information loss) + MSA load balance.
+     + RateDistortion (information loss) + MSA load balance
+     + Contrastive (modality alignment, multimodal only).
 """
 
 from __future__ import annotations
@@ -43,14 +44,14 @@ class LossAggregator:
         self.w_extrinsic_info = cfg.train.w_extrinsic_info
         self.w_efficiency = cfg.train.w_efficiency
         self.w_msa_lb = 0.01
-        self.w_rate_distortion = getattr(cfg.train, "w_rate_distortion", 0.01)
+        self.w_rate_distortion = cfg.train.w_rate_distortion
+        self.w_contrastive = cfg.train.w_contrastive
 
     def __call__(
         self,
         model_output: ModelOutput,
         targets: torch.Tensor,
         mask: torch.Tensor | None,
-        w_coherence_override: float | None = None,
     ) -> torch.Tensor:
         if model_output.ce_loss is not None:
             ce_loss = model_output.ce_loss
@@ -72,5 +73,7 @@ class LossAggregator:
             total = total + self.w_efficiency * aux.efficiency
         if aux.rate_distortion is not None:
             total = total + self.w_rate_distortion * aux.rate_distortion
+        if aux.contrastive is not None:
+            total = total + self.w_contrastive * aux.contrastive
 
         return total
