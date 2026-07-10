@@ -40,23 +40,24 @@ class MultimodalInput(nn.Module):
 
         self.text_embed = nn.Embedding(m.vocab_size, H)
 
-        self.image_patch_size = mm.image.patch_size
-        self.image_embed = nn.Linear(mm.image.input_channels * self.image_patch_size**2, H, bias=False)
+        self.image_patch_size = m.image.patch_size
+        self.image_embed = nn.Linear(m.image.input_channels * self.image_patch_size**2, H, bias=False)
 
-        self.audio_n_mels = mm.audio.n_mels
+        self.audio_n_mels = m.audio.n_mels
         self.audio_embed = nn.Linear(self.audio_n_mels, H, bias=False)
 
-        self.modality_embeds = nn.Parameter(torch.zeros(3, H))
+        self.num_modalities = mm.num_modalities
+        self.modality_embeds = nn.Parameter(torch.zeros(mm.num_modalities, H))
         nn.init.normal_(self.modality_embeds, std=mm.modality_embed_std)
 
-        self.mask_embeds = nn.Parameter(torch.zeros(3, H))
-        for i in range(3):
+        self.mask_embeds = nn.Parameter(torch.zeros(mm.num_modalities, H))
+        for i in range(mm.num_modalities):
             self.mask_embeds.data[i] = torch.ones(H) / (H**0.5)
 
-        self.image_pos_embed = nn.Parameter(torch.zeros(mm.image.max_image_patches, H))
+        self.image_pos_embed = nn.Parameter(torch.zeros(m.image.max_image_patches, H))
         nn.init.normal_(self.image_pos_embed, std=0.02)
 
-        self.audio_pos_embed = nn.Parameter(torch.zeros(mm.audio.max_audio_frames, H))
+        self.audio_pos_embed = nn.Parameter(torch.zeros(m.audio.max_audio_frames, H))
         nn.init.normal_(self.audio_pos_embed, std=0.02)
 
     def encode_text(self, input_ids: torch.Tensor) -> torch.Tensor:

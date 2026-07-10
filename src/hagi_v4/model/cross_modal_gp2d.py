@@ -93,7 +93,6 @@ class CrossModalGP2D(nn.Module):
                 gate = torch.sigmoid(self.cross_gates[pair_idx])
                 cross_out = gate * cross_out
 
-                idx_i = torch.where(mask_i[0])[0] if mask_i.dim() == 1 else torch.where(mask_i[0])[0]
                 for b in range(B):
                     mask_b = modality_ids[b] == i
                     idx_b = torch.where(mask_b)[0]

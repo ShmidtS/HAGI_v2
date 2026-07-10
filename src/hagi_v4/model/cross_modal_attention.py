@@ -1,15 +1,17 @@
-"""Cross-modal attention — MIMO space-time coding (V7).
+"""Cross-modal frequency mixing — MIMO space-time coding (V7.1).
 
-Each perception layer gets cross-modal attention after self-attention.
-Text tokens attend to image/audio tokens and vice versa, combining
-modality streams for diversity gain (MIMO analog).
+Replaces V7's attention-based cross-modal with frequency-domain
+cross-spectrum mixing. Each modality's frequency representation
+is combined via cross-spectrum (MIMO channel estimation analog).
 
-Gated residual: starts with sigmoid(0)=0.5, allowing some cross-modal
-flow from the beginning. Gate is learnable per layer.
+5G NR MIMO: signals from multiple antennas are combined through
+a channel matrix. In HAGI, modalities = antennas, cross-spectrum =
+channel estimation, gated residual = adaptive MIMO receiver.
 
 Information theory:
-  - Self-attention = intra-modality equalizer (existing channel taps)
-  - Cross-modal attention = inter-modality equalizer (new channel taps)
+  - Self-modality FreqBlock = intra-modality equalizer (existing channel)
+  - Cross-modal freq mix = inter-modality equalizer (MIMO channel)
+  - Cross-spectrum = X_text_f * conj(X_other_f) = cross-correlation
   - Gated cross-modal = adaptive MIMO (start SISO, gradually enable MIMO)
   - Diversity order = num_modalities (3x outage reduction)
 """
@@ -19,76 +21,126 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from hagi_v4.config import HAGIv4Config
-from hagi_v4.model.attention import GroupedQueryAttention
-from hagi_v4.model.moe import MoESwiGLU
 from hagi_v4.model.norms import RMSNorm
-from hagi_v4.config import MoEConfig
 
 
-class MultimodalPerceptionBlock(nn.Module):
-    """Perception block with cross-modal attention.
+class CrossModalFreqMix(nn.Module):
+    """Cross-modal frequency-domain mixing via cross-spectrum.
 
-    1. Self-attention (intra-modality, bidirectional)
-    2. Cross-modal attention (inter-modality, MIMO, gated)
-    3. MoE FFN (modality-aware routing)
+    Computes cross-spectrum between modality streams in frequency domain,
+    applies learnable complex weight, and blends via gated residual.
+
+    5G analog: MIMO channel estimation — cross-spectrum between antennas
+    gives the channel response, which is then equalized.
     """
 
-    def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
+    def __init__(
+        self, hidden_size: int, n_heads: int = 8, head_dim: int = 72, gate_init: float = 0.0, norm_eps: float = 1e-6
+    ) -> None:
         super().__init__()
-        m = cfg.model
-        H = hidden_size
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        freq_dim = n_heads * head_dim
 
-        self.self_attn_norm = RMSNorm(H, m.norm_eps)
-        self.self_attn = GroupedQueryAttention(
-            hidden_size=H,
-            num_q_heads=m.attention.num_query_heads,
-            num_kv_heads=m.attention.num_kv_heads,
-            head_dim=m.attention.head_dim,
-            rope_theta=m.attention.rope_theta,
-            bidirectional=True,
-            fp16_attention=m.attention.fp16_attention,
-        )
+        self.norm = RMSNorm(hidden_size, eps=norm_eps)
 
-        self.cross_attn_norm = RMSNorm(H, m.norm_eps)
-        self.cross_attn = GroupedQueryAttention(
-            hidden_size=H,
-            num_q_heads=m.attention.num_query_heads,
-            num_kv_heads=m.attention.num_kv_heads,
-            head_dim=m.attention.head_dim,
-            rope_theta=m.attention.rope_theta,
-            bidirectional=True,
-            fp16_attention=m.attention.fp16_attention,
-        )
-        self.cross_gate = nn.Parameter(torch.tensor(m.multimodal.cross_modal_attention.gate_init))
+        if freq_dim == hidden_size:
+            self.proj_in: nn.Module | None = None
+            self.proj_out: nn.Module | None = None
+        else:
+            self.proj_in = nn.Linear(hidden_size, freq_dim, bias=False)
+            self.proj_out = nn.Linear(freq_dim, hidden_size, bias=False)
 
-        i_size = max(64, m.moe.intermediate_size * H // m.hidden_size)
-        moe_cfg = MoEConfig(
-            num_experts=m.moe.num_experts,
-            top_k=m.moe.top_k,
-            intermediate_size=i_size,
-            use_mod_skip=m.moe.use_mod_skip,
-            alpha=m.moe.alpha,
-            n_shared_bases=m.moe.n_shared_bases,
-            router_noise=m.moe.router_noise,
-            router_init_std=m.moe.router_init_std,
-        )
-        self.ffn_norm = RMSNorm(H, m.norm_eps)
-        self.moe = MoESwiGLU(cfg=moe_cfg, hidden_size=H)
+        rank = 16
+        self.w_re = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+        self.w_im = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+        nn.init.normal_(self.w_re, std=0.02)
+        nn.init.normal_(self.w_im, std=0.02)
+
+        self.gate = nn.Parameter(torch.tensor(gate_init))
+
+    def _split_by_modality(self, h: torch.Tensor, modality_ids: torch.Tensor, mod_id: int) -> torch.Tensor | None:
+        mask = modality_ids == mod_id
+        if not mask.any():
+            return None
+        return h[mask].unsqueeze(0)
+
+    def _cross_spectrum(self, h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
+        B, T, H = h_a.shape
+        h_a_n = self.norm(h_a)
+        h_b_n = self.norm(h_b)
+
+        if self.proj_in is not None:
+            a = self.proj_in(h_a_n).view(B, T, self.n_heads, self.head_dim)
+            b = self.proj_in(h_b_n).view(B, T, self.n_heads, self.head_dim)
+        else:
+            a = h_a_n.view(B, T, self.n_heads, self.head_dim)
+            b = h_b_n.view(B, T, self.n_heads, self.head_dim)
+
+        a = a.permute(0, 2, 1, 3).contiguous()
+        b = b.permute(0, 2, 1, 3).contiguous()
+
+        A_f = torch.fft.rfft2(a.float())
+        B_f = torch.fft.rfft2(b.float())
+
+        T_a = A_f.shape[2]
+        H_a = A_f.shape[3]
+        Kt = min(16, T_a)
+        Kh = min(12, H_a)
+
+        cross = A_f[:, :, :Kt, :Kh] * B_f[:, :, :Kt, :Kh].conj()
+
+        w_re = self.w_re.float() @ self.w_re.t().float()
+        w_im = self.w_im.float() @ self.w_im.t().float()
+        w = torch.complex(w_re, w_im)
+
+        cross = cross @ w[:, :Kh, :H_a]
+
+        out_f = torch.zeros_like(A_f)
+        out_f[:, :, :Kt, :] = cross
+
+        x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(h_a.dtype)
+        x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
+
+        if self.proj_out is not None:
+            return self.proj_out(x_out)
+        return x_out
 
     def forward(
         self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        h: torch.Tensor,
         modality_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, list]:
-        x = x + self.self_attn(self.self_attn_norm(x), cos, sin)
+        num_modalities: int = 3,
+    ) -> torch.Tensor:
+        if modality_ids is None:
+            return h
 
-        if modality_ids is not None:
-            cross_out = self.cross_attn(self.cross_attn_norm(x), cos, sin)
-            gate = torch.sigmoid(self.cross_gate)
-            x = x + gate * cross_out
+        B, T, H = h.shape
+        gate = torch.sigmoid(self.gate)
+        cross_residual = h.new_zeros(B, T, H)
 
-        moe_out, aux, rp = self.moe(self.ffn_norm(x))
-        return x + moe_out, aux, rp
+        for i in range(num_modalities):
+            for j in range(i + 1, num_modalities):
+                h_i = self._split_by_modality(h, modality_ids, i)
+                h_j = self._split_by_modality(h, modality_ids, j)
+                if h_i is None or h_j is None:
+                    continue
+
+                n_min = min(h_i.shape[1], h_j.shape[1])
+                cross_i = self._cross_spectrum(h_i[:, :n_min], h_j[:, :n_min])
+                cross_j = self._cross_spectrum(h_j[:, :n_min], h_i[:, :n_min])
+
+                mask_i = modality_ids == i
+                mask_j = modality_ids == j
+                for b in range(B):
+                    idx_i = torch.where(mask_i[b])[0]
+                    idx_j = torch.where(mask_j[b])[0]
+                    n_i = min(idx_i.shape[0], n_min)
+                    n_j = min(idx_j.shape[0], n_min)
+                    if n_i > 0:
+                        cross_residual[b, idx_i[:n_i]] += cross_i[0, :n_i]
+                    if n_j > 0:
+                        cross_residual[b, idx_j[:n_j]] += cross_j[0, :n_j]
+
+        return h + gate * cross_residual

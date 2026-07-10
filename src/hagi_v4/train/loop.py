@@ -95,38 +95,6 @@ def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
     return cfg.train.phase2_mask_ratio
 
 
-def _two_phase_coherence_weight(step: int, cfg: HAGIv4Config) -> float:
-    """Two-phase coherence weight: minimal early, stronger late."""
-    if not cfg.train.use_two_phase_schedule:
-        return cfg.train.w_coherence
-    split_step = int(cfg.train.max_steps * cfg.train.two_phase_split)
-    if step < split_step:
-        return cfg.train.phase1_w_coherence
-    return cfg.train.phase2_w_coherence
-
-
-def _log_grade_variance(model: nn.Module, hidden: torch.Tensor, step: int, cfg: HAGIv4Config) -> dict:
-    """Log per-grade activation variance for capacity monitoring."""
-    if not cfg.train.log_grade_variance:
-        return {}
-    if step % cfg.train.grade_log_interval != 0:
-        return {}
-    gdr = getattr(model, "gdr", None)
-    if gdr is None:
-        return {}
-    b = gdr._bounds
-    var_scalar = hidden[..., b[0] : b[1]].float().var(dim=(0, 1)).sum().item()
-    var_vector = hidden[..., b[1] : b[2]].float().var(dim=(0, 1)).sum().item()
-    var_bivector = hidden[..., b[2] : b[3]].float().var(dim=(0, 1)).sum().item()
-    var_trivector = hidden[..., b[3] : b[4]].float().var(dim=(0, 1)).sum().item()
-    return {
-        "var_scalar": var_scalar,
-        "var_vector": var_vector,
-        "var_bivector": var_bivector,
-        "var_trivector": var_trivector,
-    }
-
-
 def train_step(
     model: nn.Module,
     batch: dict,
@@ -157,10 +125,6 @@ def train_step(
     pattern = sample_mask_pattern()
     masked_ids, mask = create_mask(input_ids, pattern, mask_ratio, mc.mask_token_id, mc.span_length)
 
-    w_coherence = cfg.train.w_coherence
-    if cfg.train.use_two_phase_schedule:
-        w_coherence = _two_phase_coherence_weight(step, cfg)
-
     if loss_aggregator is None:
         loss_aggregator = LossAggregator(cfg)
 
@@ -172,7 +136,7 @@ def train_step(
 
     for micro_idx in range(accum):
         output = model(masked_ids, targets=targets, mask=mask, step=step)
-        loss = loss_aggregator(output, targets, mask, w_coherence_override=w_coherence)
+        loss = loss_aggregator(output, targets, mask)
 
         use_distill = (
             teacher is not None
@@ -229,8 +193,6 @@ def train_step(
     if output is None:
         return {"loss": 0.0, "step": step, "grad_norm": grad_norm}
 
-    grade_vars = _log_grade_variance(model, output.hidden, step, cfg)
-
     with torch.no_grad():
         if output.logits is not None:
             probs = F.softmax(output.logits, dim=-1)
@@ -261,7 +223,6 @@ def train_step(
         "lr": lr_at(step, cfg),
         "step": step,
     }
-    result.update(grade_vars)
     return result
 
 
