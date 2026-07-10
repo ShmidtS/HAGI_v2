@@ -40,7 +40,7 @@ from hagi_v4.model.gp2d import GeometricProduct2D
 from hagi_v4.model.kalman import KalmanFilter
 from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
-from hagi_v4.model.norms import RMSNorm, build_rope_cache
+from hagi_v4.model.norms import RMSNorm
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
 
 if TYPE_CHECKING:
@@ -418,7 +418,7 @@ class HAGIv4(nn.Module):
             mask = mask & pilot_mask.unsqueeze(0)
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
-        cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
+        cos, sin = None, None
 
         cached_len = 0
         if cache is not None and cache.context_len > 0:
@@ -536,7 +536,3 @@ class HAGIv4(nn.Module):
             ce_loss=ce,
             iterations_used=side_info.get("iterations_used"),
         )
-
-    def _rope(self, T: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        a = self.cfg.model.attention
-        return build_rope_cache(T, a.head_dim, a.rope_theta, device, dtype)
