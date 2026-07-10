@@ -26,6 +26,7 @@ Spectral cache:
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,9 @@ from hagi_v4.model.msa import MSAModule
 from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
 from hagi_v4.model.norms import RMSNorm, build_rope_cache
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
+
+if TYPE_CHECKING:
+    from hagi_v4.inference.spectral_cache import SpectralCache
 
 
 class TurboLoop(nn.Module):
@@ -135,6 +139,7 @@ class TurboLoop(nn.Module):
         cqi_mean: float = 0.5,
         mask: torch.Tensor | None = None,
         cached_p: torch.Tensor | None = None,
+        clear_msa: bool = True,
     ) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
         B, T, C = z.shape
 
@@ -145,14 +150,15 @@ class TurboLoop(nn.Module):
         iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
         gp2d_residual = torch.zeros_like(z)
 
-        p = torch.ones(C, device=z.device, dtype=z.dtype)
+        p = cached_p if cached_p is not None else torch.ones(C, device=z.device, dtype=z.dtype)
 
         base_k = self.msa.cfg.top_k
         adaptive_k = base_k + int((1.0 - cqi_mean) * 4)
 
         q_scale = 1.0 + (1.0 - cqi_mean)
 
-        self.msa.clear()
+        if clear_msa:
+            self.msa.clear()
 
         w_shared = None
         phase_shared = None
@@ -227,7 +233,7 @@ class TurboLoop(nn.Module):
             "gp2d_residual": gp2d_residual,
         }
 
-        return z, side_info, None
+        return z, side_info, p
 
 
 class HAGIv4(nn.Module):
@@ -398,6 +404,7 @@ class HAGIv4(nn.Module):
         spectrograms: torch.Tensor | None = None,
         modality_ids: torch.Tensor | None = None,
         cached_p: torch.Tensor | None = None,
+        cache: SpectralCache | None = None,
     ) -> ModelOutput:
         if self.use_multimodal and (images is not None or spectrograms is not None):
             h, modality_ids, lengths = self.mm_input(input_ids, images, spectrograms)
@@ -412,7 +419,22 @@ class HAGIv4(nn.Module):
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
         cos, sin = (None, None) if self.use_freq_coding else self._rope(T, h.device, h.dtype)
+
+        cached_len = 0
+        if cache is not None and cache.context_len > 0:
+            cached_h = cache.get_context(0)
+            if cached_h is not None and cached_h.shape[0] == B and cached_h.shape[2] == h.shape[2]:
+                h = torch.cat([cached_h.to(h.dtype), h], dim=1)
+                cached_len = cached_h.shape[1]
+
         h = self._freq_blocks_forward(h, cos, sin)
+
+        if cache is not None:
+            W = cache.context_window
+            cache.update_context(0, h[:, -W:, :])
+            if cached_len > 0:
+                h = h[:, cached_len:]
+                B, T, _ = h.shape
 
         if self.use_multimodal and modality_ids is not None:
             h = self.cross_freq(h, modality_ids, num_modalities=self.cfg.model.multimodal.num_modalities)
@@ -425,7 +447,6 @@ class HAGIv4(nn.Module):
 
         cqi = self.cqi(h)
         cqi_mean_t = cqi.mean()
-        cqi_mean = cqi_mean_t.item()
 
         h_pre_bottleneck = h
 
@@ -437,15 +458,23 @@ class HAGIv4(nn.Module):
         if mask is not None:
             z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
 
+        turbo_cached_p = cached_p
+        if cache is not None:
+            turbo_cached_p = cache.get_kalman_p()
+
         z, side_info, p_final = self.turbo(
             z,
             training=self.training,
             cos=cos,
             sin=sin,
-            cqi_mean=cqi_mean,
+            cqi_mean=float(cqi_mean_t.detach()) if self.training else cqi_mean_t.item(),
             mask=mask,
-            cached_p=cached_p,
+            cached_p=turbo_cached_p,
+            clear_msa=(cache is None),
         )
+
+        if cache is not None and p_final is not None:
+            cache.update_kalman_p(p_final)
 
         if self.use_multimodal and modality_ids is not None:
             z_cross, cross_residual = self.cross_gp2d(z, modality_ids)
@@ -470,11 +499,12 @@ class HAGIv4(nn.Module):
         rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
 
         h_normed = self.final_norm(h)
-        mask_valid = mask is not None and mask.any().item() if mask is not None else False
-        if targets is not None and mask_valid:
+        if targets is not None and mask is not None:
             h_masked = h_normed[mask]
-            t_masked = targets[mask]
-            ce = F.cross_entropy(F.linear(h_masked, self.lm_head.weight), t_masked)
+            if h_masked.shape[0] > 0:
+                ce = F.cross_entropy(F.linear(h_masked, self.lm_head.weight), targets[mask])
+            else:
+                ce = self._chunked_ce(h_normed, targets)
             logits = None
         elif targets is not None:
             ce = self._chunked_ce(h_normed, targets)

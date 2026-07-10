@@ -31,12 +31,18 @@ def generate(
     noise_ratio: float = 0.0,
     block_size: int = 16,
     refine_passes: int = 2,
-    repetition_penalty: float = 1.5,
-    repetition_window: int = 64,
+    repetition_penalty: float = 0.8,
+    repetition_window: int = 32,
     use_cache: bool = True,
     cache_window: int = 128,
 ) -> torch.Tensor:
     """Generate text block-parallel with Turbo-style iterative refinement.
+
+    Spectral cache (OFDM cyclic prefix analog):
+      First call processes the full prompt and caches perception output.
+      Subsequent calls process only (cached_window + new_block) instead of
+      (full_prompt + all_generated + new_block). FFT complexity drops from
+      O(T_total * log(T_total)) to O((W + block) * log(W + block)).
 
     Args:
         model: HAGIv4 model (eval mode).
@@ -71,8 +77,7 @@ def generate(
     else:
         full_ids = prompt_ids.clone()
 
-    if use_cache:
-        SpectralCache(context_window=cache_window)
+    cache = SpectralCache(context_window=cache_window) if use_cache else None
 
     turbo = getattr(model, "turbo", None)
     orig_n_iters_backup = None
@@ -91,7 +96,7 @@ def generate(
             logits[b, :, unique] = logits[b, :, unique] - counts * repetition_penalty
         return logits
 
-    def sample_tokens(logits: torch.Tensor, n_block: int, gen_count: int) -> torch.Tensor:
+    def sample_tokens(logits: torch.Tensor, n_block: int) -> torch.Tensor:
         if temperature > 0:
             lt = logits / temperature
         else:
@@ -110,35 +115,44 @@ def generate(
         else:
             return lt.argmax(dim=-1)
 
+    if cache is not None:
+        _ = model(full_ids, targets=None, mask=None, cache=cache)
+
     generated = 0
-    cached_p = None
     try:
         while generated < max_new_tokens:
             n_block = min(block_size, max_new_tokens - generated)
-            mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
-            seq = torch.cat([full_ids, mask_tokens], dim=1)
-            T = seq.shape[1]
 
-            mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-            mask[:, T - n_block :] = True
+            if cache is not None:
+                mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
+                block_mask = torch.ones(B, n_block, dtype=torch.bool, device=device)
+                output = model(mask_tokens, targets=None, mask=block_mask, cache=cache)
+            else:
+                mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
+                seq = torch.cat([full_ids, mask_tokens], dim=1)
+                T = seq.shape[1]
+                mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+                mask[:, T - n_block :] = True
+                output = model(seq, targets=None, mask=mask)
 
-            output = model(seq, targets=None, mask=mask, cached_p=cached_p)
             if output.logits is None:
                 break
 
-            block_logits = output.logits[:, T - n_block :, :]
-
-            new_tokens = sample_tokens(block_logits, n_block, generated)
+            block_logits = output.logits[:, -n_block:, :]
+            new_tokens = sample_tokens(block_logits, n_block)
 
             for pass_idx in range(1, refine_passes):
-                seq[:, T - n_block :] = new_tokens
-                mask_refined = torch.zeros_like(mask)
-                output = model(seq, targets=None, mask=mask_refined, cached_p=cached_p)
+                if cache is not None:
+                    output = model(new_tokens, targets=None, mask=None, cache=cache)
+                else:
+                    seq[:, -n_block:] = new_tokens
+                    mask_refined = torch.zeros(B, seq.shape[1], dtype=torch.bool, device=device)
+                    output = model(seq, targets=None, mask=mask_refined)
                 if output.logits is None:
                     break
-                refined_logits = output.logits[:, T - n_block :, :]
+                refined_logits = output.logits[:, -n_block:, :]
                 block_logits = 0.5 * block_logits + 0.5 * refined_logits
-                new_tokens = sample_tokens(block_logits, n_block, generated)
+                new_tokens = sample_tokens(block_logits, n_block)
 
             if eos_token_id is not None and generated < min_tokens:
                 new_tokens[:, 0] = torch.where(

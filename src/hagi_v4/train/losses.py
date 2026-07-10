@@ -45,7 +45,7 @@ class LossAggregator:
         self.w_efficiency = cfg.train.w_efficiency
         self.w_msa_lb = 0.01
         self.w_rate_distortion = cfg.train.w_rate_distortion
-        self.w_contrastive = cfg.train.w_contrastive
+        self.w_contrastive = cfg.train.w_contrastive if hasattr(cfg.train, "w_contrastive") else 0.0
 
     def __call__(
         self,
