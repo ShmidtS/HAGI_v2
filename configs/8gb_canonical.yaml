@@ -58,7 +58,7 @@ model:
     complex_rank: 16
 
   multimodal:
-    enabled: false
+    enabled: true
     num_modalities: 3
     modality_embed_std: 0.02
     modality_dropout_prob: 0.10
