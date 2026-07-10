@@ -132,10 +132,8 @@ _MUON_EXCLUDE = frozenset(
         "norm",
         "router",
         "gate",
-        "halt",
         "block_proj",
         "w_time",
-        "coherence",
     }
 )
 

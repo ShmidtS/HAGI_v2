@@ -60,11 +60,14 @@ class SpectralCache:
         return self._kalman_p
 
     def update_kalman_p(self, p: torch.Tensor) -> None:
-        W = self.context_window
-        if p.shape[1] <= W:
-            self._context_p = p.detach()
+        if p.dim() <= 1:
+            self._kalman_p = p.detach()
         else:
-            self._kalman_p = p[:, -W:, :].detach()
+            W = self.context_window
+            if p.shape[1] <= W:
+                self._kalman_p = p.detach()
+            else:
+                self._kalman_p = p[:, -W:, :].detach()
 
     def advance(self, new_len: int) -> None:
         self._total_len = new_len
