@@ -130,6 +130,16 @@ class TurboLoop(nn.Module):
         self.kalman = KalmanFilter(hidden_size)
         self._layers_per_iter = max(2, m.reasoning_layers // 2)
 
+        mut_rank = 8
+        self.mut_down_w = nn.Parameter(torch.empty(mut_rank, hidden_size))
+        self.mut_down_b = nn.Parameter(torch.empty(mut_rank))
+        self.mut_up_w = nn.Parameter(torch.empty(hidden_size, mut_rank))
+        self.mut_rank = mut_rank
+
+        self.corr_gate_w = nn.Parameter(torch.tensor(5.0))
+        self.corr_gate_b = nn.Parameter(torch.tensor(-1.0))
+        self.write_gate_w = nn.Parameter(torch.tensor(5.0))
+
     def forward(
         self,
         z: torch.Tensor,
@@ -205,8 +215,12 @@ class TurboLoop(nn.Module):
             z_kalman, p = self.kalman.update(z_pred, innovation, p_pred, r_scale=r_decay, r=r_cached)
 
             correction = z_kalman - z_pred
-            correction_gate = torch.sigmoid(gp2d_residual.abs().float() * 5 - 1).to(z.dtype)
+            correction_gate = torch.sigmoid(gp2d_residual.abs().float() * self.corr_gate_w + self.corr_gate_b).to(
+                z.dtype
+            )
             z = z_pred + correction_gate * correction
+
+            z = z + F.linear(F.silu(F.linear(z, self.mut_down_w, self.mut_down_b)), self.mut_up_w)
 
             z = self.tanh_scale * torch.tanh(z / self.tanh_scale)
 
@@ -215,7 +229,7 @@ class TurboLoop(nn.Module):
 
             innovation_harq = z - h_prior
             inn_mag = innovation_harq.float().norm(dim=-1, keepdim=True)
-            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * 5).to(innovation_harq.dtype)
+            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * self.write_gate_w).to(innovation_harq.dtype)
             self.msa.write(innovation_harq * write_gate)
 
             combined_ext = ext_norm
@@ -341,6 +355,9 @@ class HAGIv4(nn.Module):
 
         self._init_weights()
         self._init_mask_embeds()
+        nn.init.normal_(self.turbo.mut_down_w, std=0.02)
+        nn.init.zeros_(self.turbo.mut_down_b)
+        nn.init.zeros_(self.turbo.mut_up_w)
 
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
         B, T, H = h.shape
@@ -355,8 +372,10 @@ class HAGIv4(nn.Module):
         return total_loss / max(n, 1)
 
     def _init_weights(self) -> None:
-        for mod in self.modules():
+        for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
+                if "mut_" in name:
+                    continue
                 nn.init.normal_(mod.weight, mean=0.0, std=0.02)
                 if mod.bias is not None:
                     nn.init.zeros_(mod.bias)

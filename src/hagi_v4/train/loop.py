@@ -27,6 +27,7 @@ from hagi_v4.model.masking import (
 )
 from hagi_v4.model.outputs import ModelOutput
 from hagi_v4.train.distillation import alpha_at, temperature_at
+from hagi_v4.train.foxp2 import FOXP2Controller, apply_foxp2
 from hagi_v4.train.losses import LossAggregator
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
@@ -106,6 +107,7 @@ def train_step(
     mask_warmup_steps: int = 20000,
     grad_norm_target: float = 1.0,
     adaptive_mask_state: dict | None = None,
+    foxp2: FOXP2Controller | None = None,
 ) -> dict:
     """Single training step with gradient accumulation."""
     model.train()
@@ -188,6 +190,13 @@ def train_step(
         total_loss += loss.item()
 
     grad_norm = soft_grad_scale(model, grad_norm_target)
+
+    if foxp2 is not None:
+        progress = min(1.0, step / max(cfg.train.max_steps, 1))
+        groups = [[p for p in model.parameters() if p.requires_grad]]
+        device = next(model.parameters()).device
+        apply_foxp2(foxp2, groups, progress, device)
+
     optimizer.step()
 
     if output is None:
@@ -244,6 +253,12 @@ def train(
     optimizer = build_optimizer(model, cfg)
     loss_aggregator = LossAggregator(cfg)
     adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
+
+    foxp2 = FOXP2Controller(num_groups=1, hidden=32)
+    if torch.cuda.is_available():
+        foxp2 = foxp2.cuda()
+    foxp2_optimizer = torch.optim.AdamW(foxp2.parameters(), lr=1e-4, weight_decay=0.01)
+
     step = start_step
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
@@ -267,9 +282,22 @@ def train(
             teacher,
             loss_aggregator=loss_aggregator,
             adaptive_mask_state=adaptive_mask_state,
+            foxp2=foxp2,
         )
         if step % log_interval == 0:
             yield metrics
+
+        if foxp2 is not None:
+            progress = min(1.0, step / max(cfg.train.max_steps, 1))
+            groups = [[p for p in model.parameters() if p.requires_grad]]
+            device = next(model.parameters()).device
+            grad_stats = foxp2.compute_grad_stats(groups).to(device=device, dtype=torch.float32)
+            gates = foxp2(grad_stats, progress)
+            foxp2_loss = -gates.mean() + 0.01 * (gates - 0.5).pow(2).mean()
+            foxp2_optimizer.zero_grad(set_to_none=True)
+            foxp2_loss.backward()
+            foxp2_optimizer.step()
+            metrics["foxp2_gates"] = gates.detach().flatten().tolist()
 
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
             save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)
