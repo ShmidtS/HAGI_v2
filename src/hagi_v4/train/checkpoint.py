@@ -97,7 +97,7 @@ def get_latest_checkpoint(checkpoint_dir: str) -> str | None:
     ckpt_dir = Path(checkpoint_dir)
     if not ckpt_dir.exists():
         return None
-    checkpoints = sorted(ckpt_dir.glob("step-*.pt"))
+    checkpoints = sorted(ckpt_dir.glob("step-*.pt"), key=lambda p: int(p.stem.split("-")[1]))
     if not checkpoints:
         return None
     return str(checkpoints[-1])

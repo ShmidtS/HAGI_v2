@@ -210,6 +210,7 @@ class TrainConfig:
     w_efficiency: float = 0.001
     w_rate_distortion: float = 0.01
     w_contrastive: float = 0.1
+    w_msa_lb: float = 0.01
     use_two_phase_schedule: bool = True
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15
@@ -277,7 +278,6 @@ class HAGIv4Config:
 
 
 _BOTTLENECK_RATIO = 0.5
-_MOE_INT_RATIO = 1.3333
 _HEAD_DIM_MIN = 16
 
 
@@ -308,10 +308,10 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
 
         C = _round_to_multiple(int(H * _BOTTLENECK_RATIO), 8)
 
-        moe_int_h = _round_to_multiple(int(H * _MOE_INT_RATIO * _BOTTLENECK_RATIO), 8)
-        moe_int_c = _round_to_multiple(int(C * _MOE_INT_RATIO), 8)
-        cost_h = 4 * H * H + 3 * H * moe_int_h + 2 * H
-        cost_c = 4 * C * C + 3 * C * moe_int_c + 2 * C
+        ffn_int_h = _round_to_multiple(int(H * 2 * _BOTTLENECK_RATIO), 8)
+        ffn_int_c = _round_to_multiple(int(C * 2), 8)
+        cost_h = 4 * H * H + 3 * H * ffn_int_h + 2 * H
+        cost_c = 4 * C * C + 3 * C * ffn_int_c + 2 * C
         extra = 50 * C + 20 * H
         k = (cost_h * (perc + expr) + cost_c * reason + extra) / (H * H)
         H_new = int(math.sqrt(target / k))

@@ -64,16 +64,39 @@ class ContrastiveAlignment(nn.Module):
                 if not (ma.any() and mb.any()):
                     continue
 
-                h_a = h[b][ma].mean(dim=0, keepdim=True)
-                h_b = h[b][mb].mean(dim=0, keepdim=True)
+                h_a = h[b][ma].mean(dim=0)
+                h_b = h[b][mb].mean(dim=0)
 
-                proj_a = self._proj(mod_a)(h_a)
-                proj_b = self._proj(mod_b)(h_b)
+                z_a = self._proj(mod_a)(h_a)
+                z_b = self._proj(mod_b)(h_b)
 
-                sim = F.cosine_similarity(proj_a, proj_b, dim=-1) / self.temperature
-                sim_exp = sim.exp()
-                loss = loss - sim_exp.log() / (sim_exp + 1e-8)
+                sim_pos = F.cosine_similarity(z_a, z_b, dim=-1) / self.temperature
+
+                negatives_a = []
+                negatives_b = []
+                for other_b in range(B):
+                    if other_b == b:
+                        continue
+                    other_ma = mask_a[other_b]
+                    other_mb = mask_b[other_b]
+                    if other_ma.any():
+                        negatives_a.append(self._proj(mod_a)(h[other_b][other_ma].mean(dim=0)))
+                    if other_mb.any():
+                        negatives_b.append(self._proj(mod_b)(h[other_b][other_mb].mean(dim=0)))
+
+                if not negatives_a and not negatives_b:
+                    continue
+
+                all_b = torch.stack([z_b] + negatives_a)
+                logits_a = F.cosine_similarity(z_a.unsqueeze(0), all_b, dim=-1) / self.temperature
+                loss = loss - F.log_softmax(logits_a, dim=0)[0]
                 n_pairs += 1
+
+                if negatives_b:
+                    all_a = torch.stack([z_a] + negatives_b)
+                    logits_b = F.cosine_similarity(z_b.unsqueeze(0), all_a, dim=-1) / self.temperature
+                    loss = loss - F.log_softmax(logits_b, dim=0)[0]
+                    n_pairs += 1
 
         if n_pairs > 0:
             loss = loss / n_pairs

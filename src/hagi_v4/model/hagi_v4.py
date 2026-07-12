@@ -144,8 +144,6 @@ class TurboLoop(nn.Module):
         self,
         z: torch.Tensor,
         training: bool,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
         cqi_mean: float = 0.5,
         mask: torch.Tensor | None = None,
         cached_p: torch.Tensor | None = None,
@@ -197,10 +195,10 @@ class TurboLoop(nn.Module):
                 idx = (start + i) % len(self.reasoning)
                 blk = self.reasoning[idx]
                 if training:
-                    z = z + blk.freq(z, cos, sin, cached_w=w_shared, cached_phase=phase_shared)
+                    z = z + blk.freq(z, cached_w=w_shared, cached_phase=phase_shared)
                     z = z + checkpoint(blk.ffn, blk.ffn_norm(z), use_reentrant=False)
                 else:
-                    z, _, _ = blk(z, cos, sin, cached_w=w_shared, cached_phase=phase_shared)
+                    z = blk(z, cached_w=w_shared, cached_phase=phase_shared)
 
             z_pred = z
 
@@ -390,13 +388,13 @@ class HAGIv4(nn.Module):
             me_f_c = me_f[: self._C // 2 + 1] * gate.float()
             self.core_mask_embed.data.copy_(torch.fft.irfft(me_f_c, n=self._C).to(self.mask_embed.dtype))
 
-    def _freq_blocks_forward(self, h: torch.Tensor, cos, sin) -> torch.Tensor:
+    def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
         for blk in self.perception:
             if self.training:
-                h = h + blk.freq(h, cos, sin)
+                h = h + blk.freq(h)
                 h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
             else:
-                h, _, _ = blk(h, cos, sin)
+                h = blk(h)
         return h
 
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
@@ -437,8 +435,6 @@ class HAGIv4(nn.Module):
             mask = mask & pilot_mask.unsqueeze(0)
             h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
 
-        cos, sin = None, None
-
         cached_len = 0
         if cache is not None and cache.context_len > 0:
             cached_h = cache.get_context(0)
@@ -446,7 +442,7 @@ class HAGIv4(nn.Module):
                 h = torch.cat([cached_h.to(h.dtype), h], dim=1)
                 cached_len = cached_h.shape[1]
 
-        h = self._freq_blocks_forward(h, cos, sin)
+        h = self._freq_blocks_forward(h)
 
         if cache is not None:
             W = cache.context_window
@@ -484,8 +480,6 @@ class HAGIv4(nn.Module):
         z, side_info, p_final = self.turbo(
             z,
             training=self.training,
-            cos=cos,
-            sin=sin,
             cqi_mean=float(cqi_mean_t.detach()) if self.training else cqi_mean_t.item(),
             mask=mask,
             cached_p=turbo_cached_p,
@@ -513,7 +507,7 @@ class HAGIv4(nn.Module):
         z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins]
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
-        h = self._freq_blocks_forward(h, cos, sin)
+        h = self._freq_blocks_forward(h)
 
         rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
 

@@ -76,7 +76,11 @@ def main() -> int:
         overrides["train.checkpoint_dir"] = args.checkpoint_dir
     cfg = load_config(path=args.config, **overrides)
 
-    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
+    device = torch.device(
+        "cuda"
+        if args.device == "auto" and torch.cuda.is_available()
+        else ("cpu" if args.device == "auto" else args.device)
+    )
     logger.info(f"Device: {device} | Config: {args.config} | Data: {args.data_dir}")
 
     model = HAGIv4(cfg).to(device)

@@ -61,7 +61,6 @@ def generate(
         repetition_window: number of recent tokens to penalize.
         no_repeat_ngram_size: ban tokens that would create repeated n-grams.
         use_cache: enable spectral cache for efficient inference.
-        cache_window: context window size for spectral cache.
 
     Returns:
         [B, T_prompt + generated] token IDs.
@@ -183,10 +182,10 @@ def generate(
                 new_tokens = sample_tokens(block_logits, n_block)
 
             if eos_token_id is not None and generated < min_tokens:
-                new_tokens[:, 0] = torch.where(
-                    new_tokens[:, 0] == eos_token_id,
-                    torch.full_like(new_tokens[:, 0], mask_token_id),
-                    new_tokens[:, 0],
+                new_tokens = torch.where(
+                    new_tokens == eos_token_id,
+                    torch.full_like(new_tokens, mask_token_id),
+                    new_tokens,
                 )
 
             full_ids = torch.cat([full_ids, new_tokens], dim=1)

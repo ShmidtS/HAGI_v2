@@ -43,7 +43,7 @@ class LossAggregator:
         self.w_parity = cfg.train.w_parity
         self.w_extrinsic_info = cfg.train.w_extrinsic_info
         self.w_efficiency = cfg.train.w_efficiency
-        self.w_msa_lb = 0.01
+        self.w_msa_lb = getattr(cfg.train, "w_msa_lb", 0.01)
         self.w_rate_distortion = cfg.train.w_rate_distortion
         self.w_contrastive = cfg.train.w_contrastive if hasattr(cfg.train, "w_contrastive") else 0.0
 

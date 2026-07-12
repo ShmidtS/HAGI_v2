@@ -1,1 +1,1 @@
-"""Inference: progressive unmasking, length prediction."""
+"""Inference: block-parallel generation with iterative refinement."""

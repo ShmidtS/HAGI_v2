@@ -23,7 +23,6 @@ learns to progressively activate longer-range parity as training proceeds.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hagi_v4.config import GP2DConfig
@@ -65,7 +64,7 @@ class MultiScaleGP2D(nn.Module):
             )
             self.gp_layers.append(GeometricProduct2D(scale_cfg, hidden_size))
 
-        self.scale_weights = nn.Parameter(torch.zeros(len(scales)))
+        self.scale_gates = nn.Parameter(torch.zeros(len(scales)))
         self.fusion_norm = RMSNorm(hidden_size, eps=1e-6)
         self.fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fusion_gate = nn.Parameter(torch.tensor(0.0))
@@ -98,8 +97,8 @@ class MultiScaleGP2D(nn.Module):
                 residual_i = self._interleave(residual_i, -idx)
             residuals.append(residual_i)
 
-        scale_w = F.softmax(self.scale_weights, dim=0)
-        combined_residual = sum(w * r for w, r in zip(scale_w, residuals))
+        scale_gates = torch.sigmoid(self.scale_gates)
+        combined_residual = sum(g * r for g, r in zip(scale_gates, residuals))
 
         fused = self.fusion_norm(self.fusion_proj(combined_residual))
         gate = torch.sigmoid(self.fusion_gate)

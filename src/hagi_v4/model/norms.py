@@ -1,7 +1,7 @@
-"""RMSNorm and RoPE utilities for HAGI V4.
+"""RMSNorm for HAGI V4.
 
-Ported from V3 norms.py. RoPE works identically for bidirectional attention
-(position encoding is position-relative, not direction-dependent).
+5G analog: RMSNorm = signal normalization before modulation (AGC).
+RoPE removed in V7 — 2D FFT provides position encoding via phase.
 """
 
 from __future__ import annotations
@@ -32,39 +32,3 @@ class RMSNorm(nn.Module):
             out = F.rms_norm(x_f32, x_f32.shape[-1:], self.weight.float(), self.eps)
             return out.to(orig_dtype)
         return F.rms_norm(x, x.shape[-1:], self.weight, self.eps)
-
-
-def build_rope_cache(
-    seq_len: int,
-    head_dim: int,
-    theta: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute cos/sin tables for rotary position embeddings.
-
-    Returns:
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-    """
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    t = torch.arange(end=seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    cos = freqs.cos().to(dtype)
-    sin = freqs.sin().to(dtype)
-    return cos, sin
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embeddings using slice-based even/odd rotation.
-
-    x: [B, H, T, D] or [..., T, D]
-    cos/sin: [T, D // 2]
-    """
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-    rx1 = x1 * cos - x2 * sin
-    rx2 = x1 * sin + x2 * cos
-    return torch.stack((rx1, rx2), dim=-1).flatten(-2)

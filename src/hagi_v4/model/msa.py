@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hagi_v4.config import MSAConfig
-from hagi_v4.model.norms import RMSNorm
 
 
 class TensorSlotRegistry(nn.Module):
@@ -29,28 +28,32 @@ class TensorSlotRegistry(nn.Module):
         self.register_buffer("num_written", torch.zeros(1, dtype=torch.long), persistent=False)
 
     def write(self, keys: torch.Tensor, kv_compressed: torch.Tensor) -> None:
-        """Write keys and compressed KV into the ring buffer.
-
-        .detach() on keys/kv prevents gradients from flowing through the
-        memory write path — slots are treated as fixed context, not as
-        differentiable parameters of the current forward pass.
-        """
         n = keys.shape[0]
         ptr = int(self.write_ptr.item())
         idx = torch.arange(n, device=keys.device)
         indices = (idx + ptr) % self.max_slots
         self.slot_keys.index_copy_(0, indices, keys.detach().to(self.slot_keys.dtype))
         self.slot_kv.index_copy_(0, indices, kv_compressed.detach().to(self.slot_kv.dtype))
-        new_ptr = torch.tensor([(ptr + n) % self.max_slots], dtype=torch.long, device=keys.device)
-        self.write_ptr.copy_(new_ptr)
-        self.num_written.copy_(torch.tensor([min(ptr + n, self.max_slots)], dtype=torch.long, device=keys.device))
+        new_ptr = (ptr + n) % self.max_slots
+        self.write_ptr.fill_(new_ptr)
+        self.num_written.fill_(min(ptr + n, self.max_slots))
 
     def read_topk(self, query: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        num_valid = int(self.num_written.item())
+        if num_valid == 0:
+            dummy_idx = torch.zeros(query.shape[0], top_k, dtype=torch.long, device=query.device)
+            dummy_scores = torch.zeros(query.shape[0], top_k, dtype=query.dtype, device=query.device)
+            return dummy_idx, dummy_scores
         q_norm = F.normalize(query, dim=-1)
-        k_norm = F.normalize(self.slot_keys, dim=-1)
+        k_norm = F.normalize(self.slot_keys[:num_valid], dim=-1)
         scores = q_norm @ k_norm.T
-        k = min(top_k, self.max_slots)
+        k = min(top_k, num_valid)
         top_scores, top_indices = torch.topk(scores, k=k, dim=-1)
+        if k < top_k:
+            pad_idx = torch.zeros(query.shape[0], top_k - k, dtype=torch.long, device=query.device)
+            pad_scores = torch.full((query.shape[0], top_k - k), -1e9, dtype=query.dtype, device=query.device)
+            top_indices = torch.cat([top_indices, pad_idx], dim=-1)
+            top_scores = torch.cat([top_scores, pad_scores], dim=-1)
         return top_indices, top_scores
 
     def gather_kv(self, indices: torch.Tensor) -> torch.Tensor:
@@ -73,30 +76,26 @@ class MSAModule(nn.Module):
         self.mla_up_v = nn.Linear(cfg.mla_compress_dim, cfg.mla_up_dim, bias=False)
         self.q_proj = nn.Linear(hidden_size, cfg.mla_up_dim, bias=False)
         self.o_proj = nn.Linear(cfg.mla_up_dim, hidden_size, bias=False)
-        self.attn_norm = RMSNorm(hidden_size)
         self.registry = TensorSlotRegistry(cfg.max_slots, cfg.routing_key_dim, cfg.mla_compress_dim)
         self._n_kv_heads = cfg.n_kv_heads
         self._head_dim = cfg.head_dim
-        self._scalar_slice = (0, cfg.grade_dims[0])
-        self._bivector_slice = (sum(cfg.grade_dims[:2]), sum(cfg.grade_dims[:2]) + cfg.grade_dims[2])
-        self._adaptive_chunk = cfg.use_adaptive_chunk_size
-        self._chunk_low = cfg.chunk_size_low_entropy
-        self._chunk_high = cfg.chunk_size_high_entropy
         self._default_chunk = cfg.slot_chunk_size
-
-    def _select_chunk_size(self, h: torch.Tensor) -> int:
-        return self._default_chunk
 
     def write(self, h: torch.Tensor) -> None:
         B, T, _ = h.shape
-        chunk = self._select_chunk_size(h)
+        chunk = self._default_chunk
         flat_h = h.reshape(B * T, -1)
         n = flat_h.shape[0]
         n_slots = n // chunk
-        if n_slots == 0:
+        remainder = n % chunk
+        chunks = []
+        if n_slots > 0:
+            chunks.append(flat_h[: n_slots * chunk].view(n_slots, chunk, -1).mean(dim=1))
+        if remainder > 0:
+            chunks.append(flat_h[n_slots * chunk :].mean(dim=0, keepdim=True))
+        if not chunks:
             return
-        usable = flat_h[: n_slots * chunk]
-        chunked = usable.view(n_slots, chunk, -1).mean(dim=1)
+        chunked = torch.cat(chunks, dim=0)
         keys = self.route_proj(chunked)
         kv = self.mla_compress(chunked)
         self.registry.write(keys, kv)

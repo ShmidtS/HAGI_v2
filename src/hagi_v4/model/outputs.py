@@ -33,8 +33,8 @@ class ModelOutput:
 
 
 def compute_whiteness_loss(residual: torch.Tensor) -> torch.Tensor:
-    if residual is None or residual.size(1) < 2:
-        return residual.new_zeros(()) if residual is not None else torch.tensor(0.0)
+    if residual.size(1) < 2:
+        return residual.new_zeros(())
     r_t = residual[:, :-1].reshape(-1, residual.size(-1))
     r_t1 = residual[:, 1:].reshape(-1, residual.size(-1))
     cos_sim = F.cosine_similarity(r_t.float(), r_t1.float(), dim=-1)

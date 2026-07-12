@@ -24,7 +24,6 @@ from __future__ import annotations
 import torch
 
 BLADE_COUNT = 8
-METRIC = [1, 1, 1]
 
 GRADE = [0, 1, 1, 2, 1, 2, 2, 3]
 
