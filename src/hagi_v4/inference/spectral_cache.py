@@ -69,9 +69,6 @@ class SpectralCache:
             else:
                 self._kalman_p = p[:, -W:, :].detach()
 
-    def advance(self, new_len: int) -> None:
-        self._total_len = new_len
-
     def reset(self) -> None:
         self._context.clear()
         self._kalman_p = None

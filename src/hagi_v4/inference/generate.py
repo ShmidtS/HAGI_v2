@@ -137,7 +137,7 @@ def generate(
             lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
 
         if temperature > 0:
-            probs = F.softmax(lt, dim=-1)
+            probs = F.softmax(lt.float(), dim=-1)
             return torch.multinomial(probs.reshape(-1, V), 1).reshape(B, n_block)
         else:
             return lt.argmax(dim=-1)

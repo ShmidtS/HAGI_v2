@@ -170,7 +170,6 @@ def train_step(
                 )
                 loss = distill_loss
                 del teacher_hidden
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         if not torch.isfinite(loss).all():
             logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — skipping")
@@ -182,9 +181,10 @@ def train_step(
 
     grad_norm = soft_grad_scale(model, grad_norm_target)
 
+    foxp2_gates = None
     if foxp2 is not None and foxp2_groups is not None:
         progress = min(1.0, step / max(cfg.train.max_steps, 1))
-        apply_foxp2(foxp2, foxp2_groups, progress, device)
+        foxp2_gates = apply_foxp2(foxp2, foxp2_groups, progress, device)
 
     optimizer.step()
 
@@ -193,8 +193,8 @@ def train_step(
 
     with torch.no_grad():
         if output.logits is not None:
-            probs = F.softmax(output.logits, dim=-1)
-            avg_confidence = probs.max(dim=-1).values.float().mean().item()
+            probs = F.softmax(output.logits.float(), dim=-1)
+            avg_confidence = probs.max(dim=-1).values.mean().item()
         elif output.ce_loss is not None:
             avg_confidence = max(0.0, 1.0 - output.ce_loss.item() / 10.0)
         else:
@@ -221,6 +221,9 @@ def train_step(
         "lr": lr_at(step, cfg),
         "step": step,
     }
+    if foxp2_gates is not None:
+        result["foxp2_gates"] = foxp2_gates.detach().flatten().tolist()
+        result["_foxp2_gates_tensor"] = foxp2_gates.detach()
     return result
 
 
@@ -283,16 +286,13 @@ def train(
         if step % log_interval == 0:
             yield metrics
 
-        if foxp2 is not None:
-            progress = min(1.0, step / max(cfg.train.max_steps, 1))
-            foxp2_device = next(foxp2.parameters()).device
-            grad_stats = foxp2.compute_grad_stats(fo_groups).to(device=foxp2_device, dtype=torch.float32)
-            gates = foxp2(grad_stats, progress)
-            foxp2_loss = 0.01 * gates.pow(2).sum()
+        if foxp2 is not None and "_foxp2_gates_tensor" in metrics:
+            gates_t = metrics["_foxp2_gates_tensor"]
+            foxp2_loss = 0.01 * gates_t.pow(2).sum()
             foxp2_optimizer.zero_grad(set_to_none=True)
             foxp2_loss.backward()
             foxp2_optimizer.step()
-            metrics["foxp2_gates"] = gates.detach().flatten().tolist()
+            del metrics["_foxp2_gates_tensor"]
 
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
             save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)

@@ -72,7 +72,7 @@ class KalmanFilter(nn.Module):
             r = r * r_scale
         if p_pred.dim() == 3:
             r = r.unsqueeze(0).unsqueeze(0)
-        k = p_pred / (p_pred + r + 1e-8)
+        k = (p_pred.float() / (p_pred.float() + r.float() + 1e-8)).to(z_pred.dtype)
         z_corrected = z_pred + k * innovation
         p_corrected = (1 - k) * p_pred
         return z_corrected, p_corrected
