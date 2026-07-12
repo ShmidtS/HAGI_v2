@@ -133,12 +133,14 @@ def apply_foxp2(
         dtype: dtype for computation.
 
     Returns:
-        gates: [num_groups] tensor (for logging).
+        gates: [num_groups] tensor with grad_fn (for FOXP2 optimizer).
     """
     with torch.no_grad():
         grad_stats = controller.compute_grad_stats(param_groups).to(device=device, dtype=dtype)
-        gates = controller(grad_stats, progress)
 
+    gates = controller(grad_stats, progress)
+
+    with torch.no_grad():
         for idx, group in enumerate(param_groups):
             scale = float(gates[idx].item())
             for p in group:
