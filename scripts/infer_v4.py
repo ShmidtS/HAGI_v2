@@ -102,6 +102,7 @@ def main() -> int:
         refine_passes=icfg.refine_passes,
         repetition_penalty=icfg.repetition_penalty,
         repetition_window=icfg.repetition_window,
+        no_repeat_ngram_size=icfg.no_repeat_ngram_size,
     )
 
     if args.interactive:

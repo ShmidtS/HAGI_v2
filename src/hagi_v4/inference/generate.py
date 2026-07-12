@@ -33,6 +33,7 @@ def generate(
     refine_passes: int = 2,
     repetition_penalty: float = 0.8,
     repetition_window: int = 32,
+    no_repeat_ngram_size: int = 3,
     use_cache: bool = True,
     cache_window: int = 128,
 ) -> torch.Tensor:
@@ -56,8 +57,9 @@ def generate(
         min_tokens: minimum tokens before EOS accepted.
         block_size: tokens generated per forward pass (5G block coding).
         refine_passes: total forward passes per block (Turbo iterative).
-        repetition_penalty: subtract from logits of recently used tokens.
+        repetition_penalty: multiplicative penalty for recently used tokens.
         repetition_window: number of recent tokens to penalize.
+        no_repeat_ngram_size: ban tokens that would create repeated n-grams.
         use_cache: enable spectral cache for efficient inference.
         cache_window: context window size for spectral cache.
 
@@ -93,7 +95,30 @@ def generate(
             unique, counts = window[b].unique(return_counts=True)
             unique = unique[unique < V]
             counts = counts[: len(unique)].to(logits.dtype)
-            logits[b, :, unique] = logits[b, :, unique] - counts * repetition_penalty
+            factor = repetition_penalty**counts
+            score = logits[b, :, unique]
+            score = torch.where(score > 0, score / factor, score * factor)
+            logits[b, :, unique] = score
+        return logits
+
+    def ban_repeated_ngrams(logits: torch.Tensor, context_ids: torch.Tensor, n: int) -> torch.Tensor:
+        if n <= 0 or context_ids.numel() == 0 or context_ids.shape[1] < n:
+            return logits
+        for b in range(B):
+            seq = context_ids[b].tolist()
+            ngram_set = set()
+            for i in range(len(seq) - n + 1):
+                ngram_set.add(tuple(seq[i : i + n]))
+            prefix = tuple(seq[-(n - 1) :]) if len(seq) >= n - 1 else None
+            if prefix is None:
+                continue
+            banned = set()
+            for ngram in ngram_set:
+                if ngram[:-1] == prefix:
+                    banned.add(ngram[-1])
+            if banned:
+                ban_idx = torch.tensor(list(banned), dtype=torch.long, device=logits.device)
+                logits[b, :, ban_idx] = float("-inf")
         return logits
 
     def sample_tokens(logits: torch.Tensor, n_block: int) -> torch.Tensor:
@@ -104,6 +129,9 @@ def generate(
 
         if repetition_penalty > 0.0 and full_ids.shape[1] > 0:
             lt = apply_echo_cancellation(lt.clone(), full_ids)
+
+        if no_repeat_ngram_size > 0 and full_ids.shape[1] >= no_repeat_ngram_size:
+            lt = ban_repeated_ngrams(lt, full_ids, no_repeat_ngram_size)
 
         if top_k > 0:
             v, _ = torch.topk(lt, min(top_k, V), dim=-1)
