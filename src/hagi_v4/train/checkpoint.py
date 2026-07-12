@@ -75,6 +75,20 @@ def save_checkpoint(
     return str(path)
 
 
+def _migrate_state_dict(state_dict: dict) -> dict:
+    """Migrate old checkpoint keys to current model architecture."""
+    renamed = {}
+    for key, val in state_dict.items():
+        new_key = key
+        if "scale_weights" in key:
+            new_key = key.replace("scale_weights", "scale_gates")
+        renamed[new_key] = val
+    to_delete = [k for k in renamed if "attn_norm" in k]
+    for k in to_delete:
+        del renamed[k]
+    return renamed
+
+
 def load_checkpoint(
     path: str,
     model: nn.Module,
@@ -83,7 +97,7 @@ def load_checkpoint(
 ) -> tuple[int, HAGIv4Config]:
     """Load checkpoint. Returns (step, config)."""
     state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model"])
+    model.load_state_dict(_migrate_state_dict(state["model"]))
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
     cfg = cfg_from_dict(state["config"])
