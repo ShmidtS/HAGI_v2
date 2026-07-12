@@ -89,10 +89,11 @@ def main() -> int:
 
     # Resume from checkpoint
     start_step = 0
+    ckpt_extra: dict = {}
     if args.resume:
         from hagi_v4.train.checkpoint import resume_from_checkpoint
 
-        start_step, _ = resume_from_checkpoint(cfg.train.checkpoint_dir, model, device=str(device))
+        start_step, _, ckpt_extra = resume_from_checkpoint(cfg.train.checkpoint_dir, model, device=str(device))
         if start_step > 0:
             logger.info(f"Resumed from step {start_step}")
         else:
@@ -138,6 +139,9 @@ def main() -> int:
     from hagi_v4.data.sequential import build_sequential_dataloader
 
     dataloader = build_sequential_dataloader(cfg, data_dir=args.data_dir, start_step=start_step)
+    if "dataloader" in ckpt_extra:
+        dataloader.load_state_dict(ckpt_extra["dataloader"])
+        logger.info(f"Dataloader state restored: {ckpt_extra['dataloader']}")
     logger.info(f"Sequential cycling dataloader from {args.data_dir}")
 
     from hagi_v4.train.loop import train
@@ -150,7 +154,9 @@ def main() -> int:
             f"(alpha {cfg.train.distill_alpha_start}->{cfg.train.distill_alpha_end}, T={cfg.train.distill_temperature})"
         )
 
-    for metrics in train(model, dataloader, cfg, log_interval=1, teacher=teacher, start_step=start_step):
+    for metrics in train(
+        model, dataloader, cfg, log_interval=1, teacher=teacher, start_step=start_step, resume_extra=ckpt_extra
+    ):
         loss = metrics["loss"]
         bits_per_token = loss / 0.6931
         conf = metrics.get("avg_confidence", 0.0)
