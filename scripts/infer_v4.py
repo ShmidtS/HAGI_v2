@@ -21,16 +21,18 @@ logger = logging.getLogger(__name__)
 def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     """Load model + config from checkpoint (single load)."""
     from hagi_v4.model.hagi_v4 import HAGIv4
-    from hagi_v4.train.checkpoint import cfg_from_dict
+    from hagi_v4.train.checkpoint import cfg_from_dict, _migrate_state_dict
 
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = cfg_from_dict(state["config"])
 
-    dev = torch.device("cuda" if device == "auto" and torch.cuda.is_available() else device)
+    dev = torch.device(
+        "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
+    )
     model = HAGIv4(cfg).to(dev)
     if cfg.train.precision == "bf16":
         model.to(torch.bfloat16)
-    model.load_state_dict(state["model"])
+    model.load_state_dict(_migrate_state_dict(state["model"]))
     step = state["step"]
     model.eval()
     return model, cfg, step, dev

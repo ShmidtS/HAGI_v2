@@ -55,9 +55,9 @@ class FOXP2Controller(nn.Module):
         self.num_groups = num_groups
 
         self.proj = nn.Linear(3, hidden)
-        self.out = nn.Linear(hidden, num_groups)
+        self.out = nn.Linear(hidden, 1)
 
-        self.gate_bias = nn.Parameter(torch.zeros(num_groups))
+        self.gate_bias = nn.Parameter(torch.zeros(1))
 
         nn.init.normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
@@ -86,7 +86,7 @@ class FOXP2Controller(nn.Module):
         )
         x = torch.cat([grad_stats, p], dim=-1)
         h = F.silu(self.proj(x))
-        logits = self.out(h) + self.gate_bias
+        logits = self.out(h).squeeze(-1) + self.gate_bias
         return torch.sigmoid(logits)
 
     def compute_grad_stats(
@@ -109,7 +109,8 @@ class FOXP2Controller(nn.Module):
                 )
                 continue
             norms = torch.stack([g.norm() for g in grads])
-            stats.append(torch.stack([norms.mean().log(), norms.var().log()]))
+            var = norms.var(unbiased=False) if norms.numel() > 1 else norms.new_zeros(())
+            stats.append(torch.stack([norms.mean().log(), var.log()]))
         return torch.stack(stats)
 
 

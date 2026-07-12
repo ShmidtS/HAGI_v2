@@ -278,6 +278,7 @@ class HAGIv4Config:
 
 
 _BOTTLENECK_RATIO = 0.5
+_MOE_INT_RATIO = 1.3333
 _HEAD_DIM_MIN = 16
 
 
@@ -308,8 +309,8 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
 
         C = _round_to_multiple(int(H * _BOTTLENECK_RATIO), 8)
 
-        ffn_int_h = _round_to_multiple(int(H * 2 * _BOTTLENECK_RATIO), 8)
-        ffn_int_c = _round_to_multiple(int(C * 2), 8)
+        ffn_int_h = _round_to_multiple(int(H * _MOE_INT_RATIO * _BOTTLENECK_RATIO), 8)
+        ffn_int_c = _round_to_multiple(int(C * _MOE_INT_RATIO), 8)
         cost_h = 4 * H * H + 3 * H * ffn_int_h + 2 * H
         cost_c = 4 * C * C + 3 * C * ffn_int_c + 2 * C
         extra = 50 * C + 20 * H
