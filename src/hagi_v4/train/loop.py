@@ -267,9 +267,9 @@ def train(
             logger.info(f"Adaptive mask ratio restored: {adaptive_mask_state['ratio']:.4f}")
         if "rng" in resume_extra:
             rng = resume_extra["rng"]
-            torch.set_rng_state(rng["torch"])
-            if torch.cuda.is_available() and "cuda" in rng:
-                torch.cuda.set_rng_state(rng["cuda"])
+            torch.set_rng_state(rng["torch"].cpu().to(torch.uint8))
+            if torch.cuda.is_available() and rng.get("cuda") is not None:
+                torch.cuda.set_rng_state(rng["cuda"].cpu().to(torch.uint8))
             logger.info("RNG state restored from checkpoint")
 
     step = start_step
