@@ -135,6 +135,9 @@ class FreqCoding2D(nn.Module):
             self.phase = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
             nn.init.normal_(self.phase, std=0.1)
 
+        self._w_cache: torch.Tensor | None = None
+        self._phase_cache: torch.Tensor | None = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -165,24 +168,37 @@ class FreqCoding2D(nn.Module):
         low = X_f[:, :, :Kt, :Kh]
         if cached_phase is not None:
             phase = cached_phase
+        elif (
+            not self.training
+            and self._phase_cache is not None
+            and self._phase_cache.shape[1] >= Kt
+            and self._phase_cache.shape[2] >= Kh
+        ):
+            phase = self._phase_cache[:, :Kt, :Kh]
         else:
             phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
+            if not self.training:
+                self._phase_cache = phase
         low = low * phase.unsqueeze(0)
         if cached_w is not None:
             w = cached_w
+        elif not self.training and self._w_cache is not None:
+            w = self._w_cache
         else:
             w_re = self.w_re_a.float() @ self.w_re_b.float()
             w_im = self.w_im_a.float() @ self.w_im_b.float()
             w = torch.complex(w_re, w_im)
+            if not self.training:
+                self._w_cache = w
         low = low @ w[:, :Kh, :F_h]
         out_f = torch.empty_like(X_f)
         out_f[:, :, :Kt, :] = low
         if Kt < F_t:
             out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
 
-        mag = out_f.abs()
+        mag = out_f.abs().float()
         scale = torch.tanh(mag / 10.0) / (mag / 10.0 + 1e-9)
-        out_f = out_f * scale
+        out_f = out_f * scale.to(out_f.dtype)
 
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)

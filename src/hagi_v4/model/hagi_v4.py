@@ -144,7 +144,7 @@ class TurboLoop(nn.Module):
         self,
         z: torch.Tensor,
         training: bool,
-        cqi_mean: float = 0.5,
+        cqi_mean: torch.Tensor | float = 0.5,
         mask: torch.Tensor | None = None,
         cached_p: torch.Tensor | None = None,
         clear_msa: bool = True,
@@ -161,9 +161,10 @@ class TurboLoop(nn.Module):
         p = cached_p if cached_p is not None else torch.ones(C, device=z.device, dtype=z.dtype)
 
         base_k = self.msa.cfg.top_k
-        adaptive_k = base_k + int((1.0 - cqi_mean) * 4)
+        cqi_val = float(cqi_mean) if isinstance(cqi_mean, (int, float)) else cqi_mean.item()
+        adaptive_k = base_k + int((1.0 - cqi_val) * 4)
 
-        q_scale = 1.0 + (1.0 - cqi_mean)
+        q_scale = 1.0 + (1.0 - cqi_val)
 
         if clear_msa:
             self.msa.clear()
@@ -466,7 +467,8 @@ class HAGIv4(nn.Module):
         h_pre_bottleneck = h
 
         h_f = torch.fft.rfft(h.float(), dim=-1)
-        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * cqi_mean_t)
+        cqi_gate = (0.5 + 0.5 * cqi).unsqueeze(-1)
+        gate = torch.sigmoid(self.bottleneck_gate) * cqi_gate
         h_f_c = h_f[:, :, : self._C // 2 + 1] * gate
         z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
@@ -480,7 +482,7 @@ class HAGIv4(nn.Module):
         z, side_info, p_final = self.turbo(
             z,
             training=self.training,
-            cqi_mean=float(cqi_mean_t.detach()) if self.training else cqi_mean_t.item(),
+            cqi_mean=cqi_mean_t,
             mask=mask,
             cached_p=turbo_cached_p,
             clear_msa=(cache is None),
@@ -503,8 +505,9 @@ class HAGIv4(nn.Module):
         z_f = torch.fft.rfft(z.float(), dim=-1)
         z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
         c_bins = self._C // 2 + 1
-        gate_up = torch.sigmoid(self.bottleneck_up_gate) * (0.5 + 0.5 * cqi_mean_t)
-        z_pad[:, :, :c_bins] = z_f * gate_up[:c_bins]
+        cqi_gate_up = (0.5 + 0.5 * cqi).unsqueeze(-1)
+        gate_up = torch.sigmoid(self.bottleneck_up_gate[:c_bins]) * cqi_gate_up
+        z_pad[:, :, :c_bins] = z_f[:, :, :c_bins] * gate_up
         h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
 
         h = self._freq_blocks_forward(h)

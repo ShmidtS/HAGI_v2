@@ -66,7 +66,7 @@ class LossAggregator:
         if aux.whiteness is not None:
             total = total + self.w_whiteness * aux.whiteness
         if aux.parity is not None:
-            total = total - self.w_parity * aux.parity.clamp(max=1.0)
+            total = total - self.w_parity * aux.parity.clamp(min=0.0, max=1.0)
         if aux.extrinsic_info is not None:
             total = total - self.w_extrinsic_info * aux.extrinsic_info
         if aux.efficiency is not None:
