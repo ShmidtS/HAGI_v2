@@ -223,7 +223,7 @@ def train_step(
     }
     if foxp2_gates is not None:
         result["foxp2_gates"] = foxp2_gates.detach().flatten().tolist()
-        result["_foxp2_gates_tensor"] = foxp2_gates.detach()
+        result["_foxp2_gates_tensor"] = foxp2_gates
     return result
 
 
