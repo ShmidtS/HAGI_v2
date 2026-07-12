@@ -138,8 +138,6 @@ class FreqCoding2D(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
         cached_w: torch.Tensor | None = None,
         cached_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -243,13 +241,9 @@ class FreqBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
-        modality_ids: torch.Tensor | None = None,
-        all_outputs: list | None = None,
         cached_w: torch.Tensor | None = None,
         cached_phase: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = x + self.freq(x, cos, sin, cached_w=cached_w, cached_phase=cached_phase)
+    ) -> torch.Tensor:
+        x = x + self.freq(x, cached_w=cached_w, cached_phase=cached_phase)
         x = x + self.ffn(self.ffn_norm(x))
-        return x, None, None
+        return x

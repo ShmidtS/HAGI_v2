@@ -80,13 +80,11 @@ class Muon(Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
                 if wd != 0.0:
-                    scale_wd = min(max(1.0, p.size(0) / p.size(1)) ** 0.5, 2.0)
-                    p.mul_(1.0 - lr * wd * scale_wd)
+                    p.mul_(1.0 - lr * wd * min(max(1.0, p.size(0) / p.size(1)) ** 0.5, 2.0))
                 buf.mul_(momentum).add_(g)
                 update = g.add(buf, alpha=momentum) if nesterov else buf
                 update = newton_schulz5(update, ns_steps)
-                scale = min(max(1.0, p.size(0) / p.size(1)) ** 0.5, 2.0)
-                p.add_(update.reshape(p.shape), alpha=-lr * scale)
+                p.add_(update.reshape(p.shape), alpha=-lr * min(max(1.0, p.size(0) / p.size(1)) ** 0.5, 2.0))
 
 
 class CombinedOptimizer:
@@ -133,7 +131,6 @@ _MUON_EXCLUDE = frozenset(
         "router",
         "gate",
         "block_proj",
-        "w_time",
     }
 )
 

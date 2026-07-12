@@ -60,15 +60,6 @@ def lr_at(step: int, cfg: HAGIv4Config) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def sample_mask_pattern() -> str:
-    """Only random masking — span causes loss 6-12 and grad spikes."""
-    return "random"
-
-
-def create_mask(input_ids, pattern, mask_ratio, mask_token_id, span_length=3):
-    return create_random_mask(input_ids, mask_ratio, mask_token_id)
-
-
 def cast_to_bf16(model: nn.Module) -> None:
     model.to(torch.bfloat16)
 
@@ -77,7 +68,7 @@ def soft_grad_scale(model: nn.Module, target: float = 1.0) -> float:
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return 0.0
-    total_sq = sum(g.pow(2).sum() for g in grads)
+    total_sq = torch.stack([g.pow(2).sum() for g in grads]).sum()
     norm = total_sq.sqrt().item()
     if norm > target:
         scale = target / norm
@@ -108,6 +99,7 @@ def train_step(
     grad_norm_target: float = 1.0,
     adaptive_mask_state: dict | None = None,
     foxp2: FOXP2Controller | None = None,
+    foxp2_groups: list | None = None,
 ) -> dict:
     """Single training step with gradient accumulation."""
     model.train()
@@ -124,8 +116,7 @@ def train_step(
         mask_ratio = progressive_mask_ratio(step, mask_warmup_steps, 0.15, mc.mask_ratio)
     else:
         mask_ratio = mc.mask_ratio
-    pattern = sample_mask_pattern()
-    masked_ids, mask = create_mask(input_ids, pattern, mask_ratio, mc.mask_token_id, mc.span_length)
+    masked_ids, mask = create_random_mask(input_ids, mask_ratio, mc.mask_token_id)
 
     if loss_aggregator is None:
         loss_aggregator = LossAggregator(cfg)
@@ -191,11 +182,9 @@ def train_step(
 
     grad_norm = soft_grad_scale(model, grad_norm_target)
 
-    if foxp2 is not None:
+    if foxp2 is not None and foxp2_groups is not None:
         progress = min(1.0, step / max(cfg.train.max_steps, 1))
-        groups = [[p for p in model.parameters() if p.requires_grad]]
-        device = next(model.parameters()).device
-        apply_foxp2(foxp2, groups, progress, device)
+        apply_foxp2(foxp2, foxp2_groups, progress, device)
 
     optimizer.step()
 
@@ -254,10 +243,16 @@ def train(
     loss_aggregator = LossAggregator(cfg)
     adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
 
-    foxp2 = FOXP2Controller(num_groups=1, hidden=32)
+    foxp2 = FOXP2Controller(num_groups=4, hidden=32)
     if torch.cuda.is_available():
         foxp2 = foxp2.cuda()
     foxp2_optimizer = torch.optim.AdamW(foxp2.parameters(), lr=1e-4, weight_decay=0.01)
+
+    fo_groups = []
+    named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    chunk = max(1, len(named_params) // 4)
+    for i in range(4):
+        fo_groups.append([p for _, p in named_params[i * chunk : (i + 1) * chunk]])
 
     step = start_step
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
@@ -283,17 +278,17 @@ def train(
             loss_aggregator=loss_aggregator,
             adaptive_mask_state=adaptive_mask_state,
             foxp2=foxp2,
+            foxp2_groups=fo_groups,
         )
         if step % log_interval == 0:
             yield metrics
 
         if foxp2 is not None:
             progress = min(1.0, step / max(cfg.train.max_steps, 1))
-            groups = [[p for p in model.parameters() if p.requires_grad]]
-            device = next(model.parameters()).device
-            grad_stats = foxp2.compute_grad_stats(groups).to(device=device, dtype=torch.float32)
+            foxp2_device = next(foxp2.parameters()).device
+            grad_stats = foxp2.compute_grad_stats(fo_groups).to(device=foxp2_device, dtype=torch.float32)
             gates = foxp2(grad_stats, progress)
-            foxp2_loss = -gates.mean() + 0.01 * (gates - 0.5).pow(2).mean()
+            foxp2_loss = 0.01 * gates.pow(2).sum()
             foxp2_optimizer.zero_grad(set_to_none=True)
             foxp2_loss.backward()
             foxp2_optimizer.step()

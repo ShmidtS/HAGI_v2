@@ -50,7 +50,18 @@ class GeometricProduct2D(nn.Module):
         mv = h.reshape(B, T, self.n_heads, 8)
         deltas = list(range(-self.w, self.w + 1))
         if len(deltas) > 1:
-            shifted_stack = torch.stack([torch.roll(mv, shifts=d, dims=1) for d in deltas], dim=0)
+            shifted_list = []
+            for d in deltas:
+                if d == 0:
+                    shifted_list.append(mv)
+                elif d > 0:
+                    padded = torch.zeros(B, d, self.n_heads, 8, device=h.device, dtype=h.dtype)
+                    shifted_list.append(torch.cat([padded, mv[:, : max(0, T - d)]], dim=1)[:, :T])
+                else:
+                    ad = -d
+                    padded = torch.zeros(B, ad, self.n_heads, 8, device=h.device, dtype=h.dtype)
+                    shifted_list.append(torch.cat([mv[:, min(ad, T) :], padded], dim=1)[:, :T])
+            shifted_stack = torch.stack(shifted_list, dim=0)
             prods = geometric_product(mv.unsqueeze(0), shifted_stack)
             accumulated = (prods * self.temporal_weights.view(-1, 1, 1, 1, 1)).sum(0)
         else:

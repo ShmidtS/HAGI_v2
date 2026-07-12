@@ -33,10 +33,10 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
         return False
 
     try:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, torch_dtype=torch.bfloat16, local_files_only=True)
     except Exception:
         try:
-            teacher = AutoModel.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+            teacher = AutoModel.from_pretrained(teacher_name, torch_dtype=torch.bfloat16, local_files_only=True)
         except Exception as e:
             logger.warning(f"Could not load {teacher_name}: {e}")
             return False
@@ -112,7 +112,7 @@ class DistillationTeacher:
 
         try:
             self._model = AutoModelForCausalLM.from_pretrained(
-                self.teacher_name, dtype=torch.bfloat16, local_files_only=True
+                self.teacher_name, torch_dtype=torch.bfloat16, local_files_only=True
             )
             self._model.eval()
             for param in self._model.parameters():
@@ -149,7 +149,9 @@ class DistillationTeacher:
             logger.info(f"Teacher loaded: {self.teacher_name}")
         except Exception:
             try:
-                self._model = AutoModel.from_pretrained(self.teacher_name, dtype=torch.bfloat16, local_files_only=True)
+                self._model = AutoModel.from_pretrained(
+                    self.teacher_name, torch_dtype=torch.bfloat16, local_files_only=True
+                )
                 self._model.eval()
                 for param in self._model.parameters():
                     param.requires_grad_(False)

@@ -102,7 +102,11 @@ class FOXP2Controller(nn.Module):
         for group in param_groups:
             grads = [p.grad for p in group if p.grad is not None]
             if not grads:
-                stats.append(torch.tensor([0.0, 0.0]))
+                stats.append(
+                    torch.tensor(
+                        [0.0, 0.0], device=param_groups[0][0].device if param_groups and param_groups[0] else "cpu"
+                    )
+                )
                 continue
             norms = torch.stack([g.norm() for g in grads])
             stats.append(torch.stack([norms.mean().log(), norms.var().log()]))
@@ -131,9 +135,7 @@ def apply_foxp2(
         gates: [num_groups] tensor (for logging).
     """
     with torch.no_grad():
-        grad_stats = controller.compute_grad_stats(param_groups).to(
-            device=device, dtype=dtype
-        )
+        grad_stats = controller.compute_grad_stats(param_groups).to(device=device, dtype=dtype)
         gates = controller(grad_stats, progress)
 
         for idx, group in enumerate(param_groups):
