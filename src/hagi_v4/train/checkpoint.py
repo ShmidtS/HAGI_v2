@@ -23,7 +23,7 @@ def cfg_to_dict(cfg: HAGIv4Config) -> dict:
 def cfg_from_dict(data: dict) -> HAGIv4Config:
     """Reconstruct config from a plain dict, preserving nested dataclass structure."""
     cfg = HAGIv4Config()
-    for top_key in ("model", "train"):
+    for top_key in ("model", "train", "inference"):
         if top_key not in data:
             continue
         top_val = getattr(cfg, top_key)

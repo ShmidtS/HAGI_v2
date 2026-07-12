@@ -129,5 +129,6 @@ inference:
   refine_passes: 2
   repetition_penalty: 1.5
   repetition_window: 64
+  no_repeat_ngram_size: 3
   max_iterations: 4
   max_new_tokens: 128

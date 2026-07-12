@@ -262,6 +262,7 @@ class InferenceConfig:
     refine_passes: int = 2
     repetition_penalty: float = 0.8
     repetition_window: int = 32
+    no_repeat_ngram_size: int = 3
     max_iterations: int = 4
     max_new_tokens: int = 128
 
