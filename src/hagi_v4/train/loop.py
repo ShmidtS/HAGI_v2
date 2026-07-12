@@ -234,6 +234,7 @@ def train(
     log_interval: int = 100,
     teacher=None,
     start_step: int = 0,
+    resume_extra: dict | None = None,
 ) -> Iterator[dict]:
     from hagi_v4.train.checkpoint import save_checkpoint
 
@@ -256,6 +257,20 @@ def train(
     chunk = max(1, len(named_params) // 4)
     for i in range(4):
         fo_groups.append([p for _, p in named_params[i * chunk : (i + 1) * chunk]])
+
+    if resume_extra:
+        if "foxp2" in resume_extra:
+            foxp2.load_state_dict(resume_extra["foxp2"])
+            logger.info("FOXP2 state restored from checkpoint")
+        if "adaptive_mask" in resume_extra and adaptive_mask_state is not None:
+            adaptive_mask_state["ratio"] = resume_extra["adaptive_mask"]["ratio"]
+            logger.info(f"Adaptive mask ratio restored: {adaptive_mask_state['ratio']:.4f}")
+        if "rng" in resume_extra:
+            rng = resume_extra["rng"]
+            torch.set_rng_state(rng["torch"])
+            if torch.cuda.is_available() and "cuda" in rng:
+                torch.cuda.set_rng_state(rng["cuda"])
+            logger.info("RNG state restored from checkpoint")
 
     step = start_step
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
@@ -295,9 +310,31 @@ def train(
             del metrics["_foxp2_gates_tensor"]
 
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
-            save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)
+            extra = {
+                "foxp2": foxp2.state_dict(),
+                "rng": {
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                },
+            }
+            if adaptive_mask_state is not None:
+                extra["adaptive_mask"] = {"ratio": adaptive_mask_state["ratio"]}
+            if hasattr(dataloader, "state_dict"):
+                extra["dataloader"] = dataloader.state_dict()
+            save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep, extra=extra)
 
         step += 1
 
     if ckpt_interval > 0:
-        save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep)
+        extra = {
+            "foxp2": foxp2.state_dict(),
+            "rng": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            },
+        }
+        if adaptive_mask_state is not None:
+            extra["adaptive_mask"] = {"ratio": adaptive_mask_state["ratio"]}
+        if hasattr(dataloader, "state_dict"):
+            extra["dataloader"] = dataloader.state_dict()
+        save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep, extra=extra)

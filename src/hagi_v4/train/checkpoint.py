@@ -94,16 +94,17 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: CombinedOptimizer | None = None,
     device: str = "cpu",
-) -> tuple[int, HAGIv4Config]:
-    """Load checkpoint. Returns (step, config)."""
+) -> tuple[int, HAGIv4Config, dict]:
+    """Load checkpoint. Returns (step, config, extra)."""
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(_migrate_state_dict(state["model"]))
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
     cfg = cfg_from_dict(state["config"])
     step = state["step"]
+    extra = state.get("extra", {})
     logger.info(f"Checkpoint loaded: {path} (step {step})")
-    return step, cfg
+    return step, cfg, extra
 
 
 def get_latest_checkpoint(checkpoint_dir: str) -> str | None:
@@ -122,10 +123,10 @@ def resume_from_checkpoint(
     model: nn.Module,
     optimizer: CombinedOptimizer | None = None,
     device: str = "cpu",
-) -> tuple[int, HAGIv4Config | None]:
-    """Resume from latest checkpoint. Returns (step, config) or (0, None)."""
+) -> tuple[int, HAGIv4Config | None, dict]:
+    """Resume from latest checkpoint. Returns (step, config, extra) or (0, None, {})."""
     latest = get_latest_checkpoint(checkpoint_dir)
     if latest is None:
         logger.info(f"No checkpoint found in {checkpoint_dir} — starting from scratch")
-        return 0, None
+        return 0, None, {}
     return load_checkpoint(latest, model, optimizer, device)
