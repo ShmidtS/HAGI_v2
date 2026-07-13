@@ -166,7 +166,7 @@ def run_single(name, overrides, train_ds, val_ds, device):
 
         optimizer.zero_grad(set_to_none=True)
         out = model(masked_ids, targets=tgts, mask=mask, step=step)
-        loss = loss_agg(out, tgts, mask)
+        loss = loss_agg(out, tgts, mask, step=step)
 
         if not torch.isfinite(loss).all():
             step += 1

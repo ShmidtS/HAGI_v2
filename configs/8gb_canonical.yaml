@@ -26,7 +26,7 @@ model:
     whiteness_weight: 0.01
     use_multiscale: true
     multiscale_windows: [1, 4, 16]
-    multiscale_gate_inits: [-2.0, -3.0, -4.0]
+    multiscale_gate_inits: [-4.0, -5.0, -6.0]
     use_interleave: true
 
   refinement:
@@ -115,6 +115,11 @@ train:
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
   distill_every: 2
+  awgn_enabled: true
+  awgn_sigma_start: 0.005
+  awgn_sigma_end: 0.0
+  awgn_end_frac: 0.5
+  freeze_embeddings: true
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   checkpoint_dir: "checkpoints"
   checkpoint_interval: 500

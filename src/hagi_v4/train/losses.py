@@ -37,7 +37,11 @@ def masked_cross_entropy_chunked(
 
 
 class LossAggregator:
-    """Computes total loss from ModelOutput + targets + mask."""
+    """Computes total loss from ModelOutput + targets + mask.
+
+    Phase 0 CE-only warmup: aux losses are zero during warmup_steps,
+    then linearly ramp to full weight over the next warmup_steps.
+    """
 
     def __init__(self, cfg: HAGIv4Config | TrainLossConfig):
         contract = TrainLossConfig.from_hagi_config(cfg) if isinstance(cfg, HAGIv4Config) else cfg
@@ -48,12 +52,22 @@ class LossAggregator:
         self.w_msa_lb = contract.msa_lb_weight
         self.w_rate_distortion = contract.rate_distortion_weight
         self.w_contrastive = contract.contrastive_weight
+        self.warmup_steps = cfg.train.warmup_steps if isinstance(cfg, HAGIv4Config) else 5000
+
+    def _aux_weight(self, step: int) -> float:
+        w = self.warmup_steps
+        if step < w:
+            return 0.0
+        if step < 2 * w:
+            return (step - w) / w
+        return 1.0
 
     def __call__(
         self,
         model_output: ModelOutput,
         targets: torch.Tensor,
         mask: torch.Tensor | None,
+        step: int = 0,
     ) -> torch.Tensor:
         if model_output.ce_loss is not None:
             ce_loss = model_output.ce_loss
@@ -63,19 +77,23 @@ class LossAggregator:
         aux: AuxLosses = model_output.aux
         total = ce_loss
 
+        aw = self._aux_weight(step)
+        if aw == 0.0:
+            return total
+
         if aux.msa_lb is not None:
-            total = total + self.w_msa_lb * aux.msa_lb
+            total = total + aw * self.w_msa_lb * aux.msa_lb
         if aux.whiteness is not None:
-            total = total + self.w_whiteness * aux.whiteness
+            total = total + aw * self.w_whiteness * aux.whiteness
         if aux.parity is not None:
-            total = total - self.w_parity * torch.sigmoid(aux.parity * 5.0)
+            total = total - aw * self.w_parity * torch.sigmoid(aux.parity * 5.0)
         if aux.extrinsic_info is not None:
-            total = total + self.w_extrinsic_info * aux.extrinsic_info
+            total = total + aw * self.w_extrinsic_info * aux.extrinsic_info
         if aux.efficiency is not None:
-            total = total + self.w_efficiency * aux.efficiency
+            total = total + aw * self.w_efficiency * aux.efficiency
         if aux.rate_distortion is not None:
-            total = total + self.w_rate_distortion * aux.rate_distortion
+            total = total + aw * self.w_rate_distortion * aux.rate_distortion
         if aux.contrastive is not None:
-            total = total + self.w_contrastive * aux.contrastive
+            total = total + aw * self.w_contrastive * aux.contrastive
 
         return total

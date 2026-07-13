@@ -129,6 +129,11 @@ class FreqCoding2D(nn.Module):
         nn.init.normal_(self.freq_gate_h[:n_modes_h], mean=2.0, std=0.5)
         nn.init.normal_(self.freq_gate_h[n_modes_h:], mean=-2.0, std=0.5)
 
+        self.channel_response_t = nn.Parameter(torch.zeros(T_max))
+        self.channel_response_h = nn.Parameter(torch.zeros(head_dim))
+        nn.init.normal_(self.channel_response_t[:n_modes_t], mean=0.0, std=0.02)
+        nn.init.normal_(self.channel_response_h[:n_modes_h], mean=0.0, std=0.02)
+
         if shared_phase is not None:
             self.phase = shared_phase
         else:
@@ -160,6 +165,11 @@ class FreqCoding2D(nn.Module):
         F_h = X_f.shape[3]
         Kt = min(self.n_modes_t, F_t)
         Kh = min(self.n_modes_h, F_h)
+
+        ch_t = torch.exp(1j * self.channel_response_t[:F_t].float())
+        ch_h = torch.exp(1j * self.channel_response_h[:F_h].float())
+        ch_2d = ch_t.unsqueeze(1) * ch_h.unsqueeze(0)
+        X_f = X_f * ch_2d.unsqueeze(0)
 
         gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
         gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())

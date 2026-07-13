@@ -147,6 +147,9 @@ class TurboLoop(nn.Module):
         self.corr_gate_w = nn.Parameter(torch.tensor(5.0))
         self.corr_gate_b = nn.Parameter(torch.tensor(-1.0))
         self.write_gate_w = nn.Parameter(torch.tensor(5.0))
+        self.sic_w = nn.Parameter(torch.tensor(10.0))
+        self.sic_b = nn.Parameter(torch.tensor(-10.0))
+        self.harq_gate = nn.Parameter(torch.tensor(-5.0))
 
     def forward(
         self,
@@ -164,6 +167,7 @@ class TurboLoop(nn.Module):
         converged_at = self.n_iters
         iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
         gp2d_residual = torch.zeros_like(z)
+        prev_residual = None
 
         p = state.kalman_p if state.kalman_p is not None else torch.ones(C, device=z.device, dtype=z.dtype)
 
@@ -195,7 +199,12 @@ class TurboLoop(nn.Module):
 
             if iteration > 0:
                 msa_out, lb = self.msa.read(z, top_k=adaptive_k)
-                z = z + msa_out
+                if prev_residual is not None:
+                    uncertainty = prev_residual.abs().float().mean(dim=-1)
+                    harq_alpha = (torch.sigmoid(self.harq_gate.float()) * torch.sigmoid(uncertainty * 10.0)).to(z.dtype)
+                    z = z + harq_alpha.unsqueeze(-1) * msa_out
+                else:
+                    z = z + msa_out
                 total_msa_lb = total_msa_lb + lb
 
             layers_per_iter = self._layers_per_iter
@@ -231,6 +240,11 @@ class TurboLoop(nn.Module):
 
             z = self.tanh_scale * torch.tanh(z / self.tanh_scale)
 
+            if training and iteration < self.n_iters - 1:
+                confidence = 1.0 / (1.0 + gp2d_residual.abs().float().mean(dim=-1))
+                sic_gate = torch.sigmoid(confidence * self.sic_w.float() + self.sic_b.float()).to(z.dtype)
+                z = z * (1 - sic_gate.unsqueeze(-1)) + z.detach() * sic_gate.unsqueeze(-1)
+
             ext_norm = innovation.float().norm(dim=-1).mean().detach()
             extrinsic_norms.append(ext_norm)
 
@@ -238,6 +252,8 @@ class TurboLoop(nn.Module):
             inn_mag = innovation_harq.float().norm(dim=-1, keepdim=True)
             write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * self.write_gate_w).to(innovation_harq.dtype)
             self.msa.write(innovation_harq * write_gate)
+
+            prev_residual = gp2d_residual
 
             combined_ext = ext_norm
             if self.use_convergence_halt and iteration >= self.min_iters:
@@ -372,6 +388,9 @@ class HAGIv4(nn.Module):
         nn.init.zeros_(self.turbo.mut_down_b)
         nn.init.zeros_(self.turbo.mut_up_w)
 
+        if cfg.train.freeze_embeddings:
+            self.embed.weight.requires_grad_(False)
+
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
@@ -432,6 +451,7 @@ class HAGIv4(nn.Module):
         spectrograms: torch.Tensor | None,
         modality_ids: torch.Tensor | None,
         cache: SpectralCache | None,
+        awgn_sigma: float = 0.0,
     ) -> SourceEncodeResult:
         if self.use_multimodal and (images is not None or spectrograms is not None):
             h, modality_ids, _ = self.mm_input(input_ids, images, spectrograms)
@@ -460,6 +480,8 @@ class HAGIv4(nn.Module):
         if cached_len > 0:
             h = h[:, cached_len:]
             B, T, _ = h.shape
+        if self.training and awgn_sigma > 0.0:
+            h = h + awgn_sigma * torch.randn_like(h)
         if self.use_multimodal and modality_ids is not None:
             h = self.cross_freq(h, modality_ids, num_modalities=self.codec_shape.num_modalities)
         if mask is not None and T >= self.codec_shape.pilot_spacing:
@@ -472,8 +494,15 @@ class HAGIv4(nn.Module):
         h = encoded.source
         B, T, _ = h.shape
         h_f = torch.fft.rfft(h.float(), dim=-1)
-        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * encoded.cqi).unsqueeze(-1)
-        z = torch.fft.irfft(h_f[:, :, : self._C // 2 + 1] * gate, n=self._C, dim=-1).to(h.dtype)
+        n_bins = self._C // 2 + 1
+        base_gate = torch.sigmoid(self.bottleneck_gate)
+        cqi = encoded.cqi.unsqueeze(-1)
+        bw_scale = 1.0 - 0.15 * cqi
+        bin_idx = torch.arange(n_bins, device=h.device, dtype=h.dtype)
+        cutoff = n_bins * bw_scale
+        dyn_mask = torch.sigmoid((cutoff - bin_idx) * 6.0)
+        gate = base_gate * dyn_mask * (0.5 + 0.5 * cqi)
+        z = torch.fft.irfft(h_f[:, :, :n_bins] * gate, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
         if encoded.mask is not None:
             z = torch.where(encoded.mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
@@ -515,11 +544,12 @@ class HAGIv4(nn.Module):
         modality_ids: torch.Tensor | None = None,
         cached_p: torch.Tensor | None = None,
         cache: SpectralCache | None = None,
+        awgn_sigma: float = 0.0,
     ) -> ModelOutput:
         state = cache.to_decode_state() if cache is not None else DecodeState(kalman_p=cached_p)
         if cache is not None and state.kalman_p is None:
             state.kalman_p = cached_p
-        encoded = self._source_encode(input_ids, mask, images, spectrograms, modality_ids, cache)
+        encoded = self._source_encode(input_ids, mask, images, spectrograms, modality_ids, cache, awgn_sigma)
         matched = self._rate_match(encoded)
         decoded = self._turbo_decode(matched, state, self.training)
         h = self._source_decode(decoded, encoded)
