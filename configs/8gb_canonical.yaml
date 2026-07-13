@@ -107,8 +107,8 @@ train:
   distill_kl_enabled: false
   distill_teacher: "HuggingFaceTB/SmolLM2-360M"
   distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"
-  distill_alpha_start: 0.5
-  distill_alpha_end: 0.3
+  distill_alpha_start: 0.3
+  distill_alpha_end: 0.1
   distill_temperature: 2.0
   distill_temp_start: 4.0
   distill_temp_end: 1.0
