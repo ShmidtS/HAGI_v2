@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from hagi_v4.algebra.clifford import geometric_product
-from hagi_v4.config import GP2DConfig
+from hagi_v4.model.codec_contracts import GP2DDecodeConfig
 from hagi_v4.model.multiscale_gp2d import MultiScaleGP2D
 from hagi_v4.model.norms import RMSNorm
 
@@ -32,7 +32,7 @@ class CrossModalGP2D(nn.Module):
 
     def __init__(
         self,
-        cfg: GP2DConfig,
+        cfg: GP2DDecodeConfig,
         hidden_size: int,
         num_modalities: int = 3,
         gate_init: float = -3.0,

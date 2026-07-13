@@ -19,26 +19,43 @@ logger = logging.getLogger(__name__)
 
 
 def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
-    """Load model + config from checkpoint (single load)."""
+    """Load model + config from checkpoint. Keeps embedding/lm_head on CPU to save VRAM.
+
+    Embedding table (83% of params, tied with lm_head) stays on CPU.
+    Only 230M non-embed params go to GPU (~0.5 GB VRAM in bf16).
+    Token IDs are moved to CPU for embedding lookup, hidden states back to GPU.
+    """
     from hagi_v4.model.hagi_v4 import HAGIv4
     from hagi_v4.train.checkpoint import cfg_from_dict, _migrate_state_dict
 
+    target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = cfg_from_dict(state["config"])
 
-    dev = torch.device(
-        "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
-    )
-    model = HAGIv4(cfg).to(dev)
+    dev = torch.device(target)
+    model = HAGIv4(cfg)
+    model.load_state_dict(_migrate_state_dict(state["model"]))
     if cfg.train.precision == "bf16":
         model.to(torch.bfloat16)
-    model.load_state_dict(_migrate_state_dict(state["model"]))
-    step = state["step"]
+
+    if dev.type == "cuda":
+        for name, param in model.named_parameters():
+            if "embed.weight" in name or "lm_head.weight" in name:
+                continue
+            param.data = param.data.to(dev)
+        for name, buf in model.named_buffers():
+            if "embed" in name or "lm_head" in name:
+                continue
+            buf.data = buf.data.to(dev)
+    else:
+        model = model.to(dev)
+
     model.eval()
+    step = state["step"]
     return model, cfg, step, dev
 
 
-def tokens_to_text(token_ids: torch.Tensor, tokenizer_name: str = "HuggingFaceTB/SmolLM2-135M") -> str:
+def tokens_to_text(token_ids: torch.Tensor, tokenizer_name: str = "google/gemma-4-E2B-it") -> str:
     """Decode token IDs to text using the model's tokenizer."""
     try:
         from transformers import AutoTokenizer
@@ -50,13 +67,13 @@ def tokens_to_text(token_ids: torch.Tensor, tokenizer_name: str = "HuggingFaceTB
         return " ".join(str(t) for t in token_ids.tolist())
 
 
-def text_to_tokens(text: str, tokenizer_name: str = "HuggingFaceTB/SmolLM2-135M", device: str = "cuda") -> torch.Tensor:
-    """Encode text to token IDs."""
+def text_to_tokens(text: str, tokenizer_name: str = "google/gemma-4-E2B-it", device: str = "cuda") -> torch.Tensor:
+    """Encode text to token IDs (no BOS — model trained on raw chunks without special tokens)."""
     try:
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
-        ids = tok.encode(text, return_tensors="pt")
+        ids = tok.encode(text, return_tensors="pt", add_special_tokens=False)
         return ids.to(device)
     except Exception as e:
         logger.warning(f"Could not load tokenizer '{tokenizer_name}': {e}")
@@ -71,7 +88,7 @@ def main() -> int:
     parser.add_argument("--checkpoint", default="checkpoints/step-001000.pt")
     parser.add_argument("--prompt", default="Once upon a time", help="Text prompt")
     parser.add_argument("--interactive", action="store_true", help="Interactive REPL mode")
-    parser.add_argument("--config", default="configs/8gb_canonical.yaml")
+    parser.add_argument("--config", default="configs/8gb_google.yaml")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-tokens", type=int, default=128, help="Hard cap on generated tokens")
     parser.add_argument(
@@ -90,7 +107,7 @@ def main() -> int:
     logger.info(f"Using tokenizer: {tokenizer_name}")
 
     mask_token_id = cfg.model.masking.mask_token_id
-    eos_token_id = cfg.model.vocab_size - 2
+    eos_token_id = 1
 
     icfg = cfg.inference
     gen_kwargs = dict(
@@ -98,13 +115,13 @@ def main() -> int:
         max_iterations=args.iterations,
         mask_token_id=mask_token_id,
         eos_token_id=eos_token_id,
-        temperature=args.temperature if args.temperature is not None else icfg.temperature,
-        top_k=args.top_k if args.top_k is not None else icfg.top_k,
-        block_size=icfg.block_size,
-        refine_passes=icfg.refine_passes,
-        repetition_penalty=icfg.repetition_penalty,
-        repetition_window=icfg.repetition_window,
-        no_repeat_ngram_size=icfg.no_repeat_ngram_size,
+        temperature=args.temperature if args.temperature is not None else 0.4,
+        top_k=args.top_k if args.top_k is not None else 20,
+        block_size=8,
+        refine_passes=3,
+        repetition_penalty=1.1,
+        repetition_window=64,
+        no_repeat_ngram_size=0,
     )
 
     if args.interactive:

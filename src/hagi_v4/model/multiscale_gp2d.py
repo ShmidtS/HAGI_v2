@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from hagi_v4.config import GP2DConfig
+from hagi_v4.model.codec_contracts import GP2DDecodeConfig
 from hagi_v4.model.gp2d import GeometricProduct2D
 from hagi_v4.model.norms import RMSNorm
 
@@ -40,7 +40,7 @@ class MultiScaleGP2D(nn.Module):
 
     def __init__(
         self,
-        cfg: GP2DConfig,
+        cfg: GP2DDecodeConfig,
         hidden_size: int = 288,
         scales: tuple[int, ...] = (1, 4, 16),
         gate_inits: tuple[float, ...] = (-2.0, -3.0, -4.0),
@@ -54,13 +54,13 @@ class MultiScaleGP2D(nn.Module):
 
         self.gp_layers = nn.ModuleList()
         for window, gate_init in zip(scales, gate_inits):
-            scale_cfg = GP2DConfig(
+            scale_cfg = GP2DDecodeConfig(
                 window=window,
                 gate_init=gate_init,
-                use_whiteness_loss=cfg.use_whiteness_loss,
-                whiteness_weight=cfg.whiteness_weight,
-                use_systematic_parity=cfg.use_systematic_parity,
-                parity_weight=cfg.parity_weight,
+                use_multiscale=False,
+                multiscale_windows=(),
+                multiscale_gate_inits=(),
+                use_interleave=False,
             )
             self.gp_layers.append(GeometricProduct2D(scale_cfg, hidden_size))
 

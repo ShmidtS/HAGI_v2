@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from hagi_v4.algebra.clifford import geometric_product
-from hagi_v4.config import GP2DConfig
+from hagi_v4.model.codec_contracts import GP2DDecodeConfig
 from hagi_v4.model.norms import RMSNorm
 
 
@@ -34,7 +34,7 @@ class GeometricProduct2D(nn.Module):
     via a sigmoid gate.
     """
 
-    def __init__(self, cfg: GP2DConfig, hidden_size: int = 576):
+    def __init__(self, cfg: GP2DDecodeConfig, hidden_size: int = 576):
         super().__init__()
         self.cfg = cfg
         self.w = cfg.window

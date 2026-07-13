@@ -78,13 +78,23 @@ def soft_grad_scale(model: nn.Module, target: float = 1.0) -> float:
 
 
 def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
-    """Two-phase mask ratio: low in fitting phase, high in compression phase."""
+    """Three-phase mask ratio for LLaDA-compatible masked LM.
+
+    Phase 1 (0-50%):   0.15 — easy fitting, model learns token reconstruction
+    Phase 2 (50-80%):  0.35 — compression, model learns from less context
+    Phase 3 (80-100%): 0.50 — LLaDA generation compatibility, model handles
+                                  high mask ratios needed for iterative decoding
+    """
     if not cfg.train.use_two_phase_schedule:
         return cfg.model.masking.mask_ratio
-    split_step = int(cfg.train.max_steps * cfg.train.two_phase_split)
-    if step < split_step:
+    max_steps = cfg.train.max_steps
+    split1 = int(max_steps * cfg.train.two_phase_split)
+    split2 = int(max_steps * 0.8)
+    if step < split1:
         return cfg.train.phase1_mask_ratio
-    return cfg.train.phase2_mask_ratio
+    if step < split2:
+        return cfg.train.phase2_mask_ratio
+    return getattr(cfg.train, "phase3_mask_ratio", 0.50)
 
 
 def train_step(
@@ -100,6 +110,7 @@ def train_step(
     adaptive_mask_state: dict | None = None,
     foxp2: FOXP2Controller | None = None,
     foxp2_groups: list | None = None,
+    distill_end_step: int = 0,
 ) -> dict:
     """Single training step with gradient accumulation."""
     model.train()
@@ -136,6 +147,7 @@ def train_step(
             and getattr(teacher, "_loaded", False)
             and cfg.train.distill_enabled
             and step % cfg.train.distill_every == 0
+            and step <= distill_end_step
         )
         if use_distill:
             alpha = alpha_at(
@@ -145,16 +157,6 @@ def train_step(
                 cfg.train.max_steps,
                 cfg.train.distill_end_frac,
             )
-            if cfg.train.distill_use_temp_anneal:
-                temperature = temperature_at(
-                    step,
-                    cfg.train.max_steps,
-                    cfg.train.distill_temp_start,
-                    cfg.train.distill_temp_end,
-                    cfg.train.distill_end_frac,
-                )
-            else:
-                temperature = cfg.train.distill_temperature
             with torch.inference_mode():
                 teacher_hidden = teacher.get_hidden(input_ids)
             if teacher_hidden is not None:
@@ -165,7 +167,6 @@ def train_step(
                     targets=targets,
                     ce_loss=loss,
                     mask=mask,
-                    temperature=temperature,
                     alpha=alpha,
                 )
                 loss = distill_loss
@@ -297,6 +298,7 @@ def train(
             adaptive_mask_state=adaptive_mask_state,
             foxp2=foxp2,
             foxp2_groups=fo_groups,
+            distill_end_step=distill_end_step,
         )
         if step % log_interval == 0:
             yield metrics

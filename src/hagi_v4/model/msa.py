@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hagi_v4.config import MSAConfig
+from hagi_v4.model.codec_contracts import MSADecodeConfig
 
 
 class TensorSlotRegistry(nn.Module):
@@ -36,7 +36,7 @@ class TensorSlotRegistry(nn.Module):
         self.slot_kv.index_copy_(0, indices, kv_compressed.detach().to(self.slot_kv.dtype))
         new_ptr = (ptr + n) % self.max_slots
         self.write_ptr.fill_(new_ptr)
-        self.num_written.fill_(min(ptr + n, self.max_slots))
+        self.num_written.fill_(min(int(self.num_written.item()) + n, self.max_slots))
 
     def read_topk(self, query: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         num_valid = int(self.num_written.item())
@@ -67,7 +67,7 @@ class TensorSlotRegistry(nn.Module):
 
 
 class MSAModule(nn.Module):
-    def __init__(self, cfg: MSAConfig, hidden_size: int = 576):
+    def __init__(self, cfg: MSADecodeConfig, hidden_size: int = 576):
         super().__init__()
         self.cfg = cfg
         self.route_proj = nn.Linear(hidden_size, cfg.routing_key_dim, bias=False)
@@ -136,3 +136,24 @@ class MSAModule(nn.Module):
 
     def clear(self) -> None:
         self.registry.clear()
+
+    def serialize_feedback(self) -> torch.Tensor:
+        return torch.cat(
+            [
+                self.registry.slot_keys.flatten(),
+                self.registry.slot_kv.flatten(),
+                self.registry.write_ptr,
+                self.registry.num_written,
+            ]
+        ).detach()
+
+    def restore_feedback(self, feedback: torch.Tensor) -> None:
+        key_size = self.registry.slot_keys.numel()
+        kv_size = self.registry.slot_kv.numel()
+        if feedback.numel() != key_size + kv_size + 2:
+            raise ValueError("Invalid MSA feedback state")
+        flat = feedback.to(device=self.registry.slot_keys.device, dtype=self.registry.slot_keys.dtype)
+        self.registry.slot_keys.copy_(flat[:key_size].view_as(self.registry.slot_keys))
+        self.registry.slot_kv.copy_(flat[key_size : key_size + kv_size].view_as(self.registry.slot_kv))
+        self.registry.write_ptr.copy_(flat[-2:-1].to(self.registry.write_ptr.dtype))
+        self.registry.num_written.copy_(flat[-1:].to(self.registry.num_written.dtype))
