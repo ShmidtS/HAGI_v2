@@ -215,8 +215,10 @@ class TrainConfig:
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15
     phase2_mask_ratio: float = 0.35
+    phase3_mask_ratio: float = 0.50
     use_continuous_anneal: bool = True
     distill_enabled: bool = True
+    distill_kl_enabled: bool = False
     distill_teacher: str = "HuggingFaceTB/SmolLM2-360M"
     distill_embed_teacher: str = "HuggingFaceTB/SmolLM2-135M"
     distill_alpha_start: float = 0.5

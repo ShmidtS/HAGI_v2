@@ -34,6 +34,15 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hagi_v4.config import HAGIv4Config
+from hagi_v4.model.codec_contracts import (
+    CodecShapeConfig,
+    DecodeResult,
+    DecodeState,
+    InferenceShapeConfig,
+    RateMatchResult,
+    SourceEncodeResult,
+    TurboDecodeConfig,
+)
 from hagi_v4.model.cqi import CQIEstimator
 from hagi_v4.model.freq_layer import FreqBlock
 from hagi_v4.model.gp2d import GeometricProduct2D
@@ -58,20 +67,19 @@ class TurboLoop(nn.Module):
       Convergence halt   = EXIT chart stopping criterion
     """
 
-    def __init__(self, cfg: HAGIv4Config, hidden_size: int) -> None:
+    def __init__(self, cfg: TurboDecodeConfig, hidden_size: int) -> None:
         super().__init__()
-        m = cfg.model
-        self.n_iters = m.refinement.num_iterations
-        self.min_iters = m.refinement.min_iterations
-        self.convergence_threshold = m.refinement.convergence_threshold
-        self.use_convergence_halt = m.refinement.use_convergence_halt
-        self.tanh_scale = m.refinement.tanh_scale
+        self.n_iters = cfg.num_iterations
+        self.min_iters = cfg.min_iterations
+        self.convergence_threshold = cfg.convergence_threshold
+        self.use_convergence_halt = cfg.use_convergence_halt
+        self.tanh_scale = cfg.tanh_scale
 
-        n_modes_t = m.freq_coding.n_modes_t
-        n_modes_h = m.freq_coding.n_modes_h
+        n_modes_t = cfg.freq_n_modes_t
+        n_modes_h = cfg.freq_n_modes_h
         ffn_int = hidden_size * 2
-        rank = m.freq_coding.complex_rank
-        head_dim = m.attention.head_dim
+        rank = cfg.freq_complex_rank
+        head_dim = cfg.attention_head_dim
         n_heads = max(1, hidden_size // head_dim)
         proj_rank = hidden_size // 4
         ffn_rank = max(32, hidden_size // 4)
@@ -102,35 +110,35 @@ class TurboLoop(nn.Module):
                 n_modes_t=n_modes_t,
                 n_modes_h=n_modes_h,
                 ffn_intermediate=ffn_int,
-                T_max=m.attention.max_seq_len,
+                T_max=cfg.attention_max_seq_len,
                 rank=rank,
                 proj_rank=proj_rank,
                 ffn_rank=ffn_rank,
                 shared_weights=shared_w,
                 shared_phase=shared_phase,
                 shared_ffn=shared_ffn,
-                norm_eps=m.norm_eps,
+                norm_eps=cfg.norm_eps,
             )
-            for _ in range(m.reasoning_layers)
+            for _ in range(cfg.reasoning_layers)
         )
 
-        if m.gp2d.use_multiscale:
+        if cfg.gp2d.use_multiscale:
             self.gp2d = MultiScaleGP2D(
-                m.gp2d,
+                cfg.gp2d,
                 hidden_size,
-                scales=m.gp2d.multiscale_windows,
-                gate_inits=m.gp2d.multiscale_gate_inits,
-                use_interleave=m.gp2d.use_interleave,
+                scales=cfg.gp2d.multiscale_windows,
+                gate_inits=cfg.gp2d.multiscale_gate_inits,
+                use_interleave=cfg.gp2d.use_interleave,
             )
         else:
-            self.gp2d = GeometricProduct2D(m.gp2d, hidden_size)
+            self.gp2d = GeometricProduct2D(cfg.gp2d, hidden_size)
 
-        self.msa = MSAModule(m.msa, hidden_size)
+        self.msa = MSAModule(cfg.msa, hidden_size)
 
         self.kalman = KalmanFilter(hidden_size)
-        self._layers_per_iter = max(2, m.reasoning_layers // 2)
+        self._layers_per_iter = max(2, cfg.reasoning_layers // 2)
 
-        mut_rank = 8
+        mut_rank = 32
         self.mut_down_w = nn.Parameter(torch.empty(mut_rank, hidden_size))
         self.mut_down_b = nn.Parameter(torch.empty(mut_rank))
         self.mut_up_w = nn.Parameter(torch.empty(hidden_size, mut_rank))
@@ -144,11 +152,10 @@ class TurboLoop(nn.Module):
         self,
         z: torch.Tensor,
         training: bool,
+        state: DecodeState,
         cqi_mean: torch.Tensor | float = 0.5,
         mask: torch.Tensor | None = None,
-        cached_p: torch.Tensor | None = None,
-        clear_msa: bool = True,
-    ) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
+    ) -> DecodeResult:
         B, T, C = z.shape
 
         total_parity = z.new_zeros(())
@@ -158,7 +165,7 @@ class TurboLoop(nn.Module):
         iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z.device)
         gp2d_residual = torch.zeros_like(z)
 
-        p = cached_p if cached_p is not None else torch.ones(C, device=z.device, dtype=z.dtype)
+        p = state.kalman_p if state.kalman_p is not None else torch.ones(C, device=z.device, dtype=z.dtype)
 
         base_k = self.msa.cfg.top_k
         cqi_val = float(cqi_mean) if isinstance(cqi_mean, (int, float)) else cqi_mean.item()
@@ -166,8 +173,9 @@ class TurboLoop(nn.Module):
 
         q_scale = 1.0 + (1.0 - cqi_val)
 
-        if clear_msa:
-            self.msa.clear()
+        self.msa.clear()
+        if state.cache_active and state.msa_feedback is not None:
+            self.msa.restore_feedback(state.msa_feedback)
 
         w_shared = None
         phase_shared = None
@@ -246,7 +254,10 @@ class TurboLoop(nn.Module):
             "gp2d_residual": gp2d_residual,
         }
 
-        return z, side_info, p
+        state.kalman_p = p
+        state.msa_feedback = self.msa.serialize_feedback()
+        state.iteration = converged_at
+        return DecodeResult(latent=z, state=state, side_info=side_info)
 
 
 class HAGIv4(nn.Module):
@@ -256,6 +267,9 @@ class HAGIv4(nn.Module):
         super().__init__()
         self.cfg = cfg
         m = cfg.model
+        self.codec_shape = CodecShapeConfig.from_hagi_config(cfg)
+        self.turbo_config = TurboDecodeConfig.from_hagi_config(cfg)
+        self.inference_config = InferenceShapeConfig.from_hagi_config(cfg)
         H = m.hidden_size
         C = m.core_hidden_size
         self.use_multimodal = m.multimodal.enabled
@@ -322,7 +336,7 @@ class HAGIv4(nn.Module):
         else:
             raise ValueError("V7.1 requires freq_coding.enabled=True (attention fallback removed)")
 
-        self.turbo = TurboLoop(cfg, C)
+        self.turbo = TurboLoop(self.turbo_config, C)
 
         self.expression = self.perception
 
@@ -344,12 +358,12 @@ class HAGIv4(nn.Module):
                 norm_eps=m.norm_eps,
             )
             self.cross_gp2d = CrossModalGP2D(
-                m.gp2d,
+                self.turbo_config.gp2d,
                 C,
                 num_modalities=m.multimodal.num_modalities,
                 gate_init=m.multimodal.cross_gp2d_gate_init,
             )
-            self.cross_msa = CrossModalMSA(m.msa, C, num_modalities=m.multimodal.num_modalities)
+            self.cross_msa = CrossModalMSA(self.turbo_config.msa, C, num_modalities=m.multimodal.num_modalities)
             self.contrastive = ContrastiveAlignment(C, temperature=m.multimodal.contrastive_temperature)
 
         self._init_weights()
@@ -362,12 +376,13 @@ class HAGIv4(nn.Module):
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
         t_flat = targets.reshape(B * T)
+        lm_dev = self.lm_head.weight.device
         total_loss = h_flat.new_zeros(())
         n = h_flat.shape[0]
         for i in range(0, n, chunk):
             end = min(i + chunk, n)
-            logits_chunk = F.linear(h_flat[i:end], self.lm_head.weight)
-            total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end], reduction="sum")
+            logits_chunk = F.linear(h_flat[i:end].to(lm_dev), self.lm_head.weight)
+            total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(lm_dev), reduction="sum")
         return total_loss / max(n, 1)
 
     def _init_weights(self) -> None:
@@ -383,11 +398,8 @@ class HAGIv4(nn.Module):
 
     def _init_mask_embeds(self) -> None:
         with torch.no_grad():
-            self.mask_embed.data.copy_(self.embed.weight.mean(dim=0))
-            me_f = torch.fft.rfft(self.mask_embed.data.float())
-            gate = torch.sigmoid(self.bottleneck_gate)
-            me_f_c = me_f[: self._C // 2 + 1] * gate.float()
-            self.core_mask_embed.data.copy_(torch.fft.irfft(me_f_c, n=self._C).to(self.mask_embed.dtype))
+            self.mask_embed.zero_()
+            self.core_mask_embed.zero_()
 
     def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
         for blk in self.perception:
@@ -399,18 +411,98 @@ class HAGIv4(nn.Module):
         return h
 
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
-        spacing = self.cfg.model.pilot_spacing
+        spacing = self.codec_shape.pilot_spacing
         if T not in self._pilot_idx_cache:
             self._pilot_idx_cache[T] = torch.arange(0, T, spacing, device=device)
         return self._pilot_idx_cache[T]
 
     def _get_pilot_mask(self, T: int, device: torch.device) -> torch.Tensor:
-        spacing = self.cfg.model.pilot_spacing
+        spacing = self.codec_shape.pilot_spacing
         if T not in self._pilot_mask_cache:
             pm = torch.ones(T, dtype=torch.bool, device=device)
             pm[::spacing] = False
             self._pilot_mask_cache[T] = pm
         return self._pilot_mask_cache[T]
+
+    def _source_encode(
+        self,
+        input_ids: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        images: torch.Tensor | None,
+        spectrograms: torch.Tensor | None,
+        modality_ids: torch.Tensor | None,
+        cache: SpectralCache | None,
+    ) -> SourceEncodeResult:
+        if self.use_multimodal and (images is not None or spectrograms is not None):
+            h, modality_ids, _ = self.mm_input(input_ids, images, spectrograms)
+            B, T, _ = h.shape
+        else:
+            B, T = input_ids.shape
+            embed_dev = self.embed.weight.device
+            ids_dev = input_ids.device
+            if embed_dev != ids_dev:
+                h = self.embed(input_ids.to(embed_dev)).to(ids_dev)
+            else:
+                h = self.embed(input_ids)
+        if mask is not None:
+            pilot_mask = self._get_pilot_mask(T, h.device)
+            mask = mask & pilot_mask.unsqueeze(0)
+            h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
+        cached_len = 0
+        if cache is not None and cache.context_len > 0:
+            cached_h = cache.get_context(0)
+            if cached_h is not None and cached_h.shape[0] == B and cached_h.shape[2] == h.shape[2]:
+                h = torch.cat([cached_h.to(h.dtype), h], dim=1)
+                cached_len = cached_h.shape[1]
+        if cache is not None:
+            cache.update_context(0, h, new_tokens=T)
+        h = self._freq_blocks_forward(h)
+        if cached_len > 0:
+            h = h[:, cached_len:]
+            B, T, _ = h.shape
+        if self.use_multimodal and modality_ids is not None:
+            h = self.cross_freq(h, modality_ids, num_modalities=self.codec_shape.num_modalities)
+        if mask is not None and T >= self.codec_shape.pilot_spacing:
+            pilot_idx = self._get_pilot_idx(T, h.device)
+            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
+            h = h + self.pilot_eq_strength * (h_pilot_ref - h.mean(dim=1, keepdim=True))
+        return SourceEncodeResult(h, mask, modality_ids, self.cqi(h), h)
+
+    def _rate_match(self, encoded: SourceEncodeResult) -> RateMatchResult:
+        h = encoded.source
+        B, T, _ = h.shape
+        h_f = torch.fft.rfft(h.float(), dim=-1)
+        gate = torch.sigmoid(self.bottleneck_gate) * (0.5 + 0.5 * encoded.cqi).unsqueeze(-1)
+        z = torch.fft.irfft(h_f[:, :, : self._C // 2 + 1] * gate, n=self._C, dim=-1).to(h.dtype)
+        z = self.bottleneck_norm(z)
+        if encoded.mask is not None:
+            z = torch.where(encoded.mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
+        return RateMatchResult(z, encoded)
+
+    def _turbo_decode(self, matched: RateMatchResult, state: DecodeState, training: bool) -> DecodeResult:
+        result = self.turbo(matched.latent, training, state, matched.source.cqi.mean(), matched.source.mask)
+        z = result.latent
+        modality_ids = matched.source.modality_ids
+        if self.use_multimodal and modality_ids is not None:
+            z, _ = self.cross_gp2d(z, modality_ids)
+            self.cross_msa.clear()
+            self.cross_msa.write(z, modality_ids)
+            side_info_q = z + self.cross_msa.read_cross(
+                z, modality_ids, target_modality=0, top_k=self.codec_shape.msa_top_k
+            )
+            z = z + 0.1 * (side_info_q - z)
+            result.latent = z
+        return result
+
+    def _source_decode(self, decoded: DecodeResult, encoded: SourceEncodeResult) -> torch.Tensor:
+        z = decoded.latent
+        B, T, _ = z.shape
+        z_f = torch.fft.rfft(z.float(), dim=-1)
+        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
+        c_bins = self._C // 2 + 1
+        gate = torch.sigmoid(self.bottleneck_up_gate[:c_bins]) * (0.5 + 0.5 * encoded.cqi).unsqueeze(-1)
+        z_pad[:, :, :c_bins] = z_f[:, :, :c_bins] * gate
+        return self._freq_blocks_forward(torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype))
 
     def forward(
         self,
@@ -424,101 +516,27 @@ class HAGIv4(nn.Module):
         cached_p: torch.Tensor | None = None,
         cache: SpectralCache | None = None,
     ) -> ModelOutput:
-        if self.use_multimodal and (images is not None or spectrograms is not None):
-            h, modality_ids, lengths = self.mm_input(input_ids, images, spectrograms)
-            B, T, H = h.shape
-        else:
-            B, T = input_ids.shape
-            h = self.embed(input_ids)
-
-        if mask is not None:
-            pilot_mask = self._get_pilot_mask(T, h.device)
-            mask = mask & pilot_mask.unsqueeze(0)
-            h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
-
-        cached_len = 0
-        if cache is not None and cache.context_len > 0:
-            cached_h = cache.get_context(0)
-            if cached_h is not None and cached_h.shape[0] == B and cached_h.shape[2] == h.shape[2]:
-                h = torch.cat([cached_h.to(h.dtype), h], dim=1)
-                cached_len = cached_h.shape[1]
-
-        h = self._freq_blocks_forward(h)
-
+        state = cache.to_decode_state() if cache is not None else DecodeState(kalman_p=cached_p)
+        if cache is not None and state.kalman_p is None:
+            state.kalman_p = cached_p
+        encoded = self._source_encode(input_ids, mask, images, spectrograms, modality_ids, cache)
+        matched = self._rate_match(encoded)
+        decoded = self._turbo_decode(matched, state, self.training)
+        h = self._source_decode(decoded, encoded)
         if cache is not None:
-            W = cache.context_window
-            cache.update_context(0, h[:, -W:, :])
-            if cached_len > 0:
-                h = h[:, cached_len:]
-                B, T, _ = h.shape
-
-        if self.use_multimodal and modality_ids is not None:
-            h = self.cross_freq(h, modality_ids, num_modalities=self.cfg.model.multimodal.num_modalities)
-
-        if mask is not None and T >= self.cfg.model.pilot_spacing:
-            pilot_idx = self._get_pilot_idx(T, h.device)
-            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
-            h_mean = h.mean(dim=1, keepdim=True)
-            h = h + self.pilot_eq_strength * (h_pilot_ref - h_mean)
-
-        cqi = self.cqi(h)
-        cqi_mean_t = cqi.mean()
-
-        h_pre_bottleneck = h
-
-        h_f = torch.fft.rfft(h.float(), dim=-1)
-        cqi_gate = (0.5 + 0.5 * cqi).unsqueeze(-1)
-        gate = torch.sigmoid(self.bottleneck_gate) * cqi_gate
-        h_f_c = h_f[:, :, : self._C // 2 + 1] * gate
-        z = torch.fft.irfft(h_f_c, n=self._C, dim=-1).to(h.dtype)
-        z = self.bottleneck_norm(z)
-        if mask is not None:
-            z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
-
-        turbo_cached_p = cached_p
-        if cache is not None:
-            turbo_cached_p = cache.get_kalman_p()
-
-        z, side_info, p_final = self.turbo(
-            z,
-            training=self.training,
-            cqi_mean=cqi_mean_t,
-            mask=mask,
-            cached_p=turbo_cached_p,
-            clear_msa=(cache is None),
-        )
-
-        if cache is not None and p_final is not None:
-            cache.update_kalman_p(p_final)
-
-        if self.use_multimodal and modality_ids is not None:
-            z_cross, cross_residual = self.cross_gp2d(z, modality_ids)
-            z = z_cross
-
-            self.cross_msa.clear()
-            self.cross_msa.write(z, modality_ids)
-            side_info_q = z + self.cross_msa.read_cross(
-                z, modality_ids, target_modality=0, top_k=self.cfg.model.msa.top_k
-            )
-            z = z + 0.1 * (side_info_q - z)
-
-        z_f = torch.fft.rfft(z.float(), dim=-1)
-        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
-        c_bins = self._C // 2 + 1
-        cqi_gate_up = (0.5 + 0.5 * cqi).unsqueeze(-1)
-        gate_up = torch.sigmoid(self.bottleneck_up_gate[:c_bins]) * cqi_gate_up
-        z_pad[:, :, :c_bins] = z_f[:, :, :c_bins] * gate_up
-        h = torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype)
-
-        h = self._freq_blocks_forward(h)
-
-        rd_loss = (h_pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
+            cache.update_decode_state(decoded.state)
+        side_info = decoded.side_info
+        rd_loss = (encoded.pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
 
         h_normed = self.final_norm(h)
-        if targets is not None and mask is not None:
-            h_masked = h_normed[mask]
+        lm_dev = self.lm_head.weight.device
+        if targets is not None and encoded.mask is not None:
+            h_masked = h_normed[encoded.mask]
             if h_masked.shape[0] > 0:
-                ce = F.cross_entropy(F.linear(h_masked, self.lm_head.weight), targets[mask])
+                ce = F.cross_entropy(
+                    F.linear(h_masked.to(lm_dev), self.lm_head.weight),
+                    targets[encoded.mask].to(lm_dev),
+                )
             else:
                 ce = self._chunked_ce(h_normed, targets)
             logits = None
@@ -526,14 +544,14 @@ class HAGIv4(nn.Module):
             ce = self._chunked_ce(h_normed, targets)
             logits = None
         else:
-            logits = F.linear(h_normed, self.lm_head.weight)
+            logits = F.linear(h_normed.to(lm_dev), self.lm_head.weight).to(h_normed.device)
             ce = None
 
         aux = AuxLosses()
         if targets is not None:
             if side_info["parity_strength"] is not None:
                 aux.parity = side_info["parity_strength"]
-            if self.cfg.model.gp2d.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
+            if self.codec_shape.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
                 aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"])
             if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
                 ext_sum = sum(side_info["extrinsic_norms"])
@@ -542,8 +560,8 @@ class HAGIv4(nn.Module):
                 aux.efficiency = side_info["iterations_used"].float().mean()
             aux.rate_distortion = rd_loss
 
-            if self.use_multimodal and modality_ids is not None and hasattr(self, "contrastive"):
-                aux.contrastive = self.contrastive(h, modality_ids)
+            if self.use_multimodal and encoded.modality_ids is not None and hasattr(self, "contrastive"):
+                aux.contrastive = self.contrastive(h, encoded.modality_ids)
 
         return ModelOutput(
             logits=logits,

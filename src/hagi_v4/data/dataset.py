@@ -44,21 +44,19 @@ class MemmapDataset(Dataset):
                 self._data = torch.frombuffer(f.read(), dtype=self._dtype).long().clone()
 
     def __len__(self) -> int:
-        return max(0, self.num_tokens - self.seq_len - 1)
+        return max(0, self.num_tokens - self.seq_len)
 
     def __getitem__(self, idx: int) -> dict:
-        """Return a single sample.
+        """Return a single sample for masked LM (same-position prediction).
 
-        Both input_ids and targets are the same chunk[:seq_len] — this is
-        intentional for plane prediction (masked CE), where the model predicts
-        all positions simultaneously rather than doing next-token prediction.
-        The masking layer (create_random_mask) decides which positions are
-        masked and which are visible.
+        input_ids and targets are the same chunk[:seq_len] — the model
+        predicts the original token at each masked position, not the next
+        token. create_random_mask decides which positions are masked.
         """
         self._load()
-        chunk = self._data[idx : idx + self.seq_len + 1]
-        ids = chunk[: self.seq_len].clone()
-        tgt = chunk[1 : self.seq_len + 1].clone()
+        chunk = self._data[idx : idx + self.seq_len]
+        ids = chunk.clone()
+        tgt = chunk.clone()
         ids[ids >= self.vocab_size] = 0
         tgt[tgt >= self.vocab_size] = 0
         return {"input_ids": ids, "targets": tgt}

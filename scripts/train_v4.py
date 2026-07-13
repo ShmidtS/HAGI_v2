@@ -125,9 +125,9 @@ def main() -> int:
             logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
         return 0
 
-    # Load distillation teacher
+    # Load distillation teacher (KL distillation only, not embedding transfer)
     teacher = None
-    if cfg.train.distill_enabled:
+    if cfg.train.distill_enabled and getattr(cfg.train, "distill_kl_enabled", False):
         from hagi_v4.train.distillation import DistillationTeacher
 
         teacher = DistillationTeacher(cfg.train.distill_teacher)

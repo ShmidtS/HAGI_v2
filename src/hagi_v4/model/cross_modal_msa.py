@@ -20,14 +20,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from hagi_v4.config import MSAConfig
+from hagi_v4.model.codec_contracts import MSADecodeConfig
 from hagi_v4.model.msa import MSAModule
 
 
 class CrossModalMSA(nn.Module):
     """MSA with modality-specific slot registries for Wyner-Ziv coding."""
 
-    def __init__(self, cfg: MSAConfig, hidden_size: int, num_modalities: int = 3) -> None:
+    def __init__(self, cfg: MSADecodeConfig, hidden_size: int, num_modalities: int = 3) -> None:
         super().__init__()
         self.num_modalities = num_modalities
         self.msa_modules = nn.ModuleList([MSAModule(cfg, hidden_size) for _ in range(num_modalities)])

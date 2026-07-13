@@ -41,9 +41,9 @@ model:
     mask_token_id: 49153
     use_span_masking: true
     span_length: 3
-    use_progressive: true
-    use_adaptive_erasure: true
-    mask_embed_init: "max_entropy"
+    use_progressive: false
+    use_adaptive_erasure: false
+    mask_embed_init: "zero"
     adaptation_rate: 0.01
 
   msa:
@@ -93,7 +93,7 @@ train:
   w_ce: 1.0
   w_whiteness: 0.01
   w_parity: 0.1
-  w_extrinsic_info: 0.01
+  w_extrinsic_info: 0.001
   w_efficiency: 0.001
   w_rate_distortion: 0.01
   w_contrastive: 0.1
@@ -101,8 +101,10 @@ train:
   two_phase_split: 0.5
   phase1_mask_ratio: 0.15
   phase2_mask_ratio: 0.35
+  phase3_mask_ratio: 0.50
   use_continuous_anneal: true
   distill_enabled: true
+  distill_kl_enabled: false
   distill_teacher: "HuggingFaceTB/SmolLM2-360M"
   distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"
   distill_alpha_start: 0.5

@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from hagi_v4.config import HAGIv4Config
+from hagi_v4.model.codec_contracts import TrainLossConfig
 from hagi_v4.model.outputs import AuxLosses, ModelOutput
 
 
@@ -38,14 +39,15 @@ def masked_cross_entropy_chunked(
 class LossAggregator:
     """Computes total loss from ModelOutput + targets + mask."""
 
-    def __init__(self, cfg: HAGIv4Config):
-        self.w_whiteness = cfg.train.w_whiteness
-        self.w_parity = cfg.train.w_parity
-        self.w_extrinsic_info = cfg.train.w_extrinsic_info
-        self.w_efficiency = cfg.train.w_efficiency
-        self.w_msa_lb = getattr(cfg.train, "w_msa_lb", 0.01)
-        self.w_rate_distortion = cfg.train.w_rate_distortion
-        self.w_contrastive = cfg.train.w_contrastive if hasattr(cfg.train, "w_contrastive") else 0.0
+    def __init__(self, cfg: HAGIv4Config | TrainLossConfig):
+        contract = TrainLossConfig.from_hagi_config(cfg) if isinstance(cfg, HAGIv4Config) else cfg
+        self.w_whiteness = contract.whiteness_weight
+        self.w_parity = contract.parity_weight
+        self.w_extrinsic_info = contract.extrinsic_info_weight
+        self.w_efficiency = contract.efficiency_weight
+        self.w_msa_lb = contract.msa_lb_weight
+        self.w_rate_distortion = contract.rate_distortion_weight
+        self.w_contrastive = contract.contrastive_weight
 
     def __call__(
         self,
@@ -66,9 +68,9 @@ class LossAggregator:
         if aux.whiteness is not None:
             total = total + self.w_whiteness * aux.whiteness
         if aux.parity is not None:
-            total = total - self.w_parity * aux.parity.clamp(min=0.0, max=1.0)
+            total = total - self.w_parity * torch.sigmoid(aux.parity * 5.0)
         if aux.extrinsic_info is not None:
-            total = total - self.w_extrinsic_info * aux.extrinsic_info
+            total = total + self.w_extrinsic_info * aux.extrinsic_info
         if aux.efficiency is not None:
             total = total + self.w_efficiency * aux.efficiency
         if aux.rate_distortion is not None:

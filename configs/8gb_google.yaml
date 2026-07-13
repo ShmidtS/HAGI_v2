@@ -4,7 +4,7 @@
 
 model:
   vocab_size: 262146
-  target_params: 2000000000
+  target_params: 1000000000
   norm_eps: 1.0e-6
   pilot_spacing: 8
 
@@ -13,7 +13,7 @@ model:
 
   attention:
     rope_theta: 500000.0
-    max_seq_len: 4096
+    max_seq_len: 3072
     bidirectional: true
     fp16_attention: true
     fp32_rmsnorm: true
@@ -40,9 +40,9 @@ model:
     mask_token_id: 262145
     use_span_masking: true
     span_length: 3
-    use_progressive: true
-    use_adaptive_erasure: true
-    mask_embed_init: "max_entropy"
+    use_progressive: false
+    use_adaptive_erasure: false
+    mask_embed_init: "zero"
     adaptation_rate: 0.01
 
   msa:
@@ -87,12 +87,12 @@ train:
   weight_decay: 0.1
   precision: "bf16"
   grad_accum_steps: 2
-  batch_size: 8
+  batch_size: 2
   seq_len: 1024
   w_ce: 1.0
   w_whiteness: 0.01
   w_parity: 0.1
-  w_extrinsic_info: 0.01
+  w_extrinsic_info: 0.001
   w_efficiency: 0.001
   w_rate_distortion: 0.01
   w_contrastive: 0.1
@@ -100,7 +100,9 @@ train:
   two_phase_split: 0.5
   phase1_mask_ratio: 0.15
   phase2_mask_ratio: 0.35
+  phase3_mask_ratio: 0.50
   distill_enabled: true
+  distill_kl_enabled: false
   distill_teacher: "google/gemma-4-E2B-it"
   distill_embed_teacher: "google/t5gemma-2-1b-1b"
   distill_alpha_start: 0.5
