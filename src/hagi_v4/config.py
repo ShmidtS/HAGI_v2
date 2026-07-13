@@ -50,7 +50,7 @@ class GP2DConfig:
     parity_weight: float = 0.1
     use_multiscale: bool = True
     multiscale_windows: tuple = (1, 4, 16)
-    multiscale_gate_inits: tuple = (-2.0, -3.0, -4.0)
+    multiscale_gate_inits: tuple = (-4.0, -5.0, -6.0)
     use_interleave: bool = True
 
 
@@ -229,6 +229,11 @@ class TrainConfig:
     distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
     distill_every: int = 2
+    awgn_enabled: bool = True
+    awgn_sigma_start: float = 0.005
+    awgn_sigma_end: float = 0.0
+    awgn_end_frac: float = 0.5
+    freeze_embeddings: bool = True
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 5000

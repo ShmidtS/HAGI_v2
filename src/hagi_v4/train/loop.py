@@ -139,8 +139,14 @@ def train_step(
     output: ModelOutput | None = None
 
     for micro_idx in range(accum):
-        output = model(masked_ids, targets=targets, mask=mask, step=step)
-        loss = loss_aggregator(output, targets, mask)
+        awgn_sigma = 0.0
+        if cfg.train.awgn_enabled:
+            awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
+            if step < awgn_end:
+                progress = step / max(awgn_end, 1)
+                awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
+        output = model(masked_ids, targets=targets, mask=mask, step=step, awgn_sigma=awgn_sigma)
+        loss = loss_aggregator(output, targets, mask, step=step)
 
         use_distill = (
             teacher is not None

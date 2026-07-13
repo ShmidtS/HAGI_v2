@@ -119,7 +119,7 @@ def main() -> int:
         aggregator = LossAggregator(cfg)
         model.train()
         output = model(masked_ids, targets=targets, mask=mask)
-        total_loss = aggregator(output, targets, mask)
+        total_loss = aggregator(output, targets, mask, step=0)
         logger.info(f"Loss: {total_loss.item():.4f}")
         if device.type == "cuda":
             logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
