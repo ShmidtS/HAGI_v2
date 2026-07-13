@@ -398,8 +398,8 @@ class HAGIv4(nn.Module):
 
     def _init_mask_embeds(self) -> None:
         with torch.no_grad():
-            self.mask_embed.zero_()
-            self.core_mask_embed.zero_()
+            nn.init.normal_(self.mask_embed, std=0.02)
+            nn.init.normal_(self.core_mask_embed, std=0.02)
 
     def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
         for blk in self.perception:

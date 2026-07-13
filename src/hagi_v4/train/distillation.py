@@ -210,13 +210,19 @@ class DistillationTeacher:
         alpha: float = 0.5,
         chunk_size: int = 512,
     ) -> torch.Tensor:
-        """Hidden state alignment: alpha * CE + (1-alpha) * MSE(student, teacher).
+        """Hidden state alignment on unmasked positions only.
 
         Teacher hidden states act as pilot/reference signals (5G DM-RS).
-        Student learns to produce contextual representations matching teacher,
-        regardless of causal vs masked LM direction difference.
+        Student learns to match teacher's contextual representations on
+        VISIBLE (unmasked) positions — where both see the same token.
 
-        A learnable projection aligns dimensions if student H != teacher H.
+        On masked positions, student must recover the token via CE loss,
+        NOT by matching teacher's hidden state (teacher sees the real
+        token, student sees mask_embed — MSE there would penalize the
+        student for not seeing what it can't see).
+
+        5G analog: DM-RS alignment on pilot positions, data recovery
+        on data positions.
         """
         if teacher_hidden is None:
             return ce_loss
@@ -227,6 +233,16 @@ class DistillationTeacher:
         flat_sh = student_hidden.reshape(B * T, H_s).float()
         flat_th = teacher_hidden.reshape(B * T, H_t).float().to(flat_sh.device)
 
+        if mask is not None:
+            flat_mask = mask.reshape(B * T)
+            valid_mask = ~flat_mask
+        else:
+            valid_mask = torch.ones(B * T, dtype=torch.bool, device=flat_sh.device)
+
+        n_valid = valid_mask.sum().item()
+        if n_valid == 0:
+            return ce_loss
+
         if H_s != H_t:
             if not hasattr(self, "_align_proj") or self._align_proj is None or self._align_proj.in_features != H_t:
                 self._align_proj = nn.Linear(H_t, H_s, bias=False).to(flat_sh.device)
@@ -234,13 +250,15 @@ class DistillationTeacher:
             flat_th = self._align_proj(flat_th)
 
         total_mse = flat_sh.new_zeros(())
-        n = flat_sh.shape[0]
-        for i in range(0, n, chunk_size):
-            end = min(i + chunk_size, n)
-            diff = flat_sh[i:end] - flat_th[i:end].to(flat_sh.dtype)
+        for i in range(0, flat_sh.shape[0], chunk_size):
+            end = min(i + chunk_size, flat_sh.shape[0])
+            mask_c = valid_mask[i:end]
+            if not mask_c.any():
+                continue
+            diff = flat_sh[i:end][mask_c] - flat_th[i:end][mask_c].to(flat_sh.dtype)
             total_mse = total_mse + diff.pow(2).mean(dim=-1).sum()
 
-        mse_loss = total_mse / n
+        mse_loss = total_mse / n_valid
         return alpha * ce_loss + (1.0 - alpha) * mse_loss
 
     def free(self):
