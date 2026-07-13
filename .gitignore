@@ -29,6 +29,7 @@ meta.json
 # untracked / wip artifacts
 formalization/.lake/
 formalization/.lake-build.log
+docs/superpowers/
 
 # Python
 __pycache__/
