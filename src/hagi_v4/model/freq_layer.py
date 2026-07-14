@@ -207,7 +207,7 @@ class FreqCoding2D(nn.Module):
             out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
 
         mag = out_f.abs().float()
-        scale = torch.tanh(mag / 10.0) / (mag / 10.0 + 1e-9)
+        scale = 1.0 / (1.0 + mag / 10.0)
         out_f = out_f * scale.to(out_f.dtype)
 
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)

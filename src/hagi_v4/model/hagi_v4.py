@@ -191,8 +191,8 @@ class TurboLoop(nn.Module):
             Kt = min(self.shared_phase.shape[1], T)
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
-        q_cached = torch.exp(self.kalman.log_q).to(z.dtype)
-        r_cached = torch.exp(self.kalman.log_r).to(z.dtype)
+        q_cached = self.kalman._q(z.dtype)
+        r_cached = self.kalman._r(z.dtype)
 
         for iteration in range(self.n_iters):
             h_prior = z
@@ -238,7 +238,7 @@ class TurboLoop(nn.Module):
 
             z = z + F.linear(F.silu(F.linear(z, self.mut_down_w, self.mut_down_b)), self.mut_up_w)
 
-            z = self.tanh_scale * torch.tanh(z / self.tanh_scale)
+            z = z / (1.0 + z.float().square().mean(dim=-1, keepdim=True) / self.tanh_scale**2).to(z.dtype).sqrt()
 
             if training and iteration < self.n_iters - 1:
                 confidence = 1.0 / (1.0 + gp2d_residual.abs().float().mean(dim=-1))
@@ -250,7 +250,12 @@ class TurboLoop(nn.Module):
 
             innovation_harq = z - h_prior
             inn_mag = innovation_harq.float().norm(dim=-1, keepdim=True)
-            write_gate = torch.sigmoid((inn_mag - inn_mag.mean()) * self.write_gate_w).to(innovation_harq.dtype)
+            if mask is not None:
+                valid = ~mask
+                inn_mean = (inn_mag * valid.unsqueeze(-1).float()).sum() / valid.float().sum()
+            else:
+                inn_mean = inn_mag.mean()
+            write_gate = torch.sigmoid((inn_mag - inn_mean) * self.write_gate_w).to(innovation_harq.dtype)
             self.msa.write(innovation_harq * write_gate)
 
             prev_residual = gp2d_residual
@@ -509,7 +514,13 @@ class HAGIv4(nn.Module):
         return RateMatchResult(z, encoded)
 
     def _turbo_decode(self, matched: RateMatchResult, state: DecodeState, training: bool) -> DecodeResult:
-        result = self.turbo(matched.latent, training, state, matched.source.cqi.mean(), matched.source.mask)
+        result = self.turbo(
+            matched.latent,
+            training,
+            state,
+            matched.source.cqi.mean(),
+            matched.source.mask,
+        )
         z = result.latent
         modality_ids = matched.source.modality_ids
         if self.use_multimodal and modality_ids is not None:
@@ -582,7 +593,14 @@ class HAGIv4(nn.Module):
             if side_info["parity_strength"] is not None:
                 aux.parity = side_info["parity_strength"]
             if self.codec_shape.use_whiteness_loss and side_info.get("gp2d_residual") is not None:
-                aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"])
+                pilot_mask = self._get_pilot_mask(
+                    side_info["gp2d_residual"].shape[1],
+                    side_info["gp2d_residual"].device,
+                )
+                valid = pilot_mask.unsqueeze(0).expand(side_info["gp2d_residual"].shape[0], -1)
+                if encoded.mask is not None:
+                    valid = valid & ~encoded.mask
+                aux.whiteness = compute_whiteness_loss(side_info["gp2d_residual"], valid)
             if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
                 ext_sum = sum(side_info["extrinsic_norms"])
                 aux.extrinsic_info = (ext_sum / len(side_info["extrinsic_norms"])).to(h.dtype)
