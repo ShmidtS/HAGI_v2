@@ -32,10 +32,15 @@ class ModelOutput:
     iterations_used: torch.Tensor | None = None
 
 
-def compute_whiteness_loss(residual: torch.Tensor) -> torch.Tensor:
+def compute_whiteness_loss(residual: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
     if residual.size(1) < 2:
         return residual.new_zeros(())
     r_t = residual[:, :-1].reshape(-1, residual.size(-1))
     r_t1 = residual[:, 1:].reshape(-1, residual.size(-1))
     cos_sim = F.cosine_similarity(r_t.float(), r_t1.float(), dim=-1)
+    if valid_mask is not None:
+        adjacent = valid_mask[:, 1:] & valid_mask[:, :-1]
+        if adjacent.any():
+            return cos_sim[adjacent.reshape(-1)].abs().mean()
+        return residual.new_zeros(())
     return cos_sim.abs().mean()

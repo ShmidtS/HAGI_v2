@@ -120,19 +120,20 @@ class MSAModule(nn.Module):
         return msa_out, lb
 
     def _load_balance_loss(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        """Auxiliary loss encouraging uniform slot usage.
-
-        f = slot visit frequency, P = mean routing probability (softmaxed scores
-        averaged across queries, then across slots). The double mean on P
-        first averages over queries (dim=0) yielding per-slot probabilities,
-        then averages over slots to produce a scalar — this is intentional
-        to match the Switch Transformer load-balancing formulation.
-        """
+        num_valid = int(self.registry.num_written.item())
+        if num_valid == 0:
+            return scores.new_zeros(())
         counts = torch.bincount(indices.reshape(-1), minlength=self.cfg.max_slots).float()
+        counts = counts[:num_valid]
         total = counts.sum()
-        f = counts / total if total > 0 else counts
-        P = (scores.softmax(dim=-1).mean(dim=0)).mean()
-        return self.cfg.load_balance_weight * (f * P).sum()
+        if total == 0:
+            return scores.new_zeros(())
+        f = counts / total
+        P_per_slot = scores.softmax(dim=-1).mean(dim=0)[:num_valid]
+        if P_per_slot.shape[0] != f.shape[0]:
+            n = min(f.shape[0], P_per_slot.shape[0])
+            return self.cfg.load_balance_weight * (f[:n] * P_per_slot[:n]).sum()
+        return self.cfg.load_balance_weight * (f * P_per_slot).sum()
 
     def clear(self) -> None:
         self.registry.clear()
