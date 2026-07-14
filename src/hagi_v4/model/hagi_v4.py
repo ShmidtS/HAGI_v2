@@ -245,7 +245,7 @@ class TurboLoop(nn.Module):
                 sic_gate = torch.sigmoid(confidence * self.sic_w.float() + self.sic_b.float()).to(z.dtype)
                 z = z * (1 - sic_gate.unsqueeze(-1)) + z.detach() * sic_gate.unsqueeze(-1)
 
-            ext_norm = innovation.float().norm(dim=-1).mean().detach()
+            ext_norm = innovation.float().norm(dim=-1).mean()
             extrinsic_norms.append(ext_norm)
 
             innovation_harq = z - h_prior
@@ -396,6 +396,15 @@ class HAGIv4(nn.Module):
         if cfg.train.freeze_embeddings:
             self.embed.weight.requires_grad_(False)
 
+    def train(self, mode: bool = True) -> HAGIv4:
+        result = super().train(mode)
+        if mode:
+            for blk in self.perception:
+                blk.reset_cache()
+            for blk in self.turbo.reasoning:
+                blk.reset_cache()
+        return result
+
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
@@ -412,12 +421,14 @@ class HAGIv4(nn.Module):
     def _init_weights(self) -> None:
         for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
-                if "mut_" in name:
+                if "mut_" in name or mod is self.lm_head:
                     continue
                 nn.init.normal_(mod.weight, mean=0.0, std=0.02)
                 if mod.bias is not None:
                     nn.init.zeros_(mod.bias)
             elif isinstance(mod, nn.Embedding):
+                if mod is self.embed:
+                    continue
                 nn.init.normal_(mod.weight, mean=0.0, std=0.02)
 
     def _init_mask_embeds(self) -> None:
@@ -606,6 +617,8 @@ class HAGIv4(nn.Module):
                 aux.extrinsic_info = (ext_sum / len(side_info["extrinsic_norms"])).to(h.dtype)
             if side_info.get("iterations_used") is not None:
                 aux.efficiency = side_info["iterations_used"].float().mean()
+            if side_info.get("msa_lb") is not None:
+                aux.msa_lb = side_info["msa_lb"]
             aux.rate_distortion = rd_loss
 
             if self.use_multimodal and encoded.modality_ids is not None and hasattr(self, "contrastive"):

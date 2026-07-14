@@ -143,6 +143,16 @@ class FreqCoding2D(nn.Module):
         self._w_cache: torch.Tensor | None = None
         self._phase_cache: torch.Tensor | None = None
 
+    def reset_cache(self) -> None:
+        """Invalidate eval caches (complex weight, phase).
+
+        Caches are populated lazily on first eval forward and never cleared,
+        which produces stale data when seq_len/n_modes change between calls.
+        Call on train/eval mode toggle.
+        """
+        self._w_cache = None
+        self._phase_cache = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -273,3 +283,6 @@ class FreqBlock(nn.Module):
         x = x + self.freq(x, cached_w=cached_w, cached_phase=cached_phase)
         x = x + self.ffn(self.ffn_norm(x))
         return x
+
+    def reset_cache(self) -> None:
+        self.freq.reset_cache()

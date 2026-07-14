@@ -27,7 +27,7 @@ from hagi_v4.model.masking import (
 )
 from hagi_v4.model.outputs import ModelOutput
 from hagi_v4.train.distillation import alpha_at, temperature_at
-from hagi_v4.train.foxp2 import FOXP2Controller, apply_foxp2
+from hagi_v4.train.foxp2 import FOXP2Controller, apply_foxp2, foxp2_alignment_loss
 from hagi_v4.train.losses import LossAggregator
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
@@ -189,9 +189,9 @@ def train_step(
     grad_norm = soft_grad_scale(model, grad_norm_target)
 
     foxp2_gates = None
+    foxp2_log_norms = None
     if foxp2 is not None and foxp2_groups is not None:
-        progress = min(1.0, step / max(cfg.train.max_steps, 1))
-        foxp2_gates = apply_foxp2(foxp2, foxp2_groups, progress, device)
+        foxp2_gates, foxp2_log_norms = apply_foxp2(foxp2, foxp2_groups, device)
 
     optimizer.step()
 
@@ -231,6 +231,7 @@ def train_step(
     if foxp2_gates is not None:
         result["foxp2_gates"] = foxp2_gates.detach().flatten().tolist()
         result["_foxp2_gates_tensor"] = foxp2_gates
+        result["_foxp2_log_norms"] = foxp2_log_norms
     return result
 
 
@@ -266,6 +267,13 @@ def train(
         fo_groups.append([p for _, p in named_params[i * chunk : (i + 1) * chunk]])
 
     if resume_extra:
+        opt_state = resume_extra.get("optimizer")
+        if opt_state is not None:
+            try:
+                optimizer.load_state_dict(opt_state)
+                logger.info("Optimizer state restored from checkpoint")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                logger.warning(f"Optimizer state mismatch — starting fresh: {exc}")
         if "foxp2" in resume_extra:
             foxp2.load_state_dict(resume_extra["foxp2"])
             logger.info("FOXP2 state restored from checkpoint")
@@ -311,11 +319,18 @@ def train(
 
         if foxp2 is not None and "_foxp2_gates_tensor" in metrics:
             gates_t = metrics["_foxp2_gates_tensor"]
-            foxp2_loss = 0.01 * gates_t.pow(2).sum()
+            log_norms_t = metrics["_foxp2_log_norms"]
+            # Alignment surrogate: raise gates on groups whose grad-norm is
+            # stable (close to EMA trend = consistent signal), suppress where
+            # it is an outlier (noise). Replaces L2 (collapse to 0) and entropy
+            # (collapse to uniform 0.5).
+            foxp2_loss = foxp2_alignment_loss(gates_t, log_norms_t, foxp2.ema_log_norm)
             foxp2_optimizer.zero_grad(set_to_none=True)
             foxp2_loss.backward()
             foxp2_optimizer.step()
+            foxp2.update_ema(log_norms_t)
             del metrics["_foxp2_gates_tensor"]
+            del metrics["_foxp2_log_norms"]
 
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
             extra = {

@@ -95,14 +95,20 @@ def load_checkpoint(
     optimizer: CombinedOptimizer | None = None,
     device: str = "cpu",
 ) -> tuple[int, HAGIv4Config, dict]:
-    """Load checkpoint. Returns (step, config, extra)."""
+    """Load checkpoint. Returns (step, config, extra).
+
+    Optimizer state is returned in extra["optimizer"] when present, so a caller
+    that builds the optimizer after resume can still restore momentum buffers.
+    """
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(_migrate_state_dict(state["model"]))
-    if optimizer is not None and "optimizer" in state:
-        optimizer.load_state_dict(state["optimizer"])
     cfg = cfg_from_dict(state["config"])
     step = state["step"]
     extra = state.get("extra", {})
+    if "optimizer" in state:
+        extra["optimizer"] = state["optimizer"]
+    if optimizer is not None and "optimizer" in state:
+        optimizer.load_state_dict(state["optimizer"])
     logger.info(f"Checkpoint loaded: {path} (step {step})")
     return step, cfg, extra
 
