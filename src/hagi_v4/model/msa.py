@@ -32,8 +32,16 @@ class TensorSlotRegistry(nn.Module):
         ptr = int(self.write_ptr.item())
         idx = torch.arange(n, device=keys.device)
         indices = (idx + ptr) % self.max_slots
-        self.slot_keys.index_copy_(0, indices, keys.detach().to(self.slot_keys.dtype))
-        self.slot_kv.index_copy_(0, indices, kv_compressed.detach().to(self.slot_kv.dtype))
+        # Routing keys stay detached: topk indices are non-differentiable anyway,
+        # so write-side keys only serve address lookup. route_proj learns via the
+        # read-side query path + load-balance loss.
+        self.slot_keys = torch.index_copy(
+            self.slot_keys, 0, indices, keys.detach().to(self.slot_keys.dtype)
+        )
+        # KV values keep grad_fn: read gathers top-k and feeds mla_up_k/v, so
+        # gradient flows back into mla_compress through the slots actually read.
+        # Top-k (<=6) bounds the BPTT fan-in per query, not the full ring buffer.
+        self.slot_kv = torch.index_copy(self.slot_kv, 0, indices, kv_compressed.to(self.slot_kv.dtype))
         new_ptr = (ptr + n) % self.max_slots
         self.write_ptr.fill_(new_ptr)
         self.num_written.fill_(min(int(self.num_written.item()) + n, self.max_slots))
@@ -60,8 +68,11 @@ class TensorSlotRegistry(nn.Module):
         return self.slot_kv[indices]
 
     def clear(self) -> None:
-        self.slot_keys.zero_()
-        self.slot_kv.zero_()
+        # Reassign (not in-place) so non-leaf slot_kv from a prior forward
+        # graph doesn't raise "a leaf Variable that requires grad is used in
+        # an in-place operation" / "modified by an inplace operation".
+        self.slot_keys = self.slot_keys.detach().zero_()
+        self.slot_kv = self.slot_kv.detach().zero_()
         self.write_ptr.zero_()
         self.num_written.zero_()
 
@@ -132,8 +143,8 @@ class MSAModule(nn.Module):
         P_per_slot = scores.softmax(dim=-1).mean(dim=0)[:num_valid]
         if P_per_slot.shape[0] != f.shape[0]:
             n = min(f.shape[0], P_per_slot.shape[0])
-            return self.cfg.load_balance_weight * (f[:n] * P_per_slot[:n]).sum()
-        return self.cfg.load_balance_weight * (f * P_per_slot).sum()
+            return (f[:n] * P_per_slot[:n]).sum()
+        return (f * P_per_slot).sum()
 
     def clear(self) -> None:
         self.registry.clear()
@@ -154,7 +165,7 @@ class MSAModule(nn.Module):
         if feedback.numel() != key_size + kv_size + 2:
             raise ValueError("Invalid MSA feedback state")
         flat = feedback.to(device=self.registry.slot_keys.device, dtype=self.registry.slot_keys.dtype)
-        self.registry.slot_keys.copy_(flat[:key_size].view_as(self.registry.slot_keys))
-        self.registry.slot_kv.copy_(flat[key_size : key_size + kv_size].view_as(self.registry.slot_kv))
+        self.registry.slot_keys = flat[:key_size].view_as(self.registry.slot_keys).clone()
+        self.registry.slot_kv = flat[key_size : key_size + kv_size].view_as(self.registry.slot_kv).clone()
         self.registry.write_ptr.copy_(flat[-2:-1].to(self.registry.write_ptr.dtype))
         self.registry.num_written.copy_(flat[-1:].to(self.registry.num_written.dtype))
