@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class EXITChartEstimator(nn.Module):
@@ -40,29 +41,31 @@ class EXITChartEstimator(nn.Module):
         self.min_iterations = min_iterations
 
     def compute_mi(self, ext_before: torch.Tensor, ext_after: torch.Tensor) -> torch.Tensor:
-        """Compute approximate mutual information between extrinsic updates.
+        """Compute convergence proxy via directional novelty (cosine similarity).
+
+        True EXIT MI requires density estimation. We use cosine similarity
+        between consecutive extrinsic vectors as a magnitude-invariant proxy:
+        cos -> 1 means iterations add no new directional information (converged).
+        cos -> 0 means orthogonal new information (not converged).
+
+        This is invariant to amplitude scaling (unlike magnitude-based proxies),
+        making it robust to the extrinsic accumulation dynamics.
 
         Args:
             ext_before: extrinsic info from previous iteration [B, T, C].
             ext_after: extrinsic info from current iteration [B, T, C].
 
         Returns:
-            mi: scalar tensor, MI estimate in [0, 1].
-                0 = no new information (converged).
-                1 = maximum new information (not converged).
+            mi: scalar tensor, directional novelty in [0, 1].
+                0 = no new directional information (converged).
+                1 = maximum orthogonal information (not converged).
         """
-        ext_delta = (ext_after - ext_before).float()
-        delta_mag = ext_delta.abs().mean(dim=-1)  # [B, T]
-
-        p = torch.sigmoid(delta_mag)
-
-        eps = torch.finfo(p.dtype).eps
-        p = p.clamp(eps, 1.0 - eps)
-
-        entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
-        mi = 1.0 - entropy.mean()
-
-        return mi
+        eb = ext_before.float().reshape(-1, ext_before.shape[-1])
+        ea = ext_after.float().reshape(-1, ext_after.shape[-1])
+        cos = F.cosine_similarity(eb, ea, dim=-1)
+        cos = cos.clamp(-1.0, 1.0)
+        novelty = 0.5 * (1.0 - cos)
+        return novelty.mean()
 
     def should_halt(
         self,

@@ -13,7 +13,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from hagi_v4.inference.spectral_cache import SpectralCache
 from hagi_v4.model.codec_contracts import InferenceShapeConfig
 
 

@@ -64,6 +64,35 @@ class FactoredSwiGLU(nn.Module):
         return self.down(F.silu(gate) * up)
 
 
+def _interp_modes(coef: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Expand mode coefficients to target length via linear interpolation.
+
+    Models a smooth frequency-selective response from a small number of
+    mode coefficients (analogous to OFDM channel taps → frequency response
+    via DFT). This replaces per-position learnable parameters of length
+    T_max (which overfit and introduce positional noise) with a compact
+    rank-n_modes representation that generalizes across sequence lengths.
+
+    Args:
+        coef: [n_modes] learnable coefficients.
+        target_len: F_t or F_h (actual number of frequency bins).
+
+    Returns:
+        [target_len] interpolated values.
+    """
+    n = coef.shape[0]
+    if target_len <= n:
+        return coef[:target_len]
+    src = torch.arange(n, dtype=torch.float32, device=coef.device)
+    dst = torch.arange(target_len, dtype=torch.float32, device=coef.device)
+    scale = (n - 1) / max(target_len - 1, 1)
+    dst_scaled = dst * scale
+    idx_lo = dst_scaled.floor().long().clamp(max=n - 1)
+    idx_hi = dst_scaled.ceil().long().clamp(max=n - 1)
+    frac = (dst_scaled - idx_lo.float()).to(coef.dtype)
+    return coef[idx_lo] * (1.0 - frac) + coef[idx_hi] * frac
+
+
 class FreqCoding2D(nn.Module):
     """2D rFFT phase-frequency coding layer.
 
@@ -125,11 +154,11 @@ class FreqCoding2D(nn.Module):
             nn.init.normal_(self.w_re_b, std=w_std)
             nn.init.normal_(self.w_im_b, std=w_std)
 
-        self.freq_gate_t = nn.Parameter(torch.zeros(T_max))
-        self.freq_gate_h = nn.Parameter(torch.zeros(head_dim))
+        self.freq_gate_t = nn.Parameter(torch.zeros(n_modes_t))
+        self.freq_gate_h = nn.Parameter(torch.zeros(n_modes_h))
 
-        self.channel_response_t = nn.Parameter(torch.zeros(T_max))
-        self.channel_response_h = nn.Parameter(torch.zeros(head_dim))
+        self.channel_response_t = nn.Parameter(torch.zeros(n_modes_t))
+        self.channel_response_h = nn.Parameter(torch.zeros(n_modes_h))
 
         if shared_phase is not None:
             self.phase = shared_phase
@@ -173,13 +202,15 @@ class FreqCoding2D(nn.Module):
         Kt = min(self.n_modes_t, F_t)
         Kh = min(self.n_modes_h, F_h)
 
-        ch_t = torch.exp(1j * self.channel_response_t[:F_t].float())
-        ch_h = torch.exp(1j * self.channel_response_h[:F_h].float())
+        ch_t_raw = _interp_modes(self.channel_response_t, F_t)
+        ch_h_raw = _interp_modes(self.channel_response_h, F_h)
+        ch_t = torch.exp(1j * ch_t_raw.float())
+        ch_h = torch.exp(1j * ch_h_raw.float())
         ch_2d = ch_t.unsqueeze(1) * ch_h.unsqueeze(0)
         X_f = X_f * ch_2d.unsqueeze(0)
 
-        gate_t = torch.sigmoid(self.freq_gate_t[:F_t].float())
-        gate_h = torch.sigmoid(self.freq_gate_h[:F_h].float())
+        gate_t = torch.sigmoid(_interp_modes(self.freq_gate_t, F_t).float())
+        gate_h = torch.sigmoid(_interp_modes(self.freq_gate_h, F_h).float())
 
         gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
         low = X_f[:, :, :Kt, :Kh]

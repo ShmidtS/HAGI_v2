@@ -11,7 +11,7 @@ All stage boundaries are explicit dataclasses for type safety.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
