@@ -1,6 +1,20 @@
-"""MSA — Memory Sparse Attention with pure-tensor ring buffer + MLA.
+"""HARQ buffer — extrinsic-only soft combining for iterative decoding.
 
-V7: DFE (read) + HARQ buffer (write) for channel memory in turbo loop.
+V8 key change: stores EXTRINSIC deltas (not full states).
+V7 stored full hidden states and mixed intrinsic + extrinsic — this
+violates the LDPC belief propagation principle: each iteration must
+add NEW information, not re-broadcast existing beliefs.
+
+V8 HARQ buffer:
+  write(ext_delta): store the delta from this iteration
+  combine(): weighted sum of stored deltas + current delta
+             weighting by uncertainty (high uncertainty → trust stored)
+
+5G NR analog: HARQ Chase Combining — soft combining of retransmitted
+codewords. The receiver combines multiple transmissions to improve SNR.
+
+Ring buffer with monotonic num_written counter for wrap-around handling.
+MLA (Multi-head Latent Attention) for efficient read/compression.
 """
 
 from __future__ import annotations
@@ -13,9 +27,12 @@ from hagi_v4.model.codec_contracts import MSADecodeConfig
 
 
 class TensorSlotRegistry(nn.Module):
+    """Pure-tensor ring buffer for HARQ soft combining storage."""
+
     slot_keys: torch.Tensor
     slot_kv: torch.Tensor
     write_ptr: torch.Tensor
+    num_written: torch.Tensor
 
     def __init__(self, max_slots: int, key_dim: int, compress_dim: int):
         super().__init__()
@@ -32,15 +49,7 @@ class TensorSlotRegistry(nn.Module):
         ptr = int(self.write_ptr.item())
         idx = torch.arange(n, device=keys.device)
         indices = (idx + ptr) % self.max_slots
-        # Routing keys stay detached: topk indices are non-differentiable anyway,
-        # so write-side keys only serve address lookup. route_proj learns via the
-        # read-side query path + load-balance loss.
-        self.slot_keys = torch.index_copy(
-            self.slot_keys, 0, indices, keys.detach().to(self.slot_keys.dtype)
-        )
-        # KV values keep grad_fn: read gathers top-k and feeds mla_up_k/v, so
-        # gradient flows back into mla_compress through the slots actually read.
-        # Top-k (<=6) bounds the BPTT fan-in per query, not the full ring buffer.
+        self.slot_keys = torch.index_copy(self.slot_keys, 0, indices, keys.detach().to(self.slot_keys.dtype))
         self.slot_kv = torch.index_copy(self.slot_kv, 0, indices, kv_compressed.to(self.slot_kv.dtype))
         new_ptr = (ptr + n) % self.max_slots
         self.write_ptr.fill_(new_ptr)
@@ -68,17 +77,29 @@ class TensorSlotRegistry(nn.Module):
         return self.slot_kv[indices]
 
     def clear(self) -> None:
-        # Reassign (not in-place) so non-leaf slot_kv from a prior forward
-        # graph doesn't raise "a leaf Variable that requires grad is used in
-        # an in-place operation" / "modified by an inplace operation".
         self.slot_keys = self.slot_keys.detach().zero_()
         self.slot_kv = self.slot_kv.detach().zero_()
         self.write_ptr.zero_()
         self.num_written.zero_()
 
 
-class MSAModule(nn.Module):
-    def __init__(self, cfg: MSADecodeConfig, hidden_size: int = 576):
+class HARQBuffer(nn.Module):
+    """HARQ soft combining buffer with MLA (Multi-head Latent Attention).
+
+    V8: stores EXTRINSIC deltas only (not full hidden states).
+    Write: receives delta = (corrected - predicted) from each iteration.
+    Read: returns combined extrinsic info for the next iteration.
+
+    Combining weight adapts to uncertainty:
+        high uncertainty → trust stored buffer (more redundancy)
+        low uncertainty → trust current (less combining)
+
+    Args:
+        cfg: MSADecodeConfig with buffer shape parameters.
+        hidden_size: C (core hidden dimension).
+    """
+
+    def __init__(self, cfg: MSADecodeConfig, hidden_size: int = 288) -> None:
         super().__init__()
         self.cfg = cfg
         self.route_proj = nn.Linear(hidden_size, cfg.routing_key_dim, bias=False)
@@ -92,18 +113,25 @@ class MSAModule(nn.Module):
         self._head_dim = cfg.head_dim
         self._default_chunk = cfg.slot_chunk_size
 
-    def write(self, h: torch.Tensor) -> None:
-        B, T, _ = h.shape
+        self.harq_gate = nn.Parameter(torch.zeros(1))
+
+    def write(self, ext_delta: torch.Tensor) -> None:
+        """Store extrinsic delta (NOT full state).
+
+        Args:
+            ext_delta: [B, T, C] extrinsic info delta from current iteration.
+        """
+        B, T, _ = ext_delta.shape
         chunk = self._default_chunk
-        flat_h = h.reshape(B * T, -1)
-        n = flat_h.shape[0]
+        flat = ext_delta.reshape(B * T, -1)
+        n = flat.shape[0]
         n_slots = n // chunk
         remainder = n % chunk
         chunks = []
         if n_slots > 0:
-            chunks.append(flat_h[: n_slots * chunk].view(n_slots, chunk, -1).mean(dim=1))
+            chunks.append(flat[: n_slots * chunk].view(n_slots, chunk, -1).mean(dim=1))
         if remainder > 0:
-            chunks.append(flat_h[n_slots * chunk :].mean(dim=0, keepdim=True))
+            chunks.append(flat[n_slots * chunk :].mean(dim=0, keepdim=True))
         if not chunks:
             return
         chunked = torch.cat(chunks, dim=0)
@@ -111,45 +139,57 @@ class MSAModule(nn.Module):
         kv = self.mla_compress(chunked)
         self.registry.write(keys, kv)
 
-    def read(self, h: torch.Tensor, top_k: int = 6) -> tuple[torch.Tensor, torch.Tensor]:
-        B, T, _ = h.shape
-        flat_h = h.reshape(B * T, -1)
-        query = self.route_proj(flat_h)
-        top_indices, top_scores = self.registry.read_topk(query, top_k)
+    def read(self, query_state: torch.Tensor, top_k: int = 6) -> torch.Tensor:
+        """Read combined extrinsic info from buffer.
+
+        Args:
+            query_state: [B, T, C] current working state to query with.
+            top_k: number of nearest slots to combine.
+
+        Returns:
+            combined: [B, T, C] combined extrinsic info from buffer.
+        """
+        B, T, _ = query_state.shape
+        flat = query_state.reshape(B * T, -1)
+        query = self.route_proj(flat)
+        top_indices, _ = self.registry.read_topk(query, top_k)
         kv_compressed = self.registry.gather_kv(top_indices)
         k = self.mla_up_k(kv_compressed).view(B * T, top_k, self._n_kv_heads, self._head_dim)
         v = self.mla_up_v(kv_compressed).view(B * T, top_k, self._n_kv_heads, self._head_dim)
-        h_proj = self.q_proj(flat_h).view(B * T, 1, self._n_kv_heads, self._head_dim)
+        h_proj = self.q_proj(flat).view(B * T, 1, self._n_kv_heads, self._head_dim)
         q_4d = h_proj.permute(0, 2, 1, 3)
         k_4d = k.permute(0, 2, 1, 3)
         v_4d = v.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q_4d, k_4d, v_4d, is_causal=False)
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(B * T, -1)
-        msa_out = self.o_proj(attn_out)
-        msa_out = msa_out.view(B, T, -1)
-        lb = self._load_balance_loss(top_indices, top_scores)
-        return msa_out, lb
+        combined = self.o_proj(attn_out)
+        return combined.view(B, T, -1)
 
-    def _load_balance_loss(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        num_valid = int(self.registry.num_written.item())
-        if num_valid == 0:
-            return scores.new_zeros(())
-        counts = torch.bincount(indices.reshape(-1), minlength=self.cfg.max_slots).float()
-        counts = counts[:num_valid]
-        total = counts.sum()
-        if total == 0:
-            return scores.new_zeros(())
-        f = counts / total
-        P_per_slot = scores.softmax(dim=-1).mean(dim=0)[:num_valid]
-        if P_per_slot.shape[0] != f.shape[0]:
-            n = min(f.shape[0], P_per_slot.shape[0])
-            return (f[:n] * P_per_slot[:n]).sum()
-        return (f * P_per_slot).sum()
+    def combine(
+        self,
+        current: torch.Tensor,
+        stored_ext: torch.Tensor,
+        uncertainty: torch.Tensor,
+    ) -> torch.Tensor:
+        """Uncertainty-weighted soft combining (Chase combining).
+
+        Args:
+            current: [B, T, C] current extrinsic delta.
+            stored_ext: [B, T, C] combined stored extrinsic from buffer.
+            uncertainty: [B, T] per-position uncertainty (from Kalman P).
+
+        Returns:
+            combined: [B, T, C] soft-combined extrinsic.
+        """
+        alpha = torch.sigmoid(self.harq_gate.float()) * torch.sigmoid(uncertainty.float())
+        alpha = alpha.unsqueeze(-1).to(current.dtype)
+        return current + alpha * stored_ext
 
     def clear(self) -> None:
         self.registry.clear()
 
     def serialize_feedback(self) -> torch.Tensor:
+        """Serialize buffer state for checkpoint/cache continuity."""
         return torch.cat(
             [
                 self.registry.slot_keys.flatten(),
@@ -160,10 +200,11 @@ class MSAModule(nn.Module):
         ).detach()
 
     def restore_feedback(self, feedback: torch.Tensor) -> None:
+        """Restore buffer state from serialized feedback."""
         key_size = self.registry.slot_keys.numel()
         kv_size = self.registry.slot_kv.numel()
         if feedback.numel() != key_size + kv_size + 2:
-            raise ValueError("Invalid MSA feedback state")
+            raise ValueError("Invalid HARQ feedback state")
         flat = feedback.to(device=self.registry.slot_keys.device, dtype=self.registry.slot_keys.dtype)
         self.registry.slot_keys = flat[:key_size].view_as(self.registry.slot_keys).clone()
         self.registry.slot_kv = flat[key_size : key_size + kv_size].view_as(self.registry.slot_kv).clone()

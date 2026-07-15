@@ -29,7 +29,7 @@ class CQIEstimator(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.proj = nn.Linear(hidden_size, 1, bias=True)
-        nn.init.normal_(self.proj.weight, std=0.01)
+        nn.init.normal_(self.proj.weight, std=1.0 / (hidden_size**0.5))
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:

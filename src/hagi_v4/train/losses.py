@@ -1,9 +1,11 @@
-"""Multi-objective CodecLoss for HAGI V7.1.
+"""V8 CodecLoss — 3-level loss hierarchy for from-scratch training.
 
-Loss = CE (fidelity) + Parity (redundancy reward) + Whiteness (decorrelation)
-     + ExtrinsicInfo (decoding reward) + Efficiency (convergence cost)
-     + RateDistortion (information loss) + MSA load balance
-     + Contrastive (modality alignment, multimodal only).
+Level 1 (Fidelity): CE — always active
+Level 2 (Code Quality): Parity reward, Rate distortion — after warmup
+Level 3 (Convergence): Extrinsic info, Whiteness — after 2×warmup
+
+V8 simplification: 4 aux losses instead of V7's 7.
+Removed: efficiency (redundant), msa_lb (impl detail), contrastive (multimodal-only).
 """
 
 from __future__ import annotations
@@ -37,10 +39,13 @@ def masked_cross_entropy_chunked(
 
 
 class LossAggregator:
-    """Computes total loss from ModelOutput + targets + mask.
+    """Computes total loss with 3-level hierarchy.
 
-    Phase 0 CE-only warmup: aux losses are zero during warmup_steps,
-    then linearly ramp to full weight over the next warmup_steps.
+    Phase 0 (step < warmup): CE only — model learns basic representations.
+    Phase 1 (warmup ≤ step < 2×warmup): CE + L2 (code quality).
+    Phase 2 (step ≥ 2×warmup): CE + L2 + L3 (full codec optimization).
+
+    This staged activation prevents loss explosion when training from scratch.
     """
 
     def __init__(self, cfg: HAGIv4Config | TrainLossConfig):
@@ -48,19 +53,18 @@ class LossAggregator:
         self.w_whiteness = contract.whiteness_weight
         self.w_parity = contract.parity_weight
         self.w_extrinsic_info = contract.extrinsic_info_weight
-        self.w_efficiency = contract.efficiency_weight
-        self.w_msa_lb = contract.msa_lb_weight
         self.w_rate_distortion = contract.rate_distortion_weight
         self.w_contrastive = contract.contrastive_weight
         self.warmup_steps = cfg.train.warmup_steps if isinstance(cfg, HAGIv4Config) else 5000
 
-    def _aux_weight(self, step: int) -> float:
+    def _loss_level(self, step: int) -> int:
+        """Return active loss level: 1, 2, or 3."""
         w = self.warmup_steps
         if step < w:
-            return 0.0
+            return 1
         if step < 2 * w:
-            return (step - w) / w
-        return 1.0
+            return 2
+        return 3
 
     def __call__(
         self,
@@ -77,23 +81,23 @@ class LossAggregator:
         aux: AuxLosses = model_output.aux
         total = ce_loss
 
-        aw = self._aux_weight(step)
-        if aw == 0.0:
+        level = self._loss_level(step)
+        if level == 1:
             return total
 
-        if aux.msa_lb is not None:
-            total = total + aw * self.w_msa_lb * aux.msa_lb
-        if aux.whiteness is not None:
-            total = total + aw * self.w_whiteness * aux.whiteness
-        if aux.parity is not None:
-            total = total - aw * self.w_parity * torch.sigmoid(aux.parity * 5.0)
-        if aux.extrinsic_info is not None:
-            total = total + aw * self.w_extrinsic_info * aux.extrinsic_info
-        if aux.efficiency is not None:
-            total = total + aw * self.w_efficiency * aux.efficiency
         if aux.rate_distortion is not None:
-            total = total + aw * self.w_rate_distortion * aux.rate_distortion
+            total = total + self.w_rate_distortion * aux.rate_distortion
+        if aux.parity is not None:
+            total = total - self.w_parity * torch.sigmoid(aux.parity)
         if aux.contrastive is not None:
-            total = total + aw * self.w_contrastive * aux.contrastive
+            total = total + self.w_contrastive * aux.contrastive
+
+        if level == 2:
+            return total
+
+        if aux.whiteness is not None:
+            total = total + self.w_whiteness * aux.whiteness
+        if aux.extrinsic_info is not None:
+            total = total + self.w_extrinsic_info * aux.extrinsic_info
 
         return total

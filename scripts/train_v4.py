@@ -59,9 +59,8 @@ def main() -> int:
     parser.add_argument("--log-dir", default="logs", help="Directory for log files")
     args = parser.parse_args()
 
-    if not args.dry_run:
-        log_path = setup_file_logging(args.log_dir)
-        logger.info(f"Log file: {log_path}")
+    log_path = setup_file_logging(args.log_dir)
+    logger.info(f"Log file: {log_path}")
 
     from hagi_v4.config import load_config
     from hagi_v4.model.hagi_v4 import HAGIv4
