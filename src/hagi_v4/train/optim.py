@@ -160,6 +160,9 @@ def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:
     rest = [(n, p) for n, p in named if not is_muon_param(n, p)]
     decay = [p for n, p in rest if p.ndim >= 2 and "norm" not in n.lower()]
     no_decay = [p for n, p in rest if not (p.ndim >= 2 and "norm" not in n.lower())]
+    optimized_ids = [id(p) for p in muon_params + decay + no_decay]
+    if len(optimized_ids) != len(set(optimized_ids)) or set(optimized_ids) != {id(p) for _, p in named}:
+        raise RuntimeError("every trainable parameter must appear in exactly one optimizer group")
 
     muon = Muon(
         muon_params,

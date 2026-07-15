@@ -39,7 +39,6 @@ model:
 
   masking:
     mask_ratio: 0.3
-    mask_token_id: 262145
     use_span_masking: true
     span_length: 3
     use_adaptive_erasure: false
@@ -77,12 +76,13 @@ train:
   weight_decay: 0.1
   precision: "bf16"
   grad_accum_steps: 2
+  max_grad_norm: null
   batch_size: 2
   seq_len: 1024
   w_ce: 1.0
   w_whiteness: 0.01
   w_parity: 0.1
-  w_extrinsic_info: 0.01
+  w_correction_alignment: 0.01
   w_rate_distortion: 0.01
   w_contrastive: 0.1
   use_two_phase_schedule: true
@@ -91,7 +91,7 @@ train:
   phase2_mask_ratio: 0.30
   phase3_mask_ratio: 0.50
   use_continuous_anneal: true
-  distill_enabled: true
+  distill_enabled: false
   distill_kl_enabled: false
   distill_teacher: "google/gemma-4-E2B-it"
   distill_embed_teacher: "google/t5gemma-2-1b-1b"
@@ -102,14 +102,14 @@ train:
   distill_temp_end: 1.0
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
-  distill_every: 2
   awgn_enabled: true
   awgn_sigma_start: 0.005
   awgn_sigma_end: 0.0
   awgn_end_frac: 0.5
   freeze_embeddings: false
   tokenizer: "google/gemma-4-E2B-it"
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "checkpoints/channel-v2-google"
+  checkpoint_format_version: 2
   checkpoint_interval: 500
   checkpoint_keep_last: 3
   sequential_cycles: 3

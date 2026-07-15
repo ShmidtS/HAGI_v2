@@ -52,7 +52,7 @@ class LossAggregator:
         contract = TrainLossConfig.from_hagi_config(cfg) if isinstance(cfg, HAGIv4Config) else cfg
         self.w_whiteness = contract.whiteness_weight
         self.w_parity = contract.parity_weight
-        self.w_extrinsic_info = contract.extrinsic_info_weight
+        self.w_correction_alignment = contract.correction_alignment_weight
         self.w_rate_distortion = contract.rate_distortion_weight
         self.w_contrastive = contract.contrastive_weight
         self.warmup_steps = cfg.train.warmup_steps if isinstance(cfg, HAGIv4Config) else 5000
@@ -97,7 +97,7 @@ class LossAggregator:
 
         if aux.whiteness is not None:
             total = total + self.w_whiteness * aux.whiteness
-        if aux.extrinsic_info is not None:
-            total = total + self.w_extrinsic_info * aux.extrinsic_info
+        if aux.correction_alignment is not None:
+            total = total + self.w_correction_alignment * aux.correction_alignment
 
         return total

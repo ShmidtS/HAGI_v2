@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -13,6 +14,53 @@ from hagi_v4.config import HAGIv4Config
 from hagi_v4.train.optim import CombinedOptimizer
 
 logger = logging.getLogger(__name__)
+CHECKPOINT_FORMAT_VERSION = 2
+
+
+class IncompatibleCheckpointError(RuntimeError):
+    pass
+
+
+def _require_mapping(value, name: str) -> Mapping:
+    if not isinstance(value, Mapping):
+        raise IncompatibleCheckpointError(f"incompatible checkpoint: {name} must be a mapping")
+    return value
+
+
+def load_checkpoint_payload(path: str, device: str = "cpu") -> dict:
+    """Safely deserialize and validate a checkpoint before any model mutation."""
+    try:
+        state = torch.load(path, map_location=device, weights_only=True)
+    except Exception as exc:
+        raise IncompatibleCheckpointError(f"incompatible checkpoint payload: {exc}") from exc
+    state = _require_mapping(state, "root")
+    if state.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise IncompatibleCheckpointError(
+            "incompatible checkpoint; start fresh training with a v2 checkpoint directory"
+        )
+    model_state = _require_mapping(state.get("model"), "model")
+    if not all(isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in model_state.items()):
+        raise IncompatibleCheckpointError("incompatible checkpoint: model must map parameter names to tensors")
+    if not isinstance(state.get("config"), Mapping):
+        raise IncompatibleCheckpointError("incompatible checkpoint: config must be a mapping")
+    if not isinstance(state.get("completed_updates"), int) or state["completed_updates"] < 0:
+        raise IncompatibleCheckpointError("incompatible checkpoint: completed_updates must be a non-negative integer")
+    if "optimizer" in state:
+        optimizer_state = _require_mapping(state["optimizer"], "optimizer")
+        if set(optimizer_state) != {"muon", "adamw"} or not all(
+            isinstance(optimizer_state[name], Mapping) for name in ("muon", "adamw")
+        ):
+            raise IncompatibleCheckpointError("incompatible checkpoint: optimizer must contain muon and adamw states")
+    extra = _require_mapping(state.get("extra", {}), "extra")
+    if "rng" in extra:
+        rng = _require_mapping(extra["rng"], "rng")
+        if not isinstance(rng.get("torch"), torch.Tensor) or rng["torch"].dtype != torch.uint8:
+            raise IncompatibleCheckpointError("incompatible checkpoint: rng.torch must be a uint8 tensor")
+        if rng.get("cuda") is not None and (
+            not isinstance(rng["cuda"], torch.Tensor) or rng["cuda"].dtype != torch.uint8
+        ):
+            raise IncompatibleCheckpointError("incompatible checkpoint: rng.cuda must be a uint8 tensor or None")
+    return dict(state)
 
 
 def cfg_to_dict(cfg: HAGIv4Config) -> dict:
@@ -43,7 +91,7 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: CombinedOptimizer | None,
     cfg: HAGIv4Config,
-    step: int,
+    completed_updates: int,
     checkpoint_dir: str,
     keep_last: int = 3,
     extra: dict | None = None,
@@ -52,10 +100,11 @@ def save_checkpoint(
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    path = ckpt_dir / f"step-{step:06d}.pt"
+    path = ckpt_dir / f"step-{completed_updates:06d}.pt"
     state = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
         "model": model.state_dict(),
-        "step": step,
+        "completed_updates": completed_updates,
         "config": cfg_to_dict(cfg),
     }
     if optimizer is not None:
@@ -100,17 +149,17 @@ def load_checkpoint(
     Optimizer state is returned in extra["optimizer"] when present, so a caller
     that builds the optimizer after resume can still restore momentum buffers.
     """
-    state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(_migrate_state_dict(state["model"]))
+    state = load_checkpoint_payload(path, device)
+    model.load_state_dict(state["model"])
     cfg = cfg_from_dict(state["config"])
-    step = state["step"]
+    next_step = state["completed_updates"]
     extra = state.get("extra", {})
     if "optimizer" in state:
         extra["optimizer"] = state["optimizer"]
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
-    logger.info(f"Checkpoint loaded: {path} (step {step})")
-    return step, cfg, extra
+    logger.info(f"Checkpoint loaded: {path} (next step {next_step})")
+    return next_step, cfg, extra
 
 
 def get_latest_checkpoint(checkpoint_dir: str) -> str | None:

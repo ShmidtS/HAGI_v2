@@ -38,7 +38,7 @@ class CodecShapeConfig:
     use_whiteness_loss: bool
 
     @classmethod
-    def from_hagi_config(cls, cfg: "HAGIv4Config") -> CodecShapeConfig:
+    def from_hagi_config(cls, cfg: HAGIv4Config) -> CodecShapeConfig:
         m = cfg.model
         codec = m.codec
         C = m.core_hidden_size
@@ -75,10 +75,10 @@ class TurboDecodeConfig:
     freq_n_modes_t: int
     freq_n_modes_h: int
     freq_complex_rank: int
-    msa: "MSADecodeConfig"
+    msa: MSADecodeConfig
 
     @classmethod
-    def from_hagi_config(cls, cfg: "HAGIv4Config") -> TurboDecodeConfig:
+    def from_hagi_config(cls, cfg: HAGIv4Config) -> TurboDecodeConfig:
         m = cfg.model
         r = m.refinement
         return cls(
@@ -113,17 +113,17 @@ class TrainLossConfig:
 
     whiteness_weight: float
     parity_weight: float
-    extrinsic_info_weight: float
+    correction_alignment_weight: float
     rate_distortion_weight: float
     contrastive_weight: float
 
     @classmethod
-    def from_hagi_config(cls, cfg: "HAGIv4Config") -> TrainLossConfig:
+    def from_hagi_config(cls, cfg: HAGIv4Config) -> TrainLossConfig:
         t = cfg.train
         return cls(
             whiteness_weight=t.w_whiteness,
             parity_weight=t.w_parity,
-            extrinsic_info_weight=t.w_extrinsic_info,
+            correction_alignment_weight=t.w_correction_alignment,
             rate_distortion_weight=t.w_rate_distortion,
             contrastive_weight=t.w_contrastive,
         )
@@ -134,7 +134,7 @@ class InferenceShapeConfig:
     vocab_size: int
 
     @classmethod
-    def from_hagi_config(cls, cfg: "HAGIv4Config") -> InferenceShapeConfig:
+    def from_hagi_config(cls, cfg: HAGIv4Config) -> InferenceShapeConfig:
         return cls(vocab_size=cfg.model.vocab_size)
 
 
@@ -187,6 +187,7 @@ class ChannelEncodeResult:
     systematic: torch.Tensor
     parity: torch.Tensor
     interleaver_perm: torch.Tensor | None = None
+    erasure_mask: torch.Tensor | None = None
 
 
 @dataclass

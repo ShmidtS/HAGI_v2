@@ -7,21 +7,25 @@ gradient_checkpointing, moe_int scaling, msa_top_k, batch_size, seq_len.
 Score = 0.6 * normalized_val_loss + 0.4 * normalized_bpt
 """
 
-import json, logging, random, sys, time, os, math, copy
+import json
+import logging
+import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("opt")
 
-import torch
-from hagi_v4.config import HAGIv4Config, auto_configure
-from hagi_v4.model.hagi_v4 import HAGIv4
-from hagi_v4.train.losses import LossAggregator
-from hagi_v4.train.optim import build_optimizer
-from hagi_v4.model.masking import create_random_mask
-from hagi_v4.research.dataset import TinyStoriesConfig, load_tinystories
-from torch.utils.data import DataLoader
+import torch  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+
+from hagi_v4.config import HAGIv4Config, auto_configure  # noqa: E402
+from hagi_v4.model.hagi_v4 import HAGIv4  # noqa: E402
+from hagi_v4.model.masking import create_erasure_mask  # noqa: E402
+from hagi_v4.research.dataset import TinyStoriesConfig, load_tinystories  # noqa: E402
+from hagi_v4.train.losses import LossAggregator  # noqa: E402
+from hagi_v4.train.optim import build_optimizer  # noqa: E402
 
 RESULTS_PATH = "research_results/loss_bpt_search.json"
 
@@ -107,10 +111,10 @@ def run_single(name: str, overrides: dict, train_ds, val_ds, device) -> dict:
 
         ids = batch["input_ids"].to(device)
         tgts = batch["targets"].to(device)
-        masked_ids, mask = create_random_mask(ids, cfg.model.masking.mask_ratio, cfg.model.masking.mask_token_id)
+        mask = create_erasure_mask(ids, cfg.model.masking.mask_ratio)
 
         optimizer.zero_grad(set_to_none=True)
-        out = model(masked_ids, targets=tgts, mask=mask, step=step)
+        out = model(ids, targets=tgts, mask=mask, step=step)
         loss = loss_agg(out, tgts, mask, step=step)
 
         if not torch.isfinite(loss).all():

@@ -1,5 +1,17 @@
 # HAGI V7.2 — Codec Language Model (5G NR pipeline)
 
+## Channel-Correct Training Contract
+
+The codec order is fixed: clean token IDs are source-encoded, parity is generated from the clean systematic representation, channel erasure/AWGN corrupts only the received systematic symbols, the decoder receives the same boolean erasure mask, and source decoding follows correction. Erasure is never represented by a token ID.
+
+`step` always means completed optimizer updates. Each update consumes exactly `grad_accum_steps` distinct dataloader yields, and curriculum selection is set explicitly from that optimizer step before microbatch collection.
+
+During active distillation, reconstruction and hidden-state alignment form one joint objective on every update. `distill_align` is student-owned and registered before optimizer construction; decoder correction is trained against the known clean-minus-received channel error rather than by minimizing extrinsic magnitude.
+
+Checkpoint format v2 stores `completed_updates`; resume begins at that first unexecuted update. V1 artifacts such as `step-016000.pt` are diagnostic-only and cannot be loaded into v2 training. Fresh runs use dedicated `checkpoints/channel-v2-*` directories.
+
+Diagnostics report raw gradient norm and gradient RMS. Optional clipping is configured with `train.max_grad_norm`; a finite raw norm such as 40 is a measurement, not an explosion classification.
+
 ## Architecture based on Shannon information theory and 5G NR
 
 ### Concept
@@ -13,7 +25,7 @@ coding (error correction).
 
 The model is a masked LM (bidirectional, same-position prediction),
 not a causal next-token LM. Generation uses LLaDA-style iterative
-decoding: prompt + N mask tokens → iterative filling by confidence
+decoding: prompt + N in-vocabulary placeholders + boolean erasure mask → iterative filling by confidence
 (LDPC belief propagation analog).
 
 ---
@@ -283,7 +295,7 @@ no need to relearn.
 
 Same-position masked LM (bidirectional). Generation via
 LLaDA-style iterative decoding:
-1. Create prompt + N mask tokens
+1. Create prompt + N in-vocabulary placeholders and a separate boolean erasure mask
 2. Forward pass → logits for all mask positions
 3. Fill confident positions (top-50% by confidence)
 4. Repeat forward, gradually filling remaining positions
@@ -374,13 +386,13 @@ then 1.0 (CE only). Teacher freed after distill_end_frac.
 ### LLaDA-style Iterative Decoding
 
 ```
-1. Init: prompt + max_new_tokens mask tokens
+1. Init: prompt + max_new_tokens in-vocabulary placeholders plus boolean erasure mask
 2. For iteration in range(max_iterations):
    a. Run full pipeline: Embed → FreqBlock → Bottleneck → Turbo → Up → LM
    b. Get logits at all mask positions
    c. Compute confidence per mask position
    d. Fill top-50% confident positions (last iteration: fill all remaining)
-   e. Ban mask_token_id and padding from logits
+   e. Ban configured forbidden token IDs from logits
    f. Apply echo cancellation (repetition penalty) on visible tokens
 3. Stop when all mask filled or EOS detected
 ```

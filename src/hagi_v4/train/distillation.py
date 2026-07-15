@@ -29,6 +29,17 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def create_distillation_teacher(cfg, device: torch.device):
+    """Create and load the canonical teacher when distillation is enabled."""
+    if not cfg.train.distill_enabled:
+        return None
+    teacher = DistillationTeacher(cfg.train.distill_teacher)
+    teacher.load()
+    if teacher.is_loaded and device.type == "cuda":
+        logger.info(f"Teacher VRAM: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
+    return teacher
+
+
 def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/SmolLM2-135M") -> bool:
     """Copy embedding weights from teacher into student via SVD projection.
 
@@ -201,11 +212,9 @@ class DistillationTeacher:
         self,
         student_hidden: torch.Tensor,
         teacher_hidden: torch.Tensor,
-        student_lm_head_weight: torch.Tensor,
-        targets: torch.Tensor,
-        ce_loss: torch.Tensor,
+        reconstruction_loss: torch.Tensor,
         mask: torch.Tensor | None,
-        temperature: float = 2.0,
+        align_projection: nn.Module,
         alpha: float = 0.5,
         chunk_size: int = 512,
     ) -> torch.Tensor:
@@ -224,13 +233,18 @@ class DistillationTeacher:
         on data positions.
         """
         if teacher_hidden is None:
-            return ce_loss
+            return reconstruction_loss
 
         B, T, H_s = student_hidden.shape
         _, _, H_t = teacher_hidden.shape
 
         flat_sh = student_hidden.reshape(B * T, H_s).float()
-        flat_th = teacher_hidden.reshape(B * T, H_t).float().to(flat_sh.device)
+        projection_param = next(align_projection.parameters(), None)
+        projection_device = projection_param.device if projection_param is not None else student_hidden.device
+        projection_dtype = projection_param.dtype if projection_param is not None else student_hidden.dtype
+        flat_th = (
+            teacher_hidden.detach().reshape(B * T, H_t).to(device=projection_device, dtype=projection_dtype).clone()
+        )
 
         if mask is not None:
             flat_mask = mask.reshape(B * T)
@@ -240,13 +254,11 @@ class DistillationTeacher:
 
         n_valid = valid_mask.sum().item()
         if n_valid == 0:
-            return ce_loss
+            return reconstruction_loss
 
-        if H_s != H_t:
-            if not hasattr(self, "_align_proj") or self._align_proj is None or self._align_proj.in_features != H_t:
-                self._align_proj = nn.Linear(H_t, H_s, bias=False).to(flat_sh.device)
-                nn.init.normal_(self._align_proj.weight, std=0.02)
-            flat_th = self._align_proj(flat_th)
+        flat_th = align_projection(flat_th).float()
+        if flat_th.shape[-1] != H_s:
+            raise ValueError(f"alignment projection produced {flat_th.shape[-1]} features, expected {H_s}")
 
         total_mse = flat_sh.new_zeros(())
         for i in range(0, flat_sh.shape[0], chunk_size):
@@ -258,7 +270,7 @@ class DistillationTeacher:
             total_mse = total_mse + diff.pow(2).mean(dim=-1).sum()
 
         mse_loss = total_mse / n_valid
-        return alpha * ce_loss + (1.0 - alpha) * mse_loss
+        return alpha * reconstruction_loss + (1.0 - alpha) * mse_loss
 
     def free(self):
         """Release teacher model from VRAM."""

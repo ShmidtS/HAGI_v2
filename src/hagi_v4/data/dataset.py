@@ -8,6 +8,12 @@ import torch
 from torch.utils.data import Dataset
 
 
+def dataset_path(data_dir: str | Path, name: str) -> Path:
+    if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name or "\\" in name:
+        raise ValueError(f"invalid dataset name: {name!r}")
+    return Path(data_dir) / f"{name}.bin"
+
+
 class MemmapDataset(Dataset):
     """Binary token dataset. Token IDs stored as uint16 or uint32.
 
@@ -41,7 +47,7 @@ class MemmapDataset(Dataset):
     def _load(self):
         if self._data is None:
             with open(self.path, "rb") as f:
-                self._data = torch.frombuffer(f.read(), dtype=self._dtype).long().clone()
+                self._data = torch.frombuffer(bytearray(f.read()), dtype=self._dtype).long().clone()
 
     def __len__(self) -> int:
         return max(0, self.num_tokens - self.seq_len)
@@ -51,7 +57,7 @@ class MemmapDataset(Dataset):
 
         input_ids and targets are the same chunk[:seq_len] — the model
         predicts the original token at each masked position, not the next
-        token. create_random_mask decides which positions are masked.
+        token. create_erasure_mask decides which channel positions are erased.
         """
         self._load()
         chunk = self._data[idx : idx + self.seq_len]
@@ -94,7 +100,7 @@ class MixedDataset(Dataset):
         for src in mix["sources"]:
             name = src["name"]
             ratio = src["ratio"]
-            path = self.data_dir / f"{name}.bin"
+            path = dataset_path(self.data_dir, name)
             if path.exists():
                 ds = MemmapDataset(str(path), seq_len, vocab_size)
                 if len(ds) > 0:

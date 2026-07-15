@@ -26,10 +26,10 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     Token IDs are moved to CPU for embedding lookup, hidden states back to GPU.
     """
     from hagi_v4.model.hagi_v4 import HAGIv4
-    from hagi_v4.train.checkpoint import cfg_from_dict, _migrate_state_dict
+    from hagi_v4.train.checkpoint import _migrate_state_dict, cfg_from_dict, load_checkpoint_payload
 
     target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = load_checkpoint_payload(checkpoint_path, "cpu")
     cfg = cfg_from_dict(state["config"])
 
     dev = torch.device(target)
@@ -51,7 +51,7 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
         model = model.to(dev)
 
     model.eval()
-    step = state["step"]
+    step = state.get("completed_updates", state.get("step", 0))
     return model, cfg, step, dev
 
 
@@ -106,14 +106,12 @@ def main() -> int:
     tokenizer_name = args.tokenizer or cfg.train.tokenizer
     logger.info(f"Using tokenizer: {tokenizer_name}")
 
-    mask_token_id = cfg.model.masking.mask_token_id
     eos_token_id = 1
 
-    icfg = cfg.inference
     gen_kwargs = dict(
         max_new_tokens=args.max_tokens,
         max_iterations=args.iterations,
-        mask_token_id=mask_token_id,
+        placeholder_token_id=0,
         eos_token_id=eos_token_id,
         temperature=args.temperature if args.temperature is not None else 0.4,
         top_k=args.top_k if args.top_k is not None else 20,
