@@ -64,7 +64,7 @@ def main() -> int:
 
     from hagi_v4.config import load_config
     from hagi_v4.model.hagi_v4 import HAGIv4
-    from hagi_v4.model.masking import create_random_mask
+    from hagi_v4.model.masking import create_erasure_mask
 
     overrides = {}
     if args.steps is not None:
@@ -108,16 +108,12 @@ def main() -> int:
         B, T = 2, min(cfg.train.seq_len, 128)
         input_ids = torch.randint(0, cfg.model.vocab_size, (B, T), device=device)
         targets = input_ids.clone()
-        masked_ids, mask = create_random_mask(
-            input_ids,
-            mask_ratio=cfg.model.masking.mask_ratio,
-            mask_token_id=cfg.model.masking.mask_token_id,
-        )
+        mask = create_erasure_mask(input_ids, mask_ratio=cfg.model.masking.mask_ratio)
         from hagi_v4.train.losses import LossAggregator
 
         aggregator = LossAggregator(cfg)
         model.train()
-        output = model(masked_ids, targets=targets, mask=mask)
+        output = model(input_ids, targets=targets, mask=mask)
         total_loss = aggregator(output, targets, mask, step=0)
         logger.info(f"Loss: {total_loss.item():.4f}")
         if device.type == "cuda":
@@ -126,18 +122,15 @@ def main() -> int:
 
     # Load distillation teacher (KL distillation only, not embedding transfer)
     teacher = None
-    if cfg.train.distill_enabled and getattr(cfg.train, "distill_kl_enabled", False):
-        from hagi_v4.train.distillation import DistillationTeacher
+    if cfg.train.distill_enabled:
+        from hagi_v4.train.distillation import create_distillation_teacher
 
-        teacher = DistillationTeacher(cfg.train.distill_teacher)
-        teacher.load()
-        if teacher.is_loaded and device.type == "cuda":
-            logger.info(f"Teacher VRAM: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
+        teacher = create_distillation_teacher(cfg, device)
 
     # Build sequential cycling dataloader (v1-style curriculum)
     from hagi_v4.data.sequential import build_sequential_dataloader
 
-    dataloader = build_sequential_dataloader(cfg, data_dir=args.data_dir, start_step=start_step)
+    dataloader = build_sequential_dataloader(cfg, data_dir=args.data_dir)
     if "dataloader" in ckpt_extra:
         dataloader.load_state_dict(ckpt_extra["dataloader"])
         logger.info(f"Dataloader state restored: {ckpt_extra['dataloader']}")
@@ -159,12 +152,12 @@ def main() -> int:
         loss = metrics["loss"]
         bits_per_token = loss / 0.6931
         conf = metrics.get("avg_confidence", 0.0)
-        ext = metrics.get("extrinsic_info", 0.0)
+        correction = metrics.get("correction_alignment", 0.0)
         par = metrics.get("parity", 0.0)
         logger.info(
             f"step {metrics['step']} | loss={loss:.4f} | bpt={bits_per_token:.2f} | "
             f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
-            f"conf={conf:.3f} | ext={ext:.2f} | par={par:.4f}"
+            f"conf={conf:.3f} | correction={correction:.4f} | par={par:.4f}"
         )
     logger.info("Training complete.")
     return 0

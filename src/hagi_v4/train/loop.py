@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator
+from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +22,7 @@ from torch import nn
 from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.masking import (
     adaptive_mask_ratio,
-    create_random_mask,
+    create_erasure_mask,
     progressive_mask_ratio,
 )
 from hagi_v4.model.outputs import ModelOutput
@@ -88,13 +89,19 @@ def cast_to_bf16(model: nn.Module) -> None:
     model.to(torch.bfloat16)
 
 
-def grad_norm(model: nn.Module) -> float:
-    """Compute gradient norm (no clipping/scaling)."""
+def gradient_stats(model: nn.Module, train_cfg) -> tuple[float, float]:
+    """Report raw global norm and element RMS, then optionally clip."""
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
-        return 0.0
+        return 0.0, 0.0
     total_sq = torch.stack([g.pow(2).sum() for g in grads]).sum()
-    return total_sq.sqrt().item()
+    total_elements = sum(g.numel() for g in grads)
+    raw_norm = total_sq.sqrt().item()
+    grad_rms = (total_sq / max(total_elements, 1)).sqrt().item()
+    max_grad_norm = getattr(train_cfg, "max_grad_norm", None)
+    if max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    return raw_norm, grad_rms
 
 
 def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
@@ -113,7 +120,7 @@ def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
 
 def train_step(
     model: nn.Module,
-    batch: dict,
+    microbatches: list[dict],
     optimizer: CombinedOptimizer,
     cfg: HAGIv4Config,
     step: int,
@@ -126,9 +133,6 @@ def train_step(
     """Single training step with gradient accumulation."""
     model.train()
     device = next(model.parameters()).device
-    input_ids = batch["input_ids"].to(device)
-    targets = batch["targets"].to(device)
-
     mc = cfg.model.masking
     if mc.use_adaptive_erasure and adaptive_mask_state is not None:
         mask_ratio = adaptive_mask_state.get("ratio", mc.mask_ratio)
@@ -138,33 +142,38 @@ def train_step(
         mask_ratio = progressive_mask_ratio(step, mask_warmup_steps, 0.15, mc.mask_ratio)
     else:
         mask_ratio = mc.mask_ratio
-    masked_ids, mask = create_random_mask(input_ids, mask_ratio, mc.mask_token_id)
-
     if loss_aggregator is None:
         loss_aggregator = LossAggregator(cfg)
 
     accum = cfg.train.grad_accum_steps
+    if len(microbatches) != accum:
+        raise ValueError(f"expected {accum} microbatches, got {len(microbatches)}")
     optimizer.zero_grad(set_to_none=True)
 
     total_loss = 0.0
     output: ModelOutput | None = None
+    outputs: list[ModelOutput] = []
+    all_finite = True
 
-    for micro_idx in range(accum):
+    for micro_idx, batch in enumerate(microbatches):
+        input_ids = batch["input_ids"].to(device)
+        targets = batch["targets"].to(device)
+        mask = create_erasure_mask(input_ids, mask_ratio)
         awgn_sigma = 0.0
         if cfg.train.awgn_enabled:
             awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
             if step < awgn_end:
                 progress = step / max(awgn_end, 1)
                 awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
-        output = model(masked_ids, targets=targets, mask=mask, step=step, awgn_sigma=awgn_sigma)
+        output = model(input_ids, targets=targets, mask=mask, step=step, awgn_sigma=awgn_sigma)
+        outputs.append(output)
         loss = loss_aggregator(output, targets, mask, step=step)
 
         use_distill = (
             teacher is not None
             and getattr(teacher, "_loaded", False)
             and cfg.train.distill_enabled
-            and step % cfg.train.distill_every == 0
-            and step <= distill_end_step
+            and step < distill_end_step
         )
         if use_distill:
             from hagi_v4.train.distillation import alpha_at
@@ -182,38 +191,63 @@ def train_step(
                 distill_loss = teacher.distillation_loss_chunked(
                     student_hidden=output.hidden,
                     teacher_hidden=teacher_hidden,
-                    student_lm_head_weight=model.lm_head.weight,
-                    targets=targets,
-                    ce_loss=loss,
+                    reconstruction_loss=loss,
                     mask=mask,
+                    align_projection=model.distill_align,
                     alpha=alpha,
                 )
                 loss = distill_loss
                 del teacher_hidden
 
         if not torch.isfinite(loss).all():
-            logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — skipping")
-            continue
+            logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — cancelling update")
+            all_finite = False
+            break
 
         scaled_loss = loss / accum
         scaled_loss.backward()
         total_loss += loss.item()
 
-    gn = grad_norm(model)
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
+    if not all_finite:
+        optimizer.zero_grad(set_to_none=True)
+        for param in model.parameters():
+            param.grad = None
+        return {
+            "loss": total_loss / max(accum, 1),
+            "parity": 0.0,
+            "correction_alignment": 0.0,
+            "rate_distortion": 0.0,
+            "whiteness": 0.0,
+            "contrastive": 0.0,
+            "avg_confidence": 0.0,
+            "grad_norm": 0.0,
+            "grad_rms": 0.0,
+            "mask_ratio": mask_ratio,
+            "lr": lr_at(step, cfg) if hasattr(cfg.train, "warmup_steps") else 0.0,
+            "step": step,
+            "update_applied": False,
+            "all_finite": False,
+        }
 
+    gn, grad_rms = gradient_stats(model, cfg.train)
     optimizer.step()
 
     if output is None:
-        return {"loss": 0.0, "step": step, "grad_norm": gn}
+        return {"loss": 0.0, "step": step, "grad_norm": gn, "grad_rms": grad_rms}
 
     with torch.no_grad():
-        if output.logits is not None:
-            probs = F.softmax(output.logits.float(), dim=-1)
-            avg_confidence = probs.max(dim=-1).values.mean().item()
-        elif output.ce_loss is not None:
-            avg_confidence = max(0.0, 1.0 - output.ce_loss.item() / 10.0)
-        else:
-            avg_confidence = 0.5
+        confidences = []
+        for micro_output in outputs:
+            if micro_output.logits is not None:
+                probs = F.softmax(micro_output.logits.float(), dim=-1)
+                confidences.append(probs.max(dim=-1).values.mean().item())
+            elif micro_output.ce_loss is not None:
+                confidences.append(max(0.0, 1.0 - micro_output.ce_loss.item() / 10.0))
+            else:
+                confidences.append(0.5)
+        avg_confidence = sum(confidences) / max(len(confidences), 1)
     if mc.use_adaptive_erasure and adaptive_mask_state is not None:
         adaptive_mask_state["ratio"] = adaptive_mask_ratio(
             avg_confidence,
@@ -221,20 +255,25 @@ def train_step(
             adaptation_rate=mc.adaptation_rate,
         )
 
+    def mean_aux(name: str) -> float:
+        values = [getattr(item.aux, name) for item in outputs if getattr(item.aux, name) is not None]
+        return sum(float(value.detach()) for value in values) / max(len(values), 1)
+
     return {
         "loss": total_loss / max(accum, 1),
-        "parity": float(output.aux.parity.detach()) if output.aux.parity is not None else 0.0,
-        "extrinsic_info": float(output.aux.extrinsic_info.detach()) if output.aux.extrinsic_info is not None else 0.0,
-        "rate_distortion": float(output.aux.rate_distortion.detach())
-        if output.aux.rate_distortion is not None
-        else 0.0,
-        "whiteness": float(output.aux.whiteness.detach()) if output.aux.whiteness is not None else 0.0,
-        "contrastive": float(output.aux.contrastive.detach()) if output.aux.contrastive is not None else 0.0,
+        "parity": mean_aux("parity"),
+        "correction_alignment": mean_aux("correction_alignment"),
+        "rate_distortion": mean_aux("rate_distortion"),
+        "whiteness": mean_aux("whiteness"),
+        "contrastive": mean_aux("contrastive"),
         "avg_confidence": avg_confidence,
         "grad_norm": gn,
+        "grad_rms": grad_rms,
         "mask_ratio": mask_ratio,
-        "lr": lr_at(step, cfg),
+        "lr": lr_at(step, cfg) if hasattr(cfg.train, "warmup_steps") else 0.0,
         "step": step,
+        "update_applied": True,
+        "all_finite": True,
     }
 
 
@@ -265,7 +304,7 @@ def train(
                 optimizer.load_state_dict(opt_state)
                 logger.info("Optimizer state restored from checkpoint")
             except (ValueError, KeyError, RuntimeError) as exc:
-                logger.warning(f"Optimizer state mismatch — starting fresh: {exc}")
+                raise RuntimeError(f"optimizer state is incompatible with strict resume: {exc}") from exc
         if "adaptive_mask" in resume_extra and adaptive_mask_state is not None:
             adaptive_mask_state["ratio"] = resume_extra["adaptive_mask"]["ratio"]
             logger.info(f"Adaptive mask ratio restored: {adaptive_mask_state['ratio']:.4f}")
@@ -282,8 +321,12 @@ def train(
     ckpt_interval = cfg.train.checkpoint_interval
     ckpt_keep = cfg.train.checkpoint_keep_last
 
-    for batch in dataloader:
-        if step >= cfg.train.max_steps:
+    data_iter = iter(dataloader)
+    while step < cfg.train.max_steps:
+        if hasattr(dataloader, "set_optimizer_step"):
+            dataloader.set_optimizer_step(step)
+        microbatches = list(islice(data_iter, cfg.train.grad_accum_steps))
+        if len(microbatches) != cfg.train.grad_accum_steps:
             break
 
         set_lr(optimizer, step, cfg)
@@ -294,7 +337,7 @@ def train(
 
         metrics = train_step(
             model,
-            batch,
+            microbatches,
             optimizer,
             cfg,
             step,
@@ -305,6 +348,9 @@ def train(
         )
         if step % log_interval == 0:
             yield metrics
+
+        if not metrics["update_applied"]:
+            continue
 
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
             extra = {
@@ -317,7 +363,7 @@ def train(
                 extra["adaptive_mask"] = {"ratio": adaptive_mask_state["ratio"]}
             if hasattr(dataloader, "state_dict"):
                 extra["dataloader"] = dataloader.state_dict()
-            save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep, extra=extra)
+            save_checkpoint(model, optimizer, cfg, step + 1, ckpt_dir, ckpt_keep, extra=extra)
 
         step += 1
 

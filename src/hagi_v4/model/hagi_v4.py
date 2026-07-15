@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hagi_v4.config import HAGIv4Config
+from hagi_v4.model.clifford_cross_modal import CliffordCrossModal
 from hagi_v4.model.codec_contracts import (
     ChannelEncodeResult,
     CodecShapeConfig,
@@ -27,15 +28,14 @@ from hagi_v4.model.codec_contracts import (
     SourceEncodeResult,
     TurboDecodeConfig,
 )
+from hagi_v4.model.contrastive import ContrastiveAlignment
 from hagi_v4.model.cqi import CQIEstimator
 from hagi_v4.model.exit_chart import EXITChartEstimator
-from hagi_v4.model.clifford_cross_modal import CliffordCrossModal
-from hagi_v4.model.contrastive import ContrastiveAlignment
-from hagi_v4.model.freq_layer import FreqBlock, FactoredSwiGLU
+from hagi_v4.model.freq_layer import FactoredSwiGLU, FreqBlock
 from hagi_v4.model.interleaver import BlockInterleaver
 from hagi_v4.model.kalman import KalmanFilter
-from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.msa import HARQBuffer
+from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.norms import RMSNorm
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
 from hagi_v4.model.sparse_parity import SparseParityChecker, SparseParityEncoder
@@ -230,7 +230,7 @@ class LDPCDecoder(nn.Module):
             ext_new = z_corrected - z_pred
 
             if mask is not None:
-                ext_new = ext_new * ~mask.unsqueeze(-1)
+                ext_new = ext_new * mask.unsqueeze(-1)
 
             ext = ext + ext_new
             ext_rms = ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6
@@ -370,6 +370,8 @@ class HAGIv4(nn.Module):
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
         self.lm_head = nn.Linear(H, m.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+        teacher_hidden = cfg.train.distill_teacher_hidden_size
+        self.distill_align = nn.Identity() if teacher_hidden == H else nn.Linear(teacher_hidden, H, bias=False)
 
         self.multimodal_enabled = m.multimodal.enabled
         if self.multimodal_enabled:
@@ -478,11 +480,6 @@ class HAGIv4(nn.Module):
             else:
                 h = self.embed(input_ids)
 
-            if mask is not None:
-                pilot_mask = self._get_pilot_mask(T, h.device)
-                mask = mask & pilot_mask.unsqueeze(0)
-                h = torch.where(mask.unsqueeze(-1), self.mask_embed.expand(B, T, -1), h)
-
             cached_len = 0
             if cache is not None and cache.context_len > 0:
                 cached_h = cache.get_context(0)
@@ -496,14 +493,6 @@ class HAGIv4(nn.Module):
             if cached_len > 0:
                 h = h[:, cached_len:]
                 B, T, _ = h.shape
-
-        if self.training and awgn_sigma > 0.0:
-            h = h + awgn_sigma * torch.randn_like(h)
-
-        if mask is not None and T >= self.codec_shape.pilot_spacing:
-            pilot_idx = self._get_pilot_idx(T, h.device)
-            h_pilot_ref = h[:, pilot_idx].mean(dim=1, keepdim=True)
-            h = h + self.pilot_eq_strength * (h_pilot_ref - h.mean(dim=1, keepdim=True))
 
         cqi = self.cqi(h)
 
@@ -522,9 +511,6 @@ class HAGIv4(nn.Module):
         z = torch.fft.irfft(h_f[:, :, :n_bins] * gate, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
 
-        if mask is not None:
-            z = torch.where(mask.unsqueeze(-1), self.core_mask_embed.expand(B, T, -1), z)
-
         return SourceEncodeResult(systematic=z, mask=mask, cqi=cqi, pre_bottleneck=h)
 
     def _channel_encode(self, encoded: SourceEncodeResult) -> ChannelEncodeResult:
@@ -533,6 +519,28 @@ class HAGIv4(nn.Module):
         codeword = torch.cat([systematic, parity], dim=-1)
         codeword = self.interleaver.interleave(codeword)
         return ChannelEncodeResult(codeword=codeword, systematic=systematic, parity=parity)
+
+    def _apply_erasure(
+        self,
+        encoded: ChannelEncodeResult,
+        erasure_mask: torch.Tensor | None,
+        awgn_sigma: float = 0.0,
+    ) -> ChannelEncodeResult:
+        if erasure_mask is None and (not self.training or awgn_sigma <= 0.0):
+            return encoded
+        codeword = self.interleaver.deinterleave(encoded.codeword).clone()
+        systematic = codeword[..., : self._C]
+        if self.training and awgn_sigma > 0.0:
+            systematic.add_(awgn_sigma * torch.randn_like(systematic))
+        if erasure_mask is not None:
+            systematic[erasure_mask] = self.core_mask_embed.to(systematic.dtype)
+        return ChannelEncodeResult(
+            codeword=self.interleaver.interleave(codeword),
+            systematic=encoded.systematic,
+            parity=encoded.parity,
+            interleaver_perm=encoded.interleaver_perm,
+            erasure_mask=erasure_mask,
+        )
 
     def _channel_decode(
         self,
@@ -552,8 +560,19 @@ class HAGIv4(nn.Module):
             training=training,
             state=state,
             cqi_mean=cqi_mean,
-            mask=None,
+            mask=ch_encoded.erasure_mask,
         )
+        if ch_encoded.erasure_mask is not None and ch_encoded.erasure_mask.any():
+            predicted = result.latent - z_sys
+            target = ch_encoded.systematic - z_sys
+            selected_predicted = predicted[ch_encoded.erasure_mask].float()
+            selected_target = target[ch_encoded.erasure_mask].float()
+            target_scale = selected_target.pow(2).mean().clamp_min(1e-6)
+            normalized_mse = (selected_predicted - selected_target).pow(2).mean() / target_scale
+            cosine = F.cosine_similarity(selected_predicted, selected_target, dim=-1).mean()
+            result.side_info["correction_alignment"] = normalized_mse + 1.0 - cosine
+        else:
+            result.side_info["correction_alignment"] = z_sys.new_zeros(())
         return result
 
     def _source_decode(self, decoded: DecodeResult, encoded: SourceEncodeResult) -> torch.Tensor:
@@ -593,9 +612,9 @@ class HAGIv4(nn.Module):
             mm_h = self.cross_modal(mm_h, modality_ids, self.multimodal_input.num_modalities)
             encoded = self._source_encode(None, None, cache, awgn_sigma, pre_encoded_h=mm_h)
         else:
-            encoded = self._source_encode(input_ids, mask, cache, awgn_sigma)
+            encoded = self._source_encode(input_ids, None, cache, awgn_sigma)
 
-        chEncoded = self._channel_encode(encoded)
+        chEncoded = self._apply_erasure(self._channel_encode(encoded), mask, awgn_sigma)
         decoded = self._channel_decode(chEncoded, encoded, state, self.training)
         h = self._source_decode(decoded, encoded)
 
@@ -607,12 +626,12 @@ class HAGIv4(nn.Module):
 
         h_normed = self.final_norm(h)
         lm_dev = self.lm_head.weight.device
-        if targets is not None and encoded.mask is not None:
-            h_masked = h_normed[encoded.mask]
+        if targets is not None and mask is not None:
+            h_masked = h_normed[mask]
             if h_masked.shape[0] > 0:
                 ce = F.cross_entropy(
                     F.linear(h_masked.to(lm_dev), self.lm_head.weight),
-                    targets[encoded.mask].to(lm_dev),
+                    targets[mask].to(lm_dev),
                 )
             else:
                 ce = self._chunked_ce(h_normed, targets)
@@ -634,12 +653,10 @@ class HAGIv4(nn.Module):
                     side_info["parity_residual"].device,
                 )
                 valid = pilot_mask.unsqueeze(0).expand(side_info["parity_residual"].shape[0], -1)
-                if encoded.mask is not None:
-                    valid = valid & ~encoded.mask
+                if mask is not None:
+                    valid = valid & ~mask
                 aux.whiteness = compute_whiteness_loss(side_info["parity_residual"], valid)
-            if side_info.get("extrinsic_norms") and len(side_info["extrinsic_norms"]) > 1:
-                ext_sum = sum(side_info["extrinsic_norms"])
-                aux.extrinsic_info = (ext_sum / len(side_info["extrinsic_norms"])).to(h.dtype)
+            aux.correction_alignment = side_info["correction_alignment"].to(h.dtype)
             aux.rate_distortion = rd_loss
 
         if use_multimodal and modality_ids is not None:

@@ -7,20 +7,26 @@ Worker A: training hyperparams (lr, wd, muon_lr, muon_wd, mask_ratio, warmup)
 Worker B: architecture efficiency (iters, grad_ckpt, moe_int, msa_k, batch, seq_len)
 """
 
-import argparse, json, logging, sys, time, os, math, random
+import argparse
+import json
+import logging
+import os
+import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 
-import torch
-from hagi_v4.config import HAGIv4Config, auto_configure
-from hagi_v4.model.hagi_v4 import HAGIv4
-from hagi_v4.train.losses import LossAggregator
-from hagi_v4.train.optim import build_optimizer
-from hagi_v4.model.masking import create_random_mask
-from hagi_v4.research.dataset import TinyStoriesConfig, load_tinystories
-from torch.utils.data import DataLoader
+import torch  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+
+from hagi_v4.config import HAGIv4Config, auto_configure  # noqa: E402
+from hagi_v4.model.hagi_v4 import HAGIv4  # noqa: E402
+from hagi_v4.model.masking import create_erasure_mask  # noqa: E402
+from hagi_v4.research.dataset import TinyStoriesConfig, load_tinystories  # noqa: E402
+from hagi_v4.train.losses import LossAggregator  # noqa: E402
+from hagi_v4.train.optim import build_optimizer  # noqa: E402
 
 SHARED_PATH = "research_results/loss_bpt_all.json"
 LOCK_PATH = "research_results/lock.json"
@@ -65,7 +71,7 @@ REGIONS = {
             ("ib", "train.w_ib", [0.005, 0.01, 0.02]),
             ("whiteness", "model.gp2d.whiteness_weight", [0.005, 0.01, 0.02]),
             ("parity", "train.w_parity", [0.05, 0.10, 0.20]),
-            ("extrinsic", "train.w_extrinsic_info", [0.005, 0.01, 0.02]),
+            ("correction", "train.w_correction_alignment", [0.005, 0.01, 0.02]),
         ],
     },
 }
@@ -99,7 +105,7 @@ def load_results():
     if not Path(SHARED_PATH).exists():
         return []
     try:
-        with open(SHARED_PATH, "r") as f:
+        with open(SHARED_PATH) as f:
             return json.load(f)
     except Exception:
         return []
@@ -162,10 +168,10 @@ def run_single(name, overrides, train_ds, val_ds, device):
 
         ids = batch["input_ids"].to(device)
         tgts = batch["targets"].to(device)
-        masked_ids, mask = create_random_mask(ids, cfg.model.masking.mask_ratio, cfg.model.masking.mask_token_id)
+        mask = create_erasure_mask(ids, cfg.model.masking.mask_ratio)
 
         optimizer.zero_grad(set_to_none=True)
-        out = model(masked_ids, targets=tgts, mask=mask, step=step)
+        out = model(ids, targets=tgts, mask=mask, step=step)
         loss = loss_agg(out, tgts, mask, step=step)
 
         if not torch.isfinite(loss).all():

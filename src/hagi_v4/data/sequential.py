@@ -16,7 +16,7 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader, Dataset
 
-from hagi_v4.data.dataset import MemmapDataset
+from hagi_v4.data.dataset import MemmapDataset, dataset_path
 
 logger = logging.getLogger(__name__)
 
@@ -136,24 +136,20 @@ class CurriculumBatchProvider:
         stage1_iter: SequentialCyclingIterator,
         stage2_iter: SequentialCyclingIterator | None,
         stage2_start_step: int,
-        start_step: int = 0,
-        grad_accum_steps: int = 1,
     ):
         self.stage1 = stage1_iter
         self.stage2 = stage2_iter
         self.stage2_start = stage2_start_step
-        self.start_step = start_step
-        self.grad_accum = grad_accum_steps
-        self._batch_count = 0
+        self._optimizer_step = 0
         self._switched = False
 
-    def _current_step(self) -> int:
-        return self.start_step + self._batch_count // max(self.grad_accum, 1)
+    def set_optimizer_step(self, step: int) -> None:
+        self._optimizer_step = step
 
     def _active_iter(self):
-        if self.stage2 is not None and self._current_step() >= self.stage2_start:
+        if self.stage2 is not None and self._optimizer_step >= self.stage2_start:
             if not self._switched:
-                logger.info(f"Curriculum: switching to stage 2 at step {self._current_step()}")
+                logger.info(f"Curriculum: switching to stage 2 at step {self._optimizer_step}")
                 self._switched = True
             return self.stage2
         return self.stage1
@@ -162,23 +158,23 @@ class CurriculumBatchProvider:
         return self
 
     def __next__(self) -> dict:
-        self._batch_count += 1
         return next(self._active_iter())
 
     def state_dict(self) -> dict:
-        active = self.stage2 if self._switched else self.stage1
         return {
             "stage": 2 if self._switched else 1,
-            "batch_count": self._batch_count,
-            "sequential_state": active.state_dict(),
+            "optimizer_step": self._optimizer_step,
+            "stage1_state": self.stage1.state_dict(),
+            "stage2_state": self.stage2.state_dict() if self.stage2 is not None else None,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self._batch_count = state.get("batch_count", 0)
+        self._optimizer_step = state.get("optimizer_step", 0)
         self._switched = state.get("stage", 1) == 2
-        active = self.stage2 if self._switched else self.stage1
-        if "sequential_state" in state:
-            active.load_state_dict(state["sequential_state"])
+        if "stage1_state" in state:
+            self.stage1.load_state_dict(state["stage1_state"])
+        if self.stage2 is not None and state.get("stage2_state") is not None:
+            self.stage2.load_state_dict(state["stage2_state"])
 
 
 def resolve_sequential_entries(
@@ -189,7 +185,7 @@ def resolve_sequential_entries(
     entries = []
     for entry in mix_paths:
         name = entry["name"]
-        path = str(Path(data_dir) / f"{name}.bin")
+        path = str(dataset_path(data_dir, name))
         if Path(path).exists():
             entries.append((name, path))
         else:
@@ -200,7 +196,6 @@ def resolve_sequential_entries(
 def build_sequential_dataloader(
     cfg,
     data_dir: str = "data",
-    start_step: int = 0,
 ) -> CurriculumBatchProvider:
     """Build curriculum dataloader from config."""
 
@@ -213,7 +208,7 @@ def build_sequential_dataloader(
     stage1_entries = []
     for name in curriculum_order:
         if name in available:
-            path = str(Path(data_dir) / f"{name}.bin")
+            path = str(dataset_path(data_dir, name))
             if Path(path).exists():
                 stage1_entries.append((name, path))
 
@@ -236,7 +231,7 @@ def build_sequential_dataloader(
     stage2_entries = [(n, p) for n, p in stage1_entries if n in stage2_names]
     stage2 = None
     stage2_start = cfg.train.curriculum_stage2_start if cfg.train.curriculum_enabled else None
-    if stage2_entries and stage2_start is not None and start_step < stage2_start:
+    if stage2_entries and stage2_start is not None:
         stage2 = SequentialCyclingIterator(
             entries=stage2_entries,
             seq_len=cfg.train.seq_len,
@@ -251,6 +246,4 @@ def build_sequential_dataloader(
         stage1_iter=stage1,
         stage2_iter=stage2,
         stage2_start_step=stage2_start if stage2_start is not None else 0,
-        start_step=start_step,
-        grad_accum_steps=cfg.train.grad_accum_steps,
     )

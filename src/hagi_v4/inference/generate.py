@@ -22,7 +22,8 @@ def generate(
     prompt_ids: torch.Tensor,
     max_new_tokens: int = 128,
     max_iterations: int = 4,
-    mask_token_id: int = 49153,
+    placeholder_token_id: int = 0,
+    forbidden_token_ids: tuple[int, ...] = (0,),
     eos_token_id: int | None = None,
     temperature: float = 0.4,
     top_k: int = 20,
@@ -47,7 +48,7 @@ def generate(
         prompt_ids: [B, T_prompt] prompt token IDs.
         max_new_tokens: number of mask tokens to fill.
         max_iterations: forward passes for iterative decoding.
-        mask_token_id: token ID for masked positions.
+        placeholder_token_id: in-vocabulary value used at unknown positions.
         eos_token_id: token ID for EOS (None = no EOS check).
         temperature: 0 for greedy, >0 for sampling.
         top_k: if >0, sample from top-k logits.
@@ -64,7 +65,8 @@ def generate(
     """
     model.eval()
     B = prompt_ids.shape[0]
-    T_prompt = prompt_ids.shape[1]
+    original_prompt_len = prompt_ids.shape[1]
+    T_prompt = original_prompt_len
     device = prompt_ids.device
     inference_config = getattr(model, "inference_config", None)
     V = (
@@ -72,14 +74,18 @@ def generate(
         if inference_config is not None
         else InferenceShapeConfig.from_hagi_config(model.cfg).vocab_size
     )
+    if not 0 <= placeholder_token_id < V:
+        raise ValueError(f"placeholder_token_id must satisfy 0 <= id < {V}")
+    if any(token_id < 0 or token_id >= V for token_id in forbidden_token_ids):
+        raise ValueError("forbidden_token_ids must contain only in-vocabulary IDs")
 
     min_len = 4
     if T_prompt < min_len:
-        pad = torch.full((B, min_len - T_prompt), mask_token_id, dtype=torch.long, device=device)
+        pad = torch.full((B, min_len - T_prompt), placeholder_token_id, dtype=torch.long, device=device)
         prompt_ids = torch.cat([prompt_ids, pad], dim=1)
         T_prompt = prompt_ids.shape[1]
 
-    mask_block = torch.full((B, max_new_tokens), mask_token_id, dtype=torch.long, device=device)
+    mask_block = torch.full((B, max_new_tokens), placeholder_token_id, dtype=torch.long, device=device)
     seq = torch.cat([prompt_ids, mask_block], dim=1)
     mask = torch.zeros_like(seq, dtype=torch.bool)
     mask[:, T_prompt:] = True
@@ -119,8 +125,8 @@ def generate(
         return logits
 
     def sample_token(logits: torch.Tensor) -> torch.Tensor:
-        logits[:, mask_token_id] = float("-inf")
-        logits[:, 0] = float("-inf")
+        if forbidden_token_ids:
+            logits[:, list(forbidden_token_ids)] = float("-inf")
 
         if repetition_penalty > 1.0 and seq.shape[1] > 0:
             visible = seq[~mask].reshape(B, -1)
@@ -155,54 +161,52 @@ def generate(
                 break
 
             logits = output.logits  # [B, T, V]
-            mask_positions = mask[0].nonzero(as_tuple=True)[0]
-
-            if len(mask_positions) == 0:
+            if not mask.any():
                 break
 
-            mask_logits = logits[0, mask_positions]  # [n_mask, V]
-
-            if iteration < max_iterations - 1:
-                confidence = mask_logits.float().max(dim=-1).values
-                if temperature > 0:
-                    confidence = confidence / temperature
-                n_fill = max(1, int(len(mask_positions) * 0.5))
-                top_confident = confidence.topk(n_fill).indices
-                fill_positions = mask_positions[top_confident]
-                fill_logits = mask_logits[top_confident]
-            else:
-                fill_positions = mask_positions
-                fill_logits = mask_logits
-
-            for i, pos in enumerate(fill_positions):
-                single_logits = fill_logits[i : i + 1]
-                if temperature > 0:
-                    lt = single_logits / temperature
+            for batch_idx in range(B):
+                mask_positions = mask[batch_idx].nonzero(as_tuple=True)[0]
+                if len(mask_positions) == 0:
+                    continue
+                mask_logits = logits[batch_idx, mask_positions]
+                if iteration < max_iterations - 1:
+                    confidence = mask_logits.float().max(dim=-1).values
+                    if temperature > 0:
+                        confidence = confidence / temperature
+                    n_fill = max(1, int(len(mask_positions) * 0.5))
+                    selected = confidence.topk(n_fill).indices
+                    fill_positions = mask_positions[selected]
+                    fill_logits = mask_logits[selected]
                 else:
-                    lt = single_logits
-                if top_k > 0:
-                    v, _ = torch.topk(lt, min(top_k, V), dim=-1)
-                    lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
-                if temperature > 0:
-                    probs = F.softmax(lt.float(), dim=-1)
-                    tok = torch.multinomial(probs.reshape(1, -1), 1).squeeze(-1)
-                else:
-                    tok = lt.argmax(dim=-1)
-                seq[0, pos] = tok
-                mask[0, pos] = False
+                    fill_positions = mask_positions
+                    fill_logits = mask_logits
 
-            if eos_token_id is not None and (seq[0, T_prompt:] == eos_token_id).any():
-                break
+                for i, pos in enumerate(fill_positions):
+                    single_logits = fill_logits[i : i + 1]
+                    if forbidden_token_ids:
+                        single_logits[:, list(forbidden_token_ids)] = float("-inf")
+                    lt = single_logits / temperature if temperature > 0 else single_logits
+                    if top_k > 0:
+                        v, _ = torch.topk(lt, min(top_k, V), dim=-1)
+                        lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
+                    if temperature > 0:
+                        probs = F.softmax(lt.float(), dim=-1)
+                        tok = torch.multinomial(probs.reshape(1, -1), 1).squeeze(-1)
+                    else:
+                        tok = lt.argmax(dim=-1)
+                    seq[batch_idx, pos] = tok
+                    mask[batch_idx, pos] = False
+
+                generated = seq[batch_idx, T_prompt:]
+                if eos_token_id is not None and (generated == eos_token_id).any():
+                    first_eos = (generated == eos_token_id).nonzero()[0].item()
+                    if first_eos + 1 >= min_tokens:
+                        generated[first_eos:] = eos_token_id
+                        mask[batch_idx, T_prompt + first_eos :] = False
 
     finally:
         if turbo is not None and orig_n_iters is not None:
             turbo.n_iters = orig_n_iters
 
-    result = seq[:, : T_prompt + max_new_tokens]
-    if eos_token_id is not None:
-        eos_mask = result[0, T_prompt:] == eos_token_id
-        if eos_mask.any():
-            first_eos = T_prompt + eos_mask.nonzero()[0].item()
-            result = result[:, : first_eos + 1]
-
-    return result
+    generated = seq[:, T_prompt : T_prompt + max_new_tokens]
+    return torch.cat([seq[:, :original_prompt_len], generated], dim=1)

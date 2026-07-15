@@ -5,7 +5,7 @@ V8 loss hierarchy (3 levels):
   Level 2 (Code Quality): Parity reward, Rate distortion — after warmup
   Level 3 (Convergence): Extrinsic info, Whiteness — after 2×warmup
 
-Removed vs V7: efficiency (redundant with extrinsic_info),
+Removed vs V7: efficiency and collapsing extrinsic norm minimization,
 msa_lb (implementation detail), contrastive (multimodal-only).
 """
 
@@ -23,7 +23,7 @@ class AuxLosses:
 
     whiteness: torch.Tensor | None = None
     parity: torch.Tensor | None = None
-    extrinsic_info: torch.Tensor | None = None
+    correction_alignment: torch.Tensor | None = None
     rate_distortion: torch.Tensor | None = None
     contrastive: torch.Tensor | None = None
 

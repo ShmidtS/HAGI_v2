@@ -91,7 +91,6 @@ class MaskingConfig:
     """
 
     mask_ratio: float = 0.3
-    mask_token_id: int = 49153
     use_span_masking: bool = True
     span_length: int = 3
     use_progressive: bool = True
@@ -229,12 +228,13 @@ class TrainConfig:
     weight_decay: float = 0.1
     precision: str = "bf16"
     grad_accum_steps: int = 2
+    max_grad_norm: float | None = None
     batch_size: int = 10
     seq_len: int = 1024
     w_ce: float = 1.0
     w_whiteness: float = 0.01
     w_parity: float = 0.1
-    w_extrinsic_info: float = 0.01
+    w_correction_alignment: float = 0.01
     w_rate_distortion: float = 0.01
     w_contrastive: float = 0.1
     use_two_phase_schedule: bool = True
@@ -246,6 +246,7 @@ class TrainConfig:
     distill_enabled: bool = True
     distill_kl_enabled: bool = False
     distill_teacher: str = "HuggingFaceTB/SmolLM2-360M"
+    distill_teacher_hidden_size: int = 576
     distill_embed_teacher: str = "HuggingFaceTB/SmolLM2-135M"
     distill_alpha_start: float = 0.5
     distill_alpha_end: float = 0.3
@@ -254,7 +255,6 @@ class TrainConfig:
     distill_temp_end: float = 1.0
     distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
-    distill_every: int = 2
     awgn_enabled: bool = True
     awgn_sigma_start: float = 0.005
     awgn_sigma_end: float = 0.0
@@ -262,6 +262,7 @@ class TrainConfig:
     freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     checkpoint_dir: str = "checkpoints"
+    checkpoint_format_version: int = 2
     checkpoint_interval: int = 5000
     checkpoint_keep_last: int = 3
     sequential_cycles: int = 3
@@ -465,7 +466,17 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
             setattr(obj, parts[-1], value)
         elif hasattr(cfg, key):
             setattr(cfg, key, value)
+    validate_config(cfg)
     return cfg
+
+
+def validate_config(cfg: HAGIv4Config) -> None:
+    if cfg.train.checkpoint_format_version != 2:
+        raise ValueError("checkpoint_format_version must be 2 for channel-correct fresh training")
+    if cfg.train.distill_enabled and cfg.train.distill_teacher_hidden_size <= 0:
+        raise ValueError("distill_teacher_hidden_size must be positive when distillation is enabled")
+    if cfg.train.grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be positive")
 
 
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
