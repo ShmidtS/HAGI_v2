@@ -57,6 +57,33 @@ def lr_at(step: int, cfg: HAGIv4Config) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def muon_lr_at(step: int, cfg: HAGIv4Config) -> float:
+    """Linear warmup from 0, then stable, then cosine decay for Muon."""
+    tc = cfg.train
+    warmup = tc.warmup_steps
+    max_steps = tc.max_steps
+    base_lr = tc.muon_lr
+    if step < warmup:
+        return base_lr * step / max(warmup, 1)
+    stable_end = int(max_steps * 0.8)
+    if step < stable_end:
+        return base_lr
+    decay_steps = max(max_steps - stable_end, 1)
+    progress = (step - stable_end) / decay_steps
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def set_lr(optimizer: CombinedOptimizer, step: int, cfg: HAGIv4Config) -> None:
+    """Apply LR schedule to optimizer param_groups."""
+    lr_adam = lr_at(step, cfg)
+    lr_muon = muon_lr_at(step, cfg)
+    for group in optimizer.param_groups:
+        if group.get("_muon", False):
+            group["lr"] = lr_muon
+        else:
+            group["lr"] = lr_adam
+
+
 def cast_to_bf16(model: nn.Module) -> None:
     model.to(torch.bfloat16)
 
@@ -258,6 +285,8 @@ def train(
     for batch in dataloader:
         if step >= cfg.train.max_steps:
             break
+
+        set_lr(optimizer, step, cfg)
 
         if teacher is not None and getattr(teacher, "_loaded", False) and step == distill_end_step:
             logger.info(f"Step {step}: distillation ended — freeing teacher")

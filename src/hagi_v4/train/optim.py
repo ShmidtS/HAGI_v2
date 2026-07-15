@@ -167,6 +167,7 @@ def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:
         momentum=tc.muon_momentum,
         weight_decay=tc.muon_weight_decay,
     )
+    muon.param_groups[0]["_muon"] = True
     adamw = torch.optim.AdamW(
         [
             {"params": decay, "weight_decay": tc.weight_decay},

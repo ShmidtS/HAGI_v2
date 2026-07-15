@@ -131,6 +131,8 @@ class LDPCDecoder(nn.Module):
         self.corr_gate_w = nn.Parameter(torch.zeros(1))
         self.corr_gate_b = nn.Parameter(torch.zeros(1))
 
+        self.ext_gate = nn.Parameter(torch.zeros(1))
+
     def forward(
         self,
         z_sys: torch.Tensor,
@@ -222,6 +224,7 @@ class LDPCDecoder(nn.Module):
                 ext_new = ext_new * ~mask.unsqueeze(-1)
 
             ext = ext + ext_new
+            ext = ext * torch.rsqrt(ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6)
 
             ext_delta = ext - ext_before
             ext_norm = ext_delta.float().norm(dim=-1).mean()
@@ -247,7 +250,7 @@ class LDPCDecoder(nn.Module):
         state.harq_feedback = self.harq.serialize_feedback()
         state.iteration = converged_at
 
-        decoded = z_sys + ext
+        decoded = z_sys + torch.tanh(self.ext_gate) * ext
         return DecodeResult(latent=decoded, state=state, side_info=side_info)
 
 
@@ -278,7 +281,7 @@ class HAGIv4(nn.Module):
         nn.init.uniform_(self.core_mask_embed, -1.0 / math.sqrt(C), 1.0 / math.sqrt(C))
 
         self.cqi = CQIEstimator(H)
-        self.cqi_bw_logit = nn.Parameter(torch.zeros(1))
+        self.cqi_bw_logit = nn.Parameter(torch.tensor([-3.0]))
         self.cqi_mag_logit = nn.Parameter(torch.zeros(1))
         self.pilot_eq_strength = nn.Parameter(torch.zeros(1))
 
@@ -286,18 +289,20 @@ class HAGIv4(nn.Module):
         rolloff_start = int(n_bins_down * 3 / 4)
         t = torch.arange(max(1, n_bins_down - rolloff_start), dtype=torch.float32)
         t = t / max(n_bins_down - rolloff_start, 1)
-        rc = torch.ones(n_bins_down)
-        rc[rolloff_start:] = 0.5 * (1 + torch.cos(t * math.pi))
+        pass_logit = math.log(0.99 / 0.01)
+        stop_logit = math.log(0.5 / 0.5)
+        rc = torch.full((n_bins_down,), pass_logit)
+        rc[rolloff_start:] = stop_logit + (pass_logit - stop_logit) * 0.5 * (1 + torch.cos(t * math.pi))
         self.bottleneck_gate = nn.Parameter(rc)
 
         n_bins_up = H // 2 + 1
         c_bins = C // 2 + 1
-        rc_up = torch.zeros(n_bins_up)
-        rc_up[:c_bins] = 1.0
+        rc_up = torch.full((n_bins_up,), stop_logit)
+        rc_up[:c_bins] = pass_logit
         rolloff_up = max(1, int(c_bins / 4))
         n_rolloff = max(1, c_bins - rolloff_up)
         t_up = torch.arange(n_rolloff, dtype=torch.float32) / max(n_rolloff, 1)
-        rc_up[rolloff_up:c_bins] = 0.5 * (1 + torch.cos(t_up * math.pi))
+        rc_up[rolloff_up:c_bins] = stop_logit + (pass_logit - stop_logit) * 0.5 * (1 + torch.cos(t_up * math.pi))
         self.bottleneck_up_gate = nn.Parameter(rc_up)
 
         self._pilot_idx_cache: dict[int, torch.Tensor] = {}
@@ -388,10 +393,11 @@ class HAGIv4(nn.Module):
                 nn.init.normal_(mod.weight, mean=0.0, std=std)
 
     def _init_turbo_weights(self) -> None:
-        std = 1.0 / math.sqrt(max(1, self.decoder.mut_down_w.shape[1]))
-        nn.init.normal_(self.decoder.mut_down_w, std=std)
+        std_down = 1.0 / math.sqrt(max(1, self.decoder.mut_down_w.shape[1]))
+        nn.init.normal_(self.decoder.mut_down_w, std=std_down)
         nn.init.zeros_(self.decoder.mut_down_b)
-        nn.init.zeros_(self.decoder.mut_up_w)
+        std_up = 1.0 / math.sqrt(max(1, self.decoder.mut_up_w.shape[1]))
+        nn.init.normal_(self.decoder.mut_up_w, std=std_up)
 
     def train(self, mode: bool = True) -> HAGIv4:
         result = super().train(mode)
