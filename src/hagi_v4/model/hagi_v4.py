@@ -54,6 +54,9 @@ class LDPCDecoder(nn.Module):
         n_parity_checks: int,
         edges_per_check: int,
         exit_threshold: float,
+        shared_parity_weights: nn.Parameter | None = None,
+        shared_sparse_mask: torch.Tensor | None = None,
+        shared_parity_norm: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.n_iters = cfg.num_iterations
@@ -112,6 +115,9 @@ class LDPCDecoder(nn.Module):
             edges_per_check=edges_per_check,
             seed=42,
             norm_eps=cfg.norm_eps,
+            shared_weights=shared_parity_weights,
+            shared_mask=shared_sparse_mask,
+            shared_norm=shared_parity_norm,
         )
 
         self.harq = HARQBuffer(cfg.msa, hidden_size)
@@ -129,7 +135,7 @@ class LDPCDecoder(nn.Module):
         self.mut_up_w = nn.Parameter(torch.empty(hidden_size, mut_rank))
 
         self.corr_gate_w = nn.Parameter(torch.zeros(1))
-        self.corr_gate_b = nn.Parameter(torch.zeros(1))
+        self.corr_gate_b = nn.Parameter(torch.tensor([-3.0]))
 
         self.ext_gate = nn.Parameter(torch.zeros(1))
 
@@ -153,7 +159,7 @@ class LDPCDecoder(nn.Module):
         p = state.kalman_p if state.kalman_p is not None else torch.ones(C, device=z_sys.device, dtype=z_sys.dtype)
 
         cqi_val = float(cqi_mean) if isinstance(cqi_mean, (int, float)) else cqi_mean.item()
-        q_scale = 1.0 + (1.0 - cqi_val)
+        q_scale = 0.5 + 0.5 * cqi_val
 
         self.harq.clear()
         if state.cache_active and state.harq_feedback is not None:
@@ -214,7 +220,10 @@ class LDPCDecoder(nn.Module):
             ).to(z_pred.dtype)
             z_corrected = z_pred + correction_gate * correction
 
-            z_corrected = z_corrected + F.linear(
+            mut_gate = torch.sigmoid(
+                residual.abs().float().mean(dim=-1, keepdim=True) * self.corr_gate_w + self.corr_gate_b
+            ).to(z_corrected.dtype)
+            z_corrected = z_corrected + mut_gate * F.linear(
                 F.silu(F.linear(z_corrected, self.mut_down_w, self.mut_down_b)), self.mut_up_w
             )
 
@@ -224,7 +233,8 @@ class LDPCDecoder(nn.Module):
                 ext_new = ext_new * ~mask.unsqueeze(-1)
 
             ext = ext + ext_new
-            ext = ext * torch.rsqrt(ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6)
+            ext_rms = ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6
+            ext = ext * (1.0 / torch.sqrt(ext_rms)).clamp_max(4.0)
 
             ext_delta = ext - ext_before
             ext_norm = ext_delta.float().norm(dim=-1).mean()
@@ -281,7 +291,7 @@ class HAGIv4(nn.Module):
         nn.init.uniform_(self.core_mask_embed, -1.0 / math.sqrt(C), 1.0 / math.sqrt(C))
 
         self.cqi = CQIEstimator(H)
-        self.cqi_bw_logit = nn.Parameter(torch.tensor([-3.0]))
+        self.cqi_bw_logit = nn.Parameter(torch.tensor([2.0]))
         self.cqi_mag_logit = nn.Parameter(torch.zeros(1))
         self.pilot_eq_strength = nn.Parameter(torch.zeros(1))
 
@@ -350,6 +360,9 @@ class HAGIv4(nn.Module):
             n_parity_checks=self.codec_shape.n_parity_checks,
             edges_per_check=self.codec_shape.edges_per_check,
             exit_threshold=self.codec_shape.exit_threshold,
+            shared_parity_weights=self.parity_encoder.parity_weights,
+            shared_sparse_mask=self.parity_encoder.sparse_mask,
+            shared_parity_norm=self.parity_encoder.norm,
         )
 
         self.expression = self.perception
@@ -396,8 +409,7 @@ class HAGIv4(nn.Module):
         std_down = 1.0 / math.sqrt(max(1, self.decoder.mut_down_w.shape[1]))
         nn.init.normal_(self.decoder.mut_down_w, std=std_down)
         nn.init.zeros_(self.decoder.mut_down_b)
-        std_up = 1.0 / math.sqrt(max(1, self.decoder.mut_up_w.shape[1]))
-        nn.init.normal_(self.decoder.mut_up_w, std=std_up)
+        nn.init.zeros_(self.decoder.mut_up_w)
 
     def train(self, mode: bool = True) -> HAGIv4:
         result = super().train(mode)
@@ -499,10 +511,11 @@ class HAGIv4(nn.Module):
         n_bins = self._C // 2 + 1
         base_gate = torch.sigmoid(self.bottleneck_gate)
         cqi_expanded = cqi.unsqueeze(-1)
-        bw_scale = 1.0 - torch.sigmoid(self.cqi_bw_logit) * cqi_expanded
+        bw_base = torch.sigmoid(self.cqi_bw_logit)
+        bw_scale = bw_base + (1.0 - bw_base) * cqi_expanded
         bin_idx = torch.arange(n_bins, device=h.device, dtype=h.dtype)
         cutoff = n_bins * bw_scale
-        sharpness = 1.0 + torch.sigmoid(self.cqi_bw_logit).abs() * n_bins
+        sharpness = 1.0 + bw_base.abs() * n_bins
         dyn_mask = torch.sigmoid((cutoff - bin_idx) * sharpness)
         mag_scale = torch.sigmoid(self.cqi_mag_logit) + (1.0 - torch.sigmoid(self.cqi_mag_logit)) * cqi_expanded
         gate = base_gate * dyn_mask * mag_scale
@@ -590,7 +603,7 @@ class HAGIv4(nn.Module):
             cache.update_decode_state(decoded.state)
 
         side_info = decoded.side_info
-        rd_loss = (encoded.pre_bottleneck.float() - h.float()).pow(2).mean().to(h.dtype)
+        rd_loss = (encoded.systematic.float() - decoded.latent.float()).pow(2).mean().to(h.dtype)
 
         h_normed = self.final_norm(h)
         lm_dev = self.lm_head.weight.device

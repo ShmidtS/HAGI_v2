@@ -88,7 +88,7 @@ class LossAggregator:
         if aux.rate_distortion is not None:
             total = total + self.w_rate_distortion * aux.rate_distortion
         if aux.parity is not None:
-            total = total - self.w_parity * torch.sigmoid(aux.parity)
+            total = total + self.w_parity * torch.log1p(aux.parity.float())
         if aux.contrastive is not None:
             total = total + self.w_contrastive * aux.contrastive
 

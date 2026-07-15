@@ -45,8 +45,8 @@ class KalmanFilter(nn.Module):
         super().__init__()
         self.dim = dim
 
-        self.q_logit = nn.Parameter(torch.zeros(dim))
-        self.r_logit = nn.Parameter(torch.zeros(dim))
+        self.q_logit = nn.Parameter(torch.full((dim,), -2.0))
+        self.r_logit = nn.Parameter(torch.full((dim,), -2.0))
 
     def _q(self, dtype: torch.dtype) -> torch.Tensor:
         return torch.sigmoid(self.q_logit).to(dtype)

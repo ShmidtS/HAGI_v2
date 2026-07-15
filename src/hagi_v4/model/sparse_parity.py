@@ -115,16 +115,27 @@ class SparseParityChecker(nn.Module):
     In LDPC decoding, the check node computes:
         residual = parity_received - parity_computed_from_estimate
 
-    If the estimate is correct, residual → 0. Non-zero residual drives
+    If the estimate is correct, residual -> 0. Non-zero residual drives
     belief propagation corrections.
 
-    Shares the same sparse mask as the encoder (transposed connectivity).
+    SHARED parity-check matrix: uses the SAME H = parity_weights * sparse_mask
+    as the encoder. This is the fundamental LDPC invariant — encoder and
+    decoder must agree on H, otherwise residual can never converge to 0
+    even with a perfect estimate.
 
     Args:
         n_vars: C (systematic dimension)
         n_checks: M (parity dimension)
         edges_per_check: sparsity
         seed: must match the encoder's seed for consistent graph
+        shared_weights: nn.Parameter from SparseParityEncoder. If None,
+            creates own (for standalone use). If provided, uses the
+            encoder's weights so H_enc = H_dec exactly.
+        shared_mask: sparse_mask buffer from SparseParityEncoder.
+            If None, builds own. If provided, shares the same graph.
+        shared_norm: RMSNorm from SparseParityEncoder. If None, creates
+            own. If provided, shares the same normalization so the
+            parity domain is identical on both sides.
     """
 
     def __init__(
@@ -134,24 +145,36 @@ class SparseParityChecker(nn.Module):
         edges_per_check: int = 4,
         seed: int = 42,
         norm_eps: float = 1e-6,
+        shared_weights: nn.Parameter | None = None,
+        shared_mask: torch.Tensor | None = None,
+        shared_norm: RMSNorm | None = None,
     ) -> None:
         super().__init__()
         self.n_vars = n_vars
         self.n_checks = n_checks
         self.edges_per_check = edges_per_check
 
-        gen = torch.Generator().manual_seed(seed)
-        mask = _build_sparse_mask(n_checks, n_vars, edges_per_check, gen)
-        self.register_buffer("sparse_mask", mask, persistent=True)
+        if shared_mask is not None:
+            self.register_buffer("sparse_mask", shared_mask, persistent=True)
+        else:
+            gen = torch.Generator().manual_seed(seed)
+            mask = _build_sparse_mask(n_checks, n_vars, edges_per_check, gen)
+            self.register_buffer("sparse_mask", mask, persistent=True)
 
-        self.check_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
-        nn.init.normal_(self.check_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
+        if shared_weights is not None:
+            self.parity_weights = shared_weights
+        else:
+            self.parity_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
+            nn.init.normal_(self.parity_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
 
-        self.norm = RMSNorm(n_checks, eps=norm_eps)
+        if shared_norm is not None:
+            self.norm = shared_norm
+        else:
+            self.norm = RMSNorm(n_checks, eps=norm_eps)
 
     @property
     def masked_weights(self) -> torch.Tensor:
-        return self.check_weights * self.sparse_mask
+        return self.parity_weights * self.sparse_mask
 
     def forward(
         self,
