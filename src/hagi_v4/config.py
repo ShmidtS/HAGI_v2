@@ -36,10 +36,10 @@ class AttentionConfig:
 
 @dataclass
 class GP2DConfig:
-    """2D Geometric Product — systematic parity channel code (LDPC analog).
+    """Parity channel configuration (V8: used by SparseParity, kept for compat).
 
-    Multi-scale GP2D with interleaving: multiple window sizes provide
-    parity at different frequency bands (local, burst, long-range).
+    V8 replaces dense GP2D with sparse LDPC-style parity. These fields
+    are retained for backward compatibility with existing configs.
     """
 
     window: int = 1
@@ -48,10 +48,23 @@ class GP2DConfig:
     whiteness_weight: float = 0.01
     use_systematic_parity: bool = True
     parity_weight: float = 0.1
-    use_multiscale: bool = True
-    multiscale_windows: tuple = (1, 4, 16)
-    multiscale_gate_inits: tuple = (-4.0, -5.0, -6.0)
-    use_interleave: bool = True
+
+
+@dataclass
+class CodecConfig:
+    """V8 channel codec configuration — LDPC-style FEC parameters.
+
+    Implements true Source-Channel Separation: parity is generated
+    BEFORE the channel, not inside the decoder.
+
+    5G NR analog: LDPC base graph + rate matching + interleaving.
+    """
+
+    code_rate: float = 0.5
+    n_checks: int = 0
+    edges_per_check: int = 4
+    interleaver_mode: str = "qpp"
+    exit_threshold: float = 0.01
 
 
 @dataclass
@@ -126,6 +139,19 @@ class FreqCodingConfig:
 
 
 @dataclass
+class EmbeddingsConfig:
+    """Embedding configuration (V8: trainable by default).
+
+    V7 froze embeddings (copied from SmolLM2). V8 trains embeddings
+    from scratch with proper regularization.
+    """
+
+    trainable: bool = True
+    init: str = "normal"
+    weight_decay: float = 0.01
+
+
+@dataclass
 class MultimodalImageConfig:
     """Image encoder config (ViT-style patches)."""
 
@@ -178,6 +204,8 @@ class ModelConfig:
     algebra: AlgebraConfig = field(default_factory=AlgebraConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     gp2d: GP2DConfig = field(default_factory=GP2DConfig)
+    codec: CodecConfig = field(default_factory=CodecConfig)
+    embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     msa: MSAConfig = field(default_factory=MSAConfig)
@@ -207,10 +235,8 @@ class TrainConfig:
     w_whiteness: float = 0.01
     w_parity: float = 0.1
     w_extrinsic_info: float = 0.01
-    w_efficiency: float = 0.001
     w_rate_distortion: float = 0.01
     w_contrastive: float = 0.1
-    w_msa_lb: float = 0.01
     use_two_phase_schedule: bool = True
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15
@@ -233,7 +259,7 @@ class TrainConfig:
     awgn_sigma_start: float = 0.005
     awgn_sigma_end: float = 0.0
     awgn_end_frac: float = 0.5
-    freeze_embeddings: bool = True
+    freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 5000
@@ -285,75 +311,70 @@ class HAGIv4Config:
 
 
 _BOTTLENECK_RATIO = 0.5
-_MOE_INT_RATIO = 1.3333
-_HEAD_DIM_MIN = 16
+_HEAD_DIM_TARGET = 64
+_GRADE_RATIOS = (1, 1.5, 1.5, 1, 4)  # Cl(3,0,0): scalar, 3 vectors, 3 bivectors, pseudoscalar
 
 
 def _round_to_multiple(value: int, multiple: int = 8) -> int:
     return max(multiple, ((value + multiple - 1) // multiple) * multiple)
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 >= n, minimum 2."""
+    p = 2
+    while p < n:
+        p *= 2
+    return p
+
+
 def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
-    """Auto-compute all model sizes from target non-embedding params."""
+    """Auto-compute all model sizes from target non-embedding params.
+
+    All dimensions derived from target_params via continuous formulas —
+    no hardcoded thresholds, no magic constants. Convergence is natural
+    via iterative H-size refinement.
+    """
     import math
 
     target = float(target_params)
-    perc, reason, expr = 2, 7, 2
 
-    H = int(math.sqrt(target / 42.0))
-    H = _round_to_multiple(H, 8)
+    ratio = _BOTTLENECK_RATIO
+    int_ratio = 4.0 / 3.0
 
-    for _ in range(5):
-        if target < 2_000_000:
-            perc, expr = 1, 1
-            reason = max(3, min(7, round(4 * (target / 1e6) ** 0.3)))
-        elif target < 10_000_000:
-            perc, expr = 2, 2
-            reason = max(5, min(7, round(5 * (target / 5e6) ** 0.3)))
-        else:
-            perc, expr = 2, 2
-            reason = 7
+    layers = max(2, round(math.log10(target / 1e5) * 3))
+    perc = max(1, layers // 4)
+    expr = perc
+    reason = max(3, layers - 2 * perc)
 
-        C = _round_to_multiple(int(H * _BOTTLENECK_RATIO), 8)
+    cost_per_h_sq = (
+        4 * (perc + expr)
+        + 4 * ratio * ratio * reason
+        + 3 * int_ratio * ratio * (perc + expr)
+        + 3 * int_ratio * ratio * ratio * reason
+    )
+    H = _round_to_multiple(int(math.sqrt(target / cost_per_h_sq)), 8)
 
-        ffn_int_h = _round_to_multiple(int(H * _MOE_INT_RATIO * _BOTTLENECK_RATIO), 8)
-        ffn_int_c = _round_to_multiple(int(C * _MOE_INT_RATIO), 8)
+    for _ in range(8):
+        C = _round_to_multiple(int(H * ratio), 8)
+        ffn_int_h = _round_to_multiple(int(H * int_ratio * ratio), 8)
+        ffn_int_c = _round_to_multiple(int(C * int_ratio), 8)
         cost_h = 4 * H * H + 3 * H * ffn_int_h + 2 * H
         cost_c = 4 * C * C + 3 * C * ffn_int_c + 2 * C
         extra = 50 * C + 20 * H
         k = (cost_h * (perc + expr) + cost_c * reason + extra) / (H * H)
-        H_new = int(math.sqrt(target / k))
-        H_new = _round_to_multiple(H_new, 8)
+        H_new = _round_to_multiple(int(math.sqrt(target / k)), 8)
         if abs(H_new - H) <= 8:
             H = H_new
             break
         H = H_new
 
-    H = _round_to_multiple(int(H / 1.18), 8)
-    C = _round_to_multiple(int(H * _BOTTLENECK_RATIO), 8)
+    C = _round_to_multiple(int(H * ratio), 8)
 
-    grade_dims = tuple(_round_to_multiple(int(H * r), 4) for r in (0.1111, 0.1667, 0.1667, 0.1111, 0.4444))
-    diff = H - sum(grade_dims)
-    if diff != 0:
-        grade_dims = list(grade_dims)
-        grade_dims[4] += diff
-        grade_dims = tuple(max(0, g) for g in grade_dims)
-
-    if H <= 64:
-        n_q = 2
-    elif H <= 128:
-        n_q = 4
-    elif H <= 256:
-        n_q = 4
-    elif H <= 768:
-        n_q = 8
-    elif H <= 1536:
-        n_q = 16
-    else:
-        n_q = 32
+    head_dim = _round_to_multiple(_HEAD_DIM_TARGET, 8)
+    n_q = max(2, _next_pow2(H // head_dim))
     head_dim = _round_to_multiple(H // n_q, 8)
-    if n_q * head_dim < H:
-        head_dim = _round_to_multiple(H // n_q + 8, 8)
+    while n_q * head_dim < H:
+        head_dim += 8
     n_kv = max(1, n_q // 2)
     while n_q % n_kv != 0:
         n_kv -= 1
@@ -361,13 +382,28 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
     mla_up = n_kv * head_dim
     mla_compress = max(16, mla_up // 2)
 
+    total_grade = sum(_GRADE_RATIOS)
+    grade_dims = tuple(_round_to_multiple(int(H * r / total_grade), 4) for r in _GRADE_RATIOS)
+    diff = H - sum(grade_dims)
+    if diff != 0:
+        grade_dims = list(grade_dims)
+        grade_dims[-1] += diff
+        grade_dims = tuple(max(0, g) for g in grade_dims)
+
+    n_modes_t = _round_to_multiple(max(4, H // 32), 4)
+    n_modes_h = _round_to_multiple(max(4, head_dim // 4), 4)
+    complex_rank = max(8, head_dim // 4)
+
+    n_checks = C
+    edges_per_check = max(3, min(8, C // 32))
+
     m = ModelConfig()
     m.vocab_size = vocab_size
     m.hidden_size = H
     m.core_hidden_size = C
     m.perception_layers = perc
     m.reasoning_layers = reason
-    m.bottleneck_ratio = _BOTTLENECK_RATIO
+    m.bottleneck_ratio = ratio
     m.target_params = target_params
 
     m.algebra.grade_dims = grade_dims
@@ -382,6 +418,13 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
     m.msa.grade_dims = grade_dims
     m.msa.mla_compress_dim = mla_compress
     m.msa.mla_up_dim = mla_up
+
+    m.freq_coding.n_modes_t = n_modes_t
+    m.freq_coding.n_modes_h = n_modes_h
+    m.freq_coding.complex_rank = complex_rank
+
+    m.codec.n_checks = n_checks
+    m.codec.edges_per_check = edges_per_check
 
     return m
 
@@ -442,6 +485,8 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         "algebra": ["grade_dims", "hidden_size"],
         "attention": ["num_query_heads", "num_kv_heads", "head_dim"],
         "msa": ["n_kv_heads", "head_dim", "grade_dims", "mla_compress_dim", "mla_up_dim"],
+        "freq_coding": ["n_modes_t", "n_modes_h", "complex_rank"],
+        "codec": ["n_checks", "edges_per_check"],
     }
     for section, fields in nested.items():
         yaml_section = yaml_data.get(section, {})

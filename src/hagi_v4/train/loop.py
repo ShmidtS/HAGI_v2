@@ -1,12 +1,11 @@
-"""Training loop for HAGI V4.
+"""Training loop for HAGI V8.
 
-Key fixes from log analysis:
-1. grad_accum_steps IMPLEMENTED — micro-batch loop with loss scaling
-2. Suffix masking removed — only random + span (suffix causes loss 8-16)
-3. Soft grad norm scaling (not clipping) — scale grads by 1/max(1, norm/target)
-4. Warmup starts from 0 — lr=0 at step 0, linear ramp to max
-5. manual_bf16 — model cast to bf16, no autocast
-6. Teacher under inference_mode + del + empty_cache before backward
+V8 changes vs V7:
+  1. Simplified loss hierarchy (3 levels, 4 aux instead of 7)
+  2. FOXP2 made optional (disabled by default for clean from-scratch)
+  3. No frozen embeddings (trainable from scratch)
+  4. Distillation optional (not required for basic training)
+  5. AWGN annealing preserved (channel robustness)
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ from hagi_v4.model.masking import (
     progressive_mask_ratio,
 )
 from hagi_v4.model.outputs import ModelOutput
-from hagi_v4.train.distillation import alpha_at, temperature_at
-from hagi_v4.train.foxp2 import FOXP2Controller, apply_foxp2, foxp2_alignment_loss
 from hagi_v4.train.losses import LossAggregator
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
@@ -64,27 +61,17 @@ def cast_to_bf16(model: nn.Module) -> None:
     model.to(torch.bfloat16)
 
 
-def soft_grad_scale(model: nn.Module, target: float = 1.0) -> float:
+def grad_norm(model: nn.Module) -> float:
+    """Compute gradient norm (no clipping/scaling)."""
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return 0.0
     total_sq = torch.stack([g.pow(2).sum() for g in grads]).sum()
-    norm = total_sq.sqrt().item()
-    if norm > target:
-        scale = target / norm
-        for g in grads:
-            g.mul_(scale)
-    return norm
+    return total_sq.sqrt().item()
 
 
 def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
-    """Three-phase mask ratio for LLaDA-compatible masked LM.
-
-    Phase 1 (0-50%):   0.15 — easy fitting, model learns token reconstruction
-    Phase 2 (50-80%):  0.35 — compression, model learns from less context
-    Phase 3 (80-100%): 0.50 — LLaDA generation compatibility, model handles
-                                  high mask ratios needed for iterative decoding
-    """
+    """Three-phase mask ratio for LLaDA-compatible masked LM."""
     if not cfg.train.use_two_phase_schedule:
         return cfg.model.masking.mask_ratio
     max_steps = cfg.train.max_steps
@@ -106,10 +93,7 @@ def train_step(
     teacher=None,
     loss_aggregator: LossAggregator | None = None,
     mask_warmup_steps: int = 20000,
-    grad_norm_target: float = 1.0,
     adaptive_mask_state: dict | None = None,
-    foxp2: FOXP2Controller | None = None,
-    foxp2_groups: list | None = None,
     distill_end_step: int = 0,
 ) -> dict:
     """Single training step with gradient accumulation."""
@@ -156,6 +140,8 @@ def train_step(
             and step <= distill_end_step
         )
         if use_distill:
+            from hagi_v4.train.distillation import alpha_at
+
             alpha = alpha_at(
                 step,
                 cfg.train.distill_alpha_start,
@@ -186,17 +172,12 @@ def train_step(
         scaled_loss.backward()
         total_loss += loss.item()
 
-    grad_norm = soft_grad_scale(model, grad_norm_target)
-
-    foxp2_gates = None
-    foxp2_log_norms = None
-    if foxp2 is not None and foxp2_groups is not None:
-        foxp2_gates, foxp2_log_norms = apply_foxp2(foxp2, foxp2_groups, device)
+    gn = grad_norm(model)
 
     optimizer.step()
 
     if output is None:
-        return {"loss": 0.0, "step": step, "grad_norm": grad_norm}
+        return {"loss": 0.0, "step": step, "grad_norm": gn}
 
     with torch.no_grad():
         if output.logits is not None:
@@ -213,26 +194,21 @@ def train_step(
             adaptation_rate=mc.adaptation_rate,
         )
 
-    result = {
+    return {
         "loss": total_loss / max(accum, 1),
         "parity": float(output.aux.parity.detach()) if output.aux.parity is not None else 0.0,
         "extrinsic_info": float(output.aux.extrinsic_info.detach()) if output.aux.extrinsic_info is not None else 0.0,
-        "efficiency": float(output.aux.efficiency.detach()) if output.aux.efficiency is not None else 0.0,
-        "msa_lb": float(output.aux.msa_lb.detach()) if output.aux.msa_lb is not None else 0.0,
         "rate_distortion": float(output.aux.rate_distortion.detach())
         if output.aux.rate_distortion is not None
         else 0.0,
+        "whiteness": float(output.aux.whiteness.detach()) if output.aux.whiteness is not None else 0.0,
+        "contrastive": float(output.aux.contrastive.detach()) if output.aux.contrastive is not None else 0.0,
         "avg_confidence": avg_confidence,
-        "grad_norm": grad_norm,
+        "grad_norm": gn,
         "mask_ratio": mask_ratio,
         "lr": lr_at(step, cfg),
         "step": step,
     }
-    if foxp2_gates is not None:
-        result["foxp2_gates"] = foxp2_gates.detach().flatten().tolist()
-        result["_foxp2_gates_tensor"] = foxp2_gates
-        result["_foxp2_log_norms"] = foxp2_log_norms
-    return result
 
 
 def train(
@@ -255,17 +231,6 @@ def train(
     loss_aggregator = LossAggregator(cfg)
     adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
 
-    foxp2 = FOXP2Controller(num_groups=4, hidden=32)
-    if torch.cuda.is_available():
-        foxp2 = foxp2.cuda()
-    foxp2_optimizer = torch.optim.AdamW(foxp2.parameters(), lr=1e-4, weight_decay=0.01)
-
-    fo_groups = []
-    named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    chunk = max(1, len(named_params) // 4)
-    for i in range(4):
-        fo_groups.append([p for _, p in named_params[i * chunk : (i + 1) * chunk]])
-
     if resume_extra:
         opt_state = resume_extra.get("optimizer")
         if opt_state is not None:
@@ -274,9 +239,6 @@ def train(
                 logger.info("Optimizer state restored from checkpoint")
             except (ValueError, KeyError, RuntimeError) as exc:
                 logger.warning(f"Optimizer state mismatch — starting fresh: {exc}")
-        if "foxp2" in resume_extra:
-            foxp2.load_state_dict(resume_extra["foxp2"])
-            logger.info("FOXP2 state restored from checkpoint")
         if "adaptive_mask" in resume_extra and adaptive_mask_state is not None:
             adaptive_mask_state["ratio"] = resume_extra["adaptive_mask"]["ratio"]
             logger.info(f"Adaptive mask ratio restored: {adaptive_mask_state['ratio']:.4f}")
@@ -310,31 +272,13 @@ def train(
             teacher,
             loss_aggregator=loss_aggregator,
             adaptive_mask_state=adaptive_mask_state,
-            foxp2=foxp2,
-            foxp2_groups=fo_groups,
             distill_end_step=distill_end_step,
         )
         if step % log_interval == 0:
             yield metrics
 
-        if foxp2 is not None and "_foxp2_gates_tensor" in metrics:
-            gates_t = metrics["_foxp2_gates_tensor"]
-            log_norms_t = metrics["_foxp2_log_norms"]
-            # Alignment surrogate: raise gates on groups whose grad-norm is
-            # stable (close to EMA trend = consistent signal), suppress where
-            # it is an outlier (noise). Replaces L2 (collapse to 0) and entropy
-            # (collapse to uniform 0.5).
-            foxp2_loss = foxp2_alignment_loss(gates_t, log_norms_t, foxp2.ema_log_norm)
-            foxp2_optimizer.zero_grad(set_to_none=True)
-            foxp2_loss.backward()
-            foxp2_optimizer.step()
-            foxp2.update_ema(log_norms_t)
-            del metrics["_foxp2_gates_tensor"]
-            del metrics["_foxp2_log_norms"]
-
         if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
             extra = {
-                "foxp2": foxp2.state_dict(),
                 "rng": {
                     "torch": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
@@ -350,7 +294,6 @@ def train(
 
     if ckpt_interval > 0:
         extra = {
-            "foxp2": foxp2.state_dict(),
             "rng": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,

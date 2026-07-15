@@ -54,11 +54,12 @@ class MultimodalInput(nn.Module):
         for i in range(mm.num_modalities):
             self.mask_embeds.data[i] = torch.ones(H) / (H**0.5)
 
+        pos_std = 1.0 / (H**0.5)
         self.image_pos_embed = nn.Parameter(torch.zeros(m.image.max_image_patches, H))
-        nn.init.normal_(self.image_pos_embed, std=0.02)
+        nn.init.normal_(self.image_pos_embed, std=pos_std)
 
         self.audio_pos_embed = nn.Parameter(torch.zeros(m.audio.max_audio_frames, H))
-        nn.init.normal_(self.audio_pos_embed, std=0.02)
+        nn.init.normal_(self.audio_pos_embed, std=pos_std)
 
     def encode_text(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self.text_embed(input_ids)

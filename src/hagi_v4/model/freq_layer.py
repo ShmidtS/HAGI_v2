@@ -34,8 +34,10 @@ class FactoredLinear(nn.Module):
         super().__init__()
         self.compress = nn.Linear(in_features, rank, bias=bias)
         self.expand = nn.Linear(rank, out_features, bias=bias)
-        nn.init.normal_(self.compress.weight, std=0.02)
-        nn.init.normal_(self.expand.weight, std=0.02)
+        c_std = 1.0 / (in_features**0.5)
+        e_std = 1.0 / (rank**0.5)
+        nn.init.normal_(self.compress.weight, std=c_std)
+        nn.init.normal_(self.expand.weight, std=e_std)
         if bias:
             nn.init.zeros_(self.compress.bias)
             nn.init.zeros_(self.expand.bias)
@@ -117,28 +119,23 @@ class FreqCoding2D(nn.Module):
             self.w_im_a = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
             self.w_re_b = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
             self.w_im_b = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
-            nn.init.normal_(self.w_re_a, std=0.02)
-            nn.init.normal_(self.w_im_a, std=0.02)
-            nn.init.normal_(self.w_re_b, std=0.02)
-            nn.init.normal_(self.w_im_b, std=0.02)
+            w_std = 1.0 / (head_dim**0.5)
+            nn.init.normal_(self.w_re_a, std=w_std)
+            nn.init.normal_(self.w_im_a, std=w_std)
+            nn.init.normal_(self.w_re_b, std=w_std)
+            nn.init.normal_(self.w_im_b, std=w_std)
 
         self.freq_gate_t = nn.Parameter(torch.zeros(T_max))
         self.freq_gate_h = nn.Parameter(torch.zeros(head_dim))
-        nn.init.normal_(self.freq_gate_t[:n_modes_t], mean=2.0, std=0.5)
-        nn.init.normal_(self.freq_gate_t[n_modes_t:], mean=-2.0, std=0.5)
-        nn.init.normal_(self.freq_gate_h[:n_modes_h], mean=2.0, std=0.5)
-        nn.init.normal_(self.freq_gate_h[n_modes_h:], mean=-2.0, std=0.5)
 
         self.channel_response_t = nn.Parameter(torch.zeros(T_max))
         self.channel_response_h = nn.Parameter(torch.zeros(head_dim))
-        nn.init.normal_(self.channel_response_t[:n_modes_t], mean=0.0, std=0.02)
-        nn.init.normal_(self.channel_response_h[:n_modes_h], mean=0.0, std=0.02)
 
         if shared_phase is not None:
             self.phase = shared_phase
         else:
             self.phase = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-            nn.init.normal_(self.phase, std=0.1)
+            nn.init.normal_(self.phase, std=1.0 / (n_modes_t**0.5))
 
         self._w_cache: torch.Tensor | None = None
         self._phase_cache: torch.Tensor | None = None
@@ -217,7 +214,7 @@ class FreqCoding2D(nn.Module):
             out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
 
         mag = out_f.abs().float()
-        scale = 1.0 / (1.0 + mag / 10.0)
+        scale = 1.0 / (1.0 + mag)
         out_f = out_f * scale.to(out_f.dtype)
 
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
