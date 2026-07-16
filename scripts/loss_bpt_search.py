@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 
 from hagi_v4.config import HAGIv4Config, auto_configure  # noqa: E402
 from hagi_v4.model.hagi_v4 import HAGIv4  # noqa: E402
-from hagi_v4.model.masking import create_erasure_mask  # noqa: E402
+from hagi_v4.model.masking import create_physical_corruption_mask, create_semantic_corruption  # noqa: E402
 from hagi_v4.research.dataset import TinyStoriesConfig, load_tinystories  # noqa: E402
 from hagi_v4.train.losses import LossAggregator  # noqa: E402
 from hagi_v4.train.optim import build_optimizer  # noqa: E402
@@ -111,11 +111,24 @@ def run_single(name: str, overrides: dict, train_ds, val_ds, device) -> dict:
 
         ids = batch["input_ids"].to(device)
         tgts = batch["targets"].to(device)
-        mask = create_erasure_mask(ids, cfg.model.masking.mask_ratio)
+        valid_target_mask = batch.get("valid_target_mask", torch.ones_like(ids, dtype=torch.bool)).to(device)
+        semantic_unknown_mask, prediction_mask, _ = create_semantic_corruption(
+            valid_target_mask,
+            random_ratio=cfg.model.masking.mask_ratio,
+        )
+        physical_corruption_mask = create_physical_corruption_mask(ids, cfg.model.masking.mask_ratio)
 
         optimizer.zero_grad(set_to_none=True)
-        out = model(ids, targets=tgts, mask=mask, step=step)
-        loss = loss_agg(out, tgts, mask, step=step)
+        out = model(
+            ids,
+            targets=tgts,
+            semantic_unknown_mask=semantic_unknown_mask,
+            prediction_mask=prediction_mask,
+            valid_target_mask=valid_target_mask,
+            physical_corruption_mask=physical_corruption_mask,
+            step=step,
+        )
+        loss = loss_agg(out, tgts, prediction_mask, step=step)
 
         if not torch.isfinite(loss).all():
             step += 1
@@ -146,7 +159,15 @@ def run_single(name: str, overrides: dict, train_ds, val_ds, device) -> dict:
                     vT = vi_ids.shape[1]
                     vmask = torch.zeros_like(vi_ids, dtype=torch.bool)
                     vmask[:, vT // 2 :] = True
-                    vout = model(vi_ids, targets=vi_tgts, mask=vmask, step=0)
+                    vout = model(
+                        vi_ids,
+                        targets=vi_tgts,
+                        semantic_unknown_mask=vmask,
+                        prediction_mask=vmask,
+                        valid_target_mask=torch.ones_like(vmask),
+                        physical_corruption_mask=torch.zeros_like(vmask),
+                        step=0,
+                    )
                     if vout.ce_loss is not None:
                         tl += vout.ce_loss.item() * vi_ids.shape[0]
                         tc += vi_ids.shape[0]
@@ -170,7 +191,15 @@ def run_single(name: str, overrides: dict, train_ds, val_ds, device) -> dict:
             vT = vi_ids.shape[1]
             vmask = torch.zeros_like(vi_ids, dtype=torch.bool)
             vmask[:, vT // 2 :] = True
-            vout = model(vi_ids, targets=vi_tgts, mask=vmask, step=0)
+            vout = model(
+                vi_ids,
+                targets=vi_tgts,
+                semantic_unknown_mask=vmask,
+                prediction_mask=vmask,
+                valid_target_mask=torch.ones_like(vmask),
+                physical_corruption_mask=torch.zeros_like(vmask),
+                step=0,
+            )
             if vout.ce_loss is not None:
                 tl += vout.ce_loss.item() * vi_ids.shape[0]
                 tc += vi_ids.shape[0]

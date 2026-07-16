@@ -261,8 +261,10 @@ class TrainConfig:
     awgn_end_frac: float = 0.5
     freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
+    eos_token_id: int = 0
+    pad_token_id: int = 49152
     checkpoint_dir: str = "checkpoints"
-    checkpoint_format_version: int = 2
+    checkpoint_format_version: int = 3
     checkpoint_interval: int = 5000
     checkpoint_keep_last: int = 3
     sequential_cycles: int = 3
@@ -292,11 +294,9 @@ class InferenceConfig:
 
     temperature: float = 0.8
     top_k: int = 50
-    min_tokens: int = 2
-    block_size: int = 16
-    refine_passes: int = 2
-    repetition_penalty: float = 0.8
-    repetition_window: int = 32
+    min_new_tokens: int = 2
+    repetition_penalty: float = 1.1
+    repetition_window: int = 64
     no_repeat_ngram_size: int = 3
     max_iterations: int = 4
     max_new_tokens: int = 128
@@ -471,12 +471,42 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
 
 
 def validate_config(cfg: HAGIv4Config) -> None:
-    if cfg.train.checkpoint_format_version != 2:
-        raise ValueError("checkpoint_format_version must be 2 for channel-correct fresh training")
-    if cfg.train.distill_enabled and cfg.train.distill_teacher_hidden_size <= 0:
+    def bounded_int(name: str, value: int, upper: int) -> None:
+        if type(value) is not int or not 1 <= value <= upper:
+            raise ValueError(f"{name} must be an integer in [1, {upper}]")
+
+    bounded_int("model.vocab_size", cfg.model.vocab_size, 1_000_000)
+    bounded_int("model.hidden_size", cfg.model.hidden_size, 16_384)
+    bounded_int("model.core_hidden_size", cfg.model.core_hidden_size, 16_384)
+    bounded_int("model.attention.max_seq_len", cfg.model.attention.max_seq_len, 65_536)
+    bounded_int("train.seq_len", cfg.train.seq_len, 65_536)
+    bounded_int("train.batch_size", cfg.train.batch_size, 4_096)
+    bounded_int("model.refinement.num_iterations", cfg.model.refinement.num_iterations, 64)
+    bounded_int("model.refinement.min_iterations", cfg.model.refinement.min_iterations, 64)
+    bounded_int("inference.max_new_tokens", cfg.inference.max_new_tokens, 8_192)
+    bounded_int("inference.max_iterations", cfg.inference.max_iterations, 64)
+    if cfg.model.core_hidden_size > cfg.model.hidden_size:
+        raise ValueError("model.core_hidden_size must not exceed model.hidden_size")
+    if cfg.model.refinement.min_iterations > cfg.model.refinement.num_iterations:
+        raise ValueError("model.refinement.min_iterations must not exceed num_iterations")
+    if not 0 <= cfg.inference.min_new_tokens <= cfg.inference.max_new_tokens:
+        raise ValueError("inference.min_new_tokens must be within max_new_tokens")
+    if cfg.train.checkpoint_format_version != 3:
+        raise ValueError("checkpoint_format_version must be 3 for channel-correct fresh training")
+    if type(cfg.train.checkpoint_keep_last) is not int or cfg.train.checkpoint_keep_last < 1:
+        raise ValueError("checkpoint_keep_last must be an integer of at least 1")
+    if type(cfg.train.distill_enabled) is not bool:
+        raise ValueError("distill_enabled must be a boolean")
+    if cfg.train.distill_enabled is True and cfg.train.distill_teacher_hidden_size <= 0:
         raise ValueError("distill_teacher_hidden_size must be positive when distillation is enabled")
     if cfg.train.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be positive")
+    if cfg.train.eos_token_id == cfg.train.pad_token_id:
+        raise ValueError("eos_token_id and pad_token_id must be distinct")
+    if not 0 <= cfg.train.eos_token_id < cfg.model.vocab_size:
+        raise ValueError("eos_token_id must be within the model vocabulary")
+    if not 0 <= cfg.train.pad_token_id < cfg.model.vocab_size:
+        raise ValueError("pad_token_id must be within the model vocabulary")
 
 
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:

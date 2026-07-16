@@ -1,158 +1,98 @@
-# HAGI V7.2 — Codec Language Model (5G NR pipeline)
+# HAGI V8 — Probabilistic Codec Language Model
 
 ## Channel-Correct Training Contract
 
-The codec order is fixed: clean token IDs are source-encoded, parity is generated from the clean systematic representation, channel erasure/AWGN corrupts only the received systematic symbols, the decoder receives the same boolean erasure mask, and source decoding follows correction. Erasure is never represented by a token ID.
+Semantic erasure and physical channel corruption are independent events. `semantic_unknown_mask` replaces unknown token embeddings with the learned `semantic_unknown_embed` before cache writes, spectral mixing, bottlenecking, or source-state derivation; changing placeholder IDs under the same mask therefore cannot change the model input at the causal seam. The source encoder then produces the systematic latent, learned continuous analog redundancy is derived from that clean latent, and only after that does the independently sampled physical channel corrupt received systematic symbols. Erasure is never represented by a token ID.
+
+Four boolean `[B,T]` masks define the runtime contract: `semantic_unknown_mask` controls semantic visibility, `prediction_mask` selects logits/objective rows, `valid_target_mask` excludes padding and invalid targets, and `physical_corruption_mask` controls the independent latent channel. `prediction_mask` must be a subset of both semantic unknown and valid target positions; physical corruption does not modify semantic visibility or token IDs.
+
+Training samples a random-unknown or full-suffix task independently per sequence with a 50/50 policy. A valid sequence has one terminal EOS before padding; suffix prediction includes that EOS. Generation starts with a fully unknown suffix, obtains compact gathered logits, emits left-to-right, accepts EOS only at generated lengths `2..max_new_tokens`, pads shorter rows, and returns `GenerationOutput(token_ids, generated_lengths, finished)`.
 
 `step` always means completed optimizer updates. Each update consumes exactly `grad_accum_steps` distinct dataloader yields, and curriculum selection is set explicitly from that optimizer step before microbatch collection.
 
 During active distillation, reconstruction and hidden-state alignment form one joint objective on every update. `distill_align` is student-owned and registered before optimizer construction; decoder correction is trained against the known clean-minus-received channel error rather than by minimizing extrinsic magnitude.
 
-Checkpoint format v2 stores `completed_updates`; resume begins at that first unexecuted update. V1 artifacts such as `step-016000.pt` are diagnostic-only and cannot be loaded into v2 training. Fresh runs use dedicated `checkpoints/channel-v2-*` directories.
+Checkpoint format v3 is a strict fresh-only inference artifact with exactly `format_version`, `model`, `config`, and `completed_updates`. Training resume, migration, partial loading, and legacy compatibility are not supported. Checkpoints use flat `step-XXXXXX.pt` paths with no run-specific subdirectories, and training refuses to start when the checkpoint root contains any entry. Old artifacts, including the collapsed step-501 probe and v1/v2 checkpoints, remain diagnostic-only; generation claims require fresh retraining.
 
-Diagnostics report raw gradient norm and gradient RMS. Optional clipping is configured with `train.max_grad_norm`; a finite raw norm such as 40 is a measurement, not an explosion classification.
+Diagnostics report raw gradient norm and gradient RMS. Optional clipping is configured with `train.max_grad_norm`; a finite raw norm such as 40 is a measurement, not an explosion classification. `objective_loss` (with compatibility alias `loss`) names the optimized blended objective, while `masked_ce` is pure CE over gathered prediction rows and `bpt` is only `masked_ce / ln(2)`. `suffix_ce`, suffix/random task ratios, semantic/physical mask ratios, top-2 posterior mass, and posterior entropy separate objective viability from generation correctness without another model forward.
 
-## Architecture based on Shannon information theory and 5G NR
+The locally retained, untracked log `logs/train_20260715_180755.log` covered steps `0..503`: loss fell from `8.8538` to `1.0447` (`-88.2%`), first/last-100 means were `6.7324`/`0.9648`, the minimum was `0.8416` at step 438, no NaN/Inf appeared, and throughput was about `1.076 steps/s`. This establishes early objective optimization only. The top-2 `of`/`and` mass `0.99977`, entropy `0.0927`, and `5.91..7.06` CE advantage are historical diagnostic measurements from the 2026-07-15 session, not a tracked repository artifact or repository-verifiable proof. The causal diagnosis of information-support leakage/mismatch is supported by reproduction, but no repository-verifiable log records those probe values; pre-mixing semantic erasure addresses the reproduced mismatch.
+
+## Architecture inspired by Shannon information theory and 5G NR
 
 ### Concept
 
-A language model is a codec in Shannon's sense, designed by analogy
-with the 5G NR physical layer.
+A language model is treated as a codec and designed with analogies to the
+5G NR physical layer. These mappings describe design inspiration only: the
+learned real-valued codec does not implement exact LDPC belief propagation,
+a probabilistically derived Bayesian filter, or a formal EXIT-chart algorithm.
 
 Source-Channel Separation Theorem: optimal communication is achieved
 by separate optimization of source coding (compression) and channel
 coding (error correction).
 
 The model is a masked LM (bidirectional, same-position prediction),
-not a causal next-token LM. Generation uses LLaDA-style iterative
-decoding: prompt + N in-vocabulary placeholders + boolean erasure mask → iterative filling by confidence
-(LDPC belief propagation analog).
+not a causal next-token LM. Generation obtains a posterior over a fully
+unknown suffix and applies constrained left-to-right token decisions with
+adaptive EOS stopping.
 
 ---
 
 ## Pipeline
 
-`HAGIv4.forward` executes four explicit stage boundaries:
-`_source_encode` → `_rate_match` → `_turbo_decode` → `_source_decode`.
-`DecodeState` carries Kalman covariance, MSA/DFE feedback, iteration
-marker, and cache intent through the turbo decoder. `SpectralCache`
+`HAGIv4.forward` executes five explicit stage boundaries:
+`_source_encode` → `_channel_encode` → `_apply_erasure` → `_channel_decode` → `_source_decode`.
+`_source_encode` replaces semantically unknown token embeddings before cache
+writes and frequency-domain mixing. `_channel_encode` then derives learned
+real-valued redundancy from the clean systematic latent; `_apply_erasure`
+corrupts only the received systematic part while preserving that redundancy.
+`DecodeState` carries Kalman covariance, HARQ feedback, iteration
+marker, and cache intent through the channel decoder. `SpectralCache`
 owns boundary context and stores a persistent snapshot of this state.
 Local immutable contracts (`codec_contracts.py`) isolate runtime
 model/train/inference stages from root config.
 
-Embedding table (83% of parameters) can remain on CPU at inference
-for VRAM savings; cross-device tensor transfers occur only at embedding
-lookup and lm_head projection. Embeddings are frozen
-(`freeze_embeddings=True`): copied from teacher, not trained.
+The embedding table can remain on CPU at inference for VRAM savings;
+cross-device tensor transfers occur only at embedding lookup and lm_head
+projection. Fresh embeddings are trainable from scratch. Distillation is
+optional but enabled by default in `TrainConfig` and in the canonical profile;
+an enabled run requires the configured distillation teacher to be available
+locally, which may require network access during prior model setup, and fails
+fast when that teacher cannot be loaded. Set `train.distill_enabled: false`
+explicitly for a teacher-free baseline.
 
 ```
 Token IDs
     |
     v
-+-----------------------------------------------+
-|           SOURCE ENCODER                       |
-|                                                |
-|  Embedding (vocab -> H, FROZEN, CPU offload)   |
-|  Masking (BEC: erasure, mask_embed=zero init)  |
-|  Pilot equalization (DC removal, spacing=8)    |
-|  FreqBlock x2 (2D FFT = OFDM pre-equalization) |
-|    + per-mode channel response (fading)        |
-|  AWGN noise injection (training-only, anneal)  |
-|                                                |
-|  5G: transport block + CRC + OFDM mod          |
-+----------------------+-------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-|         RATE MATCHING (deterministic)          |
-|                                                |
-|  rFFT(H) -> truncate to C bins                |
-|  + CQI-adaptive dynamic bandwidth (AMC)       |
-|  + CQI magnitude gate (0.5+0.5*CQI)           |
-|  + raised-cosine rolloff                      |
-|  -> irFFT(C) + RMSNorm                        |
-|  core_mask_embed (erasure in compressed domain)|
-|                                                |
-|  5G: puncturing/shortening (deterministic)     |
-|  CQI-adaptive gate + bandwidth = true AMC      |
-+----------------------+-------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-|      LDPC ITERATIVE DECODER (turbo loop)       |
-|                                                |
-|  for iteration in range(n_iters):             |
-|                                                |
-|    DFE: MSA.read(z)  [iter > 0]                |
-|      + HARQ soft combining (uncertainty-weighted)|
-|      Channel memory = past decisions cancel ISI|
-|      5G: DFE + HARQ Chase Combining            |
-|                                                |
-|    Component A: FreqBlock (prediction)          |
-|      Shared weights across reasoning layers    |
-|      2D FFT -> per-mode fading -> soft gate    |
-|      -> complex weight -> phase modulation     |
-|      -> 2D IFFT                                |
-|      5G: OFDM equalization                    |
-|                                                |
-|    Kalman predict: P_pred = P_prev + Q         |
-|      5G: channel estimation, uncertainty grow  |
-|                                                |
-|    Component B: GP2D (measurement)             |
-|      MultiScale geometric product = parity     |
-|      Gates init: -4, -5, -6 (conservative)     |
-|      5G: LDPC parity check                    |
-|                                                |
-|    Kalman update:                              |
-|      K = P_pred / (P_pred + R)                 |
-|      z = z_pred + K * (z_meas - z_pred)        |
-|      P = (1 - K) * P_pred                      |
-|      5G: optimal Bayesian channel estimation   |
-|                                                |
-|    SIC: freeze confident positions (training)  |
-|      confidence = 1/(1+|GP2D residual|)        |
-|      sic_gate = sigmoid(conf*sic_w + sic_b)    |
-|      z = z*(1-gate) + z.detach()*gate          |
-|      5G: Successive Interference Cancellation  |
-|                                                |
-|    Mutation: rank-32 bottleneck perturbation   |
-|      5G: noise injection for exploration       |
-|                                                |
-|    tanh clipping: z = scale * tanh(z / scale)  |
-|      5G: LLR clipping in LDPC decoding         |
-|                                                |
-|    HARQ: MSA.write(z)                          |
-|      Store parity-checked state for combining  |
-|      5G: HARQ buffer (Chase combining)         |
-|                                                |
-|    Convergence: ||innovation|| < eps -> stop   |
-|      5G: EXIT chart stopping criterion         |
-|                                                |
-+----------------------+-------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-|         RATE DEMATCHING                        |
-|                                                |
-|  rFFT(C) -> zero-pad to H bins + CQI gate     |
-|  -> irFFT(H)                                   |
-|  FreqBlock x2 (expression = shared perception) |
-|                                                |
-|  5G: rate dematching (de-puncturing)           |
-+----------------------+-------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-|         SOURCE DECODER (demodulation)          |
-|                                                |
-|  RMSNorm -> LM Head (H -> vocab)              |
-|  Weight tying: lm_head.weight = embed.weight  |
-|  (frozen — no gradients to embeddings)         |
-|  CE on masked positions only (same-position)   |
-|                                                |
-|  5G: demodulation -> bits                     |
-+-----------------------------------------------+
+SOURCE ENCODE
+  embedding -> semantic unknown replacement -> cache write -> FreqBlock mixing
+  -> CQI-controlled frequency bottleneck -> clean systematic latent
+    |
+    v
+CHANNEL ENCODE
+  SparseParityEncoder(clean systematic) -> learned real-valued redundancy
+  -> concatenate systematic/redundancy -> interleave
+    |
+    v
+APPLY ERASURE
+  deinterleave -> AWGN and/or physical replacement on received systematic only
+  -> preserve redundancy -> reinterleave
+    |
+    v
+CHANNEL DECODE
+  iterative FreqBlock prediction -> sparse parity residual
+  -> Kalman-form gated correction -> extrinsic accumulation/HARQBuffer
+  -> optional directional-novelty convergence halt
+    |
+    v
+SOURCE DECODE
+  frequency-domain expansion C -> H -> FreqBlock mixing -> RMSNorm -> LM head
 ```
+
+The sparse parity graph, iterative correction, Kalman equations, HARQ buffer,
+and convergence proxy are analogies to communications techniques. They are not
+exact LDPC, Bayesian inference, HARQ retransmission, or EXIT-chart algorithms.
 
 ---
 
@@ -183,73 +123,60 @@ which frequencies matter more.
 
 5G analog: Frequency-selective fading channel + per-subcarrier equalization.
 
-### Kalman Filter
+### Kalman-Form Residual Correction
 
-Optimal Bayesian blend via Kalman gain.
-Kalman gain is adaptive: high uncertainty → trust measurement (GP2D).
-Low uncertainty → trust prediction (FreqBlock).
+The decoder tracks diagonal state `P` and uses learned, sigmoid-bounded `Q`
+and `R` in the Kalman-form equations `P_pred = P + Q`,
+`K = P_pred / (P_pred + R)`, and `P = (1-K) * P_pred`. It applies `K` to
+the sparse parity residual averaged over checks and passes the correction
+through a learned gate. This is a Kalman-filter analogy and implementation
+pattern, not a claim that the model computes an exact Bayesian posterior.
 
-Diagonal covariance: O(C) per iteration, negligible parameter count.
+### HARQ Buffer
 
-### Channel Memory (MSA) = DFE + HARQ
-
-MSA has two explicit roles:
-- **DFE (Decision Feedback Equalizer)**: read from previous iterations
-  cancels ISI. Past decisions = feedback signal.
-- **HARQ buffer**: write after parity check. Stored states combined
-  across iterations = Chase combining.
-
-MSA ring buffer: `TensorSlotRegistry` with monotonic `num_written` counter,
-correctly handling wrap-around. Serialize/restore feedback via
-`DecodeState.msa_feedback` for cache continuity.
+`HARQBuffer` stores extrinsic updates, reads top-ranked stored updates, and
+combines them with the current update using tracked uncertainty. Feedback is
+serialized through `DecodeState.harq_feedback` for cache continuity. HARQ soft
+combining is the communications analogy; this is not retransmission-level
+Chase combining or a decision-feedback equalizer.
 
 ### HARQ Soft Combining
 
-MSA.read is combined with previous residual, weighted by uncertainty:
+On decoder iterations after the first, `HARQBuffer.read` supplies stored
+extrinsic information and `HARQBuffer.combine` weights it using mean diagonal
+Kalman uncertainty:
 
 ```python
-uncertainty = prev_residual.abs().mean(dim=-1)
-harq_alpha = sigmoid(harq_gate) * sigmoid(uncertainty * 10.0)
-z = z + harq_alpha * msa_out  # harq_gate=-5: nearly OFF at start
+stored_ext = self.harq.read(z_sys + ext, top_k=self.harq.cfg.top_k)
+uncertainty = p.unsqueeze(0).expand(B, T, -1).mean(dim=-1)
+ext = self.harq.combine(ext, stored_ext, uncertainty)
 ```
 
 High uncertainty → more trust in stored state (prior).
 Low uncertainty → more trust in current state.
 
-5G analog: HARQ Chase Combining — soft combining of retransmitted codewords.
+5G analogy: uncertainty-weighted soft combining. The implementation combines
+learned extrinsic tensors, not retransmitted codewords.
 
-### SIC — Successive Interference Cancellation
-
-After each turbo loop iteration, per-position confidence is computed
-from GP2D residual. Confident positions are frozen (detach gradient),
-gradients flow only to uncertain positions.
-
-```python
-confidence = 1.0 / (1.0 + gp2d_residual.abs().mean(dim=-1))
-sic_gate = sigmoid(confidence * sic_w + sic_b)  # sic_b=-10: nearly OFF at start
-z = z * (1 - gate) + z.detach() * gate
-```
-
-Initialization `sic_b=-10` → `sigmoid(-10)≈0.00005` — SIC is nearly off
-at start, the model activates it through learning.
-
-5G analog: SIC — decode strong signal → subtract → decode weak.
-
-### Dynamic Bottleneck — true AMC
+### Dynamic Bottleneck — AMC Analogy
 
 CQI controls both magnitude gate and bandwidth cutoff:
 
 ```python
-bw_scale = 1.0 - 0.15 * cqi           # high CQI → fewer bins (more compression)
+bw_base = sigmoid(cqi_bw_logit)
+bw_scale = bw_base + (1.0 - bw_base) * cqi
 cutoff = n_bins * bw_scale
-dyn_mask = sigmoid((cutoff - bin_idx) * 6.0)
-gate = base_gate * dyn_mask * (0.5 + 0.5 * cqi)
+dyn_mask = sigmoid((cutoff - bin_idx) * (1.0 + abs(bw_base) * n_bins))
+mag_base = sigmoid(cqi_mag_logit)
+gate = base_gate * dyn_mask * (mag_base + (1.0 - mag_base) * cqi)
 ```
 
-High CQI → fewer bins = more compression (good channel).
-Low CQI → more bins = more redundancy (bad channel).
+Higher CQI moves the soft cutoff toward the full retained band and increases
+the magnitude scale; lower CQI moves both toward their learned bases.
 
-5G analog: True AMC — CQI determines both modulation order and code rate.
+5G analogy: AMC-like CQI control. The implementation changes latent frequency
+bandwidth and magnitude; it does not select a standardized modulation and
+coding scheme.
 
 ### Deterministic Bottleneck (Rate Matching)
 
@@ -258,56 +185,59 @@ Deterministic rFFT truncation H→C + CQI-adaptive gate.
 
 ### AWGN Noise Injection (training-only)
 
-Gaussian noise is added to hidden states after FreqBlock
-in the source encoder:
+After channel encoding, Gaussian noise is added to the received systematic
+symbols in `_apply_erasure`; learned redundancy remains clean:
 
 ```python
 if self.training and awgn_sigma > 0.0:
-    h = h + awgn_sigma * torch.randn_like(h)
+    systematic.add_(awgn_sigma * torch.randn_like(systematic))
 ```
 
 Sigma annealing: `0.005 → 0.0` linearly until 50% of training.
 
 5G analog: Training with AWGN channel — model robustness to additive noise.
 
-### MultiScale GP2D
+### Sparse Real-Valued Redundancy
 
-Multi-scale geometric product with interleaving for burst error protection:
-- Scale 1 (window=1): adjacent parity — high-freq errors
-- Scale 2 (window=4): mid-range parity — burst errors
-- Scale 3 (window=16): long-range parity — structural errors
+`SparseParityEncoder` maps each systematic latent `[B,T,C]` to learned
+real-valued redundancy `[B,T,M]` with a fixed sparse connectivity mask,
+learned weights, and `RMSNorm`. The systematic and redundancy tensors are
+concatenated and interleaved before physical corruption. The decoder-side
+`SparseParityChecker` shares the encoder mask, weights, and normalization and
+computes `parity_received - parity_computed`. This sparse graph is LDPC-style
+inspiration only: values are continuous learned features, and decoding is not
+the standardized binary LDPC sum-product or min-sum algorithm.
 
-Gates init: `-4.0, -5.0, -6.0` (sigmoid → 0.02, 0.007, 0.002).
-GP2D is nearly off at start — does not dominate before the model
-learns basic representations. Activated gradually through learning.
+### Embeddings
 
-### Frozen Embeddings
-
-`freeze_embeddings=True` — embeddings are copied from teacher
-(SmolLM2-135M / Gemma) and frozen. Gradients do not flow into the
-embedding table, `lm_head.weight = embed.weight` (tied, frozen).
-
-VRAM savings: no optimizer state for the largest parameter group.
-Quality: teacher embeddings already contain semantic structure,
-no need to relearn.
+Embeddings remain trainable from scratch (`freeze_embeddings=False`), but the
+current defaults enable teacher distillation rather than a teacher-free baseline:
+`TrainConfig` and `configs/8gb_canonical.yaml` enable optional distillation.
+That profile requires the configured distillation teacher to be available
+locally, which may require network access during prior model setup, and startup
+fails fast when the enabled distillation teacher cannot be loaded. Set
+`train.distill_enabled: false` explicitly for a teacher-free baseline. Weight
+tying remains supported.
 
 ### Masked LM + LLaDA-style Generation
 
-Same-position masked LM (bidirectional). Generation via
-LLaDA-style iterative decoding:
-1. Create prompt + N in-vocabulary placeholders and a separate boolean erasure mask
-2. Forward pass → logits for all mask positions
-3. Fill confident positions (top-50% by confidence)
-4. Repeat forward, gradually filling remaining positions
-5. Stop when all masks replaced or max_iterations reached
+Same-position masked LM (bidirectional). Training mixes random unknowns
+and full unknown suffixes 50/50. Generation performs one final refinement
+over the fully unknown suffix, returns gathered logits only for prediction
+positions, and applies the unified logits processor left-to-right. EOS is
+forbidden before two generated tokens and ends each row adaptively through
+`max_new_tokens`; shorter rows remain padded in `GenerationOutput`.
 
-5G analog: LDPC belief propagation — fill confident positions first,
-using them as additional pilot signals for the remaining ones.
+Coding analogy: iterative refinement. Generation itself performs constrained
+left-to-right decisions from gathered masked-LM posteriors; it is not LDPC
+belief propagation.
 
 ### Teacher as pilot generator (DM-RS analog)
 
-Teacher (Gemma/SmolLM2) is used as a pilot/reference signal
-generator (5G DM-RS analog):
+Teacher (Gemma/SmolLM2) can optionally be used as a pilot/reference signal
+generator (5G DM-RS analog). `TrainConfig` and the canonical profile enable
+this optional distillation path by default; set `train.distill_enabled: false`
+explicitly for a teacher-free baseline:
 - **Embedding transfer**: copy (or project) teacher embeddings into
   student. Random projection when hidden_size differs.
 - **Hidden state alignment**: MSE(student_hidden, teacher_hidden) on
@@ -319,10 +249,10 @@ generator (5G DM-RS analog):
 KL distillation on logits is disabled: causal teacher logits (next-token)
 conflict with masked LM student (same-position).
 
-### mask_embed Init
+### Semantic Erasure Embedding
 
-`zero_()` — mask embedding starts with zero norm,
-the model learns the optimal mask signal independently.
+`semantic_unknown_embed` is learned and randomly initialized as an explicit
+erasure indicator. It replaces unknown token embeddings before any mixing.
 
 ### Mutation Rank
 
@@ -330,23 +260,30 @@ rank=32 — capacity for noise injection in the turbo loop.
 
 ---
 
-## Training Objective
+## Training Objective And Evidence Metrics
 
 ```
-Loss = CE                                    # Fidelity: same-position masked prediction
-      + aux_w(step) * lambda_1 * sigmoid(Parity * 5)    # Redundancy: soft-clamped (subtracted)
-      + aux_w(step) * lambda_2 * Whiteness               # GP2D residual autocorrelation
-      + aux_w(step) * lambda_3 * Extrinsic_info          # Convergence penalty (innovation norm)
-      + aux_w(step) * lambda_4 * Efficiency              # Iterations used (minimize computation)
-      + aux_w(step) * lambda_5 * Rate_distortion         # Reconstruction MSE (pre/post bottleneck)
-      + aux_w(step) * lambda_6 * MSA_load_balance        # Slot usage uniformity
-      + aux_w(step) * lambda_7 * Contrastive             # Modality alignment (multimodal only)
+Level 1: objective = CE
+Level 2: objective = CE + lambda_rate * Rate_distortion
+                        + lambda_parity * log1p(Parity)
+                        + lambda_contrastive * Contrastive
+Level 3: objective = Level 2 + lambda_whiteness * Whiteness
+                           + lambda_correction * Correction_alignment
 ```
 
-Where `aux_w(step)`:
-- `step < warmup_steps` → `0.0` (Phase 0: CE only)
-- `warmup_steps ≤ step < 2*warmup_steps` → linear ramp `0→1`
-- `step ≥ 2*warmup_steps` → `1.0` (full loss)
+The displayed `Loss` is the blended optimization objective and is logged as
+`objective_loss` with the compatibility alias `loss`. It must not be used to
+derive bits per token. Pure evidence metrics are computed under `no_grad`
+from the existing gathered `[N_prediction,V]` logits:
+
+- `masked_ce`: CE over every gathered prediction row.
+- `bpt`: exactly `masked_ce / ln(2)`.
+- `suffix_ce`: CE only over rows belonging to suffix tasks; NaN when no suffix row exists.
+- `top2_mass` and `posterior_entropy`: compact posterior concentration evidence, not generation correctness claims.
+- `suffix_task_ratio`, `random_task_ratio`, `semantic_mask_ratio`, and `physical_corruption_ratio`: observed task/channel support.
+
+The staged auxiliary schedule is discrete: level 1 before `warmup_steps`,
+level 2 until `2 * warmup_steps`, then level 3.
 
 5G analog: Initial transmission without channel coding (uncoded),
 then gradual coding.
@@ -369,7 +306,7 @@ Distill_loss = alpha * CE + (1 - alpha) * MSE(student_hidden, teacher_hidden)
 
 Where:
 - **CE** = masked cross-entropy on masked positions, same-position targets
-- **Parity** = GP2D residual energy, soft-clamped via sigmoid (subtract = reward)
+- **Parity** = sparse parity-check residual energy accumulated by the decoder
 - **Whiteness** = lag-1 autocorrelation penalty (decorrelated residual)
 - **Extrinsic_info** = innovation norm, **penalty** (reward convergence)
 - **Efficiency** = iterations used (minimize computation)
@@ -386,20 +323,15 @@ then 1.0 (CE only). Teacher freed after distill_end_frac.
 ### LLaDA-style Iterative Decoding
 
 ```
-1. Init: prompt + max_new_tokens in-vocabulary placeholders plus boolean erasure mask
-2. For iteration in range(max_iterations):
-   a. Run full pipeline: Embed → FreqBlock → Bottleneck → Turbo → Up → LM
-   b. Get logits at all mask positions
-   c. Compute confidence per mask position
-   d. Fill top-50% confident positions (last iteration: fill all remaining)
-   e. Ban configured forbidden token IDs from logits
-   f. Apply echo cancellation (repetition penalty) on visible tokens
-3. Stop when all mask filled or EOS detected
+1. Init: prompt + `max_new_tokens` placeholders plus a fully true suffix `semantic_unknown_mask`.
+2. Run the configured final refinement and gather logits for suffix prediction positions only.
+3. Process each suffix position left-to-right: forbidden IDs, minimum-length EOS gate, repetition penalty, no-repeat n-gram, temperature, top-k, then sampling/argmax.
+4. Stop each row at its first valid EOS in `2..max_new_tokens`; pad unused suffix positions.
+5. Return `GenerationOutput(token_ids, generated_lengths, finished)`.
 ```
 
-5G analog: LDPC belief propagation — iterative filling of confident
-positions, using filled ones as additional pilot signals for the
-remaining. Turbo loop iterations controllable via `max_iterations`.
+`max_iterations` controls internal turbo refinement; it does not perform
+confidence-ranked repeated full-model generation forwards.
 
 ### VRAM Efficiency
 
@@ -414,9 +346,9 @@ params (bf16) instead of ~10 GB for full model.
 
 | 5G NR Stage | HAGI Component | File |
 |-------------|----------------|------|
-| Transport block + CRC | Embedding + Masking (zero init, frozen) | hagi_v4.py |
+| Transport block + CRC | Visible embedding or pre-mixing semantic erasure | hagi_v4.py |
 | Pilot/reference signal (DM-RS) | Teacher hidden states (distillation) | distillation.py |
-| Scrambling | mask_embed (zero init, learnable) | hagi_v4.py |
+| Scrambling | semantic_unknown_embed (learned erasure indicator) | hagi_v4.py |
 | OFDM modulation (IFFT) | torch.fft.irfft2 | freq_layer.py |
 | Modulation mapping (QAM) | FreqCoding2D phase modulation | freq_layer.py |
 | Layer mapping + precoding | Multi-head + complex weight (rank=16) | freq_layer.py |
@@ -427,18 +359,16 @@ params (bf16) instead of ~10 GB for full model.
 | OFDM demodulation (FFT) | torch.fft.rfft2 | freq_layer.py |
 | Channel estimate | Kalman filter (P, Q, R) | kalman.py |
 | Equalization | Complex weight @ freq modes | freq_layer.py |
-| LDPC iterative decode | TurboLoop (4 iterations) | hagi_v4.py |
-| Parity check | MultiScaleGP2D (gates init -4,-5,-6) | gp2d.py |
-| Successive Interference Cancellation | SIC: freeze confident positions | hagi_v4.py |
-| Noise injection | Mutation (rank=32 bottleneck) | hagi_v4.py |
-| LLR clipping | tanh scaling (scale=10) | hagi_v4.py |
-| HARQ buffer (Chase combining) | MSA.write + soft combining (uncertainty-weighted) | msa.py |
-| Decision Feedback Equalizer | MSA.read | msa.py |
-| EXIT chart stopping | Convergence halt (innovation norm) | hagi_v4.py |
+| Sparse channel redundancy (LDPC analogy only) | `SparseParityEncoder` learned real-valued projection | sparse_parity.py |
+| Sparse parity residual (LDPC analogy only) | `SparseParityChecker` with shared encoder parameters | sparse_parity.py |
+| Iterative correction (belief-propagation analogy only) | `LDPCDecoder`: FreqBlock reasoning, residual correction, extrinsic accumulation | hagi_v4.py |
+| Kalman-style estimation (not exact Bayesian inference) | Learned diagonal `P`, `Q`, `R` residual update | kalman.py, hagi_v4.py |
+| HARQ soft-combining analogy | `HARQBuffer` extrinsic write/read/combine | msa.py |
+| EXIT analogy only | Directional-novelty convergence proxy | exit_chart.py, hagi_v4.py |
 | Adaptive modulation (AMC) | CQI gate + dynamic bandwidth + soft freq gating | hagi_v4.py, freq_layer.py |
 | Rate dematching | rFFT zero-pad (C→H) + CQI gate | hagi_v4.py |
-| Demodulation → bits | LM head (tied embeddings, frozen) | hagi_v4.py |
-| Belief propagation | LLaDA iterative decoding | generate.py |
+| Demodulation → bits | LM head over gathered prediction states | hagi_v4.py |
+| Iterative decoding analogy | Masked-LM posterior generation | generate.py |
 
 ---
 
@@ -450,15 +380,10 @@ params (bf16) instead of ~10 GB for full model.
 | `train.awgn_sigma_start` | `0.005` | Initial noise sigma |
 | `train.awgn_sigma_end` | `0.0` | Final sigma (anneal to zero) |
 | `train.awgn_end_frac` | `0.5` | Fraction of training for anneal |
-| `train.freeze_embeddings` | `true` | Freeze embedding table |
-| `model.gp2d.multiscale_gate_inits` | `[-4, -5, -6]` | Conservative GP2D gates |
-
-SIC and HARQ soft combining — learnable parameters in TurboLoop:
-| Parameter | Init | Description |
-|-----------|------|-------------|
-| `turbo.sic_w` | `10.0` | SIC confidence weight |
-| `turbo.sic_b` | `-10.0` | SIC bias (OFF at start) |
-| `turbo.harq_gate` | `-5.0` | HARQ combining gate (OFF at start) |
+| `train.freeze_embeddings` | `false` | Fresh baseline trains embeddings from scratch |
+| `train.distill_enabled` | `true` | Enables optional teacher distillation in `TrainConfig` and the canonical profile; set `false` for a teacher-free baseline |
+| `model.codec.code_rate` | `0.5` | Configured systematic code-rate target |
+| `model.codec.edges_per_check` | `4` | Default sparse inputs per redundancy check |
 
 Per-mode frequency response — learnable parameters in FreqCoding2D:
 | Parameter | Init | Description |

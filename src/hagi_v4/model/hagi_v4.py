@@ -25,6 +25,7 @@ from hagi_v4.model.codec_contracts import (
     DecodeResult,
     DecodeState,
     InferenceShapeConfig,
+    SemanticMaskBatch,
     SourceEncodeResult,
     TurboDecodeConfig,
 )
@@ -147,13 +148,17 @@ class LDPCDecoder(nn.Module):
         state: DecodeState,
         cqi_mean: torch.Tensor | float = 0.5,
         mask: torch.Tensor | None = None,
+        refinement_iterations: int | None = None,
     ) -> DecodeResult:
         B, T, C = z_sys.shape
+        iteration_limit = self.n_iters if refinement_iterations is None else refinement_iterations
+        if type(iteration_limit) is not int or not 1 <= iteration_limit <= self.n_iters:
+            raise ValueError(f"refinement_iterations must be an integer in [1, {self.n_iters}]")
 
         total_parity = z_sys.new_zeros(())
         extrinsic_norms: list = []
-        converged_at = self.n_iters
-        iterations_used = torch.full((B, T), self.n_iters, dtype=torch.long, device=z_sys.device)
+        converged_at = iteration_limit
+        iterations_used = torch.full((B, T), iteration_limit, dtype=torch.long, device=z_sys.device)
         parity_residual = torch.zeros_like(z_sys)
 
         p = state.kalman_p if state.kalman_p is not None else torch.ones(C, device=z_sys.device, dtype=z_sys.dtype)
@@ -181,7 +186,7 @@ class LDPCDecoder(nn.Module):
 
         ext = torch.zeros_like(z_sys)
 
-        for iteration in range(self.n_iters):
+        for iteration in range(iteration_limit):
             ext_before = ext
 
             if iteration > 0:
@@ -282,9 +287,8 @@ class HAGIv4(nn.Module):
         self.embed = nn.Embedding(m.vocab_size, H)
         nn.init.normal_(self.embed.weight, mean=0.0, std=1.0 / math.sqrt(H))
 
-        bound = 1.0 / math.sqrt(H)
-        self.mask_embed = nn.Parameter(torch.empty(H))
-        nn.init.uniform_(self.mask_embed, -bound, bound)
+        self.semantic_unknown_embed = nn.Parameter(torch.empty(H))
+        nn.init.normal_(self.semantic_unknown_embed, mean=0.0, std=1.0 / math.sqrt(H))
 
         self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
@@ -461,7 +465,7 @@ class HAGIv4(nn.Module):
     def _source_encode(
         self,
         input_ids: torch.Tensor | None,
-        mask: torch.Tensor | None,
+        semantic_unknown_mask: torch.Tensor | None,
         cache: SpectralCache | None,
         awgn_sigma: float = 0.0,
         pre_encoded_h: torch.Tensor | None = None,
@@ -479,6 +483,9 @@ class HAGIv4(nn.Module):
                 h = self.embed(input_ids.to(embed_dev)).to(ids_dev)
             else:
                 h = self.embed(input_ids)
+            if semantic_unknown_mask is not None:
+                unknown = self.semantic_unknown_embed.to(device=h.device, dtype=h.dtype)
+                h = torch.where(semantic_unknown_mask.to(h.device).unsqueeze(-1), unknown, h)
 
             cached_len = 0
             if cache is not None and cache.context_len > 0:
@@ -511,7 +518,7 @@ class HAGIv4(nn.Module):
         z = torch.fft.irfft(h_f[:, :, :n_bins] * gate, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
 
-        return SourceEncodeResult(systematic=z, mask=mask, cqi=cqi, pre_bottleneck=h)
+        return SourceEncodeResult(systematic=z, mask=semantic_unknown_mask, cqi=cqi, pre_bottleneck=h)
 
     def _channel_encode(self, encoded: SourceEncodeResult) -> ChannelEncodeResult:
         systematic = encoded.systematic
@@ -548,6 +555,7 @@ class HAGIv4(nn.Module):
         encoded: SourceEncodeResult,
         state: DecodeState,
         training: bool,
+        refinement_iterations: int | None = None,
     ) -> DecodeResult:
         codeword = self.interleaver.deinterleave(ch_encoded.codeword)
         C = self._C
@@ -561,6 +569,7 @@ class HAGIv4(nn.Module):
             state=state,
             cqi_mean=cqi_mean,
             mask=ch_encoded.erasure_mask,
+            refinement_iterations=refinement_iterations,
         )
         if ch_encoded.erasure_mask is not None and ch_encoded.erasure_mask.any():
             predicted = result.latent - z_sys
@@ -592,30 +601,57 @@ class HAGIv4(nn.Module):
         self,
         input_ids: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
+        *,
+        semantic_unknown_mask: torch.Tensor,
+        prediction_mask: torch.Tensor,
+        valid_target_mask: torch.Tensor,
+        physical_corruption_mask: torch.Tensor,
         step: int = 0,
         cached_p: torch.Tensor | None = None,
         cache: SpectralCache | None = None,
         awgn_sigma: float = 0.0,
         images: torch.Tensor | None = None,
         spectrograms: torch.Tensor | None = None,
+        refinement_iterations: int | None = None,
     ) -> ModelOutput:
+        if input_ids is None:
+            raise ValueError("input_ids is required")
+        masks = SemanticMaskBatch(
+            semantic_unknown_mask,
+            prediction_mask,
+            valid_target_mask,
+            physical_corruption_mask,
+        )
+        use_multimodal = self.multimodal_enabled and (images is not None or spectrograms is not None)
+        mm_h: torch.Tensor | None = None
+        modality_ids: torch.Tensor | None = None
+        if use_multimodal:
+            mm_h, modality_ids, _ = self.multimodal_input(
+                input_ids=input_ids,
+                images=images,
+                spectrograms=spectrograms,
+            )
+        masks.validate(input_ids, mm_h.shape[:2] if mm_h is not None else None)
         state = cache.to_decode_state() if cache is not None else DecodeState(kalman_p=cached_p)
         if cache is not None and state.kalman_p is None:
             state.kalman_p = cached_p
 
-        use_multimodal = self.multimodal_enabled and (images is not None or spectrograms is not None)
-
-        modality_ids: torch.Tensor | None = None
         if use_multimodal:
-            mm_h, modality_ids, _ = self.multimodal_input(input_ids=input_ids, images=images, spectrograms=spectrograms)
+            assert mm_h is not None
+            text_len = input_ids.shape[1]
+            unknown = self.semantic_unknown_embed.to(device=mm_h.device, dtype=mm_h.dtype)
+            mm_h[:, :text_len] = torch.where(
+                semantic_unknown_mask.to(mm_h.device).unsqueeze(-1),
+                unknown,
+                mm_h[:, :text_len],
+            )
             mm_h = self.cross_modal(mm_h, modality_ids, self.multimodal_input.num_modalities)
-            encoded = self._source_encode(None, None, cache, awgn_sigma, pre_encoded_h=mm_h)
+            encoded = self._source_encode(None, semantic_unknown_mask, cache, awgn_sigma, pre_encoded_h=mm_h)
         else:
-            encoded = self._source_encode(input_ids, None, cache, awgn_sigma)
+            encoded = self._source_encode(input_ids, semantic_unknown_mask, cache, awgn_sigma)
 
-        chEncoded = self._apply_erasure(self._channel_encode(encoded), mask, awgn_sigma)
-        decoded = self._channel_decode(chEncoded, encoded, state, self.training)
+        chEncoded = self._apply_erasure(self._channel_encode(encoded), physical_corruption_mask, awgn_sigma)
+        decoded = self._channel_decode(chEncoded, encoded, state, self.training, refinement_iterations)
         h = self._source_decode(decoded, encoded)
 
         if cache is not None:
@@ -626,21 +662,17 @@ class HAGIv4(nn.Module):
 
         h_normed = self.final_norm(h)
         lm_dev = self.lm_head.weight.device
-        if targets is not None and mask is not None:
-            h_masked = h_normed[mask]
-            if h_masked.shape[0] > 0:
-                ce = F.cross_entropy(
-                    F.linear(h_masked.to(lm_dev), self.lm_head.weight),
-                    targets[mask].to(lm_dev),
-                )
-            else:
-                ce = self._chunked_ce(h_normed, targets)
-            logits = None
-        elif targets is not None:
-            ce = self._chunked_ce(h_normed, targets)
-            logits = None
+        selected = prediction_mask & valid_target_mask
+        prediction_indices = selected.flatten().nonzero(as_tuple=False).squeeze(-1)
+        prediction_hidden = h_normed[:, : input_ids.shape[1]] if use_multimodal else h_normed
+        selected_hidden = prediction_hidden.flatten(0, 1).index_select(0, prediction_indices.to(h_normed.device))
+        logits = F.linear(selected_hidden.to(lm_dev), self.lm_head.weight).to(h_normed.device)
+        if targets is not None:
+            if prediction_indices.numel() == 0:
+                raise ValueError("prediction_mask must select at least one target during training")
+            selected_targets = targets.flatten().index_select(0, prediction_indices.to(targets.device))
+            ce = F.cross_entropy(logits.to(lm_dev), selected_targets.to(lm_dev))
         else:
-            logits = F.linear(h_normed.to(lm_dev), self.lm_head.weight).to(h_normed.device)
             ce = None
 
         aux = AuxLosses()
@@ -653,8 +685,7 @@ class HAGIv4(nn.Module):
                     side_info["parity_residual"].device,
                 )
                 valid = pilot_mask.unsqueeze(0).expand(side_info["parity_residual"].shape[0], -1)
-                if mask is not None:
-                    valid = valid & ~mask
+                valid = valid & ~physical_corruption_mask.to(valid.device)
                 aux.whiteness = compute_whiteness_loss(side_info["parity_residual"], valid)
             aux.correction_alignment = side_info["correction_alignment"].to(h.dtype)
             aux.rate_distortion = rd_loss
@@ -668,4 +699,5 @@ class HAGIv4(nn.Module):
             aux=aux,
             ce_loss=ce,
             iterations_used=side_info.get("iterations_used"),
+            prediction_indices=prediction_indices,
         )

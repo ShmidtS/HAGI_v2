@@ -70,8 +70,6 @@ class ContrastiveAlignment(nn.Module):
                 z_a = self._proj(mod_a)(h_a)
                 z_b = self._proj(mod_b)(h_b)
 
-                sim_pos = F.cosine_similarity(z_a, z_b, dim=-1) / self.temperature
-
                 negatives_a = []
                 negatives_b = []
                 for other_b in range(B):
@@ -84,16 +82,14 @@ class ContrastiveAlignment(nn.Module):
                     if other_mb.any():
                         negatives_b.append(self._proj(mod_b)(h[other_b][other_mb].mean(dim=0)))
 
-                if not negatives_a and not negatives_b:
-                    continue
-
-                all_b = torch.stack([z_b] + negatives_a)
-                logits_a = F.cosine_similarity(z_a.unsqueeze(0), all_b, dim=-1) / self.temperature
-                loss = loss - F.log_softmax(logits_a, dim=0)[0]
-                n_pairs += 1
-
                 if negatives_b:
-                    all_a = torch.stack([z_a] + negatives_b)
+                    all_b = torch.stack([z_b] + negatives_b)
+                    logits_a = F.cosine_similarity(z_a.unsqueeze(0), all_b, dim=-1) / self.temperature
+                    loss = loss - F.log_softmax(logits_a, dim=0)[0]
+                    n_pairs += 1
+
+                if negatives_a:
+                    all_a = torch.stack([z_a] + negatives_a)
                     logits_b = F.cosine_similarity(z_b.unsqueeze(0), all_a, dim=-1) / self.temperature
                     loss = loss - F.log_softmax(logits_b, dim=0)[0]
                     n_pairs += 1

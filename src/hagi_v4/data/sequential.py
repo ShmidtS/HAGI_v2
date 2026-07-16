@@ -63,6 +63,8 @@ class SequentialCyclingIterator:
         samples_per_cycle: int = 5000,
         num_workers: int = 0,
         dtype: str = "auto",
+        eos_token_id: int | None = None,
+        pad_token_id: int | None = None,
     ):
         self.entries = entries  # [(name, path), ...]
         self.seq_len = seq_len
@@ -72,6 +74,8 @@ class SequentialCyclingIterator:
         self.samples_per_cycle = samples_per_cycle
         self.num_workers = num_workers
         self.dtype = dtype
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
 
         self.current_idx = 0
         self.current_cycle = 0
@@ -86,7 +90,14 @@ class SequentialCyclingIterator:
 
     def _build_loader(self) -> DataLoader:
         name, path = self.entries[self.current_idx]
-        ds = MemmapDataset(path, self.seq_len, self.vocab_size, dtype=self.dtype)
+        ds = MemmapDataset(
+            path,
+            self.seq_len,
+            self.vocab_size,
+            dtype=self.dtype,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+        )
         subset = RandomSubsetDataset(ds, self.samples_per_cycle)
         loader = DataLoader(
             subset,
@@ -212,6 +223,10 @@ def build_sequential_dataloader(
             if Path(path).exists():
                 stage1_entries.append((name, path))
 
+    if not stage1_entries:
+        expected = ", ".join(f"{name}.bin" for name in curriculum_order)
+        raise ValueError(f"no stage1 datasets found in {data_dir}; expected: {expected}")
+
     cycles = cfg.train.sequential_cycles
     samples_per_cycle = max(1000, cfg.train.max_steps * cfg.train.batch_size // (len(stage1_entries) * cycles))
     dtype = getattr(cfg.train, "data_dtype", "auto")
@@ -224,6 +239,8 @@ def build_sequential_dataloader(
         batch_size=cfg.train.batch_size,
         samples_per_cycle=samples_per_cycle,
         dtype=dtype,
+        eos_token_id=cfg.train.eos_token_id,
+        pad_token_id=cfg.train.pad_token_id,
     )
 
     # Stage 2: hard-reasoning subset from config
@@ -240,6 +257,8 @@ def build_sequential_dataloader(
             batch_size=cfg.train.batch_size,
             samples_per_cycle=samples_per_cycle,
             dtype=dtype,
+            eos_token_id=cfg.train.eos_token_id,
+            pad_token_id=cfg.train.pad_token_id,
         )
 
     return CurriculumBatchProvider(

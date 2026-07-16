@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,9 +30,15 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class TeacherHidden:
+    hidden: torch.Tensor
+    visibility_mask: torch.BoolTensor
+
+
 def create_distillation_teacher(cfg, device: torch.device):
     """Create and load the canonical teacher when distillation is enabled."""
-    if not cfg.train.distill_enabled:
+    if cfg.train.distill_enabled is not True:
         return None
     teacher = DistillationTeacher(cfg.train.distill_teacher)
     teacher.load()
@@ -56,12 +63,12 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
         return False
 
     try:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, torch_dtype=torch.bfloat16, local_files_only=True)
-    except Exception:
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+    except (OSError, ValueError) as causal_error:
         try:
-            teacher = AutoModel.from_pretrained(teacher_name, torch_dtype=torch.bfloat16, local_files_only=True)
-        except Exception as e:
-            logger.warning(f"Could not load {teacher_name}: {e}")
+            teacher = AutoModel.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+        except (OSError, ValueError) as base_error:
+            logger.warning(f"Could not load {teacher_name}: causal={causal_error}; base={base_error}")
             return False
 
     teacher_emb = None
@@ -131,13 +138,14 @@ class DistillationTeacher:
             return
         try:
             from transformers import AutoModel, AutoModelForCausalLM
-        except ImportError:
-            logger.warning("transformers not installed — distillation disabled")
-            return
+        except ImportError as error:
+            raise RuntimeError(
+                f"Could not load distillation teacher {self.teacher_name}: transformers unavailable"
+            ) from error
 
         try:
             self._model = AutoModelForCausalLM.from_pretrained(
-                self.teacher_name, torch_dtype=torch.bfloat16, local_files_only=True
+                self.teacher_name, dtype=torch.bfloat16, local_files_only=True
             )
             self._model.eval()
             for param in self._model.parameters():
@@ -172,11 +180,9 @@ class DistillationTeacher:
 
             self._loaded = True
             logger.info(f"Teacher loaded: {self.teacher_name}")
-        except Exception:
+        except (OSError, ValueError) as causal_error:
             try:
-                self._model = AutoModel.from_pretrained(
-                    self.teacher_name, torch_dtype=torch.bfloat16, local_files_only=True
-                )
+                self._model = AutoModel.from_pretrained(self.teacher_name, dtype=torch.bfloat16, local_files_only=True)
                 self._model.eval()
                 for param in self._model.parameters():
                     param.requires_grad_(False)
@@ -184,36 +190,75 @@ class DistillationTeacher:
                 self._lm_head_weight = self._model.get_input_embeddings().weight
                 self._loaded = True
                 logger.info(f"Teacher loaded (AutoModel): {self.teacher_name}")
-            except Exception as e:
-                logger.warning(f"Could not load teacher {self.teacher_name}: {e}")
+            except (OSError, ValueError) as base_error:
+                raise RuntimeError(
+                    f"Could not load distillation teacher {self.teacher_name}: causal={causal_error}; base={base_error}"
+                ) from base_error
+        except Exception as error:
+            raise RuntimeError(f"Could not load distillation teacher {self.teacher_name}: {error}") from error
 
     @torch.no_grad()
-    def get_hidden(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+    def get_hidden(self, input_ids: torch.Tensor, visibility_mask: torch.Tensor) -> TeacherHidden | None:
         """Run teacher forward, return hidden states [B, T, H_teacher]."""
         self._load()
         if not self._loaded:
             return None
+        if visibility_mask.shape != input_ids.shape or visibility_mask.dtype != torch.bool:
+            raise ValueError("visibility_mask must be a BoolTensor with the same shape as input_ids")
+        if visibility_mask.device != input_ids.device:
+            raise ValueError(
+                f"visibility_mask device {visibility_mask.device} must match input_ids device {input_ids.device}"
+            )
         device = input_ids.device
-        base_model = self._base_model.to(device)
-        try:
-            output = base_model(input_ids)
-            if hasattr(output, "last_hidden_state"):
-                return output.last_hidden_state
-            if hasattr(output, "hidden_states") and output.hidden_states is not None:
-                return output.hidden_states[-1]
-            if isinstance(output, tuple):
-                return output[0]
-            return output
-        except Exception as e:
-            logger.warning(f"Teacher forward failed: {e}")
-            return None
+        base_model = self._base_model
+        placed_tensor = next(iter(base_model.parameters()), None)
+        if placed_tensor is None:
+            placed_tensor = next(iter(base_model.buffers()), None)
+        if placed_tensor is not None and placed_tensor.device != device:
+            base_model.to(device)
+        embeddings = base_model.get_input_embeddings()
+        teacher_vocab_size = embeddings.num_embeddings
+        config = getattr(base_model, "config", getattr(self._model, "config", None))
+        fallback_id = next(
+            (
+                token_id
+                for token_id in (
+                    getattr(config, "eos_token_id", None),
+                    getattr(config, "unk_token_id", None),
+                    0,
+                )
+                if isinstance(token_id, int) and 0 <= token_id < teacher_vocab_size
+            ),
+            None,
+        )
+        if fallback_id is None:
+            raise ValueError(f"teacher vocabulary must contain at least one token, got {teacher_vocab_size}")
+        with torch.inference_mode(False):
+            valid_ids = (input_ids >= 0) & (input_ids < teacher_vocab_size)
+            effective_visibility = visibility_mask & valid_ids
+            teacher_input_ids = input_ids.masked_fill(~effective_visibility, fallback_id)
+        if torch.any((teacher_input_ids < 0) | (teacher_input_ids >= teacher_vocab_size)):
+            raise ValueError("teacher input IDs remain outside the teacher vocabulary after remapping")
+
+        output = base_model(teacher_input_ids, attention_mask=effective_visibility, use_cache=False)
+        if hasattr(output, "last_hidden_state"):
+            hidden = output.last_hidden_state
+        elif hasattr(output, "hidden_states") and output.hidden_states is not None:
+            hidden = output.hidden_states[-1]
+        elif isinstance(output, tuple):
+            hidden = output[0]
+        else:
+            hidden = output
+        with torch.inference_mode(False):
+            hidden = hidden.detach().clone()
+        return TeacherHidden(hidden=hidden, visibility_mask=effective_visibility)
 
     def distillation_loss_chunked(
         self,
         student_hidden: torch.Tensor,
         teacher_hidden: torch.Tensor,
         reconstruction_loss: torch.Tensor,
-        mask: torch.Tensor | None,
+        visibility_mask: torch.Tensor | None,
         align_projection: nn.Module,
         alpha: float = 0.5,
         chunk_size: int = 512,
@@ -246,9 +291,8 @@ class DistillationTeacher:
             teacher_hidden.detach().reshape(B * T, H_t).to(device=projection_device, dtype=projection_dtype).clone()
         )
 
-        if mask is not None:
-            flat_mask = mask.reshape(B * T)
-            valid_mask = ~flat_mask
+        if visibility_mask is not None:
+            valid_mask = visibility_mask.reshape(B * T)
         else:
             valid_mask = torch.ones(B * T, dtype=torch.bool, device=flat_sh.device)
 

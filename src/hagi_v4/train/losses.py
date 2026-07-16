@@ -18,6 +18,54 @@ from hagi_v4.model.codec_contracts import TrainLossConfig
 from hagi_v4.model.outputs import AuxLosses, ModelOutput
 
 
+def _validate_selected_rows(logits: torch.Tensor, targets: torch.Tensor) -> None:
+    if logits.ndim != 2 or targets.ndim != 1:
+        raise ValueError("logits and targets must have shapes [N,V] and [N]")
+    if logits.shape[0] == 0:
+        raise ValueError("selected rows must be non-empty")
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError("logits and targets must have the same number of rows")
+
+
+def selected_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy over already gathered prediction rows."""
+    _validate_selected_rows(logits, targets)
+    return F.cross_entropy(logits, targets)
+
+
+def suffix_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    is_suffix_prediction: torch.Tensor,
+) -> torch.Tensor:
+    """Cross-entropy restricted to gathered rows from suffix tasks."""
+    _validate_selected_rows(logits, targets)
+    if is_suffix_prediction.ndim != 1 or is_suffix_prediction.shape[0] != logits.shape[0]:
+        raise ValueError("is_suffix_prediction must have shape [N]")
+    if is_suffix_prediction.dtype != torch.bool:
+        raise ValueError("is_suffix_prediction must be boolean")
+    if not is_suffix_prediction.any():
+        return logits.new_full((), float("nan"))
+    return F.cross_entropy(logits[is_suffix_prediction], targets[is_suffix_prediction])
+
+
+def mean_top2_probability_mass(logits: torch.Tensor) -> torch.Tensor:
+    """Mean posterior mass assigned to each row's two likeliest tokens."""
+    if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("logits must have non-empty shape [N,V]")
+    probabilities = logits.float().softmax(dim=-1)
+    return probabilities.topk(min(2, logits.shape[-1]), dim=-1).values.sum(dim=-1).mean()
+
+
+def mean_posterior_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Mean categorical posterior entropy in nats over gathered rows."""
+    if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("logits must have non-empty shape [N,V]")
+    log_probabilities = logits.float().log_softmax(dim=-1)
+    probabilities = log_probabilities.exp()
+    return -(probabilities * log_probabilities).sum(dim=-1).mean()
+
+
 def masked_cross_entropy_chunked(
     logits: torch.Tensor,
     targets: torch.Tensor,

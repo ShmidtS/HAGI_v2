@@ -108,8 +108,10 @@ train:
   awgn_end_frac: 0.5
   freeze_embeddings: false
   tokenizer: "google/gemma-4-E2B-it"
-  checkpoint_dir: "checkpoints/channel-v2-google"
-  checkpoint_format_version: 2
+  eos_token_id: 1
+  pad_token_id: 0
+  checkpoint_dir: "checkpoints"
+  checkpoint_format_version: 3
   checkpoint_interval: 500
   checkpoint_keep_last: 3
   sequential_cycles: 3
@@ -119,11 +121,9 @@ train:
 inference:
   temperature: 0.8
   top_k: 50
-  min_tokens: 2
-  block_size: 16
-  refine_passes: 2
-  repetition_penalty: 0.8
-  repetition_window: 32
+  min_new_tokens: 2
+  repetition_penalty: 1.1
+  repetition_window: 64
   no_repeat_ngram_size: 3
   max_iterations: 4
   max_new_tokens: 128
