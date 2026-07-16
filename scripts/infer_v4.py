@@ -109,11 +109,15 @@ def main() -> int:
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
     eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("tokenizer must define eos_token_id")
     pad_token_id = tokenizer.pad_token_id
-    if eos_token_id is None or pad_token_id is None:
-        raise ValueError("tokenizer must define eos_token_id and pad_token_id")
-    if eos_token_id != cfg.train.eos_token_id or pad_token_id != cfg.train.pad_token_id:
-        raise ValueError("tokenizer EOS/PAD IDs do not match the checkpoint config")
+    if pad_token_id is None:
+        pad_token_id = cfg.train.pad_token_id
+    if eos_token_id != cfg.train.eos_token_id:
+        raise ValueError(f"tokenizer eos_token_id {eos_token_id} != checkpoint {cfg.train.eos_token_id}")
+    if pad_token_id != cfg.train.pad_token_id:
+        raise ValueError(f"pad_token_id {pad_token_id} != checkpoint {cfg.train.pad_token_id}")
     forbidden_token_ids = tuple(
         token_id for token_id in tokenizer.all_special_ids if token_id not in (eos_token_id, pad_token_id)
     )
