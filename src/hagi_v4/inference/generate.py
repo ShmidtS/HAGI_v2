@@ -1,14 +1,8 @@
-"""Generation for HAGI V7.1 masked LM (LLaDA-style iterative decoding).
-
-5G analogies:
-  - Block coding: generate max_new_tokens mask tokens, fill iteratively
-  - Turbo iterative refinement: rough decode then refined decode
-  - Spectral cache: OFDM cyclic prefix analog — cache hidden states
-  - Repetition penalty: echo cancellation (G.168 analog)
-  - Iterative decoding: LDPC belief propagation — fill confident positions first
-"""
+"""Masked refinement followed by adaptive left-to-right generation."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -16,197 +10,266 @@ import torch.nn.functional as F
 from hagi_v4.model.codec_contracts import InferenceShapeConfig
 
 
+@dataclass(frozen=True)
+class GenerationOutput:
+    """Padded generated sequences and their per-row semantic lengths."""
+
+    token_ids: torch.LongTensor
+    generated_lengths: torch.LongTensor
+    finished: torch.BoolTensor
+
+
+def _validate_token_ids(name: str, token_ids: tuple[int, ...], vocab_size: int) -> None:
+    if any(token_id < 0 or token_id >= vocab_size for token_id in token_ids):
+        raise ValueError(f"{name} must contain only in-vocabulary IDs")
+
+
+def process_generation_logits(
+    logits: torch.Tensor,
+    context_ids: torch.Tensor,
+    *,
+    generated_lengths: torch.Tensor,
+    forbidden_token_ids: tuple[int, ...],
+    eos_token_id: int,
+    min_new_tokens: int,
+    repetition_penalty: float,
+    repetition_window: int,
+    no_repeat_ngram_size: int,
+    temperature: float,
+    top_k: int,
+    generator: torch.Generator | None = None,
+) -> torch.LongTensor:
+    """Apply generation constraints in one ordered path and select one token per row."""
+    if logits.ndim != 2 or context_ids.ndim != 2 or logits.shape[0] != context_ids.shape[0]:
+        raise ValueError("logits and context_ids must be row-aligned rank-2 tensors")
+    vocab_size = logits.shape[-1]
+    if context_ids.dtype != torch.long:
+        raise ValueError("context_ids must be a LongTensor")
+    _validate_token_ids("context_ids", tuple(context_ids.flatten().tolist()), vocab_size)
+    _validate_token_ids("forbidden_token_ids", forbidden_token_ids, vocab_size)
+    _validate_token_ids("eos_token_id", (eos_token_id,), vocab_size)
+    if generated_lengths.shape != (logits.shape[0],):
+        raise ValueError("generated_lengths must contain one value per logits row")
+    if generated_lengths.dtype != torch.long:
+        raise ValueError("generated_lengths must be a LongTensor")
+    if (generated_lengths < 0).any():
+        raise ValueError("generated_lengths must be non-negative")
+    if not isinstance(min_new_tokens, int) or isinstance(min_new_tokens, bool) or min_new_tokens < 0:
+        raise ValueError("min_new_tokens must be a non-negative integer")
+    if repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be positive")
+    if repetition_window < 1:
+        raise ValueError("repetition_window must be positive")
+    if no_repeat_ngram_size < 0 or temperature < 0 or top_k < 0:
+        raise ValueError("no_repeat_ngram_size, temperature, and top_k must be non-negative")
+
+    processed = logits.float().clone()
+    if forbidden_token_ids:
+        processed[:, list(forbidden_token_ids)] = float("-inf")
+    processed[generated_lengths + 1 < min_new_tokens, eos_token_id] = float("-inf")
+
+    if repetition_penalty != 1.0 and context_ids.numel() > 0:
+        window = context_ids[:, -repetition_window:]
+        for row in range(processed.shape[0]):
+            repeated = window[row].unique()
+            scores = processed[row, repeated]
+            processed[row, repeated] = torch.where(
+                scores < 0,
+                scores * repetition_penalty,
+                scores / repetition_penalty,
+            )
+
+    n = no_repeat_ngram_size
+    if n > 0 and context_ids.shape[1] + 1 >= n:
+        for row in range(processed.shape[0]):
+            tokens = context_ids[row].tolist()
+            prefix = tuple(tokens[-(n - 1) :]) if n > 1 else ()
+            banned = {
+                tokens[index + n - 1]
+                for index in range(len(tokens) - n + 1)
+                if tuple(tokens[index : index + n - 1]) == prefix
+            }
+            if banned:
+                processed[row, list(banned)] = float("-inf")
+
+    if temperature > 0:
+        processed = processed / temperature
+    if top_k > 0:
+        threshold = torch.topk(processed, min(top_k, vocab_size), dim=-1).values[:, -1:]
+        processed = torch.where(processed < threshold, float("-inf"), processed)
+    if torch.isneginf(processed).all(dim=-1).any():
+        raise ValueError("generation constraints banned every token for at least one row")
+    if temperature == 0:
+        return processed.argmax(dim=-1)
+    return torch.multinomial(F.softmax(processed, dim=-1), 1, generator=generator).squeeze(-1)
+
+
 @torch.no_grad()
-def generate(
+def _generate(
     model: torch.nn.Module,
-    prompt_ids: torch.Tensor,
-    max_new_tokens: int = 128,
-    max_iterations: int = 4,
-    placeholder_token_id: int = 0,
-    forbidden_token_ids: tuple[int, ...] = (0,),
-    eos_token_id: int | None = None,
-    temperature: float = 0.4,
-    top_k: int = 20,
-    min_tokens: int = 2,
-    noise_ratio: float = 0.0,
-    block_size: int = 8,
-    refine_passes: int = 3,
+    prompt_ids: torch.LongTensor,
+    *,
+    max_new_tokens: int,
+    max_iterations: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    forbidden_token_ids: tuple[int, ...] = (),
+    min_new_tokens: int = 2,
+    temperature: float = 0.8,
+    top_k: int = 50,
     repetition_penalty: float = 1.1,
     repetition_window: int = 64,
-    no_repeat_ngram_size: int = 0,
-    use_cache: bool = False,
-    cache_window: int = 128,
-) -> torch.Tensor:
-    """Generate text via LLaDA-style iterative masked decoding.
+    no_repeat_ngram_size: int = 3,
+    physical_corruption_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> GenerationOutput:
+    """Refine a fully unknown suffix, then sample it once from left to right."""
+    if prompt_ids.ndim != 2 or prompt_ids.dtype != torch.long:
+        raise ValueError("prompt_ids must be a rank-2 LongTensor")
+    if max_new_tokens < 2 or not 2 <= min_new_tokens <= max_new_tokens:
+        raise ValueError("generation requires 2 <= min_new_tokens <= max_new_tokens")
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be positive")
 
-    Instead of generating block-by-block (which creates 100% mask ratio OOD),
-    this creates prompt + max_new_tokens mask tokens and iteratively fills
-    them based on model confidence — like LDPC belief propagation.
-
-    Args:
-        model: HAGIv4 model (eval mode).
-        prompt_ids: [B, T_prompt] prompt token IDs.
-        max_new_tokens: number of mask tokens to fill.
-        max_iterations: forward passes for iterative decoding.
-        placeholder_token_id: in-vocabulary value used at unknown positions.
-        eos_token_id: token ID for EOS (None = no EOS check).
-        temperature: 0 for greedy, >0 for sampling.
-        top_k: if >0, sample from top-k logits.
-        min_tokens: minimum tokens before EOS accepted.
-        block_size: unused (kept for API compat).
-        refine_passes: unused (kept for API compat).
-        repetition_penalty: multiplicative penalty for recently used tokens.
-        repetition_window: number of recent tokens to penalize.
-        no_repeat_ngram_size: ban tokens that would create repeated n-grams.
-        use_cache: unused (kept for API compat).
-
-    Returns:
-        [B, T_prompt + max_new_tokens] token IDs.
-    """
     model.eval()
-    B = prompt_ids.shape[0]
-    original_prompt_len = prompt_ids.shape[1]
-    T_prompt = original_prompt_len
+    batch_size, original_prompt_len = prompt_ids.shape
     device = prompt_ids.device
     inference_config = getattr(model, "inference_config", None)
-    V = (
+    vocab_size = (
         inference_config.vocab_size
         if inference_config is not None
         else InferenceShapeConfig.from_hagi_config(model.cfg).vocab_size
     )
-    if not 0 <= placeholder_token_id < V:
-        raise ValueError(f"placeholder_token_id must satisfy 0 <= id < {V}")
-    if any(token_id < 0 or token_id >= V for token_id in forbidden_token_ids):
-        raise ValueError("forbidden_token_ids must contain only in-vocabulary IDs")
+    _validate_token_ids("prompt_ids", tuple(prompt_ids.flatten().tolist()), vocab_size)
+    _validate_token_ids("eos_token_id", (eos_token_id,), vocab_size)
+    _validate_token_ids("pad_token_id", (pad_token_id,), vocab_size)
+    _validate_token_ids("forbidden_token_ids", forbidden_token_ids, vocab_size)
+    if eos_token_id == pad_token_id:
+        raise ValueError("eos_token_id and pad_token_id must be distinct")
 
-    min_len = 4
-    if T_prompt < min_len:
-        pad = torch.full((B, min_len - T_prompt), placeholder_token_id, dtype=torch.long, device=device)
-        prompt_ids = torch.cat([prompt_ids, pad], dim=1)
-        T_prompt = prompt_ids.shape[1]
+    internal_prompt_len = max(original_prompt_len, 4)
+    prompt_padding = torch.full(
+        (batch_size, internal_prompt_len - original_prompt_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    internal_prompt = torch.cat((prompt_ids, prompt_padding), dim=1)
+    suffix = torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)
+    refinement_ids = torch.cat((internal_prompt, suffix), dim=1)
+    semantic_unknown_mask = torch.zeros_like(refinement_ids, dtype=torch.bool)
+    semantic_unknown_mask[:, internal_prompt_len:] = True
+    if physical_corruption_mask is None:
+        physical_mask = torch.zeros_like(refinement_ids, dtype=torch.bool)
+    else:
+        if physical_corruption_mask.shape != refinement_ids.shape:
+            raise ValueError("physical_corruption_mask must match the internal generation sequence")
+        physical_mask = physical_corruption_mask.to(device=device, dtype=torch.bool)
 
-    mask_block = torch.full((B, max_new_tokens), placeholder_token_id, dtype=torch.long, device=device)
-    seq = torch.cat([prompt_ids, mask_block], dim=1)
-    mask = torch.zeros_like(seq, dtype=torch.bool)
-    mask[:, T_prompt:] = True
+    posterior = None
+    output = model(
+        refinement_ids,
+        targets=None,
+        semantic_unknown_mask=semantic_unknown_mask,
+        prediction_mask=semantic_unknown_mask,
+        valid_target_mask=torch.ones_like(semantic_unknown_mask),
+        physical_corruption_mask=physical_mask,
+        refinement_iterations=max_iterations,
+    )
+    if output.logits is None or output.prediction_indices is None:
+        raise ValueError("model output must include logits and prediction_indices")
+    if output.logits.shape != (batch_size * max_new_tokens, vocab_size):
+        raise ValueError("model must return one logits row per unknown suffix position")
+    posterior = output.logits.new_empty((batch_size, max_new_tokens, vocab_size), dtype=torch.float32)
+    logits_rows = torch.full((refinement_ids.numel(),), -1, dtype=torch.long, device=device)
+    logits_rows[output.prediction_indices.to(device)] = torch.arange(output.logits.shape[0], device=device)
+    for row in range(batch_size):
+        positions = torch.arange(
+            row * refinement_ids.shape[1] + internal_prompt_len,
+            row * refinement_ids.shape[1] + internal_prompt_len + max_new_tokens,
+            device=device,
+        )
+        selected_rows = logits_rows.index_select(0, positions)
+        if (selected_rows < 0).any():
+            raise ValueError("prediction_indices omitted an unknown suffix position")
+        posterior[row] = output.logits.index_select(0, selected_rows.to(output.logits.device)).float()
 
-    def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
-        if repetition_penalty <= 1.0 or context_ids.numel() == 0:
-            return logits
-        window = context_ids[:, -repetition_window:] if context_ids.shape[1] >= repetition_window else context_ids
-        for b in range(B):
-            unique, counts = window[b].unique(return_counts=True)
-            unique = unique[unique < V]
-            counts = counts[: len(unique)].to(logits.dtype)
-            factor = repetition_penalty**counts
-            score = logits[b, :, unique]
-            score = torch.where(score > 0, score / factor, score * factor)
-            logits[b, :, unique] = score
-        return logits
+    if posterior is None:
+        raise RuntimeError("generation did not produce a posterior")
+    generated = suffix.clone()
+    generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
+    for position in range(max_new_tokens):
+        active_rows = (~finished).nonzero(as_tuple=False).squeeze(-1)
+        if active_rows.numel() == 0:
+            break
+        context = torch.cat(
+            (prompt_ids.index_select(0, active_rows), generated.index_select(0, active_rows)[:, :position]),
+            dim=1,
+        ).to(posterior.device)
+        posterior_rows = active_rows.to(posterior.device)
+        tokens = process_generation_logits(
+            posterior.index_select(0, posterior_rows)[:, position],
+            context,
+            generated_lengths=generated_lengths.index_select(0, active_rows).to(posterior.device),
+            forbidden_token_ids=invalid_token_ids,
+            eos_token_id=eos_token_id,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            top_k=top_k,
+            generator=generator,
+        )
+        tokens = tokens.to(device)
+        generated[active_rows, position] = tokens
+        generated_lengths[active_rows] += 1
+        finished[active_rows[tokens == eos_token_id]] = True
 
-    def ban_repeated_ngrams(logits: torch.Tensor, context_ids: torch.Tensor, n: int) -> torch.Tensor:
-        if n <= 0 or context_ids.numel() == 0 or context_ids.shape[1] < n:
-            return logits
-        for b in range(B):
-            s = context_ids[b].tolist()
-            ngram_set = set()
-            for i in range(len(s) - n + 1):
-                ngram_set.add(tuple(s[i : i + n]))
-            prefix = tuple(s[-(n - 1) :]) if len(s) >= n - 1 else None
-            if prefix is None:
-                continue
-            banned = set()
-            for ngram in ngram_set:
-                if ngram[:-1] == prefix:
-                    banned.add(ngram[-1])
-            if banned:
-                ban_idx = torch.tensor(list(banned), dtype=torch.long, device=logits.device)
-                logits[b, :, ban_idx] = float("-inf")
-        return logits
+    token_ids = torch.cat((prompt_ids, generated), dim=1)
+    return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)
 
-    def sample_token(logits: torch.Tensor) -> torch.Tensor:
-        if forbidden_token_ids:
-            logits[:, list(forbidden_token_ids)] = float("-inf")
 
-        if repetition_penalty > 1.0 and seq.shape[1] > 0:
-            visible = seq[~mask].reshape(B, -1)
-            if visible.numel() > 0:
-                logits = apply_echo_cancellation(logits.clone(), visible)
-
-        if no_repeat_ngram_size > 0:
-            visible = seq[~mask].reshape(B, -1)
-            if visible.shape[1] >= no_repeat_ngram_size:
-                logits = ban_repeated_ngrams(logits, visible, no_repeat_ngram_size)
-
-        if top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, V), dim=-1)
-            logits = torch.where(logits < v[..., -1:], float("-inf"), logits)
-
-        if temperature > 0:
-            probs = F.softmax(logits.float(), dim=-1)
-            return torch.multinomial(probs.reshape(B, -1), 1).squeeze(-1)
-        else:
-            return logits.argmax(dim=-1)
-
-    turbo = getattr(model, "turbo", None)
-    orig_n_iters = None
-    if turbo is not None:
-        orig_n_iters = turbo.n_iters
-        turbo.n_iters = max(max_iterations, 2)
-
+def generate(
+    model: torch.nn.Module,
+    prompt_ids: torch.LongTensor,
+    *,
+    max_new_tokens: int,
+    max_iterations: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    forbidden_token_ids: tuple[int, ...] = (),
+    min_new_tokens: int = 2,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    repetition_penalty: float = 1.1,
+    repetition_window: int = 64,
+    no_repeat_ngram_size: int = 3,
+    physical_corruption_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> GenerationOutput:
+    training_states = tuple((module, module.training) for module in model.modules())
     try:
-        for iteration in range(max_iterations):
-            output = model(seq, targets=None, mask=mask)
-            if output.logits is None:
-                break
-
-            logits = output.logits  # [B, T, V]
-            if not mask.any():
-                break
-
-            for batch_idx in range(B):
-                mask_positions = mask[batch_idx].nonzero(as_tuple=True)[0]
-                if len(mask_positions) == 0:
-                    continue
-                mask_logits = logits[batch_idx, mask_positions]
-                if iteration < max_iterations - 1:
-                    confidence = mask_logits.float().max(dim=-1).values
-                    if temperature > 0:
-                        confidence = confidence / temperature
-                    n_fill = max(1, int(len(mask_positions) * 0.5))
-                    selected = confidence.topk(n_fill).indices
-                    fill_positions = mask_positions[selected]
-                    fill_logits = mask_logits[selected]
-                else:
-                    fill_positions = mask_positions
-                    fill_logits = mask_logits
-
-                for i, pos in enumerate(fill_positions):
-                    single_logits = fill_logits[i : i + 1]
-                    if forbidden_token_ids:
-                        single_logits[:, list(forbidden_token_ids)] = float("-inf")
-                    lt = single_logits / temperature if temperature > 0 else single_logits
-                    if top_k > 0:
-                        v, _ = torch.topk(lt, min(top_k, V), dim=-1)
-                        lt = torch.where(lt < v[..., -1:], float("-inf"), lt)
-                    if temperature > 0:
-                        probs = F.softmax(lt.float(), dim=-1)
-                        tok = torch.multinomial(probs.reshape(1, -1), 1).squeeze(-1)
-                    else:
-                        tok = lt.argmax(dim=-1)
-                    seq[batch_idx, pos] = tok
-                    mask[batch_idx, pos] = False
-
-                generated = seq[batch_idx, T_prompt:]
-                if eos_token_id is not None and (generated == eos_token_id).any():
-                    first_eos = (generated == eos_token_id).nonzero()[0].item()
-                    if first_eos + 1 >= min_tokens:
-                        generated[first_eos:] = eos_token_id
-                        mask[batch_idx, T_prompt + first_eos :] = False
-
+        return _generate(
+            model,
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            max_iterations=max_iterations,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            forbidden_token_ids=forbidden_token_ids,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            physical_corruption_mask=physical_corruption_mask,
+            generator=generator,
+        )
     finally:
-        if turbo is not None and orig_n_iters is not None:
-            turbo.n_iters = orig_n_iters
-
-    generated = seq[:, T_prompt : T_prompt + max_new_tokens]
-    return torch.cat([seq[:, :original_prompt_len], generated], dim=1)
+        model.train(training_states[0][1])
+        for module, was_training in training_states:
+            module.training = was_training

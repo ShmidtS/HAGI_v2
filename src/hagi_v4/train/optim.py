@@ -152,6 +152,57 @@ def is_muon_param(name: str, param: nn.Parameter) -> bool:
     return True
 
 
+def _can_attempt_fused_adamw(params: list[nn.Parameter]) -> bool:
+    """Return whether a fused AdamW probe is meaningful for this parameter group."""
+    return bool(params) and all(
+        param.device == params[0].device and param.dtype == params[0].dtype and param.is_floating_point()
+        for param in params
+    )
+
+
+def supports_fused_adamw(params: list[nn.Parameter]) -> bool:
+    """Return whether parameters meet the legacy fused CUDA preconditions."""
+    return _can_attempt_fused_adamw(params) and params[0].device.type == "cuda"
+
+
+def _is_expected_fused_adamw_error(error: Exception) -> bool:
+    message = str(error).lower()
+    if "unexpected keyword argument 'fused'" in message or 'unexpected keyword argument "fused"' in message:
+        return True
+    return any(
+        pattern in message
+        for pattern in (
+            "fused adamw is not supported for this device",
+            "fused adamw is not supported for this dtype",
+            "fused adamw is not supported on this device",
+            "fused adamw is not supported on this dtype",
+            "fused is not supported for this device",
+            "fused is not supported for this dtype",
+            "fused is not supported on this device",
+            "fused is not supported on this dtype",
+        )
+    )
+
+
+def build_adamw(param_groups: list[dict], *, lr: float) -> torch.optim.AdamW:
+    """Build AdamW, probing fused support without touching model parameters."""
+    params = [param for group in param_groups for param in group["params"]]
+    kwargs = {"lr": lr, "betas": (0.9, 0.95), "eps": 1e-8}
+    if not supports_fused_adamw(params):
+        return torch.optim.AdamW(param_groups, **kwargs, fused=False)
+
+    probe_param = nn.Parameter(torch.zeros(1, device=params[0].device, dtype=params[0].dtype))
+    probe_param.grad = torch.ones_like(probe_param)
+    try:
+        probe = torch.optim.AdamW([{"params": [probe_param], "weight_decay": 0.0}], **kwargs, fused=True)
+        probe.step()
+    except (RuntimeError, TypeError, NotImplementedError) as error:
+        if not _is_expected_fused_adamw_error(error):
+            raise
+        return torch.optim.AdamW(param_groups, **kwargs, fused=False)
+    return torch.optim.AdamW(param_groups, **kwargs, fused=True)
+
+
 def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:
     """Build Muon (2D hidden weights) + AdamW (everything else)."""
     tc = cfg.train
@@ -171,13 +222,11 @@ def build_optimizer(model: nn.Module, cfg: HAGIv4Config) -> CombinedOptimizer:
         weight_decay=tc.muon_weight_decay,
     )
     muon.param_groups[0]["_muon"] = True
-    adamw = torch.optim.AdamW(
+    adamw = build_adamw(
         [
             {"params": decay, "weight_decay": tc.weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ],
         lr=tc.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1e-8,
     )
     return CombinedOptimizer(muon, adamw)

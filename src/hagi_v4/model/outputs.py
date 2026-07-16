@@ -37,6 +37,7 @@ class ModelOutput:
     aux: AuxLosses
     ce_loss: torch.Tensor | None = None
     iterations_used: torch.Tensor | None = None
+    prediction_indices: torch.Tensor | None = None
 
 
 def compute_whiteness_loss(residual: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:

@@ -142,6 +142,33 @@ InferenceConfig = InferenceShapeConfig
 
 
 @dataclass(frozen=True)
+class SemanticMaskBatch:
+    semantic_unknown_mask: torch.Tensor
+    prediction_mask: torch.Tensor
+    valid_target_mask: torch.Tensor
+    physical_corruption_mask: torch.Tensor
+
+    def validate(self, input_ids: torch.Tensor, physical_shape: torch.Size | None = None) -> None:
+        if any(value.device != input_ids.device for value in vars(self).values()):
+            raise ValueError(f"mask devices must match input_ids.device ({input_ids.device})")
+        semantic_shape = input_ids.shape
+        for name in ("semantic_unknown_mask", "prediction_mask", "valid_target_mask"):
+            value = getattr(self, name)
+            if value.dtype is not torch.bool or value.shape != semantic_shape:
+                raise ValueError(f"{name} must be bool{semantic_shape}")
+        expected_physical_shape = semantic_shape if physical_shape is None else physical_shape
+        if (
+            self.physical_corruption_mask.dtype is not torch.bool
+            or self.physical_corruption_mask.shape != expected_physical_shape
+        ):
+            raise ValueError(f"physical_corruption_mask must be bool{expected_physical_shape}")
+        if torch.any(self.prediction_mask & ~self.semantic_unknown_mask):
+            raise ValueError("prediction_mask must be a subset of semantic_unknown_mask")
+        if torch.any(self.prediction_mask & ~self.valid_target_mask):
+            raise ValueError("prediction_mask must be a subset of valid_target_mask")
+
+
+@dataclass(frozen=True)
 class MSADecodeConfig:
     """HARQ buffer configuration (extrinsic-only storage)."""
 

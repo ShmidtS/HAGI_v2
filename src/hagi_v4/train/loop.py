@@ -16,17 +16,16 @@ from collections.abc import Iterator
 from itertools import islice
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.masking import (
     adaptive_mask_ratio,
-    create_erasure_mask,
+    create_physical_corruption_mask,
+    create_semantic_corruption,
     progressive_mask_ratio,
 )
-from hagi_v4.model.outputs import ModelOutput
-from hagi_v4.train.losses import LossAggregator
+from hagi_v4.train.losses import LossAggregator, selected_cross_entropy, suffix_cross_entropy
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
 logger = logging.getLogger(__name__)
@@ -151,33 +150,70 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
 
     total_loss = 0.0
-    output: ModelOutput | None = None
-    outputs: list[ModelOutput] = []
+    masked_ce_sum = 0.0
+    masked_rows = 0
+    suffix_ce_sum = 0.0
+    suffix_rows = 0
+    confidence_sum = 0.0
+    top2_mass_sum = 0.0
+    entropy_sum = 0.0
+    posterior_rows = 0
+    suffix_tasks = 0
+    total_tasks = 0
+    semantic_unknowns = 0
+    valid_targets = 0
+    physical_corruptions = 0
+    physical_positions = 0
+    fallback_confidence_sum = 0.0
+    fallback_confidence_count = 0
+    aux_sums = {name: 0.0 for name in ("parity", "correction_alignment", "rate_distortion", "whiteness", "contrastive")}
+    aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
     for micro_idx, batch in enumerate(microbatches):
         input_ids = batch["input_ids"].to(device)
         targets = batch["targets"].to(device)
-        mask = create_erasure_mask(input_ids, mask_ratio)
+        valid_target_mask = batch["valid_target_mask"].to(device)
+        semantic_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2)
+        physical_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2 + 1)
+        semantic_unknown_mask, prediction_mask, is_suffix = create_semantic_corruption(
+            valid_target_mask,
+            generator=semantic_generator,
+            random_ratio=mask_ratio,
+        )
+        physical_corruption_mask = create_physical_corruption_mask(
+            input_ids,
+            mask_ratio,
+            generator=physical_generator,
+        )
         awgn_sigma = 0.0
         if cfg.train.awgn_enabled:
             awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
             if step < awgn_end:
                 progress = step / max(awgn_end, 1)
                 awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
-        output = model(input_ids, targets=targets, mask=mask, step=step, awgn_sigma=awgn_sigma)
-        outputs.append(output)
-        loss = loss_aggregator(output, targets, mask, step=step)
+        output = model(
+            input_ids,
+            targets=targets,
+            semantic_unknown_mask=semantic_unknown_mask,
+            prediction_mask=prediction_mask,
+            valid_target_mask=valid_target_mask,
+            physical_corruption_mask=physical_corruption_mask,
+            step=step,
+            awgn_sigma=awgn_sigma,
+        )
+        loss = loss_aggregator(output, targets, prediction_mask, step=step)
 
         use_distill = (
             teacher is not None
             and getattr(teacher, "_loaded", False)
-            and cfg.train.distill_enabled
+            and cfg.train.distill_enabled is True
             and step < distill_end_step
         )
         if use_distill:
             from hagi_v4.train.distillation import alpha_at
 
+            visibility_mask = valid_target_mask & ~semantic_unknown_mask
             alpha = alpha_at(
                 step,
                 cfg.train.distill_alpha_start,
@@ -186,18 +222,17 @@ def train_step(
                 cfg.train.distill_end_frac,
             )
             with torch.inference_mode():
-                teacher_hidden = teacher.get_hidden(input_ids)
-            if teacher_hidden is not None:
-                distill_loss = teacher.distillation_loss_chunked(
+                teacher_result = teacher.get_hidden(input_ids, visibility_mask=visibility_mask)
+            if teacher_result is not None:
+                loss = teacher.distillation_loss_chunked(
                     student_hidden=output.hidden,
-                    teacher_hidden=teacher_hidden,
+                    teacher_hidden=teacher_result.hidden,
                     reconstruction_loss=loss,
-                    mask=mask,
+                    visibility_mask=teacher_result.visibility_mask,
                     align_projection=model.distill_align,
                     alpha=alpha,
                 )
-                loss = distill_loss
-                del teacher_hidden
+                del teacher_result
 
         if not torch.isfinite(loss).all():
             logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — cancelling update")
@@ -208,46 +243,72 @@ def train_step(
         scaled_loss.backward()
         total_loss += loss.item()
 
+        with torch.no_grad():
+            suffix_tasks += int(is_suffix.sum().item())
+            total_tasks += is_suffix.numel()
+            semantic_unknowns += int((semantic_unknown_mask & valid_target_mask).sum().item())
+            valid_targets += int(valid_target_mask.sum().item())
+            physical_corruptions += int(physical_corruption_mask.sum().item())
+            physical_positions += physical_corruption_mask.numel()
+            for name in aux_sums:
+                value = getattr(output.aux, name)
+                if value is not None:
+                    aux_sums[name] += float(value.detach())
+                    aux_counts[name] += 1
+
+            if output.logits is None or output.prediction_indices is None:
+                if output.ce_loss is not None:
+                    fallback_confidence_sum += max(0.0, 1.0 - output.ce_loss.detach().item() / 10.0)
+                    fallback_confidence_count += 1
+            else:
+                logits = output.logits.detach()
+                prediction_indices = output.prediction_indices.detach().to(targets.device)
+                selected_targets = targets.flatten().index_select(0, prediction_indices).to(logits.device)
+                suffix_by_position = is_suffix.unsqueeze(1).expand_as(valid_target_mask).flatten()
+                suffix_predictions = suffix_by_position.index_select(0, prediction_indices).to(logits.device)
+                row_count = logits.shape[0]
+                masked_ce_sum += selected_cross_entropy(logits, selected_targets).item() * row_count
+                masked_rows += row_count
+                suffix_count = int(suffix_predictions.sum().item())
+                if suffix_count:
+                    suffix_ce_sum += (
+                        suffix_cross_entropy(logits, selected_targets, suffix_predictions).item() * suffix_count
+                    )
+                    suffix_rows += suffix_count
+
+                log_probabilities = logits.float().log_softmax(dim=-1)
+                probabilities = log_probabilities.exp()
+                confidence_sum += probabilities.max(dim=-1).values.sum().item()
+                top2_mass_sum += probabilities.topk(min(2, logits.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
+                entropy_sum += (-(probabilities * log_probabilities).sum(dim=-1)).sum().item()
+                posterior_rows += row_count
+                del logits, prediction_indices, selected_targets, suffix_predictions, log_probabilities, probabilities
+        del output, loss, scaled_loss
+
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
     if not all_finite:
         optimizer.zero_grad(set_to_none=True)
         for param in model.parameters():
             param.grad = None
-        return {
-            "loss": total_loss / max(accum, 1),
-            "parity": 0.0,
-            "correction_alignment": 0.0,
-            "rate_distortion": 0.0,
-            "whiteness": 0.0,
-            "contrastive": 0.0,
-            "avg_confidence": 0.0,
-            "grad_norm": 0.0,
-            "grad_rms": 0.0,
-            "mask_ratio": mask_ratio,
-            "lr": lr_at(step, cfg) if hasattr(cfg.train, "warmup_steps") else 0.0,
-            "step": step,
-            "update_applied": False,
-            "all_finite": False,
-        }
+        raise FloatingPointError(f"training update {step} has non-finite loss or gradients; gradients cleared")
 
     gn, grad_rms = gradient_stats(model, cfg.train)
     optimizer.step()
 
-    if output is None:
+    if total_tasks == 0:
         return {"loss": 0.0, "step": step, "grad_norm": gn, "grad_rms": grad_rms}
 
-    with torch.no_grad():
-        confidences = []
-        for micro_output in outputs:
-            if micro_output.logits is not None:
-                probs = F.softmax(micro_output.logits.float(), dim=-1)
-                confidences.append(probs.max(dim=-1).values.mean().item())
-            elif micro_output.ce_loss is not None:
-                confidences.append(max(0.0, 1.0 - micro_output.ce_loss.item() / 10.0))
-            else:
-                confidences.append(0.5)
-        avg_confidence = sum(confidences) / max(len(confidences), 1)
+    masked_ce = masked_ce_sum / masked_rows if masked_rows else float("nan")
+    suffix_ce = suffix_ce_sum / suffix_rows if suffix_rows else float("nan")
+    if posterior_rows:
+        avg_confidence = confidence_sum / posterior_rows
+        top2_mass = top2_mass_sum / posterior_rows
+        posterior_entropy = entropy_sum / posterior_rows
+    else:
+        avg_confidence = fallback_confidence_sum / fallback_confidence_count if fallback_confidence_count else 0.5
+        top2_mass = float("nan")
+        posterior_entropy = float("nan")
     if mc.use_adaptive_erasure and adaptive_mask_state is not None:
         adaptive_mask_state["ratio"] = adaptive_mask_ratio(
             avg_confidence,
@@ -256,11 +317,20 @@ def train_step(
         )
 
     def mean_aux(name: str) -> float:
-        values = [getattr(item.aux, name) for item in outputs if getattr(item.aux, name) is not None]
-        return sum(float(value.detach()) for value in values) / max(len(values), 1)
+        return aux_sums[name] / max(aux_counts[name], 1)
 
     return {
         "loss": total_loss / max(accum, 1),
+        "objective_loss": total_loss / max(accum, 1),
+        "masked_ce": masked_ce,
+        "suffix_ce": suffix_ce,
+        "bpt": masked_ce / math.log(2.0),
+        "top2_mass": top2_mass,
+        "posterior_entropy": posterior_entropy,
+        "suffix_task_ratio": suffix_tasks / max(total_tasks, 1),
+        "random_task_ratio": (total_tasks - suffix_tasks) / max(total_tasks, 1),
+        "semantic_mask_ratio": semantic_unknowns / max(valid_targets, 1),
+        "physical_corruption_ratio": physical_corruptions / max(physical_positions, 1),
         "parity": mean_aux("parity"),
         "correction_alignment": mean_aux("correction_alignment"),
         "rate_distortion": mean_aux("rate_distortion"),
@@ -283,12 +353,11 @@ def train(
     cfg: HAGIv4Config,
     log_interval: int = 100,
     teacher=None,
-    start_step: int = 0,
-    resume_extra: dict | None = None,
 ) -> Iterator[dict]:
-    from hagi_v4.train.checkpoint import save_checkpoint
+    from hagi_v4.train.checkpoint import assert_fresh_checkpoint_root, save_checkpoint
 
     configure_runtime()
+    assert_fresh_checkpoint_root(cfg.train.checkpoint_dir)
 
     if torch.cuda.is_available() and cfg.train.precision == "bf16":
         cast_to_bf16(model)
@@ -297,29 +366,12 @@ def train(
     loss_aggregator = LossAggregator(cfg)
     adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
 
-    if resume_extra:
-        opt_state = resume_extra.get("optimizer")
-        if opt_state is not None:
-            try:
-                optimizer.load_state_dict(opt_state)
-                logger.info("Optimizer state restored from checkpoint")
-            except (ValueError, KeyError, RuntimeError) as exc:
-                raise RuntimeError(f"optimizer state is incompatible with strict resume: {exc}") from exc
-        if "adaptive_mask" in resume_extra and adaptive_mask_state is not None:
-            adaptive_mask_state["ratio"] = resume_extra["adaptive_mask"]["ratio"]
-            logger.info(f"Adaptive mask ratio restored: {adaptive_mask_state['ratio']:.4f}")
-        if "rng" in resume_extra:
-            rng = resume_extra["rng"]
-            torch.set_rng_state(rng["torch"].cpu().to(torch.uint8))
-            if torch.cuda.is_available() and rng.get("cuda") is not None:
-                torch.cuda.set_rng_state(rng["cuda"].cpu().to(torch.uint8))
-            logger.info("RNG state restored from checkpoint")
-
-    step = start_step
+    step = 0
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
     ckpt_interval = cfg.train.checkpoint_interval
     ckpt_keep = cfg.train.checkpoint_keep_last
+    last_checkpoint_step = None
 
     data_iter = iter(dataloader)
     while step < cfg.train.max_steps:
@@ -352,30 +404,12 @@ def train(
         if not metrics["update_applied"]:
             continue
 
-        if ckpt_interval > 0 and step > 0 and step % ckpt_interval == 0:
-            extra = {
-                "rng": {
-                    "torch": torch.get_rng_state(),
-                    "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-                },
-            }
-            if adaptive_mask_state is not None:
-                extra["adaptive_mask"] = {"ratio": adaptive_mask_state["ratio"]}
-            if hasattr(dataloader, "state_dict"):
-                extra["dataloader"] = dataloader.state_dict()
-            save_checkpoint(model, optimizer, cfg, step + 1, ckpt_dir, ckpt_keep, extra=extra)
+        completed_updates = step + 1
+        if ckpt_interval > 0 and completed_updates % ckpt_interval == 0:
+            save_checkpoint(model, cfg, completed_updates, ckpt_dir, ckpt_keep)
+            last_checkpoint_step = completed_updates
 
         step += 1
 
-    if ckpt_interval > 0:
-        extra = {
-            "rng": {
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            },
-        }
-        if adaptive_mask_state is not None:
-            extra["adaptive_mask"] = {"ratio": adaptive_mask_state["ratio"]}
-        if hasattr(dataloader, "state_dict"):
-            extra["dataloader"] = dataloader.state_dict()
-        save_checkpoint(model, optimizer, cfg, step, ckpt_dir, ckpt_keep, extra=extra)
+    if ckpt_interval > 0 and last_checkpoint_step != step:
+        save_checkpoint(model, cfg, step, ckpt_dir, ckpt_keep)

@@ -83,7 +83,6 @@ def _interp_modes(coef: torch.Tensor, target_len: int) -> torch.Tensor:
     n = coef.shape[0]
     if target_len <= n:
         return coef[:target_len]
-    src = torch.arange(n, dtype=torch.float32, device=coef.device)
     dst = torch.arange(target_len, dtype=torch.float32, device=coef.device)
     scale = (n - 1) / max(target_len - 1, 1)
     dst_scaled = dst * scale

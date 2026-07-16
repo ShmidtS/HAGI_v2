@@ -26,15 +26,13 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     Token IDs are moved to CPU for embedding lookup, hidden states back to GPU.
     """
     from hagi_v4.model.hagi_v4 import HAGIv4
-    from hagi_v4.train.checkpoint import _migrate_state_dict, cfg_from_dict, load_checkpoint_payload
+    from hagi_v4.train.checkpoint import cfg_from_dict, load_checkpoint_payload, load_model_checkpoint
 
     target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
-    state = load_checkpoint_payload(checkpoint_path, "cpu")
-    cfg = cfg_from_dict(state["config"])
-
+    cfg = cfg_from_dict(load_checkpoint_payload(checkpoint_path, "cpu")["config"])
     dev = torch.device(target)
     model = HAGIv4(cfg)
-    model.load_state_dict(_migrate_state_dict(state["model"]))
+    step, cfg = load_model_checkpoint(checkpoint_path, model, "cpu")
     if cfg.train.precision == "bf16":
         model.to(torch.bfloat16)
 
@@ -51,37 +49,42 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
         model = model.to(dev)
 
     model.eval()
-    step = state.get("completed_updates", state.get("step", 0))
     return model, cfg, step, dev
 
 
-def tokens_to_text(token_ids: torch.Tensor, tokenizer_name: str = "google/gemma-4-E2B-it") -> str:
-    """Decode token IDs to text using the model's tokenizer."""
-    try:
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
-        return tok.decode(token_ids.tolist(), skip_special_tokens=True)
-    except Exception as e:
-        logger.warning(f"Could not load tokenizer '{tokenizer_name}': {e}")
-        return " ".join(str(t) for t in token_ids.tolist())
+def tokens_to_text(token_ids: torch.Tensor, tokenizer) -> str:
+    """Decode token IDs through the checkpoint tokenizer."""
+    return tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
 
 
-def text_to_tokens(text: str, tokenizer_name: str = "google/gemma-4-E2B-it", device: str = "cuda") -> torch.Tensor:
+def text_to_tokens(text: str, tokenizer, device: str = "cuda") -> torch.Tensor:
     """Encode text to token IDs (no BOS — model trained on raw chunks without special tokens)."""
-    try:
-        from transformers import AutoTokenizer
+    ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False)
+    return ids.to(device)
 
-        tok = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
-        ids = tok.encode(text, return_tensors="pt", add_special_tokens=False)
-        return ids.to(device)
-    except Exception as e:
-        logger.warning(f"Could not load tokenizer '{tokenizer_name}': {e}")
-        tokens = [sum(ord(c) for c in w) % 49152 for w in text.split()]
-        return torch.tensor([tokens], dtype=torch.long, device=device)
+
+def build_generation_kwargs(
+    args, inference_cfg, eos_token_id: int, pad_token_id: int, forbidden_token_ids: tuple[int, ...]
+):
+    """Build generation settings from checkpoint config plus explicit CLI overrides."""
+    return {
+        "max_new_tokens": args.max_tokens if args.max_tokens is not None else inference_cfg.max_new_tokens,
+        "max_iterations": args.iterations if args.iterations is not None else inference_cfg.max_iterations,
+        "eos_token_id": eos_token_id,
+        "pad_token_id": pad_token_id,
+        "forbidden_token_ids": forbidden_token_ids,
+        "min_new_tokens": inference_cfg.min_new_tokens,
+        "temperature": args.temperature if args.temperature is not None else inference_cfg.temperature,
+        "top_k": args.top_k if args.top_k is not None else inference_cfg.top_k,
+        "repetition_penalty": inference_cfg.repetition_penalty,
+        "repetition_window": inference_cfg.repetition_window,
+        "no_repeat_ngram_size": inference_cfg.no_repeat_ngram_size,
+    }
 
 
 def main() -> int:
+    from transformers import AutoTokenizer
+
     from hagi_v4.inference.generate import generate
 
     parser = argparse.ArgumentParser(description="HAGI V4 inference")
@@ -90,10 +93,8 @@ def main() -> int:
     parser.add_argument("--interactive", action="store_true", help="Interactive REPL mode")
     parser.add_argument("--config", default="configs/8gb_google.yaml")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--max-tokens", type=int, default=128, help="Hard cap on generated tokens")
-    parser.add_argument(
-        "--iterations", type=int, default=4, help="Refinement iterations (more = better quality, slower)"
-    )
+    parser.add_argument("--max-tokens", type=int, default=None, help="Override config hard cap on generated tokens")
+    parser.add_argument("--iterations", type=int, default=None, help="Override config refinement iterations")
     parser.add_argument("--temperature", type=float, default=None, help="Override config temperature")
     parser.add_argument("--top-k", type=int, default=None, help="Override config top_k")
     parser.add_argument("--tokenizer", default=None, help="Tokenizer name (auto-detected from checkpoint config)")
@@ -106,20 +107,23 @@ def main() -> int:
     tokenizer_name = args.tokenizer or cfg.train.tokenizer
     logger.info(f"Using tokenizer: {tokenizer_name}")
 
-    eos_token_id = 1
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    if eos_token_id is None or pad_token_id is None:
+        raise ValueError("tokenizer must define eos_token_id and pad_token_id")
+    if eos_token_id != cfg.train.eos_token_id or pad_token_id != cfg.train.pad_token_id:
+        raise ValueError("tokenizer EOS/PAD IDs do not match the checkpoint config")
+    forbidden_token_ids = tuple(
+        token_id for token_id in tokenizer.all_special_ids if token_id not in (eos_token_id, pad_token_id)
+    )
 
-    gen_kwargs = dict(
-        max_new_tokens=args.max_tokens,
-        max_iterations=args.iterations,
-        placeholder_token_id=0,
-        eos_token_id=eos_token_id,
-        temperature=args.temperature if args.temperature is not None else 0.4,
-        top_k=args.top_k if args.top_k is not None else 20,
-        block_size=8,
-        refine_passes=3,
-        repetition_penalty=1.1,
-        repetition_window=64,
-        no_repeat_ngram_size=0,
+    gen_kwargs = build_generation_kwargs(
+        args,
+        cfg.inference,
+        eos_token_id,
+        pad_token_id,
+        forbidden_token_ids,
     )
 
     if args.interactive:
@@ -133,21 +137,22 @@ def main() -> int:
                 break
             if not prompt:
                 continue
-            prompt_ids = text_to_tokens(prompt, tokenizer_name, str(dev))
+            prompt_ids = text_to_tokens(prompt, tokenizer, str(dev))
             if prompt_ids.shape[1] == 0:
                 continue
-            gen_ids = generate(model, prompt_ids, **gen_kwargs)
-            generated = gen_ids[0, prompt_ids.shape[1] :]
-            response = tokens_to_text(generated, tokenizer_name)
+            output = generate(model, prompt_ids, **gen_kwargs)
+            generated = output.token_ids[0, prompt_ids.shape[1] : prompt_ids.shape[1] + output.generated_lengths[0]]
+            response = tokens_to_text(generated, tokenizer)
             print(f"HAGI: {response}")
         return 0
 
-    prompt_ids = text_to_tokens(args.prompt, tokenizer_name, str(dev))
+    prompt_ids = text_to_tokens(args.prompt, tokenizer, str(dev))
     logger.info(f"Prompt: {args.prompt} ({prompt_ids.shape[1]} tokens)")
-    gen_ids = generate(model, prompt_ids, **gen_kwargs)
-    generated = gen_ids[0, prompt_ids.shape[1] :]
-    response = tokens_to_text(generated, tokenizer_name)
-    logger.info(f"Generated {generated.shape[0]} tokens:")
+    output = generate(model, prompt_ids, **gen_kwargs)
+    generated_length = output.generated_lengths[0].item()
+    generated = output.token_ids[0, prompt_ids.shape[1] : prompt_ids.shape[1] + generated_length]
+    response = tokens_to_text(generated, tokenizer)
+    logger.info(f"Generated {generated_length} tokens:")
     print(response)
     return 0
 
