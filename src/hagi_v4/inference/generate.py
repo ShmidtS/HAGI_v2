@@ -166,6 +166,9 @@ def _generate(
             raise ValueError("physical_corruption_mask must match the internal generation sequence")
         physical_mask = physical_corruption_mask.to(device=device, dtype=torch.bool)
 
+    decoder_n_iters = getattr(getattr(model, "decoder", None), "n_iters", max_iterations)
+    effective_iterations = min(max(1, max_iterations), decoder_n_iters)
+
     posterior = None
     output = model(
         refinement_ids,
@@ -174,7 +177,7 @@ def _generate(
         prediction_mask=semantic_unknown_mask,
         valid_target_mask=torch.ones_like(semantic_unknown_mask),
         physical_corruption_mask=physical_mask,
-        refinement_iterations=max_iterations,
+        refinement_iterations=effective_iterations,
     )
     if output.logits is None or output.prediction_indices is None:
         raise ValueError("model output must include logits and prediction_indices")
