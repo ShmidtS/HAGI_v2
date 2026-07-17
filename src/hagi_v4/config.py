@@ -135,6 +135,10 @@ class FreqCodingConfig:
     n_modes_t: int = 16
     n_modes_h: int = 12
     complex_rank: int = 16
+    use_derivative: bool = True
+    share_branch_weights: bool = False
+    use_lorentz: bool = True
+    lorentz_mode: str = "exp"
 
 
 @dataclass

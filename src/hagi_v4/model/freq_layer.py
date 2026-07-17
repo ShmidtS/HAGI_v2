@@ -161,6 +161,8 @@ class FreqCoding2D(nn.Module):
         proj_rank: int = 144,
         shared_weights: tuple | None = None,
         shared_phase: nn.Parameter | None = None,
+        shared_phase_dT: nn.Parameter | None = None,
+        shared_phase_dH: nn.Parameter | None = None,
         norm_eps: float = 1e-6,
         use_derivative: bool = True,
         share_branch_weights: bool = False,
@@ -214,40 +216,58 @@ class FreqCoding2D(nn.Module):
 
         # --- Derivative branch params (only when use_derivative) ---
         if use_derivative and not share_branch_weights:
-            self.w_re_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
-            self.w_im_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
-            self.w_re_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
-            self.w_im_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
-            self.w_re_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
-            self.w_im_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
-            self.w_re_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
-            self.w_im_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
-            w_std_d = 1.0 / (head_dim**0.5)
-            for p in (
-                self.w_re_a_dT,
-                self.w_im_a_dT,
-                self.w_re_b_dT,
-                self.w_im_b_dT,
-                self.w_re_a_dH,
-                self.w_im_a_dH,
-                self.w_re_b_dH,
-                self.w_im_b_dH,
-            ):
-                nn.init.normal_(p, std=w_std_d)
+            # 12-tuple shared_weights convention: 4 main + 4 dT + 4 dH.
+            if shared_weights is not None and len(shared_weights) == 12:
+                self.w_re_a_dT = shared_weights[4]
+                self.w_im_a_dT = shared_weights[5]
+                self.w_re_b_dT = shared_weights[6]
+                self.w_im_b_dT = shared_weights[7]
+                self.w_re_a_dH = shared_weights[8]
+                self.w_im_a_dH = shared_weights[9]
+                self.w_re_b_dH = shared_weights[10]
+                self.w_im_b_dH = shared_weights[11]
+            else:
+                self.w_re_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+                self.w_im_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+                self.w_re_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+                self.w_im_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+                self.w_re_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+                self.w_im_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+                self.w_re_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+                self.w_im_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+                w_std_d = 1.0 / (head_dim**0.5)
+                for p in (
+                    self.w_re_a_dT,
+                    self.w_im_a_dT,
+                    self.w_re_b_dT,
+                    self.w_im_b_dT,
+                    self.w_re_a_dH,
+                    self.w_im_a_dH,
+                    self.w_re_b_dH,
+                    self.w_im_b_dH,
+                ):
+                    nn.init.normal_(p, std=w_std_d)
 
-            self.phase_dT = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-            self.phase_dH = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-            nn.init.normal_(self.phase_dT, std=1.0 / (n_modes_t**0.5))
-            nn.init.normal_(self.phase_dH, std=1.0 / (n_modes_t**0.5))
+            if shared_phase_dT is not None:
+                self.phase_dT = shared_phase_dT
+            else:
+                self.phase_dT = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+                nn.init.normal_(self.phase_dT, std=1.0 / (n_modes_t**0.5))
+            if shared_phase_dH is not None:
+                self.phase_dH = shared_phase_dH
+            else:
+                self.phase_dH = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+                nn.init.normal_(self.phase_dH, std=1.0 / (n_modes_t**0.5))
 
         # Fractional orders + branch gates + magnitude safety (always present when use_derivative)
         if use_derivative:
-            self.raw_alpha_t = nn.Parameter(torch.zeros(1))
-            self.raw_alpha_h = nn.Parameter(torch.zeros(1))
-            # Initialize branch gates: main dominant (sigmoid(1.0)=0.73, sigmoid(-1.0)=0.27)
-            self.branch_gate_main = nn.Parameter(torch.tensor([1.0]))
-            self.branch_gate_dT = nn.Parameter(torch.tensor([-1.0]))
-            self.branch_gate_dH = nn.Parameter(torch.tensor([-1.0]))
+            # Init raw_alpha at 0.5 so sigmoid(0.5)~0.62 — derivative branches active from step 0.
+            self.raw_alpha_t = nn.Parameter(torch.full((1,), 0.5))
+            self.raw_alpha_h = nn.Parameter(torch.full((1,), 0.5))
+            # Balanced branch gate init (sigmoid(0)=0.5, all branches equal at start).
+            self.branch_gate_main = nn.Parameter(torch.zeros(1))
+            self.branch_gate_dT = nn.Parameter(torch.zeros(1))
+            self.branch_gate_dH = nn.Parameter(torch.zeros(1))
             self.deriv_norm_t = nn.Parameter(torch.ones(1))
             self.deriv_norm_h = nn.Parameter(torch.ones(1))
 
@@ -482,6 +502,8 @@ class FreqBlock(nn.Module):
         ffn_rank: int | None = None,
         shared_weights: tuple | None = None,
         shared_phase: nn.Parameter | None = None,
+        shared_phase_dT: nn.Parameter | None = None,
+        shared_phase_dH: nn.Parameter | None = None,
         shared_ffn: nn.Module | None = None,
         norm_eps: float = 1e-6,
         use_derivative: bool = True,
@@ -502,6 +524,8 @@ class FreqBlock(nn.Module):
             proj_rank=proj_rank,
             shared_weights=shared_weights,
             shared_phase=shared_phase,
+            shared_phase_dT=shared_phase_dT,
+            shared_phase_dH=shared_phase_dH,
             norm_eps=norm_eps,
             use_derivative=use_derivative,
             share_branch_weights=share_branch_weights,
