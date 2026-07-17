@@ -69,14 +69,9 @@ class SpectralCache:
         return self._decode_state.kalman_p
 
     def update_kalman_p(self, p: torch.Tensor) -> None:
-        if p.dim() <= 1:
-            self._decode_state.kalman_p = p.detach()
-        else:
-            W = self.context_window
-            if p.shape[1] <= W:
-                self._decode_state.kalman_p = p.detach()
-            else:
-                self._decode_state.kalman_p = p[:, -W:, :].detach()
+        # deprecated in V5 — LearnedUncertainty has no persistent state.
+        # Kept for API compatibility with existing callers; intentionally a no-op.
+        return
 
     def to_decode_state(self) -> DecodeState:
         state = self._decode_state

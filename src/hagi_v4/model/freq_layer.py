@@ -92,6 +92,49 @@ def _interp_modes(coef: torch.Tensor, target_len: int) -> torch.Tensor:
     return coef[idx_lo] * (1.0 - frac) + coef[idx_hi] * frac
 
 
+def frequency_derivative_multiplier(
+    n: int,
+    dim_is_real: bool,
+    alpha: torch.Tensor,
+    device: torch.device | str = "cpu",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compute fractional frequency-derivative multiplier (1j*2*pi*f)^alpha.
+
+    Multiplying an FFT coefficient by this is a fractional derivative of order
+    alpha in the original (time/feature) domain: alpha=0 is identity, alpha=1
+    is the first derivative (high-pass edge detector).
+
+    Args:
+        n: length of the original axis (before FFT).
+        dim_is_real: True for the rFFT axis (Hermitian, returns n//2+1 bins),
+            False for the full-FFT axis (returns n bins).
+        alpha: derivative order in [0, 1] as a SCALAR TENSOR (0-dim). Passed as
+            tensor (not float) to preserve gradient flow for learnable alpha.
+        device: torch device for the result.
+        eps: clamp applied to |f| to avoid 0**alpha singularity at DC.
+
+    Returns:
+        Complex tensor of shape [n] (full) or [n//2+1] (real).
+    """
+    if dim_is_real:
+        freqs = torch.fft.rfftfreq(n, d=1.0, device=device)
+    else:
+        freqs = torch.fft.fftfreq(n, d=1.0, device=device)
+    freqs = freqs.float()
+    mag = freqs.abs().clamp_min(eps)
+    sign = freqs.sign()
+    # signed frequency with DC epsilon: preserves sign, avoids 0
+    f_safe = sign * mag
+    base = 1j * 2.0 * torch.pi * f_safe
+    # alpha is a scalar tensor; power op keeps gradient w.r.t. alpha
+    result = base**alpha
+    # At DC (f=0 originally), force exact 0 when alpha > 0 (derivative of constant = 0).
+    dc_mask = freqs.abs() < eps
+    result = torch.where(dc_mask, torch.zeros_like(result), result)
+    return result
+
+
 class FreqCoding2D(nn.Module):
     """2D rFFT phase-frequency coding layer.
 
@@ -119,6 +162,8 @@ class FreqCoding2D(nn.Module):
         shared_weights: tuple | None = None,
         shared_phase: nn.Parameter | None = None,
         norm_eps: float = 1e-6,
+        use_derivative: bool = True,
+        share_branch_weights: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -126,6 +171,8 @@ class FreqCoding2D(nn.Module):
         self.head_dim = head_dim
         self.n_modes_t = n_modes_t
         self.n_modes_h = n_modes_h
+        self.use_derivative = use_derivative
+        self.share_branch_weights = share_branch_weights
         freq_dim = n_heads * head_dim
 
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
@@ -165,11 +212,57 @@ class FreqCoding2D(nn.Module):
             self.phase = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
             nn.init.normal_(self.phase, std=1.0 / (n_modes_t**0.5))
 
+        # --- Derivative branch params (only when use_derivative) ---
+        if use_derivative and not share_branch_weights:
+            self.w_re_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+            self.w_im_a_dT = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+            self.w_re_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+            self.w_im_b_dT = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+            self.w_re_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+            self.w_im_a_dH = nn.Parameter(torch.zeros(n_heads, head_dim, rank))
+            self.w_re_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+            self.w_im_b_dH = nn.Parameter(torch.zeros(n_heads, rank, head_dim))
+            w_std_d = 1.0 / (head_dim**0.5)
+            for p in (
+                self.w_re_a_dT,
+                self.w_im_a_dT,
+                self.w_re_b_dT,
+                self.w_im_b_dT,
+                self.w_re_a_dH,
+                self.w_im_a_dH,
+                self.w_re_b_dH,
+                self.w_im_b_dH,
+            ):
+                nn.init.normal_(p, std=w_std_d)
+
+            self.phase_dT = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+            self.phase_dH = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+            nn.init.normal_(self.phase_dT, std=1.0 / (n_modes_t**0.5))
+            nn.init.normal_(self.phase_dH, std=1.0 / (n_modes_t**0.5))
+
+        # Fractional orders + branch gates + magnitude safety (always present when use_derivative)
+        if use_derivative:
+            self.raw_alpha_t = nn.Parameter(torch.zeros(1))
+            self.raw_alpha_h = nn.Parameter(torch.zeros(1))
+            # Initialize branch gates: main dominant (sigmoid(1.0)=0.73, sigmoid(-1.0)=0.27)
+            self.branch_gate_main = nn.Parameter(torch.tensor([1.0]))
+            self.branch_gate_dT = nn.Parameter(torch.tensor([-1.0]))
+            self.branch_gate_dH = nn.Parameter(torch.tensor([-1.0]))
+            self.deriv_norm_t = nn.Parameter(torch.ones(1))
+            self.deriv_norm_h = nn.Parameter(torch.ones(1))
+
         self._w_cache: torch.Tensor | None = None
         self._phase_cache: torch.Tensor | None = None
+        self._mult_dT_cache: torch.Tensor | None = None
+        self._mult_dH_cache: torch.Tensor | None = None
+        self._w_cache_dT: torch.Tensor | None = None
+        self._w_cache_dH: torch.Tensor | None = None
+        self._phase_cache_dT: torch.Tensor | None = None
+        self._phase_cache_dH: torch.Tensor | None = None
+        self._cache_key_T: int | None = None
 
     def reset_cache(self) -> None:
-        """Invalidate eval caches (complex weight, phase).
+        """Invalidate eval caches (complex weights, phase, derivative multipliers).
 
         Caches are populated lazily on first eval forward and never cleared,
         which produces stale data when seq_len/n_modes change between calls.
@@ -177,12 +270,23 @@ class FreqCoding2D(nn.Module):
         """
         self._w_cache = None
         self._phase_cache = None
+        self._mult_dT_cache = None
+        self._mult_dH_cache = None
+        self._w_cache_dT = None
+        self._w_cache_dH = None
+        self._phase_cache_dT = None
+        self._phase_cache_dH = None
+        self._cache_key_T = None
 
     def forward(
         self,
         x: torch.Tensor,
         cached_w: torch.Tensor | None = None,
         cached_phase: torch.Tensor | None = None,
+        cached_w_dT: torch.Tensor | None = None,
+        cached_w_dH: torch.Tensor | None = None,
+        cached_phase_dT: torch.Tensor | None = None,
+        cached_phase_dH: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, H = x.shape
         orig_dtype = x.dtype
@@ -210,9 +314,10 @@ class FreqCoding2D(nn.Module):
 
         gate_t = torch.sigmoid(_interp_modes(self.freq_gate_t, F_t).float())
         gate_h = torch.sigmoid(_interp_modes(self.freq_gate_h, F_h).float())
-
         gate_2d = gate_t.unsqueeze(1) * gate_h.unsqueeze(0)
-        low = X_f[:, :, :Kt, :Kh]
+
+        # --- Main branch (existing path) ---
+        low_main = X_f[:, :, :Kt, :Kh]
         if cached_phase is not None:
             phase = cached_phase
         elif (
@@ -226,7 +331,8 @@ class FreqCoding2D(nn.Module):
             phase = torch.exp(1j * self.phase[:, :Kt, :Kh].float())
             if not self.training:
                 self._phase_cache = phase
-        low = low * phase.unsqueeze(0)
+        low_main = low_main * phase.unsqueeze(0)
+
         if cached_w is not None:
             w = cached_w
         elif not self.training and self._w_cache is not None:
@@ -237,15 +343,116 @@ class FreqCoding2D(nn.Module):
             w = torch.complex(w_re, w_im)
             if not self.training:
                 self._w_cache = w
-        low = low @ w[:, :Kh, :F_h]
+        low_main = low_main @ w[:, :Kh, :F_h]
+
+        if not self.use_derivative:
+            # Single-branch short-circuit (post-Phase-1 behavior, no compression).
+            out_f = torch.empty_like(X_f)
+            out_f[:, :, :Kt, :] = low_main
+            if Kt < F_t:
+                out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
+            x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
+            x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
+            if self.proj_out is not None:
+                return self.proj_out(x_out)
+            return x_out
+
+        # --- Derivative branches ---
+        # Recompute derivative multipliers if seq_len changed or cache empty.
+        # NOTE: alpha must stay a tensor to preserve gradient flow to raw_alpha_*.
+        cache_key_T = T
+        need_recompute = self._mult_dT_cache is None or self._cache_key_T != cache_key_T or self.training
+        if need_recompute:
+            alpha_t = torch.sigmoid(self.raw_alpha_t)
+            alpha_h = torch.sigmoid(self.raw_alpha_h)
+            mult_dT = frequency_derivative_multiplier(
+                n=T,
+                dim_is_real=False,
+                alpha=alpha_t,
+                device=X_f.device,
+            )
+            mult_dH = frequency_derivative_multiplier(
+                n=self.head_dim,
+                dim_is_real=True,
+                alpha=alpha_h,
+                device=X_f.device,
+            )
+            mult_dT = mult_dT * self.deriv_norm_t.float()
+            mult_dH = mult_dH * self.deriv_norm_h.float()
+            if not self.training:
+                self._mult_dT_cache = mult_dT
+                self._mult_dH_cache = mult_dH
+                self._cache_key_T = cache_key_T
+        else:
+            mult_dT = self._mult_dT_cache
+            mult_dH = self._mult_dH_cache
+
+        # Apply derivative multipliers (broadcast over heads and the other axis).
+        X_dT = X_f * mult_dT.to(X_f.dtype).view(1, 1, F_t, 1)
+        X_dH = X_f * mult_dH.to(X_f.dtype).view(1, 1, 1, F_h)
+
+        if self.share_branch_weights:
+            w_dT = w
+            w_dH = w
+            phase_dT = phase
+            phase_dH = phase
+        else:
+            if cached_w_dT is not None:
+                w_dT = cached_w_dT
+            elif not self.training and self._w_cache_dT is not None:
+                w_dT = self._w_cache_dT
+            else:
+                w_re_dT = self.w_re_a_dT.float() @ self.w_re_b_dT.float()
+                w_im_dT = self.w_im_a_dT.float() @ self.w_im_b_dT.float()
+                w_dT = torch.complex(w_re_dT, w_im_dT)
+                if not self.training:
+                    self._w_cache_dT = w_dT
+
+            if cached_w_dH is not None:
+                w_dH = cached_w_dH
+            elif not self.training and self._w_cache_dH is not None:
+                w_dH = self._w_cache_dH
+            else:
+                w_re_dH = self.w_re_a_dH.float() @ self.w_re_b_dH.float()
+                w_im_dH = self.w_im_a_dH.float() @ self.w_im_b_dH.float()
+                w_dH = torch.complex(w_re_dH, w_im_dH)
+                if not self.training:
+                    self._w_cache_dH = w_dH
+
+            if cached_phase_dT is not None:
+                phase_dT = cached_phase_dT
+            elif not self.training and self._phase_cache_dT is not None:
+                phase_dT = self._phase_cache_dT[:, :Kt, :Kh]
+            else:
+                phase_dT = torch.exp(1j * self.phase_dT[:, :Kt, :Kh].float())
+                if not self.training:
+                    self._phase_cache_dT = phase_dT
+
+            if cached_phase_dH is not None:
+                phase_dH = cached_phase_dH
+            elif not self.training and self._phase_cache_dH is not None:
+                phase_dH = self._phase_cache_dH[:, :Kt, :Kh]
+            else:
+                phase_dH = torch.exp(1j * self.phase_dH[:, :Kt, :Kh].float())
+                if not self.training:
+                    self._phase_cache_dH = phase_dH
+
+        low_dT = X_dT[:, :, :Kt, :Kh] * phase_dT.unsqueeze(0)
+        low_dT = low_dT @ w_dT[:, :Kh, :F_h]
+
+        low_dH = X_dH[:, :, :Kt, :Kh] * phase_dH.unsqueeze(0)
+        low_dH = low_dH @ w_dH[:, :Kh, :F_h]
+
+        # Combine branches via learnable scalar gates (sigmoid -> [0,1])
+        g_main = torch.sigmoid(self.branch_gate_main.float())
+        g_dT = torch.sigmoid(self.branch_gate_dT.float())
+        g_dH = torch.sigmoid(self.branch_gate_dH.float())
+        combined_low = g_main * low_main + g_dT * low_dT + g_dH * low_dH
+
         out_f = torch.empty_like(X_f)
-        out_f[:, :, :Kt, :] = low
+        out_f[:, :, :Kt, :] = combined_low
         if Kt < F_t:
             out_f[:, :, Kt:, :] = X_f[:, :, Kt:, :] * gate_2d[Kt:, :].unsqueeze(0).unsqueeze(0)
-
-        mag = out_f.abs().float()
-        scale = 1.0 / (1.0 + mag)
-        out_f = out_f * scale.to(out_f.dtype)
 
         x_out = torch.fft.irfft2(out_f, s=(T, self.head_dim)).to(orig_dtype)
         x_out = x_out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
@@ -277,6 +484,8 @@ class FreqBlock(nn.Module):
         shared_phase: nn.Parameter | None = None,
         shared_ffn: nn.Module | None = None,
         norm_eps: float = 1e-6,
+        use_derivative: bool = True,
+        share_branch_weights: bool = False,
     ) -> None:
         super().__init__()
         if ffn_rank is None:
@@ -294,6 +503,8 @@ class FreqBlock(nn.Module):
             shared_weights=shared_weights,
             shared_phase=shared_phase,
             norm_eps=norm_eps,
+            use_derivative=use_derivative,
+            share_branch_weights=share_branch_weights,
         )
         self.ffn_norm = RMSNorm(hidden_size, eps=norm_eps)
         if shared_ffn is not None:
@@ -301,14 +512,29 @@ class FreqBlock(nn.Module):
         else:
             self.ffn = FactoredSwiGLU(hidden_size, ffn_intermediate, ffn_rank)
 
+        self.freq_scale = nn.Parameter(torch.ones(hidden_size))
+        self.ffn_scale = nn.Parameter(torch.ones(hidden_size))
+
     def forward(
         self,
         x: torch.Tensor,
         cached_w: torch.Tensor | None = None,
         cached_phase: torch.Tensor | None = None,
+        cached_w_dT: torch.Tensor | None = None,
+        cached_w_dH: torch.Tensor | None = None,
+        cached_phase_dT: torch.Tensor | None = None,
+        cached_phase_dH: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.freq(x, cached_w=cached_w, cached_phase=cached_phase)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.freq_scale * self.freq(
+            x,
+            cached_w=cached_w,
+            cached_phase=cached_phase,
+            cached_w_dT=cached_w_dT,
+            cached_w_dH=cached_w_dH,
+            cached_phase_dT=cached_phase_dT,
+            cached_phase_dH=cached_phase_dH,
+        )
+        x = x + self.ffn_scale * self.ffn(self.ffn_norm(x))
         return x
 
     def reset_cache(self) -> None:

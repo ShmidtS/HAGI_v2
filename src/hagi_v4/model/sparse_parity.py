@@ -24,8 +24,6 @@ import math
 import torch
 import torch.nn as nn
 
-from hagi_v4.model.norms import RMSNorm
-
 
 def _build_sparse_mask(n_checks: int, n_vars: int, edges_per_check: int, generator: torch.Generator) -> torch.Tensor:
     """Build a sparse bipartite connectivity mask [n_checks, n_vars].
@@ -85,8 +83,6 @@ class SparseParityEncoder(nn.Module):
         self.parity_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
         nn.init.normal_(self.parity_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
 
-        self.norm = RMSNorm(n_checks, eps=norm_eps)
-
     @property
     def masked_weights(self) -> torch.Tensor:
         """Sparse weights applied: element-wise mask × learnable weights."""
@@ -103,7 +99,7 @@ class SparseParityEncoder(nn.Module):
         """
         w = self.masked_weights
         parity = torch.einsum("mc,btc->btm", w, systematic)
-        return self.norm(parity)
+        return parity / math.sqrt(max(self.edges_per_check, 1))
 
 
 class SparseParityChecker(nn.Module):
@@ -147,8 +143,9 @@ class SparseParityChecker(nn.Module):
         norm_eps: float = 1e-6,
         shared_weights: nn.Parameter | None = None,
         shared_mask: torch.Tensor | None = None,
-        shared_norm: RMSNorm | None = None,
+        shared_norm: nn.Module | None = None,
     ) -> None:
+        del shared_norm  # deprecated: parity is now linear (no RMSNorm)
         super().__init__()
         self.n_vars = n_vars
         self.n_checks = n_checks
@@ -166,11 +163,6 @@ class SparseParityChecker(nn.Module):
         else:
             self.parity_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
             nn.init.normal_(self.parity_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
-
-        if shared_norm is not None:
-            self.norm = shared_norm
-        else:
-            self.norm = RMSNorm(n_checks, eps=norm_eps)
 
     @property
     def masked_weights(self) -> torch.Tensor:
@@ -194,7 +186,7 @@ class SparseParityChecker(nn.Module):
         """
         w = self.masked_weights
         parity_computed = torch.einsum("mc,btc->btm", w, systematic)
-        parity_computed = self.norm(parity_computed)
+        parity_computed = parity_computed / math.sqrt(max(self.edges_per_check, 1))
 
         if parity_received is not None:
             residual = parity_received - parity_computed

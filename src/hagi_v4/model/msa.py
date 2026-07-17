@@ -171,19 +171,24 @@ class HARQBuffer(nn.Module):
         stored_ext: torch.Tensor,
         uncertainty: torch.Tensor,
     ) -> torch.Tensor:
-        """Uncertainty-weighted soft combining (Chase combining).
+        """Maximum Ratio Combining (MRC) of current and stored extrinsic.
+
+        MRC: combined = (w_cur * current + w_stored * stored) / (w_cur + w_stored)
+        where weights are inverse-variance-like. High uncertainty -> trust stored more.
 
         Args:
             current: [B, T, C] current extrinsic delta.
             stored_ext: [B, T, C] combined stored extrinsic from buffer.
-            uncertainty: [B, T] per-position uncertainty (from Kalman P).
+            uncertainty: [B, T] per-position uncertainty (from LearnedUncertainty).
 
         Returns:
-            combined: [B, T, C] soft-combined extrinsic.
+            combined: [B, T, C] MRC-combined extrinsic.
         """
-        alpha = torch.sigmoid(self.harq_gate.float()) * torch.sigmoid(uncertainty.float())
-        alpha = alpha.unsqueeze(-1).to(current.dtype)
-        return current + alpha * stored_ext
+        w_cur = torch.ones_like(uncertainty)
+        w_stored = torch.sigmoid(self.harq_gate.float()) * torch.sigmoid(uncertainty.float())
+        w_stored = w_stored.unsqueeze(-1).to(current.dtype)
+        w_cur = w_cur.unsqueeze(-1).to(current.dtype)
+        return (w_cur * current + w_stored * stored_ext) / (w_cur + w_stored + 1e-8)
 
     def clear(self) -> None:
         self.registry.clear()

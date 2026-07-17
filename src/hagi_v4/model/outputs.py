@@ -19,13 +19,14 @@ import torch.nn.functional as F
 
 @dataclass
 class AuxLosses:
-    """Auxiliary loss terms produced by the model forward pass (V8: 5 terms)."""
+    """Auxiliary loss terms produced by the model forward pass (V8: 6 terms)."""
 
     whiteness: torch.Tensor | None = None
     parity: torch.Tensor | None = None
     correction_alignment: torch.Tensor | None = None
     rate_distortion: torch.Tensor | None = None
     contrastive: torch.Tensor | None = None
+    parity_recovery: torch.Tensor | None = None
 
 
 @dataclass
