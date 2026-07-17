@@ -34,6 +34,7 @@ from hagi_v4.model.cqi import CQIEstimator
 from hagi_v4.model.exit_chart import EXITChartEstimator
 from hagi_v4.model.freq_layer import FactoredSwiGLU, FreqBlock
 from hagi_v4.model.interleaver import BlockInterleaver
+from hagi_v4.model.lorentz import LorentzSphereNorm
 from hagi_v4.model.msa import HARQBuffer
 from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.norms import RMSNorm
@@ -86,6 +87,35 @@ class LDPCDecoder(nn.Module):
         self.shared_w = nn.ParameterList(shared_w)
         self.shared_phase = shared_phase
 
+        # Derivative branch shared weights (Phase 2 Task 6): reuse dT/dH
+        # weights across all reasoning layers (same memory-saving pattern as
+        # the main branch). Packed into 12-tuple convention: 4 main + 4 dT + 4 dH.
+        shared_w_dT = (
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+        )
+        shared_w_dH = (
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
+        )
+        for p in (*shared_w_dT, *shared_w_dH):
+            nn.init.normal_(p, std=init_std)
+        self.shared_w_dT = nn.ParameterList(shared_w_dT)
+        self.shared_w_dH = nn.ParameterList(shared_w_dH)
+
+        shared_phase_dT = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+        shared_phase_dH = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
+        nn.init.normal_(shared_phase_dT, std=init_std)
+        nn.init.normal_(shared_phase_dH, std=init_std)
+        self.shared_phase_dT = shared_phase_dT
+        self.shared_phase_dH = shared_phase_dH
+
+        shared_w_full = tuple(shared_w) + tuple(shared_w_dT) + tuple(shared_w_dH)
+
         shared_ffn = FactoredSwiGLU(hidden_size, ffn_int, ffn_rank)
         self.shared_ffn = shared_ffn
 
@@ -101,10 +131,14 @@ class LDPCDecoder(nn.Module):
                 rank=rank,
                 proj_rank=proj_rank,
                 ffn_rank=ffn_rank,
-                shared_weights=shared_w,
+                shared_weights=shared_w_full,
                 shared_phase=shared_phase,
+                shared_phase_dT=shared_phase_dT,
+                shared_phase_dH=shared_phase_dH,
                 shared_ffn=shared_ffn,
                 norm_eps=cfg.norm_eps,
+                use_derivative=True,
+                share_branch_weights=False,
             )
             for _ in range(cfg.reasoning_layers)
         )
@@ -165,14 +199,34 @@ class LDPCDecoder(nn.Module):
 
         w_shared = None
         phase_shared = None
+        w_shared_dT = None
+        w_shared_dH = None
+        phase_shared_dT = None
+        phase_shared_dH = None
         if self.shared_w is not None:
             w_re = self.shared_w[0].float() @ self.shared_w[2].float()
             w_im = self.shared_w[1].float() @ self.shared_w[3].float()
             w_shared = torch.complex(w_re, w_im)
+        if hasattr(self, "shared_w_dT"):
+            w_re_dT = self.shared_w_dT[0].float() @ self.shared_w_dT[2].float()
+            w_im_dT = self.shared_w_dT[1].float() @ self.shared_w_dT[3].float()
+            w_shared_dT = torch.complex(w_re_dT, w_im_dT)
+        if hasattr(self, "shared_w_dH"):
+            w_re_dH = self.shared_w_dH[0].float() @ self.shared_w_dH[2].float()
+            w_im_dH = self.shared_w_dH[1].float() @ self.shared_w_dH[3].float()
+            w_shared_dH = torch.complex(w_re_dH, w_im_dH)
         if self.shared_phase is not None:
             Kt = min(self.shared_phase.shape[1], T)
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
+        if hasattr(self, "shared_phase_dT"):
+            Kt = min(self.shared_phase_dT.shape[1], T)
+            Kh = min(self.shared_phase_dT.shape[2], self.reasoning[0].freq.head_dim)
+            phase_shared_dT = torch.exp(1j * self.shared_phase_dT[:, :Kt, :Kh].float())
+        if hasattr(self, "shared_phase_dH"):
+            Kt = min(self.shared_phase_dH.shape[1], T)
+            Kh = min(self.shared_phase_dH.shape[2], self.reasoning[0].freq.head_dim)
+            phase_shared_dH = torch.exp(1j * self.shared_phase_dH[:, :Kt, :Kh].float())
 
         ext = torch.zeros_like(z_sys)
 
@@ -195,10 +249,26 @@ class LDPCDecoder(nn.Module):
                 idx = (start + i) % len(self.reasoning)
                 blk = self.reasoning[idx]
                 if training:
-                    z_work = z_work + blk.freq(z_work, cached_w=w_shared, cached_phase=phase_shared)
+                    z_work = z_work + blk.freq(
+                        z_work,
+                        cached_w=w_shared,
+                        cached_phase=phase_shared,
+                        cached_w_dT=w_shared_dT,
+                        cached_w_dH=w_shared_dH,
+                        cached_phase_dT=phase_shared_dT,
+                        cached_phase_dH=phase_shared_dH,
+                    )
                     z_work = z_work + checkpoint(blk.ffn, blk.ffn_norm(z_work), use_reentrant=False)
                 else:
-                    z_work = blk(z_work, cached_w=w_shared, cached_phase=phase_shared)
+                    z_work = blk(
+                        z_work,
+                        cached_w=w_shared,
+                        cached_phase=phase_shared,
+                        cached_w_dT=w_shared_dT,
+                        cached_w_dH=w_shared_dH,
+                        cached_phase_dT=phase_shared_dT,
+                        cached_phase_dH=phase_shared_dH,
+                    )
 
             z_pred = z_work
 
@@ -294,6 +364,8 @@ class HAGIv4(nn.Module):
         nn.init.normal_(self.semantic_unknown_embed, mean=0.0, std=1.0 / math.sqrt(H))
 
         self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
+        self.use_lorentz = m.freq_coding.use_lorentz
+        self.lorentz_sphere = LorentzSphereNorm(C, mode=m.freq_coding.lorentz_mode) if self.use_lorentz else None
         self.core_mask_embed = nn.Parameter(torch.zeros(C))
         nn.init.uniform_(self.core_mask_embed, -1.0 / math.sqrt(C), 1.0 / math.sqrt(C))
 
@@ -342,6 +414,7 @@ class HAGIv4(nn.Module):
                     T_max=m.attention.max_seq_len,
                     ffn_rank=H // 4,
                     norm_eps=m.norm_eps,
+                    use_derivative=True,
                 )
                 for _ in range(m.perception_layers)
             )
@@ -519,6 +592,12 @@ class HAGIv4(nn.Module):
         gate = base_gate * dyn_mask * mag_scale
         z = torch.fft.irfft(h_f[:, :, :n_bins] * gate, n=self._C, dim=-1).to(h.dtype)
         z = self.bottleneck_norm(z)
+        if self.lorentz_sphere is not None:
+            # Project to Lorentz hyperboloid (Minkowski sphere) and back to
+            # tangent space: hyperbolic normalization that respects the
+            # negatively-curved geometry of semantic space. The systematic
+            # codeword stays in R^C (channel encoder expects Euclidean input).
+            z = self.lorentz_sphere.inverse(self.lorentz_sphere(z))
 
         return SourceEncodeResult(systematic=z, mask=semantic_unknown_mask, cqi=cqi, pre_bottleneck=h)
 
