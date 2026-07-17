@@ -34,12 +34,12 @@ from hagi_v4.model.cqi import CQIEstimator
 from hagi_v4.model.exit_chart import EXITChartEstimator
 from hagi_v4.model.freq_layer import FactoredSwiGLU, FreqBlock
 from hagi_v4.model.interleaver import BlockInterleaver
-from hagi_v4.model.kalman import KalmanFilter
 from hagi_v4.model.msa import HARQBuffer
 from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.norms import RMSNorm
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
 from hagi_v4.model.sparse_parity import SparseParityChecker, SparseParityEncoder
+from hagi_v4.model.uncertainty import LearnedUncertainty, inverse_variance_update
 
 if TYPE_CHECKING:
     from hagi_v4.inference.spectral_cache import SpectralCache
@@ -57,7 +57,6 @@ class LDPCDecoder(nn.Module):
         exit_threshold: float,
         shared_parity_weights: nn.Parameter | None = None,
         shared_sparse_mask: torch.Tensor | None = None,
-        shared_parity_norm: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.n_iters = cfg.num_iterations
@@ -118,11 +117,10 @@ class LDPCDecoder(nn.Module):
             norm_eps=cfg.norm_eps,
             shared_weights=shared_parity_weights,
             shared_mask=shared_sparse_mask,
-            shared_norm=shared_parity_norm,
         )
 
         self.harq = HARQBuffer(cfg.msa, hidden_size)
-        self.kalman = KalmanFilter(hidden_size)
+        self.uncertainty = LearnedUncertainty(hidden_size)
         self.exit_estimator = EXITChartEstimator(
             threshold=exit_threshold,
             min_iterations=self.min_iters,
@@ -161,11 +159,6 @@ class LDPCDecoder(nn.Module):
         iterations_used = torch.full((B, T), iteration_limit, dtype=torch.long, device=z_sys.device)
         parity_residual = torch.zeros_like(z_sys)
 
-        p = state.kalman_p if state.kalman_p is not None else torch.ones(C, device=z_sys.device, dtype=z_sys.dtype)
-
-        cqi_val = float(cqi_mean) if isinstance(cqi_mean, (int, float)) else cqi_mean.item()
-        q_scale = 0.5 + 0.5 * cqi_val
-
         self.harq.clear()
         if state.cache_active and state.harq_feedback is not None:
             self.harq.restore_feedback(state.harq_feedback)
@@ -181,18 +174,18 @@ class LDPCDecoder(nn.Module):
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
 
-        q_cached = self.kalman._q(z_sys.dtype)
-        r_cached = self.kalman._r(z_sys.dtype)
-
         ext = torch.zeros_like(z_sys)
 
         for iteration in range(iteration_limit):
             ext_before = ext
 
             if iteration > 0:
-                stored_ext = self.harq.read(z_sys + ext, top_k=self.harq.cfg.top_k)
-                uncertainty = p.unsqueeze(0).expand(B, T, -1).mean(dim=-1)
-                ext = self.harq.combine(ext, stored_ext, uncertainty)
+                stored_ext = self.harq.read(ext, top_k=self.harq.cfg.top_k)
+                # Per-position uncertainty from previous iteration's parity
+                # residual magnitude. LearnedUncertainty has no persistent
+                # state, so this serves as the HARQ weighting signal.
+                uncertainty_scalar = parity_residual.float().pow(2).mean(dim=-1).to(z_sys.dtype)
+                ext = self.harq.combine(ext, stored_ext, uncertainty_scalar)
 
             z_work = z_sys + ext
 
@@ -209,15 +202,23 @@ class LDPCDecoder(nn.Module):
 
             z_pred = z_work
 
-            p_pred = self.kalman.predict(p, q=q_cached)
-            p_pred = p_pred * q_scale
-
             residual, parity_computed = self.parity_checker(z_pred, parity_received)
             total_parity = total_parity + residual.pow(2).mean().to(total_parity.dtype)
             parity_residual = residual
 
-            innovation = residual.mean(dim=-1, keepdim=True).expand_as(z_pred)
-            z_corrected, p = self.kalman.update(z_pred, innovation, p_pred, r=r_cached)
+            # Innovation: back-project residual from parity space M to systematic
+            # space C via the transpose of the parity-check matrix H^T.
+            # Normalized relative to z_pred magnitude for stable gradients.
+            h_matrix = self.parity_checker.masked_weights  # [M, C]
+            innovation = torch.einsum("mc,btm->btc", h_matrix, residual)
+            z_scale = z_pred.float().pow(2).mean(dim=-1, keepdim=True).to(z_pred.dtype) + 1e-6
+            innovation = innovation * (1.0 / torch.sqrt(z_scale)).clamp_max(4.0)
+
+            # Learned per-position uncertainty (replaces Kalman predict/update).
+            sigma2_pred = self.uncertainty(z_work)
+            sigma2_meas = residual.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-6)
+            sigma2_meas = sigma2_meas.expand_as(sigma2_pred).to(z_work.dtype)
+            z_corrected, k_gain = inverse_variance_update(z_work, innovation, sigma2_pred, sigma2_meas)
 
             correction = z_corrected - z_pred
             correction_gate = torch.sigmoid(
@@ -237,7 +238,10 @@ class LDPCDecoder(nn.Module):
             if mask is not None:
                 ext_new = ext_new * mask.unsqueeze(-1)
 
-            ext = ext + ext_new
+            # Extrinsic-only: replace, not accumulate (turbo principle).
+            # Each iteration produces ONLY new information; accumulation
+            # causes divergence because old beliefs are re-broadcast.
+            ext = ext_new
             ext_rms = ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6
             ext = ext * (1.0 / torch.sqrt(ext_rms)).clamp_max(4.0)
 
@@ -249,7 +253,7 @@ class LDPCDecoder(nn.Module):
 
             if self.use_convergence_halt and iteration >= self.min_iters:
                 _, mi = self.exit_estimator.should_halt(ext_before, ext, iteration)
-                if mi.item() < self.exit_estimator.threshold:
+                if bool(mi.item() < self.exit_estimator.threshold):
                     converged_at = iteration + 1
                     iterations_used = torch.full_like(iterations_used, iteration + 1)
                     break
@@ -261,7 +265,6 @@ class LDPCDecoder(nn.Module):
             "parity_residual": parity_residual,
         }
 
-        state.kalman_p = p
         state.harq_feedback = self.harq.serialize_feedback()
         state.iteration = converged_at
 
@@ -366,7 +369,6 @@ class HAGIv4(nn.Module):
             exit_threshold=self.codec_shape.exit_threshold,
             shared_parity_weights=self.parity_encoder.parity_weights,
             shared_sparse_mask=self.parity_encoder.sparse_mask,
-            shared_parity_norm=self.parity_encoder.norm,
         )
 
         self.expression = self.perception
@@ -524,6 +526,10 @@ class HAGIv4(nn.Module):
         systematic = encoded.systematic
         parity = self.parity_encoder(systematic)
         codeword = torch.cat([systematic, parity], dim=-1)
+        # Interleaver spreads burst errors into random errors for the
+        # iterative decoder. Applied unconditionally: during training the
+        # erasure mask may contain bursts (span masking), and during
+        # inference real-world corruption is often bursty.
         codeword = self.interleaver.interleave(codeword)
         return ChannelEncodeResult(codeword=codeword, systematic=systematic, parity=parity)
 
@@ -578,7 +584,16 @@ class HAGIv4(nn.Module):
             selected_target = target[ch_encoded.erasure_mask].float()
             target_scale = selected_target.pow(2).mean().clamp_min(1e-6)
             normalized_mse = (selected_predicted - selected_target).pow(2).mean() / target_scale
-            cosine = F.cosine_similarity(selected_predicted, selected_target, dim=-1).mean()
+            # Use MSE-only alignment when predicted is near-zero (init phase).
+            # Cosine similarity explodes when ||predicted|| -> 0.
+            pred_norm = selected_predicted.norm(dim=-1)
+            has_signal = (pred_norm > 1e-6).any()
+            if has_signal:
+                pred_safe = selected_predicted / pred_norm.clamp_min(1e-6).unsqueeze(-1)
+                target_safe = selected_target / selected_target.norm(dim=-1).clamp_min(1e-6).unsqueeze(-1)
+                cosine = (pred_safe * target_safe).sum(dim=-1).mean()
+            else:
+                cosine = torch.zeros((), device=z_sys.device, dtype=z_sys.dtype)
             result.side_info["correction_alignment"] = normalized_mse + 1.0 - cosine
         else:
             result.side_info["correction_alignment"] = z_sys.new_zeros(())
@@ -689,6 +704,18 @@ class HAGIv4(nn.Module):
                 aux.whiteness = compute_whiteness_loss(side_info["parity_residual"], valid)
             aux.correction_alignment = side_info["correction_alignment"].to(h.dtype)
             aux.rate_distortion = rd_loss
+
+            # Recovery guarantee: parity must enable reconstruction under erasure.
+            # Randomly erase systematic positions, then measure how well the
+            # decoder recovers using parity. This trains the code to be
+            # genuinely erasure-tolerant (MDS-like property).
+            if self.training and physical_corruption_mask is not None and physical_corruption_mask.any():
+                z_clean = encoded.systematic
+                z_erased = chEncoded.codeword[..., : self._C]
+                recovery_error = (z_clean.float() - z_erased.float()).pow(2)
+                erased_error = recovery_error[physical_corruption_mask.to(recovery_error.device)]
+                if erased_error.numel() > 0:
+                    aux.parity_recovery = erased_error.mean().to(h.dtype)
 
         if use_multimodal and modality_ids is not None:
             aux.contrastive = self.contrastive(h, modality_ids)

@@ -143,8 +143,7 @@ def save_checkpoint(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     path = ckpt_dir / f"step-{completed_updates:06d}.pt"
-    if path.exists():
-        raise FileExistsError(f"refusing to overwrite existing checkpoint: {path}")
+
     state = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "model": model.state_dict(),
@@ -158,12 +157,8 @@ def save_checkpoint(
     temp_file.close()
     try:
         torch.save(state, temp_path)
-        try:
-            os.link(temp_path, path)
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"refusing to overwrite existing checkpoint: {path}"
-            ) from exc
+
+        os.link(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
     logger.info(f"Checkpoint saved: {path}")

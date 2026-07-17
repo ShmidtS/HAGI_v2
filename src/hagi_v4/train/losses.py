@@ -147,5 +147,7 @@ class LossAggregator:
             total = total + self.w_whiteness * aux.whiteness
         if aux.correction_alignment is not None:
             total = total + self.w_correction_alignment * aux.correction_alignment
+        if aux.parity_recovery is not None:
+            total = total + self.w_parity * 0.01 * aux.parity_recovery
 
         return total

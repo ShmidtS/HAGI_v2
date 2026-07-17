@@ -188,6 +188,8 @@ class DecodeState:
 
     V8: kalman_p tracks per-dimension uncertainty.
     harq_feedback stores serialized extrinsic deltas (not full states).
+    V5: kalman_p is deprecated — LearnedUncertainty has no persistent state.
+    Kept for API compatibility with existing callers; value is ignored.
     """
 
     kalman_p: torch.Tensor | None = None

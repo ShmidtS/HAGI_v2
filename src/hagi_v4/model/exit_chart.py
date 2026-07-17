@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class EXITChartEstimator(nn.Module):
@@ -41,43 +40,34 @@ class EXITChartEstimator(nn.Module):
         self.min_iterations = min_iterations
 
     def compute_mi(self, ext_before: torch.Tensor, ext_after: torch.Tensor) -> torch.Tensor:
-        """Compute convergence proxy via directional novelty (cosine similarity).
+        """Compute convergence proxy via norm ratio.
 
-        True EXIT MI requires density estimation. We use cosine similarity
-        between consecutive extrinsic vectors as a magnitude-invariant proxy:
-        cos -> 1 means iterations add no new directional information (converged).
-        cos -> 0 means orthogonal new information (not converged).
-
-        This is invariant to amplitude scaling (unlike magnitude-based proxies),
-        making it robust to the extrinsic accumulation dynamics.
+        Returns the ratio ||ext_after|| / ||ext_before||. When this drops below
+        threshold, iterations add little magnitude -> halt. This avoids the
+        cosine-similarity MI fiction and removes the .item() GPU sync.
 
         Args:
             ext_before: extrinsic info from previous iteration [B, T, C].
             ext_after: extrinsic info from current iteration [B, T, C].
 
         Returns:
-            mi: scalar tensor, directional novelty in [0, 1].
-                0 = no new directional information (converged).
-                1 = maximum orthogonal information (not converged).
+            novelty: scalar tensor, ratio in [0, inf). Lower = more converged.
         """
-        eb = ext_before.float().reshape(-1, ext_before.shape[-1])
-        ea = ext_after.float().reshape(-1, ext_after.shape[-1])
-        cos = F.cosine_similarity(eb, ea, dim=-1)
-        cos = cos.clamp(-1.0, 1.0)
-        novelty = 0.5 * (1.0 - cos)
-        return novelty.mean()
+        eb = ext_before.float().reshape(-1)
+        ea = ext_after.float().reshape(-1)
+        return (ea.norm() / (eb.norm() + 1e-8)).clamp(0.0, 1e6)
 
     def should_halt(
         self,
         ext_before: torch.Tensor,
         ext_after: torch.Tensor,
         iteration: int,
-    ) -> tuple[bool, torch.Tensor]:
-        """Check if decoder should halt based on EXIT chart."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Check if decoder should halt based on norm-ratio novelty. No GPU sync."""
         if iteration < self.min_iterations:
             mi = torch.tensor(0.0, device=ext_after.device)
-            return False, mi
+            return torch.tensor(False, device=ext_after.device), mi
 
         mi = self.compute_mi(ext_before, ext_after)
-        should_halt = mi.item() < self.threshold
+        should_halt = mi < self.threshold
         return should_halt, mi
