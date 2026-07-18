@@ -463,11 +463,17 @@ class FreqCoding2D(nn.Module):
         low_dH = X_dH[:, :, :Kt, :Kh] * phase_dH.unsqueeze(0)
         low_dH = low_dH @ w_dH[:, :Kh, :F_h]
 
-        # Combine branches via learnable scalar gates (sigmoid -> [0,1])
+        # Combine branches as ADDITIVE residual: main branch is primary,
+        # derivative branches contribute high-pass detail. This ensures
+        # gradients flow to derivative params even when the main branch
+        # dominates the final output (DC-symmetry bypass).
         g_main = torch.sigmoid(self.branch_gate_main.float())
         g_dT = torch.sigmoid(self.branch_gate_dT.float())
         g_dH = torch.sigmoid(self.branch_gate_dH.float())
-        combined_low = g_main * low_main + g_dT * low_dT + g_dH * low_dH
+        # main is scaled by g_main; derivative branches ADD residual scaled
+        # by their gates. This guarantees the derivative contribution is
+        # non-zero in the final output (not washed out by main).
+        combined_low = g_main * low_main + g_dT * (low_dT - low_main.detach()) + g_dH * (low_dH - low_main.detach())
 
         out_f = torch.empty_like(X_f)
         out_f[:, :, :Kt, :] = combined_low

@@ -249,7 +249,7 @@ class LDPCDecoder(nn.Module):
                 idx = (start + i) % len(self.reasoning)
                 blk = self.reasoning[idx]
                 if training:
-                    z_work = z_work + blk.freq(
+                    freq_out = blk.freq(
                         z_work,
                         cached_w=w_shared,
                         cached_phase=phase_shared,
@@ -258,7 +258,8 @@ class LDPCDecoder(nn.Module):
                         cached_phase_dT=phase_shared_dT,
                         cached_phase_dH=phase_shared_dH,
                     )
-                    z_work = z_work + checkpoint(blk.ffn, blk.ffn_norm(z_work), use_reentrant=False)
+                    z_work = z_work + blk.freq_scale * freq_out
+                    z_work = z_work + blk.ffn_scale * checkpoint(blk.ffn, blk.ffn_norm(z_work), use_reentrant=False)
                 else:
                     z_work = blk(
                         z_work,
@@ -517,8 +518,12 @@ class HAGIv4(nn.Module):
     def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
         for blk in self.perception:
             if self.training:
-                h = h + blk.freq(h)
-                h = h + checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
+                # Match FreqBlock.forward semantics: apply LayerScale on both
+                # freq and ffn branches. Use checkpoint only on ffn (dominant
+                # activation memory).
+                freq_out = blk.freq(h)
+                h = h + blk.freq_scale * freq_out
+                h = h + blk.ffn_scale * checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
             else:
                 h = blk(h)
         return h
