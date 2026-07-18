@@ -1,11 +1,16 @@
-"""V8 CodecLoss — 3-level loss hierarchy for from-scratch training.
+"""V9 CodecLoss — 3-level loss hierarchy for from-scratch training.
 
 Level 1 (Fidelity): CE — always active
 Level 2 (Code Quality): Parity reward, Rate distortion — after warmup
 Level 3 (Convergence): Extrinsic info, Whiteness — after 2×warmup
 
-V8 simplification: 4 aux losses instead of V7's 7.
-Removed: efficiency (redundant), msa_lb (impl detail), contrastive (multimodal-only).
+V9 change vs V8: ``correction_alignment`` weight reduced from 0.01 to 0.001.
+The V8 log showed ``correction_alignment ~1.75`` dominating the CE signal
+(``~6.0``) once scaled (0.0175 vs 6.0 is small, but the metric still grew
+instead of shrinking — the optimizer reduced it, inflating ``loss`` as a
+Goodhart target while ``masked_ce`` stagnated). The smaller weight keeps the
+objective aligned with the actual fidelity measure (CE) while still
+encouraging the decoder to recover erased systematic symbols.
 """
 
 from __future__ import annotations

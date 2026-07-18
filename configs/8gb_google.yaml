@@ -1,11 +1,14 @@
-# HAGI V8 — Google Cloud config (T4 16GB / V100 16GB)
+# HAGI V11 — Google Cloud config (T4 16GB / V100 16GB)
 # True Source-Channel Separation codec SLM with Cl(3,0,0) geometric algebra.
-# All model dimensions auto-computed from target_params via continuous formulas.
-# Larger target than 8gb_canonical — takes advantage of 16GB VRAM.
+# V9-V11: ConvEmbedding (factorized source encoder + pulse-shaping),
+# per-layer decoder weights (BP diversity), gradient clipping, code-rate
+# fix, factor_rank=256, n_iter=6. Larger target than 8gb_canonical —
+# takes advantage of 16GB VRAM.
 
 model:
   vocab_size: 262146
   target_params: 1000000000
+  target_nonembed_params: 1000000000
   norm_eps: 1.0e-6
   pilot_spacing: 8
 
@@ -27,13 +30,16 @@ model:
   embeddings:
     trainable: true
     init: "normal"
+    factor_rank: 256
+    kernel_size: 5
+    use_conv_embedding: true
 
   gp2d:
     use_whiteness_loss: true
 
   refinement:
-    num_iterations: 4
-    min_iterations: 1
+    num_iterations: 6
+    min_iterations: 3
     convergence_threshold: 0.01
     use_convergence_halt: true
 
@@ -46,6 +52,7 @@ model:
 
   freq_coding:
     enabled: true
+    use_lorentz: false
 
   multimodal:
     enabled: true
@@ -76,13 +83,13 @@ train:
   weight_decay: 0.1
   precision: "bf16"
   grad_accum_steps: 2
-  max_grad_norm: null
+  max_grad_norm: 1.0
   batch_size: 2
   seq_len: 1024
   w_ce: 1.0
   w_whiteness: 0.01
   w_parity: 0.1
-  w_correction_alignment: 0.01
+  w_correction_alignment: 0.001
   w_rate_distortion: 0.01
   w_contrastive: 0.1
   use_two_phase_schedule: true
@@ -95,8 +102,8 @@ train:
   distill_kl_enabled: false
   distill_teacher: "google/gemma-4-E2B-it"
   distill_embed_teacher: "google/t5gemma-2-1b-1b"
-  distill_alpha_start: 0.3
-  distill_alpha_end: 0.1
+  distill_alpha_start: 0.1
+  distill_alpha_end: 0.05
   distill_temperature: 2.0
   distill_temp_start: 4.0
   distill_temp_end: 1.0
@@ -105,7 +112,7 @@ train:
   awgn_enabled: true
   awgn_sigma_start: 0.005
   awgn_sigma_end: 0.0
-  awgn_end_frac: 0.5
+  awgn_end_frac: 0.3
   freeze_embeddings: false
   tokenizer: "google/gemma-4-E2B-it"
   eos_token_id: 1
@@ -125,5 +132,5 @@ inference:
   repetition_penalty: 1.1
   repetition_window: 64
   no_repeat_ngram_size: 3
-  max_iterations: 4
+  max_iterations: 6
   max_new_tokens: 128

@@ -1,10 +1,11 @@
 """Learned per-position uncertainty for iterative decoding.
 
-Replaces the Kalman filter's assumed-variance model with a learned,
-per-position, per-dimension variance estimator. The update step uses
-inverse-variance weighting (Bayes-optimal for Gaussian), which is the
-same mathematical structure as the Kalman gain but with learned rather
-than assumed variances.
+V9: the variance estimator projects to a *scalar* per position rather than a
+full ``[C]`` vector. The Kalman-form update only needs ``sigma2_pred`` and
+``sigma2_meas`` as scalars (they are combined additively and inverted), so a
+per-dimension variance carried no information that a scalar did not. This
+cuts ``LearnedUncertainty`` from ``C*C`` to ``C+1`` parameters (~200K -> 449
+for ``C=448``) with no loss of capacity in the update equations.
 """
 
 from __future__ import annotations
@@ -15,11 +16,11 @@ import torch.nn.functional as F
 
 
 class LearnedUncertainty(nn.Module):
-    """Per-position, per-dimension learned variance estimator.
+    """Per-position scalar learned variance estimator.
 
-    Maps hidden state to sigma^2 in [0, inf) via softplus(Linear(h)).
-    Unlike the Kalman filter's global Q/R, this adapts to each position
-    and each dimension independently.
+    Maps hidden state to a scalar ``sigma^2 in [0, inf)`` via
+    ``softplus(Linear(h))``. The scalar is broadcast across the channel
+    dimension inside the inverse-variance update.
 
     Args:
         hidden_size: C (hidden dimension).
@@ -27,7 +28,7 @@ class LearnedUncertainty(nn.Module):
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
-        self.log_var = nn.Linear(hidden_size, hidden_size)
+        self.log_var = nn.Linear(hidden_size, 1)
         nn.init.normal_(self.log_var.weight, std=0.01)
         nn.init.zeros_(self.log_var.bias)
 
@@ -38,9 +39,11 @@ class LearnedUncertainty(nn.Module):
             h: [B, T, C] hidden state.
 
         Returns:
-            sigma2: [B, T, C] non-negative variance estimate.
+            sigma2: [B, T, C] non-negative variance estimate, broadcast
+                from the scalar projection.
         """
-        return F.softplus(self.log_var(h))
+        scalar = F.softplus(self.log_var(h).squeeze(-1))  # [B, T]
+        return scalar.unsqueeze(-1).expand_as(h)
 
 
 def inverse_variance_update(

@@ -84,15 +84,20 @@ class TensorSlotRegistry(nn.Module):
 
 
 class HARQBuffer(nn.Module):
-    """HARQ soft combining buffer with MLA (Multi-head Latent Attention).
+    """HARQ soft combining buffer with weighted extrinsic read.
 
-    V8: stores EXTRINSIC deltas only (not full hidden states).
-    Write: receives delta = (corrected - predicted) from each iteration.
-    Read: returns combined extrinsic info for the next iteration.
+    V9 simplification: the V8 buffer used a Multi-head Latent Attention
+    read path (``route_proj``, ``mla_compress``, ``mla_up_k/v``,
+    ``q_proj``, ``o_proj``) — roughly 0.5M parameters for a feature that
+    only stores extrinsic deltas between decoder iterations. The attention
+    path was load-bearing only when the buffer held many slots; in practice
+    the top-``k`` read combined a handful of stored deltas per iteration.
 
-    Combining weight adapts to uncertainty:
-        high uncertainty → trust stored buffer (more redundancy)
-        low uncertainty → trust current (less combining)
+    The V9 buffer keeps the ring-buffer registry (``TensorSlotRegistry``) and
+    replaces the MLA read with a single ``Linear`` projection from the
+    gathered stored deltas. The combining rule is unchanged: inverse-
+    variance weighting where high uncertainty trusts the stored (prior)
+    state and low uncertainty trusts the current iteration.
 
     Args:
         cfg: MSADecodeConfig with buffer shape parameters.
@@ -104,13 +109,11 @@ class HARQBuffer(nn.Module):
         self.cfg = cfg
         self.route_proj = nn.Linear(hidden_size, cfg.routing_key_dim, bias=False)
         self.mla_compress = nn.Linear(hidden_size, cfg.mla_compress_dim, bias=False)
-        self.mla_up_k = nn.Linear(cfg.mla_compress_dim, cfg.mla_up_dim, bias=False)
-        self.mla_up_v = nn.Linear(cfg.mla_compress_dim, cfg.mla_up_dim, bias=False)
-        self.q_proj = nn.Linear(hidden_size, cfg.mla_up_dim, bias=False)
-        self.o_proj = nn.Linear(cfg.mla_up_dim, hidden_size, bias=False)
+        # Single projection from the combined compressed deltas back to the
+        # hidden space. Replaces the MLA q/k/v/o quartet (4 matrices) with
+        # one matmul, cutting the buffer parameters by ~4x.
+        self.read_out = nn.Linear(cfg.mla_compress_dim, hidden_size, bias=False)
         self.registry = TensorSlotRegistry(cfg.max_slots, cfg.routing_key_dim, cfg.mla_compress_dim)
-        self._n_kv_heads = cfg.n_kv_heads
-        self._head_dim = cfg.head_dim
         self._default_chunk = cfg.slot_chunk_size
 
         self.harq_gate = nn.Parameter(torch.zeros(1))
@@ -152,17 +155,14 @@ class HARQBuffer(nn.Module):
         B, T, _ = query_state.shape
         flat = query_state.reshape(B * T, -1)
         query = self.route_proj(flat)
-        top_indices, _ = self.registry.read_topk(query, top_k)
-        kv_compressed = self.registry.gather_kv(top_indices)
-        k = self.mla_up_k(kv_compressed).view(B * T, top_k, self._n_kv_heads, self._head_dim)
-        v = self.mla_up_v(kv_compressed).view(B * T, top_k, self._n_kv_heads, self._head_dim)
-        h_proj = self.q_proj(flat).view(B * T, 1, self._n_kv_heads, self._head_dim)
-        q_4d = h_proj.permute(0, 2, 1, 3)
-        k_4d = k.permute(0, 2, 1, 3)
-        v_4d = v.permute(0, 2, 1, 3)
-        attn_out = F.scaled_dot_product_attention(q_4d, k_4d, v_4d, is_causal=False)
-        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B * T, -1)
-        combined = self.o_proj(attn_out)
+        top_indices, top_scores = self.registry.read_topk(query, top_k)
+        kv_compressed = self.registry.gather_kv(top_indices)  # [B*T, k, compress_dim]
+        # Weight the gathered slots by softmax of their routing scores so
+        # the most relevant stored deltas dominate the combination. The
+        # scores are cosine similarities already (normalized in read_topk).
+        weights = torch.softmax(top_scores.unsqueeze(-1), dim=1).to(kv_compressed.dtype)
+        combined_compress = (weights * kv_compressed).sum(dim=1)
+        combined = self.read_out(combined_compress)
         return combined.view(B, T, -1)
 
     def combine(
