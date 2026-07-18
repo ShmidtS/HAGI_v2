@@ -71,12 +71,15 @@ class CodecConfig:
 class RefinementConfig:
     """Turbo decoding loop — LDPC iterative belief propagation.
 
+    V9: default iterations raised to 4 (min 2). Real LDPC BP needs several
+    iterations to converge; the V8 default of 2 left the decoder unable to
+    propagate extrinsic information, and the fifth reasoning layer never
+    received a gradient (dead weights in the step-500 checkpoint).
     EXIT chart stopping: per-token convergence based on innovation norm.
-    Kalman filter: optimal Bayesian blend of prediction and measurement.
     """
 
     num_iterations: int = 4
-    min_iterations: int = 1
+    min_iterations: int = 2
     convergence_threshold: float = 0.01
     use_convergence_halt: bool = True
     tanh_scale: float = 10.0
@@ -129,6 +132,11 @@ class FreqCodingConfig:
     Complex weight = MIMO channel equalizer (frequency-selective).
     Phase = PSK (phase shift keying).
     Soft frequency gating = adaptive modulation (5G AMC).
+
+    V9: use_lorentz defaults to False. The Lorentz hyperboloid projection
+    adds an extra forward/inverse pair that violates the Euclidean contract
+    expected by the channel encoder and is not load-bearing at init.
+    Enable only when the hyperbolic geometry is explicitly required.
     """
 
     enabled: bool = True
@@ -137,21 +145,30 @@ class FreqCodingConfig:
     complex_rank: int = 16
     use_derivative: bool = True
     share_branch_weights: bool = False
-    use_lorentz: bool = True
+    use_lorentz: bool = False
     lorentz_mode: str = "exp"
 
 
 @dataclass
 class EmbeddingsConfig:
-    """Embedding configuration (V8: trainable by default).
+    """Embedding configuration (V9: ConvEmbedding by default).
 
-    V7 froze embeddings (copied from SmolLM2). V8 trains embeddings
-    from scratch with proper regularization.
+    V7 froze embeddings (copied from SmolLM2). V8 trained embeddings
+    from scratch with proper regularization. V9 replaces the monolithic
+    V×H table with a factorized (V×r + r×H) + depthwise Conv1d
+    pulse-shaping filter — a memoryless source encoder composed with a
+    local temporal mixer (FIR filter analog in communication theory).
+
+    factor_rank: inner rank r of the low-rank embedding approximation.
+    kernel_size: causal depthwise Conv1d kernel (pulse-shaping filter).
     """
 
     trainable: bool = True
     init: str = "normal"
     weight_decay: float = 0.01
+    factor_rank: int = 128
+    kernel_size: int = 5
+    use_conv_embedding: bool = True
 
 
 @dataclass
@@ -204,6 +221,7 @@ class ModelConfig:
     core_hidden_size: int = 288
     pilot_spacing: int = 8
     target_params: int = 0
+    target_nonembed_params: int = 0
     algebra: AlgebraConfig = field(default_factory=AlgebraConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     gp2d: GP2DConfig = field(default_factory=GP2DConfig)
@@ -232,13 +250,13 @@ class TrainConfig:
     weight_decay: float = 0.1
     precision: str = "bf16"
     grad_accum_steps: int = 2
-    max_grad_norm: float | None = None
+    max_grad_norm: float | None = 1.0
     batch_size: int = 10
     seq_len: int = 1024
     w_ce: float = 1.0
     w_whiteness: float = 0.01
     w_parity: float = 0.1
-    w_correction_alignment: float = 0.01
+    w_correction_alignment: float = 0.001
     w_rate_distortion: float = 0.01
     w_contrastive: float = 0.1
     use_two_phase_schedule: bool = True
@@ -262,7 +280,7 @@ class TrainConfig:
     awgn_enabled: bool = True
     awgn_sigma_start: float = 0.005
     awgn_sigma_end: float = 0.0
-    awgn_end_frac: float = 0.5
+    awgn_end_frac: float = 0.3
     freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     eos_token_id: int = 0
@@ -333,29 +351,63 @@ def _next_pow2(n: int) -> int:
 
 
 def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
-    """Auto-compute all model sizes from target non-embedding params.
+    """Auto-compute model sizes from a parameter budget.
 
-    All dimensions derived from target_params via continuous formulas —
-    no hardcoded thresholds, no magic constants. Convergence is natural
-    via iterative H-size refinement.
+    The budget is split into two independent parts following the
+    Source-Channel Separation Theorem:
+
+      * ``target_nonembed_params`` (or ``target_params`` when the former is
+        unset) governs the channel codec + source codec body. ``H`` is solved
+        from this budget alone, so the body capacity is invariant to the
+        vocabulary size.
+      * The source embedding is a factorized ``V x r + r x H`` table plus a
+        depthwise Conv1d pulse-shaping filter. Its cost is reported
+        separately and does not inflate the channel budget.
+
+    V9 cost model matches the real architecture:
+      * ``FactoredSwiGLU`` FFN uses rank ``r_ffn = H / 4`` (SVD-style), not
+        a dense ``H x intermediate`` matrix. Each FFN contributes
+        ``H*r_ffn + r_ffn*2*intermediate + intermediate*r_ffn + r_ffn*H``.
+      * ``FreqCoding2D`` uses shared low-rank complex weights
+        ``[H, head_dim, rank] + [H, rank, head_dim]`` (4 tensors per branch),
+        not the dense ``4*H*H`` of the V8 estimate.
+      * ``SparseParity`` stores ``M*C`` masked weights (already small).
+
+    This fixes the V8 regression where the cost model overestimated the body
+    and produced an ``H`` much larger than the budget warranted (a 17.5M
+    target produced a 97M checkpoint because embedding dominated at 91% and
+    the body solver ignored the FFN rank compression).
     """
     import math
 
     target = float(target_params)
-
     ratio = _BOTTLENECK_RATIO
     int_ratio = 4.0 / 3.0
+    # Factored FFN inner rank relative to H (matches FactoredSwiGLU default).
+    ffn_rank_rel = 0.25
 
     layers = max(2, round(math.log10(target / 1e5) * 3))
     perc = max(1, layers // 4)
     expr = perc
     reason = max(3, layers - 2 * perc)
 
+    # Per-H^2 cost of one FreqBlock:
+    #   FreqCoding2D: 4 * head_dim * rank (low-rank A,B) per main branch, and
+    #     the same again for dT/dH derivative branches, but those are shared
+    #     across layers so we charge only the per-layer residual (phase + gate
+    #     + layer scales). We approximate the per-layer freq cost as 2*H.
+    #   FactoredSwiGLU: H*r_ffn + r_ffn*2*intermediate + intermediate*r_ffn + r_ffn*H,
+    #     with r_ffn = H*ffn_rank_rel and intermediate = H*int_ratio*ratio.
+    # Per-H^2 cost of one reasoning block (channel side):
+    #   FreqCoding2D (shared): ~0 (charged once globally, small).
+    #   FactoredSwiGLU on C: 2*(C*r_ffn_c) + 2*(r_ffn_c * 2*intermediate_c),
+    #     with r_ffn_c = C*ffn_rank_rel and intermediate_c = C*int_ratio.
+    # We fold these into a single cost-per-H^2 coefficient via the ratios.
     cost_per_h_sq = (
-        4 * (perc + expr)
-        + 4 * ratio * ratio * reason
-        + 3 * int_ratio * ratio * (perc + expr)
-        + 3 * int_ratio * ratio * ratio * reason
+        2.0 * (perc + expr)
+        + 4.0 * ffn_rank_rel * (1.0 + int_ratio * ratio) * (perc + expr)
+        + 4.0 * ratio * ratio * ffn_rank_rel * (1.0 + int_ratio) * reason
+        + 2.0 * ratio * reason
     )
     H = _round_to_multiple(int(math.sqrt(target / cost_per_h_sq)), 8)
 
@@ -363,8 +415,16 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
         C = _round_to_multiple(int(H * ratio), 8)
         ffn_int_h = _round_to_multiple(int(H * int_ratio * ratio), 8)
         ffn_int_c = _round_to_multiple(int(C * int_ratio), 8)
-        cost_h = 4 * H * H + 3 * H * ffn_int_h + 2 * H
-        cost_c = 4 * C * C + 3 * C * ffn_int_c + 2 * C
+        r_ffn_h = max(32, H // 4)
+        r_ffn_c = max(32, C // 4)
+        # FreqBlock cost: layer scales + freq gates + phase (small per layer)
+        # + derivative branch params (shared across layers, charge once).
+        cost_h_freq = 2 * H
+        cost_h_ffn = H * r_ffn_h + r_ffn_h * 2 * ffn_int_h + ffn_int_h * r_ffn_h + r_ffn_h * H
+        cost_h = cost_h_freq + cost_h_ffn + 2 * H
+        cost_c_freq = 2 * C
+        cost_c_ffn = C * r_ffn_c + r_ffn_c * 2 * ffn_int_c + ffn_int_c * r_ffn_c + r_ffn_c * C
+        cost_c = cost_c_freq + cost_c_ffn + 2 * C
         extra = 50 * C + 20 * H
         k = (cost_h * (perc + expr) + cost_c * reason + extra) / (H * H)
         H_new = _round_to_multiple(int(math.sqrt(target / k)), 8)
@@ -410,6 +470,7 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
     m.reasoning_layers = reason
     m.bottleneck_ratio = ratio
     m.target_params = target_params
+    m.target_nonembed_params = int(target)
 
     m.algebra.grade_dims = grade_dims
     m.algebra.hidden_size = H
@@ -458,7 +519,11 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
         tp = cfg.model.target_params
         if tp and tp > 0:
             model_data = data.get("model", {})
-            auto = auto_configure(tp, cfg.model.vocab_size)
+            # Prefer the explicit non-embedding budget when provided so that
+            # the channel codec body capacity is independent of vocabulary size.
+            nonembed_budget = model_data.get("target_nonembed_params")
+            budget = nonembed_budget if nonembed_budget else tp
+            auto = auto_configure(int(budget), cfg.model.vocab_size)
             _apply_auto(cfg.model, auto, model_data)
 
     for key, value in overrides.items():
@@ -540,3 +605,14 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         for f in fields:
             if f not in yaml_section:
                 setattr(model_section, f, getattr(auto_section, f))
+
+    # V11: recompute codec dimensions from the FINAL core_hidden_size, not from
+    # the auto_configure estimate. When the YAML overrides hidden_size/
+    # core_hidden_size, the auto-computed n_checks (= auto.C = 1056) no longer
+    # matches the actual C (= 320), producing a 3.3x oversized parity matrix.
+    # code_rate governs the ratio: n_checks = C * (1/rate - 1).
+    if "n_checks" not in yaml_data.get("codec", {}):
+        rate = model.codec.code_rate
+        model.codec.n_checks = max(1, int(model.core_hidden_size * (1.0 / rate - 1.0)))
+    if "edges_per_check" not in yaml_data.get("codec", {}):
+        model.codec.edges_per_check = max(3, min(8, model.core_hidden_size // 32))

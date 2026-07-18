@@ -30,9 +30,10 @@ from hagi_v4.model.codec_contracts import (
     TurboDecodeConfig,
 )
 from hagi_v4.model.contrastive import ContrastiveAlignment
+from hagi_v4.model.conv_embedding import ConvEmbedding
 from hagi_v4.model.cqi import CQIEstimator
 from hagi_v4.model.exit_chart import EXITChartEstimator
-from hagi_v4.model.freq_layer import FactoredSwiGLU, FreqBlock
+from hagi_v4.model.freq_layer import FreqBlock
 from hagi_v4.model.interleaver import BlockInterleaver
 from hagi_v4.model.lorentz import LorentzSphereNorm
 from hagi_v4.model.msa import HARQBuffer
@@ -73,51 +74,19 @@ class LDPCDecoder(nn.Module):
         proj_rank = max(1, hidden_size // 4)
         ffn_rank = max(1, hidden_size // 4)
 
-        init_std = 1.0 / math.sqrt(max(1, n_heads * head_dim))
-        shared_w = (
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-        )
-        for p in shared_w:
-            nn.init.normal_(p, std=init_std)
-        shared_phase = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-        nn.init.normal_(shared_phase, std=init_std)
-        self.shared_w = nn.ParameterList(shared_w)
-        self.shared_phase = shared_phase
-
-        # Derivative branch shared weights (Phase 2 Task 6): reuse dT/dH
-        # weights across all reasoning layers (same memory-saving pattern as
-        # the main branch). Packed into 12-tuple convention: 4 main + 4 dT + 4 dH.
-        shared_w_dT = (
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-        )
-        shared_w_dH = (
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, head_dim, rank)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-            nn.Parameter(torch.zeros(n_heads, rank, head_dim)),
-        )
-        for p in (*shared_w_dT, *shared_w_dH):
-            nn.init.normal_(p, std=init_std)
-        self.shared_w_dT = nn.ParameterList(shared_w_dT)
-        self.shared_w_dH = nn.ParameterList(shared_w_dH)
-
-        shared_phase_dT = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-        shared_phase_dH = nn.Parameter(torch.zeros(n_heads, n_modes_t, n_modes_h))
-        nn.init.normal_(shared_phase_dT, std=init_std)
-        nn.init.normal_(shared_phase_dH, std=init_std)
-        self.shared_phase_dT = shared_phase_dT
-        self.shared_phase_dH = shared_phase_dH
-
-        shared_w_full = tuple(shared_w) + tuple(shared_w_dT) + tuple(shared_w_dH)
-
-        shared_ffn = FactoredSwiGLU(hidden_size, ffn_int, ffn_rank)
-        self.shared_ffn = shared_ffn
+        # V10: per-layer weights — BP diversity. The V8/V9 decoder shared
+        # ``shared_w``, ``shared_phase`` and ``shared_ffn`` across all reasoning
+        # layers, which made every BP iteration produce identical extrinsic
+        # information. Belief propagation requires each iteration to add NEW
+        # information; identical updates leave parity residual divergent
+        # (observed: parity grew 0.005 -> 0.069 after curriculum switch).
+        self.shared_w = None
+        self.shared_phase = None
+        self.shared_w_dT = None
+        self.shared_w_dH = None
+        self.shared_phase_dT = None
+        self.shared_phase_dH = None
+        self.shared_ffn = None
 
         self.reasoning = nn.ModuleList(
             FreqBlock(
@@ -131,11 +100,11 @@ class LDPCDecoder(nn.Module):
                 rank=rank,
                 proj_rank=proj_rank,
                 ffn_rank=ffn_rank,
-                shared_weights=shared_w_full,
-                shared_phase=shared_phase,
-                shared_phase_dT=shared_phase_dT,
-                shared_phase_dH=shared_phase_dH,
-                shared_ffn=shared_ffn,
+                shared_weights=None,
+                shared_phase=None,
+                shared_phase_dT=None,
+                shared_phase_dH=None,
+                shared_ffn=None,
                 norm_eps=cfg.norm_eps,
                 use_derivative=True,
                 share_branch_weights=False,
@@ -160,7 +129,9 @@ class LDPCDecoder(nn.Module):
             min_iterations=self.min_iters,
         )
 
-        self._layers_per_iter = max(2, cfg.reasoning_layers // 2)
+        self._layers_per_iter = max(
+            2, (cfg.reasoning_layers + max(1, cfg.num_iterations) - 1) // max(1, cfg.num_iterations)
+        )
 
         mut_rank = max(1, hidden_size // 8)
         self.mut_down_w = nn.Parameter(torch.empty(mut_rank, hidden_size))
@@ -207,11 +178,11 @@ class LDPCDecoder(nn.Module):
             w_re = self.shared_w[0].float() @ self.shared_w[2].float()
             w_im = self.shared_w[1].float() @ self.shared_w[3].float()
             w_shared = torch.complex(w_re, w_im)
-        if hasattr(self, "shared_w_dT"):
+        if self.shared_w_dT is not None:
             w_re_dT = self.shared_w_dT[0].float() @ self.shared_w_dT[2].float()
             w_im_dT = self.shared_w_dT[1].float() @ self.shared_w_dT[3].float()
             w_shared_dT = torch.complex(w_re_dT, w_im_dT)
-        if hasattr(self, "shared_w_dH"):
+        if self.shared_w_dH is not None:
             w_re_dH = self.shared_w_dH[0].float() @ self.shared_w_dH[2].float()
             w_im_dH = self.shared_w_dH[1].float() @ self.shared_w_dH[3].float()
             w_shared_dH = torch.complex(w_re_dH, w_im_dH)
@@ -219,11 +190,11 @@ class LDPCDecoder(nn.Module):
             Kt = min(self.shared_phase.shape[1], T)
             Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
-        if hasattr(self, "shared_phase_dT"):
+        if self.shared_phase_dT is not None:
             Kt = min(self.shared_phase_dT.shape[1], T)
             Kh = min(self.shared_phase_dT.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared_dT = torch.exp(1j * self.shared_phase_dT[:, :Kt, :Kh].float())
-        if hasattr(self, "shared_phase_dH"):
+        if self.shared_phase_dH is not None:
             Kt = min(self.shared_phase_dH.shape[1], T)
             Kh = min(self.shared_phase_dH.shape[2], self.reasoning[0].freq.head_dim)
             phase_shared_dH = torch.exp(1j * self.shared_phase_dH[:, :Kt, :Kh].float())
@@ -358,8 +329,22 @@ class HAGIv4(nn.Module):
         self._H = H
         self._C = C
 
-        self.embed = nn.Embedding(m.vocab_size, H)
-        nn.init.normal_(self.embed.weight, mean=0.0, std=1.0 / math.sqrt(H))
+        # Source encoder: factorized V×r + r×H + depthwise Conv1d pulse-shaping.
+        # The semantic-erasure indicator is applied by the caller before this
+        # module, so erasure never appears as a token ID (channel-correct).
+        em = m.embeddings
+        if em.use_conv_embedding:
+            self.embed = ConvEmbedding(
+                vocab_size=m.vocab_size,
+                hidden_size=H,
+                factor_rank=em.factor_rank,
+                kernel_size=em.kernel_size,
+                norm_eps=m.norm_eps,
+                init=em.init,
+            )
+        else:
+            self.embed = nn.Embedding(m.vocab_size, H)
+            nn.init.normal_(self.embed.weight, mean=0.0, std=1.0 / math.sqrt(H))
 
         self.semantic_unknown_embed = nn.Parameter(torch.empty(H))
         nn.init.normal_(self.semantic_unknown_embed, mean=0.0, std=1.0 / math.sqrt(H))
@@ -448,8 +433,16 @@ class HAGIv4(nn.Module):
         self.expression = self.perception
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
-        self.lm_head = nn.Linear(H, m.vocab_size, bias=False)
-        self.lm_head.weight = self.embed.weight
+        # Source decoder: factorized LM head. The low-rank source encoder
+        # (ConvEmbedding) has no natural inverse of the same rank, so the
+        # output projection is an independent rank-``r`` factorization rather
+        # than a tied transpose of the embedding table. This keeps the head
+        # well-conditioned while staying a small fraction of the body budget.
+        em = m.embeddings
+        self.lm_compress = nn.Linear(H, em.factor_rank, bias=False)
+        self.lm_expand = nn.Linear(em.factor_rank, m.vocab_size, bias=False)
+        nn.init.normal_(self.lm_compress.weight, mean=0.0, std=1.0 / math.sqrt(H))
+        nn.init.normal_(self.lm_expand.weight, mean=0.0, std=1.0 / math.sqrt(em.factor_rank))
         teacher_hidden = cfg.train.distill_teacher_hidden_size
         self.distill_align = nn.Identity() if teacher_hidden == H else nn.Linear(teacher_hidden, H, bias=False)
 
@@ -470,17 +463,28 @@ class HAGIv4(nn.Module):
         self._init_weights()
         self._init_turbo_weights()
 
+    @property
+    def lm_head_weight(self) -> torch.Tensor:
+        """Effective ``[V, H]`` output projection weight for compatibility.
+
+        Composed as ``lm_expand.weight @ lm_compress.weight`` (rank-``r``
+        factorization). Callers that only need the weight matrix (CE chunked
+        compute, VRAM-efficient inference) can use this property; the forward
+        path uses the factored modules directly.
+        """
+        return self.lm_expand.weight @ self.lm_compress.weight
+
     def _init_weights(self) -> None:
         for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
-                if "mut_" in name or mod is self.lm_head:
+                if "mut_" in name or mod is self.lm_compress or mod is self.lm_expand:
                     continue
                 std = 1.0 / math.sqrt(max(1, mod.weight.shape[1]))
                 nn.init.normal_(mod.weight, mean=0.0, std=std)
                 if mod.bias is not None:
                     nn.init.zeros_(mod.bias)
             elif isinstance(mod, nn.Embedding):
-                if mod is self.embed:
+                if mod is self.embed or mod is getattr(self.embed, "token_compress", None):
                     continue
                 if self.multimodal_enabled and mod is self.multimodal_input.text_embed:
                     continue
@@ -506,13 +510,17 @@ class HAGIv4(nn.Module):
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
         t_flat = targets.reshape(B * T)
-        lm_dev = self.lm_head.weight.device
-        total_loss = h_flat.new_zeros(())
-        n = h_flat.shape[0]
+        # Factored LM head: h -> lm_compress -> lm_expand -> logits. Using the
+        # factored path keeps the VRAM footprint proportional to ``r`` and not
+        # to the vocabulary size when materializing logits.
+        compress_dev = self.lm_compress.weight.device
+        z = self.lm_compress(h_flat.to(compress_dev))
+        total_loss = z.new_zeros(())
+        n = z.shape[0]
         for i in range(0, n, chunk):
             end = min(i + chunk, n)
-            logits_chunk = F.linear(h_flat[i:end].to(lm_dev), self.lm_head.weight)
-            total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(lm_dev), reduction="sum")
+            logits_chunk = self.lm_expand(z[i:end])
+            total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(compress_dev), reduction="sum")
         return total_loss / max(n, 1)
 
     def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -559,13 +567,13 @@ class HAGIv4(nn.Module):
             B, T = input_ids.shape
             embed_dev = self.embed.weight.device
             ids_dev = input_ids.device
+            unknown = self.semantic_unknown_embed.to(device=embed_dev, dtype=self.embed.token_expand.weight.dtype)
             if embed_dev != ids_dev:
-                h = self.embed(input_ids.to(embed_dev)).to(ids_dev)
+                ids_on_dev = input_ids.to(embed_dev)
+                mask_on_dev = semantic_unknown_mask.to(embed_dev) if semantic_unknown_mask is not None else None
+                h = self.embed.forward_with_erasure(ids_on_dev, unknown, mask_on_dev).to(ids_dev)
             else:
-                h = self.embed(input_ids)
-            if semantic_unknown_mask is not None:
-                unknown = self.semantic_unknown_embed.to(device=h.device, dtype=h.dtype)
-                h = torch.where(semantic_unknown_mask.to(h.device).unsqueeze(-1), unknown, h)
+                h = self.embed.forward_with_erasure(input_ids, unknown, semantic_unknown_mask)
 
             cached_len = 0
             if cache is not None and cache.context_len > 0:
@@ -760,17 +768,20 @@ class HAGIv4(nn.Module):
         rd_loss = (encoded.systematic.float() - decoded.latent.float()).pow(2).mean().to(h.dtype)
 
         h_normed = self.final_norm(h)
-        lm_dev = self.lm_head.weight.device
         selected = prediction_mask & valid_target_mask
         prediction_indices = selected.flatten().nonzero(as_tuple=False).squeeze(-1)
         prediction_hidden = h_normed[:, : input_ids.shape[1]] if use_multimodal else h_normed
         selected_hidden = prediction_hidden.flatten(0, 1).index_select(0, prediction_indices.to(h_normed.device))
-        logits = F.linear(selected_hidden.to(lm_dev), self.lm_head.weight).to(h_normed.device)
+        # Factored LM head: H -> r -> V. Keeps logits computation off the
+        # vocabulary-sized weight matrix until the final expand step.
+        logits = self.lm_expand(self.lm_compress(selected_hidden.to(self.lm_compress.weight.device))).to(
+            h_normed.device
+        )
         if targets is not None:
             if prediction_indices.numel() == 0:
                 raise ValueError("prediction_mask must select at least one target during training")
             selected_targets = targets.flatten().index_select(0, prediction_indices.to(targets.device))
-            ce = F.cross_entropy(logits.to(lm_dev), selected_targets.to(lm_dev))
+            ce = F.cross_entropy(logits, selected_targets.to(logits.device))
         else:
             ce = None
 

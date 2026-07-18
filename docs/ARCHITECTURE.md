@@ -1,4 +1,121 @@
-# HAGI V8 — Probabilistic Codec Language Model
+# HAGI V11 — Probabilistic Codec Language Model
+
+## V11 Changes vs V10
+
+V11 addresses the V10 remaining issue: `masked_ce` stagnated at ~5.71
+(bpt=8.12 bits/token) after step ~546, with `top2_mass=0.175` and
+`confidence=0.124`. Root cause analysis through information theory:
+
+1. **Code rate mismatch.** The V10 `n_checks` was 1056 for `C=320` — a
+   code rate of 0.23, far below the configured 0.5. The auto_configure
+   computed `n_checks` from its internal `C=1056` estimate, but the YAML
+   overrode `core_hidden_size=320` without recomputing `n_checks`. V11
+   recomputes `n_checks` from the FINAL `core_hidden_size` after all YAML
+   overrides, giving `n_checks=320` (rate 0.5 as intended). Parity encoder
+   params drop 0.676M → 0.102M.
+
+2. **Source code capacity.** V10 `factor_rank=128` gave the source encoder
+   only `log2(128)=7` bits of latent code capacity for a `V=49154` vocab
+   needing `log2(V)=15.6` bits. V11 raises `factor_rank` to 256 (8 bits
+   latent, still compressed but with 2x expressivity). Embedding + LM head
+   grow 12.75M → 25.33M but remain far below the V8 88M.
+
+3. **Distillation dominance.** V10 `distill_alpha_start=0.3` let the
+   SmolLM2-360M teacher (causal LM) dominate the student (masked LM),
+   pulling the posterior toward a mismatched distribution. V11 reduces
+   `distill_alpha_start=0.1`, `distill_alpha_end=0.05` so the CE signal
+   leads and distillation is a mild regularizer.
+
+4. **More BP iterations.** V10 `n_iter=4` was still short for LDPC
+   convergence. V11 raises to `n_iter=6, min=3`.
+
+5. **Channel response init.** V10 `channel_response_t/h` were zero-init,
+   leaving the MIMO equalizer near identity with a weak gradient
+   (checkpoint showed max 0.011). V11 inits with `randn * 0.1` so the
+   equalizer starts with a non-trivial phase perturbation.
+
+The channel-correct contract is unchanged.
+
+## V10 Changes vs V9
+
+V10 fixes the V9 regression observed in `train_20260718_142908.log` and the
+`step-012000` checkpoint: loss 7.32 → 1.31 (s6339) → 2.31 (regression +77%),
+parity 0.005 → 0.069 (diverging decoder), grad 0.90 → 11.69 (explosion).
+
+1. **BP diversity — per-layer decoder weights.** The V8/V9 decoder shared
+   `shared_w`, `shared_phase`, `shared_ffn` across all 5 reasoning layers,
+   so every BP iteration produced identical extrinsic information. Belief
+   propagation requires each iteration to add NEW information; identical
+   updates leave the parity residual divergent. V10 gives every reasoning
+   layer its own weights (`shared_weights=None`, `shared_ffn=None`). The
+   `w_shared`/`phase_shared` precomputation path is kept but deactivated
+   when the shared parameters are `None`.
+
+2. **Learnable derivative orders.** V9 initialized `raw_alpha_t/h = 0.5`
+   (identical on all layers) and the optimizer never moved them — the V9
+   checkpoint showed `raw_alpha = 0.5` on all 5 reasoning layers. V10
+   initializes `raw_alpha` and `branch_gate_*` with small random noise
+   (`randn * 0.1`) so the layers differentiate from step 0 and the gradient
+   is not stuck at a symmetric fixed point.
+
+3. **Gradient clipping.** V9 had `max_grad_norm = None` (no clipping). The
+   V9 log showed `grad` exploding to 11.69 (and 50.25 in the last 50 steps).
+   V10 sets `max_grad_norm = 1.0`, bounding the per-step update.
+
+4. **Shorter AWGN anneal.** V9 annealed AWGN until 50% of training
+   (`awgn_end_frac = 0.5`), so at step 12000 the systematic still carried
+   `sigma ≈ 0.0042`. V10 shortens the anneal to 30% (`awgn_end_frac = 0.3`)
+   so the channel is clean earlier and the decoder can focus on parity
+   recovery rather than noise rejection.
+
+The channel-correct contract is unchanged.
+
+## V9 Changes vs V8
+
+V9 keeps the Source-Channel Separation pipeline and all 5G analogies intact.
+The refactor targets three V8 regressions observed in the step-500 checkpoint
+and the `train_20260718_132801.log` trajectory:
+
+1. **Embedding dominance.** The V8 17.5M `target_params` produced a 97M
+   checkpoint where the `V×H` embedding table was 91% of the parameters
+   (`H=896`, `V=49154`). V9 replaces the monolithic embedding with a
+   **factorized source encoder** (`ConvEmbedding`): `V×r + r×H` plus a
+   causal depthwise Conv1d pulse-shaping filter. For `V=49154, H=640,
+   r=128` the source encoder costs ~6.4M instead of ~31M, and the body
+   capacity is now independent of the vocabulary size. The `lm_head` is an
+   independent rank-`r` factorization (`H→r→V`), not a tied transpose — the
+   low-rank source encoder has no natural inverse of the same rank.
+
+2. **Goodhart on the objective.** The V8 log showed `masked_ce` stagnating
+   at ~6.0 (bpt=8.69 bits/token, far above the Shannon entropy of language)
+   while `correction_alignment ~1.75` dominated the auxiliary signal. V9
+   reduces `w_correction_alignment` from `0.01` to `0.001` so the optimizer
+   aligns with the fidelity measure (CE) rather than the recovery proxy.
+
+3. **Decoder under-capacity and dead weights.** The V8 decoder ran 2 BP
+   iterations and `_layers_per_iter = reason//2 = 2`, so the fifth
+   reasoning layer never received a gradient (`channel_response`,
+   `branch_gate_*` were exactly zero in the checkpoint). V9 raises
+   `num_iterations` to 4, `min_iterations` to 2, and computes
+   `_layers_per_iter = ceil(reason / num_iterations)` so every reasoning
+   layer is visited on every iteration. The `HARQBuffer` is simplified:
+   the MLA read quartet (`mla_up_k/v`, `q_proj`, `o_proj`, ~0.5M params)
+   is replaced by a single `read_out` Linear on the weighted compressed
+   deltas — a 4× parameter reduction with no loss of combining rule.
+   `LearnedUncertainty` projects to a scalar per position instead of a
+   full `C` vector (`C*C → C+1` params); the inverse-variance update only
+   needs scalars.
+
+4. **Lorentz hyperboloid off by default.** The Lorentz projection adds an
+   `exp`/`log` pair that violates the Euclidean contract the channel
+   encoder expects. V9 defaults `freq_coding.use_lorentz: false`; the
+   option remains for experiments that explicitly need hyperbolic
+   geometry.
+
+The channel-correct contract is unchanged: semantic erasure replaces the
+compressed source code *before* the expand and pulse-shaping steps, physical
+corruption applies only to the received systematic part, and erasure is never
+represented by a token ID.
 
 ## Channel-Correct Training Contract
 
@@ -66,8 +183,9 @@ Token IDs
     |
     v
 SOURCE ENCODE
-  embedding -> semantic unknown replacement -> cache write -> FreqBlock mixing
-  -> CQI-controlled frequency bottleneck -> clean systematic latent
+  ConvEmbedding (V×r + r×H + depthwise Conv1d pulse-shaping) -> semantic
+  unknown replacement on the compressed source code -> cache write ->
+  FreqBlock mixing -> CQI-controlled frequency bottleneck -> clean systematic latent
     |
     v
 CHANNEL ENCODE
@@ -82,12 +200,13 @@ APPLY ERASURE
     v
 CHANNEL DECODE
   iterative FreqBlock prediction -> sparse parity residual
-  -> Kalman-form gated correction -> extrinsic accumulation/HARQBuffer
-  -> optional directional-novelty convergence halt
+  -> Kalman-form gated correction (scalar per-position uncertainty) ->
+  extrinsic accumulation/HARQBuffer (weighted read) -> optional
+  directional-novelty convergence halt
     |
     v
 SOURCE DECODE
-  frequency-domain expansion C -> H -> FreqBlock mixing -> RMSNorm -> LM head
+  frequency-domain expansion C -> H -> FreqBlock mixing -> RMSNorm -> factored LM head
 ```
 
 The sparse parity graph, iterative correction, Kalman equations, HARQ buffer,
@@ -208,6 +327,33 @@ computes `parity_received - parity_computed`. This sparse graph is LDPC-style
 inspiration only: values are continuous learned features, and decoding is not
 the standardized binary LDPC sum-product or min-sum algorithm.
 
+### Source Encoder — ConvEmbedding (V9)
+
+`ConvEmbedding` replaces the monolithic `nn.Embedding(V, H)` table with a
+factorized source encoder + pulse-shaping filter:
+
+```python
+# Factorized source code: V×r + r×H (low-rank approximation of V×H)
+compressed = token_compress(input_ids)       # [B, T, r]
+# Semantic erasure replaces the compressed source code (channel-correct):
+# the learned erasure indicator is projected into rank-r via the adjoint
+# of token_expand before the pulse-shaping filter runs.
+h = token_expand(compressed)                # [B, T, H]
+# Pulse-shaping filter: causal depthwise Conv1d (FIR filter analog)
+h = local_conv(h)                            # O(H * kernel) params
+h = norm(h)
+```
+
+Information theory: the compressed `r`-dimensional code is the true source
+message (a low-rank source coder), `token_expand` is the modulation that
+lifts it into the channel space, and the depthwise Conv1d is the
+pulse-shaping filter that confines the transmit spectrum and reduces
+inter-symbol interference before OFDM (the FreqBlock 2D FFT).
+
+Weight tying with the output head is intentionally *not* used: a rank-`r`
+source encoder has no natural inverse of the same rank, so the LM head is an
+independent rank-`r` factorization (`lm_compress: H→r`, `lm_expand: r→V`).
+
 ### Embeddings
 
 Embeddings remain trainable from scratch (`freeze_embeddings=False`), but the
@@ -217,7 +363,8 @@ That profile requires the configured distillation teacher to be available
 locally, which may require network access during prior model setup, and startup
 fails fast when the enabled distillation teacher cannot be loaded. Set
 `train.distill_enabled: false` explicitly for a teacher-free baseline. Weight
-tying remains supported.
+tying is no longer supported in V9 (the source encoder and the LM head are
+independent rank-`r` factorizations).
 
 ### Masked LM + LLaDA-style Generation
 

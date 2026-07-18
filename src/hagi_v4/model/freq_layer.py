@@ -205,8 +205,13 @@ class FreqCoding2D(nn.Module):
         self.freq_gate_t = nn.Parameter(torch.zeros(n_modes_t))
         self.freq_gate_h = nn.Parameter(torch.zeros(n_modes_h))
 
-        self.channel_response_t = nn.Parameter(torch.zeros(n_modes_t))
-        self.channel_response_h = nn.Parameter(torch.zeros(n_modes_h))
+        # V11: non-zero init for channel response (MIMO equalizer). The V10
+        # checkpoint showed channel_response_h near dead (max 0.011) because
+        # zero init left the exp(1j*0)=1 identity with a weak gradient. Small
+        # random phase perturbation gives the equalizer a non-trivial starting
+        # point and a stronger gradient signal.
+        self.channel_response_t = nn.Parameter(torch.randn(n_modes_t) * 0.1)
+        self.channel_response_h = nn.Parameter(torch.randn(n_modes_h) * 0.1)
 
         if shared_phase is not None:
             self.phase = shared_phase
@@ -261,13 +266,17 @@ class FreqCoding2D(nn.Module):
 
         # Fractional orders + branch gates + magnitude safety (always present when use_derivative)
         if use_derivative:
-            # Init raw_alpha at 0.5 so sigmoid(0.5)~0.62 — derivative branches active from step 0.
-            self.raw_alpha_t = nn.Parameter(torch.full((1,), 0.5))
-            self.raw_alpha_h = nn.Parameter(torch.full((1,), 0.5))
-            # Balanced branch gate init (sigmoid(0)=0.5, all branches equal at start).
-            self.branch_gate_main = nn.Parameter(torch.zeros(1))
-            self.branch_gate_dT = nn.Parameter(torch.zeros(1))
-            self.branch_gate_dH = nn.Parameter(torch.zeros(1))
+            # V10: init raw_alpha with small random perturbation around 0.0
+            # (sigmoid(0)=0.5) instead of the tautological 0.5 that left the
+            # parameter stuck at its init value in the V9 checkpoint. Small
+            # random init breaks symmetry between layers and gives the
+            # optimizer a non-saturated gradient signal.
+            self.raw_alpha_t = nn.Parameter(torch.randn(1) * 0.1)
+            self.raw_alpha_h = nn.Parameter(torch.randn(1) * 0.1)
+            # Branch gates: small random init so branches differentiate early.
+            self.branch_gate_main = nn.Parameter(torch.randn(1) * 0.1)
+            self.branch_gate_dT = nn.Parameter(torch.randn(1) * 0.1)
+            self.branch_gate_dH = nn.Parameter(torch.randn(1) * 0.1)
             self.deriv_norm_t = nn.Parameter(torch.ones(1))
             self.deriv_norm_h = nn.Parameter(torch.ones(1))
 
