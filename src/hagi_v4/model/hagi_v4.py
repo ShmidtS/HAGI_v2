@@ -449,7 +449,10 @@ class HAGIv4(nn.Module):
         self.multimodal_enabled = m.multimodal.enabled
         if self.multimodal_enabled:
             self.multimodal_input = MultimodalInput(cfg)
-            self.multimodal_input.text_embed.weight = self.embed.weight
+            # V9: ConvEmbedding has no single nn.Parameter ``.weight`` to tie
+            # against (it is a factorized V*r + r*H table). The multimodal
+            # text encoder keeps its own independent nn.Embedding(V, H) so
+            # the modality path is not coupled to the source-encoder rank.
             self.cross_modal = CliffordCrossModal(
                 H,
                 gate_init=m.multimodal.cross_freq_gate_init,
