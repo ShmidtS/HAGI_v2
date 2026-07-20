@@ -60,7 +60,9 @@ def create_semantic_corruption(
         rows = missing_random.nonzero(as_tuple=False).flatten()
         semantic_unknown_mask[rows, fallback_indices[rows]] = True
 
-    suffix_starts = (start_scores * valid_counts).to(torch.long)
+    # V17: quadratic bias on start → longer suffixes (train-like-generate).
+    # u^2 * valid_count puts mass on small starts (suffix length often >= T/2).
+    suffix_starts = (start_scores.square() * valid_counts).to(torch.long)
     positions = torch.arange(T, device=device).unsqueeze(0)
     suffix_mask = (positions >= suffix_starts.unsqueeze(1)) & valid_target_mask
     semantic_unknown_mask = torch.where(is_suffix.unsqueeze(1), suffix_mask, semantic_unknown_mask)

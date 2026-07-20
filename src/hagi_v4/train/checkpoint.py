@@ -25,9 +25,7 @@ class IncompatibleCheckpointError(RuntimeError):
 
 def _incompatible(message: str) -> IncompatibleCheckpointError:
     detail = " ".join(message.split())
-    return IncompatibleCheckpointError(
-        f"incompatible checkpoint: {detail}; fresh retraining required"
-    )
+    return IncompatibleCheckpointError(f"incompatible checkpoint: {detail}; fresh retraining required")
 
 
 def _require_mapping(value, name: str) -> Mapping:
@@ -44,25 +42,15 @@ def load_checkpoint_payload(path: str | Path, device: str = "cpu") -> dict:
         raise _incompatible(f"checkpoint payload cannot be loaded: {exc}") from exc
     state = _require_mapping(state, "root")
     if set(state) != CHECKPOINT_FIELDS:
-        raise _incompatible(
-            f"checkpoint schema expected {sorted(CHECKPOINT_FIELDS)}, got {sorted(state)}"
-        )
+        raise _incompatible(f"checkpoint schema expected {sorted(CHECKPOINT_FIELDS)}, got {sorted(state)}")
     if state.get("format_version") != CHECKPOINT_FORMAT_VERSION:
-        raise _incompatible(
-            f"checkpoint schema has unsupported format_version {state.get('format_version')!r}"
-        )
+        raise _incompatible(f"checkpoint schema has unsupported format_version {state.get('format_version')!r}")
     model_state = _require_mapping(state.get("model"), "model")
-    if not all(
-        isinstance(key, str) and isinstance(value, torch.Tensor)
-        for key, value in model_state.items()
-    ):
+    if not all(isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in model_state.items()):
         raise _incompatible("model must map parameter names to tensors")
     if not isinstance(state.get("config"), Mapping):
         raise _incompatible("config must be a mapping")
-    if (
-        type(state.get("completed_updates")) is not int
-        or state["completed_updates"] < 0
-    ):
+    if type(state.get("completed_updates")) is not int or state["completed_updates"] < 0:
         raise _incompatible("completed_updates must be a non-negative integer")
     return dict(state)
 
@@ -83,9 +71,7 @@ def cfg_from_dict(data: dict) -> HAGIv4Config:
             if isinstance(expected_value, Mapping):
                 child = value[key]
                 if not isinstance(child, Mapping):
-                    raise _incompatible(
-                        f"checkpoint config schema mismatch at {path}.{key}"
-                    )
+                    raise _incompatible(f"checkpoint config schema mismatch at {path}.{key}")
                 require_schema(child, expected_value, f"{path}.{key}")
 
     require_schema(data, cfg_to_dict(cfg), "config")
@@ -114,9 +100,7 @@ def assert_fresh_checkpoint_root(path: str | Path) -> Path:
     return ckpt_dir
 
 
-def load_model_checkpoint(
-    path: str | Path, model: nn.Module, device: str
-) -> tuple[int, HAGIv4Config]:
+def load_model_checkpoint(path: str | Path, model: nn.Module, device: str) -> tuple[int, HAGIv4Config]:
     """Validate a complete checkpoint, then strictly load its model state."""
     state = load_checkpoint_payload(path, device)
     cfg = cfg_from_dict(state["config"])
@@ -150,22 +134,24 @@ def save_checkpoint(
         "completed_updates": completed_updates,
         "config": cfg_to_dict(cfg),
     }
-    temp_file = tempfile.NamedTemporaryFile(
-        prefix=f".{path.name}.", suffix=".tmp", dir=ckpt_dir, delete=False
-    )
+    temp_file = tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=ckpt_dir, delete=False)
     temp_path = Path(temp_file.name)
     temp_file.close()
     try:
         torch.save(state, temp_path)
 
-        os.link(temp_path, path)
+        # V12: ``os.replace`` atomically overwrites an existing destination
+        # on both POSIX and Windows, where ``os.link`` fails with
+        # ``FileExistsError`` if the target file already exists. This allows
+        # resuming/re-running training without manually clearing the
+        # checkpoint directory first.
+        os.replace(temp_path, path)
     finally:
-        temp_path.unlink(missing_ok=True)
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
     logger.info(f"Checkpoint saved: {path}")
 
-    checkpoints = sorted(
-        ckpt_dir.glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-"))
-    )
+    checkpoints = sorted(ckpt_dir.glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-")))
     for old in checkpoints[:-keep_last]:
         old.unlink()
         logger.info(f"Old checkpoint deleted: {old}")

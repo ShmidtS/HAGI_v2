@@ -1,15 +1,17 @@
-# HAGI V8 — 8GB canonical config (RTX 3070)
-# True Source-Channel Separation codec SLM with Cl(3,0,0) geometric algebra.
-# All model dimensions auto-computed from target_params via continuous formulas.
+# HAGI V18 — Strict Shannon SCS (RTX 3070 8GB)
+# V17 regressed: mce=4.18, parity=0.0096 (dead), source_skip_scale=1.0 (not moving).
+# V18: no skip bypass, pure LDPC BP decoder, LayerScale bottleneck, channel always open.
+# See docs/ARCHITECTURE.md V18 section.
 
 model:
   vocab_size: 49154
-  target_params: 17500000
-  target_nonembed_params: 17500000
-  hidden_size: 640
-  core_hidden_size: 320
-  perception_layers: 2
-  reasoning_layers: 5
+  target_params: 25000000
+  target_nonembed_params: 25000000
+  hidden_size: 384
+  core_hidden_size: 192
+  perception_layers: 4
+  expression_layers: 4
+  reasoning_layers: 3
   norm_eps: 1.0e-6
   pilot_spacing: 8
 
@@ -22,6 +24,7 @@ model:
     bidirectional: true
     fp16_attention: true
     fp32_rmsnorm: true
+    head_dim: 64
 
   codec:
     code_rate: 0.5
@@ -31,18 +34,18 @@ model:
   embeddings:
     trainable: true
     init: "normal"
-    factor_rank: 256
+    factor_rank: 128
     kernel_size: 5
     use_conv_embedding: true
 
   gp2d:
-    use_whiteness_loss: true
+    use_whiteness_loss: false
 
   refinement:
     num_iterations: 6
     min_iterations: 3
     convergence_threshold: 0.01
-    use_convergence_halt: true
+    use_convergence_halt: false
 
   masking:
     mask_ratio: 0.30
@@ -52,8 +55,7 @@ model:
     adaptation_rate: 0.01
 
   freq_coding:
-    enabled: true
-    use_lorentz: false
+    enabled: false
 
   multimodal:
     enabled: false
@@ -69,8 +71,8 @@ model:
 
 train:
   max_steps: 150000
-  warmup_steps: 500
-  learning_rate: 0.0003
+  warmup_steps: 1000
+  learning_rate: 0.0006
   muon_lr: 0.02
   muon_momentum: 0.95
   muon_weight_decay: 0.5
@@ -82,31 +84,34 @@ train:
   batch_size: 8
   seq_len: 512
   w_ce: 1.0
-  w_whiteness: 0.01
-  w_parity: 0.1
-  w_correction_alignment: 0.001
-  w_rate_distortion: 0.01
+  w_whiteness: 0.0
+  w_parity: 0.05
+  w_correction_alignment: 0.0
+  w_rate_distortion: 0.005
+  w_parity_diversity: 0.05
+  bp_iterations: 3
   use_two_phase_schedule: true
   two_phase_split: 0.5
   phase1_mask_ratio: 0.15
   phase2_mask_ratio: 0.30
   phase3_mask_ratio: 0.50
+  suffix_probability: 0.30
   use_continuous_anneal: true
-  distill_enabled: true
+  distill_enabled: false
   distill_kl_enabled: false
   distill_teacher: "HuggingFaceTB/SmolLM2-360M"
   distill_teacher_hidden_size: 960
   distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"
-  distill_alpha_start: 0.1
-  distill_alpha_end: 0.05
+  distill_alpha_start: 0.0
+  distill_alpha_end: 0.0
   distill_temperature: 2.0
   distill_temp_start: 4.0
   distill_temp_end: 1.0
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
   awgn_enabled: true
-  awgn_sigma_start: 0.005
-  awgn_sigma_end: 0.0
+  awgn_sigma_start: 0.05
+  awgn_sigma_end: 0.01
   awgn_end_frac: 0.3
   freeze_embeddings: false
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
@@ -124,8 +129,8 @@ inference:
   temperature: 0.8
   top_k: 50
   min_new_tokens: 2
-  repetition_penalty: 1.1
-  repetition_window: 64
-  no_repeat_ngram_size: 3
-  max_iterations: 4
-  max_new_tokens: 128
+  repetition_penalty: 1.2
+  repetition_window: 32
+  no_repeat_ngram_size: 2
+  max_iterations: 3
+  max_new_tokens: 64

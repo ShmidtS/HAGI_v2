@@ -109,6 +109,14 @@ class LossAggregator:
         self.w_rate_distortion = contract.rate_distortion_weight
         self.w_contrastive = contract.contrastive_weight
         self.warmup_steps = cfg.train.warmup_steps if isinstance(cfg, HAGIv4Config) else 5000
+        # V12: parity-code diversity weight. Active from step 0 (Level 1)
+        # because collapse can occur very early — the V12 step-1500 log
+        # showed ``par`` already at 0.01 by step 1500, meaning the code
+        # had degenerated before the Level 2 codec losses kicked in.
+        if isinstance(cfg, HAGIv4Config):
+            self.w_parity_diversity = getattr(cfg.train, "w_parity_diversity", 0.05)
+        else:
+            self.w_parity_diversity = 0.05
 
     def _loss_level(self, step: int) -> int:
         """Return active loss level: 1, 2, or 3."""
@@ -134,6 +142,14 @@ class LossAggregator:
         aux: AuxLosses = model_output.aux
         total = ce_loss
 
+        # V12/V18: parity diversity is the FIRST codec-side loss to activate
+        # (Level 1). It operates purely on the parity-check matrix H and does
+        # not depend on the decoder's forward pass, so it is safe to apply
+        # before the decoder has learned anything useful. V17 had w=0.0 —
+        # that was a bug that let the LDPC graph collapse.
+        if aux.parity_diversity is not None and self.w_parity_diversity > 0.0:
+            total = total + self.w_parity_diversity * aux.parity_diversity
+
         level = self._loss_level(step)
         if level == 1:
             return total
@@ -142,17 +158,18 @@ class LossAggregator:
             total = total + self.w_rate_distortion * aux.rate_distortion
         if aux.parity is not None:
             total = total + self.w_parity * torch.log1p(aux.parity.float())
-        if aux.contrastive is not None:
-            total = total + self.w_contrastive * aux.contrastive
+        # V18: parity_recovery explicitly supervised (erasure-tolerance loss).
+        # Active from Level 2 so the LDPC code is forced to carry real
+        # information about erased systematic positions.
+        if aux.parity_recovery is not None:
+            total = total + self.w_parity * 0.5 * aux.parity_recovery
 
         if level == 2:
             return total
 
-        if aux.whiteness is not None:
-            total = total + self.w_whiteness * aux.whiteness
-        if aux.correction_alignment is not None:
+        # V18: w_correction_alignment defaults to 0 — V8 showed it Goodhart-ised.
+        if self.w_correction_alignment > 0.0 and aux.correction_alignment is not None:
             total = total + self.w_correction_alignment * aux.correction_alignment
-        if aux.parity_recovery is not None:
-            total = total + self.w_parity * 0.01 * aux.parity_recovery
-
+        if self.w_whiteness > 0.0 and aux.whiteness is not None:
+            total = total + self.w_whiteness * aux.whiteness
         return total

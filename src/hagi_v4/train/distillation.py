@@ -276,8 +276,24 @@ class DistillationTeacher:
 
         5G analog: DM-RS alignment on pilot positions, data recovery
         on data positions.
+
+        V12: when ``alpha >= 1.0`` the CE signal dominates entirely and the
+        MSE term contributes nothing; when ``alpha <= 0.0`` the function
+        returns ``reconstruction_loss`` unchanged (CE-only). This is the
+        theoretically-correct behavior — V11 had ``alpha * CE + (1-alpha) *
+        MSE`` which, at ``alpha = 0``, inverted to ``1 * MSE`` and silently
+        replaced CE with hidden alignment. The V12 canonical profile sets
+        ``alpha = 0`` to disable hidden alignment entirely (it was found
+        to compete with the CE signal via distribution mismatch); this
+        early-return makes that intent explicit and avoids the inversion.
         """
         if teacher_hidden is None:
+            return reconstruction_loss
+
+        # V12: alpha <= 0 means "CE only, no alignment". Returning early
+        # avoids the ``0 * CE + 1 * MSE`` inversion that silently replaced
+        # the primary objective with hidden-state matching.
+        if alpha <= 0.0:
             return reconstruction_loss
 
         B, T, H_s = student_hidden.shape

@@ -75,12 +75,17 @@ class SpectralCache:
 
     def to_decode_state(self) -> DecodeState:
         state = self._decode_state
-        return DecodeState(state.kalman_p, state.msa_feedback, state.iteration, cache_active=True)
+        return DecodeState(
+            kalman_p=state.kalman_p,
+            harq_feedback=state.harq_feedback,
+            iteration=state.iteration,
+            cache_active=True,
+        )
 
     def update_decode_state(self, state: DecodeState) -> None:
         self._decode_state = DecodeState(
             kalman_p=None,
-            msa_feedback=state.msa_feedback.detach() if state.msa_feedback is not None else None,
+            harq_feedback=state.harq_feedback.detach() if state.harq_feedback is not None else None,
             iteration=state.iteration,
             cache_active=True,
         )
@@ -116,7 +121,7 @@ class SpectralCache:
     def _copy_decode_state(state: DecodeState) -> DecodeState:
         return DecodeState(
             kalman_p=state.kalman_p.detach().clone() if state.kalman_p is not None else None,
-            msa_feedback=state.msa_feedback.detach().clone() if state.msa_feedback is not None else None,
+            harq_feedback=state.harq_feedback.detach().clone() if state.harq_feedback is not None else None,
             iteration=state.iteration,
             cache_active=True,
         )

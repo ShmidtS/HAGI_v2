@@ -1,10 +1,21 @@
-"""HAGI V4 — Source-Channel Separation codec language model.
+"""HAGI V18 — Strict Shannon Source-Channel Separation codec LM.
 
 Pipeline:
-  Source Encode (Embed + FreqBlock + IB Bottleneck) -> systematic
-  Channel Encode (SparseParity + Interleave) -> codeword
-  Channel Decode (iterative BP: VN update + CN check + Kalman + HARQ) -> decoded
-  Source Decode (RateDematch + FreqBlock + LM Head) -> logits
+  Source Encode (ConvEmbed + sinusoidal PE + AttentionBlock × N_perc + LayerScale + rate_down)
+    -> z_sys in R^C
+  Channel Encode (SparseParity + BlockInterleaver) -> codeword
+  Physical Channel (AWGN + erasure on systematic only)
+  Channel Decode (pure LDPC BP: syndrome -> H^T back-projection -> gated correction)
+  Source Decode (rate_up + AttentionBlock × N_expr + final_norm + factored tied lm_head)
+
+V18 changes vs V17 (see docs/ARCHITECTURE.md):
+  - No source_skip_scale bypass (strict SCS)
+  - No FreqBlock in decoder (pure LDPC BP)
+  - No bottleneck_norm (LayerScale only)
+  - No Lorentz sphere, HARQ buffer, EXIT halt, mutation branch, multimodal
+  - rate_up.expand init N(0, 1/sqrt(C)) for cold-start gradient flow
+  - corr_gate_w/b init neutral (0.1, 0.0)
+  - Channel always open (no channel_open schedule)
 """
 
 from __future__ import annotations
@@ -18,7 +29,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hagi_v4.config import HAGIv4Config
-from hagi_v4.model.clifford_cross_modal import CliffordCrossModal
+from hagi_v4.model.attention_block import AttentionBlock
 from hagi_v4.model.codec_contracts import (
     ChannelEncodeResult,
     CodecShapeConfig,
@@ -29,293 +40,133 @@ from hagi_v4.model.codec_contracts import (
     SourceEncodeResult,
     TurboDecodeConfig,
 )
-from hagi_v4.model.contrastive import ContrastiveAlignment
 from hagi_v4.model.conv_embedding import ConvEmbedding
-from hagi_v4.model.cqi import CQIEstimator
-from hagi_v4.model.exit_chart import EXITChartEstimator
-from hagi_v4.model.freq_layer import FreqBlock
 from hagi_v4.model.interleaver import BlockInterleaver
-from hagi_v4.model.lorentz import LorentzSphereNorm
-from hagi_v4.model.msa import HARQBuffer
-from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.norms import RMSNorm
-from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_whiteness_loss
+from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_parity_diversity_loss, compute_whiteness_loss
 from hagi_v4.model.sparse_parity import SparseParityChecker, SparseParityEncoder
-from hagi_v4.model.uncertainty import LearnedUncertainty, inverse_variance_update
 
 if TYPE_CHECKING:
     from hagi_v4.inference.spectral_cache import SpectralCache
 
 
 class LDPCDecoder(nn.Module):
-    """Iterative LDPC-style belief propagation decoder (extrinsic-only)."""
+    """Pure LDPC belief-propagation decoder (V18).
+
+    Each iteration:
+      syndrome    = parity_recv - H @ z_pred      [B, T, M]
+      correction  = H^T @ syndrome * residual_scale
+      gate        = sigmoid(corr_gate_w * |syndrome|_mean + corr_gate_b)
+      z_pred      = z_pred + gate * correction
+
+    No Kalman framing, no HARQ buffer, no FreqBlock reasoning, no mutation
+    branch. The Tanner-graph H is shared with the encoder (fixed sparse mask
+    + frozen parity_base + learnable per-check edge_log_scale).
+    """
 
     def __init__(
         self,
-        cfg: TurboDecodeConfig,
         hidden_size: int,
         n_parity_checks: int,
         edges_per_check: int,
-        exit_threshold: float,
+        norm_eps: float = 1e-6,
         shared_parity_weights: nn.Parameter | None = None,
         shared_sparse_mask: torch.Tensor | None = None,
+        shared_edge_log_scale: nn.Parameter | None = None,
+        shared_parity_base: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
-        self.n_iters = cfg.num_iterations
-        self.min_iters = cfg.min_iterations
-        self.use_convergence_halt = cfg.use_convergence_halt
-
-        n_modes_t = cfg.freq_n_modes_t
-        n_modes_h = cfg.freq_n_modes_h
-        ffn_int = hidden_size * 2
-        rank = cfg.freq_complex_rank
-        head_dim = cfg.attention_head_dim
-        n_heads = max(1, hidden_size // head_dim)
-        proj_rank = max(1, hidden_size // 4)
-        ffn_rank = max(1, hidden_size // 4)
-
-        # V10: per-layer weights — BP diversity. The V8/V9 decoder shared
-        # ``shared_w``, ``shared_phase`` and ``shared_ffn`` across all reasoning
-        # layers, which made every BP iteration produce identical extrinsic
-        # information. Belief propagation requires each iteration to add NEW
-        # information; identical updates leave parity residual divergent
-        # (observed: parity grew 0.005 -> 0.069 after curriculum switch).
-        self.shared_w = None
-        self.shared_phase = None
-        self.shared_w_dT = None
-        self.shared_w_dH = None
-        self.shared_phase_dT = None
-        self.shared_phase_dH = None
-        self.shared_ffn = None
-
-        self.reasoning = nn.ModuleList(
-            FreqBlock(
-                hidden_size,
-                n_heads=n_heads,
-                head_dim=head_dim,
-                n_modes_t=n_modes_t,
-                n_modes_h=n_modes_h,
-                ffn_intermediate=ffn_int,
-                T_max=cfg.attention_max_seq_len,
-                rank=rank,
-                proj_rank=proj_rank,
-                ffn_rank=ffn_rank,
-                shared_weights=None,
-                shared_phase=None,
-                shared_phase_dT=None,
-                shared_phase_dH=None,
-                shared_ffn=None,
-                norm_eps=cfg.norm_eps,
-                use_derivative=True,
-                share_branch_weights=False,
-            )
-            for _ in range(cfg.reasoning_layers)
-        )
+        self.hidden_size = hidden_size
+        self.n_parity_checks = n_parity_checks
+        self.edges_per_check = edges_per_check
 
         self.parity_checker = SparseParityChecker(
             n_vars=hidden_size,
             n_checks=n_parity_checks,
             edges_per_check=edges_per_check,
             seed=42,
-            norm_eps=cfg.norm_eps,
+            norm_eps=norm_eps,
             shared_weights=shared_parity_weights,
             shared_mask=shared_sparse_mask,
+            shared_edge_log_scale=shared_edge_log_scale,
+            shared_parity_base=shared_parity_base,
         )
 
-        self.harq = HARQBuffer(cfg.msa, hidden_size)
-        self.uncertainty = LearnedUncertainty(hidden_size)
-        self.exit_estimator = EXITChartEstimator(
-            threshold=exit_threshold,
-            min_iterations=self.min_iters,
-        )
-
-        self._layers_per_iter = max(
-            2, (cfg.reasoning_layers + max(1, cfg.num_iterations) - 1) // max(1, cfg.num_iterations)
-        )
-
-        mut_rank = max(1, hidden_size // 8)
-        self.mut_down_w = nn.Parameter(torch.empty(mut_rank, hidden_size))
-        self.mut_down_b = nn.Parameter(torch.empty(mut_rank))
-        self.mut_up_w = nn.Parameter(torch.empty(hidden_size, mut_rank))
-
-        self.corr_gate_w = nn.Parameter(torch.zeros(1))
-        self.corr_gate_b = nn.Parameter(torch.tensor([-3.0]))
-
-        self.ext_gate = nn.Parameter(torch.zeros(1))
+        # V18: neutral gate init. corr_gate_w small positive (learns to grow
+        # when syndrome magnitude is informative); corr_gate_b 0.0 gives
+        # sigmoid(0)=0.5 baseline. Resolves V17 code/checkpoint inconsistency
+        # where init was -1.0 but ckpt had +1.0.
+        self.corr_gate_w = nn.Parameter(torch.tensor([0.1]))
+        self.corr_gate_b = nn.Parameter(torch.tensor([0.0]))
 
     def forward(
         self,
         z_sys: torch.Tensor,
-        parity_received: torch.Tensor | None,
+        parity_received: torch.Tensor,
         training: bool,
         state: DecodeState,
-        cqi_mean: torch.Tensor | float = 0.5,
         mask: torch.Tensor | None = None,
         refinement_iterations: int | None = None,
+        n_iters: int = 3,
     ) -> DecodeResult:
-        B, T, C = z_sys.shape
-        iteration_limit = self.n_iters if refinement_iterations is None else refinement_iterations
-        if type(iteration_limit) is not int or not 1 <= iteration_limit <= self.n_iters:
-            raise ValueError(f"refinement_iterations must be an integer in [1, {self.n_iters}]")
+        """Run ``n_iters`` BP iterations and return the refined systematic estimate.
 
+        Args:
+            z_sys: received systematic latent [B, T, C] (post AWGN + erasure).
+            parity_received: clean parity [B, T, M] from the encoder.
+            training: when True, gradient flows through all iterations.
+            state: opaque decode state (unused in V18 but kept for cache compat).
+            mask: optional [B, T] boolean; when set, corrections are restricted
+                to masked positions. V18 applies the mask only to the
+                correction update (not the syndrome), so parity is always
+                computed over the full latent.
+            refinement_iterations: explicit iteration override (inference).
+            n_iters: default iteration count (training).
+        """
+        iteration_limit = refinement_iterations if refinement_iterations is not None else n_iters
+        if type(iteration_limit) is not int or iteration_limit < 1:
+            raise ValueError(f"refinement_iterations must be a positive int, got {iteration_limit!r}")
+
+        z_pred = z_sys
         total_parity = z_sys.new_zeros(())
-        extrinsic_norms: list = []
-        converged_at = iteration_limit
-        iterations_used = torch.full((B, T), iteration_limit, dtype=torch.long, device=z_sys.device)
-        parity_residual = torch.zeros_like(z_sys)
+        last_residual = torch.zeros_like(z_sys[..., :1].expand_as(z_sys))
 
-        self.harq.clear()
-        if state.cache_active and state.harq_feedback is not None:
-            self.harq.restore_feedback(state.harq_feedback)
-
-        w_shared = None
-        phase_shared = None
-        w_shared_dT = None
-        w_shared_dH = None
-        phase_shared_dT = None
-        phase_shared_dH = None
-        if self.shared_w is not None:
-            w_re = self.shared_w[0].float() @ self.shared_w[2].float()
-            w_im = self.shared_w[1].float() @ self.shared_w[3].float()
-            w_shared = torch.complex(w_re, w_im)
-        if self.shared_w_dT is not None:
-            w_re_dT = self.shared_w_dT[0].float() @ self.shared_w_dT[2].float()
-            w_im_dT = self.shared_w_dT[1].float() @ self.shared_w_dT[3].float()
-            w_shared_dT = torch.complex(w_re_dT, w_im_dT)
-        if self.shared_w_dH is not None:
-            w_re_dH = self.shared_w_dH[0].float() @ self.shared_w_dH[2].float()
-            w_im_dH = self.shared_w_dH[1].float() @ self.shared_w_dH[3].float()
-            w_shared_dH = torch.complex(w_re_dH, w_im_dH)
-        if self.shared_phase is not None:
-            Kt = min(self.shared_phase.shape[1], T)
-            Kh = min(self.shared_phase.shape[2], self.reasoning[0].freq.head_dim)
-            phase_shared = torch.exp(1j * self.shared_phase[:, :Kt, :Kh].float())
-        if self.shared_phase_dT is not None:
-            Kt = min(self.shared_phase_dT.shape[1], T)
-            Kh = min(self.shared_phase_dT.shape[2], self.reasoning[0].freq.head_dim)
-            phase_shared_dT = torch.exp(1j * self.shared_phase_dT[:, :Kt, :Kh].float())
-        if self.shared_phase_dH is not None:
-            Kt = min(self.shared_phase_dH.shape[1], T)
-            Kh = min(self.shared_phase_dH.shape[2], self.reasoning[0].freq.head_dim)
-            phase_shared_dH = torch.exp(1j * self.shared_phase_dH[:, :Kt, :Kh].float())
-
-        ext = torch.zeros_like(z_sys)
+        h_matrix = self.parity_checker.masked_weights  # [M, C]
 
         for iteration in range(iteration_limit):
-            ext_before = ext
-
-            if iteration > 0:
-                stored_ext = self.harq.read(ext, top_k=self.harq.cfg.top_k)
-                # Per-position uncertainty from previous iteration's parity
-                # residual magnitude. LearnedUncertainty has no persistent
-                # state, so this serves as the HARQ weighting signal.
-                uncertainty_scalar = parity_residual.float().pow(2).mean(dim=-1).to(z_sys.dtype)
-                ext = self.harq.combine(ext, stored_ext, uncertainty_scalar)
-
-            z_work = z_sys + ext
-
-            layers_per_iter = self._layers_per_iter
-            start = (iteration * layers_per_iter) % len(self.reasoning)
-            for i in range(layers_per_iter):
-                idx = (start + i) % len(self.reasoning)
-                blk = self.reasoning[idx]
-                if training:
-                    freq_out = blk.freq(
-                        z_work,
-                        cached_w=w_shared,
-                        cached_phase=phase_shared,
-                        cached_w_dT=w_shared_dT,
-                        cached_w_dH=w_shared_dH,
-                        cached_phase_dT=phase_shared_dT,
-                        cached_phase_dH=phase_shared_dH,
-                    )
-                    z_work = z_work + blk.freq_scale * freq_out
-                    z_work = z_work + blk.ffn_scale * checkpoint(blk.ffn, blk.ffn_norm(z_work), use_reentrant=False)
-                else:
-                    z_work = blk(
-                        z_work,
-                        cached_w=w_shared,
-                        cached_phase=phase_shared,
-                        cached_w_dT=w_shared_dT,
-                        cached_w_dH=w_shared_dH,
-                        cached_phase_dT=phase_shared_dT,
-                        cached_phase_dH=phase_shared_dH,
-                    )
-
-            z_pred = z_work
-
-            residual, parity_computed = self.parity_checker(z_pred, parity_received)
+            residual, _parity_computed = self.parity_checker(z_pred, parity_received)
             total_parity = total_parity + residual.pow(2).mean().to(total_parity.dtype)
-            parity_residual = residual
+            last_residual = residual
 
-            # Innovation: back-project residual from parity space M to systematic
-            # space C via the transpose of the parity-check matrix H^T.
-            # Normalized relative to z_pred magnitude for stable gradients.
-            h_matrix = self.parity_checker.masked_weights  # [M, C]
-            innovation = torch.einsum("mc,btm->btc", h_matrix, residual)
+            # Back-project syndrome from parity space M to systematic space C
+            # via H^T (transpose of the parity-check matrix).
+            correction = torch.einsum("mc,btm->btc", h_matrix, residual)
+            # Normalise by the systematic magnitude for stable gradients.
             z_scale = z_pred.float().pow(2).mean(dim=-1, keepdim=True).to(z_pred.dtype) + 1e-6
-            innovation = innovation * (1.0 / torch.sqrt(z_scale)).clamp_max(4.0)
+            correction = correction * (1.0 / torch.sqrt(z_scale)).clamp_max(4.0)
 
-            # Learned per-position uncertainty (replaces Kalman predict/update).
-            sigma2_pred = self.uncertainty(z_work)
-            sigma2_meas = residual.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-6)
-            sigma2_meas = sigma2_meas.expand_as(sigma2_pred).to(z_work.dtype)
-            z_corrected, k_gain = inverse_variance_update(z_work, innovation, sigma2_pred, sigma2_meas)
-
-            correction = z_corrected - z_pred
-            correction_gate = torch.sigmoid(
+            gate = torch.sigmoid(
                 residual.abs().float().mean(dim=-1, keepdim=True) * self.corr_gate_w + self.corr_gate_b
             ).to(z_pred.dtype)
-            z_corrected = z_pred + correction_gate * correction
 
-            mut_gate = torch.sigmoid(
-                residual.abs().float().mean(dim=-1, keepdim=True) * self.corr_gate_w + self.corr_gate_b
-            ).to(z_corrected.dtype)
-            z_corrected = z_corrected + mut_gate * F.linear(
-                F.silu(F.linear(z_corrected, self.mut_down_w, self.mut_down_b)), self.mut_up_w
-            )
-
-            ext_new = z_corrected - z_pred
-
+            update = gate * correction
             if mask is not None:
-                ext_new = ext_new * mask.unsqueeze(-1)
-
-            # Extrinsic-only: replace, not accumulate (turbo principle).
-            # Each iteration produces ONLY new information; accumulation
-            # causes divergence because old beliefs are re-broadcast.
-            ext = ext_new
-            ext_rms = ext.float().pow(2).mean(dim=-1, keepdim=True).to(ext.dtype) + 1e-6
-            ext = ext * (1.0 / torch.sqrt(ext_rms)).clamp_max(4.0)
-
-            ext_delta = ext - ext_before
-            ext_norm = ext_delta.float().norm(dim=-1).mean()
-            extrinsic_norms.append(ext_norm)
-
-            self.harq.write(ext_new)
-
-            if self.use_convergence_halt and iteration >= self.min_iters:
-                _, mi = self.exit_estimator.should_halt(ext_before, ext, iteration)
-                if bool(mi.item() < self.exit_estimator.threshold):
-                    converged_at = iteration + 1
-                    iterations_used = torch.full_like(iterations_used, iteration + 1)
-                    break
+                update = update * mask.unsqueeze(-1).to(update.dtype)
+            z_pred = z_pred + update
 
         side_info = {
-            "parity_strength": total_parity / max(converged_at, 1),
-            "extrinsic_norms": extrinsic_norms,
-            "iterations_used": iterations_used,
-            "parity_residual": parity_residual,
+            "parity_strength": total_parity / max(iteration_limit, 1),
+            "iterations_used": torch.full(
+                (z_sys.shape[0], z_sys.shape[1]), iteration_limit, dtype=torch.long, device=z_sys.device
+            ),
+            "parity_residual": last_residual,
         }
-
-        state.harq_feedback = self.harq.serialize_feedback()
-        state.iteration = converged_at
-
-        decoded = z_sys + torch.tanh(self.ext_gate) * ext
-        return DecodeResult(latent=decoded, state=state, side_info=side_info)
+        state.iteration = iteration_limit
+        return DecodeResult(latent=z_pred, state=state, side_info=side_info)
 
 
 class HAGIv4(nn.Module):
-    """HAGI V4 — Source-Channel Separation codec language model."""
+    """HAGI V18 — Strict Source-Channel Separation codec language model."""
 
     def __init__(self, cfg: HAGIv4Config) -> None:
         super().__init__()
@@ -329,9 +180,7 @@ class HAGIv4(nn.Module):
         self._H = H
         self._C = C
 
-        # Source encoder: factorized V×r + r×H + depthwise Conv1d pulse-shaping.
-        # The semantic-erasure indicator is applied by the caller before this
-        # module, so erasure never appears as a token ID (channel-correct).
+        # ---- Source encoder ----
         em = m.embeddings
         if em.use_conv_embedding:
             self.embed = ConvEmbedding(
@@ -346,67 +195,51 @@ class HAGIv4(nn.Module):
             self.embed = nn.Embedding(m.vocab_size, H)
             nn.init.normal_(self.embed.weight, mean=0.0, std=1.0 / math.sqrt(H))
 
+        # Learned erasure indicator (semantic). Replaces the compressed source
+        # code on masked positions BEFORE pulse-shaping / cache writes /
+        # frequency mixing — channel-correct placement.
         self.semantic_unknown_embed = nn.Parameter(torch.empty(H))
         nn.init.normal_(self.semantic_unknown_embed, mean=0.0, std=1.0 / math.sqrt(H))
 
-        self.bottleneck_norm = RMSNorm(C, eps=m.norm_eps)
-        self.use_lorentz = m.freq_coding.use_lorentz
-        self.lorentz_sphere = LorentzSphereNorm(C, mode=m.freq_coding.lorentz_mode) if self.use_lorentz else None
-        self.core_mask_embed = nn.Parameter(torch.zeros(C))
+        # V18: LayerScale bottleneck (replaces RMSNorm bottleneck_norm).
+        # Preserves direction, controls magnitude, init=1 (identity at start).
+        self.bottleneck_scale = nn.Parameter(torch.ones(C))
+
+        self.core_mask_embed = nn.Parameter(torch.empty(C))
         nn.init.uniform_(self.core_mask_embed, -1.0 / math.sqrt(C), 1.0 / math.sqrt(C))
 
-        self.cqi = CQIEstimator(H)
-        self.cqi_bw_logit = nn.Parameter(torch.tensor([2.0]))
-        self.cqi_mag_logit = nn.Parameter(torch.zeros(1))
-        self.pilot_eq_strength = nn.Parameter(torch.zeros(1))
+        # V14 Learned Rate Matcher (Linear H<->C). V18: NO norm on the
+        # systematic latent; only the LayerScale above.
+        lrm_rank = max(1, min(C, H // 2))
+        self._build_rate_matcher(H, C, lrm_rank)
 
-        n_bins_down = C // 2 + 1
-        rolloff_start = int(n_bins_down * 3 / 4)
-        t = torch.arange(max(1, n_bins_down - rolloff_start), dtype=torch.float32)
-        t = t / max(n_bins_down - rolloff_start, 1)
-        pass_logit = math.log(0.99 / 0.01)
-        stop_logit = math.log(0.5 / 0.5)
-        rc = torch.full((n_bins_down,), pass_logit)
-        rc[rolloff_start:] = stop_logit + (pass_logit - stop_logit) * 0.5 * (1 + torch.cos(t * math.pi))
-        self.bottleneck_gate = nn.Parameter(rc)
-
-        n_bins_up = H // 2 + 1
-        c_bins = C // 2 + 1
-        rc_up = torch.full((n_bins_up,), stop_logit)
-        rc_up[:c_bins] = pass_logit
-        rolloff_up = max(1, int(c_bins / 4))
-        n_rolloff = max(1, c_bins - rolloff_up)
-        t_up = torch.arange(n_rolloff, dtype=torch.float32) / max(n_rolloff, 1)
-        rc_up[rolloff_up:c_bins] = stop_logit + (pass_logit - stop_logit) * 0.5 * (1 + torch.cos(t_up * math.pi))
-        self.bottleneck_up_gate = nn.Parameter(rc_up)
-
+        # Sinusoidal pilot position encoding (zero params, distinguishes
+        # masked positions by location).
+        self._pilot_pos_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._pilot_pos_max = 4
         self._pilot_idx_cache: dict[int, torch.Tensor] = {}
         self._pilot_mask_cache: dict[int, torch.Tensor] = {}
+        self._pilot_cache_max = 4
 
-        self.use_freq_coding = m.freq_coding.enabled
-        n_modes_t = m.freq_coding.n_modes_t
-        n_modes_h = m.freq_coding.n_modes_h
-        ffn_int_h = H * 2
-        if self.use_freq_coding:
-            n_heads_h = H // m.attention.head_dim
-            self.perception = nn.ModuleList(
-                FreqBlock(
-                    H,
-                    n_heads=n_heads_h,
-                    head_dim=m.attention.head_dim,
-                    n_modes_t=n_modes_t,
-                    n_modes_h=n_modes_h,
-                    ffn_intermediate=ffn_int_h,
-                    T_max=m.attention.max_seq_len,
-                    ffn_rank=H // 4,
-                    norm_eps=m.norm_eps,
-                    use_derivative=True,
-                )
-                for _ in range(m.perception_layers)
+        # Source stacks: AttentionBlock (V15 win). head_dim forced to 64 so
+        # H is divisible (config head_dim 72 does not divide cleanly).
+        head_dim_src = 64
+        n_heads_src = max(1, H // head_dim_src)
+        if H % n_heads_src != 0:
+            raise ValueError(f"hidden_size={H} must be divisible by n_heads={n_heads_src} (head_dim={head_dim_src})")
+        rope_theta = float(getattr(m.attention, "rope_theta", 10000.0))
+        self.perception = nn.ModuleList(
+            AttentionBlock(
+                H,
+                n_heads=n_heads_src,
+                ffn_mult=4.0,
+                norm_eps=m.norm_eps,
+                rope_theta=rope_theta,
             )
-        else:
-            raise ValueError("freq_coding.enabled must be True")
+            for _ in range(m.perception_layers)
+        )
 
+        # ---- Channel encoder ----
         self.parity_encoder = SparseParityEncoder(
             n_vars=C,
             n_checks=self.codec_shape.n_parity_checks,
@@ -420,67 +253,85 @@ class HAGIv4(nn.Module):
             mode=self.codec_shape.interleaver_mode,
         )
 
+        # ---- Channel decoder ----
         self.decoder = LDPCDecoder(
-            self.turbo_config,
-            C,
+            hidden_size=C,
             n_parity_checks=self.codec_shape.n_parity_checks,
             edges_per_check=self.codec_shape.edges_per_check,
-            exit_threshold=self.codec_shape.exit_threshold,
-            shared_parity_weights=self.parity_encoder.parity_weights,
+            norm_eps=m.norm_eps,
+            shared_parity_weights=self.parity_encoder.edge_log_scale,
             shared_sparse_mask=self.parity_encoder.sparse_mask,
+            shared_edge_log_scale=self.parity_encoder.edge_log_scale,
+            shared_parity_base=self.parity_encoder.parity_base,
         )
 
-        self.expression = self.perception
+        # ---- Source decoder (mirror of perception, NOT alias) ----
+        n_expr = max(1, int(getattr(m, "expression_layers", 4) or 4))
+        self.expression = nn.ModuleList(
+            AttentionBlock(
+                H,
+                n_heads=n_heads_src,
+                ffn_mult=4.0,
+                norm_eps=m.norm_eps,
+                rope_theta=rope_theta,
+            )
+            for _ in range(n_expr)
+        )
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
-        # Source decoder: factorized LM head. The low-rank source encoder
-        # (ConvEmbedding) has no natural inverse of the same rank, so the
-        # output projection is an independent rank-``r`` factorization rather
-        # than a tied transpose of the embedding table. This keeps the head
-        # well-conditioned while staying a small fraction of the body budget.
-        em = m.embeddings
+
+        # Source decoder head: factored, weight-tied with token_compress (V12 win).
         self.lm_compress = nn.Linear(H, em.factor_rank, bias=False)
         self.lm_expand = nn.Linear(em.factor_rank, m.vocab_size, bias=False)
         nn.init.normal_(self.lm_compress.weight, mean=0.0, std=1.0 / math.sqrt(H))
         nn.init.normal_(self.lm_expand.weight, mean=0.0, std=1.0 / math.sqrt(em.factor_rank))
-        teacher_hidden = cfg.train.distill_teacher_hidden_size
-        self.distill_align = nn.Identity() if teacher_hidden == H else nn.Linear(teacher_hidden, H, bias=False)
+        self.tie_source_codebook: bool = em.use_conv_embedding
+        if self.tie_source_codebook:
+            with torch.no_grad():
+                self.lm_expand.weight = self.embed.token_compress.weight
 
-        self.multimodal_enabled = m.multimodal.enabled
-        if self.multimodal_enabled:
-            self.multimodal_input = MultimodalInput(cfg)
-            # V9: ConvEmbedding has no single nn.Parameter ``.weight`` to tie
-            # against (it is a factorized V*r + r*H table). The multimodal
-            # text encoder keeps its own independent nn.Embedding(V, H) so
-            # the modality path is not coupled to the source-encoder rank.
-            self.cross_modal = CliffordCrossModal(
-                H,
-                gate_init=m.multimodal.cross_freq_gate_init,
-                norm_eps=m.norm_eps,
-            )
-            self.contrastive = ContrastiveAlignment(
-                H,
-                temperature=m.multimodal.contrastive_temperature,
-            )
+        # V13: distill_align allocated lazily when distillation is enabled.
+        if cfg.train.distill_enabled:
+            teacher_hidden = cfg.train.distill_teacher_hidden_size
+            self.distill_align = nn.Identity() if teacher_hidden == H else nn.Linear(teacher_hidden, H, bias=False)
+        else:
+            self.distill_align = None
 
         self._init_weights()
-        self._init_turbo_weights()
+
+    def _build_rate_matcher(self, H: int, C: int, rank: int) -> None:
+        """Construct the rate_down / rate_up pair.
+
+        V18: ``rate_up.expand`` is initialised with std=1/sqrt(C) (NOT zero)
+        so the channel path carries gradient from step 0. This resolves the
+        cold-start deadlock identified in the architect review: with zero
+        init, the only learnable parameter on the source-decode path at
+        step 0 is ``rate_up.expand.weight`` itself, starving the source
+        encoder of gradient signal for the first ~100-200 steps.
+        """
+        from hagi_v4.model.freq_layer import FactoredLinear
+
+        self.rate_down = FactoredLinear(H, C, rank, bias=False)
+        self.rate_up = FactoredLinear(C, H, rank, bias=False)
+        # V18 critical init: expand must be nonzero for gradient flow.
+        nn.init.normal_(self.rate_up.expand.weight, mean=0.0, std=1.0 / math.sqrt(C))
 
     @property
     def lm_head_weight(self) -> torch.Tensor:
-        """Effective ``[V, H]`` output projection weight for compatibility.
-
-        Composed as ``lm_expand.weight @ lm_compress.weight`` (rank-``r``
-        factorization). Callers that only need the weight matrix (CE chunked
-        compute, VRAM-efficient inference) can use this property; the forward
-        path uses the factored modules directly.
-        """
+        """Effective [V, H] output projection for compatibility callers."""
         return self.lm_expand.weight @ self.lm_compress.weight
 
     def _init_weights(self) -> None:
         for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
-                if "mut_" in name or mod is self.lm_compress or mod is self.lm_expand:
+                if "mut_" in name or mod is self.lm_compress:
+                    continue
+                if self.tie_source_codebook and mod is self.lm_expand:
+                    continue
+                if name.endswith("out_proj") or name.endswith("ffn.w_out") or mod is self.rate_up.expand:
+                    nn.init.normal_(mod.weight, mean=0.0, std=0.02)
+                    if mod.bias is not None:
+                        nn.init.zeros_(mod.bias)
                     continue
                 std = 1.0 / math.sqrt(max(1, mod.weight.shape[1]))
                 nn.init.normal_(mod.weight, mean=0.0, std=std)
@@ -489,33 +340,16 @@ class HAGIv4(nn.Module):
             elif isinstance(mod, nn.Embedding):
                 if mod is self.embed or mod is getattr(self.embed, "token_compress", None):
                     continue
-                if self.multimodal_enabled and mod is self.multimodal_input.text_embed:
-                    continue
                 std = 1.0 / math.sqrt(max(1, mod.weight.shape[1]))
                 nn.init.normal_(mod.weight, mean=0.0, std=std)
 
-    def _init_turbo_weights(self) -> None:
-        std_down = 1.0 / math.sqrt(max(1, self.decoder.mut_down_w.shape[1]))
-        nn.init.normal_(self.decoder.mut_down_w, std=std_down)
-        nn.init.zeros_(self.decoder.mut_down_b)
-        nn.init.zeros_(self.decoder.mut_up_w)
-
     def train(self, mode: bool = True) -> HAGIv4:
-        result = super().train(mode)
-        if mode:
-            for blk in self.perception:
-                blk.reset_cache()
-            for blk in self.decoder.reasoning:
-                blk.reset_cache()
-        return result
+        return super().train(mode)
 
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
         B, T, H = h.shape
         h_flat = h.reshape(B * T, H)
         t_flat = targets.reshape(B * T)
-        # Factored LM head: h -> lm_compress -> lm_expand -> logits. Using the
-        # factored path keeps the VRAM footprint proportional to ``r`` and not
-        # to the vocabulary size when materializing logits.
         compress_dev = self.lm_compress.weight.device
         z = self.lm_compress(h_flat.to(compress_dev))
         total_loss = z.new_zeros(())
@@ -526,15 +360,10 @@ class HAGIv4(nn.Module):
             total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(compress_dev), reduction="sum")
         return total_loss / max(n, 1)
 
-    def _freq_blocks_forward(self, h: torch.Tensor) -> torch.Tensor:
-        for blk in self.perception:
+    def _stack_forward(self, h: torch.Tensor, blocks: nn.ModuleList) -> torch.Tensor:
+        for blk in blocks:
             if self.training:
-                # Match FreqBlock.forward semantics: apply LayerScale on both
-                # freq and ffn branches. Use checkpoint only on ffn (dominant
-                # activation memory).
-                freq_out = blk.freq(h)
-                h = h + blk.freq_scale * freq_out
-                h = h + blk.ffn_scale * checkpoint(blk.ffn, blk.ffn_norm(h), use_reentrant=False)
+                h = checkpoint(blk, h, use_reentrant=False)
             else:
                 h = blk(h)
         return h
@@ -542,89 +371,89 @@ class HAGIv4(nn.Module):
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
         spacing = self.codec_shape.pilot_spacing
         if T not in self._pilot_idx_cache:
+            if len(self._pilot_idx_cache) >= self._pilot_cache_max:
+                oldest = next(iter(self._pilot_idx_cache))
+                del self._pilot_idx_cache[oldest]
             self._pilot_idx_cache[T] = torch.arange(0, T, spacing, device=device)
         return self._pilot_idx_cache[T]
 
     def _get_pilot_mask(self, T: int, device: torch.device) -> torch.Tensor:
         spacing = self.codec_shape.pilot_spacing
         if T not in self._pilot_mask_cache:
+            if len(self._pilot_mask_cache) >= self._pilot_cache_max:
+                oldest = next(iter(self._pilot_mask_cache))
+                del self._pilot_mask_cache[oldest]
             pm = torch.ones(T, dtype=torch.bool, device=device)
             pm[::spacing] = False
             self._pilot_mask_cache[T] = pm
         return self._pilot_mask_cache[T]
+
+    def _get_pilot_position_encoding(self, T: int, H: int, device: torch.device) -> torch.Tensor:
+        key = (T, H)
+        if key not in self._pilot_pos_cache:
+            if len(self._pilot_pos_cache) >= self._pilot_pos_max:
+                oldest = next(iter(self._pilot_pos_cache))
+                del self._pilot_pos_cache[oldest]
+            position = torch.arange(T, dtype=torch.float32, device=device).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, H, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / max(H, 1))
+            )
+            pe = torch.zeros(T, H, device=device, dtype=torch.float32)
+            pe[:, 0::2] = torch.sin(position * div_term[: pe[:, 0::2].shape[1]])
+            pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+            self._pilot_pos_cache[key] = pe
+        return self._pilot_pos_cache[key]
 
     def _source_encode(
         self,
         input_ids: torch.Tensor | None,
         semantic_unknown_mask: torch.Tensor | None,
         cache: SpectralCache | None,
-        awgn_sigma: float = 0.0,
         pre_encoded_h: torch.Tensor | None = None,
     ) -> SourceEncodeResult:
         if pre_encoded_h is not None:
             h = pre_encoded_h
-            B, T, _ = h.shape
             cached_len = 0
-            h = self._freq_blocks_forward(h)
+            h = self._stack_forward(h, self.perception)
         else:
             B, T = input_ids.shape
             embed_dev = self.embed.weight.device
             ids_dev = input_ids.device
             unknown = self.semantic_unknown_embed.to(device=embed_dev, dtype=self.embed.token_expand.weight.dtype)
+            unknown_pos = unknown if semantic_unknown_mask is not None else None
             if embed_dev != ids_dev:
                 ids_on_dev = input_ids.to(embed_dev)
                 mask_on_dev = semantic_unknown_mask.to(embed_dev) if semantic_unknown_mask is not None else None
-                h = self.embed.forward_with_erasure(ids_on_dev, unknown, mask_on_dev).to(ids_dev)
+                h = self.embed.forward_with_erasure(ids_on_dev, unknown_pos, mask_on_dev).to(ids_dev)
             else:
-                h = self.embed.forward_with_erasure(input_ids, unknown, semantic_unknown_mask)
+                h = self.embed.forward_with_erasure(input_ids, unknown_pos, semantic_unknown_mask)
 
             cached_len = 0
             if cache is not None and cache.context_len > 0:
                 cached_h = cache.get_context(0)
-                if cached_h is not None and cached_h.shape[0] == B and cached_h.shape[2] == h.shape[2]:
+                if cached_h is not None and cached_h.shape[0] == h.shape[0] and cached_h.shape[2] == h.shape[2]:
                     h = torch.cat([cached_h.to(h.dtype), h], dim=1)
                     cached_len = cached_h.shape[1]
             if cache is not None:
                 cache.update_context(0, h, new_tokens=T)
 
-            h = self._freq_blocks_forward(h)
+            pilot_pe = self._get_pilot_position_encoding(h.shape[1], self._H, h.device)
+            pilot_scale = 1.0 / max(self._H, 1) ** 0.5
+            h = h + pilot_scale * pilot_pe.to(h.dtype).unsqueeze(0)
+
+            h = self._stack_forward(h, self.perception)
             if cached_len > 0:
                 h = h[:, cached_len:]
-                B, T, _ = h.shape
 
-        cqi = self.cqi(h)
-
-        h_f = torch.fft.rfft(h.float(), dim=-1)
-        n_bins = self._C // 2 + 1
-        base_gate = torch.sigmoid(self.bottleneck_gate)
-        cqi_expanded = cqi.unsqueeze(-1)
-        bw_base = torch.sigmoid(self.cqi_bw_logit)
-        bw_scale = bw_base + (1.0 - bw_base) * cqi_expanded
-        bin_idx = torch.arange(n_bins, device=h.device, dtype=h.dtype)
-        cutoff = n_bins * bw_scale
-        sharpness = 1.0 + bw_base.abs() * n_bins
-        dyn_mask = torch.sigmoid((cutoff - bin_idx) * sharpness)
-        mag_scale = torch.sigmoid(self.cqi_mag_logit) + (1.0 - torch.sigmoid(self.cqi_mag_logit)) * cqi_expanded
-        gate = base_gate * dyn_mask * mag_scale
-        z = torch.fft.irfft(h_f[:, :, :n_bins] * gate, n=self._C, dim=-1).to(h.dtype)
-        z = self.bottleneck_norm(z)
-        if self.lorentz_sphere is not None:
-            # Project to Lorentz hyperboloid (Minkowski sphere) and back to
-            # tangent space: hyperbolic normalization that respects the
-            # negatively-curved geometry of semantic space. The systematic
-            # codeword stays in R^C (channel encoder expects Euclidean input).
-            z = self.lorentz_sphere.inverse(self.lorentz_sphere(z))
-
-        return SourceEncodeResult(systematic=z, mask=semantic_unknown_mask, cqi=cqi, pre_bottleneck=h)
+        # V18: LayerScale bottleneck (no RMSNorm). rate_down is a plain Linear.
+        z = self.rate_down(h)
+        z = z * self.bottleneck_scale
+        return SourceEncodeResult(systematic=z, mask=semantic_unknown_mask, cqi=None, pre_bottleneck=None)
 
     def _channel_encode(self, encoded: SourceEncodeResult) -> ChannelEncodeResult:
         systematic = encoded.systematic
         parity = self.parity_encoder(systematic)
         codeword = torch.cat([systematic, parity], dim=-1)
-        # Interleaver spreads burst errors into random errors for the
-        # iterative decoder. Applied unconditionally: during training the
-        # erasure mask may contain bursts (span masking), and during
-        # inference real-world corruption is often bursty.
         codeword = self.interleaver.interleave(codeword)
         return ChannelEncodeResult(codeword=codeword, systematic=systematic, parity=parity)
 
@@ -662,15 +491,19 @@ class HAGIv4(nn.Module):
         C = self._C
         z_sys = codeword[..., :C]
         parity = codeword[..., C:]
-        cqi_mean = encoded.cqi.mean()
+        decode_mask = ch_encoded.erasure_mask
+        if encoded.mask is not None:
+            decode_mask = encoded.mask if decode_mask is None else (decode_mask | encoded.mask)
+        train_bp = getattr(self.cfg.train, "bp_iterations", None)
+        n_iters = int(train_bp) if train_bp is not None else 3
         result = self.decoder(
             z_sys=z_sys,
             parity_received=parity,
             training=training,
             state=state,
-            cqi_mean=cqi_mean,
-            mask=ch_encoded.erasure_mask,
+            mask=decode_mask,
             refinement_iterations=refinement_iterations,
+            n_iters=n_iters,
         )
         if ch_encoded.erasure_mask is not None and ch_encoded.erasure_mask.any():
             predicted = result.latent - z_sys
@@ -679,8 +512,6 @@ class HAGIv4(nn.Module):
             selected_target = target[ch_encoded.erasure_mask].float()
             target_scale = selected_target.pow(2).mean().clamp_min(1e-6)
             normalized_mse = (selected_predicted - selected_target).pow(2).mean() / target_scale
-            # Use MSE-only alignment when predicted is near-zero (init phase).
-            # Cosine similarity explodes when ||predicted|| -> 0.
             pred_norm = selected_predicted.norm(dim=-1)
             has_signal = (pred_norm > 1e-6).any()
             if has_signal:
@@ -695,17 +526,11 @@ class HAGIv4(nn.Module):
         return result
 
     def _source_decode(self, decoded: DecodeResult, encoded: SourceEncodeResult) -> torch.Tensor:
+        # V18: strict SCS — NO pre_bottleneck bypass. The source decoder
+        # receives only the post-channel latent.
         z = decoded.latent
-        B, T, _ = z.shape
-        z_f = torch.fft.rfft(z.float(), dim=-1)
-        z_pad = torch.zeros(B, T, self._H // 2 + 1, dtype=z_f.dtype, device=z.device)
-        c_bins = self._C // 2 + 1
-        mag_sigmoid = torch.sigmoid(self.cqi_mag_logit)
-        gate = torch.sigmoid(self.bottleneck_up_gate[:c_bins]) * (
-            mag_sigmoid + (1.0 - mag_sigmoid) * encoded.cqi
-        ).unsqueeze(-1)
-        z_pad[:, :, :c_bins] = z_f[:, :, :c_bins] * gate
-        return self._freq_blocks_forward(torch.fft.irfft(z_pad, n=self._H, dim=-1).to(z.dtype))
+        h = self.rate_up(z)
+        return self._stack_forward(h, self.expression)
 
     def forward(
         self,
@@ -726,40 +551,22 @@ class HAGIv4(nn.Module):
     ) -> ModelOutput:
         if input_ids is None:
             raise ValueError("input_ids is required")
+        if refinement_iterations is None and self.training:
+            train_bp = getattr(self.cfg.train, "bp_iterations", None)
+            if train_bp is None:
+                train_bp = 3
         masks = SemanticMaskBatch(
             semantic_unknown_mask,
             prediction_mask,
             valid_target_mask,
             physical_corruption_mask,
         )
-        use_multimodal = self.multimodal_enabled and (images is not None or spectrograms is not None)
-        mm_h: torch.Tensor | None = None
-        modality_ids: torch.Tensor | None = None
-        if use_multimodal:
-            mm_h, modality_ids, _ = self.multimodal_input(
-                input_ids=input_ids,
-                images=images,
-                spectrograms=spectrograms,
-            )
-        masks.validate(input_ids, mm_h.shape[:2] if mm_h is not None else None)
+        masks.validate(input_ids, None)
         state = cache.to_decode_state() if cache is not None else DecodeState(kalman_p=cached_p)
         if cache is not None and state.kalman_p is None:
             state.kalman_p = cached_p
 
-        if use_multimodal:
-            assert mm_h is not None
-            text_len = input_ids.shape[1]
-            unknown = self.semantic_unknown_embed.to(device=mm_h.device, dtype=mm_h.dtype)
-            mm_h[:, :text_len] = torch.where(
-                semantic_unknown_mask.to(mm_h.device).unsqueeze(-1),
-                unknown,
-                mm_h[:, :text_len],
-            )
-            mm_h = self.cross_modal(mm_h, modality_ids, self.multimodal_input.num_modalities)
-            encoded = self._source_encode(None, semantic_unknown_mask, cache, awgn_sigma, pre_encoded_h=mm_h)
-        else:
-            encoded = self._source_encode(input_ids, semantic_unknown_mask, cache, awgn_sigma)
-
+        encoded = self._source_encode(input_ids, semantic_unknown_mask, cache)
         chEncoded = self._apply_erasure(self._channel_encode(encoded), physical_corruption_mask, awgn_sigma)
         decoded = self._channel_decode(chEncoded, encoded, state, self.training, refinement_iterations)
         h = self._source_decode(decoded, encoded)
@@ -773,10 +580,8 @@ class HAGIv4(nn.Module):
         h_normed = self.final_norm(h)
         selected = prediction_mask & valid_target_mask
         prediction_indices = selected.flatten().nonzero(as_tuple=False).squeeze(-1)
-        prediction_hidden = h_normed[:, : input_ids.shape[1]] if use_multimodal else h_normed
+        prediction_hidden = h_normed[:, : input_ids.shape[1]]
         selected_hidden = prediction_hidden.flatten(0, 1).index_select(0, prediction_indices.to(h_normed.device))
-        # Factored LM head: H -> r -> V. Keeps logits computation off the
-        # vocabulary-sized weight matrix until the final expand step.
         logits = self.lm_expand(self.lm_compress(selected_hidden.to(self.lm_compress.weight.device))).to(
             h_normed.device
         )
@@ -803,10 +608,9 @@ class HAGIv4(nn.Module):
             aux.correction_alignment = side_info["correction_alignment"].to(h.dtype)
             aux.rate_distortion = rd_loss
 
-            # Recovery guarantee: parity must enable reconstruction under erasure.
-            # Randomly erase systematic positions, then measure how well the
-            # decoder recovers using parity. This trains the code to be
-            # genuinely erasure-tolerant (MDS-like property).
+            if getattr(self.cfg.train, "w_parity_diversity", 0.0) > 0.0:
+                aux.parity_diversity = compute_parity_diversity_loss(self.parity_encoder.masked_weights)
+
             if self.training and physical_corruption_mask is not None and physical_corruption_mask.any():
                 z_clean = encoded.systematic
                 z_erased = chEncoded.codeword[..., : self._C]
@@ -814,9 +618,6 @@ class HAGIv4(nn.Module):
                 erased_error = recovery_error[physical_corruption_mask.to(recovery_error.device)]
                 if erased_error.numel() > 0:
                     aux.parity_recovery = erased_error.mean().to(h.dtype)
-
-        if use_multimodal and modality_ids is not None:
-            aux.contrastive = self.contrastive(h, modality_ids)
 
         return ModelOutput(
             logits=logits,

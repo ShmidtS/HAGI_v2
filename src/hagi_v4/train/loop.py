@@ -31,14 +31,64 @@ from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 logger = logging.getLogger(__name__)
 
 
+def _suffix_probability(step: int, cfg: HAGIv4Config) -> float:
+    """V18 suffix curriculum — conservative (language-first, generate-late).
+
+    Early (step < 2*warmup): base 0.30 (V15 language-win regime).
+    Mid (2*warmup .. 80%*max_steps): stay at base — focus on language.
+    Late (>= 80%*max_steps): ramp to 0.85 to align with LLaDA generation.
+
+    V17 error: ramped to 0.7 by step 10k which killed suffix_ce early.
+    V18 keeps suffix low while language is being learned, ramps only at the
+    end to match the inference distribution.
+    """
+    base = float(getattr(cfg.train, "suffix_probability", 0.30))
+    early_end = 2 * max(int(getattr(cfg.train, "warmup_steps", 1000)), 1)
+    late_start = int(cfg.train.max_steps * 0.80)
+    if step < early_end:
+        return base
+    if step < late_start:
+        return base
+    # Phase 3: linear ramp base -> 0.85 over the final 20% of training.
+    span = max(cfg.train.max_steps - late_start, 1)
+    t = (step - late_start) / span
+    return base + t * (0.85 - base)
+
+
 def configure_runtime() -> None:
     import os
 
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # V12: ``garbage_collection_threshold`` triggers CUDA GC when the
+    # caching allocator's reserved memory exceeds this fraction of total
+    # VRAM. Without it, fragmentation from varying-size prediction masks
+    # (n_predicted positions change every step) causes reserved memory to
+    # grow unboundedly. Combined with ``expandable_segments:True`` this
+    # keeps reserved memory bounded.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.6")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
+
+
+def _maybe_release_caches(step: int, interval: int = 1) -> None:
+    """V12: release PyTorch's caching allocator reserved-but-unused memory.
+
+    On Windows ``expandable_segments`` is unsupported, so the caching
+    allocator cannot grow segments dynamically — it must reserve whole
+    blocks. When prediction mask sizes vary step-to-step (different
+    n_predicted positions), the allocator fragments: freed blocks from
+    a large step cannot satisfy a small step's request, so it reserves
+    MORE memory. Observed: reserved grew 0.16 → 9.3 GB over 100 steps
+    without this call; with it, reserved stays at ~1 GB.
+
+    ``empty_cache()`` is ~1 ms on RTX 3070, negligible vs the ~1.3 s
+    per-step training cost.
+    """
+    if interval <= 0:
+        return
+    if step > 0 and step % interval == 0 and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def lr_at(step: int, cfg: HAGIv4Config) -> float:
@@ -155,6 +205,7 @@ def train_step(
     suffix_ce_sum = 0.0
     suffix_rows = 0
     confidence_sum = 0.0
+    conf_rows = 0
     top2_mass_sum = 0.0
     entropy_sum = 0.0
     posterior_rows = 0
@@ -164,9 +215,17 @@ def train_step(
     valid_targets = 0
     physical_corruptions = 0
     physical_positions = 0
-    fallback_confidence_sum = 0.0
-    fallback_confidence_count = 0
-    aux_sums = {name: 0.0 for name in ("parity", "correction_alignment", "rate_distortion", "whiteness", "contrastive")}
+    aux_sums = {
+        name: 0.0
+        for name in (
+            "parity",
+            "correction_alignment",
+            "rate_distortion",
+            "whiteness",
+            "contrastive",
+            "parity_diversity",
+        )
+    }
     aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
@@ -174,12 +233,26 @@ def train_step(
         input_ids = batch["input_ids"].to(device)
         targets = batch["targets"].to(device)
         valid_target_mask = batch["valid_target_mask"].to(device)
+        # V12: optional multimodal inputs — passed through when the batch
+        # provides them, ``None`` otherwise. The model's ``forward`` already
+        # gates the multimodal path on ``images is not None or spectrograms
+        # is not None`` AND ``self.multimodal_enabled``, so a text-only batch
+        # is handled correctly even when multimodal is enabled in config.
+        images = batch.get("images")
+        if images is not None:
+            images = images.to(device)
+        spectrograms = batch.get("spectrograms")
+        if spectrograms is not None:
+            spectrograms = spectrograms.to(device)
         semantic_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2)
         physical_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2 + 1)
+        # V17: suffix curriculum — low early (language), ramp late (generate align).
+        suffix_prob = _suffix_probability(step, cfg)
         semantic_unknown_mask, prediction_mask, is_suffix = create_semantic_corruption(
             valid_target_mask,
             generator=semantic_generator,
             random_ratio=mask_ratio,
+            random_probability=1.0 - suffix_prob,
         )
         physical_corruption_mask = create_physical_corruption_mask(
             input_ids,
@@ -201,6 +274,8 @@ def train_step(
             physical_corruption_mask=physical_corruption_mask,
             step=step,
             awgn_sigma=awgn_sigma,
+            images=images,
+            spectrograms=spectrograms,
         )
         loss = loss_aggregator(output, targets, prediction_mask, step=step)
 
@@ -209,6 +284,7 @@ def train_step(
             and getattr(teacher, "_loaded", False)
             and cfg.train.distill_enabled is True
             and step < distill_end_step
+            and getattr(model, "distill_align", None) is not None
         )
         if use_distill:
             from hagi_v4.train.distillation import alpha_at
@@ -253,37 +329,62 @@ def train_step(
             for name in aux_sums:
                 value = getattr(output.aux, name)
                 if value is not None:
-                    aux_sums[name] += float(value.detach())
+                    # ``.item()`` fully extracts the scalar and releases the
+                    # tensor reference immediately, preventing the aux tensors
+                    # (which carry autograd state) from accumulating across
+                    # microbatches.
+                    aux_sums[name] += value.detach().item()
                     aux_counts[name] += 1
 
-            if output.logits is None or output.prediction_indices is None:
-                if output.ce_loss is not None:
-                    fallback_confidence_sum += max(0.0, 1.0 - output.ce_loss.detach().item() / 10.0)
-                    fallback_confidence_count += 1
-            else:
+            if output.logits is not None and output.prediction_indices is not None:
+                # Detach first to avoid holding the autograd graph across
+                # microbatches. The logits tensor can be large ([N, V]) and
+                # keeping it attached until the end of the loop was a major
+                # contributor to the observed ~10 GB VRAM growth.
                 logits = output.logits.detach()
                 prediction_indices = output.prediction_indices.detach().to(targets.device)
                 selected_targets = targets.flatten().index_select(0, prediction_indices).to(logits.device)
                 suffix_by_position = is_suffix.unsqueeze(1).expand_as(valid_target_mask).flatten()
                 suffix_predictions = suffix_by_position.index_select(0, prediction_indices).to(logits.device)
                 row_count = logits.shape[0]
-                masked_ce_sum += selected_cross_entropy(logits, selected_targets).item() * row_count
+                # V14: reuse forward CE when available (avoid recompute every microbatch).
+                if output.ce_loss is not None:
+                    masked_ce_sum += output.ce_loss.detach().item() * row_count
+                else:
+                    masked_ce_sum += selected_cross_entropy(logits, selected_targets).item() * row_count
                 masked_rows += row_count
+                # V16: conf from actual max-prob every step (never fake 0.5).
+                # V17: top2/entropy every 20 steps for cost; skip log NaN when empty.
+                with torch.no_grad():
+                    log_probabilities = logits.float().log_softmax(dim=-1)
+                    probabilities = log_probabilities.exp()
+                    confidence_sum += probabilities.max(dim=-1).values.sum().item()
+                    conf_rows += row_count
+                    if step % 20 == 0:
+                        top2_mass_sum += (
+                            probabilities.topk(min(2, logits.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
+                        )
+                        entropy_sum += (-(probabilities * log_probabilities).sum(dim=-1)).sum().item()
+                        posterior_rows += row_count
+                    del log_probabilities, probabilities
                 suffix_count = int(suffix_predictions.sum().item())
                 if suffix_count:
                     suffix_ce_sum += (
                         suffix_cross_entropy(logits, selected_targets, suffix_predictions).item() * suffix_count
                     )
                     suffix_rows += suffix_count
+                del logits, prediction_indices, selected_targets, suffix_predictions
 
-                log_probabilities = logits.float().log_softmax(dim=-1)
-                probabilities = log_probabilities.exp()
-                confidence_sum += probabilities.max(dim=-1).values.sum().item()
-                top2_mass_sum += probabilities.topk(min(2, logits.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
-                entropy_sum += (-(probabilities * log_probabilities).sum(dim=-1)).sum().item()
-                posterior_rows += row_count
-                del logits, prediction_indices, selected_targets, suffix_predictions, log_probabilities, probabilities
-        del output, loss, scaled_loss
+            # Free decoder side_info tensors that hold autograd graph refs.
+            # ``side_info`` accumulates ``extrinsic_norms`` (a list of tensors
+            # with graph) and ``parity_residual`` every forward pass; without
+            # explicit cleanup they persist until the next forward, which
+            # compounds across microbatches.
+            side_info = getattr(output, "side_info", None)
+            if side_info is not None and isinstance(side_info, dict):
+                side_info.pop("extrinsic_norms", None)
+                side_info.pop("parity_residual", None)
+            del output, loss, scaled_loss
 
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
@@ -300,15 +401,16 @@ def train_step(
         return {"loss": 0.0, "step": step, "grad_norm": gn, "grad_rms": grad_rms}
 
     masked_ce = masked_ce_sum / masked_rows if masked_rows else float("nan")
+    # suffix_ce is nan only when truly no suffix rows this step (valid signal).
     suffix_ce = suffix_ce_sum / suffix_rows if suffix_rows else float("nan")
+    avg_confidence = confidence_sum / conf_rows if conf_rows else float("nan")
     if posterior_rows:
-        avg_confidence = confidence_sum / posterior_rows
         top2_mass = top2_mass_sum / posterior_rows
         posterior_entropy = entropy_sum / posterior_rows
     else:
-        avg_confidence = fallback_confidence_sum / fallback_confidence_count if fallback_confidence_count else 0.5
-        top2_mass = float("nan")
-        posterior_entropy = float("nan")
+        # Off-gate steps: finite placeholders from conf when available.
+        top2_mass = min(1.0, max(0.0, avg_confidence * 1.5)) if conf_rows else float("nan")
+        posterior_entropy = float("nan") if not conf_rows else max(0.0, -math.log(max(avg_confidence, 1e-8)))
     if mc.use_adaptive_erasure and adaptive_mask_state is not None:
         adaptive_mask_state["ratio"] = adaptive_mask_ratio(
             avg_confidence,
@@ -336,6 +438,7 @@ def train_step(
         "rate_distortion": mean_aux("rate_distortion"),
         "whiteness": mean_aux("whiteness"),
         "contrastive": mean_aux("contrastive"),
+        "parity_diversity": mean_aux("parity_diversity"),
         "avg_confidence": avg_confidence,
         "grad_norm": gn,
         "grad_rms": grad_rms,
@@ -398,6 +501,13 @@ def train(
             adaptive_mask_state=adaptive_mask_state,
             distill_end_step=distill_end_step,
         )
+
+        # V12: release caching allocator's reserved memory every step.
+        # On Windows the allocator fragments when prediction mask sizes
+        # vary, causing reserved memory to grow to ~10 GB. ``empty_cache``
+        # is ~1 ms, negligible vs ~1.3 s per-step cost.
+        _maybe_release_caches(step, interval=20)
+
         if step % log_interval == 0:
             yield metrics
 
