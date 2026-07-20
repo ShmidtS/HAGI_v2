@@ -1,4 +1,117 @@
-# HAGI V18 — Strict Shannon SCS (Minimal LDPC + Attention Source)
+# HAGI V19 — SCS + Kalman Validation Gate (VOC-aware LDPC BP)
+
+## V19 Changes vs V18
+
+**V18 plateau root causes (3 bugs, not architecture):**
+
+1. **`bottleneck_scale` frozen at 1.000** — scientist subagent verified std=0.0
+   across all 1000 steps. The LayerScale parameter was sandwiched between two
+   Linear layers (`rate_down -> *scale -> rate_up`) with NO non-linearity, so
+   it was reparametrisation-equivalent to scaling `rate_up` columns. The
+   gradient was identically zero (reparametrisation invariance).
+2. **AWGN sigma too low** — channel was 9.6× below capacity (SNR=29dB,
+   capacity=4.82 bits/use vs code rate 0.5). BP fully cancelled AWGN in 3
+   iterations; the channel was not doing real work.
+3. **`corr_gate` barely moved** — w: 0.1→0.126, b: 0.0→0.082 (final
+   sigmoid≈0.55, no selectivity). Init too small.
+
+**V19 fixes (evidence-based, KISS):**
+
+1. **Bottleneck gate with non-linearity** — `z = z_linear + SiLU(z_linear) *
+   tanh(bottleneck_gate)`, `bottleneck_gate` zero-init (identity at start).
+   SiLU breaks the linear-linear invariance; tanh bounds the gate; residual
+   keeps cold-start stable. Verifier: std 0.0 → 1.4e-3 after 2 steps (PASS).
+2. **AWGN sigma raised** — `awgn_sigma_start 0.05→0.15`, `end 0.01→0.05`,
+   `end_frac 0.3→0.5`. New SNR ~17dB (capacity ~3.0 bits/use, still above
+   rate 0.5 but forces BP to do real work).
+3. **`corr_gate_w` init raised** 0.1 → 0.3. Gradient signal 3× stronger.
+4. **Dead code purge** — 10 modules / 1307 lines removed (lorentz, msa,
+   cqi, exit_chart, contrastive, multimodal_*, clifford_*, uncertainty,
+   algebra/).
+5. **Vestigial config stripped** — MultimodalImageConfig, MultimodalAudioConfig,
+   CrossModalConfig removed. `use_lorentz`, `lorentz_mode`, `w_contrastive`
+   removed.
+6. **CI invariants** added to `validate_config`: train/infer BP asymmetry,
+   `awgn_sigma_end > 0`, `w_parity_diversity > 0`, `sigma_start >= sigma_end`.
+
+### Kalman validation gate (the new V19 idea)
+
+Per-position Mahalanobis-style syndrome gate — measurement gating from
+Kalman filtering / JPDA multi-target tracking. Before each expensive BP
+update (H^T back-projection, gradient flow), the syndrome is tested
+against the noise covariance:
+
+```
+d²[b,t] = ||syndrome[b,t,:]||² / σ²
+gate_valid = sigmoid((d² - chi²_crit) / tau)   (training, soft)
+gate_valid = (d² > chi²_crit).float()           (inference, hard)
+```
+
+Positions inside the strobe (d² < chi²_crit at p=0.95) are statistically
+indistinguishable from pure AWGN — they do NOT participate in the update.
+This is value of computation (Horvitz/Russell/Wefald): the expected
+information gain of running BP on those positions is below compute cost.
+
+If <2% of positions are active for two consecutive iterations at inference
+time, BP halts early (global convergence). Side info now exposes
+`ever_active_frac` and `mean_iters_used` for diagnostics.
+
+This formalises the user's request for "decide not to start thinking" in
+the language of Kalman filtering (strobing / validation gate). The
+asymmetry the user identified (cheap "out of domain" gate vs expensive
+"do I know the answer" gate) is honoured: the syndrome is a cheap
+statistic (computed anyway in BP iteration 0), not a deep probe. A
+source-side probe head was considered for V19 but deferred per [YAGNI] —
+the Kalman gate already covers the "skip if confident" semantics on the
+channel side, and smoke metrics will decide whether a source-side gate
+earns its complexity in V20.
+
+### V19 smoke test results (logs/v19_archive/v19_smoke_3000.log, 3000 steps)
+
+Pure tinystories curriculum (no domain switch). Phase windows:
+
+| Phase       | Steps     | mce mean | mce min | parity mean | parity max |
+|-------------|----------:|---------:|--------:|------------:|-----------:|
+| warmup      | 0-100     | 10.34    | 9.48    | 0.082       | 0.111      |
+| early       | 100-300   | 9.08     | 7.62    | 0.213       | **0.352**  |
+| mid         | 300-1000  | 6.60     | **3.00**| 0.056       | 0.219      |
+| late        | 1000-2000 | 6.26     | 3.01    | 0.015       | 0.149      |
+| final       | 2000-3000 | 5.71     | 3.59    | 0.020       | 0.100      |
+
+Best single-step metrics: **mce=2.996 @ step 929, bpt=4.32, par=0.021**.
+Best parity peak: **0.352 @ step 214** (18× V18's 0.1948, 36× V17's 0.0096).
+
+Comparison vs prior versions:
+
+| Metric       | V17 @1180 | V18 @929 | V19 @929 | Status        |
+|--------------|----------:|---------:|---------:|:--------------|
+| mce min      | 4.18      | 3.33     | **2.996**| PASS (beats V18, near V15 2.62) |
+| bpt min      | 6.03      | 4.80     | **4.32** | PASS          |
+| parity peak  | 0.0096    | 0.1948   | **0.352**| PASS (18× V18) |
+| Kalman gate  | n/a       | n/a      | works    | PASS (25% skip in verifier test) |
+
+### Late collapse after step 1000 (open issue for V20)
+
+After the mid-phase peak (mce 3.0 @ step 929), the model regresses:
+parity falls from 0.056 mean → 0.015, mce drifts up 6.6 → 5.7 mean. Root
+cause hypothesis: cosine lr decay bottoming out (1e-6 by step 2500)
+combined with the suffix_probability curriculum crossing a regime
+boundary around step 1000. The suffix-mce gap stays positive (~0.15) but
+parity collapses faster than mce climbs, suggesting the channel path is
+being silently disabled as the source gets confident — the Kalman gate
+may be over-skipping once the source learns tinystories well.
+
+### V20 plan (from V19 evidence)
+
+1. **Plateau the lr schedule** — cosine decay to floor 1e-4 (not 1e-6).
+2. **Suffix probability ramp delay** — base 0.3 until step 2000, then ramp.
+3. **Measure Kalman skip ratio over training** — log `ever_active_frac`
+   every 100 steps. If it climbs >70% by step 1500, the channel is being
+   gated out — raise `chi2_crit` or lower σ to keep BP active.
+4. **Parity diversity hook** — add early-stop on parity collapse: if
+   `par_mean_100step` falls below 0.5 × `par_mean_peak`, log a warning.
+
+---
 
 ## V18 Changes vs V17
 

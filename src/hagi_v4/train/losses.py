@@ -107,7 +107,6 @@ class LossAggregator:
         self.w_parity = contract.parity_weight
         self.w_correction_alignment = contract.correction_alignment_weight
         self.w_rate_distortion = contract.rate_distortion_weight
-        self.w_contrastive = contract.contrastive_weight
         self.warmup_steps = cfg.train.warmup_steps if isinstance(cfg, HAGIv4Config) else 5000
         # V12: parity-code diversity weight. Active from step 0 (Level 1)
         # because collapse can occur very early — the V12 step-1500 log

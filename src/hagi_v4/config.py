@@ -132,11 +132,6 @@ class FreqCodingConfig:
     Complex weight = MIMO channel equalizer (frequency-selective).
     Phase = PSK (phase shift keying).
     Soft frequency gating = adaptive modulation (5G AMC).
-
-    V9: use_lorentz defaults to False. The Lorentz hyperboloid projection
-    adds an extra forward/inverse pair that violates the Euclidean contract
-    expected by the channel encoder and is not load-bearing at init.
-    Enable only when the hyperbolic geometry is explicitly required.
     """
 
     enabled: bool = True
@@ -145,8 +140,6 @@ class FreqCodingConfig:
     complex_rank: int = 16
     use_derivative: bool = True
     share_branch_weights: bool = False
-    use_lorentz: bool = False
-    lorentz_mode: str = "exp"
 
 
 @dataclass
@@ -169,43 +162,6 @@ class EmbeddingsConfig:
     factor_rank: int = 128
     kernel_size: int = 5
     use_conv_embedding: bool = True
-
-
-@dataclass
-class MultimodalImageConfig:
-    """Image encoder config (ViT-style patches)."""
-
-    patch_size: int = 16
-    input_channels: int = 3
-    max_image_patches: int = 1024
-
-
-@dataclass
-class MultimodalAudioConfig:
-    """Audio encoder config (spectrogram frames)."""
-
-    n_mels: int = 128
-    max_audio_frames: int = 512
-
-
-@dataclass
-class CrossModalConfig:
-    """Cross-modal mixing — MIMO space-time coding in frequency domain.
-
-    Cross-spectrum mixing = MIMO channel estimation across modalities.
-    Cross-modal GP2D = Multiple Description Coding (MDC) parity.
-    Cross-modal MSA = Wyner-Ziv side information at decoder.
-    """
-
-    enabled: bool = False
-    num_modalities: int = 3
-    modality_embed_std: float = 0.02
-    modality_dropout_prob: float = 0.10
-    modality_mask_ratios: tuple = (0.15, 0.30, 0.25)
-    cross_freq_gate_init: float = 0.0
-    cross_gp2d_gate_init: float = -3.0
-    contrastive_temperature: float = 0.07
-    contrastive_weight: float = 0.1
 
 
 @dataclass
@@ -232,9 +188,6 @@ class ModelConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     msa: MSAConfig = field(default_factory=MSAConfig)
     freq_coding: FreqCodingConfig = field(default_factory=FreqCodingConfig)
-    image: MultimodalImageConfig = field(default_factory=MultimodalImageConfig)
-    audio: MultimodalAudioConfig = field(default_factory=MultimodalAudioConfig)
-    multimodal: CrossModalConfig = field(default_factory=CrossModalConfig)
 
 
 @dataclass
@@ -293,9 +246,13 @@ class TrainConfig:
     distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
     awgn_enabled: bool = True
-    awgn_sigma_start: float = 0.05
-    awgn_sigma_end: float = 0.01
-    awgn_end_frac: float = 0.3
+    # V19: raised sigma. V18 had channel 9.6x below capacity (SNR=29dB,
+    # capacity=4.82 bits/use vs rate 0.5). BP fully cancelled AWGN even at
+    # 3 iterations. Raise to sigma=0.15 so SNR ~ 17dB, capacity ~ 3.0 bits/use,
+    # still above rate 0.5 but forces BP to do real work.
+    awgn_sigma_start: float = 0.15
+    awgn_sigma_end: float = 0.05
+    awgn_end_frac: float = 0.5
     freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     eos_token_id: int = 0
@@ -597,6 +554,40 @@ def validate_config(cfg: HAGIv4Config) -> None:
         raise ValueError("eos_token_id must be within the model vocabulary")
     if not 0 <= cfg.train.pad_token_id < cfg.model.vocab_size:
         raise ValueError("pad_token_id must be within the model vocabulary")
+
+    # V19 SCS invariants — protect against regressions discovered in V17/V18.
+    # 1. Train/infer BP asymmetry: infer must use MORE iterations than train
+    #    (the V13 win). If train >= infer, we are not doing asymmetric codec.
+    train_bp = getattr(cfg.train, "bp_iterations", None)
+    if train_bp is not None and type(train_bp) is int and train_bp >= cfg.model.refinement.num_iterations:
+        raise ValueError(
+            f"train.bp_iterations ({train_bp}) must be < refinement.num_iterations "
+            f"({cfg.model.refinement.num_iterations}). Train/infer BP asymmetry "
+            f"is a V13-vintage invariant — inference must use MORE BP iterations "
+            f"than training for recovery without gradient overhead."
+        )
+    # 2. AWGN sigma_end must be > 0 — channel never closes completely.
+    #    V17 bug: channel never opened because the schedule bottomed at 0.0.
+    if cfg.train.awgn_enabled and cfg.train.awgn_sigma_end <= 0.0:
+        raise ValueError(
+            "train.awgn_sigma_end must be > 0 when awgn_enabled. V17 regression: "
+            "channel_closed at sigma=0 broke the LDPC training signal entirely."
+        )
+    # 3. parity_diversity weight must be > 0 — prevents LDPC code collapse.
+    #    V17 YAML bug: w_parity_diversity=0.0 caused parity code to collapse
+    #    to a single edge per check.
+    if cfg.train.w_parity_diversity <= 0.0:
+        raise ValueError(
+            "train.w_parity_diversity must be > 0. V17 regression: a YAML bug "
+            "set this to 0.0 and the LDPC code collapsed (parity_metric=0.0096)."
+        )
+    # 4. AWGN sigma_start must be >= sigma_end (schedule goes from noisy to clean).
+    if cfg.train.awgn_enabled and cfg.train.awgn_sigma_start < cfg.train.awgn_sigma_end:
+        raise ValueError(
+            f"awgn_sigma_start ({cfg.train.awgn_sigma_start}) must be >= "
+            f"awgn_sigma_end ({cfg.train.awgn_sigma_end}). Schedule must go "
+            f"from noisy (high sigma) to clean (low sigma), not the reverse."
+        )
 
 
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
