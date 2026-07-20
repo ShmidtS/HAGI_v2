@@ -1,7 +1,10 @@
-# HAGI V18 — Strict Shannon SCS (RTX 3070 8GB)
-# V17 regressed: mce=4.18, parity=0.0096 (dead), source_skip_scale=1.0 (not moving).
-# V18: no skip bypass, pure LDPC BP decoder, LayerScale bottleneck, channel always open.
-# See docs/ARCHITECTURE.md V18 section.
+# HAGI V19 — SCS + Kalman validation gate (RTX 3070 8GB)
+# V18 plateau was step-starvation + 3 bugs (not architecture):
+#  1. bottleneck_scale frozen (linear-linear sandwich, no non-linearity)
+#  2. AWGN sigma too low (channel 9.6x below capacity, SNR=29dB)
+#  3. corr_gate stuck at sigmoid~0.55 (init too small)
+# V19 fixes all three + adds Kalman measurement gating (JPDA-style strobe)
+# for value-of-computation: positions inside the strobe skip BP update.
 
 model:
   vocab_size: 49154
@@ -57,18 +60,6 @@ model:
   freq_coding:
     enabled: false
 
-  multimodal:
-    enabled: false
-
-  image:
-    patch_size: 16
-    input_channels: 3
-    max_image_patches: 1024
-
-  audio:
-    n_mels: 128
-    max_audio_frames: 512
-
 train:
   max_steps: 150000
   warmup_steps: 1000
@@ -110,9 +101,11 @@ train:
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
   awgn_enabled: true
-  awgn_sigma_start: 0.05
-  awgn_sigma_end: 0.01
-  awgn_end_frac: 0.3
+  # V19: raised sigma. V18 had SNR=29dB (channel 9.6x below capacity).
+  # V19 targets SNR~17dB, still above rate 0.5 but forces BP to work.
+  awgn_sigma_start: 0.15
+  awgn_sigma_end: 0.05
+  awgn_end_frac: 0.5
   freeze_embeddings: false
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   eos_token_id: 0

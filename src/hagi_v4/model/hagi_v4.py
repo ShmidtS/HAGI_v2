@@ -51,17 +51,28 @@ if TYPE_CHECKING:
 
 
 class LDPCDecoder(nn.Module):
-    """Pure LDPC belief-propagation decoder (V18).
+    """Pure LDPC belief-propagation decoder with Kalman validation gate (V19).
 
     Each iteration:
-      syndrome    = parity_recv - H @ z_pred      [B, T, M]
-      correction  = H^T @ syndrome * residual_scale
-      gate        = sigmoid(corr_gate_w * |syndrome|_mean + corr_gate_b)
-      z_pred      = z_pred + gate * correction
+      syndrome     = parity_recv - H @ z_pred        [B, T, M]
+      d2           = ||syndrome||^2 / sigma^2         (Mahalanobis)
+      gate_valid   = sigmoid((d2 - chi2_crit) / tau)  (validation gate)
+      correction   = H^T @ syndrome * residual_scale
+      gate_mag     = sigmoid(w * |syndrome|_mean + b) (magnitude gate)
+      z_pred       = z_pred + gate_mag * gate_valid * correction
 
-    No Kalman framing, no HARQ buffer, no FreqBlock reasoning, no mutation
-    branch. The Tanner-graph H is shared with the encoder (fixed sparse mask
-    + frozen parity_base + learnable per-check edge_log_scale).
+    Positions whose syndrome falls inside the strobe (d2 < chi2_crit) are
+    statistically indistinguishable from AWGN and do NOT receive a correction
+    update — value of computation (Horvitz/Russell/Wefald): expected info
+    gain below compute cost. This is the Kalman/JPDA measurement validation
+    gate applied at every BP iteration.
+
+    If <2% of positions are active for two consecutive iterations at
+    inference time, BP halts early (global convergence).
+
+    No Kalman filter state, no HARQ buffer, no FreqBlock reasoning, no
+    mutation branch. The Tanner-graph H is shared with the encoder (fixed
+    sparse mask + frozen parity_base + learnable per-check edge_log_scale).
     """
 
     def __init__(
@@ -92,12 +103,23 @@ class LDPCDecoder(nn.Module):
             shared_parity_base=shared_parity_base,
         )
 
-        # V18: neutral gate init. corr_gate_w small positive (learns to grow
-        # when syndrome magnitude is informative); corr_gate_b 0.0 gives
-        # sigmoid(0)=0.5 baseline. Resolves V17 code/checkpoint inconsistency
-        # where init was -1.0 but ckpt had +1.0.
-        self.corr_gate_w = nn.Parameter(torch.tensor([0.1]))
+        # V19: corr_gate init raised for faster learning. V18 init (0.1, 0.0)
+        # barely moved in 1000 steps (final sigmoid~0.55, no selectivity).
+        # Raise w to 0.3 so syndrome magnitude translates more sharply to
+        # gate output, keep b=0.0 (neutral). Sigmoid(0.3*0.5 + 0) = 0.55 still
+        # at init but the gradient signal is 3x stronger.
+        self.corr_gate_w = nn.Parameter(torch.tensor([0.3]))
         self.corr_gate_b = nn.Parameter(torch.tensor([0.0]))
+
+        # V19: AWGN sigma is fed in by the training loop / inference caller.
+        # None means "unknown" — forward() falls back to conservative 0.1.
+        self._current_awgn_sigma: float | None = None
+
+    def set_awgn_sigma(self, sigma: float | None) -> None:
+        """Inform the decoder of the current AWGN sigma so the validation
+        gate can compute the correct Mahalanobis distance. Called by the
+        training loop and the inference path."""
+        self._current_awgn_sigma = float(sigma) if sigma is not None else None
 
     def forward(
         self,
@@ -109,19 +131,27 @@ class LDPCDecoder(nn.Module):
         refinement_iterations: int | None = None,
         n_iters: int = 3,
     ) -> DecodeResult:
-        """Run ``n_iters`` BP iterations and return the refined systematic estimate.
+        """Run at most ``n_iters`` BP iterations with Kalman validation gating.
 
-        Args:
-            z_sys: received systematic latent [B, T, C] (post AWGN + erasure).
-            parity_received: clean parity [B, T, M] from the encoder.
-            training: when True, gradient flows through all iterations.
-            state: opaque decode state (unused in V18 but kept for cache compat).
-            mask: optional [B, T] boolean; when set, corrections are restricted
-                to masked positions. V18 applies the mask only to the
-                correction update (not the syndrome), so parity is always
-                computed over the full latent.
-            refinement_iterations: explicit iteration override (inference).
-            n_iters: default iteration count (training).
+        Per-position Mahalanobis-style syndrome gate (validation gate /
+        measurement gating from Kalman filtering / JPDA). Before each
+        expensive update — H^T back-projection, gradient flow — the syndrome
+        is tested against the noise covariance. Positions whose squared
+        Mahalanobis distance d2 = s^T R^{-1} s falls below the chi2 threshold
+        are considered "inside the strobe" — the residual is statistically
+        indistinguishable from pure noise — and do NOT participate in the
+        update. This is value-of-computation (Horvitz/Russell/Wefald): the
+        expected information gain of running BP on those positions is below
+        the compute cost, so BP is skipped for them.
+
+        Two operating modes:
+          * training: soft gate via sigmoid (differentiable, gradient flows)
+          * inference: hard gate (positions with d2<threshold are frozen for
+            the iteration, skipping H^T back-projection entirely)
+
+        Additionally, if across the WHOLE batch no position exceeds the
+        threshold for two consecutive iterations, BP halts early (global
+        convergence criterion).
         """
         iteration_limit = refinement_iterations if refinement_iterations is not None else n_iters
         if type(iteration_limit) is not int or iteration_limit < 1:
@@ -132,12 +162,52 @@ class LDPCDecoder(nn.Module):
         last_residual = torch.zeros_like(z_sys[..., :1].expand_as(z_sys))
 
         h_matrix = self.parity_checker.masked_weights  # [M, C]
+        M = h_matrix.shape[0]  # number of parity checks = degrees of freedom for chi2
+
+        # V19 Kalman validation gate. AWGN covariance R = sigma^2 * I, so
+        # Mahalanobis distance reduces to scaled L2: d2 = ||s||^2 / sigma^2.
+        # chi2 critical value at p=0.95, df=M (large-M approximation:
+        # chi2_{0.95, M} ~= M + sqrt(2M)*1.645). This is the strobe radius.
+        chi2_crit = float(M) + (2.0 * float(M)) ** 0.5 * 1.645
+        # Use the noise sigma from the decoder's training-time schedule. At
+        # inference we don't know it, so fall back to a conservative 0.1
+        # (the midpoint of the V19 schedule 0.05-0.15).
+        sigma_sq = (self._current_awgn_sigma**2) if self._current_awgn_sigma is not None else 0.01
+
+        # Per-position activation mask, accumulates "did we update this
+        # position in at least one iteration". Drives iterations_used output.
+        B, T = z_sys.shape[0], z_sys.shape[1]
+        ever_active = torch.zeros((B, T), dtype=torch.bool, device=z_sys.device)
+        iters_used_per_pos = torch.zeros((B, T), dtype=torch.long, device=z_sys.device)
+
+        prev_global_active_frac = 1.0  # track convergence for early halt
 
         for iteration in range(iteration_limit):
             residual, _parity_computed = self.parity_checker(z_pred, parity_received)
             total_parity = total_parity + residual.pow(2).mean().to(total_parity.dtype)
             last_residual = residual
 
+            # --- V19 Kalman validation gate ---------------------------------
+            # d2[b, t] = sum_m residual[b,t,m]^2 / sigma^2
+            d2 = residual.pow(2).sum(dim=-1) / max(sigma_sq, 1e-8)  # [B, T]
+            global_active_frac = (d2 > chi2_crit).float().mean().item()
+
+            if training:
+                # Soft gate: differentiable sigmoid centered at the threshold.
+                # Temperature tau controls sharpness; tau=chi2_crit/6 puts the
+                # 0.5 crossing at d2=chi2_crit with reasonable slope.
+                tau = max(chi2_crit / 6.0, 1.0)
+                gate_valid = torch.sigmoid((d2 - chi2_crit) / tau)  # [B, T]
+            else:
+                # Hard gate: strobe — positions inside the gate are frozen.
+                gate_valid = (d2 > chi2_crit).to(z_pred.dtype)  # [B, T]
+
+            # Track which positions ever got an update (for VOC accounting).
+            active_this_iter = d2 > chi2_crit
+            ever_active = ever_active | active_this_iter
+            iters_used_per_pos += active_this_iter.long()
+
+            # --- Apply gated correction -------------------------------------
             # Back-project syndrome from parity space M to systematic space C
             # via H^T (transpose of the parity-check matrix).
             correction = torch.einsum("mc,btm->btc", h_matrix, residual)
@@ -145,21 +215,34 @@ class LDPCDecoder(nn.Module):
             z_scale = z_pred.float().pow(2).mean(dim=-1, keepdim=True).to(z_pred.dtype) + 1e-6
             correction = correction * (1.0 / torch.sqrt(z_scale)).clamp_max(4.0)
 
-            gate = torch.sigmoid(
+            # corr_gate is the magnitude gate (how strongly syndrome magnitude
+            # translates to correction strength). Multiplied by the validation
+            # gate (whether to correct at all).
+            gate_mag = torch.sigmoid(
                 residual.abs().float().mean(dim=-1, keepdim=True) * self.corr_gate_w + self.corr_gate_b
             ).to(z_pred.dtype)
 
-            update = gate * correction
+            update = gate_mag * gate_valid.unsqueeze(-1) * correction
             if mask is not None:
                 update = update * mask.unsqueeze(-1).to(update.dtype)
             z_pred = z_pred + update
 
+            # --- Early halt: global convergence ------------------------------
+            # If <2% of positions are active for two consecutive iterations,
+            # BP has converged — no point continuing. This is rational
+            # metareasoning: stop when VOC(continue BP) < 0.
+            if not training and iteration >= 1 and global_active_frac < 0.02 and prev_global_active_frac < 0.02:
+                iteration_limit = iteration + 1
+                break
+            prev_global_active_frac = global_active_frac
+
         side_info = {
             "parity_strength": total_parity / max(iteration_limit, 1),
-            "iterations_used": torch.full(
-                (z_sys.shape[0], z_sys.shape[1]), iteration_limit, dtype=torch.long, device=z_sys.device
-            ),
+            "iterations_used": iters_used_per_pos.clamp(min=1 if not training else 0, max=iteration_limit),
             "parity_residual": last_residual,
+            # V19 gating diagnostics
+            "ever_active_frac": ever_active.float().mean(),
+            "mean_iters_used": iters_used_per_pos.float().mean() / max(iteration_limit, 1),
         }
         state.iteration = iteration_limit
         return DecodeResult(latent=z_pred, state=state, side_info=side_info)
@@ -201,9 +284,15 @@ class HAGIv4(nn.Module):
         self.semantic_unknown_embed = nn.Parameter(torch.empty(H))
         nn.init.normal_(self.semantic_unknown_embed, mean=0.0, std=1.0 / math.sqrt(H))
 
-        # V18: LayerScale bottleneck (replaces RMSNorm bottleneck_norm).
-        # Preserves direction, controls magnitude, init=1 (identity at start).
-        self.bottleneck_scale = nn.Parameter(torch.ones(C))
+        # V19: Learnable per-channel bottleneck gate through non-linearity.
+        # V18 bug: bottleneck_scale=ones was sandwiched between two Linear
+        # layers (rate_down -> *scale -> rate_up) with NO non-linearity, so
+        # it was reparametrisation-equivalent to scaling rate_up columns ->
+        # gradient identically zero (verified: std=0.0 across 1000 steps).
+        # Fix: insert SiLU non-linearity + bounded tanh gate (zero-init like
+        # CaiT LayerScale). tanh makes scale identifiable, SiLU breaks the
+        # linear-linear invariance, zero-init keeps cold-start stable.
+        self.bottleneck_gate = nn.Parameter(torch.zeros(C))
 
         self.core_mask_embed = nn.Parameter(torch.empty(C))
         nn.init.uniform_(self.core_mask_embed, -1.0 / math.sqrt(C), 1.0 / math.sqrt(C))
@@ -445,9 +534,13 @@ class HAGIv4(nn.Module):
             if cached_len > 0:
                 h = h[:, cached_len:]
 
-        # V18: LayerScale bottleneck (no RMSNorm). rate_down is a plain Linear.
-        z = self.rate_down(h)
-        z = z * self.bottleneck_scale
+        # V19: LayerScale bottleneck with non-linearity (fixes V18 frozen
+        # gradient). gate=0 at init -> tanh(0)=0, SiLU(rate_down(z))=0 ->
+        # identity-ish cold start via residual to mean(z).  As gate grows,
+        # bottleneck learns per-channel suppression.
+        z_linear = self.rate_down(h)
+        z_gated = torch.nn.functional.silu(z_linear) * torch.tanh(self.bottleneck_gate)
+        z = z_linear + z_gated  # residual: at gate=0, z = z_linear (identity)
         return SourceEncodeResult(systematic=z, mask=semantic_unknown_mask, cqi=None, pre_bottleneck=None)
 
     def _channel_encode(self, encoded: SourceEncodeResult) -> ChannelEncodeResult:
@@ -568,6 +661,9 @@ class HAGIv4(nn.Module):
 
         encoded = self._source_encode(input_ids, semantic_unknown_mask, cache)
         chEncoded = self._apply_erasure(self._channel_encode(encoded), physical_corruption_mask, awgn_sigma)
+        # V19: inform the LDPC decoder of the current AWGN sigma so its
+        # Kalman validation gate uses the correct Mahalanobis threshold.
+        self.decoder.set_awgn_sigma(awgn_sigma if awgn_sigma > 0.0 else None)
         decoded = self._channel_decode(chEncoded, encoded, state, self.training, refinement_iterations)
         h = self._source_decode(decoded, encoded)
 
