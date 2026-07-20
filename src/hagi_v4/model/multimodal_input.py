@@ -31,14 +31,36 @@ class MultimodalInput(nn.Module):
     Modality type embedding (OFDM subcarrier ID) distinguishes modalities.
     """
 
-    def __init__(self, cfg: HAGIv4Config) -> None:
+    def __init__(self, cfg: HAGIv4Config, text_encoder: nn.Module | None = None) -> None:
         super().__init__()
         m = cfg.model
         H = m.hidden_size
         self.H = H
         mm = m.multimodal
 
-        self.text_embed = nn.Embedding(m.vocab_size, H)
+        # V12: share the text source encoder with the main model when one
+        # is provided. This removes the previous standalone ``nn.Embedding(V, H)``
+        # which dominated the parameter budget at large vocabularies (2.34B
+        # params for V=262146, H=8920). The text path now uses the same
+        # factorized ``V*r + r*H`` source encoder as the rest of the model —
+        # one source codebook per model, not per modality. When no encoder
+        # is passed (legacy path), fall back to a factorized ConvEmbedding
+        # sized by ``embeddings.factor_rank`` instead of dense ``V*H``.
+        if text_encoder is not None:
+            self.text_embed = text_encoder
+            self._text_shared = True
+        else:
+            from hagi_v4.model.conv_embedding import ConvEmbedding
+
+            self.text_embed = ConvEmbedding(
+                vocab_size=m.vocab_size,
+                hidden_size=H,
+                factor_rank=m.embeddings.factor_rank,
+                kernel_size=m.embeddings.kernel_size,
+                norm_eps=m.norm_eps,
+                init=m.embeddings.init,
+            )
+            self._text_shared = False
 
         self.image_patch_size = m.image.patch_size
         self.image_embed = nn.Linear(m.image.input_channels * self.image_patch_size**2, H, bias=False)

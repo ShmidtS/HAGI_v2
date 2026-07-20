@@ -3,6 +3,10 @@
 V8 key innovation: parity is generated BEFORE the channel (true
 Source-Channel Separation), not inside the decoder.
 
+V13: fixed Tanner graph (parity_base buffer) + learnable per-check
+edge_log_scale. Prevents channel-code collapse (par 0.14→0.01) by
+keeping H geometry fixed while still allowing amplitude adaptation.
+
 Structure:
   SparseParityEncoder: systematic → parity (channel encoding)
   SparseParityChecker: systematic → residual (parity check at decoder)
@@ -50,17 +54,18 @@ def _build_sparse_mask(n_checks: int, n_vars: int, edges_per_check: int, generat
 class SparseParityEncoder(nn.Module):
     """LDPC-style sparse parity generator (channel encoder).
 
-    Takes systematic bits [B, T, C] and produces parity bits [B, T, M].
-    Sparse connectivity: each check node reads from edges_per_check var nodes.
-
-    The sparse weight matrix is initialized small (near-identity residual)
-    so the model starts with weak parity and learns optimal weights.
+    V13 fixed-graph design:
+      - sparse_mask: fixed connectivity buffer
+      - parity_base: fixed random edge weights (buffer, non-trainable)
+      - edge_log_scale: learnable per-check amplitude [n_checks]
+      - masked_weights = parity_base * sparse_mask * exp(edge_log_scale)
 
     Args:
         n_vars: C (systematic dimension, number of variable nodes)
         n_checks: M (parity dimension, number of check nodes)
         edges_per_check: sparsity (edges per check node, typically 3-6)
         seed: deterministic sparsity pattern
+        freeze_base: if True (default V13), parity_base is a buffer
     """
 
     def __init__(
@@ -70,23 +75,42 @@ class SparseParityEncoder(nn.Module):
         edges_per_check: int = 4,
         seed: int = 42,
         norm_eps: float = 1e-6,
+        freeze_base: bool = True,
     ) -> None:
+        del norm_eps
         super().__init__()
         self.n_vars = n_vars
         self.n_checks = n_checks
         self.edges_per_check = edges_per_check
+        self.freeze_base = freeze_base
 
         gen = torch.Generator().manual_seed(seed)
         mask = _build_sparse_mask(n_checks, n_vars, edges_per_check, gen)
         self.register_buffer("sparse_mask", mask, persistent=True)
 
-        self.parity_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
-        nn.init.normal_(self.parity_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
+        base = torch.zeros(n_checks, n_vars)
+        nn.init.normal_(base, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
+        base = base * mask
+        if freeze_base:
+            self.register_buffer("parity_base", base, persistent=True)
+        else:
+            self.parity_base = nn.Parameter(base)
+
+        self.edge_log_scale = nn.Parameter(torch.zeros(n_checks))
+
+    @property
+    def parity_weights(self) -> nn.Parameter:
+        """Compatibility: expose edge_log_scale as the learnable shared param.
+
+        Checker shares edge_log_scale + parity_base buffer + mask.
+        """
+        return self.edge_log_scale
 
     @property
     def masked_weights(self) -> torch.Tensor:
-        """Sparse weights applied: element-wise mask × learnable weights."""
-        return self.parity_weights * self.sparse_mask
+        """Sparse weights: fixed base × mask × learnable per-check scale."""
+        scale = torch.exp(self.edge_log_scale).unsqueeze(-1)
+        return self.parity_base * self.sparse_mask * scale
 
     def forward(self, systematic: torch.Tensor) -> torch.Tensor:
         """Generate parity bits from systematic bits.
@@ -108,30 +132,17 @@ class SparseParityChecker(nn.Module):
     Computes the parity-check residual: how much the current systematic
     estimate deviates from satisfying the parity equations.
 
-    In LDPC decoding, the check node computes:
-        residual = parity_received - parity_computed_from_estimate
-
-    If the estimate is correct, residual -> 0. Non-zero residual drives
-    belief propagation corrections.
-
-    SHARED parity-check matrix: uses the SAME H = parity_weights * sparse_mask
-    as the encoder. This is the fundamental LDPC invariant — encoder and
-    decoder must agree on H, otherwise residual can never converge to 0
-    even with a perfect estimate.
+    SHARED H graph: same mask + parity_base + edge_log_scale as encoder.
 
     Args:
         n_vars: C (systematic dimension)
         n_checks: M (parity dimension)
         edges_per_check: sparsity
         seed: must match the encoder's seed for consistent graph
-        shared_weights: nn.Parameter from SparseParityEncoder. If None,
-            creates own (for standalone use). If provided, uses the
-            encoder's weights so H_enc = H_dec exactly.
-        shared_mask: sparse_mask buffer from SparseParityEncoder.
-            If None, builds own. If provided, shares the same graph.
-        shared_norm: RMSNorm from SparseParityEncoder. If None, creates
-            own. If provided, shares the same normalization so the
-            parity domain is identical on both sides.
+        shared_edge_log_scale: encoder's edge_log_scale Parameter
+        shared_mask: encoder's sparse_mask buffer
+        shared_parity_base: encoder's parity_base buffer
+        freeze_base: standalone init behaviour when not sharing
     """
 
     def __init__(
@@ -144,12 +155,17 @@ class SparseParityChecker(nn.Module):
         shared_weights: nn.Parameter | None = None,
         shared_mask: torch.Tensor | None = None,
         shared_norm: nn.Module | None = None,
+        shared_edge_log_scale: nn.Parameter | None = None,
+        shared_parity_base: torch.Tensor | None = None,
+        freeze_base: bool = True,
     ) -> None:
-        del shared_norm  # deprecated: parity is now linear (no RMSNorm)
+        del shared_norm
+        del norm_eps
         super().__init__()
         self.n_vars = n_vars
         self.n_checks = n_checks
         self.edges_per_check = edges_per_check
+        self.freeze_base = freeze_base
 
         if shared_mask is not None:
             self.register_buffer("sparse_mask", shared_mask, persistent=True)
@@ -158,15 +174,33 @@ class SparseParityChecker(nn.Module):
             mask = _build_sparse_mask(n_checks, n_vars, edges_per_check, gen)
             self.register_buffer("sparse_mask", mask, persistent=True)
 
-        if shared_weights is not None:
-            self.parity_weights = shared_weights
+        if shared_parity_base is not None:
+            self.register_buffer("parity_base", shared_parity_base, persistent=True)
         else:
-            self.parity_weights = nn.Parameter(torch.zeros(n_checks, n_vars))
-            nn.init.normal_(self.parity_weights, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
+            base = torch.zeros(n_checks, n_vars)
+            nn.init.normal_(base, mean=0.0, std=1.0 / math.sqrt(max(edges_per_check, 1)))
+            base = base * self.sparse_mask
+            if freeze_base:
+                self.register_buffer("parity_base", base, persistent=True)
+            else:
+                self.parity_base = nn.Parameter(base)
+
+        # Prefer explicit edge_log_scale; fall back to shared_weights alias.
+        scale_param = shared_edge_log_scale if shared_edge_log_scale is not None else shared_weights
+        if scale_param is not None:
+            self.edge_log_scale = scale_param
+        else:
+            self.edge_log_scale = nn.Parameter(torch.zeros(n_checks))
+
+    @property
+    def parity_weights(self) -> nn.Parameter:
+        """Compatibility alias for shared learnable scales."""
+        return self.edge_log_scale
 
     @property
     def masked_weights(self) -> torch.Tensor:
-        return self.parity_weights * self.sparse_mask
+        scale = torch.exp(self.edge_log_scale).unsqueeze(-1)
+        return self.parity_base * self.sparse_mask * scale
 
     def forward(
         self,

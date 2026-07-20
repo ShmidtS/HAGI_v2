@@ -367,9 +367,10 @@ class FreqCoding2D(nn.Module):
         elif not self.training and self._w_cache is not None:
             w = self._w_cache
         else:
-            w_re = self.w_re_a.float() @ self.w_re_b.float()
-            w_im = self.w_im_a.float() @ self.w_im_b.float()
-            w = torch.complex(w_re, w_im)
+            with torch.amp.autocast("cuda", enabled=False):
+                w_re = self.w_re_a.float() @ self.w_re_b.float()
+                w_im = self.w_im_a.float() @ self.w_im_b.float()
+                w = torch.complex(w_re, w_im)
             if not self.training:
                 self._w_cache = w
         low_main = low_main @ w[:, :Kh, :F_h]
@@ -431,9 +432,10 @@ class FreqCoding2D(nn.Module):
             elif not self.training and self._w_cache_dT is not None:
                 w_dT = self._w_cache_dT
             else:
-                w_re_dT = self.w_re_a_dT.float() @ self.w_re_b_dT.float()
-                w_im_dT = self.w_im_a_dT.float() @ self.w_im_b_dT.float()
-                w_dT = torch.complex(w_re_dT, w_im_dT)
+                with torch.amp.autocast("cuda", enabled=False):
+                    w_re_dT = self.w_re_a_dT.float() @ self.w_re_b_dT.float()
+                    w_im_dT = self.w_im_a_dT.float() @ self.w_im_b_dT.float()
+                    w_dT = torch.complex(w_re_dT, w_im_dT)
                 if not self.training:
                     self._w_cache_dT = w_dT
 
@@ -442,9 +444,10 @@ class FreqCoding2D(nn.Module):
             elif not self.training and self._w_cache_dH is not None:
                 w_dH = self._w_cache_dH
             else:
-                w_re_dH = self.w_re_a_dH.float() @ self.w_re_b_dH.float()
-                w_im_dH = self.w_im_a_dH.float() @ self.w_im_b_dH.float()
-                w_dH = torch.complex(w_re_dH, w_im_dH)
+                with torch.amp.autocast("cuda", enabled=False):
+                    w_re_dH = self.w_re_a_dH.float() @ self.w_re_b_dH.float()
+                    w_im_dH = self.w_im_a_dH.float() @ self.w_im_b_dH.float()
+                    w_dH = torch.complex(w_re_dH, w_im_dH)
                 if not self.training:
                     self._w_cache_dH = w_dH
 

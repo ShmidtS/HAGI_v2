@@ -51,10 +51,12 @@ def format_training_metrics(metrics: dict) -> str:
     conf = metrics.get("avg_confidence", 0.0)
     correction = metrics.get("correction_alignment", 0.0)
     par = metrics.get("parity", 0.0)
+    par_div = metrics.get("parity_diversity", float("nan"))
     return (
         f"step {metrics['step']} | loss={loss:.4f} | bpt={bits_per_token:.2f} | "
         f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
         f"conf={conf:.3f} | correction={correction:.4f} | par={par:.4f} | "
+        f"par_div={par_div:.4f} | "
         f"masked_ce={metrics.get('masked_ce', float('nan')):.4f} | "
         f"suffix_ce={metrics.get('suffix_ce', float('nan')):.4f} | "
         f"top2={metrics.get('top2_mass', float('nan')):.4f} | "

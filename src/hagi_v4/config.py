@@ -26,7 +26,7 @@ class AttentionConfig:
 
     num_query_heads: int = 8
     num_kv_heads: int = 4
-    head_dim: int = 72
+    head_dim: int = 64
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
     bidirectional: bool = True
@@ -213,12 +213,13 @@ class ModelConfig:
     """Full model architecture configuration."""
 
     vocab_size: int = 49154
-    hidden_size: int = 576
-    perception_layers: int = 2
-    reasoning_layers: int = 7
+    hidden_size: int = 384
+    perception_layers: int = 4
+    expression_layers: int = 4
+    reasoning_layers: int = 3
     norm_eps: float = 1e-6
     bottleneck_ratio: float = 0.5
-    core_hidden_size: int = 288
+    core_hidden_size: int = 192
     pilot_spacing: int = 8
     target_params: int = 0
     target_nonembed_params: int = 0
@@ -241,7 +242,7 @@ class TrainConfig:
     """Training hyperparameters."""
 
     max_steps: int = 150000
-    warmup_steps: int = 2000
+    warmup_steps: int = 1000
     learning_rate: float = 3e-4
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
@@ -255,31 +256,45 @@ class TrainConfig:
     seq_len: int = 1024
     w_ce: float = 1.0
     w_whiteness: float = 0.01
-    w_parity: float = 0.1
-    w_correction_alignment: float = 0.001
-    w_rate_distortion: float = 0.01
-    w_contrastive: float = 0.1
+    w_parity: float = 0.05
+    w_correction_alignment: float = 0.0
+    w_rate_distortion: float = 0.005
+    w_contrastive: float = 0.0
+    # V12: parity-code diversity regularizer. V18 keeps the default 0.05
+    # (V17 yaml bug set it to 0.0 — collapsed the LDPC graph).
+    w_parity_diversity: float = 0.05
+    # V18: train BP iterations (infer uses model.refinement.num_iterations).
+    bp_iterations: int = 3
     use_two_phase_schedule: bool = True
     two_phase_split: float = 0.5
     phase1_mask_ratio: float = 0.15
     phase2_mask_ratio: float = 0.35
     phase3_mask_ratio: float = 0.50
+    # V12: suffix-vs-random mask probability for ``create_semantic_corruption``.
+    # Inference uses suffix-only masking (contiguous block at the end), so
+    # the model must be exposed to that distribution during training. The
+    # previous default (0.5) spent half the batch on random masks, causing
+    # ``suffix_ce - masked_ce`` gap to grow from 0 → 0.65 by step 1000 —
+    # the model specialised on random-mask recovery and underperformed on
+    # the suffix regime used for generation. 0.7 biases 70% of batches
+    # toward suffix masking, matching the inference distribution.
+    suffix_probability: float = 0.3
     use_continuous_anneal: bool = True
     distill_enabled: bool = True
     distill_kl_enabled: bool = False
     distill_teacher: str = "HuggingFaceTB/SmolLM2-360M"
     distill_teacher_hidden_size: int = 576
     distill_embed_teacher: str = "HuggingFaceTB/SmolLM2-135M"
-    distill_alpha_start: float = 0.5
-    distill_alpha_end: float = 0.3
+    distill_alpha_start: float = 0.0
+    distill_alpha_end: float = 0.0
     distill_temperature: float = 2.0
     distill_temp_start: float = 4.0
     distill_temp_end: float = 1.0
     distill_use_temp_anneal: bool = True
     distill_end_frac: float = 0.6
     awgn_enabled: bool = True
-    awgn_sigma_start: float = 0.005
-    awgn_sigma_end: float = 0.0
+    awgn_sigma_start: float = 0.05
+    awgn_sigma_end: float = 0.01
     awgn_end_frac: float = 0.3
     freeze_embeddings: bool = False
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
@@ -333,9 +348,15 @@ class HAGIv4Config:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
 
-_BOTTLENECK_RATIO = 0.5
+_BOTTLENECK_RATIO = 0.75
 _HEAD_DIM_TARGET = 64
-_GRADE_RATIOS = (1, 1.5, 1.5, 1, 4)  # Cl(3,0,0): scalar, 3 vectors, 3 bivectors, pseudoscalar
+_GRADE_RATIOS = (
+    1,
+    1.5,
+    1.5,
+    1,
+    4,
+)  # Cl(3,0,0): scalar, 3 vectors, 3 bivectors, pseudoscalar
 
 
 def _round_to_multiple(value: int, multiple: int = 8) -> int:
@@ -584,6 +605,7 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         "hidden_size",
         "core_hidden_size",
         "perception_layers",
+        "expression_layers",
         "reasoning_layers",
         "bottleneck_ratio",
     ]
@@ -594,7 +616,13 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
     nested = {
         "algebra": ["grade_dims", "hidden_size"],
         "attention": ["num_query_heads", "num_kv_heads", "head_dim"],
-        "msa": ["n_kv_heads", "head_dim", "grade_dims", "mla_compress_dim", "mla_up_dim"],
+        "msa": [
+            "n_kv_heads",
+            "head_dim",
+            "grade_dims",
+            "mla_compress_dim",
+            "mla_up_dim",
+        ],
         "freq_coding": ["n_modes_t", "n_modes_h", "complex_rank"],
         "codec": ["n_checks", "edges_per_check"],
     }
