@@ -1,7 +1,7 @@
-"""HAGI V7.1 configuration dataclasses.
+"""HAGI V21 configuration dataclasses — recovered modular architecture.
 
 5G NR-style codec language model with Cl(3,0,0) geometric algebra.
-Pipeline: Source Encoder → Rate Matching → LDPC Turbo Decoder → Rate Dematching → Source Decoder.
+Pipeline: Source Encoder → Rate Matching → Turbo BP Decoder → Rate Dematching → Source Decoder (SCS preserved).
 
 Auto-configure: set `target_params` in YAML, all sizes computed automatically.
 """
@@ -18,6 +18,10 @@ class AlgebraConfig:
     blade_count: int = 8
     grade_dims: tuple = (64, 96, 96, 64, 256)
     hidden_size: int = 576
+    # V21: geometric product normalization
+    normalize_geometric_product: bool = True
+    # V21: bivector blade activation (grade-2)
+    bivector_activation: str = "tanh"
 
 
 @dataclass
@@ -36,10 +40,9 @@ class AttentionConfig:
 
 @dataclass
 class GP2DConfig:
-    """Parity channel configuration (V8: used by SparseParity, kept for compat).
+    """Parity channel configuration — SparseParity FEC encoder/checker.
 
-    V8 replaces dense GP2D with sparse LDPC-style parity. These fields
-    are retained for backward compatibility with existing configs.
+    V21: sparse LDPC-style parity generated BEFORE the channel (true SCS).
     """
 
     window: int = 1
@@ -71,6 +74,10 @@ class CodecConfig:
 class RefinementConfig:
     """Turbo decoding loop — LDPC iterative belief propagation.
 
+    V21: turbo decoder with extrinsic information exchange between spatial
+    (z_H) and per-token (z_L) components. Entropy-adaptive iteration count
+    and deep supervision support recovered from V6 HRM.
+
     V9: default iterations raised to 4 (min 2). Real LDPC BP needs several
     iterations to converge; the V8 default of 2 left the decoder unable to
     propagate extrinsic information, and the fifth reasoning layer never
@@ -83,6 +90,24 @@ class RefinementConfig:
     convergence_threshold: float = 0.01
     use_convergence_halt: bool = True
     tanh_scale: float = 10.0
+    # V21: Turbo decoder extrinsic exchange (from V6 HRM)
+    extrinsic_alpha: float = 1.0
+    use_adaptive_halt: bool = False
+    halt_threshold: float = 0.01
+    halt_threshold_start: float = 0.05
+    halt_threshold_end: float = 0.001
+    # V21: Entropy-adaptive iteration count
+    use_entropy_adaptive_refinement: bool = False
+    entropy_low_threshold: float = 0.1
+    entropy_high_threshold: float = 1.0
+    entropy_low_iterations: int = 2
+    entropy_high_iterations: int = 6
+    # V21: Deep supervision
+    use_deep_supervision: bool = False
+    deep_supervision_decay: float = 0.5
+    deep_supervision_weight: float = 0.5
+    use_adaptive_ds_weight: bool = False
+    ds_ema_decay: float = 0.9
 
 
 @dataclass
@@ -104,9 +129,10 @@ class MaskingConfig:
 
 @dataclass
 class MSAConfig:
-    """Memory Sparse Attention — DFE (read) + HARQ buffer (write).
+    """Memory Sparse Attention — HARQ buffer + Memory Sparse Attention with MLA.
 
-    Ring buffer slot registry + MLA (Multi-head Latent Attention).
+    V21: DFE (read) + HARQ buffer (write). Ring buffer slot registry
+    combined with Multi-head Latent Attention for compressed KV.
     """
 
     max_slots: int = 2048
@@ -126,9 +152,9 @@ class MSAConfig:
 
 @dataclass
 class FreqCodingConfig:
-    """Phase-frequency coding — replaces attention with 2D FFT (V7).
+    """Phase-frequency coding — 2D FFT OFDM with MIMO equalization.
 
-    FFT = OFDM demodulation, IFFT = OFDM modulation.
+    V21: FFT = OFDM demodulation, IFFT = OFDM modulation.
     Complex weight = MIMO channel equalizer (frequency-selective).
     Phase = PSK (phase shift keying).
     Soft frequency gating = adaptive modulation (5G AMC).
@@ -140,6 +166,151 @@ class FreqCodingConfig:
     complex_rank: int = 16
     use_derivative: bool = True
     share_branch_weights: bool = False
+
+
+@dataclass
+class MoEConfig:
+    """Mixture of Experts — Switch Transformer style with entropy-aware routing.
+
+    V21: variable-rate capacity allocation. Low-entropy positions route to
+    simple experts, high-entropy to complex experts.
+    """
+
+    num_experts: int = 4
+    top_k: int = 1
+    intermediate_size: int = 1024
+    use_mod_skip: bool = True
+    mod_skip_rate: float = 0.1
+    load_balance_weight: float = 0.01
+    router_jitter: float = 0.0
+    entropy_aware_routing: bool = True
+
+
+@dataclass
+class HRMConfig:
+    """Hierarchical Refinement Model — spatial plane (z_H) + per-token state (z_L).
+
+    V21: dual-component Turbo decoder state. z_H is spatial (coarse, strided),
+    z_L is per-token (fine, full resolution). Extrinsic-only exchange between
+    components avoids information recycling (LDPC BP principle).
+    """
+
+    h_state_dim: int = 128
+    l_state_dim: int = 256
+    h_stride: int = 4
+
+
+@dataclass
+class CQIConfig:
+    """Channel Quality Indicator — adaptive sigma/CQI estimation.
+
+    V21: learns SNR estimate from hidden state to drive water-filling
+    and adaptive coding rate. 5G analog: CQI feedback from UE to BS.
+    """
+
+    hidden_size: int = 384
+    cqi_dim: int = 16
+    sigma_min: float = 0.02
+    sigma_max: float = 0.3
+
+
+@dataclass
+class WaterFillingConfig:
+    """Water-Filling capacity allocator — optimal dim allocation across grades.
+
+    V21: Shannon water-filling theorem. High-variance grades get more dims.
+    """
+
+    total_dims: int = 288
+    num_grades: int = 4
+    min_dims: int = 8
+    temperature: float = 1.0
+    variance_ema_decay: float = 0.99
+
+
+@dataclass
+class KalmanConfig:
+    """Kalman filter for iterative decoding — optimal state estimation.
+
+    V21: diagonal covariance O(C). Q/R learnable, zero-init.
+    """
+
+    init_process_noise: float = 0.0
+    init_measurement_noise: float = 0.0
+    covariance_floor: float = 1e-6
+
+
+@dataclass
+class UncertaintyConfig:
+    """Learned per-position uncertainty for iterative decoding.
+
+    V21: scalar variance per position (V9 simplification — per-dim
+    variance carried no information for Kalman-form update).
+    """
+
+    hidden_size: int = 384
+
+
+@dataclass
+class EXITChartConfig:
+    """EXIT chart convergence estimator for iterative decoding.
+
+    V21: norm-ratio convergence proxy (avoids cosine-sim MI fiction).
+    """
+
+    threshold: float = 0.01
+    min_iterations: int = 1
+
+
+@dataclass
+class MultimodalConfig:
+    """Multimodal source encoders — text/image/audio to shared latent.
+
+    V21: separate source encoders per modality (optimal source coding),
+    modality type embedding (CDMA spreading code).
+    """
+
+    enabled: bool = False
+    image_patch_size: int = 16
+    image_channels: int = 3
+    audio_mel_bins: int = 80
+    audio_frame_size: int = 10
+    modality_embed_dim: int = 32
+
+
+@dataclass
+class FOXP2Config:
+    """FOXP2 plasticity controller — per-parameter-group LR modulation.
+
+    V21: adaptive coding rate analog. Applied AFTER backward(), BEFORE step().
+    """
+
+    num_groups: int = 8
+    hidden: int = 32
+    ema_decay: float = 0.99
+
+
+@dataclass
+class KVCacheConfig:
+    """KV Cache for O(T) block-parallel generation.
+
+    V21: convolutional code decoder state analog.
+    """
+
+    enabled: bool = True
+    block_size: int = 16
+
+
+@dataclass
+class SpeculativeConfig:
+    """Speculative decoding — draft-then-verify paradigm.
+
+    V21: rate-distortion analog. Draft model = low-rate code, verify = high-rate.
+    """
+
+    enabled: bool = False
+    draft_length: int = 4
+    acceptance_threshold: float = 0.5
 
 
 @dataclass
@@ -188,6 +359,14 @@ class ModelConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     msa: MSAConfig = field(default_factory=MSAConfig)
     freq_coding: FreqCodingConfig = field(default_factory=FreqCodingConfig)
+    moe: MoEConfig = field(default_factory=MoEConfig)
+    hrm: HRMConfig = field(default_factory=HRMConfig)
+    cqi: CQIConfig | None = None
+    water_filling: WaterFillingConfig = field(default_factory=WaterFillingConfig)
+    kalman: KalmanConfig = field(default_factory=KalmanConfig)
+    uncertainty: UncertaintyConfig | None = None
+    exit_chart: EXITChartConfig | None = None
+    multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
 
 
 @dataclass
@@ -280,6 +459,7 @@ class TrainConfig:
     stage2_datasets: list[str] = field(default_factory=lambda: ["openwebmath", "edu", "slimpajama"])
     data_dtype: str = "auto"
     data_dir: str = "data"
+    foxp2: FOXP2Config = field(default_factory=FOXP2Config)
 
 
 @dataclass
@@ -294,11 +474,13 @@ class InferenceConfig:
     no_repeat_ngram_size: int = 3
     max_iterations: int = 4
     max_new_tokens: int = 128
+    kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
+    speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
 
 
 @dataclass
 class HAGIv4Config:
-    """Top-level HAGI V7.1 configuration."""
+    """Top-level HAGI V21 configuration — recovered modular architecture."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)

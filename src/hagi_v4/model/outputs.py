@@ -48,6 +48,26 @@ class ModelOutput:
     prediction_indices: torch.Tensor | None = None
 
 
+@dataclass
+class RefinementSideInfo:
+    """Side info from iterative refinement (Turbo/HRM decoder).
+
+    V21: carries extrinsic information, deep supervision loss, and
+    convergence diagnostics from the iterative decoding loop.
+    """
+
+    deep_supervision_loss: torch.Tensor | None = None
+    gdr_gate_probs: torch.Tensor | None = None
+    gdr_router_loss: torch.Tensor | None = None
+    gp2d_residual: torch.Tensor | None = None
+    moe_router_probs: list[torch.Tensor] | None = None
+    moe_lb: torch.Tensor | None = None
+    msa_lb: torch.Tensor | None = None
+    iterations_used: torch.Tensor | None = None
+    extrinsic_norms: list[float] | None = None
+    parity_strength: torch.Tensor | None = None
+
+
 def compute_whiteness_loss(residual: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Lag-1 autocorrelation penalty — decorrelate parity residuals.
 
