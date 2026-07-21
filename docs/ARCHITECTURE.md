@@ -1,3 +1,73 @@
+# HAGI V20 — UniLM Mixed Attention + Causal AR Generation
+
+## V20 Changes vs V19
+
+**V19 word-salad root cause:** LLaDA-style mask-predict inference requires
+8B+ parameters (per the LLaDA paper). HAGI has 21M. The model was trained
+as BERT-style MLM (`is_causal=False`) but inference used LLaDA-style
+parallel mask-predict — a fundamental mismatch that no amount of training
+could fix at this scale.
+
+**V20 solution — Prefix-LM (GLM-style):**
+
+1. **Three attention modes** (`attention_block.py`):
+   - `bidir`: full bidirectional (BERT-style MLM)
+   - `causal`: strictly lower-triangular (GPT-style AR)
+   - `prefix`: first `prefix_len` tokens bidir, rest causal (GLM-style)
+   All three verified to produce different outputs on the same input.
+
+2. **UniLM-style mixed training** (`train/loop.py`):
+   - 40% bidir (efficient masked recovery, full context)
+   - 30% prefix-LM (bridges bidir and causal)
+   - 30% causal (trains the AR generation path inference uses)
+   - Per-batch random sampling, independent of `max_steps` (fixes V19
+     curriculum never activating in short smoke tests)
+   - Causal/prefix modes use next-token shifted CE (GPT-style), computed
+     directly from flat `prediction_indices` without materializing [B,T,V]
+
+3. **Pure causal AR generation** (`inference/generate.py`):
+   - Full rewrite: GPT-style left-to-right token generation
+   - One forward pass per token, `attention_mode="causal"`
+   - Removed LLaDA mask-predict loop, SpectralCache, parallel commit
+   - Standard generation constraints (temperature, top-k, repetition
+     penalty, no-repeat-ngram) preserved
+
+4. **`par_div` dead gradient fix** (`sparse_parity.py`):
+   - `edge_log_scale`: `[n_checks]` → `[n_checks, n_vars]` (per-edge)
+   - Root cause: cosine similarity is invariant to per-check scaling —
+     `d(cos_sim)/d(edge_log_scale)` was exactly 0 (reparametrization
+     invariance, same bug class as V18 `bottleneck_scale`)
+   - Verified: gradient now has 1153 nonzero entries (was 0)
+
+5. **LR cosine floor 10%** (not 0):
+   - V19 decayed to 0 at 80% of max_steps, causing late collapse
+     (mce 3.0 → 5.7 after step 1000)
+   - V20 decays to 10% floor, late training still progresses
+
+6. **Mask contract relaxation** (`codec_contracts.py`):
+   - Removed `prediction_mask ⊆ semantic_unknown_mask` constraint
+   - AR mode predicts at NON-masked positions (next-token), so the
+     MLM-specific subset constraint was invalid for UniLM training
+
+**V20 smoke test (5000 steps, tinystories-only):**
+- `masked_ce @ 4000 = 0.0787` (V19 collapsed to 4.68 @ 5000)
+- `par_div = 0.0162` alive (V19 dead at 0.0219 const)
+- No late collapse (V19: mce 3.0 → 5.7 after step 1000)
+- AR generation produces real words: "shouted", "treasure", "laugh",
+  "brave", "happy", "felt", "ladder" (V19: word salad only)
+- Coherent sentences require 50k+ steps (21M params, from scratch)
+
+**Why Prefix-LM over pure causal:**
+- Pure causal (GPT-style) discards the bidirectional context that makes
+  MLM training efficient — 21M params can't afford it
+- Prefix-LM keeps bidir for the prompt/context and causal for generation,
+  getting the best of both regimes
+- GLM-130B proved this architecture scales to frontier size
+- UniLM-style mixed training lets the model learn all three modes in a
+  single stack, no separate MLM/AR phases needed
+
+---
+
 # HAGI V19 — SCS + Kalman Validation Gate (VOC-aware LDPC BP)
 
 ## V19 Changes vs V18
