@@ -395,6 +395,11 @@ class TrainConfig:
     # V12: parity-code diversity regularizer. V18 keeps the default 0.05
     # (V17 yaml bug set it to 0.0 — collapsed the LDPC graph).
     w_parity_diversity: float = 0.05
+    # V22: attention entropy regularization weight. Prevents attention collapse
+    # that causes cyclic loss oscillation (677 events in 4534 V20 steps).
+    w_attn_entropy: float = 0.01
+    # V22: minimum attention entropy floor. Prevents collapse.
+    attn_entropy_floor: float = 0.5
     # V18: train BP iterations (infer uses model.refinement.num_iterations).
     bp_iterations: int = 3
     use_two_phase_schedule: bool = True

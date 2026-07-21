@@ -127,22 +127,36 @@ class AttentionBlock(nn.Module):
         self.ffn = SwiGLU(hidden_size, ffn_mult=ffn_mult)
         nn.init.normal_(self.ffn.w_out.weight, std=0.02)
 
+        # V22: attention entropy floor for distribution stabilization.
+        # Prevents attention collapse to a single position (which causes
+        # cyclic loss oscillation and entropy → 0).
+        self.attn_entropy_floor: float = 0.0  # 0 = disabled
+
+    def set_attn_entropy_floor(self, floor: float) -> None:
+        """V22: set minimum attention entropy. Prevents collapse."""
+        self.attn_entropy_floor = float(floor)
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mode: str = "bidir",
         prefix_len: torch.Tensor | int | None = None,
-    ) -> torch.Tensor:
+        soft_beta: float | None = None,
+        return_attn_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run attention + FFN with the requested attention mode.
 
         Args:
             x: [B, T, H] hidden states.
-            attention_mode: one of "bidir", "causal", "prefix".
+            attention_mode: one of "bidir", "causal", "prefix", "soft_causal".
             prefix_len: required when attention_mode == "prefix". Scalar int
                 or [B] tensor giving the number of prefix tokens per sample
                 (those positions get full bidirectional attention; positions
                 >= prefix_len get causal attention over all preceding tokens
                 including the prefix).
+            soft_beta: controls soft_causal sharpness. None defaults to 2.0.
+                0 = full bidir, large = strict causal.
+            return_attn_weights: when True, returns (output, attn_weights).
         """
         h = self.attn_norm(x)
         B, T, _ = h.shape
@@ -190,8 +204,54 @@ class AttentionBlock(nn.Module):
             mask = mask.masked_fill(both_prefix, 0.0)
             attn_mask = mask
             is_causal = False
+        elif attention_mode == "soft_causal":
+            # V22: soft causal blending — smooth transition between bidir and causal.
+            # Future positions get a penalty proportional to distance, not -inf.
+            # soft_beta controls sharpness: 0=full bidir, large=strict causal.
+            if soft_beta is None:
+                soft_beta = 2.0
+            idx = torch.arange(T, device=x.device)
+            dist = (idx.view(1, T) - idx.view(T, 1)).clamp(min=0)  # [T, T], 0 for past/self
+            penalty = -soft_beta * dist.float().to(x.dtype)
+            attn_mask = penalty.unsqueeze(0).unsqueeze(0).expand(B, 1, T, T)
+            is_causal = False
         else:
-            raise ValueError(f"attention_mode must be one of 'bidir', 'causal', 'prefix'; got {attention_mode!r}")
+            raise ValueError(
+                f"attention_mode must be one of 'bidir', 'causal', 'prefix', 'soft_causal'; got {attention_mode!r}"
+            )
+
+        if self.attn_entropy_floor > 0.0 or return_attn_weights:
+            # Manual attention computation (needed for entropy regularization)
+            scale = 1.0 / (self.head_dim**0.5)
+            if attn_mask is not None:
+                scores = torch.matmul(q, k.transpose(-2, -1)) * scale + attn_mask
+            else:
+                scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if is_causal:
+                causal_mask = torch.triu(
+                    torch.full((T, T), float("-inf"), device=q.device, dtype=scores.dtype), diagonal=1
+                )
+                scores = scores + causal_mask
+            attn_weights = torch.softmax(scores, dim=-1)  # [B, n_heads, T, T]
+
+            # V22: attention entropy regularization
+            if self.attn_entropy_floor > 0.0 and self.training:
+                log_attn = torch.log(attn_weights + 1e-8)
+                entropy = -(attn_weights * log_attn).sum(dim=-1)  # [B, n_heads, T]
+                entropy_deficit = (self.attn_entropy_floor - entropy).clamp_min(0.0)
+                self._last_attn_entropy_penalty = entropy_deficit.mean()
+            else:
+                self._last_attn_entropy_penalty = None
+
+            attn_out = torch.matmul(attn_weights, v)  # [B, n_heads, T, head_dim]
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, self.hidden_size)
+            if return_attn_weights:
+                x = x + self.out_proj(attn_out)
+                x = x + self.ffn(self.ffn_norm(x))
+                return x, attn_weights
+            x = x + self.out_proj(attn_out)
+            x = x + self.ffn(self.ffn_norm(x))
+            return x
 
         attn = F.scaled_dot_product_attention(
             q,

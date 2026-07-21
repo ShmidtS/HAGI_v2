@@ -34,6 +34,8 @@ class AuxLosses:
     # The regularizer is the mutual coherence μ(H) of the parity-check
     # matrix H: high μ means rows are nearly parallel → low-rank code.
     parity_diversity: torch.Tensor | None = None
+    # V22: attention entropy penalty (prevents attention collapse)
+    attn_entropy: torch.Tensor | None = None
 
 
 @dataclass

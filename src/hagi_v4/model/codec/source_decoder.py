@@ -95,29 +95,34 @@ class SourceDecoder(nn.Module):
         blocks: nn.ModuleList,
         attention_mode: str = "bidir",
         prefix_len: torch.Tensor | int | None = None,
-    ) -> torch.Tensor:
+        soft_beta: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run blocks sequentially with the requested attention mode.
 
-        V20: attention_mode propagates through perception/expression stacks.
-        During training, the loop selects "bidir" (masked recovery) or
-        "prefix" (causal suffix prediction). During AR inference, "causal".
+        V22: returns (output, attn_entropy_penalty) for distribution
+        stabilization. attention_mode propagates through expression stacks.
+        During training, the loop selects "bidir" (masked recovery),
+        "soft_causal" (smooth blending), or "causal". During AR inference,
+        "causal".
         """
+        total_entropy_pen = None
         for blk in blocks:
             if self.training:
-                # checkpoint doesn't accept extra positional args reliably
-                # with use_reentrant=False in older torch versions, so we
-                # fall back to a lambda that closes over the kwargs.
                 h = checkpoint(
                     _block_call,
                     blk,
                     h,
                     attention_mode,
                     prefix_len,
+                    soft_beta,
                     use_reentrant=False,
                 )
             else:
-                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len)
-        return h
+                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta)
+            pen = getattr(blk, "_last_attn_entropy_penalty", None)
+            if pen is not None:
+                total_entropy_pen = pen if total_entropy_pen is None else total_entropy_pen + pen
+        return h, total_entropy_pen
 
     def _chunked_ce(self, h: torch.Tensor, targets: torch.Tensor, chunk: int = 128) -> torch.Tensor:
         B, T, H = h.shape
@@ -133,7 +138,9 @@ class SourceDecoder(nn.Module):
             total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(compress_dev), reduction="sum")
         return total_loss / max(n, 1)
 
-    def forward(self, decoded: DecodeResult) -> torch.Tensor:
+    def forward(
+        self, decoded: DecodeResult, attention_mode: str = "causal", soft_beta: float | None = None
+    ) -> torch.Tensor:
         # V18: strict SCS — NO pre_bottleneck bypass. The source decoder
         # receives only the post-channel latent.
         # V20: source decoder always runs in causal mode — it is producing
@@ -142,6 +149,9 @@ class SourceDecoder(nn.Module):
         # positions up to and including itself (no leakage of future latent
         # into the LM head's input). This preserves train/infer consistency
         # when the LM head is queried causally at inference time.
+        # V22: caller can override attention_mode for soft_causal blending.
         z = decoded.latent
         h = self.rate_up(z)
-        return self._stack_forward(h, self.expression, attention_mode="causal")
+        h, dec_entropy_pen = self._stack_forward(h, self.expression, attention_mode=attention_mode, soft_beta=soft_beta)
+        self._last_attn_entropy_penalty = dec_entropy_pen
+        return h
