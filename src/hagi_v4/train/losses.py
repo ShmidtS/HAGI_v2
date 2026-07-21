@@ -114,8 +114,10 @@ class LossAggregator:
         # had degenerated before the Level 2 codec losses kicked in.
         if isinstance(cfg, HAGIv4Config):
             self.w_parity_diversity = getattr(cfg.train, "w_parity_diversity", 0.05)
+            self.w_attn_entropy = getattr(cfg.train, "w_attn_entropy", 0.01)
         else:
             self.w_parity_diversity = 0.05
+            self.w_attn_entropy = 0.01
 
     def _loss_level(self, step: int) -> int:
         """Return active loss level: 1, 2, or 3."""
@@ -148,6 +150,10 @@ class LossAggregator:
         # that was a bug that let the LDPC graph collapse.
         if aux.parity_diversity is not None and self.w_parity_diversity > 0.0:
             total = total + self.w_parity_diversity * aux.parity_diversity
+
+        # V22: attention entropy regularization (Level 1 — active from start)
+        if aux.attn_entropy is not None and self.w_attn_entropy > 0.0:
+            total = total + self.w_attn_entropy * aux.attn_entropy
 
         level = self._loss_level(step)
         if level == 1:

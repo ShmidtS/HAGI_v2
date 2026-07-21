@@ -270,26 +270,41 @@ def train_step(
             awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
             if step < awgn_end:
                 progress = step / max(awgn_end, 1)
-                awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
-        # V20: UniLM-style mixed attention per batch. Fixed probabilities
-        # (40% bidir, 30% prefix-LM, 30% causal) ensure all three modes
-        # are exercised every step regardless of max_steps. This avoids
-        # the V19 failure where suffix_prob curriculum (tied to max_steps)
-        # never ramped up in short smoke tests, leaving the model unable
-        # to generate causally.
-        r = float(torch.rand(1).item())
-        if r < 0.40:
+                # V22: raised sigma for proper capacity matching.
+                # V20 sigma (0.15→0.05) gave SNR 44→400, channel 5.5-8x overcapacity.
+                # V22 sigma (0.40→0.15) gives SNR 6→44, channel 1.2-5.5x capacity.
+                # At rate R=0.5, Shannon limit is SNR=1 (0 dB). V22 starts at 6x
+                # capacity (challenging but learnable) and anneals to 5.5x (stable).
+                awgn_sigma = 0.40 * (1.0 - progress) + 0.15 * progress
+        # V22: soft causal blending — smooth transition instead of hard switching.
+        # Schedule: start with bidir dominance, gradually shift to causal.
+        # This prevents the distribution shock from discrete mode switching.
+        warmup = max(int(cfg.train.warmup_steps), 1)
+        if step < warmup:
+            # Phase 1: pure bidir (learn basic representations)
             attention_mode = "bidir"
             prefix_len = None
-        elif r < 0.70:
-            attention_mode = "prefix"
-            # Use first 25% of the sequence as the bidirectional prefix
-            # (model context), the rest as the causal generation target.
-            seq_len = input_ids.size(1)
-            prefix_len = max(seq_len // 4, 1)
+            soft_beta = None
         else:
-            attention_mode = "causal"
-            prefix_len = None
+            progress = min(1.0, (step - warmup) / max(warmup * 3, 1))
+            # Blend: 50% bidir early → 20% bidir late, rest is soft_causal
+            r = float(torch.rand(1).item())
+            bidir_prob = 0.50 * (1.0 - progress * 0.6)  # 0.50 → 0.20
+            causal_prob = 0.30 * progress  # 0 → 0.30
+            if r < bidir_prob:
+                attention_mode = "bidir"
+                prefix_len = None
+                soft_beta = None
+            elif r < bidir_prob + causal_prob:
+                attention_mode = "causal"
+                prefix_len = None
+                soft_beta = None
+            else:
+                # Soft causal: smooth bidir→causal transition
+                attention_mode = "soft_causal"
+                prefix_len = None
+                # Beta ramps from 0.5 (mild) to 3.0 (strong causal)
+                soft_beta = 0.5 + progress * 2.5
         if attention_mode == "bidir":
             # MLM: use the standard masked prediction path.
             out_prediction_mask = prediction_mask
@@ -313,11 +328,12 @@ def train_step(
             spectrograms=spectrograms,
             attention_mode=attention_mode,
             prefix_len=prefix_len,
+            soft_beta=soft_beta,
         )
-        # V20: For causal/prefix modes, compute next-token CE (shifted
+        # V20: For causal/prefix/soft_causal modes, compute next-token CE (shifted
         # targets) directly from flat logits and indices — no [B,T,V]
         # expansion needed. For bidir, keep the masked-CE path.
-        if attention_mode in ("causal", "prefix"):
+        if attention_mode in ("causal", "prefix", "soft_causal"):
             T = input_ids.size(1)
             idx = output.prediction_indices.to(output.logits.device)  # [n_sel], flat b*T+t
             t = idx % T

@@ -145,29 +145,34 @@ class SourceEncoder(nn.Module):
         blocks: nn.ModuleList,
         attention_mode: str = "bidir",
         prefix_len: torch.Tensor | int | None = None,
-    ) -> torch.Tensor:
+        soft_beta: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run blocks sequentially with the requested attention mode.
 
-        V20: attention_mode propagates through perception/expression stacks.
-        During training, the loop selects "bidir" (masked recovery) or
-        "prefix" (causal suffix prediction). During AR inference, "causal".
+        V22: returns (output, attn_entropy_penalty) for distribution
+        stabilization. attention_mode propagates through perception/expression
+        stacks. During training, the loop selects "bidir" (masked recovery),
+        "soft_causal" (smooth blending), or "causal". During AR inference,
+        "causal".
         """
+        total_entropy_pen = None
         for blk in blocks:
             if self.training:
-                # checkpoint doesn't accept extra positional args reliably
-                # with use_reentrant=False in older torch versions, so we
-                # fall back to a lambda that closes over the kwargs.
                 h = checkpoint(
                     _block_call,
                     blk,
                     h,
                     attention_mode,
                     prefix_len,
+                    soft_beta,
                     use_reentrant=False,
                 )
             else:
-                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len)
-        return h
+                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta)
+            pen = getattr(blk, "_last_attn_entropy_penalty", None)
+            if pen is not None:
+                total_entropy_pen = pen if total_entropy_pen is None else total_entropy_pen + pen
+        return h, total_entropy_pen
 
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
         spacing = self.codec_shape.pilot_spacing
@@ -213,11 +218,15 @@ class SourceEncoder(nn.Module):
         pre_encoded_h: torch.Tensor | None = None,
         attention_mode: str = "bidir",
         prefix_len: torch.Tensor | int | None = None,
+        soft_beta: float | None = None,
     ) -> SourceEncodeResult:
         if pre_encoded_h is not None:
             h = pre_encoded_h
             cached_len = 0
-            h = self._stack_forward(h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len)
+            h, enc_entropy_pen = self._stack_forward(
+                h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta
+            )
+            self._last_attn_entropy_penalty = enc_entropy_pen
         else:
             B, T = input_ids.shape
             embed_dev = self.embed.weight.device
@@ -244,7 +253,10 @@ class SourceEncoder(nn.Module):
             pilot_scale = 1.0 / max(self._H, 1) ** 0.5
             h = h + pilot_scale * pilot_pe.to(h.dtype).unsqueeze(0)
 
-            h = self._stack_forward(h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len)
+            h, enc_entropy_pen = self._stack_forward(
+                h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta
+            )
+            self._last_attn_entropy_penalty = enc_entropy_pen
             if cached_len > 0:
                 h = h[:, cached_len:]
 

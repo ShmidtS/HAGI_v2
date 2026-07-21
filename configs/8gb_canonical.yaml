@@ -101,11 +101,14 @@ train:
   distill_use_temp_anneal: true
   distill_end_frac: 0.6
   awgn_enabled: true
-  # V19: raised sigma. V18 had SNR=29dB (channel 9.6x below capacity).
-  # V19 targets SNR~17dB, still above rate 0.5 but forces BP to work.
-  awgn_sigma_start: 0.15
-  awgn_sigma_end: 0.05
+  # V22: raised sigma for proper capacity matching.
+  # V20 sigma (0.15→0.05) gave SNR 44→400, channel 5.5-8x overcapacity → parity death.
+  # V22 sigma (0.40→0.15) gives SNR 6→44, forcing LDPC decoder to work.
+  awgn_sigma_start: 0.40
+  awgn_sigma_end: 0.15
   awgn_end_frac: 0.5
+  w_attn_entropy: 0.01
+  attn_entropy_floor: 0.5
   freeze_embeddings: false
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   eos_token_id: 0

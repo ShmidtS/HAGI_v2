@@ -133,6 +133,12 @@ class HAGIv4(nn.Module):
 
         self._init_weights()
 
+        # V22: set attention entropy floor on all attention blocks
+        attn_floor = getattr(cfg.train, "attn_entropy_floor", 0.5)
+        for mod in self.modules():
+            if hasattr(mod, "set_attn_entropy_floor"):
+                mod.set_attn_entropy_floor(attn_floor)
+
     @property
     def embed(self):
         """Compatibility shim: expose source_encoder.embed for callers
@@ -189,12 +195,14 @@ class HAGIv4(nn.Module):
         refinement_iterations: int | None = None,
         attention_mode: str = "bidir",
         prefix_len: torch.Tensor | int | None = None,
+        soft_beta: float | None = None,
     ) -> ModelOutput:
         """V20: attention_mode selects how perception layers attend.
 
         - "bidir":  full bidirectional (default; masked-LM training)
         - "prefix": GLM-style prefix-LM (prefix_len bidir, rest causal)
         - "causal": pure GPT-style (AR inference)
+        - "soft_causal": V22 smooth bidir→causal blending (soft_beta controls sharpness)
 
         The source decoder (expression stack) always runs in causal mode
         to match the LM head's left-to-right query pattern at inference.
@@ -222,6 +230,7 @@ class HAGIv4(nn.Module):
             cache,
             attention_mode=attention_mode,
             prefix_len=prefix_len,
+            soft_beta=soft_beta,
         )
         ch_encoded = self.channel_encoder.apply_erasure(
             self.channel_encoder.forward(encoded),
@@ -239,7 +248,7 @@ class HAGIv4(nn.Module):
             bp_iterations=getattr(self.cfg.train, "bp_iterations", None),
             refinement_iterations=refinement_iterations,
         )
-        h = self.source_decoder.forward(decoded)
+        h = self.source_decoder.forward(decoded, attention_mode="causal")
 
         if cache is not None:
             cache.update_decode_state(decoded.state)
@@ -288,6 +297,14 @@ class HAGIv4(nn.Module):
                 erased_error = recovery_error[physical_corruption_mask.to(recovery_error.device)]
                 if erased_error.numel() > 0:
                     aux.parity_recovery = erased_error.mean().to(h.dtype)
+
+        # V22: attention entropy penalty
+        enc_pen = getattr(self.source_encoder, "_last_attn_entropy_penalty", None)
+        dec_pen = getattr(self.source_decoder, "_last_attn_entropy_penalty", None)
+        if enc_pen is not None:
+            aux.attn_entropy = enc_pen
+        if dec_pen is not None:
+            aux.attn_entropy = dec_pen if aux.attn_entropy is None else aux.attn_entropy + dec_pen
 
         return ModelOutput(
             logits=logits,
