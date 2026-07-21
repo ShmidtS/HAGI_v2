@@ -1,4 +1,10 @@
-"""Masked refinement followed by adaptive left-to-right generation."""
+"""V20: Pure causal autoregressive generation.
+
+Replaces the V12 LLaDA-style mask-predict loop with standard GPT-style
+left-to-right token generation. The model is now trained with UniLM-style
+mixed attention (40% bidir, 30% prefix-LM, 30% causal), so the inference
+path uses the causal mode that was explicitly trained.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from hagi_v4.inference.spectral_cache import SpectralCache
 from hagi_v4.model.codec_contracts import InferenceShapeConfig
 
 
@@ -124,36 +129,25 @@ def _generate(
     physical_corruption_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> GenerationOutput:
-    """Iterative masked-LM generation with autoregressive commit.
+    """V20: Pure causal autoregressive generation.
 
-    V12 rewrite: the previous implementation ran ONE forward pass over the
-    fully-masked suffix and then sampled left-to-right from that frozen
-    posterior. A masked LM trained on random/suffix masks has no incentive
-    to make suffix position ``t`` depend on suffix position ``t-1`` when
-    both are masked simultaneously, so the pre-computed posterior assigned
-    near-uniform probabilities to later positions — producing the
-    repetitive, semantically-empty output observed in inference.
+    Feeds the prompt, takes logits at the last position, samples the next
+    token, appends it, and repeats. This is the standard GPT-style AR loop
+    that matches the causal training mode (30% of V20 batches).
 
-    The new loop mirrors Gibbs/iterative-decoding intuition: after each
-    forward pass, commit the highest-confidence tokens, then re-run the
-    forward pass with those tokens revealed. This gives the decoder
-    progressively more context, exactly as an iterative belief-propagation
-    decoder re-uses previously decoded symbols as new extrinsic
-    information. The process converges to a self-consistent suffix.
-
-    Args:
-        max_iterations: number of refinement passes over the suffix.
-            Each pass commits at most ``commit_per_pass`` tokens.
+    Unlike the V12 mask-predict loop, this does NOT use iterative
+    refinement or parallel commit — each token is generated sequentially,
+    conditioned on all previously generated tokens.
     """
     if prompt_ids.ndim != 2 or prompt_ids.dtype != torch.long:
         raise ValueError("prompt_ids must be a rank-2 LongTensor")
-    if max_new_tokens < 2 or not 2 <= min_new_tokens <= max_new_tokens:
-        raise ValueError("generation requires 2 <= min_new_tokens <= max_new_tokens")
-    if max_iterations < 1:
-        raise ValueError("max_iterations must be positive")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be >= 1")
+    if min_new_tokens < 0 or min_new_tokens > max_new_tokens:
+        raise ValueError("0 <= min_new_tokens <= max_new_tokens required")
 
     model.eval()
-    batch_size, original_prompt_len = prompt_ids.shape
+    batch_size, prompt_len = prompt_ids.shape
     device = prompt_ids.device
     inference_config = getattr(model, "inference_config", None)
     vocab_size = (
@@ -168,167 +162,87 @@ def _generate(
     if eos_token_id == pad_token_id:
         raise ValueError("eos_token_id and pad_token_id must be distinct")
 
-    internal_prompt_len = max(original_prompt_len, 4)
-    prompt_padding = torch.full(
-        (batch_size, internal_prompt_len - original_prompt_len),
-        pad_token_id,
-        dtype=torch.long,
-        device=device,
+    invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
+
+    # Build the sequence buffer: prompt + space for new tokens (filled with pad).
+    sequence = torch.cat(
+        (prompt_ids, torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)),
+        dim=1,
     )
-    internal_prompt = torch.cat((prompt_ids, prompt_padding), dim=1)
-    suffix = torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)
-    refinement_ids = torch.cat((internal_prompt, suffix), dim=1)
-
-    # Mask: True where the model must predict (the unknown suffix).
-    semantic_unknown_mask = torch.zeros_like(refinement_ids, dtype=torch.bool)
-    semantic_unknown_mask[:, internal_prompt_len:] = True
-    if physical_corruption_mask is None:
-        physical_mask = torch.zeros_like(refinement_ids, dtype=torch.bool)
-    else:
-        if physical_corruption_mask.shape != refinement_ids.shape:
-            raise ValueError("physical_corruption_mask must match the internal generation sequence")
-        physical_mask = physical_corruption_mask.to(device=device, dtype=torch.bool)
-
-    decoder_n_iters = getattr(getattr(model, "decoder", None), "n_iters", max_iterations)
-    # V13: BP depth independent of mask-predict pass count.
-    bp_iterations = min(4, max(1, int(decoder_n_iters)))
-
-    # Commit history: which suffix positions have been committed (revealed
-    # to the model in subsequent forward passes).
-    committed = torch.zeros(batch_size, max_new_tokens, dtype=torch.bool, device=device)
     generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
 
-    # V12: parallel mask-predict decoding (Ghazvininejad 2019).
-    # Strategy: run a small number of forward passes (controlled by
-    # ``max_iterations``, typically 4-8) and commit ALL remaining tokens
-    # in parallel each pass. At each pass:
-    #   1. Forward with uncommitted positions masked.
-    #   2. Compute logits at all uncommitted positions.
-    #   3. Sample ALL uncommitted positions in parallel (not just leftmost).
-    #   4. Commit the highest-confidence tokens (lowest entropy), keep
-    #      low-confidence ones masked for the next pass.
-    # This is O(max_iterations) forward passes regardless of
-    # max_new_tokens, making 64-token generation take ~4 passes (2.5 s)
-    # instead of 64 passes (12 s). The model was trained on suffix masks
-    # that match this parallel-decode distribution.
-    n_refinement_passes = max(1, min(max_iterations, 8))
-    generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
+    # V20: physical_corruption_mask is not used in causal AR mode (no
+    # channel noise during generation). If provided, ignored.
+    _ = physical_corruption_mask
 
-    # V13: SpectralCache for decode-state (HARQ) across mask-predict passes.
-    # Spectral context is cleared each pass because every pass re-encodes the
-    # full sequence (context prepend would double-count tokens).
-    cache = SpectralCache(context_window=128)
-
-    for iteration in range(n_refinement_passes):
-        active_rows_mask = ~finished
-        if not active_rows_mask.any():
+    for step in range(max_new_tokens):
+        if finished.all():
             break
-        active_rows = active_rows_mask.nonzero(as_tuple=False).squeeze(-1)
 
-        cache._context.clear()
-        cache._context_boundary.clear()
-        cache._total_len = 0
-
-        # Mask: True where the model must predict (uncommitted suffix).
-        iter_unknown = torch.zeros_like(refinement_ids, dtype=torch.bool)
-        for r in active_rows.tolist():
-            iter_unknown[r, internal_prompt_len:] = ~committed[r]
-
+        # Forward pass with causal attention over the current sequence.
+        current_len = prompt_len + step
+        input_ids = sequence[:, :current_len]
+        # V20: prediction_mask selects ONLY the last position for each row
+        # (next-token prediction). semantic_unknown_mask must be a superset
+        # of prediction_mask (model contract), so we mark the last position
+        # as unknown too. The model returns logits as [n_selected, V] where
+        # n_selected = prediction_mask.sum() = batch_size.
+        prediction_mask = torch.zeros((batch_size, current_len), dtype=torch.bool, device=device)
+        prediction_mask[:, -1] = True
+        semantic_unknown_mask = prediction_mask.clone()
+        valid_target_mask = torch.ones((batch_size, current_len), dtype=torch.bool, device=device)
+        physical_mask = torch.zeros((batch_size, current_len), dtype=torch.bool, device=device)
         output = model(
-            refinement_ids,
+            input_ids,
             targets=None,
-            semantic_unknown_mask=iter_unknown,
-            prediction_mask=iter_unknown,
-            valid_target_mask=torch.ones_like(iter_unknown),
+            semantic_unknown_mask=semantic_unknown_mask,
+            prediction_mask=prediction_mask,
+            valid_target_mask=valid_target_mask,
             physical_corruption_mask=physical_mask,
-            refinement_iterations=bp_iterations,
-            cache=cache,
+            attention_mode="causal",
+            prefix_len=None,
         )
-        if output.logits is None or output.prediction_indices is None:
-            raise ValueError("model output must include logits and prediction_indices")
+        if output.logits is None:
+            raise ValueError("model output must include logits")
 
-        # Map prediction_indices → positions for fast lookup.
-        logits_rows = torch.full((refinement_ids.numel(),), -1, dtype=torch.long, device=device)
-        logits_rows[output.prediction_indices.to(device)] = torch.arange(output.logits.shape[0], device=device)
+        # output.logits is [B, V] (one logit per row for the last position).
+        next_logits = output.logits  # [B, V]
 
-        # V12: parallel commit. For each active row, sample ALL
-        # uncommitted positions from this forward pass, then keep only
-        # the highest-confidence ones. Low-confidence positions stay
-        # masked for the next refinement pass. On the final pass, commit
-        # everything regardless of confidence.
-        is_final_pass = iteration == n_refinement_passes - 1
-        for r in active_rows.tolist():
+        # Zero out finished rows so they don't produce tokens.
+        for r in range(batch_size):
+            if finished[r]:
+                next_logits[r] = float("-inf")
+                next_logits[r, pad_token_id] = 0.0
+
+        # Sample next token for each row.
+        context = sequence[:, :current_len]
+        next_tokens = process_generation_logits(
+            next_logits,
+            context,
+            generated_lengths=generated_lengths,
+            forbidden_token_ids=invalid_token_ids,
+            eos_token_id=eos_token_id,
+            min_new_tokens=min_new_tokens,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            top_k=top_k,
+            generator=generator,
+        )
+
+        # Write tokens and update state.
+        for r in range(batch_size):
             if finished[r]:
                 continue
-            uncommitted_idx = (~committed[r]).nonzero(as_tuple=False).squeeze(-1)
-            if uncommitted_idx.numel() == 0:
+            token = int(next_tokens[r].item())
+            sequence[r, current_len] = token
+            generated_lengths[r] += 1
+            if token == eos_token_id:
                 finished[r] = True
-                continue
 
-            # Gather logits for all uncommitted positions of this row.
-            positions_in_refinement = internal_prompt_len + uncommitted_idx
-            row_offsets = r * refinement_ids.shape[1] + positions_in_refinement
-            logit_indices = logits_rows[row_offsets]
-            valid_mask = logit_indices >= 0
-            if not valid_mask.any():
-                continue
-            valid_positions = uncommitted_idx[valid_mask]
-            valid_logit_indices = logit_indices[valid_mask]
-            row_logits = output.logits[valid_logit_indices.to(output.logits.device)].to(device)  # [n, V]
-
-            # Compute per-position entropy (confidence).
-            with torch.no_grad():
-                probs = torch.softmax(row_logits.float(), dim=-1)
-                entropies = -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1)  # [n]
-
-            if is_final_pass:
-                # Commit all remaining on the final pass.
-                commit_mask = torch.ones_like(entropies, dtype=torch.bool)
-            else:
-                # Commit the lowest-entropy (highest-confidence) positions.
-                # Keep at most 50% uncommitted for the next pass to ensure
-                # progress, commit at least 1.
-                k_commit = max(1, int(len(entropies) * 0.5))
-                k_commit = min(k_commit, len(entropies))
-                topk_vals, topk_local = torch.topk(entropies, k_commit, largest=False)
-                commit_mask = torch.zeros_like(entropies, dtype=torch.bool)
-                commit_mask[topk_local] = True
-
-            # Sample tokens for committed positions.
-            for i, pos_in_suffix in enumerate(valid_positions.tolist()):
-                if not commit_mask[i]:
-                    continue
-                pos_in_ref = internal_prompt_len + pos_in_suffix
-                context = refinement_ids[r].unsqueeze(0)[:, :pos_in_ref]
-                gen_len_tensor = torch.tensor([generated_lengths[r]], dtype=torch.long, device=device)
-                token = process_generation_logits(
-                    row_logits[i].unsqueeze(0),
-                    context,
-                    generated_lengths=gen_len_tensor,
-                    forbidden_token_ids=invalid_token_ids,
-                    eos_token_id=eos_token_id,
-                    min_new_tokens=min_new_tokens,
-                    repetition_penalty=repetition_penalty,
-                    repetition_window=repetition_window,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    temperature=temperature,
-                    top_k=top_k,
-                    generator=generator,
-                )
-                token = int(token.item())
-                refinement_ids[r, pos_in_ref] = token
-                committed[r, pos_in_suffix] = True
-                generated_lengths[r] += 1
-                if token == eos_token_id:
-                    finished[r] = True
-                    break
-
-    generated = refinement_ids[:, internal_prompt_len:].clone()
-    token_ids = torch.cat((prompt_ids, generated), dim=1)
+    token_ids = sequence[:, : prompt_len + max_new_tokens]
     return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)
 
 

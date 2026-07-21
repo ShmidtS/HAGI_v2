@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from itertools import islice
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from hagi_v4.config import HAGIv4Config
@@ -92,7 +93,7 @@ def _maybe_release_caches(step: int, interval: int = 1) -> None:
 
 
 def lr_at(step: int, cfg: HAGIv4Config) -> float:
-    """Linear warmup from 0, then stable, then cosine decay."""
+    """Linear warmup from 0, then stable, then cosine decay to 10% floor."""
     tc = cfg.train
     warmup = tc.warmup_steps
     max_steps = tc.max_steps
@@ -104,11 +105,15 @@ def lr_at(step: int, cfg: HAGIv4Config) -> float:
         return base_lr
     decay_steps = max(max_steps - stable_end, 1)
     progress = (step - stable_end) / decay_steps
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    # V20: cosine decay to 10% floor (not 0) so late-stage training
+    # still makes progress. V19 decayed to 0, causing the late collapse
+    # (mce 3.0 -> 5.7 after step 1000).
+    min_lr_ratio = 0.1
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
 def muon_lr_at(step: int, cfg: HAGIv4Config) -> float:
-    """Linear warmup from 0, then stable, then cosine decay for Muon."""
+    """Linear warmup from 0, then stable, then cosine decay to 10% floor for Muon."""
     tc = cfg.train
     warmup = tc.warmup_steps
     max_steps = tc.max_steps
@@ -120,7 +125,8 @@ def muon_lr_at(step: int, cfg: HAGIv4Config) -> float:
         return base_lr
     decay_steps = max(max_steps - stable_end, 1)
     progress = (step - stable_end) / decay_steps
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    min_lr_ratio = 0.1
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
 def set_lr(optimizer: CombinedOptimizer, step: int, cfg: HAGIv4Config) -> None:
@@ -265,19 +271,82 @@ def train_step(
             if step < awgn_end:
                 progress = step / max(awgn_end, 1)
                 awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
+        # V20: UniLM-style mixed attention per batch. Fixed probabilities
+        # (40% bidir, 30% prefix-LM, 30% causal) ensure all three modes
+        # are exercised every step regardless of max_steps. This avoids
+        # the V19 failure where suffix_prob curriculum (tied to max_steps)
+        # never ramped up in short smoke tests, leaving the model unable
+        # to generate causally.
+        r = float(torch.rand(1).item())
+        if r < 0.40:
+            attention_mode = "bidir"
+            prefix_len = None
+        elif r < 0.70:
+            attention_mode = "prefix"
+            # Use first 25% of the sequence as the bidirectional prefix
+            # (model context), the rest as the causal generation target.
+            seq_len = input_ids.size(1)
+            prefix_len = max(seq_len // 4, 1)
+        else:
+            attention_mode = "causal"
+            prefix_len = None
+        if attention_mode == "bidir":
+            # MLM: use the standard masked prediction path.
+            out_prediction_mask = prediction_mask
+            out_unknown_mask = semantic_unknown_mask
+        else:
+            # Causal/prefix AR: predict at ALL valid positions (no input
+            # masking). The model returns logits as [n_valid, V]; we
+            # reshape to [B, T, V] for next-token shifted CE.
+            out_prediction_mask = valid_target_mask
+            out_unknown_mask = torch.zeros_like(valid_target_mask)
         output = model(
             input_ids,
-            targets=targets,
-            semantic_unknown_mask=semantic_unknown_mask,
-            prediction_mask=prediction_mask,
+            targets=targets if attention_mode == "bidir" else None,
+            semantic_unknown_mask=out_unknown_mask,
+            prediction_mask=out_prediction_mask,
             valid_target_mask=valid_target_mask,
             physical_corruption_mask=physical_corruption_mask,
             step=step,
             awgn_sigma=awgn_sigma,
             images=images,
             spectrograms=spectrograms,
+            attention_mode=attention_mode,
+            prefix_len=prefix_len,
         )
-        loss = loss_aggregator(output, targets, prediction_mask, step=step)
+        # V20: For causal/prefix modes, compute next-token CE (shifted
+        # targets) directly from flat logits and indices — no [B,T,V]
+        # expansion needed. For bidir, keep the masked-CE path.
+        if attention_mode in ("causal", "prefix"):
+            T = input_ids.size(1)
+            idx = output.prediction_indices.to(output.logits.device)  # [n_sel], flat b*T+t
+            t = idx % T
+            # Only positions with t < T-1 have a next token to predict.
+            mask = t < (T - 1)
+            if attention_mode == "prefix" and prefix_len is not None:
+                mask = mask & (t >= prefix_len)
+            if mask.any():
+                idx_keep = idx[mask]
+                target_idx = idx_keep + 1  # next position
+                shift_logits = output.logits[mask]
+                shift_targets = targets.view(-1).index_select(0, target_idx.to(targets.device)).to(shift_logits.device)
+                target_valid = (
+                    valid_target_mask.view(-1)
+                    .index_select(0, target_idx.to(valid_target_mask.device))
+                    .to(shift_logits.device)
+                )
+                if target_valid.any():
+                    output.ce_loss = F.cross_entropy(
+                        shift_logits[target_valid],
+                        shift_targets[target_valid],
+                    )
+                else:
+                    output.ce_loss = output.logits.new_zeros(())
+            else:
+                output.ce_loss = output.logits.new_zeros(())
+            loss = loss_aggregator(output, targets, None, step=step)
+        else:
+            loss = loss_aggregator(output, targets, prediction_mask, step=step)
 
         use_distill = (
             teacher is not None

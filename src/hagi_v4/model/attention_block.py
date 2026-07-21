@@ -1,4 +1,9 @@
-"""Bidirectional attention blocks for HAGI V16 Source Encode/Decode.
+"""Attention blocks for HAGI V20 Source Encode/Decode.
+
+V20: support bidirectional, causal, and prefix-LM attention modes.
+- bidir: full attention (BERT-style, for masked recovery)
+- causal: lower-triangular mask (GPT-style, for AR generation)
+- prefix: bidir on prefix tokens, causal on suffix tokens (GLM-style)
 
 FreqBlock is demoted to the channel equalizer (LDPCDecoder.reasoning).
 Source stacks use content-addressable MHA + SwiGLU + RoPE.
@@ -79,7 +84,21 @@ class SwiGLU(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Pre-norm bidirectional MHA + RoPE + SwiGLU. Content-addressable source mixer."""
+    """Pre-norm MHA + RoPE + SwiGLU with selectable attention mode.
+
+    V20 introduces the ``attention_mode`` argument to support three regimes
+    in a single stack:
+
+    - ``"bidir"``: full attention (BERT-style, for masked recovery training)
+    - ``"causal"``: lower-triangular mask (GPT-style, for AR generation)
+    - ``"prefix"``: bidir on prefix tokens, causal on suffix tokens
+      (GLM-style). Requires ``prefix_len`` (int or [B] tensor) so the block
+      knows where bidir ends and causal begins.
+
+    The mode is selected per forward call, not at construction time, so the
+    same block can be used for bidirectional perception during masked-CE
+    training and causal generation during AR inference.
+    """
 
     def __init__(
         self,
@@ -108,7 +127,23 @@ class AttentionBlock(nn.Module):
         self.ffn = SwiGLU(hidden_size, ffn_mult=ffn_mult)
         nn.init.normal_(self.ffn.w_out.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mode: str = "bidir",
+        prefix_len: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        """Run attention + FFN with the requested attention mode.
+
+        Args:
+            x: [B, T, H] hidden states.
+            attention_mode: one of "bidir", "causal", "prefix".
+            prefix_len: required when attention_mode == "prefix". Scalar int
+                or [B] tensor giving the number of prefix tokens per sample
+                (those positions get full bidirectional attention; positions
+                >= prefix_len get causal attention over all preceding tokens
+                including the prefix).
+        """
         h = self.attn_norm(x)
         B, T, _ = h.shape
         qkv = self.qkv(h).view(B, T, 3, self.n_heads, self.head_dim)
@@ -119,7 +154,53 @@ class AttentionBlock(nn.Module):
         cos, sin = self.rope.get_cos_sin(T, q.device, q.dtype)
         q, k = apply_rope(q, k, cos, sin)
         drop_p = self.dropout if self.training else 0.0
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=drop_p, is_causal=False)
+
+        is_causal = False
+        attn_mask: torch.Tensor | None = None
+
+        if attention_mode == "bidir":
+            is_causal = False
+        elif attention_mode == "causal":
+            is_causal = True
+        elif attention_mode == "prefix":
+            # Build a per-sample mask: prefix positions attend to all prefix
+            # positions bidirectionally; suffix positions attend causally to
+            # everything up to and including themselves. Implementation: start
+            # from a causal mask (lower-triangular), then open up the prefix
+            # block to full attention.
+            # attn_mask shape: [B, 1, T, T] additive mask (-inf = blocked).
+            if prefix_len is None:
+                raise ValueError("prefix_len is required when attention_mode='prefix'")
+            if isinstance(prefix_len, int):
+                pl = torch.full((B,), prefix_len, device=x.device, dtype=torch.long)
+            else:
+                pl = prefix_len.to(device=x.device, dtype=torch.long)
+            idx = torch.arange(T, device=x.device)
+            q_idx = idx.view(T, 1)
+            k_idx = idx.view(1, T)
+            causal_allowed = k_idx <= q_idx  # [T, T]
+            mask = torch.zeros(B, 1, T, T, device=x.device, dtype=x.dtype)
+            mask.masked_fill_(~causal_allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
+            # Open prefix block: for each sample, positions < pl[b] can attend
+            # to all positions < pl[b] bidirectionally.
+            pl_b = pl.view(B, 1, 1, 1)
+            q_in_prefix = idx.view(1, 1, T, 1) < pl_b
+            k_in_prefix = idx.view(1, 1, 1, T) < pl_b
+            both_prefix = q_in_prefix & k_in_prefix  # [B, 1, T, T]
+            mask = mask.masked_fill(both_prefix, 0.0)
+            attn_mask = mask
+            is_causal = False
+        else:
+            raise ValueError(f"attention_mode must be one of 'bidir', 'causal', 'prefix'; got {attention_mode!r}")
+
+        attn = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=drop_p,
+            is_causal=is_causal,
+        )
         attn = attn.transpose(1, 2).contiguous().view(B, T, self.hidden_size)
         x = x + self.out_proj(attn)
         x = x + self.ffn(self.ffn_norm(x))

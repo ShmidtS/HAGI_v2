@@ -248,6 +248,21 @@ class LDPCDecoder(nn.Module):
         return DecodeResult(latent=z_pred, state=state, side_info=side_info)
 
 
+def _block_call(
+    block: nn.Module,
+    x: torch.Tensor,
+    attention_mode: str,
+    prefix_len: torch.Tensor | int | None,
+) -> torch.Tensor:
+    """Helper for checkpoint-friendly invocation of AttentionBlock.
+
+    torch.utils.checkpoint needs a callable with positional tensor args
+    for reliable grad accumulation. This wraps the block call so the
+    attention_mode/prefix_len kwargs are passed through.
+    """
+    return block(x, attention_mode=attention_mode, prefix_len=prefix_len)
+
+
 class HAGIv4(nn.Module):
     """HAGI V18 — Strict Source-Channel Separation codec language model."""
 
@@ -449,12 +464,34 @@ class HAGIv4(nn.Module):
             total_loss = total_loss + F.cross_entropy(logits_chunk, t_flat[i:end].to(compress_dev), reduction="sum")
         return total_loss / max(n, 1)
 
-    def _stack_forward(self, h: torch.Tensor, blocks: nn.ModuleList) -> torch.Tensor:
+    def _stack_forward(
+        self,
+        h: torch.Tensor,
+        blocks: nn.ModuleList,
+        attention_mode: str = "bidir",
+        prefix_len: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        """Run blocks sequentially with the requested attention mode.
+
+        V20: attention_mode propagates through perception/expression stacks.
+        During training, the loop selects "bidir" (masked recovery) or
+        "prefix" (causal suffix prediction). During AR inference, "causal".
+        """
         for blk in blocks:
             if self.training:
-                h = checkpoint(blk, h, use_reentrant=False)
+                # checkpoint doesn't accept extra positional args reliably
+                # with use_reentrant=False in older torch versions, so we
+                # fall back to a lambda that closes over the kwargs.
+                h = checkpoint(
+                    _block_call,
+                    blk,
+                    h,
+                    attention_mode,
+                    prefix_len,
+                    use_reentrant=False,
+                )
             else:
-                h = blk(h)
+                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len)
         return h
 
     def _get_pilot_idx(self, T: int, device: torch.device) -> torch.Tensor:
@@ -499,11 +536,13 @@ class HAGIv4(nn.Module):
         semantic_unknown_mask: torch.Tensor | None,
         cache: SpectralCache | None,
         pre_encoded_h: torch.Tensor | None = None,
+        attention_mode: str = "bidir",
+        prefix_len: torch.Tensor | int | None = None,
     ) -> SourceEncodeResult:
         if pre_encoded_h is not None:
             h = pre_encoded_h
             cached_len = 0
-            h = self._stack_forward(h, self.perception)
+            h = self._stack_forward(h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len)
         else:
             B, T = input_ids.shape
             embed_dev = self.embed.weight.device
@@ -530,7 +569,7 @@ class HAGIv4(nn.Module):
             pilot_scale = 1.0 / max(self._H, 1) ** 0.5
             h = h + pilot_scale * pilot_pe.to(h.dtype).unsqueeze(0)
 
-            h = self._stack_forward(h, self.perception)
+            h = self._stack_forward(h, self.perception, attention_mode=attention_mode, prefix_len=prefix_len)
             if cached_len > 0:
                 h = h[:, cached_len:]
 
@@ -621,9 +660,15 @@ class HAGIv4(nn.Module):
     def _source_decode(self, decoded: DecodeResult, encoded: SourceEncodeResult) -> torch.Tensor:
         # V18: strict SCS — NO pre_bottleneck bypass. The source decoder
         # receives only the post-channel latent.
+        # V20: source decoder always runs in causal mode — it is producing
+        # the rightward (post-channel) reconstruction that feeds the LM head,
+        # and we want each position's reconstruction to depend only on
+        # positions up to and including itself (no leakage of future latent
+        # into the LM head's input). This preserves train/infer consistency
+        # when the LM head is queried causally at inference time.
         z = decoded.latent
         h = self.rate_up(z)
-        return self._stack_forward(h, self.expression)
+        return self._stack_forward(h, self.expression, attention_mode="causal")
 
     def forward(
         self,
@@ -641,7 +686,18 @@ class HAGIv4(nn.Module):
         images: torch.Tensor | None = None,
         spectrograms: torch.Tensor | None = None,
         refinement_iterations: int | None = None,
+        attention_mode: str = "bidir",
+        prefix_len: torch.Tensor | int | None = None,
     ) -> ModelOutput:
+        """V20: attention_mode selects how perception layers attend.
+
+        - "bidir":  full bidirectional (default; masked-LM training)
+        - "prefix": GLM-style prefix-LM (prefix_len bidir, rest causal)
+        - "causal": pure GPT-style (AR inference)
+
+        The source decoder (expression stack) always runs in causal mode
+        to match the LM head's left-to-right query pattern at inference.
+        """
         if input_ids is None:
             raise ValueError("input_ids is required")
         if refinement_iterations is None and self.training:
@@ -659,7 +715,13 @@ class HAGIv4(nn.Module):
         if cache is not None and state.kalman_p is None:
             state.kalman_p = cached_p
 
-        encoded = self._source_encode(input_ids, semantic_unknown_mask, cache)
+        encoded = self._source_encode(
+            input_ids,
+            semantic_unknown_mask,
+            cache,
+            attention_mode=attention_mode,
+            prefix_len=prefix_len,
+        )
         chEncoded = self._apply_erasure(self._channel_encode(encoded), physical_corruption_mask, awgn_sigma)
         # V19: inform the LDPC decoder of the current AWGN sigma so its
         # Kalman validation gate uses the correct Mahalanobis threshold.
