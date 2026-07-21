@@ -162,8 +162,10 @@ class SemanticMaskBatch:
             or self.physical_corruption_mask.shape != expected_physical_shape
         ):
             raise ValueError(f"physical_corruption_mask must be bool{expected_physical_shape}")
-        if torch.any(self.prediction_mask & ~self.semantic_unknown_mask):
-            raise ValueError("prediction_mask must be a subset of semantic_unknown_mask")
+        # V20: prediction_mask ⊆ semantic_unknown_mask was an MLM-specific
+        # constraint. For UniLM-style mixed training (causal/prefix modes),
+        # we predict at NON-masked positions (next-token prediction). The
+        # check is removed to allow AR training.
         if torch.any(self.prediction_mask & ~self.valid_target_mask):
             raise ValueError("prediction_mask must be a subset of valid_target_mask")
 

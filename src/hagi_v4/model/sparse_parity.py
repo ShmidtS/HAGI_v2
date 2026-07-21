@@ -57,7 +57,7 @@ class SparseParityEncoder(nn.Module):
     V13 fixed-graph design:
       - sparse_mask: fixed connectivity buffer
       - parity_base: fixed random edge weights (buffer, non-trainable)
-      - edge_log_scale: learnable per-check amplitude [n_checks]
+      - edge_log_scale: learnable per-edge amplitude [n_checks, n_vars]
       - masked_weights = parity_base * sparse_mask * exp(edge_log_scale)
 
     Args:
@@ -96,7 +96,7 @@ class SparseParityEncoder(nn.Module):
         else:
             self.parity_base = nn.Parameter(base)
 
-        self.edge_log_scale = nn.Parameter(torch.zeros(n_checks))
+        self.edge_log_scale = nn.Parameter(torch.zeros(n_checks, n_vars))
 
     @property
     def parity_weights(self) -> nn.Parameter:
@@ -108,8 +108,8 @@ class SparseParityEncoder(nn.Module):
 
     @property
     def masked_weights(self) -> torch.Tensor:
-        """Sparse weights: fixed base × mask × learnable per-check scale."""
-        scale = torch.exp(self.edge_log_scale).unsqueeze(-1)
+        """Sparse weights: fixed base × mask × learnable per-edge scale."""
+        scale = torch.exp(self.edge_log_scale)
         return self.parity_base * self.sparse_mask * scale
 
     def forward(self, systematic: torch.Tensor) -> torch.Tensor:
@@ -190,7 +190,7 @@ class SparseParityChecker(nn.Module):
         if scale_param is not None:
             self.edge_log_scale = scale_param
         else:
-            self.edge_log_scale = nn.Parameter(torch.zeros(n_checks))
+            self.edge_log_scale = nn.Parameter(torch.zeros(n_checks, n_vars))
 
     @property
     def parity_weights(self) -> nn.Parameter:
@@ -199,7 +199,7 @@ class SparseParityChecker(nn.Module):
 
     @property
     def masked_weights(self) -> torch.Tensor:
-        scale = torch.exp(self.edge_log_scale).unsqueeze(-1)
+        scale = torch.exp(self.edge_log_scale)
         return self.parity_base * self.sparse_mask * scale
 
     def forward(
