@@ -679,6 +679,8 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
     if path:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
+        train_yaml_keys = set(data.get("train", {}).keys())
+        inference_yaml_keys = set(data.get("inference", {}).keys())
         _apply_dict(cfg, data)
 
         tp = cfg.model.target_params
@@ -690,6 +692,8 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
             budget = nonembed_budget if nonembed_budget else tp
             auto = auto_configure(int(budget), cfg.model.vocab_size)
             _apply_auto(cfg.model, auto, model_data)
+
+        _derive_defaults(cfg, train_yaml_keys, inference_yaml_keys)
 
     for key, value in overrides.items():
         if "." in key:
@@ -822,3 +826,182 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         model.codec.n_checks = max(1, int(model.core_hidden_size * (1.0 / rate - 1.0)))
     if "edges_per_check" not in yaml_data.get("codec", {}):
         model.codec.edges_per_check = max(3, min(8, model.core_hidden_size // 32))
+
+
+def _derive_defaults(cfg: HAGIv4Config, train_yaml_keys: set[str], inference_yaml_keys: set[str]) -> None:
+    """Derive train/inference defaults from model architecture.
+
+    Only sets fields NOT explicitly provided in YAML. This reduces the
+    required YAML to ~15 lines (target_params, vocab_size, tokenizer,
+    batch_size, seq_len, max_steps, and hardware-specific params).
+    """
+    import math
+
+    m = cfg.model
+    t = cfg.train
+    nonembed = max(1, m.target_nonembed_params or m.target_params)
+    H = m.hidden_size
+    C = m.core_hidden_size
+
+    # --- Train defaults derived from model size ---
+
+    if "warmup_steps" not in train_yaml_keys:
+        # Larger models need more warmup. Linear scaling with parameter count.
+        # 25M -> 1000, 100M -> 4000, 1B -> 40000
+        t.warmup_steps = max(500, nonembed // 25000)
+
+    if "learning_rate" not in train_yaml_keys:
+        # muP-style scaling: lr proportional to 1/sqrt(nonembed_params)
+        # 25M -> 0.0006, 100M -> 0.0003, 1B -> 0.0001
+        t.learning_rate = max(1e-5, 0.003 / math.sqrt(nonembed / 1e6))
+
+    if "bp_iterations" not in train_yaml_keys:
+        t.bp_iterations = 3
+
+    if "suffix_probability" not in train_yaml_keys:
+        t.suffix_probability = 0.30
+
+    if "w_parity_diversity" not in train_yaml_keys:
+        t.w_parity_diversity = 0.05
+
+    if "w_attn_entropy" not in train_yaml_keys:
+        t.w_attn_entropy = 0.01
+
+    if "attn_entropy_floor" not in train_yaml_keys:
+        t.attn_entropy_floor = 0.5
+
+    if "checkpoint_interval" not in train_yaml_keys:
+        t.checkpoint_interval = max(100, t.max_steps // 300)
+
+    if "curriculum_stage2_start" not in train_yaml_keys:
+        t.curriculum_stage2_start = int(t.max_steps * 0.8)
+
+    if "checkpoint_format_version" not in train_yaml_keys:
+        t.checkpoint_format_version = 3
+
+    if "checkpoint_keep_last" not in train_yaml_keys:
+        t.checkpoint_keep_last = 3
+
+    if "sequential_cycles" not in train_yaml_keys:
+        t.sequential_cycles = 3
+
+    if "curriculum_enabled" not in train_yaml_keys:
+        t.curriculum_enabled = True
+
+    if "use_two_phase_schedule" not in train_yaml_keys:
+        t.use_two_phase_schedule = True
+
+    if "two_phase_split" not in train_yaml_keys:
+        t.two_phase_split = 0.5
+
+    if "phase1_mask_ratio" not in train_yaml_keys:
+        t.phase1_mask_ratio = 0.15
+
+    if "phase2_mask_ratio" not in train_yaml_keys:
+        t.phase2_mask_ratio = 0.30
+
+    if "phase3_mask_ratio" not in train_yaml_keys:
+        t.phase3_mask_ratio = 0.50
+
+    if "use_continuous_anneal" not in train_yaml_keys:
+        t.use_continuous_anneal = True
+
+    if "awgn_enabled" not in train_yaml_keys:
+        t.awgn_enabled = True
+
+    if "awgn_sigma_start" not in train_yaml_keys:
+        t.awgn_sigma_start = 0.40
+
+    if "awgn_sigma_end" not in train_yaml_keys:
+        t.awgn_sigma_end = 0.15
+
+    if "awgn_end_frac" not in train_yaml_keys:
+        t.awgn_end_frac = 0.5
+
+    if "distill_end_frac" not in train_yaml_keys:
+        t.distill_end_frac = 0.6
+
+    if "distill_kl_enabled" not in train_yaml_keys:
+        t.distill_kl_enabled = False
+
+    if "distill_use_temp_anneal" not in train_yaml_keys:
+        t.distill_use_temp_anneal = True
+
+    if "distill_temp_start" not in train_yaml_keys:
+        t.distill_temp_start = 4.0
+
+    if "distill_temp_end" not in train_yaml_keys:
+        t.distill_temp_end = 1.0
+
+    if "distill_temperature" not in train_yaml_keys:
+        t.distill_temperature = 2.0
+
+    if "distill_alpha_start" not in train_yaml_keys:
+        t.distill_alpha_start = 0.0
+
+    if "distill_alpha_end" not in train_yaml_keys:
+        t.distill_alpha_end = 0.0
+
+    if "distill_enabled" not in train_yaml_keys:
+        t.distill_enabled = False
+
+    if "freeze_embeddings" not in train_yaml_keys:
+        t.freeze_embeddings = False
+
+    if "w_ce" not in train_yaml_keys:
+        t.w_ce = 1.0
+
+    if "w_whiteness" not in train_yaml_keys:
+        t.w_whiteness = 0.0
+
+    if "w_parity" not in train_yaml_keys:
+        t.w_parity = 0.05
+
+    if "w_correction_alignment" not in train_yaml_keys:
+        t.w_correction_alignment = 0.0
+
+    if "w_rate_distortion" not in train_yaml_keys:
+        t.w_rate_distortion = 0.005
+
+    if "max_grad_norm" not in train_yaml_keys:
+        t.max_grad_norm = 1.0
+
+    if "weight_decay" not in train_yaml_keys:
+        t.weight_decay = 0.1
+
+    if "muon_lr" not in train_yaml_keys:
+        t.muon_lr = 0.02
+
+    if "muon_momentum" not in train_yaml_keys:
+        t.muon_momentum = 0.95
+
+    if "muon_weight_decay" not in train_yaml_keys:
+        t.muon_weight_decay = 0.5
+
+    if "muon_ns_steps" not in train_yaml_keys:
+        t.muon_ns_steps = 5
+
+    if "precision" not in train_yaml_keys:
+        t.precision = "bf16"
+
+    if "grad_accum_steps" not in train_yaml_keys:
+        t.grad_accum_steps = 2
+
+    # --- Inference defaults ---
+
+    if "temperature" not in inference_yaml_keys:
+        cfg.inference.temperature = 0.8
+    if "top_k" not in inference_yaml_keys:
+        cfg.inference.top_k = 50
+    if "min_new_tokens" not in inference_yaml_keys:
+        cfg.inference.min_new_tokens = 2
+    if "repetition_penalty" not in inference_yaml_keys:
+        cfg.inference.repetition_penalty = 1.2
+    if "repetition_window" not in inference_yaml_keys:
+        cfg.inference.repetition_window = 32
+    if "no_repeat_ngram_size" not in inference_yaml_keys:
+        cfg.inference.no_repeat_ngram_size = 2
+    if "max_iterations" not in inference_yaml_keys:
+        cfg.inference.max_iterations = 3
+    if "max_new_tokens" not in inference_yaml_keys:
+        cfg.inference.max_new_tokens = 64

@@ -1,45 +1,27 @@
-# HAGI V19 — SCS + Kalman validation gate (RTX 3070 8GB)
-# V18 plateau was step-starvation + 3 bugs (not architecture):
-#  1. bottleneck_scale frozen (linear-linear sandwich, no non-linearity)
-#  2. AWGN sigma too low (channel 9.6x below capacity, SNR=29dB)
-#  3. corr_gate stuck at sigmoid~0.55 (init too small)
-# V19 fixes all three + adds Kalman measurement gating (JPDA-style strobe)
-# for value-of-computation: positions inside the strobe skip BP update.
+# HAGI V22 — Canonical config (RTX 3070 8GB)
+# Auto-derived from model architecture: H, C, layers, heads, n_checks,
+# warmup_steps, learning_rate, checkpoint_interval, loss weights, AWGN sigma
+# (0.40->0.15), entropy floor (0.5), distill params, inference defaults.
+# Only hardware-specific, task-specific, and non-default params need to be set.
 
 model:
   vocab_size: 49154
   target_params: 25000000
   target_nonembed_params: 25000000
+  # Architecture overrides (auto_configure gives H=1928 for 25M; canonical
+  # uses a smaller H for faster iteration on 8GB).
   hidden_size: 384
   core_hidden_size: 192
   perception_layers: 4
   expression_layers: 4
   reasoning_layers: 3
-  norm_eps: 1.0e-6
-  pilot_spacing: 8
-
-  algebra:
-    blade_count: 8
 
   attention:
-    rope_theta: 10000.0
     max_seq_len: 4096
-    bidirectional: true
-    fp16_attention: true
-    fp32_rmsnorm: true
     head_dim: 64
 
-  codec:
-    code_rate: 0.5
-    interleaver_mode: "qpp"
-    exit_threshold: 0.01
-
   embeddings:
-    trainable: true
-    init: "normal"
     factor_rank: 128
-    kernel_size: 5
-    use_conv_embedding: true
 
   gp2d:
     use_whiteness_loss: false
@@ -47,86 +29,27 @@ model:
   refinement:
     num_iterations: 6
     min_iterations: 3
-    convergence_threshold: 0.01
     use_convergence_halt: false
 
   masking:
-    mask_ratio: 0.30
-    use_span_masking: true
-    span_length: 3
     use_adaptive_erasure: false
-    adaptation_rate: 0.01
 
   freq_coding:
     enabled: false
 
 train:
   max_steps: 150000
-  warmup_steps: 1000
-  learning_rate: 0.0006
-  muon_lr: 0.02
-  muon_momentum: 0.95
-  muon_weight_decay: 0.5
-  muon_ns_steps: 5
-  weight_decay: 0.1
-  precision: "bf16"
-  grad_accum_steps: 2
-  max_grad_norm: 1.0
   batch_size: 8
   seq_len: 512
-  w_ce: 1.0
-  w_whiteness: 0.0
-  w_parity: 0.05
-  w_correction_alignment: 0.0
-  w_rate_distortion: 0.005
-  w_parity_diversity: 0.05
-  bp_iterations: 3
-  use_two_phase_schedule: true
-  two_phase_split: 0.5
-  phase1_mask_ratio: 0.15
-  phase2_mask_ratio: 0.30
-  phase3_mask_ratio: 0.50
-  suffix_probability: 0.30
-  use_continuous_anneal: true
-  distill_enabled: false
-  distill_kl_enabled: false
-  distill_teacher: "HuggingFaceTB/SmolLM2-360M"
-  distill_teacher_hidden_size: 960
-  distill_embed_teacher: "HuggingFaceTB/SmolLM2-135M"
-  distill_alpha_start: 0.0
-  distill_alpha_end: 0.0
-  distill_temperature: 2.0
-  distill_temp_start: 4.0
-  distill_temp_end: 1.0
-  distill_use_temp_anneal: true
-  distill_end_frac: 0.6
-  awgn_enabled: true
-  # V22: raised sigma for proper capacity matching.
-  # V20 sigma (0.15→0.05) gave SNR 44→400, channel 5.5-8x overcapacity → parity death.
-  # V22 sigma (0.40→0.15) gives SNR 6→44, forcing LDPC decoder to work.
-  awgn_sigma_start: 0.40
-  awgn_sigma_end: 0.15
-  awgn_end_frac: 0.5
-  w_attn_entropy: 0.01
-  attn_entropy_floor: 0.5
-  freeze_embeddings: false
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   eos_token_id: 0
   pad_token_id: 49152
-  checkpoint_dir: "checkpoints"
-  checkpoint_format_version: 3
-  checkpoint_interval: 500
-  checkpoint_keep_last: 3
-  sequential_cycles: 3
-  curriculum_enabled: true
+  # Non-default values (auto-derive would give 120000 for 150000 steps)
   curriculum_stage2_start: 100000
+  # Non-default teacher hidden size (dataclass default is 576)
+  distill_teacher_hidden_size: 960
 
 inference:
-  temperature: 0.8
-  top_k: 50
-  min_new_tokens: 2
   repetition_penalty: 1.2
-  repetition_window: 32
   no_repeat_ngram_size: 2
-  max_iterations: 3
   max_new_tokens: 64
