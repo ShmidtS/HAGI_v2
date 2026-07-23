@@ -1,21 +1,17 @@
-# HAGI V22 — Google Cloud config (T4 16GB / V100 16GB)
-# SCS codec LM with attention entropy stabilization + soft causal blending.
-# Auto-derived from model architecture: warmup, lr (when not overridden),
-# loss weights (when matching defaults), AWGN sigma (0.40->0.15), entropy
-# floor (0.5), distill defaults, inference defaults, etc.
-# V22: sigma 0.40->0.15, w_attn_entropy=0.01, attn_entropy_floor=0.5.
+# HAGI V23 — Google Cloud config (T4 16GB / V100 16GB)
+# Full SCS codec with integrated modules: CQI, EXIT chart, LearnedUncertainty,
+# Kalman filter, HARQ soft combining, HRM dual-component turbo loop,
+# FreqCoding equalizer, MoE, WaterFilling, Lorentz, Contrastive.
+# Training from scratch — all information-theoretic modules active.
 
 model:
   vocab_size: 262146
   target_params: 1000000000
   target_nonembed_params: 1000000000
-  # Architecture overrides (auto_configure gives H=8920 for 1B; google
-  # uses H=768 for T4/V100 memory constraints).
   hidden_size: 768
   core_hidden_size: 384
   perception_layers: 8
   expression_layers: 8
-  reasoning_layers: 6
 
   attention:
     rope_theta: 500000.0
@@ -25,12 +21,54 @@ model:
   embeddings:
     factor_rank: 256
 
+  gp2d:
+    use_whiteness_loss: false
+
+  codec:
+    code_rate: 0.5
+
   refinement:
     num_iterations: 6
     min_iterations: 3
+    use_convergence_halt: true
+    convergence_threshold: 0.01
 
   masking:
-    use_adaptive_erasure: false
+    use_adaptive_erasure: true
+    mask_embed_init: "max_entropy"
+
+  cqi:
+    hidden_size: 768
+    cqi_dim: 16
+    sigma_min: 0.02
+    sigma_max: 0.3
+
+  exit_chart:
+    threshold: 0.01
+    min_iterations: 1
+
+  uncertainty:
+    hidden_size: 384
+
+  kalman:
+    init_process_noise: 0.0
+    init_measurement_noise: 0.0
+    covariance_floor: 0.000001
+
+  msa:
+    max_slots: 256
+    slot_chunk_size: 4
+    top_k: 6
+    routing_key_dim: 64
+    n_kv_heads: 4
+    head_dim: 64
+    mla_compress_dim: 128
+    mla_up_dim: 256
+
+  hrm:
+    h_state_dim: 128
+    l_state_dim: 256
+    h_stride: 4
 
   multimodal:
     enabled: true
@@ -56,6 +94,8 @@ train:
   pad_token_id: 0
   checkpoint_interval: 500
   curriculum_stage2_start: 120000
+  awgn_sigma_start: 0.50
+  awgn_sigma_end: 0.30
 
 inference:
   repetition_penalty: 1.1

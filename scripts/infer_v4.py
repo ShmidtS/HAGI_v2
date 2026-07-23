@@ -29,7 +29,21 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     from hagi_v4.train.checkpoint import cfg_from_dict, load_checkpoint_payload, load_model_checkpoint
 
     target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
-    cfg = cfg_from_dict(load_checkpoint_payload(checkpoint_path, "cpu")["config"])
+    ckpt_payload = load_checkpoint_payload(checkpoint_path, "cpu")
+    cfg = cfg_from_dict(ckpt_payload["config"])
+    ckpt_state = ckpt_payload.get("model", {})
+    v23_keys = [
+        k
+        for k in ckpt_state
+        if any(x in k for x in ("kalman", "harq", "l_transition", "h_transition", "z_h_to_hidden", "z_l_to_hidden"))
+    ]
+    if not v23_keys:
+        cfg.model.kalman = None
+        cfg.model.msa = None
+        cfg.model.hrm = None
+        logger.info("V22 checkpoint detected — disabling V23 modules (Kalman/HARQ/HRM)")
+    else:
+        logger.info(f"V23 checkpoint detected ({len(v23_keys)} V23 module keys)")
     dev = torch.device(target)
     model = HAGIv4(cfg)
     step, cfg = load_model_checkpoint(checkpoint_path, model, "cpu")
@@ -83,8 +97,7 @@ def build_generation_kwargs(
 
 
 def main() -> int:
-    from transformers import AutoTokenizer
-
+    from hagi_v4.data.tokenizer import load_tokenizer
     from hagi_v4.inference.generate import generate
 
     parser = argparse.ArgumentParser(description="HAGI V4 inference")
@@ -98,16 +111,19 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=None, help="Override config temperature")
     parser.add_argument("--top-k", type=int, default=None, help="Override config top_k")
     parser.add_argument("--tokenizer", default=None, help="Tokenizer name (auto-detected from checkpoint config)")
+    parser.add_argument("--speculative", action="store_true", help="Use speculative block decoding")
     args = parser.parse_args()
 
     model, cfg, step, dev = load_model_from_checkpoint(args.checkpoint, args.device)
+    if args.speculative:
+        cfg.inference.speculative.enabled = True
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Loaded checkpoint: step {step} | {n_params / 1e6:.1f}M params | device: {dev}")
 
     tokenizer_name = args.tokenizer or cfg.train.tokenizer
     logger.info(f"Using tokenizer: {tokenizer_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+    tokenizer = load_tokenizer(tokenizer_name, local_files_only=True)
     eos_token_id = tokenizer.eos_token_id
     if eos_token_id is None:
         raise ValueError("tokenizer must define eos_token_id")

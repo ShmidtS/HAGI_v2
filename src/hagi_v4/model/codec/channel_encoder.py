@@ -63,10 +63,43 @@ class ChannelEncoder(nn.Module):
             mode=codec_shape.interleaver_mode,
         )
 
+        self.water_filling = None
+        wf_cfg = getattr(cfg.model, "water_filling", None)
+        if wf_cfg is not None and getattr(wf_cfg, "enabled", False):
+            from hagi_v4.model.water_filling import WaterFillingAllocator
+
+            self.water_filling = WaterFillingAllocator(
+                total_dims=wf_cfg.total_dims,
+                num_grades=wf_cfg.num_grades,
+                min_dims=wf_cfg.min_dims,
+                temperature=wf_cfg.temperature,
+            )
+            self._wf_ema_decay = getattr(wf_cfg, "variance_ema_decay", 0.99)
+
     def forward(self, encoded: SourceEncodeResult) -> ChannelEncodeResult:
         systematic = encoded.systematic
         parity = self.parity_encoder(systematic)
         codeword = torch.cat([systematic, parity], dim=-1)
+        if self.water_filling is not None:
+            probs = self.water_filling.get_allocation_probs()
+            D = codeword.shape[-1]
+            ng = self.water_filling.num_grades
+            grade_size = max(1, D // ng)
+            gain = torch.repeat_interleave(probs, grade_size)[:D]
+            if gain.shape[0] < D:
+                gain = torch.cat([gain, gain.new_ones(D - gain.shape[0])])
+            gain = gain * (D / gain.sum())
+            codeword = codeword * gain.to(codeword.dtype)
+            C_sys = systematic.shape[-1]
+            gs = max(1, C_sys // ng)
+            grade_vars = torch.stack(
+                [systematic[..., g * gs : (g + 1) * gs if g < ng - 1 else C_sys].float().var() for g in range(ng)]
+            )
+            self.water_filling.update_variance_ema(grade_vars, decay=self._wf_ema_decay)
+            _, wf_reg = self.water_filling()
+            self._last_wf_reg = wf_reg
+        else:
+            self._last_wf_reg = None
         codeword = self.interleaver.interleave(codeword)
         return ChannelEncodeResult(codeword=codeword, systematic=systematic, parity=parity)
 

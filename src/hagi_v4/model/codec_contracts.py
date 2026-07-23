@@ -54,7 +54,7 @@ class CodecShapeConfig:
             edges_per_check=codec.edges_per_check,
             interleaver_mode=codec.interleaver_mode,
             exit_threshold=codec.exit_threshold,
-            msa_top_k=m.msa.top_k,
+            msa_top_k=m.msa.top_k if m.msa is not None else 0,
             use_whiteness_loss=m.gp2d.use_whiteness_loss,
         )
 
@@ -95,14 +95,14 @@ class TurboDecodeConfig:
             freq_n_modes_h=m.freq_coding.n_modes_h,
             freq_complex_rank=m.freq_coding.complex_rank,
             msa=MSADecodeConfig(
-                max_slots=m.msa.max_slots,
-                slot_chunk_size=m.msa.slot_chunk_size,
-                top_k=m.msa.top_k,
-                routing_key_dim=m.msa.routing_key_dim,
-                n_kv_heads=m.msa.n_kv_heads,
-                head_dim=m.msa.head_dim,
-                mla_compress_dim=m.msa.mla_compress_dim,
-                mla_up_dim=m.msa.mla_up_dim,
+                max_slots=m.msa.max_slots if m.msa is not None else 0,
+                slot_chunk_size=m.msa.slot_chunk_size if m.msa is not None else 4,
+                top_k=m.msa.top_k if m.msa is not None else 0,
+                routing_key_dim=m.msa.routing_key_dim if m.msa is not None else 64,
+                n_kv_heads=m.msa.n_kv_heads if m.msa is not None else 4,
+                head_dim=m.msa.head_dim if m.msa is not None else 64,
+                mla_compress_dim=m.msa.mla_compress_dim if m.msa is not None else 128,
+                mla_up_dim=m.msa.mla_up_dim if m.msa is not None else 256,
             ),
         )
 

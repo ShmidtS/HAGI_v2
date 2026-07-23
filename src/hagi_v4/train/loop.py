@@ -268,14 +268,12 @@ def train_step(
         awgn_sigma = 0.0
         if cfg.train.awgn_enabled:
             awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
-            if step < awgn_end:
-                progress = step / max(awgn_end, 1)
-                # V22: raised sigma for proper capacity matching.
-                # V20 sigma (0.15→0.05) gave SNR 44→400, channel 5.5-8x overcapacity.
-                # V22 sigma (0.40→0.15) gives SNR 6→44, channel 1.2-5.5x capacity.
-                # At rate R=0.5, Shannon limit is SNR=1 (0 dB). V22 starts at 6x
-                # capacity (challenging but learnable) and anneals to 5.5x (stable).
-                awgn_sigma = 0.40 * (1.0 - progress) + 0.15 * progress
+            awgn_warmup = int(cfg.train.max_steps * 0.05)
+            if step < awgn_warmup:
+                awgn_sigma = 0.0
+            elif step < awgn_end:
+                progress = (step - awgn_warmup) / max(awgn_end - awgn_warmup, 1)
+                awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
         # V22: soft causal blending — smooth transition instead of hard switching.
         # Schedule: start with bidir dominance, gradually shift to causal.
         # This prevents the distribution shock from discrete mode switching.

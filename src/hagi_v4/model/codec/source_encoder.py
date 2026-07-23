@@ -122,6 +122,13 @@ class SourceEncoder(nn.Module):
         if getattr(m, "cqi", None) is not None:
             self.cqi_estimator = CQIEstimator(hidden_size=H)
 
+        self.moe_layer = None
+        moe_cfg = getattr(m, "moe", None)
+        if moe_cfg is not None and getattr(moe_cfg, "enabled", False) and getattr(moe_cfg, "num_experts", 0) > 1:
+            from hagi_v4.model.moe import MoESwiGLU
+
+            self.moe_layer = MoESwiGLU(moe_cfg, hidden_size=H)
+
     def _build_rate_matcher(self, H: int, C: int, rank: int) -> None:
         """Construct the rate_down / rate_up pair.
 
@@ -259,6 +266,12 @@ class SourceEncoder(nn.Module):
             self._last_attn_entropy_penalty = enc_entropy_pen
             if cached_len > 0:
                 h = h[:, cached_len:]
+
+        if self.moe_layer is not None:
+            h, moe_aux, moe_rp = self.moe_layer(h)
+            self._last_moe_aux = moe_aux
+        else:
+            self._last_moe_aux = None
 
         # V19: LayerScale bottleneck with non-linearity (fixes V18 frozen
         # gradient). gate=0 at init -> tanh(0)=0, SiLU(rate_down(z))=0 ->

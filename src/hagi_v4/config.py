@@ -135,7 +135,7 @@ class MSAConfig:
     combined with Multi-head Latent Attention for compressed KV.
     """
 
-    max_slots: int = 2048
+    max_slots: int = 256
     slot_chunk_size: int = 4
     use_adaptive_chunk_size: bool = True
     chunk_size_low_entropy: int = 8
@@ -176,6 +176,7 @@ class MoEConfig:
     simple experts, high-entropy to complex experts.
     """
 
+    enabled: bool = False
     num_experts: int = 4
     top_k: int = 1
     intermediate_size: int = 1024
@@ -184,6 +185,11 @@ class MoEConfig:
     load_balance_weight: float = 0.01
     router_jitter: float = 0.0
     entropy_aware_routing: bool = True
+    alpha: float = 0.01
+    use_grade_specialization: bool = False
+    n_shared_bases: int = 0
+    router_init_std: float = 0.02
+    router_noise: float = 0.0
 
 
 @dataclass
@@ -221,6 +227,7 @@ class WaterFillingConfig:
     V21: Shannon water-filling theorem. High-variance grades get more dims.
     """
 
+    enabled: bool = False
     total_dims: int = 288
     num_grades: int = 4
     min_dims: int = 8
@@ -276,6 +283,10 @@ class MultimodalConfig:
     audio_mel_bins: int = 80
     audio_frame_size: int = 10
     modality_embed_dim: int = 32
+    num_modalities: int = 3
+    modality_embed_std: float = 0.02
+    max_image_patches: int = 1024
+    max_audio_frames: int = 1024
 
 
 @dataclass
@@ -367,6 +378,7 @@ class ModelConfig:
     uncertainty: UncertaintyConfig | None = None
     exit_chart: EXITChartConfig | None = None
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    lorentz_enabled: bool = False
 
 
 @dataclass
@@ -667,8 +679,46 @@ def _apply_dict(obj: object, data: dict) -> None:
         current = getattr(obj, key)
         if hasattr(current, "__dataclass_fields__") and isinstance(value, dict):
             _apply_dict(current, value)
+        elif current is None and isinstance(value, dict):
+            _instantiate_optional(obj, key, value)
         else:
             setattr(obj, key, value)
+
+
+def _instantiate_optional(obj: object, key: str, value: dict) -> None:
+    """Instantiate an optional dataclass field (None default) from a YAML dict."""
+    import dataclasses
+    import sys
+
+    if not dataclasses.is_dataclass(obj):
+        setattr(obj, key, value)
+        return
+    fields_map = {f.name: f for f in dataclasses.fields(obj)}
+    if key not in fields_map:
+        setattr(obj, key, value)
+        return
+    type_name = fields_map[key].type
+    if isinstance(type_name, str):
+        mod = sys.modules.get(type(obj).__module__)
+        if mod is None:
+            setattr(obj, key, value)
+            return
+        resolved = getattr(mod, type_name, None)
+        if resolved is None:
+            for part in type_name.replace(" | None", "").split("."):
+                resolved = getattr(resolved or mod, part, None)
+        if resolved and hasattr(resolved, "__dataclass_fields__"):
+            instance = resolved()
+            _apply_dict(instance, value)
+            setattr(obj, key, instance)
+        else:
+            setattr(obj, key, value)
+    elif hasattr(type_name, "__dataclass_fields__"):
+        instance = type_name()
+        _apply_dict(instance, value)
+        setattr(obj, key, instance)
+    else:
+        setattr(obj, key, value)
 
 
 def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
@@ -779,6 +829,60 @@ def validate_config(cfg: HAGIv4Config) -> None:
             f"awgn_sigma_end ({cfg.train.awgn_sigma_end}). Schedule must go "
             f"from noisy (high sigma) to clean (low sigma), not the reverse."
         )
+
+    # V23 information-theoretic invariants — protect against regressions.
+
+    # 5. Attention entropy floor must be > 0 — prevents attention collapse.
+    #    V22: 677 collapse events in 4534 V20 steps when floor was 0.
+    if cfg.train.w_attn_entropy > 0 and cfg.train.attn_entropy_floor <= 0.0:
+        raise ValueError(
+            "train.attn_entropy_floor must be > 0 when w_attn_entropy > 0. "
+            "V22 regression: floor=0 caused 677 attention collapse events."
+        )
+
+    # 6. Attention entropy regularization weight must be > 0.
+    if cfg.train.w_attn_entropy <= 0.0:
+        raise ValueError(
+            "train.w_attn_entropy must be > 0. V22: entropy regularization "
+            "prevents cyclic loss oscillation from attention collapse."
+        )
+
+    # 7. Channel code rate must be in (0, 1) — Shannon SCS constraint.
+    #    rate=0: no systematic bits (channel-only, useless). rate=1: no parity
+    #    bits (no error correction). Both violate Source-Channel Separation.
+    code_rate = cfg.model.codec.code_rate
+    if not 0.0 < code_rate < 1.0:
+        raise ValueError(
+            f"model.codec.code_rate ({code_rate}) must be in (0, 1). "
+            f"Shannon SCS: rate=0 means no systematic, rate=1 means no parity."
+        )
+
+    # 8. LDPC: each parity check must have at least 1 edge.
+    if cfg.model.codec.n_checks > 0 and cfg.model.codec.edges_per_check < 1:
+        raise ValueError(
+            f"model.codec.edges_per_check ({cfg.model.codec.edges_per_check}) "
+            f"must be >= 1. LDPC: each check needs at least 1 edge."
+        )
+
+    # 9. Shannon capacity at AWGN sigma_end must exceed code rate.
+    #    If capacity < rate, the channel cannot support the code — BP cannot
+    #    converge regardless of iterations. C = 0.5 * log2(1 + 1/sigma^2).
+    if cfg.train.awgn_enabled:
+        import math
+
+        sigma_end = cfg.train.awgn_sigma_end
+        capacity_end = 0.5 * math.log2(1.0 + 1.0 / max(sigma_end**2, 1e-10))
+        if capacity_end < code_rate:
+            raise ValueError(
+                f"Shannon limit violated: awgn_sigma_end={sigma_end} gives "
+                f"capacity={capacity_end:.3f} bits/use < code_rate={code_rate}. "
+                f"Channel cannot support the code — BP cannot converge."
+            )
+
+    # 10. HRM stride must divide sequence length for clean spatial coarsening.
+    hrm_cfg = getattr(cfg.model, "hrm", None)
+    if hrm_cfg is not None and hrm_cfg.h_stride < 1:
+        raise ValueError(f"model.hrm.h_stride ({hrm_cfg.h_stride}) must be >= 1.")
 
 
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
@@ -910,10 +1014,10 @@ def _derive_defaults(cfg: HAGIv4Config, train_yaml_keys: set[str], inference_yam
         t.awgn_enabled = True
 
     if "awgn_sigma_start" not in train_yaml_keys:
-        t.awgn_sigma_start = 0.40
+        t.awgn_sigma_start = 0.50
 
     if "awgn_sigma_end" not in train_yaml_keys:
-        t.awgn_sigma_end = 0.15
+        t.awgn_sigma_end = 0.30
 
     if "awgn_end_frac" not in train_yaml_keys:
         t.awgn_end_frac = 0.5
