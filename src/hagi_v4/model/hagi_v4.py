@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hagi_v4.algebra.clifford import geometric_product
 from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.codec import (
     ChannelDecoder,
@@ -47,6 +48,8 @@ from hagi_v4.model.codec_contracts import (
     SemanticMaskBatch,
     TurboDecodeConfig,
 )
+from hagi_v4.model.contrastive import ContrastiveAlignment
+from hagi_v4.model.multimodal_input import MultimodalInput
 from hagi_v4.model.outputs import AuxLosses, ModelOutput, compute_parity_diversity_loss, compute_whiteness_loss
 
 if TYPE_CHECKING:
@@ -131,6 +134,14 @@ class HAGIv4(nn.Module):
         else:
             self.distill_align = None
 
+        self.contrastive: ContrastiveAlignment | None = None
+        if cfg.train.w_contrastive > 0.0:
+            self.contrastive = ContrastiveAlignment(hidden_size=C, temperature=0.07)
+
+        self.multimodal_input: MultimodalInput | None = None
+        if m.multimodal.enabled:
+            self.multimodal_input = MultimodalInput(cfg, text_encoder=self.source_encoder.embed)
+
         self._init_weights()
 
         # V22: set attention entropy floor on all attention blocks
@@ -151,8 +162,11 @@ class HAGIv4(nn.Module):
         return self.source_decoder.lm_expand.weight @ self.source_decoder.lm_compress.weight
 
     def _init_weights(self) -> None:
+        v23_zero_init_names = {"hrm_z_h_to_hidden", "hrm_z_l_to_hidden"}
         for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
+                if any(n in name for n in v23_zero_init_names):
+                    continue
                 if "mut_" in name or mod is self.source_decoder.lm_compress:
                     continue
                 if self.tie_source_codebook and mod is self.source_decoder.lm_expand:
@@ -176,6 +190,30 @@ class HAGIv4(nn.Module):
 
     def train(self, mode: bool = True) -> HAGIv4:
         return super().train(mode)
+
+    def _clifford_cross_modal_mix(self, h: torch.Tensor, modality_ids: torch.Tensor) -> torch.Tensor:
+        """Mix cross-modal representations using Cl(3,0,0) geometric product.
+
+        Computes the geometric product of mean per-modality representations
+        and adds a small mixed contribution back to all positions.
+        """
+        B, T, H = h.shape
+        if H % 8 != 0:
+            return h
+        n_mv = H // 8
+        h_mv = h.view(B, T, n_mv, 8)
+        mixed = h_mv
+        for mod_a in range(3):
+            for mod_b in range(mod_a + 1, 3):
+                mask_a = modality_ids == mod_a
+                mask_b = modality_ids == mod_b
+                if not (mask_a.any() and mask_b.any()):
+                    continue
+                mean_a = h_mv[mask_a].mean(dim=0)
+                mean_b = h_mv[mask_b].mean(dim=0)
+                gp = geometric_product(mean_a, mean_b)
+                mixed = mixed + gp.unsqueeze(0).unsqueeze(0) * 0.1
+        return mixed.view(B, T, H)
 
     def forward(
         self,
@@ -224,17 +262,39 @@ class HAGIv4(nn.Module):
         if cache is not None and state.kalman_p is None:
             state.kalman_p = cached_p
 
-        encoded = self.source_encoder.forward(
-            input_ids,
-            semantic_unknown_mask,
-            cache,
-            attention_mode=attention_mode,
-            prefix_len=prefix_len,
-            soft_beta=soft_beta,
-        )
+        phys_mask = physical_corruption_mask
+        semantic_unknown_eff = semantic_unknown_mask
+        if self.multimodal_input is not None and (images is not None or spectrograms is not None):
+            h_mm, modality_ids, lengths = self.multimodal_input(input_ids, images, spectrograms)
+            h_mm = self._clifford_cross_modal_mix(h_mm, modality_ids)
+            B = h_mm.shape[0]
+            T_text = input_ids.shape[1]
+            T_total = h_mm.shape[1]
+            if T_total > T_text:
+                extra = torch.zeros((B, T_total - T_text), dtype=torch.bool, device=input_ids.device)
+                semantic_unknown_eff = torch.cat([semantic_unknown_mask, extra], dim=1)
+                phys_mask = torch.cat([physical_corruption_mask, extra], dim=1)
+            encoded = self.source_encoder.forward(
+                None,
+                semantic_unknown_eff,
+                cache,
+                pre_encoded_h=h_mm,
+                attention_mode=attention_mode,
+                prefix_len=prefix_len,
+                soft_beta=soft_beta,
+            )
+        else:
+            encoded = self.source_encoder.forward(
+                input_ids,
+                semantic_unknown_mask,
+                cache,
+                attention_mode=attention_mode,
+                prefix_len=prefix_len,
+                soft_beta=soft_beta,
+            )
         ch_encoded = self.channel_encoder.apply_erasure(
             self.channel_encoder.forward(encoded),
-            physical_corruption_mask,
+            phys_mask,
             awgn_sigma,
         )
         # V19: inform the LDPC decoder of the current AWGN sigma so its
@@ -273,6 +333,8 @@ class HAGIv4(nn.Module):
             ce = None
 
         aux = AuxLosses()
+        if self.contrastive is not None and self.training:
+            aux.contrastive = self.contrastive(encoded.systematic, semantic_unknown_eff.long())
         if targets is not None:
             if side_info.get("parity_strength") is not None:
                 aux.parity = side_info["parity_strength"]
@@ -282,7 +344,7 @@ class HAGIv4(nn.Module):
                     side_info["parity_residual"].device,
                 )
                 valid = pilot_mask.unsqueeze(0).expand(side_info["parity_residual"].shape[0], -1)
-                valid = valid & ~physical_corruption_mask.to(valid.device)
+                valid = valid & ~phys_mask.to(valid.device)
                 aux.whiteness = compute_whiteness_loss(side_info["parity_residual"], valid)
             aux.correction_alignment = side_info["correction_alignment"].to(h.dtype)
             aux.rate_distortion = rd_loss
@@ -290,11 +352,11 @@ class HAGIv4(nn.Module):
             if getattr(self.cfg.train, "w_parity_diversity", 0.0) > 0.0:
                 aux.parity_diversity = compute_parity_diversity_loss(self.channel_encoder.parity_encoder.masked_weights)
 
-            if self.training and physical_corruption_mask is not None and physical_corruption_mask.any():
+            if self.training and phys_mask is not None and phys_mask.any():
                 z_clean = encoded.systematic
                 z_erased = ch_encoded.codeword[..., : self._C]
                 recovery_error = (z_clean.float() - z_erased.float()).pow(2)
-                erased_error = recovery_error[physical_corruption_mask.to(recovery_error.device)]
+                erased_error = recovery_error[phys_mask.to(recovery_error.device)]
                 if erased_error.numel() > 0:
                     aux.parity_recovery = erased_error.mean().to(h.dtype)
 

@@ -164,6 +164,15 @@ def _generate(
 
     invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
 
+    # V23: SpectralCache for VRAM-efficient inference.
+    kv_cache_cfg = getattr(model.cfg.inference, "kv_cache", None)
+    use_spectral_cache = kv_cache_cfg is not None and getattr(kv_cache_cfg, "enabled", False)
+    cache = None
+    if use_spectral_cache:
+        from hagi_v4.inference.spectral_cache import SpectralCache
+
+        cache = SpectralCache(context_window=128)
+
     # Build the sequence buffer: prompt + space for new tokens (filled with pad).
     sequence = torch.cat(
         (prompt_ids, torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)),
@@ -182,17 +191,21 @@ def _generate(
 
         # Forward pass with causal attention over the current sequence.
         current_len = prompt_len + step
-        input_ids = sequence[:, :current_len]
+        if cache is not None and cache.context_len > 0:
+            input_ids = sequence[:, current_len - 1 : current_len]
+        else:
+            input_ids = sequence[:, :current_len]
+        T_input = input_ids.shape[1]
         # V20: prediction_mask selects ONLY the last position for each row
         # (next-token prediction). semantic_unknown_mask must be a superset
         # of prediction_mask (model contract), so we mark the last position
         # as unknown too. The model returns logits as [n_selected, V] where
         # n_selected = prediction_mask.sum() = batch_size.
-        prediction_mask = torch.zeros((batch_size, current_len), dtype=torch.bool, device=device)
+        prediction_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
         prediction_mask[:, -1] = True
         semantic_unknown_mask = prediction_mask.clone()
-        valid_target_mask = torch.ones((batch_size, current_len), dtype=torch.bool, device=device)
-        physical_mask = torch.zeros((batch_size, current_len), dtype=torch.bool, device=device)
+        valid_target_mask = torch.ones((batch_size, T_input), dtype=torch.bool, device=device)
+        physical_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
         output = model(
             input_ids,
             targets=None,
@@ -202,6 +215,7 @@ def _generate(
             physical_corruption_mask=physical_mask,
             attention_mode="causal",
             prefix_len=None,
+            cache=cache,
         )
         if output.logits is None:
             raise ValueError("model output must include logits")
@@ -264,6 +278,31 @@ def generate(
     physical_corruption_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> GenerationOutput:
+    spec_cfg = getattr(model.cfg.inference, "speculative", None)
+    if spec_cfg is not None and getattr(spec_cfg, "enabled", False):
+        from hagi_v4.inference.speculative import generate_speculative
+
+        token_ids = generate_speculative(
+            model,
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            mask_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            min_tokens=min_new_tokens,
+            block_size=max(4, getattr(spec_cfg, "draft_length", 4) * 4),
+            refine_passes=max(2, max_iterations),
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            speculation_confidence_threshold=getattr(spec_cfg, "acceptance_threshold", 0.5),
+        )
+        B = token_ids.shape[0]
+        gen_len = token_ids.shape[1] - prompt_ids.shape[1]
+        generated_lengths = torch.full((B,), gen_len, dtype=torch.long, device=token_ids.device)
+        finished = torch.ones(B, dtype=torch.bool, device=token_ids.device)
+        return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)
+
     training_states = tuple((module, module.training) for module in model.modules())
     try:
         return _generate(

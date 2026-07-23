@@ -1,20 +1,17 @@
-# HAGI V22 — Canonical config (RTX 3070 8GB)
-# Auto-derived from model architecture: H, C, layers, heads, n_checks,
-# warmup_steps, learning_rate, checkpoint_interval, loss weights, AWGN sigma
-# (0.40->0.15), entropy floor (0.5), distill params, inference defaults.
-# Only hardware-specific, task-specific, and non-default params need to be set.
+# HAGI V23 — Canonical config (RTX 3070 8GB)
+# Full SCS codec with integrated modules: CQI, EXIT chart, LearnedUncertainty,
+# Kalman filter, HARQ soft combining, HRM dual-component turbo loop,
+# FreqCoding equalizer, MoE variable-rate, WaterFilling, Lorentz, Contrastive.
+# Training from scratch — all information-theoretic modules active.
 
 model:
   vocab_size: 49154
   target_params: 25000000
   target_nonembed_params: 25000000
-  # Architecture overrides (auto_configure gives H=1928 for 25M; canonical
-  # uses a smaller H for faster iteration on 8GB).
   hidden_size: 384
   core_hidden_size: 192
   perception_layers: 4
   expression_layers: 4
-  reasoning_layers: 3
 
   attention:
     max_seq_len: 4096
@@ -26,13 +23,64 @@ model:
   gp2d:
     use_whiteness_loss: false
 
+  codec:
+    code_rate: 0.5
+
   refinement:
     num_iterations: 6
     min_iterations: 3
-    use_convergence_halt: false
+    use_convergence_halt: true
+    convergence_threshold: 0.01
 
   masking:
-    use_adaptive_erasure: false
+    use_adaptive_erasure: true
+    mask_embed_init: "max_entropy"
+
+  # V23: Channel Quality Indicator — per-position channel quality feedback.
+  # Drives adaptive AWGN sigma, BP gate strength, mask ratio.
+  cqi:
+    hidden_size: 384
+    cqi_dim: 16
+    sigma_min: 0.02
+    sigma_max: 0.3
+
+  # V23: EXIT chart convergence estimator — norm-ratio halt criterion.
+  # Implements ‖extrinsic‖ < ε convergence halt (omc-codec-framing Mechanism 2).
+  exit_chart:
+    threshold: 0.01
+    min_iterations: 1
+
+  # V23: Learned per-position uncertainty — Bayes-optimal Mahalanobis gate.
+  # Replaces fixed sigma_sq with learned variance for BP validation gate.
+  uncertainty:
+    hidden_size: 192
+
+  # V23: Kalman filter — Bayes-optimal predict/update in BP loop.
+  # K = P/(P+R) bounds measurement contribution in [0,1].
+  # Q/R learnable, init sigmoid(-2.0) ≈ 0.12.
+  kalman:
+    init_process_noise: 0.0
+    init_measurement_noise: 0.0
+    covariance_floor: 0.000001
+
+  # V23: HARQ buffer — extrinsic-only soft combining across BP iterations.
+  # Stores deltas (NOT full state). MRC combining with uncertainty weighting.
+  msa:
+    max_slots: 256
+    slot_chunk_size: 4
+    top_k: 6
+    routing_key_dim: 64
+    n_kv_heads: 4
+    head_dim: 64
+    mla_compress_dim: 128
+    mla_up_dim: 256
+
+  # V23: HRM dual-component — z_H spatial (coarse) + z_L per-token (fine).
+  # Extrinsic-only exchange between components (turbo decoder principle).
+  hrm:
+    h_state_dim: 128
+    l_state_dim: 256
+    h_stride: 4
 
   freq_coding:
     enabled: false
@@ -44,10 +92,12 @@ train:
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   eos_token_id: 0
   pad_token_id: 49152
-  # Non-default values (auto-derive would give 120000 for 150000 steps)
   curriculum_stage2_start: 100000
-  # Non-default teacher hidden size (dataclass default is 576)
   distill_teacher_hidden_size: 960
+  # V23: AWGN sigma schedule — forces LDPC to do real work.
+  # SNR=4.0 (start) → SNR=11.1 (end), capacity stays above code_rate=0.5.
+  awgn_sigma_start: 0.50
+  awgn_sigma_end: 0.30
 
 inference:
   repetition_penalty: 1.2

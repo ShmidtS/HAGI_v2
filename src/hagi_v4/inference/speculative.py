@@ -1,5 +1,4 @@
-# V21 DEFER: not wired in V21 forward path. Available for V22+ integration.
-# See docs/ARCHITECTURE.md for integration roadmap.
+# V23: fixed model.hrm references and model forward signature.
 
 """Speculative Block Generation — predict next block while refining current.
 
@@ -87,11 +86,6 @@ def generate_speculative(
     else:
         full_ids = prompt_ids.clone()
 
-    orig_n_iters = model.hrm.entropy_scheduler.n_iterations
-    orig_adaptive = model.hrm.entropy_scheduler.use_entropy_adaptive
-    model.hrm.entropy_scheduler.use_entropy_adaptive = False
-    model.hrm.entropy_scheduler.n_iterations = 1
-
     def apply_echo_cancellation(logits: torch.Tensor, context_ids: torch.Tensor) -> torch.Tensor:
         if repetition_penalty <= 0.0 or context_ids.numel() == 0:
             return logits
@@ -129,73 +123,106 @@ def generate_speculative(
     speculative_tokens: torch.Tensor | None = None
     speculative_confidence: float = 0.0
 
-    try:
-        while generated < max_new_tokens:
-            n_block = min(block_size, max_new_tokens - generated)
+    while generated < max_new_tokens:
+        n_block = min(block_size, max_new_tokens - generated)
 
-            if speculative_tokens is not None and speculative_confidence > speculation_confidence_threshold:
-                new_tokens = speculative_tokens[:, :n_block]
-                rough_logits = None
-            else:
-                mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
-                seq = torch.cat([full_ids, mask_tokens], dim=1)
-                T = seq.shape[1]
+        if speculative_tokens is not None and speculative_confidence > speculation_confidence_threshold:
+            new_tokens = speculative_tokens[:, :n_block]
+            rough_logits = None
+        else:
+            mask_tokens = torch.full((B, n_block), mask_token_id, dtype=torch.long, device=device)
+            seq = torch.cat([full_ids, mask_tokens], dim=1)
+            T = seq.shape[1]
 
-                mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-                mask[:, T - n_block :] = True
+            semantic_unknown_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+            semantic_unknown_mask[:, T - n_block :] = True
+            prediction_mask = semantic_unknown_mask.clone()
+            valid_target_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+            physical_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
 
-                output = model(seq, targets=None, mask=mask)
-                if output.logits is None:
-                    break
-
-                rough_logits = output.logits[:, T - n_block :, :]
-                new_tokens, _ = sample_tokens(rough_logits, n_block)
-
-            for pass_idx in range(1, refine_passes):
-                seq = torch.cat([full_ids, new_tokens], dim=1)
-                T = seq.shape[1]
-                mask_refined = torch.zeros(B, T, dtype=torch.bool, device=device)
-
-                output = model(seq, targets=None, mask=mask_refined)
-                if output.logits is None:
-                    break
-                refined_logits = output.logits[:, T - n_block :, :]
-
-                if rough_logits is not None:
-                    combined_logits = 0.5 * rough_logits + 0.5 * refined_logits
-                else:
-                    combined_logits = refined_logits
-                    rough_logits = refined_logits
-
-                new_tokens, _ = sample_tokens(combined_logits, n_block)
-
-            if eos_token_id is not None and generated < min_tokens:
-                new_tokens[:, 0] = torch.where(
-                    new_tokens[:, 0] == eos_token_id,
-                    torch.full_like(new_tokens[:, 0], mask_token_id),
-                    new_tokens[:, 0],
-                )
-
-            full_ids = torch.cat([full_ids, new_tokens], dim=1)
-            generated += n_block
-
-            if n_block == block_size and generated < max_new_tokens:
-                next_n = min(block_size, max_new_tokens - generated)
-                next_mask_tokens = torch.full((B, next_n), mask_token_id, dtype=torch.long, device=device)
-                spec_seq = torch.cat([full_ids, next_mask_tokens], dim=1)
-                T_spec = spec_seq.shape[1]
-                spec_mask = torch.zeros(B, T_spec, dtype=torch.bool, device=device)
-                spec_mask[:, T_spec - next_n :] = True
-
-                spec_output = model(spec_seq, targets=None, mask=spec_mask)
-                if spec_output.logits is not None:
-                    spec_logits = spec_output.logits[:, T_spec - next_n :, :]
-                    speculative_tokens, speculative_confidence = sample_tokens(spec_logits, next_n)
-
-            if eos_token_id is not None and (new_tokens == eos_token_id).any():
+            output = model(
+                seq,
+                targets=None,
+                semantic_unknown_mask=semantic_unknown_mask,
+                prediction_mask=prediction_mask,
+                valid_target_mask=valid_target_mask,
+                physical_corruption_mask=physical_mask,
+                attention_mode="bidir",
+                refinement_iterations=1,
+            )
+            if output.logits is None:
                 break
-    finally:
-        model.hrm.entropy_scheduler.n_iterations = orig_n_iters
-        model.hrm.entropy_scheduler.use_entropy_adaptive = orig_adaptive
+
+            rough_logits = output.logits.view(B, n_block, V)
+            new_tokens, _ = sample_tokens(rough_logits, n_block)
+
+        for pass_idx in range(1, refine_passes):
+            seq = torch.cat([full_ids, new_tokens], dim=1)
+            T = seq.shape[1]
+
+            semantic_unknown_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+            prediction_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+            prediction_mask[:, T - n_block :] = True
+            valid_target_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+            physical_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+
+            output = model(
+                seq,
+                targets=None,
+                semantic_unknown_mask=semantic_unknown_mask,
+                prediction_mask=prediction_mask,
+                valid_target_mask=valid_target_mask,
+                physical_corruption_mask=physical_mask,
+                attention_mode="bidir",
+            )
+            if output.logits is None:
+                break
+            refined_logits = output.logits.view(B, n_block, V)
+
+            if rough_logits is not None:
+                combined_logits = 0.5 * rough_logits + 0.5 * refined_logits
+            else:
+                combined_logits = refined_logits
+                rough_logits = refined_logits
+
+            new_tokens, _ = sample_tokens(combined_logits, n_block)
+
+        if eos_token_id is not None and generated < min_tokens:
+            new_tokens[:, 0] = torch.where(
+                new_tokens[:, 0] == eos_token_id,
+                torch.full_like(new_tokens[:, 0], mask_token_id),
+                new_tokens[:, 0],
+            )
+
+        full_ids = torch.cat([full_ids, new_tokens], dim=1)
+        generated += n_block
+
+        if n_block == block_size and generated < max_new_tokens:
+            next_n = min(block_size, max_new_tokens - generated)
+            next_mask_tokens = torch.full((B, next_n), mask_token_id, dtype=torch.long, device=device)
+            spec_seq = torch.cat([full_ids, next_mask_tokens], dim=1)
+            T_spec = spec_seq.shape[1]
+            spec_semantic = torch.zeros(B, T_spec, dtype=torch.bool, device=device)
+            spec_semantic[:, T_spec - next_n :] = True
+            spec_pred = spec_semantic.clone()
+            spec_valid = torch.ones(B, T_spec, dtype=torch.bool, device=device)
+            spec_physical = torch.zeros(B, T_spec, dtype=torch.bool, device=device)
+
+            spec_output = model(
+                spec_seq,
+                targets=None,
+                semantic_unknown_mask=spec_semantic,
+                prediction_mask=spec_pred,
+                valid_target_mask=spec_valid,
+                physical_corruption_mask=spec_physical,
+                attention_mode="bidir",
+                refinement_iterations=1,
+            )
+            if spec_output.logits is not None:
+                spec_logits = spec_output.logits.view(B, next_n, V)
+                speculative_tokens, speculative_confidence = sample_tokens(spec_logits, next_n)
+
+        if eos_token_id is not None and (new_tokens == eos_token_id).any():
+            break
 
     return full_ids[:, : T_prompt + generated]

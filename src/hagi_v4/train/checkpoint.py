@@ -61,27 +61,26 @@ def cfg_to_dict(cfg: HAGIv4Config) -> dict:
 
 
 def cfg_from_dict(data: dict) -> HAGIv4Config:
-    """Reconstruct config only when it exactly matches the current dataclass fields."""
+    """Reconstruct config from a checkpoint dict.
+
+    Handles V22→V23 migration: new optional fields (exit_chart, cqi,
+    uncertainty, kalman, hrm, msa) absent in V22 checkpoints default to None.
+    Dict values for None-default fields are instantiated into dataclasses.
+    """
     cfg = HAGIv4Config()
 
-    def require_schema(value: Mapping, expected: Mapping, path: str) -> None:
-        if set(value) != set(expected):
-            raise _incompatible(f"checkpoint config schema mismatch at {path}")
-        for key, expected_value in expected.items():
-            if isinstance(expected_value, Mapping):
-                child = value[key]
-                if not isinstance(child, Mapping):
-                    raise _incompatible(f"checkpoint config schema mismatch at {path}.{key}")
-                require_schema(child, expected_value, f"{path}.{key}")
-
-    require_schema(data, cfg_to_dict(cfg), "config")
     for top_key in ("model", "train", "inference"):
         top_val = getattr(cfg, top_key)
-        for f_name, fv in data[top_key].items():
+        top_data = data.get(top_key, {})
+        for f_name, fv in top_data.items():
+            if not hasattr(top_val, f_name):
+                continue
             current = getattr(top_val, f_name)
             if hasattr(current, "__dataclass_fields__") and isinstance(fv, dict):
                 for sf, sv in fv.items():
                     setattr(current, sf, sv)
+            elif current is None and isinstance(fv, dict):
+                _instantiate_optional_field(top_val, f_name, fv)
             else:
                 setattr(top_val, f_name, fv)
     try:
@@ -89,6 +88,37 @@ def cfg_from_dict(data: dict) -> HAGIv4Config:
     except (TypeError, ValueError) as exc:
         raise _incompatible(f"checkpoint config is invalid: {exc}") from exc
     return cfg
+
+
+def _instantiate_optional_field(obj, key: str, value: dict) -> None:
+    """Instantiate a None-default optional dataclass field from a dict."""
+    import dataclasses
+    import sys
+    import typing
+
+    if not dataclasses.is_dataclass(obj):
+        setattr(obj, key, value)
+        return
+    fields_map = {f.name: f for f in dataclasses.fields(obj)}
+    if key not in fields_map:
+        setattr(obj, key, value)
+        return
+    raw_type = fields_map[key].type
+    mod = sys.modules.get(type(obj).__module__)
+    cls = None
+    if isinstance(raw_type, str):
+        clean = raw_type.replace(" | None", "").replace("Optional[", "").replace("]", "").strip()
+        cls = getattr(mod, clean, None) if mod else None
+    elif raw_type is not None:
+        cls = raw_type
+    if cls and hasattr(cls, "__dataclass_fields__"):
+        instance = cls()
+        for sf, sv in value.items():
+            if hasattr(instance, sf):
+                setattr(instance, sf, sv)
+        setattr(obj, key, instance)
+    else:
+        setattr(obj, key, value)
 
 
 def assert_fresh_checkpoint_root(path: str | Path) -> Path:

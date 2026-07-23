@@ -120,7 +120,7 @@ class HARQBuffer(nn.Module):
         self.registry = TensorSlotRegistry(cfg.max_slots, cfg.routing_key_dim, cfg.mla_compress_dim)
         self._default_chunk = cfg.slot_chunk_size
 
-        self.harq_gate = nn.Parameter(torch.zeros(1))
+        self.harq_gate = nn.Parameter(torch.full((1,), -10.0))
 
     def write(self, ext_delta: torch.Tensor) -> None:
         """Store extrinsic delta (NOT full state).

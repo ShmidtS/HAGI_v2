@@ -21,6 +21,7 @@ from hagi_v4.config import HAGIv4Config
 from hagi_v4.model.attention_block import AttentionBlock
 from hagi_v4.model.codec._utils import _block_call
 from hagi_v4.model.codec_contracts import DecodeResult
+from hagi_v4.model.lorentz import LorentzSphereNorm, lorentz_log_origin
 from hagi_v4.model.norms import RMSNorm
 
 
@@ -89,6 +90,10 @@ class SourceDecoder(nn.Module):
             with torch.no_grad():
                 self.lm_expand.weight = token_compress_weight
 
+        self.lorentz_norm: LorentzSphereNorm | None = None
+        if getattr(m, "lorentz_enabled", False):
+            self.lorentz_norm = LorentzSphereNorm(dim=H)
+
     def _stack_forward(
         self,
         h: torch.Tensor,
@@ -152,6 +157,9 @@ class SourceDecoder(nn.Module):
         # V22: caller can override attention_mode for soft_causal blending.
         z = decoded.latent
         h = self.rate_up(z)
+        if self.lorentz_norm is not None:
+            h = self.lorentz_norm(h)
+            h = lorentz_log_origin(h)
         h, dec_entropy_pen = self._stack_forward(h, self.expression, attention_mode=attention_mode, soft_beta=soft_beta)
         self._last_attn_entropy_penalty = dec_entropy_pen
         return h
