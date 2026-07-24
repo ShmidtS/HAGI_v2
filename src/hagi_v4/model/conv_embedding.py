@@ -73,15 +73,23 @@ class ConvEmbedding(nn.Module):
         nn.init.normal_(self.token_compress.weight, mean=0.0, std=1.0 / (factor_rank**0.5))
         nn.init.normal_(self.token_expand.weight, mean=0.0, std=1.0 / (factor_rank**0.5))
 
-        # Pulse-shaping filter: causal depthwise Conv1d. Padding makes the
-        # convolution centred (bidirectional context for a masked LM); the
-        # model is not causal so we do not force a left-only receptive field.
-        padding = kernel_size // 2
+        # Causal depthwise Conv1d (left-pad only): hidden[t] depends on
+        # input[0..t] and NOTHING from the future. This is MANDATORY for a
+        # generative LM. The old symmetric padding (kernel_size // 2, centred,
+        # receptive field [-k//2, +k//2]) leaked future tokens into the
+        # embedding — so the attention never learned to condition the
+        # next-token prediction on the real context (proven by the leak probe:
+        # perturbing input[1] changed hidden[0] by 4.16). At inference the
+        # last position has no future to read, so its prediction collapsed to
+        # the marginal distribution of frequent tokens, independent of the
+        # prompt — the prompt-independent word-salad symptom.
+        left_pad = kernel_size - 1
+        self.left_pad = left_pad
         self.local_conv = nn.Conv1d(
             hidden_size,
             hidden_size,
             kernel_size=kernel_size,
-            padding=padding,
+            padding=0,
             groups=hidden_size,
             bias=True,
         )
@@ -142,6 +150,8 @@ class ConvEmbedding(nn.Module):
             compressed = torch.where(mask, unknown_code, compressed)
         h = self.token_expand(compressed)  # [B, T, H]
         h = h.transpose(1, 2)
+        # Left-pad then causal conv: output[t] uses only input[0..t].
+        h = torch.nn.functional.pad(h, (self.left_pad, 0))
         h = self.local_conv(h)
         h = h.transpose(1, 2)
         return self.norm(h)
@@ -159,6 +169,8 @@ class ConvEmbedding(nn.Module):
         h = self.token_expand(compressed)  # [B, T, H]
         # Conv1d expects [B, C, T]; depthwise groups=H keeps it O(H*k).
         h = h.transpose(1, 2)
+        # Left-pad then causal conv: output[t] uses only input[0..t].
+        h = torch.nn.functional.pad(h, (self.left_pad, 0))
         h = self.local_conv(h)
         h = h.transpose(1, 2)
         return self.norm(h)

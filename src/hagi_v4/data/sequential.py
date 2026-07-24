@@ -214,7 +214,7 @@ def build_sequential_dataloader(
         mix = json.load(f)
 
     # Build stage1 entries in curriculum order (easy -> hard)
-    curriculum_order = cfg.train.curriculum_order
+    curriculum_order = cfg.train.curriculum.stage1_order
     available = {s["name"]: s for s in mix["sources"]}
     stage1_entries = []
     for name in curriculum_order:
@@ -227,9 +227,9 @@ def build_sequential_dataloader(
         expected = ", ".join(f"{name}.bin" for name in curriculum_order)
         raise ValueError(f"no stage1 datasets found in {data_dir}; expected: {expected}")
 
-    cycles = cfg.train.sequential_cycles
+    cycles = cfg.train.curriculum.cycles_per_dataset
     samples_per_cycle = max(1000, cfg.train.max_steps * cfg.train.batch_size // (len(stage1_entries) * cycles))
-    dtype = getattr(cfg.train, "data_dtype", "auto")
+    dtype = cfg.train.data_dtype
 
     stage1 = SequentialCyclingIterator(
         entries=stage1_entries,
@@ -244,10 +244,10 @@ def build_sequential_dataloader(
     )
 
     # Stage 2: hard-reasoning subset from config
-    stage2_names = set(cfg.train.stage2_datasets)
+    stage2_names = set(cfg.train.curriculum.stage2_datasets)
     stage2_entries = [(n, p) for n, p in stage1_entries if n in stage2_names]
     stage2 = None
-    stage2_start = cfg.train.curriculum_stage2_start if cfg.train.curriculum_enabled else None
+    stage2_start = cfg.train.curriculum.stage2_start if cfg.train.curriculum.enabled else None
     if stage2_entries and stage2_start is not None:
         stage2 = SequentialCyclingIterator(
             entries=stage2_entries,

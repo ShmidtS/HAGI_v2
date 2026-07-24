@@ -1,0 +1,92 @@
+# HAGI — SmolLM2 teacher configuration (RTX 3070 8GB).
+#
+# Ternary RD-channel causal LM (see docs/ARCHITECTURE.md). Trained from
+# scratch on SmolLM2-tokenized data (vocab 49154). The auto_configure solver
+# derives hidden/layer/head sizes from target_nonembed_params; everything else
+# is an explicit knob here (no hardcoded constants in the training loop).
+
+model:
+  vocab_size: 49154
+  hidden_size: 384                 # explicit (overrides auto_configure)
+  core_hidden_size: 192            # C < H (real compression)
+  target_params: 40000000
+  target_nonembed_params: 40000000
+
+  attention:
+    max_seq_len: 8192
+    num_query_heads: 8             # 384 / 8 = 48 per head
+    head_dim: 48
+    rope_theta: 10000.0
+
+  embeddings:
+    factor_rank: 128
+    kernel_size: 5                  # causal depthwise conv (left-pad only)
+
+  multimodal:
+    enabled: false                  # text-only; set true for image/audio
+
+  body:
+    context_layers: 8
+    expression_layers: 8
+    ternary:
+      use_ternary: true             # BitNet b1.58 on the 2D body masters
+      hebbian_expansion: 4
+    bottleneck:
+      bottleneck_in_path: false     # IB stays an auxiliary KL regularizer
+    predictive:
+      enabled: false                # optional extrinsic error highway (off)
+    ib_beta: 0.001                  # rate Lagrangian (the only rate notion)
+    distortion_weight: 1.0
+    perception_weight: 0.01
+    kl_free_bits: 0.5
+    moe_enabled: false              # dropped (YAGNI)
+
+train:
+  max_steps: 150000
+  batch_size: 4
+  seq_len: 512
+  warmup_steps: 1600
+  learning_rate: 0.0003
+  muon_lr: 0.02
+  grad_accum_steps: 2
+  precision: bf16
+
+  tokenizer: "HuggingFaceTB/SmolLM2-135M"
+  eos_token_id: 0
+  pad_token_id: 49152
+  data_dir: data
+
+  w_rate: 0.001
+  w_distortion: 1.0
+  w_perception: 0.01
+  w_ternary_bias: 0.0
+  w_attn_entropy: 0.01
+  attn_entropy_floor: 0.5
+
+  checkpoint_dir: checkpoints
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 3
+
+  curriculum:
+    enabled: true
+    stage2_start: 120000
+    cycles_per_dataset: 3
+    stage1_order: [tinystories, python_instruct, smoltalk, wikipedia_en, wikipedia_ru, openwebmath, oscar_ru, slimpajama, edu]
+    stage2_datasets: [openwebmath, edu, slimpajama]
+
+  distill:
+    enabled: false                  # opt-in online hidden-state distillation
+    teacher: "HuggingFaceTB/SmolLM2-360M"
+    teacher_hidden_size: 960
+    embed_teacher: "HuggingFaceTB/SmolLM2-135M"
+    alpha_start: 0.0
+    alpha_end: 0.0
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  min_new_tokens: 2
+  repetition_penalty: 1.2
+  repetition_window: 64
+  no_repeat_ngram_size: 2
+  max_new_tokens: 64

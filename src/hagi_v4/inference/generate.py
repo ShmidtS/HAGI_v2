@@ -1,9 +1,12 @@
-"""V20: Pure causal autoregressive generation.
+"""Causal autoregressive generation.
 
-Replaces the V12 LLaDA-style mask-predict loop with standard GPT-style
-left-to-right token generation. The model is now trained with UniLM-style
-mixed attention (40% bidir, 30% prefix-LM, 30% causal), so the inference
-path uses the causal mode that was explicitly trained.
+Standard GPT-style left-to-right token generation matching the causal
+training mode. Feeds the prompt, takes logits at the last position, samples
+the next token, appends it, and repeats.
+
+The model sees the REAL context at every step — nothing is erased. The
+causal-mode mask contract (``prediction_mask`` all-True, ``semantic_unknown_mask``
+all-False) returns logits as ``[B*T, V]``; we take the last position per row.
 """
 
 from __future__ import annotations
@@ -12,8 +15,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-
-from hagi_v4.model.codec_contracts import InferenceShapeConfig
 
 
 @dataclass(frozen=True)
@@ -89,11 +90,11 @@ def process_generation_logits(
     if n > 0 and context_ids.shape[1] + 1 >= n:
         for row in range(processed.shape[0]):
             tokens = context_ids[row].tolist()
-            prefix = tuple(tokens[-(n - 1) :]) if n > 1 else ()
+            prefix = tuple(tokens[-(n - 1):]) if n > 1 else ()
             banned = {
                 tokens[index + n - 1]
                 for index in range(len(tokens) - n + 1)
-                if tuple(tokens[index : index + n - 1]) == prefix
+                if tuple(tokens[index: index + n - 1]) == prefix
             }
             if banned:
                 processed[row, list(banned)] = float("-inf")
@@ -111,12 +112,11 @@ def process_generation_logits(
 
 
 @torch.no_grad()
-def _generate(
+def generate(
     model: torch.nn.Module,
     prompt_ids: torch.LongTensor,
     *,
     max_new_tokens: int,
-    max_iterations: int,
     eos_token_id: int,
     pad_token_id: int,
     forbidden_token_ids: tuple[int, ...] = (),
@@ -126,19 +126,9 @@ def _generate(
     repetition_penalty: float = 1.1,
     repetition_window: int = 64,
     no_repeat_ngram_size: int = 3,
-    physical_corruption_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> GenerationOutput:
-    """V20: Pure causal autoregressive generation.
-
-    Feeds the prompt, takes logits at the last position, samples the next
-    token, appends it, and repeats. This is the standard GPT-style AR loop
-    that matches the causal training mode (30% of V20 batches).
-
-    Unlike the V12 mask-predict loop, this does NOT use iterative
-    refinement or parallel commit — each token is generated sequentially,
-    conditioned on all previously generated tokens.
-    """
+    """Pure causal autoregressive generation (matches the causal training mode)."""
     if prompt_ids.ndim != 2 or prompt_ids.dtype != torch.long:
         raise ValueError("prompt_ids must be a rank-2 LongTensor")
     if max_new_tokens < 1:
@@ -149,12 +139,7 @@ def _generate(
     model.eval()
     batch_size, prompt_len = prompt_ids.shape
     device = prompt_ids.device
-    inference_config = getattr(model, "inference_config", None)
-    vocab_size = (
-        inference_config.vocab_size
-        if inference_config is not None
-        else InferenceShapeConfig.from_hagi_config(model.cfg).vocab_size
-    )
+    vocab_size = model.cfg.model.vocab_size
     _validate_token_ids("prompt_ids", tuple(prompt_ids.flatten().tolist()), vocab_size)
     _validate_token_ids("eos_token_id", (eos_token_id,), vocab_size)
     _validate_token_ids("pad_token_id", (pad_token_id,), vocab_size)
@@ -164,16 +149,6 @@ def _generate(
 
     invalid_token_ids = tuple(dict.fromkeys((*forbidden_token_ids, pad_token_id)))
 
-    # V23: SpectralCache for VRAM-efficient inference.
-    kv_cache_cfg = getattr(model.cfg.inference, "kv_cache", None)
-    use_spectral_cache = kv_cache_cfg is not None and getattr(kv_cache_cfg, "enabled", False)
-    cache = None
-    if use_spectral_cache:
-        from hagi_v4.inference.spectral_cache import SpectralCache
-
-        cache = SpectralCache(context_window=128)
-
-    # Build the sequence buffer: prompt + space for new tokens (filled with pad).
     sequence = torch.cat(
         (prompt_ids, torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)),
         dim=1,
@@ -181,58 +156,38 @@ def _generate(
     generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    # V20: physical_corruption_mask is not used in causal AR mode (no
-    # channel noise during generation). If provided, ignored.
-    _ = physical_corruption_mask
-
     for step in range(max_new_tokens):
         if finished.all():
             break
 
-        # Forward pass with causal attention over the current sequence.
         current_len = prompt_len + step
-        if cache is not None and cache.context_len > 0:
-            input_ids = sequence[:, current_len - 1 : current_len]
-        else:
-            input_ids = sequence[:, :current_len]
+        input_ids = sequence[:, :current_len]
         T_input = input_ids.shape[1]
-        # Causal next-token prediction (matches training): the model sees the
-        # REAL context — nothing is erased. semantic_unknown_mask is all-False
-        # (the old code marked the last position as unknown, which is how the
-        # MLM bidir path signals an erasure; in causal AR the last token IS the
-        # context and must NOT be erased — marking it unknown fed the model its
-        # learned unknown_embed instead of the real token, producing garbage).
-        # prediction_mask=all-True selects every position (model contract for
-        # causal), returning logits as [B*T, V]; we take the LAST per row below.
+        # Causal next-token: the model sees the REAL context — nothing erased.
+        # semantic_unknown_mask all-False (marking the last token unknown fed
+        # the model its learned unknown_embed instead of the real token).
+        # prediction_mask all-True selects every position; logits come as
+        # [B*T, V] and we take the LAST per row.
         valid_target_mask = torch.ones((batch_size, T_input), dtype=torch.bool, device=device)
         prediction_mask = valid_target_mask.clone()
         semantic_unknown_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
-        physical_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
         output = model(
             input_ids,
             targets=None,
             semantic_unknown_mask=semantic_unknown_mask,
             prediction_mask=prediction_mask,
             valid_target_mask=valid_target_mask,
-            physical_corruption_mask=physical_mask,
             attention_mode="causal",
-            prefix_len=None,
-            cache=cache,
         )
         if output.logits is None:
             raise ValueError("model output must include logits")
-
-        # output.logits is [B*T, V] (causal selects all positions, row-major:
-        # row b*T + t). Take the LAST position per batch row -> [B, V].
         next_logits = output.logits.view(batch_size, T_input, -1)[:, -1, :]
 
-        # Zero out finished rows so they don't produce tokens.
         for r in range(batch_size):
             if finished[r]:
                 next_logits[r] = float("-inf")
                 next_logits[r, pad_token_id] = 0.0
 
-        # Sample next token for each row.
         context = sequence[:, :current_len]
         next_tokens = process_generation_logits(
             next_logits,
@@ -249,7 +204,6 @@ def _generate(
             generator=generator,
         )
 
-        # Write tokens and update state.
         for r in range(batch_size):
             if finished[r]:
                 continue
@@ -261,71 +215,3 @@ def _generate(
 
     token_ids = sequence[:, : prompt_len + max_new_tokens]
     return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)
-
-
-def generate(
-    model: torch.nn.Module,
-    prompt_ids: torch.LongTensor,
-    *,
-    max_new_tokens: int,
-    max_iterations: int,
-    eos_token_id: int,
-    pad_token_id: int,
-    forbidden_token_ids: tuple[int, ...] = (),
-    min_new_tokens: int = 2,
-    temperature: float = 0.8,
-    top_k: int = 50,
-    repetition_penalty: float = 1.1,
-    repetition_window: int = 64,
-    no_repeat_ngram_size: int = 3,
-    physical_corruption_mask: torch.Tensor | None = None,
-    generator: torch.Generator | None = None,
-) -> GenerationOutput:
-    spec_cfg = getattr(model.cfg.inference, "speculative", None)
-    if spec_cfg is not None and getattr(spec_cfg, "enabled", False):
-        from hagi_v4.inference.speculative import generate_speculative
-
-        token_ids = generate_speculative(
-            model,
-            prompt_ids,
-            max_new_tokens=max_new_tokens,
-            mask_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
-            temperature=temperature,
-            top_k=top_k,
-            min_tokens=min_new_tokens,
-            block_size=max(4, getattr(spec_cfg, "draft_length", 4) * 4),
-            refine_passes=max(2, max_iterations),
-            repetition_penalty=repetition_penalty,
-            repetition_window=repetition_window,
-            speculation_confidence_threshold=getattr(spec_cfg, "acceptance_threshold", 0.5),
-        )
-        B = token_ids.shape[0]
-        gen_len = token_ids.shape[1] - prompt_ids.shape[1]
-        generated_lengths = torch.full((B,), gen_len, dtype=torch.long, device=token_ids.device)
-        finished = torch.ones(B, dtype=torch.bool, device=token_ids.device)
-        return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)
-
-    training_states = tuple((module, module.training) for module in model.modules())
-    try:
-        return _generate(
-            model,
-            prompt_ids,
-            max_new_tokens=max_new_tokens,
-            max_iterations=max_iterations,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            forbidden_token_ids=forbidden_token_ids,
-            min_new_tokens=min_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            repetition_window=repetition_window,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            physical_corruption_mask=physical_corruption_mask,
-            generator=generator,
-        )
-    finally:
-        model.train(training_states[0][1])
-        for module, was_training in training_states:
-            module.training = was_training

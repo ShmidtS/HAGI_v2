@@ -12,13 +12,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from hagi_v4.config import HAGIv4Config, validate_config
+from hagi_v4.config import Config, validate_config
 
 logger = logging.getLogger(__name__)
-CHECKPOINT_FORMAT_VERSION = 3
+CHECKPOINT_FORMAT_VERSION = 4
 CHECKPOINT_FIELDS = {"format_version", "model", "config", "completed_updates"}
 # Optional field persisted only by training checkpoints for resume. Inference
-# loaders ignore it; pre-resume checkpoints simply omit it.
+# loaders ignore it.
 OPTIONAL_FIELDS = {"optimizer"}
 
 
@@ -62,20 +62,14 @@ def load_checkpoint_payload(path: str | Path, device: str = "cpu") -> dict:
     return dict(state)
 
 
-def cfg_to_dict(cfg: HAGIv4Config) -> dict:
+def cfg_to_dict(cfg: Config) -> dict:
     """Serialize config to a plain dict via dataclasses.asdict."""
     return dataclasses.asdict(cfg)
 
 
-def cfg_from_dict(data: dict) -> HAGIv4Config:
-    """Reconstruct config from a checkpoint dict.
-
-    Handles V22→V23 migration: new optional fields (exit_chart, cqi,
-    uncertainty, kalman, hrm, msa) absent in V22 checkpoints default to None.
-    Dict values for None-default fields are instantiated into dataclasses.
-    """
-    cfg = HAGIv4Config()
-
+def cfg_from_dict(data: dict) -> Config:
+    """Reconstruct config from a checkpoint dict."""
+    cfg = Config()
     for top_key in ("model", "train", "inference"):
         top_val = getattr(cfg, top_key)
         top_data = data.get(top_key, {})
@@ -85,9 +79,8 @@ def cfg_from_dict(data: dict) -> HAGIv4Config:
             current = getattr(top_val, f_name)
             if hasattr(current, "__dataclass_fields__") and isinstance(fv, dict):
                 for sf, sv in fv.items():
-                    setattr(current, sf, sv)
-            elif current is None and isinstance(fv, dict):
-                _instantiate_optional_field(top_val, f_name, fv)
+                    if hasattr(current, sf):
+                        setattr(current, sf, sv)
             else:
                 setattr(top_val, f_name, fv)
     try:
@@ -97,47 +90,14 @@ def cfg_from_dict(data: dict) -> HAGIv4Config:
     return cfg
 
 
-def _instantiate_optional_field(obj, key: str, value: dict) -> None:
-    """Instantiate a None-default optional dataclass field from a dict."""
-    import dataclasses
-    import sys
-    import typing
-
-    if not dataclasses.is_dataclass(obj):
-        setattr(obj, key, value)
-        return
-    fields_map = {f.name: f for f in dataclasses.fields(obj)}
-    if key not in fields_map:
-        setattr(obj, key, value)
-        return
-    raw_type = fields_map[key].type
-    mod = sys.modules.get(type(obj).__module__)
-    cls = None
-    if isinstance(raw_type, str):
-        clean = raw_type.replace(" | None", "").replace("Optional[", "").replace("]", "").strip()
-        cls = getattr(mod, clean, None) if mod else None
-    elif raw_type is not None:
-        cls = raw_type
-    if cls and hasattr(cls, "__dataclass_fields__"):
-        instance = cls()
-        for sf, sv in value.items():
-            if hasattr(instance, sf):
-                setattr(instance, sf, sv)
-        setattr(obj, key, instance)
-    else:
-        setattr(obj, key, value)
-
-
 def assert_fresh_checkpoint_root(path: str | Path) -> Path:
-    """Reject a checkpoint root containing flat ``step-*.pt`` artifacts that a
-    new run would overwrite. Unrelated subfolders and non-matching files do not
-    conflict with flat ``checkpoints/step-XXXXXX.pt`` output and are ignored."""
+    """Ensure the checkpoint root exists."""
     ckpt_dir = Path(path)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     return ckpt_dir
 
 
-def load_model_checkpoint(path: str | Path, model: nn.Module, device: str) -> tuple[int, HAGIv4Config]:
+def load_model_checkpoint(path: str | Path, model: nn.Module, device: str) -> tuple[int, Config]:
     """Validate a complete checkpoint, then strictly load its model state."""
     state = load_checkpoint_payload(path, device)
     cfg = cfg_from_dict(state["config"])
@@ -156,19 +116,17 @@ def latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
 
 def save_checkpoint(
     model: nn.Module,
-    cfg: HAGIv4Config,
+    cfg: Config,
     completed_updates: int,
     checkpoint_dir: str | Path,
     keep_last: int = 3,
     optimizer=None,
 ) -> Path:
-    """Save training checkpoint. Returns path to saved file.
+    """Save a training checkpoint. Returns path to the saved file.
 
     ``optimizer`` (a CombinedOptimizer with state_dict/load_state_dict) is
     optional: when provided, its state is persisted so a ``--resume`` run
-    continues with Muon momentum buffers + AdamW second moments intact. When
-    omitted (inference/eval checkpoints), the field is absent and loaders
-    treat it as a cold start.
+    continues with Muon momentum buffers + AdamW second moments intact.
     """
     if type(completed_updates) is not int or completed_updates < 0:
         raise ValueError("completed_updates must be a non-negative integer")
@@ -178,7 +136,6 @@ def save_checkpoint(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     path = ckpt_dir / f"step-{completed_updates:06d}.pt"
-
     state = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "model": model.state_dict(),
@@ -192,12 +149,8 @@ def save_checkpoint(
     temp_file.close()
     try:
         torch.save(state, temp_path)
-
-        # V12: ``os.replace`` atomically overwrites an existing destination
-        # on both POSIX and Windows, where ``os.link`` fails with
-        # ``FileExistsError`` if the target file already exists. This allows
-        # resuming/re-running training without manually clearing the
-        # checkpoint directory first.
+        # os.replace atomically overwrites an existing destination on both
+        # POSIX and Windows (os.link fails with FileExistsError on rerun).
         os.replace(temp_path, path)
     finally:
         if temp_path.exists():
