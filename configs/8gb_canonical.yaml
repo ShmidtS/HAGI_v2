@@ -1,8 +1,9 @@
-# HAGI V23 — Canonical config (RTX 3070 8GB)
-# Full SCS codec with integrated modules: CQI, EXIT chart, LearnedUncertainty,
-# Kalman filter, HARQ soft combining, HRM dual-component turbo loop,
-# FreqCoding equalizer, MoE variable-rate, WaterFilling, Lorentz, Contrastive.
-# Training from scratch — all information-theoretic modules active.
+# HAGI V24 — Canonical config (RTX 3070 8GB)
+# V24 information-theoretic path (default ON): variational InformationBottleneck
+# (§3.1) + PredictiveDecoder extrinsic-error highway (§3.2, reuses
+# uncertainty.py for K=P/(P+R)) + HebbianBilinearFFN (hebbian-mlps §4.2).
+# No AWGN self-noise, no LDPC parity over self-noise — the V8-V23 flaw is gone.
+# Set model.v24.enabled: false to restore the V23 AWGN/LDPC SCS codec (ablation).
 
 model:
   vocab_size: 49154
@@ -85,6 +86,20 @@ model:
   freq_coding:
     enabled: false
 
+  # V24 information-theoretic path (default ON). See docs/ARCHITECTURE_V24.md.
+  v24:
+    enabled: true
+    ib_beta: 0.001            # rate Lagrangian (β): small → fidelity-led
+    distortion_weight: 1.0
+    perception_weight: 0.01
+    kl_free_bits: 0.5
+    predictive_train_iterations: 2
+    predictive_infer_iterations: 4
+    predictive_convergence_threshold: 0.01
+    predictive_update_hidden: 256
+    use_kalman_blend: true    # reuse uncertainty.py (K=P/(P+R))
+    hebbian_expansion: 4      # m = 4·H (hebbian-mlps paper default)
+
 train:
   max_steps: 150000
   batch_size: 8
@@ -94,6 +109,10 @@ train:
   pad_token_id: 49152
   curriculum_stage2_start: 100000
   distill_teacher_hidden_size: 960
+  # V24 rate-distortion aux weights (information bottleneck §3.1).
+  w_v24_rate: 0.001
+  w_v24_distortion: 1.0
+  w_v24_perception: 0.01
   # V23: AWGN sigma schedule — forces LDPC to do real work.
   # SNR=4.0 (start) → SNR=11.1 (end), capacity stays above code_rate=0.5.
   awgn_sigma_start: 0.50

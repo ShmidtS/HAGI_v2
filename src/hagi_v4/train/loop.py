@@ -230,6 +230,12 @@ def train_step(
             "whiteness",
             "contrastive",
             "parity_diversity",
+            # V24/V25 genuine RD terms (§3.1) + V25 ternary-bias / MoE LB (§4).
+            "rate",
+            "distortion",
+            "perception",
+            "ternary_bias",
+            "moe_lb",
         )
     }
     aux_counts = {name: 0 for name in aux_sums}
@@ -274,35 +280,36 @@ def train_step(
             elif step < awgn_end:
                 progress = (step - awgn_warmup) / max(awgn_end - awgn_warmup, 1)
                 awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
-        # V22: soft causal blending — smooth transition instead of hard switching.
-        # Schedule: start with bidir dominance, gradually shift to causal.
-        # This prevents the distribution shock from discrete mode switching.
+        # Attention-mode curriculum. The OLD V20 design ran PURE bidir for the
+        # whole warmup (step<warmup) before any causal exposure — catastrophic
+        # for an AUTOREGRESSIVE generation model: every checkpoint taken during
+        # warmup is out-of-distribution for generation (causal never trained).
+        # Measured on the step-1500 checkpoint: bidir MLM loss 5.68 vs causal AR
+        # loss 7.64 (gap +1.96) — pure bidir-first. For a generative LM we instead
+        # make CAUSAL dominant from step 0 (with a small bidir slice for its
+        # denser representation gradient), ramping bidir out by mid-training.
         warmup = max(int(cfg.train.warmup_steps), 1)
-        if step < warmup:
-            # Phase 1: pure bidir (learn basic representations)
+        stable_end = int(cfg.train.max_steps * 0.8)
+        progress = min(1.0, step / max(warmup, 1))  # 0 -> 1 over warmup
+        late = min(1.0, step / max(stable_end, 1))  # slow ramp over whole stable phase
+        r = float(torch.rand(1).item())
+        # Causal-primary from step 0: 50% causal / 30% soft_causal / 20% bidir
+        # early, tightening to 60% causal / 40% soft_causal (bidir -> 0) late.
+        causal_prob = 0.50 + 0.10 * late
+        soft_prob = 0.30 + 0.10 * late
+        bidir_prob = max(0.0, 0.20 - 0.20 * late)
+        if r < causal_prob:
+            attention_mode = "causal"
+            prefix_len = None
+            soft_beta = None
+        elif r < causal_prob + soft_prob:
+            attention_mode = "soft_causal"
+            prefix_len = None
+            soft_beta = 0.5 + progress * 2.5  # mild -> strong causal
+        else:
             attention_mode = "bidir"
             prefix_len = None
             soft_beta = None
-        else:
-            progress = min(1.0, (step - warmup) / max(warmup * 3, 1))
-            # Blend: 50% bidir early → 20% bidir late, rest is soft_causal
-            r = float(torch.rand(1).item())
-            bidir_prob = 0.50 * (1.0 - progress * 0.6)  # 0.50 → 0.20
-            causal_prob = 0.30 * progress  # 0 → 0.30
-            if r < bidir_prob:
-                attention_mode = "bidir"
-                prefix_len = None
-                soft_beta = None
-            elif r < bidir_prob + causal_prob:
-                attention_mode = "causal"
-                prefix_len = None
-                soft_beta = None
-            else:
-                # Soft causal: smooth bidir→causal transition
-                attention_mode = "soft_causal"
-                prefix_len = None
-                # Beta ramps from 0.5 (mild) to 3.0 (strong causal)
-                soft_beta = 0.5 + progress * 2.5
         if attention_mode == "bidir":
             # MLM: use the standard masked prediction path.
             out_prediction_mask = prediction_mask
@@ -438,18 +445,28 @@ def train_step(
                 masked_rows += row_count
                 # V16: conf from actual max-prob every step (never fake 0.5).
                 # V17: top2/entropy every 20 steps for cost; skip log NaN when empty.
+                # Chunked to avoid materializing [N,V] float32 three times
+                # (log_softmax + exp + product). After warmup, causal/soft_causal
+                # modes select ALL valid positions (n_selected = B*T ~ 4096),
+                # which made the unchunked path peak at ~2.4 GB on every 20th
+                # step — the post-step-1000 VRAM jump. 256 rows/chunk keeps the
+                # float32 peak under ~150 MB regardless of n_selected.
                 with torch.no_grad():
-                    log_probabilities = logits.float().log_softmax(dim=-1)
-                    probabilities = log_probabilities.exp()
-                    confidence_sum += probabilities.max(dim=-1).values.sum().item()
+                    want_post = (step % 20 == 0)
+                    chunk_rows = 256
+                    for ci in range(0, logits.shape[0], chunk_rows):
+                        chunk = logits[ci : ci + chunk_rows].float()
+                        log_p = chunk.log_softmax(dim=-1)
+                        p = log_p.exp()
+                        confidence_sum += p.max(dim=-1).values.sum().item()
+                        if want_post:
+                            top2_mass_sum += (
+                                p.topk(min(2, chunk.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
+                            )
+                            entropy_sum += -(p * log_p).sum(dim=-1).sum().item()
                     conf_rows += row_count
-                    if step % 20 == 0:
-                        top2_mass_sum += (
-                            probabilities.topk(min(2, logits.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
-                        )
-                        entropy_sum += (-(probabilities * log_probabilities).sum(dim=-1)).sum().item()
+                    if want_post:
                         posterior_rows += row_count
-                    del log_probabilities, probabilities
                 suffix_count = int(suffix_predictions.sum().item())
                 if suffix_count:
                     suffix_ce_sum += (
@@ -522,6 +539,12 @@ def train_step(
         "whiteness": mean_aux("whiteness"),
         "contrastive": mean_aux("contrastive"),
         "parity_diversity": mean_aux("parity_diversity"),
+        # V24/V25 genuine RD terms + V25 ternary-bias / MoE LB (§3.1, §4).
+        "rate": mean_aux("rate"),
+        "distortion": mean_aux("distortion"),
+        "perception": mean_aux("perception"),
+        "ternary_bias": mean_aux("ternary_bias"),
+        "moe_lb": mean_aux("moe_lb"),
         "avg_confidence": avg_confidence,
         "grad_norm": gn,
         "grad_rms": grad_rms,
@@ -539,6 +562,8 @@ def train(
     cfg: HAGIv4Config,
     log_interval: int = 100,
     teacher=None,
+    start_step: int = 0,
+    optimizer_state: dict | None = None,
 ) -> Iterator[dict]:
     from hagi_v4.train.checkpoint import assert_fresh_checkpoint_root, save_checkpoint
 
@@ -549,15 +574,17 @@ def train(
         cast_to_bf16(model)
 
     optimizer = build_optimizer(model, cfg)
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
     loss_aggregator = LossAggregator(cfg)
     adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
 
-    step = 0
+    step = start_step
     distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
     ckpt_interval = cfg.train.checkpoint_interval
     ckpt_keep = cfg.train.checkpoint_keep_last
-    last_checkpoint_step = None
+    last_checkpoint_step = step if step > 0 else None
 
     data_iter = iter(dataloader)
     while step < cfg.train.max_steps:
@@ -586,10 +613,11 @@ def train(
         )
 
         # V12: release caching allocator's reserved memory every step.
-        # On Windows the allocator fragments when prediction mask sizes
-        # vary, causing reserved memory to grow to ~10 GB. ``empty_cache``
-        # is ~1 ms, negligible vs ~1.3 s per-step cost.
-        _maybe_release_caches(step, interval=20)
+        # On Windows the allocator cannot use ``expandable_segments``, so when
+        # prediction-mask sizes vary (bidir ~1.2k rows vs causal 4k rows after
+        # warmup), freed blocks fragment and reserved grows toward 10 GB.
+        # ``empty_cache`` is ~1 ms, negligible vs the ~1.3 s per-step cost.
+        _maybe_release_caches(step, interval=1)
 
         if step % log_interval == 0:
             yield metrics
@@ -599,10 +627,10 @@ def train(
 
         completed_updates = step + 1
         if ckpt_interval > 0 and completed_updates % ckpt_interval == 0:
-            save_checkpoint(model, cfg, completed_updates, ckpt_dir, ckpt_keep)
+            save_checkpoint(model, cfg, completed_updates, ckpt_dir, ckpt_keep, optimizer=optimizer)
             last_checkpoint_step = completed_updates
 
         step += 1
 
     if ckpt_interval > 0 and last_checkpoint_step != step:
-        save_checkpoint(model, cfg, step, ckpt_dir, ckpt_keep)
+        save_checkpoint(model, cfg, step, ckpt_dir, ckpt_keep, optimizer=optimizer)
