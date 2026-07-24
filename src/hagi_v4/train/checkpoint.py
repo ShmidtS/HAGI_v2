@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from hagi_v4.config import Config, validate_config
+from hagi_v4.config import Config, _apply_dict, validate_config
 
 logger = logging.getLogger(__name__)
 CHECKPOINT_FORMAT_VERSION = 4
@@ -68,21 +68,12 @@ def cfg_to_dict(cfg: Config) -> dict:
 
 
 def cfg_from_dict(data: dict) -> Config:
-    """Reconstruct config from a checkpoint dict."""
+    """Reconstruct config from a checkpoint dict (recursive)."""
     cfg = Config()
     for top_key in ("model", "train", "inference"):
-        top_val = getattr(cfg, top_key)
         top_data = data.get(top_key, {})
-        for f_name, fv in top_data.items():
-            if not hasattr(top_val, f_name):
-                continue
-            current = getattr(top_val, f_name)
-            if hasattr(current, "__dataclass_fields__") and isinstance(fv, dict):
-                for sf, sv in fv.items():
-                    if hasattr(current, sf):
-                        setattr(current, sf, sv)
-            else:
-                setattr(top_val, f_name, fv)
+        if isinstance(top_data, dict) and hasattr(cfg, top_key):
+            _apply_dict(getattr(cfg, top_key), top_data)
     try:
         validate_config(cfg)
     except (TypeError, ValueError) as exc:
