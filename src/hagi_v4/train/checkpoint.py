@@ -17,6 +17,9 @@ from hagi_v4.config import HAGIv4Config, validate_config
 logger = logging.getLogger(__name__)
 CHECKPOINT_FORMAT_VERSION = 3
 CHECKPOINT_FIELDS = {"format_version", "model", "config", "completed_updates"}
+# Optional field persisted only by training checkpoints for resume. Inference
+# loaders ignore it; pre-resume checkpoints simply omit it.
+OPTIONAL_FIELDS = {"optimizer"}
 
 
 class IncompatibleCheckpointError(RuntimeError):
@@ -41,8 +44,12 @@ def load_checkpoint_payload(path: str | Path, device: str = "cpu") -> dict:
     except Exception as exc:
         raise _incompatible(f"checkpoint payload cannot be loaded: {exc}") from exc
     state = _require_mapping(state, "root")
-    if set(state) != CHECKPOINT_FIELDS:
-        raise _incompatible(f"checkpoint schema expected {sorted(CHECKPOINT_FIELDS)}, got {sorted(state)}")
+    extra = set(state) - CHECKPOINT_FIELDS - OPTIONAL_FIELDS
+    if extra:
+        raise _incompatible(f"unknown checkpoint fields {sorted(extra)}")
+    missing = CHECKPOINT_FIELDS - set(state)
+    if missing:
+        raise _incompatible(f"checkpoint schema missing {sorted(missing)}")
     if state.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         raise _incompatible(f"checkpoint schema has unsupported format_version {state.get('format_version')!r}")
     model_state = _require_mapping(state.get("model"), "model")
@@ -141,14 +148,28 @@ def load_model_checkpoint(path: str | Path, model: nn.Module, device: str) -> tu
     return state["completed_updates"], cfg
 
 
+def latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
+    """Return the highest-numbered ``step-*.pt`` in ``checkpoint_dir`` or None."""
+    ckpts = sorted(Path(checkpoint_dir).glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-")))
+    return ckpts[-1] if ckpts else None
+
+
 def save_checkpoint(
     model: nn.Module,
     cfg: HAGIv4Config,
     completed_updates: int,
     checkpoint_dir: str | Path,
     keep_last: int = 3,
+    optimizer=None,
 ) -> Path:
-    """Save training checkpoint. Returns path to saved file."""
+    """Save training checkpoint. Returns path to saved file.
+
+    ``optimizer`` (a CombinedOptimizer with state_dict/load_state_dict) is
+    optional: when provided, its state is persisted so a ``--resume`` run
+    continues with Muon momentum buffers + AdamW second moments intact. When
+    omitted (inference/eval checkpoints), the field is absent and loaders
+    treat it as a cold start.
+    """
     if type(completed_updates) is not int or completed_updates < 0:
         raise ValueError("completed_updates must be a non-negative integer")
     if type(keep_last) is not int or keep_last < 1:
@@ -164,6 +185,8 @@ def save_checkpoint(
         "completed_updates": completed_updates,
         "config": cfg_to_dict(cfg),
     }
+    if optimizer is not None:
+        state["optimizer"] = optimizer.state_dict()
     temp_file = tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=ckpt_dir, delete=False)
     temp_path = Path(temp_file.name)
     temp_file.close()

@@ -75,6 +75,15 @@ def main() -> int:
     parser.add_argument("--no-embed-transfer", action="store_true")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory")
     parser.add_argument("--log-dir", default="logs", help="Directory for log files")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        help="Resume from checkpoint. Bare '--resume' picks the latest step-*.pt; "
+        "'--resume PATH' loads a specific one. Restores model + optimizer state and "
+        "continues training from completed_updates.",
+    )
     args = parser.parse_args()
 
     log_path = setup_file_logging(args.log_dir)
@@ -93,7 +102,7 @@ def main() -> int:
         overrides["train.checkpoint_dir"] = args.checkpoint_dir
     cfg = load_config(path=args.config, **overrides)
 
-    from hagi_v4.train.checkpoint import assert_fresh_checkpoint_root
+    from hagi_v4.train.checkpoint import assert_fresh_checkpoint_root, latest_checkpoint, load_checkpoint_payload
 
     assert_fresh_checkpoint_root(cfg.train.checkpoint_dir)
 
@@ -114,7 +123,22 @@ def main() -> int:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Parameters: {n_params / 1e6:.1f}M")
 
-    if cfg.train.distill_enabled is True and not args.no_embed_transfer:
+    # Resume: load model weights + start step (+ optimizer state below). On a
+    # fresh run start_step=0 and optimizer_state=None — identical to before.
+    start_step = 0
+    optimizer_state = None
+    if args.resume is not None:
+        from hagi_v4.train.checkpoint import load_model_checkpoint
+
+        ckpt_path = args.resume if args.resume != "latest" else latest_checkpoint(cfg.train.checkpoint_dir)
+        if ckpt_path is None:
+            raise FileNotFoundError(f"--resume: no step-*.pt found in {cfg.train.checkpoint_dir}")
+        completed, _ = load_model_checkpoint(ckpt_path, model, str(device))
+        start_step = completed
+        optimizer_state = load_checkpoint_payload(ckpt_path, str(device)).get("optimizer")
+        logger.info(f"Resumed from {ckpt_path} at step {completed} (optimizer state: {'yes' if optimizer_state else 'no'})")
+
+    if cfg.train.distill_enabled is True and not args.no_embed_transfer and start_step == 0:
         from hagi_v4.train.distillation import transfer_embeddings
 
         transfer_embeddings(model, cfg.train.distill_embed_teacher)
@@ -163,7 +187,15 @@ def main() -> int:
             f"(alpha {cfg.train.distill_alpha_start}->{cfg.train.distill_alpha_end}, T={cfg.train.distill_temperature})"
         )
 
-    for metrics in train(model, dataloader, cfg, log_interval=1, teacher=teacher):
+    for metrics in train(
+        model,
+        dataloader,
+        cfg,
+        log_interval=1,
+        teacher=teacher,
+        start_step=start_step,
+        optimizer_state=optimizer_state,
+    ):
         logger.info(format_training_metrics(metrics))
     logger.info("Training complete.")
     return 0

@@ -115,9 +115,24 @@ class LossAggregator:
         if isinstance(cfg, HAGIv4Config):
             self.w_parity_diversity = getattr(cfg.train, "w_parity_diversity", 0.05)
             self.w_attn_entropy = getattr(cfg.train, "w_attn_entropy", 0.01)
+            # V24 information-bottleneck RD weights (§3.1). These are genuine
+            # rate-distortion terms — only active on the V24/V25 path (aux.rate set).
+            self.w_v24_rate = getattr(cfg.train, "w_v24_rate", 1e-3)
+            self.w_v24_distortion = getattr(cfg.train, "w_v24_distortion", 1.0)
+            self.w_v24_perception = getattr(cfg.train, "w_v24_perception", 0.01)
+            # V25 ternary-bias regularizer (§4) + MoE load-balance (opt-in).
+            # Both default-inert (ternary loss-free at scale per §10; MoE dropped
+            # per §8 YAGNI) and only fire when their aux term is set.
+            self.w_ternary_bias = getattr(cfg.train, "w_ternary_bias", 0.0)
+            self.w_moe_load_balance = getattr(cfg.train, "w_moe_load_balance", 0.01)
         else:
             self.w_parity_diversity = 0.05
             self.w_attn_entropy = 0.01
+            self.w_v24_rate = 1e-3
+            self.w_v24_distortion = 1.0
+            self.w_v24_perception = 0.01
+            self.w_ternary_bias = 0.0
+            self.w_moe_load_balance = 0.01
 
     def _loss_level(self, step: int) -> int:
         """Return active loss level: 1, 2, or 3."""
@@ -142,6 +157,45 @@ class LossAggregator:
 
         aux: AuxLosses = model_output.aux
         total = ce_loss
+
+        # V24 information-bottleneck rate-distortion terms (§3.1). These are the
+        # honest "code rate" (KL[q(z|h)||N(0,I)]) and reconstruction distortion —
+        # active only on the V24 path (aux.rate is None on V23). Applied from
+        # Level 1 so the bottleneck learns its RD operating point from step 0.
+        if aux.rate is not None:
+            total = total + self.w_v24_rate * aux.rate
+        # V24 distortion warmup (VAE β-annealing): distortion = ||h_ctx−ĥ||² is
+        # computed over the UN-normalized h_ctx, so at init it scales with
+        # ||h_ctx||² (≈300, see the train log's loss vs masked_ce gap) and
+        # dominates CE (≈ln V ≈ 11) by ~30× — the same Goodhart class as V8's
+        # correction_alignment. The reconstruction head (decompress) is also not
+        # on the LM path (rate_up is), so letting it shape z early wastes the
+        # warmup gradient. Ramp its weight 0→full over warmup_steps: the LM
+        # signal via rate_up shapes z first, then the bottleneck learns to
+        # compress meaningful features. free_bits already prevents rate-collapse.
+        if aux.distortion is not None and self.w_v24_distortion > 0.0:
+            frac = min(1.0, step / max(1, self.warmup_steps))
+            total = total + (self.w_v24_distortion * frac) * aux.distortion
+        # V24 perception (RDP third axis). §10 Risk: the residual is large at
+        # init, so perception must β-anneal alongside distortion over warmup to
+        # avoid early domination. Ramp 0->full over warmup_steps (matching the
+        # distortion anneal above).
+        if aux.perception is not None and self.w_v24_perception > 0.0:
+            perc_frac = min(1.0, step / max(1, self.warmup_steps))
+            total = total + (self.w_v24_perception * perc_frac) * aux.perception
+
+        # V25 ternary-bias regularizer (§4) — only fires when the term is set
+        # (V25 path + opt-in w_ternary_bias > 0). Pushes ternary FP masters toward
+        # the {-1,0,+1} lattice so the per-output-channel absmean scale tracks a
+        # clean ternary point. Default-inert (ternary loss-free at scale, §10).
+        if aux.ternary_bias is not None and self.w_ternary_bias > 0.0:
+            total = total + self.w_ternary_bias * aux.ternary_bias
+
+        # V25 MoE load-balance (Switch-Transformer CV²) — only fires when the term
+        # is set (model.v25.moe_enabled). MoE is dropped by default (§8 YAGNI) so
+        # aux.moe_lb is None on the canonical path.
+        if aux.moe_lb is not None and self.w_moe_load_balance > 0.0:
+            total = total + self.w_moe_load_balance * aux.moe_lb
 
         # V12/V18: parity diversity is the FIRST codec-side loss to activate
         # (Level 1). It operates purely on the parity-check matrix H and does

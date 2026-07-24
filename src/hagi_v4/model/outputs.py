@@ -36,6 +36,20 @@ class AuxLosses:
     parity_diversity: torch.Tensor | None = None
     # V22: attention entropy penalty (prevents attention collapse)
     attn_entropy: torch.Tensor | None = None
+    # V24: genuine rate-distortion terms from the information bottleneck (§3.1).
+    # rate = KL[q(z|h)||N(0,I)] (the honest "code rate"); perception = residual
+    # autocorrelation (RDP axis). Only set on the V24 path.
+    rate: torch.Tensor | None = None
+    distortion: torch.Tensor | None = None
+    perception: torch.Tensor | None = None
+    # V25: ternary-bias regularizer (§4). A lattice-alignment penalty on the
+    # ternary FP masters so the per-output-channel absmean scale tracks a clean
+    # {-1,0,+1} point. Only set on the V25 path (None on V24/V23). 0-weight by
+    # default (ternary is loss-free at this scale); opt-in via w_ternary_bias.
+    ternary_bias: torch.Tensor | None = None
+    # V25: MoE load-balance loss (Switch-Transformer coefficient of variation).
+    # Only set when model.v25.moe_enabled (MoE is dropped by default — §8 YAGNI).
+    moe_lb: torch.Tensor | None = None
 
 
 @dataclass

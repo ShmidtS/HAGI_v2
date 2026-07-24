@@ -196,15 +196,17 @@ def _generate(
         else:
             input_ids = sequence[:, :current_len]
         T_input = input_ids.shape[1]
-        # V20: prediction_mask selects ONLY the last position for each row
-        # (next-token prediction). semantic_unknown_mask must be a superset
-        # of prediction_mask (model contract), so we mark the last position
-        # as unknown too. The model returns logits as [n_selected, V] where
-        # n_selected = prediction_mask.sum() = batch_size.
-        prediction_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
-        prediction_mask[:, -1] = True
-        semantic_unknown_mask = prediction_mask.clone()
+        # Causal next-token prediction (matches training): the model sees the
+        # REAL context — nothing is erased. semantic_unknown_mask is all-False
+        # (the old code marked the last position as unknown, which is how the
+        # MLM bidir path signals an erasure; in causal AR the last token IS the
+        # context and must NOT be erased — marking it unknown fed the model its
+        # learned unknown_embed instead of the real token, producing garbage).
+        # prediction_mask=all-True selects every position (model contract for
+        # causal), returning logits as [B*T, V]; we take the LAST per row below.
         valid_target_mask = torch.ones((batch_size, T_input), dtype=torch.bool, device=device)
+        prediction_mask = valid_target_mask.clone()
+        semantic_unknown_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
         physical_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
         output = model(
             input_ids,
@@ -220,8 +222,9 @@ def _generate(
         if output.logits is None:
             raise ValueError("model output must include logits")
 
-        # output.logits is [B, V] (one logit per row for the last position).
-        next_logits = output.logits  # [B, V]
+        # output.logits is [B*T, V] (causal selects all positions, row-major:
+        # row b*T + t). Take the LAST position per batch row -> [B, V].
+        next_logits = output.logits.view(batch_size, T_input, -1)[:, -1, :]
 
         # Zero out finished rows so they don't produce tokens.
         for r in range(batch_size):

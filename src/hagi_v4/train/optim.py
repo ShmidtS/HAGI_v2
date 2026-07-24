@@ -135,6 +135,21 @@ _MUON_EXCLUDE = frozenset(
         "router",
         "gate",
         "block_proj",
+        # V25 §5: rate-critical / source-codebook FP32 masters flow to AdamW.
+        # The ternary 2D body masters (qkv/out_proj/A0/A1/W/rate_up/predictor/
+        # update_proj/update_out/hep_feedback) are NOT here — they are 2D and
+        # ride Muon. Only the bottleneck KL/decoder linears and the multimodal
+        # source encoders stay FP32 (InformationBottleneck.FP32_PARAM_NAMES).
+        "to_mu",
+        "to_logvar",
+        "decompress",
+        "image_embed",
+        "audio_embed",
+        "shared_down",
+        "shared_up",
+        # uncertainty.log_var is 1D (already excluded by the 2D gate) but is
+        # also rate-critical; list it explicitly for clarity.
+        "log_var",
     }
 )
 

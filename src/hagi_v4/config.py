@@ -347,6 +347,83 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class V24PathConfig:
+    """V24 information-theoretic path (§3-§4 of ARCHITECTURE_V24.md).
+
+    When ``enabled`` is True, HAGIv4.forward routes the hidden state through the
+    variational InformationBottleneck + PredictiveDecoder instead of the V23
+    AWGN/LDPC physical channel. The V23 codec modules stay on disk as an
+    ablation path (enabled=False restores exact V23 behaviour).
+    """
+
+    enabled: bool = True
+    # Variational bottleneck H->C (§3.1). C defaults from model.core_hidden_size.
+    ib_beta: float = 1e-3  # rate Lagrangian
+    distortion_weight: float = 1.0
+    perception_weight: float = 0.01
+    kl_free_bits: float = 0.5
+    # Predictive decoder (§3.2). Reuses uncertainty.py for the K=P/(P+R) blend.
+    predictive_train_iterations: int = 2
+    predictive_infer_iterations: int = 4
+    predictive_convergence_threshold: float = 0.01
+    predictive_update_hidden: int = 256
+    use_kalman_blend: bool = True
+    # Hebbian bilinear FFN (§4.2) replacing the FFT token mixer.
+    hebbian_expansion: int = 4
+    hebbian_dropout: float = 0.0
+
+
+@dataclass
+class V25PathConfig:
+    """V25 ternary RD-channel path (ARCHITECTURE_V25.md).
+
+    When ``enabled`` is True (default), HAGIv4.forward routes the hidden state
+    through the ternary TransformerBlock body (BitNet b1.58) + variational
+    InformationBottleneck (KL is the only rate) + PredictiveDecoder (extrinsic
+    error highway + HEP). The ternary quantization noise is the genuine channel
+    impairment (no self-inflicted AWGN). The V23 AWGN/LDPC codec stays on disk
+    as an ablation path (``v25.enabled=False`` AND ``v24.enabled=False``); the
+    V24 dense path is retained for A/B comparison (``v25.enabled=False`` AND
+    ``v24.enabled=True``).
+    """
+
+    enabled: bool = True
+    # V25 main-path-bypass fix: the variational IB + PredictiveDecoder are OUT of
+    # the main LM signal path by default (inserting them deadlocked from-scratch
+    # training — ablation: dense-ternary w/o them learns masked_ce 11.4->0.39 in
+    # 200 steps; with them it stalls at ~11.2). bottleneck_in_path=True restores
+    # the failed original design for the ablation comparison only.
+    bottleneck_in_path: bool = False
+    use_ternary: bool = True  # BitNet b1.58 on the 2D body masters
+    # Variational bottleneck H->C (§3.2). C defaults from model.core_hidden_size.
+    ib_beta: float = 1e-3  # rate Lagrangian (the ONLY rate notion)
+    distortion_weight: float = 1.0
+    perception_weight: float = 0.01
+    kl_free_bits: float = 0.5
+    logvar_clamp: tuple[float, float] = (-10.0, 10.0)
+    distortion_eps: float = 1e-6
+    # Predictive decoder (§3.3): extrinsic error highway + HEP + Kalman blend.
+    predictive_train_iterations: int = 2
+    predictive_infer_iterations: int = 4
+    predictive_convergence_threshold: float = 0.01
+    predictive_update_hidden: int = 256
+    use_kalman_blend: bool = True
+    hep_enabled: bool = True  # Highway Error Propagation linear feedback V_t
+    # Hebbian bilinear FFN (the only ternary body token/channel mixer).
+    hebbian_expansion: int = 4
+    hebbian_dropout: float = 0.0
+    # Looped-depth: ternary context/expression stacks (§8 DEPTH).
+    context_layers: int = 8
+    expression_layers: int = 8
+    # Multimodal (§6): per-modality source encode + early sequence concat.
+    # Either this flag OR model.multimodal.enabled turns on the multimodal path.
+    multimodal_enabled: bool = False
+    # MoE: dropped in V25 (§8 YAGNI — dead in V24). Retained flag for opt-in
+    # ablation; the loss aggregator only applies MoE load-balance when enabled.
+    moe_enabled: bool = False
+
+
+@dataclass
 class ModelConfig:
     """Full model architecture configuration."""
 
@@ -379,6 +456,14 @@ class ModelConfig:
     exit_chart: EXITChartConfig | None = None
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
     lorentz_enabled: bool = False
+    # V24 information-theoretic path (default ON). Set enabled=False to restore
+    # the V23 AWGN/LDPC SCS codec for ablation.
+    v24: V24PathConfig = field(default_factory=V24PathConfig)
+    # V25 ternary RD-channel path (default ON — supersedes v24). When enabled
+    # the forward routes through ternary blocks + IB + PredictiveDecoder. Set
+    # enabled=False to fall back to v24 (dense) or v23 (AWGN/LDPC) ablation.
+    v25: V25PathConfig = field(default_factory=V25PathConfig)
+
 
 
 @dataclass
@@ -404,6 +489,21 @@ class TrainConfig:
     w_correction_alignment: float = 0.0
     w_rate_distortion: float = 0.005
     w_contrastive: float = 0.0
+    # V24: rate-distortion aux weights for the information bottleneck (§3.1).
+    # These mirror the v24-path config but live on TrainConfig so the loss
+    # aggregator can read them without touching model internals.
+    w_v24_rate: float = 1e-3
+    w_v24_distortion: float = 1.0
+    w_v24_perception: float = 0.01
+    # V25: ternary-bias regularizer (§4). Pushes ternary FP masters toward the
+    # {-1,0,+1} lattice so the per-output-channel absmean scale tracks a clean
+    # ternary point (low zero-fraction starvation + bounded saturated region).
+    # 0.0 = off (ternary is loss-free at this scale per §10). Active only on the
+    # V25 path (aux.ternary_bias is None on V24/V23).
+    w_ternary_bias: float = 0.0
+    # V25: MoE load-balance weight (§4). Only applied when model.v25.moe_enabled
+    # (MoE is dropped by default — §8 YAGNI). 0.0 keeps it inert.
+    w_moe_load_balance: float = 0.01
     # V12: parity-code diversity regularizer. V18 keeps the default 0.05
     # (V17 yaml bug set it to 0.0 — collapsed the LDPC graph).
     w_parity_diversity: float = 0.05
@@ -796,39 +896,76 @@ def validate_config(cfg: HAGIv4Config) -> None:
     if not 0 <= cfg.train.pad_token_id < cfg.model.vocab_size:
         raise ValueError("pad_token_id must be within the model vocabulary")
 
-    # V19 SCS invariants — protect against regressions discovered in V17/V18.
-    # 1. Train/infer BP asymmetry: infer must use MORE iterations than train
-    #    (the V13 win). If train >= infer, we are not doing asymmetric codec.
-    train_bp = getattr(cfg.train, "bp_iterations", None)
-    if train_bp is not None and type(train_bp) is int and train_bp >= cfg.model.refinement.num_iterations:
-        raise ValueError(
-            f"train.bp_iterations ({train_bp}) must be < refinement.num_iterations "
-            f"({cfg.model.refinement.num_iterations}). Train/infer BP asymmetry "
-            f"is a V13-vintage invariant — inference must use MORE BP iterations "
-            f"than training for recovery without gradient overhead."
-        )
-    # 2. AWGN sigma_end must be > 0 — channel never closes completely.
-    #    V17 bug: channel never opened because the schedule bottomed at 0.0.
-    if cfg.train.awgn_enabled and cfg.train.awgn_sigma_end <= 0.0:
-        raise ValueError(
-            "train.awgn_sigma_end must be > 0 when awgn_enabled. V17 regression: "
-            "channel_closed at sigma=0 broke the LDPC training signal entirely."
-        )
-    # 3. parity_diversity weight must be > 0 — prevents LDPC code collapse.
-    #    V17 YAML bug: w_parity_diversity=0.0 caused parity code to collapse
-    #    to a single edge per check.
-    if cfg.train.w_parity_diversity <= 0.0:
-        raise ValueError(
-            "train.w_parity_diversity must be > 0. V17 regression: a YAML bug "
-            "set this to 0.0 and the LDPC code collapsed (parity_metric=0.0096)."
-        )
-    # 4. AWGN sigma_start must be >= sigma_end (schedule goes from noisy to clean).
-    if cfg.train.awgn_enabled and cfg.train.awgn_sigma_start < cfg.train.awgn_sigma_end:
-        raise ValueError(
-            f"awgn_sigma_start ({cfg.train.awgn_sigma_start}) must be >= "
-            f"awgn_sigma_end ({cfg.train.awgn_sigma_end}). Schedule must go "
-            f"from noisy (high sigma) to clean (low sigma), not the reverse."
-        )
+    # V25 path selection. V25 (default ON) supersedes V24/V23. When v25.enabled
+    # is True the AWGN/LDPC codec invariants (sigma_end, code_rate, capacity,
+    # edges_per_check, parity_diversity, BP asymmetry) do NOT apply — those are
+    # properties of the self-inflicted AWGN channel V25 structurally removes
+    # (ARCHITECTURE_V25.md §9). They stay enforced for the V23 ablation path.
+    v25_enabled = bool(getattr(cfg.model, "v25", None) and cfg.model.v25.enabled)
+
+    # V25-specific invariants (§7). Honest for the V25 path; the AWGN/LDPC
+    # checks below are skipped because there is no physical channel on V25.
+    if v25_enabled:
+        v25 = cfg.model.v25
+        # 1. bottleneck_dim C < H — real compression (else no RD).
+        if not (0 < cfg.model.core_hidden_size < cfg.model.hidden_size):
+            raise ValueError(
+                f"V25: model.core_hidden_size ({cfg.model.core_hidden_size}) must satisfy "
+                f"0 < C < model.hidden_size ({cfg.model.hidden_size}). No compression => no RD."
+            )
+        # 4. predictive train/infer asymmetry (V13 win).
+        if not (v25.predictive_train_iterations < v25.predictive_infer_iterations):
+            raise ValueError(
+                f"V25: v25.predictive_train_iterations ({v25.predictive_train_iterations}) must be "
+                f"< v25.predictive_infer_iterations ({v25.predictive_infer_iterations}). "
+                f"Train/infer asymmetry is the V13 invariant."
+            )
+        # 5. attn-entropy floor > 0 when the weight is active (V22 collapse guard).
+        if cfg.train.w_attn_entropy > 0 and cfg.train.attn_entropy_floor <= 0.0:
+            raise ValueError(
+                "train.attn_entropy_floor must be > 0 when w_attn_entropy > 0. "
+                "V22 regression: floor=0 caused 677 attention collapse events."
+            )
+        # perception_weight is informational here (the aggregator applies it via
+        # w_v24_perception). Keep the V24 invariant honest for the RD terms.
+        if getattr(cfg.train, "w_v24_perception", 0.0) < 0.0:
+            raise ValueError("train.w_v24_perception must be >= 0 (RDP perception axis).")
+        # Skip the V19-V23 AWGN/LDPC/parity invariants — dead code on the V25
+        # path. They re-engage below when v25.enabled=False.
+    else:
+        # V19 SCS invariants — protect against regressions discovered in V17/V18.
+        # 1. Train/infer BP asymmetry: infer must use MORE iterations than train
+        #    (the V13 win). If train >= infer, we are not doing asymmetric codec.
+        train_bp = getattr(cfg.train, "bp_iterations", None)
+        if train_bp is not None and type(train_bp) is int and train_bp >= cfg.model.refinement.num_iterations:
+            raise ValueError(
+                f"train.bp_iterations ({train_bp}) must be < refinement.num_iterations "
+                f"({cfg.model.refinement.num_iterations}). Train/infer BP asymmetry "
+                f"is a V13-vintage invariant — inference must use MORE BP iterations "
+                f"than training for recovery without gradient overhead."
+            )
+        # 2. AWGN sigma_end must be > 0 — channel never closes completely.
+        #    V17 bug: channel never opened because the schedule bottomed at 0.0.
+        if cfg.train.awgn_enabled and cfg.train.awgn_sigma_end <= 0.0:
+            raise ValueError(
+                "train.awgn_sigma_end must be > 0 when awgn_enabled. V17 regression: "
+                "channel_closed at sigma=0 broke the LDPC training signal entirely."
+            )
+        # 3. parity_diversity weight must be > 0 — prevents LDPC code collapse.
+        #    V17 YAML bug: w_parity_diversity=0.0 caused parity code to collapse
+        #    to a single edge per check.
+        if cfg.train.w_parity_diversity <= 0.0:
+            raise ValueError(
+                "train.w_parity_diversity must be > 0. V17 regression: a YAML bug "
+                "set this to 0.0 and the LDPC code collapsed (parity_metric=0.0096)."
+            )
+        # 4. AWGN sigma_start must be >= sigma_end (schedule goes from noisy to clean).
+        if cfg.train.awgn_enabled and cfg.train.awgn_sigma_start < cfg.train.awgn_sigma_end:
+            raise ValueError(
+                f"awgn_sigma_start ({cfg.train.awgn_sigma_start}) must be >= "
+                f"awgn_sigma_end ({cfg.train.awgn_sigma_end}). Schedule must go "
+                f"from noisy (high sigma) to clean (low sigma), not the reverse."
+            )
 
     # V23 information-theoretic invariants — protect against regressions.
 
@@ -847,37 +984,44 @@ def validate_config(cfg: HAGIv4Config) -> None:
             "prevents cyclic loss oscillation from attention collapse."
         )
 
-    # 7. Channel code rate must be in (0, 1) — Shannon SCS constraint.
-    #    rate=0: no systematic bits (channel-only, useless). rate=1: no parity
-    #    bits (no error correction). Both violate Source-Channel Separation.
-    code_rate = cfg.model.codec.code_rate
-    if not 0.0 < code_rate < 1.0:
-        raise ValueError(
-            f"model.codec.code_rate ({code_rate}) must be in (0, 1). "
-            f"Shannon SCS: rate=0 means no systematic, rate=1 means no parity."
-        )
-
-    # 8. LDPC: each parity check must have at least 1 edge.
-    if cfg.model.codec.n_checks > 0 and cfg.model.codec.edges_per_check < 1:
-        raise ValueError(
-            f"model.codec.edges_per_check ({cfg.model.codec.edges_per_check}) "
-            f"must be >= 1. LDPC: each check needs at least 1 edge."
-        )
-
-    # 9. Shannon capacity at AWGN sigma_end must exceed code rate.
-    #    If capacity < rate, the channel cannot support the code — BP cannot
-    #    converge regardless of iterations. C = 0.5 * log2(1 + 1/sigma^2).
-    if cfg.train.awgn_enabled:
-        import math
-
-        sigma_end = cfg.train.awgn_sigma_end
-        capacity_end = 0.5 * math.log2(1.0 + 1.0 / max(sigma_end**2, 1e-10))
-        if capacity_end < code_rate:
+    # 7-9. LDPC / Shannon capacity invariants. These describe the V23 AWGN/LDPC
+    # physical channel (code_rate, edges_per_check, Shannon capacity at sigma_end).
+    # On the V25 path there is no physical channel — ternary quantization noise is
+    # the only impairment — so these invariants are structurally meaningless and
+    # are skipped when v25.enabled (ARCHITECTURE_V25.md §9). They stay enforced
+    # for the V23 ablation path.
+    if not v25_enabled:
+        # 7. Channel code rate must be in (0, 1) — Shannon SCS constraint.
+        #    rate=0: no systematic bits (channel-only, useless). rate=1: no parity
+        #    bits (no error correction). Both violate Source-Channel Separation.
+        code_rate = cfg.model.codec.code_rate
+        if not 0.0 < code_rate < 1.0:
             raise ValueError(
-                f"Shannon limit violated: awgn_sigma_end={sigma_end} gives "
-                f"capacity={capacity_end:.3f} bits/use < code_rate={code_rate}. "
-                f"Channel cannot support the code — BP cannot converge."
+                f"model.codec.code_rate ({code_rate}) must be in (0, 1). "
+                f"Shannon SCS: rate=0 means no systematic, rate=1 means no parity."
             )
+
+        # 8. LDPC: each parity check must have at least 1 edge.
+        if cfg.model.codec.n_checks > 0 and cfg.model.codec.edges_per_check < 1:
+            raise ValueError(
+                f"model.codec.edges_per_check ({cfg.model.codec.edges_per_check}) "
+                f"must be >= 1. LDPC: each check needs at least 1 edge."
+            )
+
+        # 9. Shannon capacity at AWGN sigma_end must exceed code rate.
+        #    If capacity < rate, the channel cannot support the code — BP cannot
+        #    converge regardless of iterations. C = 0.5 * log2(1 + 1/sigma^2).
+        if cfg.train.awgn_enabled:
+            import math
+
+            sigma_end = cfg.train.awgn_sigma_end
+            capacity_end = 0.5 * math.log2(1.0 + 1.0 / max(sigma_end**2, 1e-10))
+            if capacity_end < code_rate:
+                raise ValueError(
+                    f"Shannon limit violated: awgn_sigma_end={sigma_end} gives "
+                    f"capacity={capacity_end:.3f} bits/use < code_rate={code_rate}. "
+                    f"Channel cannot support the code — BP cannot converge."
+                )
 
     # 10. HRM stride must divide sequence length for clean spatial coarsening.
     hrm_cfg = getattr(cfg.model, "hrm", None)
