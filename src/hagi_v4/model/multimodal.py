@@ -1,51 +1,43 @@
-"""MultimodalFusion (V25) — separable source coding + shared subspace (§3.4).
+"""MultimodalFusion — separable source coding + shared subspace.
 
-Replaces V24's ``MultimodalInput`` (naive concat + additive ``modality_embed``).
 Separate source coding theorem -> one factorized source encoder per modality
-(text reuses the shared ``ConvEmbedding``; image = ViT patch Linear; audio = mel
-Linear). MultiLoReFT (arXiv 2607.16789) -> an explicit cross-modal alignment via
-a shared subspace, with the residual kept modality-specific and gated by a
-learned inverse-variance head (uncertain modality contributes less of its
-specific residual; the shared subspace is always kept).
+(text reuses the shared ``ConvEmbedding``; image = ViT patch Linear; audio =
+mel Linear). An explicit cross-modal alignment via a shared subspace, with the
+residual kept modality-specific and gated by a learned inverse-variance head
+(uncertain modality contributes less of its specific residual; the shared
+subspace is always kept).
 
 All parameters here are FP32 source-codebook / 1D heads: they are routed to
 AdamW (the names ``image_embed`` / ``audio_embed`` / ``shared_down`` /
 ``shared_up`` / ``log_var`` / ``embed`` are in ``_MUON_EXCLUDE``). Nothing in
 this module is ternary — the source codebook is rate-critical.
 
-Forward signature matches the V24 ``MultimodalInput`` for drop-in use:
-``forward(input_ids, images, spectrograms) -> (h, modality_ids, lengths)``.
+Forward: ``forward(input_ids, images, spectrograms) -> (h, modality_ids, lengths)``.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from hagi_v4.config import HAGIv4Config
+from hagi_v4.config import Config
 
 
 def _inv_var_gate(h: torch.Tensor, log_var_head: nn.Module) -> torch.Tensor:
     """Learned inverse-variance gate in (0, 1).
 
-    ``logit = log_var_head(h).squeeze(-1)`` is an unbounded log-variance estimate.
-    The gate ``sigmoid(-logit)`` keeps the modality-specific residual when the
-    modality is confident (low variance -> logit < 0 -> gate -> 1) and suppresses
-    it when uncertain (high variance -> gate -> 0). Bounded, differentiable, and
-    never rescales the shared subspace (which is always kept additively).
+    ``sigmoid(-logit)`` keeps the modality-specific residual when the modality
+    is confident (low variance -> gate -> 1) and suppresses it when uncertain.
+    Bounded, differentiable, and never rescales the shared subspace.
     """
     logit = log_var_head(h).squeeze(-1)
     return torch.sigmoid(-logit.float()).to(h.dtype)
 
 
 class _InvVarHead(nn.Module):
-    """Per-position scalar log-variance estimator (1D Linear -> softplus-free).
+    """Per-position scalar log-variance estimator.
 
-    The raw output IS the log-variance; ``sigmoid(-logit)`` turns it into a
-    bounded [0, 1] gate. Zero-bias init keeps the gate at ``sigmoid(0)=0.5`` at
-    start (neutral: half the specific residual kept) so the shared subspace and
-    the specific residual are both live from step 0.
+    Zero-bias init keeps the gate at ``sigmoid(0)=0.5`` at start (neutral).
     """
 
     def __init__(self, hidden_size: int) -> None:
@@ -70,7 +62,7 @@ class MultimodalFusion(nn.Module):
 
     NUM_MODALITIES = 3
 
-    def __init__(self, cfg: HAGIv4Config, text_encoder: nn.Module | None = None) -> None:
+    def __init__(self, cfg: Config, text_encoder: nn.Module | None = None) -> None:
         super().__init__()
         m = cfg.model
         H = m.hidden_size
@@ -79,7 +71,6 @@ class MultimodalFusion(nn.Module):
         self.image_patch_size = mm.image_patch_size
         self.audio_n_mels = mm.audio_mel_bins
 
-        # Text source encoder: shared with the main model when provided.
         if text_encoder is not None:
             self.text_embed = text_encoder
             self._text_shared = True
@@ -105,21 +96,16 @@ class MultimodalFusion(nn.Module):
         nn.init.normal_(self.shared_down.weight, std=1.0 / max(H, 1))
         nn.init.zeros_(self.shared_up.weight)
 
-        # Image / audio source encoders (FP source codebook, FP32 -> AdamW).
         self.image_embed = nn.Linear(mm.image_channels * self.image_patch_size**2, H, bias=False)
         self.audio_embed = nn.Linear(self.audio_n_mels, H, bias=False)
 
-        # Per-modality inverse-variance gates (1D heads, FP).
         self.text_unc = _InvVarHead(H)
         self.image_unc = _InvVarHead(H)
         self.audio_unc = _InvVarHead(H)
 
-        # Modality type embeddings (additive; the OFDM-subcarrier analog so the
-        # channel can attribute positions to modalities).
         self.modality_embeds = nn.Parameter(torch.zeros(self.NUM_MODALITIES, H))
         nn.init.normal_(self.modality_embeds, std=mm.modality_embed_std)
 
-        # Sinusoid-free learned positional embeddings for the continuous modalities.
         pos_std = 1.0 / (H**0.5)
         self.image_pos_embed = nn.Parameter(torch.zeros(mm.max_image_patches, H))
         nn.init.normal_(self.image_pos_embed, std=pos_std)
@@ -127,13 +113,7 @@ class MultimodalFusion(nn.Module):
         nn.init.normal_(self.audio_pos_embed, std=pos_std)
 
     def _fuse(self, h: torch.Tensor, unc: nn.Module) -> torch.Tensor:
-        """Shared/specific split + inverse-variance gating of the specific residual.
-
-        ``z_shared = shared_up(shared_down(h))`` (zero at init); the specific
-        residual ``h - z_shared`` is gated by the learned inv-var gate so an
-        uncertain modality contributes less of its private signal. The shared
-        subspace is always kept (cross-modal alignment is never dropped).
-        """
+        """Shared/specific split + inverse-variance gating of the specific residual."""
         z_shared = self.shared_up(self.shared_down(h))
         z_specific = h - z_shared
         gate = _inv_var_gate(h, unc).unsqueeze(-1)
@@ -205,7 +185,3 @@ class MultimodalFusion(nn.Module):
             "audio": T_a,
         }
         return h, modality_ids, lengths
-
-    def get_mask_embed(self, modality_id: int) -> torch.Tensor:
-        """Unused in V25 (no additive mask embed; kept for call-site parity)."""
-        return self.modality_embeds[modality_id]

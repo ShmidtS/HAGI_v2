@@ -1,9 +1,12 @@
-"""V24 transformer block: attention + Hebbian bilinear FFN, UniLM modes.
+"""Ternary transformer block: attention + Hebbian bilinear FFN, UniLM modes.
 
 Self-contained additive module. Selects attention_mode per call
 (bidir / causal / prefix / soft_causal) so a single stack supports both
-efficient masked training and AR generation. The token/channel mixer is
-the HebbianBilinearFFN (hebbian-mlps) instead of a dense FFT block.
+masked training and causal AR generation. The token/channel mixer is the
+HebbianBilinearFFN (hebbian-mlps). Only the 2D hidden mixing matrices are
+ternarized via ``BitLinear`` (BitNet b1.58) when ``use_ternary``; everything
+that must stay FP (RMSNorm gains, RoPE inv_freq, attn_norm, entropy-floor
+math, the FFN gate) is untouched.
 """
 
 from __future__ import annotations
@@ -15,14 +18,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hagi_v4.model.hebbian_ffn import HebbianFFNConfig
-from hagi_v4.model.hebbian_ffn import HebbianBilinearFFN
 from hagi_v4.model.norms import RMSNorm
+from hagi_v4.model.ternary import BitLinear
+
 
 @dataclass
 class AttentionConfig:
-    """Local attention config for the V24 block (does not touch V21 config)."""
+    """Local attention config for the ternary block."""
 
-    num_heads: int = 6
+    num_heads: int = 8
     head_dim: int = 64
     rope_theta: float = 10000.0
     attn_entropy_floor: float = 0.5  # prevent attention collapse
@@ -87,17 +91,26 @@ def _build_soft_causal_mask(T: int, beta: float, device: torch.device, dtype: to
     return (-beta * dist.float().to(dtype)).unsqueeze(0).unsqueeze(0)
 
 
+def _proj(hidden_size_in: int, hidden_size_out: int, bias: bool, use_ternary: bool) -> nn.Module:
+    """Pick a 2D hidden-weight projection: BitLinear (ternary) or nn.Linear (FP)."""
+    if use_ternary:
+        return BitLinear(hidden_size_in, hidden_size_out, bias=bias)
+    return nn.Linear(hidden_size_in, hidden_size_out, bias=bias)
+
+
 class Attention(nn.Module):
     """Pre-norm MHA + RoPE with bidir / causal / prefix / soft_causal modes."""
 
-    def __init__(self, hidden_size: int, cfg: AttentionConfig, norm_eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, cfg: AttentionConfig, norm_eps: float = 1e-6, use_ternary: bool = True) -> None:
         super().__init__()
+        if hidden_size % cfg.num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={cfg.num_heads}")
         self.hidden_size = hidden_size
         self.n_heads = cfg.num_heads
         self.head_dim = hidden_size // cfg.num_heads
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.qkv = _proj(hidden_size, 3 * hidden_size, bias=False, use_ternary=use_ternary)
+        self.out_proj = _proj(hidden_size, hidden_size, bias=False, use_ternary=use_ternary)
         nn.init.normal_(self.out_proj.weight, std=0.02)
         self.rope = RotaryEmbedding(self.head_dim, rope_theta=cfg.rope_theta)
         self.attn_entropy_floor = float(cfg.attn_entropy_floor)
@@ -140,11 +153,6 @@ class Attention(nn.Module):
         entropy_pen = None
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
 
-        # Attention-entropy floor penalty (anti-collapse). Computed with a
-        # cheap fused/SDPA-friendly path: run the same attention once to get
-        # probabilities and recombine v — no separate [B,H,T,T] materialization
-        # held for the main output (the SDPA path above is fused/Flash where
-        # available). The penalty is only needed for autograd at train time.
         if self.attn_entropy_floor > 0.0 and self.training:
             scores = (q @ k.transpose(-2, -1)) * scale
             if attn_mask is not None:
@@ -161,13 +169,43 @@ class Attention(nn.Module):
         return self.out_proj(attn_out), entropy_pen
 
 
-class TransformerBlock(nn.Module):
-    """Pre-norm attention + HebbianBilinearFFN with residual."""
+class HebbianBilinearFFN(nn.Module):
+    """Ternary Hebbian bilinear FFN: phi(h)=(A0 h) (.) silu(A1 h); out=W(phi)*(1+tanh(gate))."""
 
-    def __init__(self, hidden_size: int, attn_cfg: AttentionConfig, ffn_cfg: HebbianFFNConfig, norm_eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, cfg: HebbianFFNConfig, norm_eps: float = 1e-6, use_ternary: bool = True) -> None:
         super().__init__()
-        self.attn = Attention(hidden_size, attn_cfg, norm_eps)
-        self.ffn = HebbianBilinearFFN(hidden_size, ffn_cfg, norm_eps)
+        self.hidden_size = hidden_size
+        m = cfg.expansion * hidden_size
+        self.m = m
+        self.norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.A0 = _proj(hidden_size, m, bias=False, use_ternary=use_ternary)
+        self.A1 = _proj(hidden_size, m, bias=False, use_ternary=use_ternary)
+        self.W = _proj(m, hidden_size, bias=False, use_ternary=use_ternary)
+        self.gate = nn.Parameter(torch.zeros(hidden_size))
+        self.dropout = nn.Dropout(cfg.dropout)
+        nn.init.normal_(self.W.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        phi = self.A0(h) * F.silu(self.A1(h))
+        phi = self.dropout(phi)
+        return x + self.W(phi) * (1.0 + torch.tanh(self.gate))
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm ternary attention + HebbianBilinearFFN with residual."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        attn_cfg: AttentionConfig,
+        ffn_cfg: HebbianFFNConfig,
+        norm_eps: float = 1e-6,
+        use_ternary: bool = True,
+    ) -> None:
+        super().__init__()
+        self.attn = Attention(hidden_size, attn_cfg, norm_eps, use_ternary=use_ternary)
+        self.ffn = HebbianBilinearFFN(hidden_size, ffn_cfg, norm_eps, use_ternary=use_ternary)
         self._last_attn_entropy_penalty: torch.Tensor | None = None
 
     def set_attn_entropy_floor(self, floor: float) -> None:

@@ -1,10 +1,7 @@
-"""HAGI V4 training entry point. All params from YAML config.
-
-Reads .bin token files from data/ directory using mix.json ratios.
-Performs embedding transfer + online KL distillation from SmolLM2.
+"""HAGI training entry point. All params come from the YAML config.
 
 Usage:
-    python scripts/train_v4.py --config configs/8gb_canonical.yaml
+    python scripts/train_v4.py --config configs/smollm2.yaml
     python scripts/train_v4.py --dry-run
     python scripts/train_v4.py --no-distill
     python scripts/train_v4.py --data-dir data --steps 50000
@@ -29,12 +26,10 @@ def setup_file_logging(log_dir: str = "logs") -> str:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    # Console handler
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     root.addHandler(ch)
-    # File handler
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
@@ -46,27 +41,20 @@ logger = logging.getLogger(__name__)
 
 
 def format_training_metrics(metrics: dict) -> str:
-    loss = metrics["loss"]
-    bits_per_token = metrics.get("bpt", float("nan"))
-    conf = metrics.get("avg_confidence", 0.0)
-    correction = metrics.get("correction_alignment", 0.0)
-    par = metrics.get("parity", 0.0)
-    par_div = metrics.get("parity_diversity", float("nan"))
     return (
-        f"step {metrics['step']} | loss={loss:.4f} | bpt={bits_per_token:.2f} | "
+        f"step {metrics['step']} | loss={metrics['loss']:.4f} | bpt={metrics.get('bpt', float('nan')):.2f} | "
         f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
-        f"conf={conf:.3f} | correction={correction:.4f} | par={par:.4f} | "
-        f"par_div={par_div:.4f} | "
+        f"conf={metrics.get('avg_confidence', 0.0):.3f} | "
         f"masked_ce={metrics.get('masked_ce', float('nan')):.4f} | "
-        f"suffix_ce={metrics.get('suffix_ce', float('nan')):.4f} | "
-        f"top2={metrics.get('top2_mass', float('nan')):.4f} | "
+        f"rate={metrics.get('rate', float('nan')):.4f} | "
+        f"distortion={metrics.get('distortion', float('nan')):.4f} | "
         f"entropy={metrics.get('posterior_entropy', float('nan')):.4f}"
     )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="HAGI V4 training on real data")
-    parser.add_argument("--config", default="configs/8gb_canonical.yaml")
+    parser = argparse.ArgumentParser(description="HAGI training on real data")
+    parser.add_argument("--config", default="configs/smollm2.yaml")
     parser.add_argument("--data-dir", default="data", help="Directory with .bin files + mix.json")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--steps", type=int, default=None, help="Override max_steps")
@@ -80,9 +68,7 @@ def main() -> int:
         nargs="?",
         const="latest",
         default=None,
-        help="Resume from checkpoint. Bare '--resume' picks the latest step-*.pt; "
-        "'--resume PATH' loads a specific one. Restores model + optimizer state and "
-        "continues training from completed_updates.",
+        help="Resume from checkpoint. Bare '--resume' picks the latest step-*.pt.",
     )
     args = parser.parse_args()
 
@@ -90,14 +76,13 @@ def main() -> int:
     logger.info(f"Log file: {log_path}")
 
     from hagi_v4.config import load_config
-    from hagi_v4.model.hagi_v4 import HAGIv4
-    from hagi_v4.model.masking import create_physical_corruption_mask, create_semantic_corruption
+    from hagi_v4.model.model import HAGI
 
     overrides = {}
     if args.steps is not None:
         overrides["train.max_steps"] = args.steps
     if args.no_distill:
-        overrides["train.distill_enabled"] = False
+        overrides["train.distill.enabled"] = False
     if args.checkpoint_dir is not None:
         overrides["train.checkpoint_dir"] = args.checkpoint_dir
     cfg = load_config(path=args.config, **overrides)
@@ -114,17 +99,15 @@ def main() -> int:
     logger.info(f"Device: {device} | Config: {args.config} | Data: {args.data_dir}")
 
     teacher = None
-    if cfg.train.distill_enabled is True:
+    if cfg.train.distill.enabled is True:
         from hagi_v4.train.distillation import create_distillation_teacher
 
         teacher = create_distillation_teacher(cfg, device)
 
-    model = HAGIv4(cfg).to(device)
+    model = HAGI(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Parameters: {n_params / 1e6:.1f}M")
 
-    # Resume: load model weights + start step (+ optimizer state below). On a
-    # fresh run start_step=0 and optimizer_state=None — identical to before.
     start_step = 0
     optimizer_state = None
     if args.resume is not None:
@@ -138,40 +121,33 @@ def main() -> int:
         optimizer_state = load_checkpoint_payload(ckpt_path, str(device)).get("optimizer")
         logger.info(f"Resumed from {ckpt_path} at step {completed} (optimizer state: {'yes' if optimizer_state else 'no'})")
 
-    if cfg.train.distill_enabled is True and not args.no_embed_transfer and start_step == 0:
+    if cfg.train.distill.enabled is True and not args.no_embed_transfer and start_step == 0:
         from hagi_v4.train.distillation import transfer_embeddings
 
-        transfer_embeddings(model, cfg.train.distill_embed_teacher)
+        transfer_embeddings(model, cfg.train.distill.embed_teacher)
 
     if args.dry_run:
         B, T = 2, min(cfg.train.seq_len, 128)
         input_ids = torch.randint(0, cfg.model.vocab_size, (B, T), device=device)
-        targets = input_ids.clone()
         valid_target_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        semantic_unknown_mask, prediction_mask, _ = create_semantic_corruption(
-            valid_target_mask,
-            random_ratio=cfg.model.masking.mask_ratio,
-        )
-        physical_corruption_mask = create_physical_corruption_mask(input_ids, cfg.model.masking.mask_ratio)
         from hagi_v4.train.losses import LossAggregator
 
         aggregator = LossAggregator(cfg)
         model.train()
         output = model(
             input_ids,
-            targets=targets,
-            semantic_unknown_mask=semantic_unknown_mask,
-            prediction_mask=prediction_mask,
+            targets=input_ids.clone(),
+            semantic_unknown_mask=torch.zeros_like(valid_target_mask),
+            prediction_mask=valid_target_mask,
             valid_target_mask=valid_target_mask,
-            physical_corruption_mask=physical_corruption_mask,
+            attention_mode="causal",
         )
-        total_loss = aggregator(output, targets, prediction_mask, step=0)
+        total_loss = aggregator(output, step=0)
         logger.info(f"Loss: {total_loss.item():.4f}")
         if device.type == "cuda":
             logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
         return 0
 
-    # Build sequential cycling dataloader (v1-style curriculum)
     from hagi_v4.data.sequential import build_sequential_dataloader
 
     dataloader = build_sequential_dataloader(cfg, data_dir=args.data_dir)
@@ -181,20 +157,15 @@ def main() -> int:
 
     logger.info(f"Training: {cfg.train.max_steps} steps, B={cfg.train.batch_size} T={cfg.train.seq_len}")
     if teacher is not None and teacher.is_loaded:
-        distill_end = int(cfg.train.max_steps * cfg.train.distill_end_frac)
+        distill_end = int(cfg.train.max_steps * cfg.train.distill.end_frac)
         logger.info(
             f"Distillation: steps 0->{distill_end} "
-            f"(alpha {cfg.train.distill_alpha_start}->{cfg.train.distill_alpha_end}, T={cfg.train.distill_temperature})"
+            f"(alpha {cfg.train.distill.alpha_start}->{cfg.train.distill.alpha_end}, T={cfg.train.distill.temperature})"
         )
 
     for metrics in train(
-        model,
-        dataloader,
-        cfg,
-        log_interval=1,
-        teacher=teacher,
-        start_step=start_step,
-        optimizer_state=optimizer_state,
+        model, dataloader, cfg, log_interval=1, teacher=teacher,
+        start_step=start_step, optimizer_state=optimizer_state,
     ):
         logger.info(format_training_metrics(metrics))
     logger.info("Training complete.")

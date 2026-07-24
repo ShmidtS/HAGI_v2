@@ -38,9 +38,9 @@ class TeacherHidden:
 
 def create_distillation_teacher(cfg, device: torch.device):
     """Create and load the canonical teacher when distillation is enabled."""
-    if cfg.train.distill_enabled is not True:
+    if cfg.train.distill.enabled is not True:
         return None
-    teacher = DistillationTeacher(cfg.train.distill_teacher)
+    teacher = DistillationTeacher(cfg.train.distill.teacher)
     teacher.load()
     if teacher.is_loaded and device.type == "cuda":
         logger.info(f"Teacher VRAM: {torch.cuda.memory_allocated() / 1e9:.3f} GB")

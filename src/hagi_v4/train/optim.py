@@ -124,22 +124,18 @@ class CombinedOptimizer:
 _MUON_EXCLUDE = frozenset(
     {
         "embed",
-        "lm_head",
-        "core_lm_head",
         "lm_compress",
         "lm_expand",
         "token_compress",
         "token_expand",
-        "mask_embed",
         "norm",
         "router",
         "gate",
-        "block_proj",
-        # V25 §5: rate-critical / source-codebook FP32 masters flow to AdamW.
-        # The ternary 2D body masters (qkv/out_proj/A0/A1/W/rate_up/predictor/
+        # Rate-critical / source-codebook FP32 masters flow to AdamW. The
+        # ternary 2D body masters (qkv/out_proj/A0/A1/W/rate_up/predictor/
         # update_proj/update_out/hep_feedback) are NOT here — they are 2D and
-        # ride Muon. Only the bottleneck KL/decoder linears and the multimodal
-        # source encoders stay FP32 (InformationBottleneck.FP32_PARAM_NAMES).
+        # ride Muon. Only the bottleneck KL/decoder linears, the multimodal
+        # source encoders, and the learned-uncertainty head stay FP32.
         "to_mu",
         "to_logvar",
         "decompress",
@@ -147,8 +143,6 @@ _MUON_EXCLUDE = frozenset(
         "audio_embed",
         "shared_down",
         "shared_up",
-        # uncertainty.log_var is 1D (already excluded by the 2D gate) but is
-        # also rate-critical; list it explicitly for clarity.
         "log_var",
     }
 )

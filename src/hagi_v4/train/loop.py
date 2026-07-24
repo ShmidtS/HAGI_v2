@@ -1,11 +1,15 @@
-"""Training loop for HAGI V8.
+"""Training loop for the ternary RD-channel LM.
 
-V8 changes vs V7:
-  1. Simplified loss hierarchy (3 levels, 4 aux instead of 7)
-  2. FOXP2 made optional (disabled by default for clean from-scratch)
-  3. No frozen embeddings (trainable from scratch)
-  4. Distillation optional (not required for basic training)
-  5. AWGN annealing preserved (channel robustness)
+The model is a CAUSAL generative LM: every batch trains next-token prediction
+with a causal (or causal-dominant) attention mask, exactly matching the
+inference path. There is no bidir-MLM/suffix/parity/AWGN machinery — those
+belonged to the abandoned self-inflicted-channel design and broke the
+train/infer alignment.
+
+Attention-mode curriculum: causal is dominant from step 0 (the inference
+regime); a small soft_causal/bidir slice adds a denser representation
+gradient early and is ramped out by mid-training. This avoids the
+out-of-distribution-at-generation failure of pure-bidir warmup.
 """
 
 from __future__ import annotations
@@ -19,52 +23,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from hagi_v4.config import HAGIv4Config
-from hagi_v4.model.masking import (
-    adaptive_mask_ratio,
-    create_physical_corruption_mask,
-    create_semantic_corruption,
-    progressive_mask_ratio,
-)
-from hagi_v4.train.losses import LossAggregator, selected_cross_entropy, suffix_cross_entropy
+from hagi_v4.config import Config
+from hagi_v4.train.losses import LossAggregator
 from hagi_v4.train.optim import CombinedOptimizer, build_optimizer
 
 logger = logging.getLogger(__name__)
 
 
-def _suffix_probability(step: int, cfg: HAGIv4Config) -> float:
-    """V18 suffix curriculum — conservative (language-first, generate-late).
-
-    Early (step < 2*warmup): base 0.30 (V15 language-win regime).
-    Mid (2*warmup .. 80%*max_steps): stay at base — focus on language.
-    Late (>= 80%*max_steps): ramp to 0.85 to align with LLaDA generation.
-
-    V17 error: ramped to 0.7 by step 10k which killed suffix_ce early.
-    V18 keeps suffix low while language is being learned, ramps only at the
-    end to match the inference distribution.
-    """
-    base = float(getattr(cfg.train, "suffix_probability", 0.30))
-    early_end = 2 * max(int(getattr(cfg.train, "warmup_steps", 1000)), 1)
-    late_start = int(cfg.train.max_steps * 0.80)
-    if step < early_end:
-        return base
-    if step < late_start:
-        return base
-    # Phase 3: linear ramp base -> 0.85 over the final 20% of training.
-    span = max(cfg.train.max_steps - late_start, 1)
-    t = (step - late_start) / span
-    return base + t * (0.85 - base)
-
-
 def configure_runtime() -> None:
     import os
 
-    # V12: ``garbage_collection_threshold`` triggers CUDA GC when the
-    # caching allocator's reserved memory exceeds this fraction of total
-    # VRAM. Without it, fragmentation from varying-size prediction masks
-    # (n_predicted positions change every step) causes reserved memory to
-    # grow unboundedly. Combined with ``expandable_segments:True`` this
-    # keeps reserved memory bounded.
+    # Bounded caching allocator: varying prediction sizes fragment Windows
+    # VRAM without this; empty_cache() every step keeps reserved bounded.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.6")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -73,26 +43,13 @@ def configure_runtime() -> None:
 
 
 def _maybe_release_caches(step: int, interval: int = 1) -> None:
-    """V12: release PyTorch's caching allocator reserved-but-unused memory.
-
-    On Windows ``expandable_segments`` is unsupported, so the caching
-    allocator cannot grow segments dynamically — it must reserve whole
-    blocks. When prediction mask sizes vary step-to-step (different
-    n_predicted positions), the allocator fragments: freed blocks from
-    a large step cannot satisfy a small step's request, so it reserves
-    MORE memory. Observed: reserved grew 0.16 → 9.3 GB over 100 steps
-    without this call; with it, reserved stays at ~1 GB.
-
-    ``empty_cache()`` is ~1 ms on RTX 3070, negligible vs the ~1.3 s
-    per-step training cost.
-    """
     if interval <= 0:
         return
     if step > 0 and step % interval == 0 and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
-def lr_at(step: int, cfg: HAGIv4Config) -> float:
+def lr_at(step: int, cfg: Config) -> float:
     """Linear warmup from 0, then stable, then cosine decay to 10% floor."""
     tc = cfg.train
     warmup = tc.warmup_steps
@@ -105,15 +62,12 @@ def lr_at(step: int, cfg: HAGIv4Config) -> float:
         return base_lr
     decay_steps = max(max_steps - stable_end, 1)
     progress = (step - stable_end) / decay_steps
-    # V20: cosine decay to 10% floor (not 0) so late-stage training
-    # still makes progress. V19 decayed to 0, causing the late collapse
-    # (mce 3.0 -> 5.7 after step 1000).
     min_lr_ratio = 0.1
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
-def muon_lr_at(step: int, cfg: HAGIv4Config) -> float:
-    """Linear warmup from 0, then stable, then cosine decay to 10% floor for Muon."""
+def muon_lr_at(step: int, cfg: Config) -> float:
+    """Muon LR schedule (same shape as lr_at, scaled to muon_lr)."""
     tc = cfg.train
     warmup = tc.warmup_steps
     max_steps = tc.max_steps
@@ -129,8 +83,7 @@ def muon_lr_at(step: int, cfg: HAGIv4Config) -> float:
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
-def set_lr(optimizer: CombinedOptimizer, step: int, cfg: HAGIv4Config) -> None:
-    """Apply LR schedule to optimizer param_groups."""
+def set_lr(optimizer: CombinedOptimizer, step: int, cfg: Config) -> None:
     lr_adam = lr_at(step, cfg)
     lr_muon = muon_lr_at(step, cfg)
     for group in optimizer.param_groups:
@@ -145,7 +98,6 @@ def cast_to_bf16(model: nn.Module) -> None:
 
 
 def gradient_stats(model: nn.Module, train_cfg) -> tuple[float, float]:
-    """Report raw global norm and element RMS, then optionally clip."""
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return 0.0, 0.0
@@ -159,44 +111,67 @@ def gradient_stats(model: nn.Module, train_cfg) -> tuple[float, float]:
     return raw_norm, grad_rms
 
 
-def _two_phase_mask_ratio(step: int, cfg: HAGIv4Config) -> float:
-    """Three-phase mask ratio for LLaDA-compatible masked LM."""
-    if not cfg.train.use_two_phase_schedule:
-        return cfg.model.masking.mask_ratio
-    max_steps = cfg.train.max_steps
-    split1 = int(max_steps * cfg.train.two_phase_split)
-    split2 = int(max_steps * 0.8)
-    if step < split1:
-        return cfg.train.phase1_mask_ratio
-    if step < split2:
-        return cfg.train.phase2_mask_ratio
-    return getattr(cfg.train, "phase3_mask_ratio", 0.50)
+def _sample_attention_mode(step: int, cfg: Config) -> tuple[str, float | None]:
+    """Causal-dominant attention-mode curriculum.
+
+    Returns (attention_mode, soft_beta). Causal is the inference regime and is
+    dominant from step 0; soft_causal/bidir add a denser representation
+    gradient early and are ramped out by mid-training.
+    """
+    warmup = max(int(cfg.train.warmup_steps), 1)
+    stable_end = int(cfg.train.max_steps * 0.8)
+    progress = min(1.0, step / warmup)
+    late = min(1.0, step / max(stable_end, 1))
+    r = float(torch.rand(1).item())
+    causal_prob = 0.50 + 0.10 * late
+    soft_prob = 0.30 + 0.10 * late
+    if r < causal_prob:
+        return "causal", None
+    if r < causal_prob + soft_prob:
+        return "soft_causal", 0.5 + progress * 2.5
+    return "bidir", None
+
+
+def _causal_next_token_loss(output, input_ids, targets, valid_target_mask):
+    """Next-token shifted CE from flat logits/indices for causal-style modes.
+
+    For causal/prefix/soft_causal the model selects ALL valid positions and
+    returns logits as [n_valid, V]; we shift targets by one to form the
+    next-token objective that matches inference.
+    """
+    T = input_ids.size(1)
+    idx = output.prediction_indices.to(output.logits.device)
+    t = idx % T
+    keep = t < (T - 1)
+    if not keep.any():
+        return output.logits.new_zeros(())
+    idx_keep = idx[keep]
+    target_idx = idx_keep + 1
+    shift_logits = output.logits[keep]
+    shift_targets = targets.view(-1).index_select(0, target_idx.to(targets.device)).to(shift_logits.device)
+    target_valid = (
+        valid_target_mask.view(-1)
+        .index_select(0, target_idx.to(valid_target_mask.device))
+        .to(shift_logits.device)
+    )
+    if target_valid.any():
+        return F.cross_entropy(shift_logits[target_valid], shift_targets[target_valid])
+    return output.logits.new_zeros(())
 
 
 def train_step(
     model: nn.Module,
     microbatches: list[dict],
     optimizer: CombinedOptimizer,
-    cfg: HAGIv4Config,
+    cfg: Config,
     step: int,
     teacher=None,
     loss_aggregator: LossAggregator | None = None,
-    mask_warmup_steps: int = 20000,
-    adaptive_mask_state: dict | None = None,
     distill_end_step: int = 0,
 ) -> dict:
-    """Single training step with gradient accumulation."""
+    """Single training step with gradient accumulation (causal next-token)."""
     model.train()
     device = next(model.parameters()).device
-    mc = cfg.model.masking
-    if mc.use_adaptive_erasure and adaptive_mask_state is not None:
-        mask_ratio = adaptive_mask_state.get("ratio", mc.mask_ratio)
-    elif cfg.train.use_two_phase_schedule:
-        mask_ratio = _two_phase_mask_ratio(step, cfg)
-    elif mc.use_progressive:
-        mask_ratio = progressive_mask_ratio(step, mask_warmup_steps, 0.15, mc.mask_ratio)
-    else:
-        mask_ratio = mc.mask_ratio
     if loss_aggregator is None:
         loss_aggregator = LossAggregator(cfg)
 
@@ -208,36 +183,12 @@ def train_step(
     total_loss = 0.0
     masked_ce_sum = 0.0
     masked_rows = 0
-    suffix_ce_sum = 0.0
-    suffix_rows = 0
     confidence_sum = 0.0
     conf_rows = 0
     top2_mass_sum = 0.0
     entropy_sum = 0.0
     posterior_rows = 0
-    suffix_tasks = 0
-    total_tasks = 0
-    semantic_unknowns = 0
-    valid_targets = 0
-    physical_corruptions = 0
-    physical_positions = 0
-    aux_sums = {
-        name: 0.0
-        for name in (
-            "parity",
-            "correction_alignment",
-            "rate_distortion",
-            "whiteness",
-            "contrastive",
-            "parity_diversity",
-            # V24/V25 genuine RD terms (§3.1) + V25 ternary-bias / MoE LB (§4).
-            "rate",
-            "distortion",
-            "perception",
-            "ternary_bias",
-            "moe_lb",
-        )
-    }
+    aux_sums = {name: 0.0 for name in ("rate", "distortion", "perception", "ternary_bias", "moe_lb", "attn_entropy")}
     aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
@@ -245,147 +196,52 @@ def train_step(
         input_ids = batch["input_ids"].to(device)
         targets = batch["targets"].to(device)
         valid_target_mask = batch["valid_target_mask"].to(device)
-        # V12: optional multimodal inputs — passed through when the batch
-        # provides them, ``None`` otherwise. The model's ``forward`` already
-        # gates the multimodal path on ``images is not None or spectrograms
-        # is not None`` AND ``self.multimodal_enabled``, so a text-only batch
-        # is handled correctly even when multimodal is enabled in config.
         images = batch.get("images")
         if images is not None:
             images = images.to(device)
         spectrograms = batch.get("spectrograms")
         if spectrograms is not None:
             spectrograms = spectrograms.to(device)
-        semantic_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2)
-        physical_generator = torch.Generator(device=device).manual_seed(step * accum * 2 + micro_idx * 2 + 1)
-        # V17: suffix curriculum — low early (language), ramp late (generate align).
-        suffix_prob = _suffix_probability(step, cfg)
-        semantic_unknown_mask, prediction_mask, is_suffix = create_semantic_corruption(
-            valid_target_mask,
-            generator=semantic_generator,
-            random_ratio=mask_ratio,
-            random_probability=1.0 - suffix_prob,
-        )
-        physical_corruption_mask = create_physical_corruption_mask(
-            input_ids,
-            mask_ratio,
-            generator=physical_generator,
-        )
-        awgn_sigma = 0.0
-        if cfg.train.awgn_enabled:
-            awgn_end = int(cfg.train.max_steps * cfg.train.awgn_end_frac)
-            awgn_warmup = int(cfg.train.max_steps * 0.05)
-            if step < awgn_warmup:
-                awgn_sigma = 0.0
-            elif step < awgn_end:
-                progress = (step - awgn_warmup) / max(awgn_end - awgn_warmup, 1)
-                awgn_sigma = cfg.train.awgn_sigma_start * (1.0 - progress) + cfg.train.awgn_sigma_end * progress
-        # Attention-mode curriculum. The OLD V20 design ran PURE bidir for the
-        # whole warmup (step<warmup) before any causal exposure — catastrophic
-        # for an AUTOREGRESSIVE generation model: every checkpoint taken during
-        # warmup is out-of-distribution for generation (causal never trained).
-        # Measured on the step-1500 checkpoint: bidir MLM loss 5.68 vs causal AR
-        # loss 7.64 (gap +1.96) — pure bidir-first. For a generative LM we instead
-        # make CAUSAL dominant from step 0 (with a small bidir slice for its
-        # denser representation gradient), ramping bidir out by mid-training.
-        warmup = max(int(cfg.train.warmup_steps), 1)
-        stable_end = int(cfg.train.max_steps * 0.8)
-        progress = min(1.0, step / max(warmup, 1))  # 0 -> 1 over warmup
-        late = min(1.0, step / max(stable_end, 1))  # slow ramp over whole stable phase
-        r = float(torch.rand(1).item())
-        # Causal-primary from step 0: 50% causal / 30% soft_causal / 20% bidir
-        # early, tightening to 60% causal / 40% soft_causal (bidir -> 0) late.
-        causal_prob = 0.50 + 0.10 * late
-        soft_prob = 0.30 + 0.10 * late
-        bidir_prob = max(0.0, 0.20 - 0.20 * late)
-        if r < causal_prob:
-            attention_mode = "causal"
-            prefix_len = None
-            soft_beta = None
-        elif r < causal_prob + soft_prob:
-            attention_mode = "soft_causal"
-            prefix_len = None
-            soft_beta = 0.5 + progress * 2.5  # mild -> strong causal
-        else:
-            attention_mode = "bidir"
-            prefix_len = None
-            soft_beta = None
-        if attention_mode == "bidir":
-            # MLM: use the standard masked prediction path.
-            out_prediction_mask = prediction_mask
-            out_unknown_mask = semantic_unknown_mask
-        else:
-            # Causal/prefix AR: predict at ALL valid positions (no input
-            # masking). The model returns logits as [n_valid, V]; we
-            # reshape to [B, T, V] for next-token shifted CE.
-            out_prediction_mask = valid_target_mask
-            out_unknown_mask = torch.zeros_like(valid_target_mask)
+
+        attention_mode, soft_beta = _sample_attention_mode(step, cfg)
+        # Causal/prefix/soft_causal: predict at ALL valid positions, nothing
+        # erased (matches inference). bidir: would use masked prediction, but
+        # we keep the causal next-token objective for all modes so the model
+        # always trains the generation signal.
+        out_unknown_mask = torch.zeros_like(valid_target_mask)
+        out_prediction_mask = valid_target_mask
+
         output = model(
             input_ids,
-            targets=targets if attention_mode == "bidir" else None,
+            targets=None,
             semantic_unknown_mask=out_unknown_mask,
             prediction_mask=out_prediction_mask,
             valid_target_mask=valid_target_mask,
-            physical_corruption_mask=physical_corruption_mask,
-            step=step,
-            awgn_sigma=awgn_sigma,
             images=images,
             spectrograms=spectrograms,
             attention_mode=attention_mode,
-            prefix_len=prefix_len,
             soft_beta=soft_beta,
         )
-        # V20: For causal/prefix/soft_causal modes, compute next-token CE (shifted
-        # targets) directly from flat logits and indices — no [B,T,V]
-        # expansion needed. For bidir, keep the masked-CE path.
-        if attention_mode in ("causal", "prefix", "soft_causal"):
-            T = input_ids.size(1)
-            idx = output.prediction_indices.to(output.logits.device)  # [n_sel], flat b*T+t
-            t = idx % T
-            # Only positions with t < T-1 have a next token to predict.
-            mask = t < (T - 1)
-            if attention_mode == "prefix" and prefix_len is not None:
-                mask = mask & (t >= prefix_len)
-            if mask.any():
-                idx_keep = idx[mask]
-                target_idx = idx_keep + 1  # next position
-                shift_logits = output.logits[mask]
-                shift_targets = targets.view(-1).index_select(0, target_idx.to(targets.device)).to(shift_logits.device)
-                target_valid = (
-                    valid_target_mask.view(-1)
-                    .index_select(0, target_idx.to(valid_target_mask.device))
-                    .to(shift_logits.device)
-                )
-                if target_valid.any():
-                    output.ce_loss = F.cross_entropy(
-                        shift_logits[target_valid],
-                        shift_targets[target_valid],
-                    )
-                else:
-                    output.ce_loss = output.logits.new_zeros(())
-            else:
-                output.ce_loss = output.logits.new_zeros(())
-            loss = loss_aggregator(output, targets, None, step=step)
-        else:
-            loss = loss_aggregator(output, targets, prediction_mask, step=step)
+        output.ce_loss = _causal_next_token_loss(output, input_ids, targets, valid_target_mask)
+        loss = loss_aggregator(output, step=step)
 
         use_distill = (
             teacher is not None
             and getattr(teacher, "_loaded", False)
-            and cfg.train.distill_enabled is True
+            and cfg.train.distill.enabled is True
             and step < distill_end_step
             and getattr(model, "distill_align", None) is not None
         )
         if use_distill:
             from hagi_v4.train.distillation import alpha_at
 
-            visibility_mask = valid_target_mask & ~semantic_unknown_mask
+            visibility_mask = valid_target_mask
             alpha = alpha_at(
                 step,
-                cfg.train.distill_alpha_start,
-                cfg.train.distill_alpha_end,
+                cfg.train.distill.alpha_start,
+                cfg.train.distill.alpha_end,
                 cfg.train.max_steps,
-                cfg.train.distill_end_frac,
+                cfg.train.distill.end_frac,
             )
             with torch.inference_mode():
                 teacher_result = teacher.get_hidden(input_ids, visibility_mask=visibility_mask)
@@ -410,47 +266,20 @@ def train_step(
         total_loss += loss.item()
 
         with torch.no_grad():
-            suffix_tasks += int(is_suffix.sum().item())
-            total_tasks += is_suffix.numel()
-            semantic_unknowns += int((semantic_unknown_mask & valid_target_mask).sum().item())
-            valid_targets += int(valid_target_mask.sum().item())
-            physical_corruptions += int(physical_corruption_mask.sum().item())
-            physical_positions += physical_corruption_mask.numel()
             for name in aux_sums:
                 value = getattr(output.aux, name)
                 if value is not None:
-                    # ``.item()`` fully extracts the scalar and releases the
-                    # tensor reference immediately, preventing the aux tensors
-                    # (which carry autograd state) from accumulating across
-                    # microbatches.
                     aux_sums[name] += value.detach().item()
                     aux_counts[name] += 1
 
             if output.logits is not None and output.prediction_indices is not None:
-                # Detach first to avoid holding the autograd graph across
-                # microbatches. The logits tensor can be large ([N, V]) and
-                # keeping it attached until the end of the loop was a major
-                # contributor to the observed ~10 GB VRAM growth.
                 logits = output.logits.detach()
                 prediction_indices = output.prediction_indices.detach().to(targets.device)
                 selected_targets = targets.flatten().index_select(0, prediction_indices).to(logits.device)
-                suffix_by_position = is_suffix.unsqueeze(1).expand_as(valid_target_mask).flatten()
-                suffix_predictions = suffix_by_position.index_select(0, prediction_indices).to(logits.device)
                 row_count = logits.shape[0]
-                # V14: reuse forward CE when available (avoid recompute every microbatch).
                 if output.ce_loss is not None:
                     masked_ce_sum += output.ce_loss.detach().item() * row_count
-                else:
-                    masked_ce_sum += selected_cross_entropy(logits, selected_targets).item() * row_count
                 masked_rows += row_count
-                # V16: conf from actual max-prob every step (never fake 0.5).
-                # V17: top2/entropy every 20 steps for cost; skip log NaN when empty.
-                # Chunked to avoid materializing [N,V] float32 three times
-                # (log_softmax + exp + product). After warmup, causal/soft_causal
-                # modes select ALL valid positions (n_selected = B*T ~ 4096),
-                # which made the unchunked path peak at ~2.4 GB on every 20th
-                # step — the post-step-1000 VRAM jump. 256 rows/chunk keeps the
-                # float32 peak under ~150 MB regardless of n_selected.
                 with torch.no_grad():
                     want_post = (step % 20 == 0)
                     chunk_rows = 256
@@ -460,30 +289,13 @@ def train_step(
                         p = log_p.exp()
                         confidence_sum += p.max(dim=-1).values.sum().item()
                         if want_post:
-                            top2_mass_sum += (
-                                p.topk(min(2, chunk.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
-                            )
+                            top2_mass_sum += p.topk(min(2, chunk.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
                             entropy_sum += -(p * log_p).sum(dim=-1).sum().item()
-                    conf_rows += row_count
-                    if want_post:
-                        posterior_rows += row_count
-                suffix_count = int(suffix_predictions.sum().item())
-                if suffix_count:
-                    suffix_ce_sum += (
-                        suffix_cross_entropy(logits, selected_targets, suffix_predictions).item() * suffix_count
-                    )
-                    suffix_rows += suffix_count
-                del logits, prediction_indices, selected_targets, suffix_predictions
+                conf_rows += row_count
+                if want_post:
+                    posterior_rows += row_count
+                del logits, prediction_indices, selected_targets
 
-            # Free decoder side_info tensors that hold autograd graph refs.
-            # ``side_info`` accumulates ``extrinsic_norms`` (a list of tensors
-            # with graph) and ``parity_residual`` every forward pass; without
-            # explicit cleanup they persist until the next forward, which
-            # compounds across microbatches.
-            side_info = getattr(output, "side_info", None)
-            if side_info is not None and isinstance(side_info, dict):
-                side_info.pop("extrinsic_norms", None)
-                side_info.pop("parity_residual", None)
             del output, loss, scaled_loss
 
     grads = [p.grad for p in model.parameters() if p.grad is not None]
@@ -497,26 +309,17 @@ def train_step(
     gn, grad_rms = gradient_stats(model, cfg.train)
     optimizer.step()
 
-    if total_tasks == 0:
+    if masked_rows == 0:
         return {"loss": 0.0, "step": step, "grad_norm": gn, "grad_rms": grad_rms}
 
-    masked_ce = masked_ce_sum / masked_rows if masked_rows else float("nan")
-    # suffix_ce is nan only when truly no suffix rows this step (valid signal).
-    suffix_ce = suffix_ce_sum / suffix_rows if suffix_rows else float("nan")
+    masked_ce = masked_ce_sum / masked_rows
     avg_confidence = confidence_sum / conf_rows if conf_rows else float("nan")
     if posterior_rows:
         top2_mass = top2_mass_sum / posterior_rows
         posterior_entropy = entropy_sum / posterior_rows
     else:
-        # Off-gate steps: finite placeholders from conf when available.
         top2_mass = min(1.0, max(0.0, avg_confidence * 1.5)) if conf_rows else float("nan")
         posterior_entropy = float("nan") if not conf_rows else max(0.0, -math.log(max(avg_confidence, 1e-8)))
-    if mc.use_adaptive_erasure and adaptive_mask_state is not None:
-        adaptive_mask_state["ratio"] = adaptive_mask_ratio(
-            avg_confidence,
-            adaptive_mask_state.get("ratio", mc.mask_ratio),
-            adaptation_rate=mc.adaptation_rate,
-        )
 
     def mean_aux(name: str) -> float:
         return aux_sums[name] / max(aux_counts[name], 1)
@@ -525,31 +328,19 @@ def train_step(
         "loss": total_loss / max(accum, 1),
         "objective_loss": total_loss / max(accum, 1),
         "masked_ce": masked_ce,
-        "suffix_ce": suffix_ce,
         "bpt": masked_ce / math.log(2.0),
         "top2_mass": top2_mass,
         "posterior_entropy": posterior_entropy,
-        "suffix_task_ratio": suffix_tasks / max(total_tasks, 1),
-        "random_task_ratio": (total_tasks - suffix_tasks) / max(total_tasks, 1),
-        "semantic_mask_ratio": semantic_unknowns / max(valid_targets, 1),
-        "physical_corruption_ratio": physical_corruptions / max(physical_positions, 1),
-        "parity": mean_aux("parity"),
-        "correction_alignment": mean_aux("correction_alignment"),
-        "rate_distortion": mean_aux("rate_distortion"),
-        "whiteness": mean_aux("whiteness"),
-        "contrastive": mean_aux("contrastive"),
-        "parity_diversity": mean_aux("parity_diversity"),
-        # V24/V25 genuine RD terms + V25 ternary-bias / MoE LB (§3.1, §4).
         "rate": mean_aux("rate"),
         "distortion": mean_aux("distortion"),
         "perception": mean_aux("perception"),
         "ternary_bias": mean_aux("ternary_bias"),
         "moe_lb": mean_aux("moe_lb"),
+        "attn_entropy": mean_aux("attn_entropy"),
         "avg_confidence": avg_confidence,
         "grad_norm": gn,
         "grad_rms": grad_rms,
-        "mask_ratio": mask_ratio,
-        "lr": lr_at(step, cfg) if hasattr(cfg.train, "warmup_steps") else 0.0,
+        "lr": lr_at(step, cfg),
         "step": step,
         "update_applied": True,
         "all_finite": True,
@@ -559,7 +350,7 @@ def train_step(
 def train(
     model: nn.Module,
     dataloader,
-    cfg: HAGIv4Config,
+    cfg: Config,
     log_interval: int = 100,
     teacher=None,
     start_step: int = 0,
@@ -577,10 +368,9 @@ def train(
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
     loss_aggregator = LossAggregator(cfg)
-    adaptive_mask_state = {"ratio": cfg.model.masking.mask_ratio} if cfg.model.masking.use_adaptive_erasure else None
 
     step = start_step
-    distill_end_step = int(cfg.train.max_steps * cfg.train.distill_end_frac)
+    distill_end_step = int(cfg.train.max_steps * cfg.train.distill.end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
     ckpt_interval = cfg.train.checkpoint_interval
     ckpt_keep = cfg.train.checkpoint_keep_last
@@ -601,22 +391,10 @@ def train(
             teacher.free()
 
         metrics = train_step(
-            model,
-            microbatches,
-            optimizer,
-            cfg,
-            step,
-            teacher,
-            loss_aggregator=loss_aggregator,
-            adaptive_mask_state=adaptive_mask_state,
-            distill_end_step=distill_end_step,
+            model, microbatches, optimizer, cfg, step,
+            teacher, loss_aggregator=loss_aggregator, distill_end_step=distill_end_step,
         )
 
-        # V12: release caching allocator's reserved memory every step.
-        # On Windows the allocator cannot use ``expandable_segments``, so when
-        # prediction-mask sizes vary (bidir ~1.2k rows vs causal 4k rows after
-        # warmup), freed blocks fragment and reserved grows toward 10 GB.
-        # ``empty_cache`` is ~1 ms, negligible vs the ~1.3 s per-step cost.
         _maybe_release_caches(step, interval=1)
 
         if step % log_interval == 0:

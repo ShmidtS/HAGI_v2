@@ -1,287 +1,55 @@
-"""HAGI V21 configuration dataclasses — recovered modular architecture.
+"""HAGI configuration — ternary RD-channel language model.
 
-5G NR-style codec language model with Cl(3,0,0) geometric algebra.
-Pipeline: Source Encoder → Rate Matching → Turbo BP Decoder → Rate Dematching → Source Decoder (SCS preserved).
+The model is a causal autoregressive LM framed as a communication channel:
+  * factorized source encoder (ConvEmbedding, CAUSAL conv — no future leak)
+  * ternary BitNet b1.58 transformer body (the genuine discrete channel;
+    quantization noise is the only impairment — there is no self-inflicted
+    AWGN/LDPC physical channel)
+  * auxiliary variational information bottleneck (KL rate regularizer, kept
+    OUT of the main LM path — inserting it deadlocked from-scratch training)
+  * optional predictive decoder (extrinsic error highway, off the main path)
+  * optional multimodal source coding (per-modality encoder + early fusion)
 
-Auto-configure: set `target_params` in YAML, all sizes computed automatically.
+All knobs live here. ``auto_configure`` solves the hidden/layer sizes from a
+parameter budget; everything else is an explicit config value (no hidden
+hardcoded constants scattered through the training loop).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
 @dataclass
-class AlgebraConfig:
-    """Cl(3,0,0) algebra layout within hidden state."""
-
-    blade_count: int = 8
-    grade_dims: tuple = (64, 96, 96, 64, 256)
-    hidden_size: int = 576
-    # V21: geometric product normalization
-    normalize_geometric_product: bool = True
-    # V21: bivector blade activation (grade-2)
-    bivector_activation: str = "tanh"
-
-
-@dataclass
 class AttentionConfig:
-    """Grouped-query attention with bidirectional support (fallback when freq_coding disabled)."""
+    """Grouped-query attention (bidir / causal / prefix / soft_causal at train)."""
 
     num_query_heads: int = 8
     num_kv_heads: int = 4
     head_dim: int = 64
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
-    bidirectional: bool = True
-    fp16_attention: bool = True
-    fp32_rmsnorm: bool = True
 
 
 @dataclass
-class GP2DConfig:
-    """Parity channel configuration — SparseParity FEC encoder/checker.
+class EmbeddingsConfig:
+    """Factorized source encoder V x r + r x H + causal depthwise Conv1d filter."""
 
-    V21: sparse LDPC-style parity generated BEFORE the channel (true SCS).
-    """
-
-    window: int = 1
-    gate_init: float = -2.0
-    use_whiteness_loss: bool = True
-    whiteness_weight: float = 0.01
-    use_systematic_parity: bool = True
-    parity_weight: float = 0.1
-
-
-@dataclass
-class CodecConfig:
-    """V8 channel codec configuration — LDPC-style FEC parameters.
-
-    Implements true Source-Channel Separation: parity is generated
-    BEFORE the channel, not inside the decoder.
-
-    5G NR analog: LDPC base graph + rate matching + interleaving.
-    """
-
-    code_rate: float = 0.5
-    n_checks: int = 0
-    edges_per_check: int = 4
-    interleaver_mode: str = "qpp"
-    exit_threshold: float = 0.01
-
-
-@dataclass
-class RefinementConfig:
-    """Turbo decoding loop — LDPC iterative belief propagation.
-
-    V21: turbo decoder with extrinsic information exchange between spatial
-    (z_H) and per-token (z_L) components. Entropy-adaptive iteration count
-    and deep supervision support recovered from V6 HRM.
-
-    V9: default iterations raised to 4 (min 2). Real LDPC BP needs several
-    iterations to converge; the V8 default of 2 left the decoder unable to
-    propagate extrinsic information, and the fifth reasoning layer never
-    received a gradient (dead weights in the step-500 checkpoint).
-    EXIT chart stopping: per-token convergence based on innovation norm.
-    """
-
-    num_iterations: int = 4
-    min_iterations: int = 2
-    convergence_threshold: float = 0.01
-    use_convergence_halt: bool = True
-    tanh_scale: float = 10.0
-    # V21: Turbo decoder extrinsic exchange (from V6 HRM)
-    extrinsic_alpha: float = 1.0
-    use_adaptive_halt: bool = False
-    halt_threshold: float = 0.01
-    halt_threshold_start: float = 0.05
-    halt_threshold_end: float = 0.001
-    # V21: Entropy-adaptive iteration count
-    use_entropy_adaptive_refinement: bool = False
-    entropy_low_threshold: float = 0.1
-    entropy_high_threshold: float = 1.0
-    entropy_low_iterations: int = 2
-    entropy_high_iterations: int = 6
-    # V21: Deep supervision
-    use_deep_supervision: bool = False
-    deep_supervision_decay: float = 0.5
-    deep_supervision_weight: float = 0.5
-    use_adaptive_ds_weight: bool = False
-    ds_ema_decay: float = 0.9
-
-
-@dataclass
-class MaskingConfig:
-    """Adaptive erasure channel for codec training.
-
-    Mask ratio adapts to model confidence (capacity matching).
-    mask_embed initialized as max-entropy vector (not zero).
-    """
-
-    mask_ratio: float = 0.3
-    use_span_masking: bool = True
-    span_length: int = 3
-    use_progressive: bool = True
-    use_adaptive_erasure: bool = True
-    mask_embed_init: str = "max_entropy"
-    adaptation_rate: float = 0.01
-
-
-@dataclass
-class MSAConfig:
-    """Memory Sparse Attention — HARQ buffer + Memory Sparse Attention with MLA.
-
-    V21: DFE (read) + HARQ buffer (write). Ring buffer slot registry
-    combined with Multi-head Latent Attention for compressed KV.
-    """
-
-    max_slots: int = 256
-    slot_chunk_size: int = 4
-    use_adaptive_chunk_size: bool = True
-    chunk_size_low_entropy: int = 8
-    chunk_size_high_entropy: int = 2
-    top_k: int = 6
-    routing_key_dim: int = 64
-    n_kv_heads: int = 4
-    head_dim: int = 72
-    grade_dims: tuple = (64, 96, 96, 64, 256)
-    mla_compress_dim: int = 128
-    mla_up_dim: int = 288
-    load_balance_weight: float = 0.01
-
-
-@dataclass
-class FreqCodingConfig:
-    """Phase-frequency coding — 2D FFT OFDM with MIMO equalization.
-
-    V21: FFT = OFDM demodulation, IFFT = OFDM modulation.
-    Complex weight = MIMO channel equalizer (frequency-selective).
-    Phase = PSK (phase shift keying).
-    Soft frequency gating = adaptive modulation (5G AMC).
-    """
-
-    enabled: bool = True
-    n_modes_t: int = 16
-    n_modes_h: int = 12
-    complex_rank: int = 16
-    use_derivative: bool = True
-    share_branch_weights: bool = False
-
-
-@dataclass
-class MoEConfig:
-    """Mixture of Experts — Switch Transformer style with entropy-aware routing.
-
-    V21: variable-rate capacity allocation. Low-entropy positions route to
-    simple experts, high-entropy to complex experts.
-    """
-
-    enabled: bool = False
-    num_experts: int = 4
-    top_k: int = 1
-    intermediate_size: int = 1024
-    use_mod_skip: bool = True
-    mod_skip_rate: float = 0.1
-    load_balance_weight: float = 0.01
-    router_jitter: float = 0.0
-    entropy_aware_routing: bool = True
-    alpha: float = 0.01
-    use_grade_specialization: bool = False
-    n_shared_bases: int = 0
-    router_init_std: float = 0.02
-    router_noise: float = 0.0
-
-
-@dataclass
-class HRMConfig:
-    """Hierarchical Refinement Model — spatial plane (z_H) + per-token state (z_L).
-
-    V21: dual-component Turbo decoder state. z_H is spatial (coarse, strided),
-    z_L is per-token (fine, full resolution). Extrinsic-only exchange between
-    components avoids information recycling (LDPC BP principle).
-    """
-
-    h_state_dim: int = 128
-    l_state_dim: int = 256
-    h_stride: int = 4
-
-
-@dataclass
-class CQIConfig:
-    """Channel Quality Indicator — adaptive sigma/CQI estimation.
-
-    V21: learns SNR estimate from hidden state to drive water-filling
-    and adaptive coding rate. 5G analog: CQI feedback from UE to BS.
-    """
-
-    hidden_size: int = 384
-    cqi_dim: int = 16
-    sigma_min: float = 0.02
-    sigma_max: float = 0.3
-
-
-@dataclass
-class WaterFillingConfig:
-    """Water-Filling capacity allocator — optimal dim allocation across grades.
-
-    V21: Shannon water-filling theorem. High-variance grades get more dims.
-    """
-
-    enabled: bool = False
-    total_dims: int = 288
-    num_grades: int = 4
-    min_dims: int = 8
-    temperature: float = 1.0
-    variance_ema_decay: float = 0.99
-
-
-@dataclass
-class KalmanConfig:
-    """Kalman filter for iterative decoding — optimal state estimation.
-
-    V21: diagonal covariance O(C). Q/R learnable, zero-init.
-    """
-
-    init_process_noise: float = 0.0
-    init_measurement_noise: float = 0.0
-    covariance_floor: float = 1e-6
-
-
-@dataclass
-class UncertaintyConfig:
-    """Learned per-position uncertainty for iterative decoding.
-
-    V21: scalar variance per position (V9 simplification — per-dim
-    variance carried no information for Kalman-form update).
-    """
-
-    hidden_size: int = 384
-
-
-@dataclass
-class EXITChartConfig:
-    """EXIT chart convergence estimator for iterative decoding.
-
-    V21: norm-ratio convergence proxy (avoids cosine-sim MI fiction).
-    """
-
-    threshold: float = 0.01
-    min_iterations: int = 1
+    factor_rank: int = 128
+    kernel_size: int = 5
+    use_conv_embedding: bool = True
+    trainable: bool = True
 
 
 @dataclass
 class MultimodalConfig:
-    """Multimodal source encoders — text/image/audio to shared latent.
-
-    V21: separate source encoders per modality (optimal source coding),
-    modality type embedding (CDMA spreading code).
-    """
+    """Per-modality source encoders + early sequence concatenation."""
 
     enabled: bool = False
     image_patch_size: int = 16
     image_channels: int = 3
     audio_mel_bins: int = 80
-    audio_frame_size: int = 10
     modality_embed_dim: int = 32
     num_modalities: int = 3
     modality_embed_std: float = 0.02
@@ -290,180 +58,109 @@ class MultimodalConfig:
 
 
 @dataclass
-class FOXP2Config:
-    """FOXP2 plasticity controller — per-parameter-group LR modulation.
+class BottleneckConfig:
+    """Auxiliary variational information bottleneck (H->C, off the main LM path).
 
-    V21: adaptive coding rate analog. Applied AFTER backward(), BEFORE step().
+    The IB computes KL/distortion/perception on the context hidden as an
+    auxiliary regularizer. It does NOT intercept the LM signal — inserting it
+    in the main path deadlocks from-scratch training.
     """
 
-    num_groups: int = 8
-    hidden: int = 32
-    ema_decay: float = 0.99
+    bottleneck_in_path: bool = False  # ablation: restore the failed in-path design
 
 
 @dataclass
-class KVCacheConfig:
-    """KV Cache for O(T) block-parallel generation.
+class PredictiveConfig:
+    """Optional extrinsic error highway (off the main path by default)."""
 
-    V21: convolutional code decoder state analog.
-    """
-
-    enabled: bool = True
-    block_size: int = 16
-
-
-@dataclass
-class SpeculativeConfig:
-    """Speculative decoding — draft-then-verify paradigm.
-
-    V21: rate-distortion analog. Draft model = low-rate code, verify = high-rate.
-    """
-
-    enabled: bool = False
-    draft_length: int = 4
-    acceptance_threshold: float = 0.5
-
-
-@dataclass
-class EmbeddingsConfig:
-    """Embedding configuration (V9: ConvEmbedding by default).
-
-    V7 froze embeddings (copied from SmolLM2). V8 trained embeddings
-    from scratch with proper regularization. V9 replaces the monolithic
-    V×H table with a factorized (V×r + r×H) + depthwise Conv1d
-    pulse-shaping filter — a memoryless source encoder composed with a
-    local temporal mixer (FIR filter analog in communication theory).
-
-    factor_rank: inner rank r of the low-rank embedding approximation.
-    kernel_size: causal depthwise Conv1d kernel (pulse-shaping filter).
-    """
-
-    trainable: bool = True
-    init: str = "normal"
-    weight_decay: float = 0.01
-    factor_rank: int = 128
-    kernel_size: int = 5
-    use_conv_embedding: bool = True
-
-
-@dataclass
-class V24PathConfig:
-    """V24 information-theoretic path (§3-§4 of ARCHITECTURE_V24.md).
-
-    When ``enabled`` is True, HAGIv4.forward routes the hidden state through the
-    variational InformationBottleneck + PredictiveDecoder instead of the V23
-    AWGN/LDPC physical channel. The V23 codec modules stay on disk as an
-    ablation path (enabled=False restores exact V23 behaviour).
-    """
-
-    enabled: bool = True
-    # Variational bottleneck H->C (§3.1). C defaults from model.core_hidden_size.
-    ib_beta: float = 1e-3  # rate Lagrangian
-    distortion_weight: float = 1.0
-    perception_weight: float = 0.01
-    kl_free_bits: float = 0.5
-    # Predictive decoder (§3.2). Reuses uncertainty.py for the K=P/(P+R) blend.
-    predictive_train_iterations: int = 2
-    predictive_infer_iterations: int = 4
-    predictive_convergence_threshold: float = 0.01
-    predictive_update_hidden: int = 256
+    enabled: bool = False  # off the main path; opt-in for ablation/research
+    train_iterations: int = 2
+    infer_iterations: int = 4
+    convergence_threshold: float = 0.01
+    update_hidden: int = 256
     use_kalman_blend: bool = True
-    # Hebbian bilinear FFN (§4.2) replacing the FFT token mixer.
-    hebbian_expansion: int = 4
+    hep_enabled: bool = True
+
+
+@dataclass
+class TernaryConfig:
+    """BitNet b1.58 ternary body (the genuine discrete channel)."""
+
+    use_ternary: bool = True
+    hebbian_expansion: int = 4  # m = expansion * H
     hebbian_dropout: float = 0.0
 
 
 @dataclass
-class V25PathConfig:
-    """V25 ternary RD-channel path (ARCHITECTURE_V25.md).
+class BodyConfig:
+    """Ternary transformer body: context (perception) + expression stacks."""
 
-    When ``enabled`` is True (default), HAGIv4.forward routes the hidden state
-    through the ternary TransformerBlock body (BitNet b1.58) + variational
-    InformationBottleneck (KL is the only rate) + PredictiveDecoder (extrinsic
-    error highway + HEP). The ternary quantization noise is the genuine channel
-    impairment (no self-inflicted AWGN). The V23 AWGN/LDPC codec stays on disk
-    as an ablation path (``v25.enabled=False`` AND ``v24.enabled=False``); the
-    V24 dense path is retained for A/B comparison (``v25.enabled=False`` AND
-    ``v24.enabled=True``).
-    """
-
-    enabled: bool = True
-    # V25 main-path-bypass fix: the variational IB + PredictiveDecoder are OUT of
-    # the main LM signal path by default (inserting them deadlocked from-scratch
-    # training — ablation: dense-ternary w/o them learns masked_ce 11.4->0.39 in
-    # 200 steps; with them it stalls at ~11.2). bottleneck_in_path=True restores
-    # the failed original design for the ablation comparison only.
-    bottleneck_in_path: bool = False
-    use_ternary: bool = True  # BitNet b1.58 on the 2D body masters
-    # Variational bottleneck H->C (§3.2). C defaults from model.core_hidden_size.
-    ib_beta: float = 1e-3  # rate Lagrangian (the ONLY rate notion)
+    context_layers: int = 8
+    expression_layers: int = 8
+    ternary: TernaryConfig = field(default_factory=TernaryConfig)
+    bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
+    predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
+    # Rate-distortion loss weights (the only genuine "rate" is the IB KL).
+    ib_beta: float = 0.001
     distortion_weight: float = 1.0
     perception_weight: float = 0.01
     kl_free_bits: float = 0.5
     logvar_clamp: tuple[float, float] = (-10.0, 10.0)
     distortion_eps: float = 1e-6
-    # Predictive decoder (§3.3): extrinsic error highway + HEP + Kalman blend.
-    predictive_train_iterations: int = 2
-    predictive_infer_iterations: int = 4
-    predictive_convergence_threshold: float = 0.01
-    predictive_update_hidden: int = 256
-    use_kalman_blend: bool = True
-    hep_enabled: bool = True  # Highway Error Propagation linear feedback V_t
-    # Hebbian bilinear FFN (the only ternary body token/channel mixer).
-    hebbian_expansion: int = 4
-    hebbian_dropout: float = 0.0
-    # Looped-depth: ternary context/expression stacks (§8 DEPTH).
-    context_layers: int = 8
-    expression_layers: int = 8
-    # Multimodal (§6): per-modality source encode + early sequence concat.
-    # Either this flag OR model.multimodal.enabled turns on the multimodal path.
-    multimodal_enabled: bool = False
-    # MoE: dropped in V25 (§8 YAGNI — dead in V24). Retained flag for opt-in
-    # ablation; the loss aggregator only applies MoE load-balance when enabled.
-    moe_enabled: bool = False
+    moe_enabled: bool = False  # dropped (YAGNI); flag retained for opt-in
+
+
+@dataclass
+class DistillationConfig:
+    """Online hidden-state distillation from a causal teacher LM."""
+
+    enabled: bool = False
+    teacher: str = "HuggingFaceTB/SmolLM2-360M"
+    teacher_hidden_size: int = 960
+    embed_teacher: str = "HuggingFaceTB/SmolLM2-135M"
+    alpha_start: float = 0.0
+    alpha_end: float = 0.0
+    temperature: float = 2.0
+    temp_start: float = 4.0
+    temp_end: float = 1.0
+    use_temp_anneal: bool = True
+    end_frac: float = 0.6
+
+
+@dataclass
+class CurriculumConfig:
+    """Two-stage dataset curriculum + attention-mode mixing.
+
+    The model is a CAUSAL generative LM; attention_mode stays causal-dominant
+    from step 0 (bidir/soft_causal slices add a denser representation gradient).
+    """
+
+    enabled: bool = True
+    stage2_start: int = 100000
+    cycles_per_dataset: int = 3
+    stage1_order: list[str] = field(
+        default_factory=lambda: [
+            "tinystories", "python_instruct", "smoltalk", "wikipedia_en",
+            "wikipedia_ru", "openwebmath", "oscar_ru", "slimpajama", "edu",
+        ]
+    )
+    stage2_datasets: list[str] = field(default_factory=lambda: ["openwebmath", "edu", "slimpajama"])
 
 
 @dataclass
 class ModelConfig:
-    """Full model architecture configuration."""
+    """Full model architecture."""
 
     vocab_size: int = 49154
     hidden_size: int = 384
-    perception_layers: int = 4
-    expression_layers: int = 4
-    reasoning_layers: int = 3
-    norm_eps: float = 1e-6
-    bottleneck_ratio: float = 0.5
     core_hidden_size: int = 192
-    pilot_spacing: int = 8
+    norm_eps: float = 1e-6
     target_params: int = 0
     target_nonembed_params: int = 0
-    algebra: AlgebraConfig = field(default_factory=AlgebraConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
-    gp2d: GP2DConfig = field(default_factory=GP2DConfig)
-    codec: CodecConfig = field(default_factory=CodecConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
-    refinement: RefinementConfig = field(default_factory=RefinementConfig)
-    masking: MaskingConfig = field(default_factory=MaskingConfig)
-    msa: MSAConfig = field(default_factory=MSAConfig)
-    freq_coding: FreqCodingConfig = field(default_factory=FreqCodingConfig)
-    moe: MoEConfig = field(default_factory=MoEConfig)
-    hrm: HRMConfig = field(default_factory=HRMConfig)
-    cqi: CQIConfig | None = None
-    water_filling: WaterFillingConfig = field(default_factory=WaterFillingConfig)
-    kalman: KalmanConfig = field(default_factory=KalmanConfig)
-    uncertainty: UncertaintyConfig | None = None
-    exit_chart: EXITChartConfig | None = None
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
-    lorentz_enabled: bool = False
-    # V24 information-theoretic path (default ON). Set enabled=False to restore
-    # the V23 AWGN/LDPC SCS codec for ablation.
-    v24: V24PathConfig = field(default_factory=V24PathConfig)
-    # V25 ternary RD-channel path (default ON — supersedes v24). When enabled
-    # the forward routes through ternary blocks + IB + PredictiveDecoder. Set
-    # enabled=False to fall back to v24 (dense) or v23 (AWGN/LDPC) ablation.
-    v25: V25PathConfig = field(default_factory=V25PathConfig)
-
+    body: BodyConfig = field(default_factory=BodyConfig)
 
 
 @dataclass
@@ -471,8 +168,8 @@ class TrainConfig:
     """Training hyperparameters."""
 
     max_steps: int = 150000
-    warmup_steps: int = 1000
-    learning_rate: float = 3e-4
+    warmup_steps: int = 1600
+    learning_rate: float = 0.0003
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.5
@@ -480,139 +177,56 @@ class TrainConfig:
     weight_decay: float = 0.1
     precision: str = "bf16"
     grad_accum_steps: int = 2
-    max_grad_norm: float | None = 1.0
-    batch_size: int = 10
-    seq_len: int = 1024
+    max_grad_norm: float = 1.0
+    batch_size: int = 8
+    seq_len: int = 512
+    # Loss weights.
     w_ce: float = 1.0
-    w_whiteness: float = 0.01
-    w_parity: float = 0.05
-    w_correction_alignment: float = 0.0
-    w_rate_distortion: float = 0.005
-    w_contrastive: float = 0.0
-    # V24: rate-distortion aux weights for the information bottleneck (§3.1).
-    # These mirror the v24-path config but live on TrainConfig so the loss
-    # aggregator can read them without touching model internals.
-    w_v24_rate: float = 1e-3
-    w_v24_distortion: float = 1.0
-    w_v24_perception: float = 0.01
-    # V25: ternary-bias regularizer (§4). Pushes ternary FP masters toward the
-    # {-1,0,+1} lattice so the per-output-channel absmean scale tracks a clean
-    # ternary point (low zero-fraction starvation + bounded saturated region).
-    # 0.0 = off (ternary is loss-free at this scale per §10). Active only on the
-    # V25 path (aux.ternary_bias is None on V24/V23).
+    w_rate: float = 0.001
+    w_distortion: float = 1.0
+    w_perception: float = 0.01
     w_ternary_bias: float = 0.0
-    # V25: MoE load-balance weight (§4). Only applied when model.v25.moe_enabled
-    # (MoE is dropped by default — §8 YAGNI). 0.0 keeps it inert.
     w_moe_load_balance: float = 0.01
-    # V12: parity-code diversity regularizer. V18 keeps the default 0.05
-    # (V17 yaml bug set it to 0.0 — collapsed the LDPC graph).
-    w_parity_diversity: float = 0.05
-    # V22: attention entropy regularization weight. Prevents attention collapse
-    # that causes cyclic loss oscillation (677 events in 4534 V20 steps).
     w_attn_entropy: float = 0.01
-    # V22: minimum attention entropy floor. Prevents collapse.
     attn_entropy_floor: float = 0.5
-    # V18: train BP iterations (infer uses model.refinement.num_iterations).
-    bp_iterations: int = 3
-    use_two_phase_schedule: bool = True
-    two_phase_split: float = 0.5
-    phase1_mask_ratio: float = 0.15
-    phase2_mask_ratio: float = 0.35
-    phase3_mask_ratio: float = 0.50
-    # V12: suffix-vs-random mask probability for ``create_semantic_corruption``.
-    # Inference uses suffix-only masking (contiguous block at the end), so
-    # the model must be exposed to that distribution during training. The
-    # previous default (0.5) spent half the batch on random masks, causing
-    # ``suffix_ce - masked_ce`` gap to grow from 0 → 0.65 by step 1000 —
-    # the model specialised on random-mask recovery and underperformed on
-    # the suffix regime used for generation. 0.7 biases 70% of batches
-    # toward suffix masking, matching the inference distribution.
-    suffix_probability: float = 0.3
-    use_continuous_anneal: bool = True
-    distill_enabled: bool = True
-    distill_kl_enabled: bool = False
-    distill_teacher: str = "HuggingFaceTB/SmolLM2-360M"
-    distill_teacher_hidden_size: int = 576
-    distill_embed_teacher: str = "HuggingFaceTB/SmolLM2-135M"
-    distill_alpha_start: float = 0.0
-    distill_alpha_end: float = 0.0
-    distill_temperature: float = 2.0
-    distill_temp_start: float = 4.0
-    distill_temp_end: float = 1.0
-    distill_use_temp_anneal: bool = True
-    distill_end_frac: float = 0.6
-    awgn_enabled: bool = True
-    # V19: raised sigma. V18 had channel 9.6x below capacity (SNR=29dB,
-    # capacity=4.82 bits/use vs rate 0.5). BP fully cancelled AWGN even at
-    # 3 iterations. Raise to sigma=0.15 so SNR ~ 17dB, capacity ~ 3.0 bits/use,
-    # still above rate 0.5 but forces BP to do real work.
-    awgn_sigma_start: float = 0.15
-    awgn_sigma_end: float = 0.05
-    awgn_end_frac: float = 0.5
-    freeze_embeddings: bool = False
+    # Data / tokens.
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     eos_token_id: int = 0
     pad_token_id: int = 49152
-    checkpoint_dir: str = "checkpoints"
-    checkpoint_format_version: int = 3
-    checkpoint_interval: int = 5000
-    checkpoint_keep_last: int = 3
-    sequential_cycles: int = 3
-    curriculum_enabled: bool = True
-    curriculum_stage2_start: int = 100000
-    curriculum_order: list[str] = field(
-        default_factory=lambda: [
-            "tinystories",
-            "python_instruct",
-            "smoltalk",
-            "wikipedia_en",
-            "wikipedia_ru",
-            "openwebmath",
-            "oscar_ru",
-            "slimpajama",
-            "edu",
-        ]
-    )
-    stage2_datasets: list[str] = field(default_factory=lambda: ["openwebmath", "edu", "slimpajama"])
-    data_dtype: str = "auto"
     data_dir: str = "data"
-    foxp2: FOXP2Config = field(default_factory=FOXP2Config)
+    data_dtype: str = "auto"
+    # Checkpoints.
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_interval: int = 1000
+    checkpoint_keep_last: int = 3
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    distill: DistillationConfig = field(default_factory=DistillationConfig)
 
 
 @dataclass
 class InferenceConfig:
-    """Inference/generation parameters."""
+    """Generation parameters."""
 
     temperature: float = 0.8
     top_k: int = 50
     min_new_tokens: int = 2
-    repetition_penalty: float = 1.1
+    repetition_penalty: float = 1.2
     repetition_window: int = 64
-    no_repeat_ngram_size: int = 3
-    max_iterations: int = 4
-    max_new_tokens: int = 128
-    kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
-    speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
+    no_repeat_ngram_size: int = 2
+    max_new_tokens: int = 64
 
 
 @dataclass
-class HAGIv4Config:
-    """Top-level HAGI V21 configuration — recovered modular architecture."""
+class Config:
+    """Top-level configuration."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
 
-_BOTTLENECK_RATIO = 0.75
-_HEAD_DIM_TARGET = 64
-_GRADE_RATIOS = (
-    1,
-    1.5,
-    1.5,
-    1,
-    4,
-)  # Cl(3,0,0): scalar, 3 vectors, 3 bivectors, pseudoscalar
+# Backwards-compatible alias for callers that import HAGIv4Config.
+HAGIv4Config = Config
 
 
 def _round_to_multiple(value: int, multiple: int = 8) -> int:
@@ -620,7 +234,6 @@ def _round_to_multiple(value: int, multiple: int = 8) -> int:
 
 
 def _next_pow2(n: int) -> int:
-    """Smallest power of 2 >= n, minimum 2."""
     p = 2
     while p < n:
         p *= 2
@@ -628,147 +241,39 @@ def _next_pow2(n: int) -> int:
 
 
 def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
-    """Auto-compute model sizes from a parameter budget.
+    """Solve hidden/layer sizes from a non-embedding parameter budget.
 
-    The budget is split into two independent parts following the
-    Source-Channel Separation Theorem:
-
-      * ``target_nonembed_params`` (or ``target_params`` when the former is
-        unset) governs the channel codec + source codec body. ``H`` is solved
-        from this budget alone, so the body capacity is invariant to the
-        vocabulary size.
-      * The source embedding is a factorized ``V x r + r x H`` table plus a
-        depthwise Conv1d pulse-shaping filter. Its cost is reported
-        separately and does not inflate the channel budget.
-
-    V9 cost model matches the real architecture:
-      * ``FactoredSwiGLU`` FFN uses rank ``r_ffn = H / 4`` (SVD-style), not
-        a dense ``H x intermediate`` matrix. Each FFN contributes
-        ``H*r_ffn + r_ffn*2*intermediate + intermediate*r_ffn + r_ffn*H``.
-      * ``FreqCoding2D`` uses shared low-rank complex weights
-        ``[H, head_dim, rank] + [H, rank, head_dim]`` (4 tensors per branch),
-        not the dense ``4*H*H`` of the V8 estimate.
-      * ``SparseParity`` stores ``M*C`` masked weights (already small).
-
-    This fixes the V8 regression where the cost model overestimated the body
-    and produced an ``H`` much larger than the budget warranted (a 17.5M
-    target produced a 97M checkpoint because embedding dominated at 91% and
-    the body solver ignored the FFN rank compression).
+    The body is a ternary Hebbian-bilinear FFN + attention stack. Cost per
+    layer is dominated by the FFN (A0, A1: H x 4H; W: 4H x H) and attention
+    qkv+out (4 H^2). Two stacks (context + expression) each of depth L.
     """
-    import math
-
     target = float(target_params)
-    ratio = _BOTTLENECK_RATIO
-    int_ratio = 4.0 / 3.0
-    # Factored FFN inner rank relative to H (matches FactoredSwiGLU default).
-    ffn_rank_rel = 0.25
-
     layers = max(2, round(math.log10(target / 1e5) * 3))
-    perc = max(1, layers // 4)
+    perc = max(1, layers // 2)
     expr = perc
-    reason = max(3, layers - 2 * perc)
-
-    # Per-H^2 cost of one FreqBlock:
-    #   FreqCoding2D: 4 * head_dim * rank (low-rank A,B) per main branch, and
-    #     the same again for dT/dH derivative branches, but those are shared
-    #     across layers so we charge only the per-layer residual (phase + gate
-    #     + layer scales). We approximate the per-layer freq cost as 2*H.
-    #   FactoredSwiGLU: H*r_ffn + r_ffn*2*intermediate + intermediate*r_ffn + r_ffn*H,
-    #     with r_ffn = H*ffn_rank_rel and intermediate = H*int_ratio*ratio.
-    # Per-H^2 cost of one reasoning block (channel side):
-    #   FreqCoding2D (shared): ~0 (charged once globally, small).
-    #   FactoredSwiGLU on C: 2*(C*r_ffn_c) + 2*(r_ffn_c * 2*intermediate_c),
-    #     with r_ffn_c = C*ffn_rank_rel and intermediate_c = C*int_ratio.
-    # We fold these into a single cost-per-H^2 coefficient via the ratios.
-    cost_per_h_sq = (
-        2.0 * (perc + expr)
-        + 4.0 * ffn_rank_rel * (1.0 + int_ratio * ratio) * (perc + expr)
-        + 4.0 * ratio * ratio * ffn_rank_rel * (1.0 + int_ratio) * reason
-        + 2.0 * ratio * reason
-    )
-    H = _round_to_multiple(int(math.sqrt(target / cost_per_h_sq)), 8)
-
-    for _ in range(8):
-        C = _round_to_multiple(int(H * ratio), 8)
-        ffn_int_h = _round_to_multiple(int(H * int_ratio * ratio), 8)
-        ffn_int_c = _round_to_multiple(int(C * int_ratio), 8)
-        r_ffn_h = max(32, H // 4)
-        r_ffn_c = max(32, C // 4)
-        # FreqBlock cost: layer scales + freq gates + phase (small per layer)
-        # + derivative branch params (shared across layers, charge once).
-        cost_h_freq = 2 * H
-        cost_h_ffn = H * r_ffn_h + r_ffn_h * 2 * ffn_int_h + ffn_int_h * r_ffn_h + r_ffn_h * H
-        cost_h = cost_h_freq + cost_h_ffn + 2 * H
-        cost_c_freq = 2 * C
-        cost_c_ffn = C * r_ffn_c + r_ffn_c * 2 * ffn_int_c + ffn_int_c * r_ffn_c + r_ffn_c * C
-        cost_c = cost_c_freq + cost_c_ffn + 2 * C
-        extra = 50 * C + 20 * H
-        k = (cost_h * (perc + expr) + cost_c * reason + extra) / (H * H)
-        H_new = _round_to_multiple(int(math.sqrt(target / k)), 8)
-        if abs(H_new - H) <= 8:
-            H = H_new
-            break
-        H = H_new
-
-    C = _round_to_multiple(int(H * ratio), 8)
-
-    head_dim = _round_to_multiple(_HEAD_DIM_TARGET, 8)
+    ffn_cost_per_layer = 2 * (_round_to_multiple(int(target ** 0.5)) * 4)  # rough
+    # Per-H^2 coefficient: attn ~4, FFN ~8 (A0+A1+W at m=4H => 3*4H^2 ~ 12, /2 master)
+    cost_per_h_sq = 4.0 + 6.0
+    H = _round_to_multiple(int(math.sqrt(target / (cost_per_h_sq * (perc + expr)))), 8)
+    C = _round_to_multiple(H // 2, 8)
+    head_dim = _round_to_multiple(64, 8)
     n_q = max(2, _next_pow2(H // head_dim))
     head_dim = _round_to_multiple(H // n_q, 8)
     while n_q * head_dim < H:
         head_dim += 8
-    n_kv = max(1, n_q // 2)
-    while n_q % n_kv != 0:
-        n_kv -= 1
-
-    mla_up = n_kv * head_dim
-    mla_compress = max(16, mla_up // 2)
-
-    total_grade = sum(_GRADE_RATIOS)
-    grade_dims = tuple(_round_to_multiple(int(H * r / total_grade), 4) for r in _GRADE_RATIOS)
-    diff = H - sum(grade_dims)
-    if diff != 0:
-        grade_dims = list(grade_dims)
-        grade_dims[-1] += diff
-        grade_dims = tuple(max(0, g) for g in grade_dims)
-
-    n_modes_t = _round_to_multiple(max(4, H // 32), 4)
-    n_modes_h = _round_to_multiple(max(4, head_dim // 4), 4)
-    complex_rank = max(8, head_dim // 4)
-
-    n_checks = C
-    edges_per_check = max(3, min(8, C // 32))
+    del ffn_cost_per_layer
 
     m = ModelConfig()
     m.vocab_size = vocab_size
     m.hidden_size = H
     m.core_hidden_size = C
-    m.perception_layers = perc
-    m.reasoning_layers = reason
-    m.bottleneck_ratio = ratio
     m.target_params = target_params
     m.target_nonembed_params = int(target)
-
-    m.algebra.grade_dims = grade_dims
-    m.algebra.hidden_size = H
-
+    m.body.context_layers = perc
+    m.body.expression_layers = expr
     m.attention.num_query_heads = n_q
-    m.attention.num_kv_heads = n_kv
+    m.attention.num_kv_heads = max(1, n_q // 2)
     m.attention.head_dim = head_dim
-
-    m.msa.n_kv_heads = n_kv
-    m.msa.head_dim = head_dim
-    m.msa.grade_dims = grade_dims
-    m.msa.mla_compress_dim = mla_compress
-    m.msa.mla_up_dim = mla_up
-
-    m.freq_coding.n_modes_t = n_modes_t
-    m.freq_coding.n_modes_h = n_modes_h
-    m.freq_coding.complex_rank = complex_rank
-
-    m.codec.n_checks = n_checks
-    m.codec.edges_per_check = edges_per_check
-
     return m
 
 
@@ -779,71 +284,29 @@ def _apply_dict(obj: object, data: dict) -> None:
         current = getattr(obj, key)
         if hasattr(current, "__dataclass_fields__") and isinstance(value, dict):
             _apply_dict(current, value)
-        elif current is None and isinstance(value, dict):
-            _instantiate_optional(obj, key, value)
         else:
             setattr(obj, key, value)
 
 
-def _instantiate_optional(obj: object, key: str, value: dict) -> None:
-    """Instantiate an optional dataclass field (None default) from a YAML dict."""
-    import dataclasses
-    import sys
-
-    if not dataclasses.is_dataclass(obj):
-        setattr(obj, key, value)
-        return
-    fields_map = {f.name: f for f in dataclasses.fields(obj)}
-    if key not in fields_map:
-        setattr(obj, key, value)
-        return
-    type_name = fields_map[key].type
-    if isinstance(type_name, str):
-        mod = sys.modules.get(type(obj).__module__)
-        if mod is None:
-            setattr(obj, key, value)
-            return
-        resolved = getattr(mod, type_name, None)
-        if resolved is None:
-            for part in type_name.replace(" | None", "").split("."):
-                resolved = getattr(resolved or mod, part, None)
-        if resolved and hasattr(resolved, "__dataclass_fields__"):
-            instance = resolved()
-            _apply_dict(instance, value)
-            setattr(obj, key, instance)
-        else:
-            setattr(obj, key, value)
-    elif hasattr(type_name, "__dataclass_fields__"):
-        instance = type_name()
-        _apply_dict(instance, value)
-        setattr(obj, key, instance)
-    else:
-        setattr(obj, key, value)
-
-
-def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
-    """Load config from YAML file, then apply keyword overrides."""
+def load_config(path: str | None = None, **overrides: object) -> Config:
+    """Load config from YAML, auto-configure sizes from target_params, validate."""
     import yaml
 
-    cfg = HAGIv4Config()
+    cfg = Config()
+    yaml_keys = {"train": set(), "inference": set()}
     if path:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
-        train_yaml_keys = set(data.get("train", {}).keys())
-        inference_yaml_keys = set(data.get("inference", {}).keys())
+        yaml_keys["train"] = set(data.get("train", {}).keys())
+        yaml_keys["inference"] = set(data.get("inference", {}).keys())
         _apply_dict(cfg, data)
 
         tp = cfg.model.target_params
         if tp and tp > 0:
             model_data = data.get("model", {})
-            # Prefer the explicit non-embedding budget when provided so that
-            # the channel codec body capacity is independent of vocabulary size.
-            nonembed_budget = model_data.get("target_nonembed_params")
-            budget = nonembed_budget if nonembed_budget else tp
-            auto = auto_configure(int(budget), cfg.model.vocab_size)
+            nonembed = model_data.get("target_nonembed_params") or tp
+            auto = auto_configure(int(nonembed), cfg.model.vocab_size)
             _apply_auto(cfg.model, auto, model_data)
-
-        _derive_defaults(cfg, train_yaml_keys, inference_yaml_keys)
 
     for key, value in overrides.items():
         if "." in key:
@@ -854,402 +317,56 @@ def load_config(path: str | None = None, **overrides: object) -> HAGIv4Config:
             setattr(obj, parts[-1], value)
         elif hasattr(cfg, key):
             setattr(cfg, key, value)
+
     validate_config(cfg)
     return cfg
 
 
-def validate_config(cfg: HAGIv4Config) -> None:
-    def bounded_int(name: str, value: int, upper: int) -> None:
-        if type(value) is not int or not 1 <= value <= upper:
-            raise ValueError(f"{name} must be an integer in [1, {upper}]")
-
-    bounded_int("model.vocab_size", cfg.model.vocab_size, 1_000_000)
-    bounded_int("model.hidden_size", cfg.model.hidden_size, 16_384)
-    bounded_int("model.core_hidden_size", cfg.model.core_hidden_size, 16_384)
-    bounded_int("model.attention.max_seq_len", cfg.model.attention.max_seq_len, 65_536)
-    bounded_int("train.seq_len", cfg.train.seq_len, 65_536)
-    bounded_int("train.batch_size", cfg.train.batch_size, 4_096)
-    bounded_int("model.refinement.num_iterations", cfg.model.refinement.num_iterations, 64)
-    bounded_int("model.refinement.min_iterations", cfg.model.refinement.min_iterations, 64)
-    bounded_int("inference.max_new_tokens", cfg.inference.max_new_tokens, 8_192)
-    bounded_int("inference.max_iterations", cfg.inference.max_iterations, 64)
-    if cfg.model.core_hidden_size > cfg.model.hidden_size:
-        raise ValueError("model.core_hidden_size must not exceed model.hidden_size")
-    if cfg.model.refinement.min_iterations > cfg.model.refinement.num_iterations:
-        raise ValueError("model.refinement.min_iterations must not exceed num_iterations")
-    if not 0 <= cfg.inference.min_new_tokens <= cfg.inference.max_new_tokens:
-        raise ValueError("inference.min_new_tokens must be within max_new_tokens")
-    if cfg.train.checkpoint_format_version != 3:
-        raise ValueError("checkpoint_format_version must be 3 for channel-correct fresh training")
-    if type(cfg.train.checkpoint_keep_last) is not int or cfg.train.checkpoint_keep_last < 1:
-        raise ValueError("checkpoint_keep_last must be an integer of at least 1")
-    if type(cfg.train.distill_enabled) is not bool:
-        raise ValueError("distill_enabled must be a boolean")
-    if cfg.train.distill_enabled is True and cfg.train.distill_teacher_hidden_size <= 0:
-        raise ValueError("distill_teacher_hidden_size must be positive when distillation is enabled")
-    if cfg.train.grad_accum_steps < 1:
-        raise ValueError("grad_accum_steps must be positive")
-    if cfg.train.eos_token_id == cfg.train.pad_token_id:
-        raise ValueError("eos_token_id and pad_token_id must be distinct")
-    if not 0 <= cfg.train.eos_token_id < cfg.model.vocab_size:
-        raise ValueError("eos_token_id must be within the model vocabulary")
-    if not 0 <= cfg.train.pad_token_id < cfg.model.vocab_size:
-        raise ValueError("pad_token_id must be within the model vocabulary")
-
-    # V25 path selection. V25 (default ON) supersedes V24/V23. When v25.enabled
-    # is True the AWGN/LDPC codec invariants (sigma_end, code_rate, capacity,
-    # edges_per_check, parity_diversity, BP asymmetry) do NOT apply — those are
-    # properties of the self-inflicted AWGN channel V25 structurally removes
-    # (ARCHITECTURE_V25.md §9). They stay enforced for the V23 ablation path.
-    v25_enabled = bool(getattr(cfg.model, "v25", None) and cfg.model.v25.enabled)
-
-    # V25-specific invariants (§7). Honest for the V25 path; the AWGN/LDPC
-    # checks below are skipped because there is no physical channel on V25.
-    if v25_enabled:
-        v25 = cfg.model.v25
-        # 1. bottleneck_dim C < H — real compression (else no RD).
-        if not (0 < cfg.model.core_hidden_size < cfg.model.hidden_size):
-            raise ValueError(
-                f"V25: model.core_hidden_size ({cfg.model.core_hidden_size}) must satisfy "
-                f"0 < C < model.hidden_size ({cfg.model.hidden_size}). No compression => no RD."
-            )
-        # 4. predictive train/infer asymmetry (V13 win).
-        if not (v25.predictive_train_iterations < v25.predictive_infer_iterations):
-            raise ValueError(
-                f"V25: v25.predictive_train_iterations ({v25.predictive_train_iterations}) must be "
-                f"< v25.predictive_infer_iterations ({v25.predictive_infer_iterations}). "
-                f"Train/infer asymmetry is the V13 invariant."
-            )
-        # 5. attn-entropy floor > 0 when the weight is active (V22 collapse guard).
-        if cfg.train.w_attn_entropy > 0 and cfg.train.attn_entropy_floor <= 0.0:
-            raise ValueError(
-                "train.attn_entropy_floor must be > 0 when w_attn_entropy > 0. "
-                "V22 regression: floor=0 caused 677 attention collapse events."
-            )
-        # perception_weight is informational here (the aggregator applies it via
-        # w_v24_perception). Keep the V24 invariant honest for the RD terms.
-        if getattr(cfg.train, "w_v24_perception", 0.0) < 0.0:
-            raise ValueError("train.w_v24_perception must be >= 0 (RDP perception axis).")
-        # Skip the V19-V23 AWGN/LDPC/parity invariants — dead code on the V25
-        # path. They re-engage below when v25.enabled=False.
-    else:
-        # V19 SCS invariants — protect against regressions discovered in V17/V18.
-        # 1. Train/infer BP asymmetry: infer must use MORE iterations than train
-        #    (the V13 win). If train >= infer, we are not doing asymmetric codec.
-        train_bp = getattr(cfg.train, "bp_iterations", None)
-        if train_bp is not None and type(train_bp) is int and train_bp >= cfg.model.refinement.num_iterations:
-            raise ValueError(
-                f"train.bp_iterations ({train_bp}) must be < refinement.num_iterations "
-                f"({cfg.model.refinement.num_iterations}). Train/infer BP asymmetry "
-                f"is a V13-vintage invariant — inference must use MORE BP iterations "
-                f"than training for recovery without gradient overhead."
-            )
-        # 2. AWGN sigma_end must be > 0 — channel never closes completely.
-        #    V17 bug: channel never opened because the schedule bottomed at 0.0.
-        if cfg.train.awgn_enabled and cfg.train.awgn_sigma_end <= 0.0:
-            raise ValueError(
-                "train.awgn_sigma_end must be > 0 when awgn_enabled. V17 regression: "
-                "channel_closed at sigma=0 broke the LDPC training signal entirely."
-            )
-        # 3. parity_diversity weight must be > 0 — prevents LDPC code collapse.
-        #    V17 YAML bug: w_parity_diversity=0.0 caused parity code to collapse
-        #    to a single edge per check.
-        if cfg.train.w_parity_diversity <= 0.0:
-            raise ValueError(
-                "train.w_parity_diversity must be > 0. V17 regression: a YAML bug "
-                "set this to 0.0 and the LDPC code collapsed (parity_metric=0.0096)."
-            )
-        # 4. AWGN sigma_start must be >= sigma_end (schedule goes from noisy to clean).
-        if cfg.train.awgn_enabled and cfg.train.awgn_sigma_start < cfg.train.awgn_sigma_end:
-            raise ValueError(
-                f"awgn_sigma_start ({cfg.train.awgn_sigma_start}) must be >= "
-                f"awgn_sigma_end ({cfg.train.awgn_sigma_end}). Schedule must go "
-                f"from noisy (high sigma) to clean (low sigma), not the reverse."
-            )
-
-    # V23 information-theoretic invariants — protect against regressions.
-
-    # 5. Attention entropy floor must be > 0 — prevents attention collapse.
-    #    V22: 677 collapse events in 4534 V20 steps when floor was 0.
-    if cfg.train.w_attn_entropy > 0 and cfg.train.attn_entropy_floor <= 0.0:
-        raise ValueError(
-            "train.attn_entropy_floor must be > 0 when w_attn_entropy > 0. "
-            "V22 regression: floor=0 caused 677 attention collapse events."
-        )
-
-    # 6. Attention entropy regularization weight must be > 0.
-    if cfg.train.w_attn_entropy <= 0.0:
-        raise ValueError(
-            "train.w_attn_entropy must be > 0. V22: entropy regularization "
-            "prevents cyclic loss oscillation from attention collapse."
-        )
-
-    # 7-9. LDPC / Shannon capacity invariants. These describe the V23 AWGN/LDPC
-    # physical channel (code_rate, edges_per_check, Shannon capacity at sigma_end).
-    # On the V25 path there is no physical channel — ternary quantization noise is
-    # the only impairment — so these invariants are structurally meaningless and
-    # are skipped when v25.enabled (ARCHITECTURE_V25.md §9). They stay enforced
-    # for the V23 ablation path.
-    if not v25_enabled:
-        # 7. Channel code rate must be in (0, 1) — Shannon SCS constraint.
-        #    rate=0: no systematic bits (channel-only, useless). rate=1: no parity
-        #    bits (no error correction). Both violate Source-Channel Separation.
-        code_rate = cfg.model.codec.code_rate
-        if not 0.0 < code_rate < 1.0:
-            raise ValueError(
-                f"model.codec.code_rate ({code_rate}) must be in (0, 1). "
-                f"Shannon SCS: rate=0 means no systematic, rate=1 means no parity."
-            )
-
-        # 8. LDPC: each parity check must have at least 1 edge.
-        if cfg.model.codec.n_checks > 0 and cfg.model.codec.edges_per_check < 1:
-            raise ValueError(
-                f"model.codec.edges_per_check ({cfg.model.codec.edges_per_check}) "
-                f"must be >= 1. LDPC: each check needs at least 1 edge."
-            )
-
-        # 9. Shannon capacity at AWGN sigma_end must exceed code rate.
-        #    If capacity < rate, the channel cannot support the code — BP cannot
-        #    converge regardless of iterations. C = 0.5 * log2(1 + 1/sigma^2).
-        if cfg.train.awgn_enabled:
-            import math
-
-            sigma_end = cfg.train.awgn_sigma_end
-            capacity_end = 0.5 * math.log2(1.0 + 1.0 / max(sigma_end**2, 1e-10))
-            if capacity_end < code_rate:
-                raise ValueError(
-                    f"Shannon limit violated: awgn_sigma_end={sigma_end} gives "
-                    f"capacity={capacity_end:.3f} bits/use < code_rate={code_rate}. "
-                    f"Channel cannot support the code — BP cannot converge."
-                )
-
-    # 10. HRM stride must divide sequence length for clean spatial coarsening.
-    hrm_cfg = getattr(cfg.model, "hrm", None)
-    if hrm_cfg is not None and hrm_cfg.h_stride < 1:
-        raise ValueError(f"model.hrm.h_stride ({hrm_cfg.h_stride}) must be >= 1.")
-
-
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
-    """Apply auto-computed values, skipping fields explicitly set in YAML."""
-    size_fields = [
-        "hidden_size",
-        "core_hidden_size",
-        "perception_layers",
-        "expression_layers",
-        "reasoning_layers",
-        "bottleneck_ratio",
-    ]
+    """Apply auto-computed sizes, skipping anything explicitly set in YAML."""
+    size_fields = ["hidden_size", "core_hidden_size", "target_params", "target_nonembed_params"]
     for f in size_fields:
         if f not in yaml_data:
             setattr(model, f, getattr(auto, f))
-
-    nested = {
-        "algebra": ["grade_dims", "hidden_size"],
-        "attention": ["num_query_heads", "num_kv_heads", "head_dim"],
-        "msa": [
-            "n_kv_heads",
-            "head_dim",
-            "grade_dims",
-            "mla_compress_dim",
-            "mla_up_dim",
-        ],
-        "freq_coding": ["n_modes_t", "n_modes_h", "complex_rank"],
-        "codec": ["n_checks", "edges_per_check"],
-    }
-    for section, fields in nested.items():
-        yaml_section = yaml_data.get(section, {})
-        auto_section = getattr(auto, section)
-        model_section = getattr(model, section)
-        for f in fields:
-            if f not in yaml_section:
-                setattr(model_section, f, getattr(auto_section, f))
-
-    # V11: recompute codec dimensions from the FINAL core_hidden_size, not from
-    # the auto_configure estimate. When the YAML overrides hidden_size/
-    # core_hidden_size, the auto-computed n_checks (= auto.C = 1056) no longer
-    # matches the actual C (= 320), producing a 3.3x oversized parity matrix.
-    # code_rate governs the ratio: n_checks = C * (1/rate - 1).
-    if "n_checks" not in yaml_data.get("codec", {}):
-        rate = model.codec.code_rate
-        model.codec.n_checks = max(1, int(model.core_hidden_size * (1.0 / rate - 1.0)))
-    if "edges_per_check" not in yaml_data.get("codec", {}):
-        model.codec.edges_per_check = max(3, min(8, model.core_hidden_size // 32))
+    if "hidden_size" not in yaml_data:
+        model.attention.num_query_heads = auto.attention.num_query_heads
+        model.attention.num_kv_heads = auto.attention.num_kv_heads
+        model.attention.head_dim = auto.attention.head_dim
+    body = yaml_data.get("body", {})
+    if "context_layers" not in body:
+        model.body.context_layers = auto.body.context_layers
+    if "expression_layers" not in body:
+        model.body.expression_layers = auto.body.expression_layers
 
 
-def _derive_defaults(cfg: HAGIv4Config, train_yaml_keys: set[str], inference_yaml_keys: set[str]) -> None:
-    """Derive train/inference defaults from model architecture.
+def validate_config(cfg: Config) -> None:
+    """Structural invariants for the ternary RD-channel LM."""
+    m, t = cfg.model, cfg.train
 
-    Only sets fields NOT explicitly provided in YAML. This reduces the
-    required YAML to ~15 lines (target_params, vocab_size, tokenizer,
-    batch_size, seq_len, max_steps, and hardware-specific params).
-    """
-    import math
+    def bint(name: str, value: int, upper: int) -> None:
+        if type(value) is not int or not 1 <= value <= upper:
+            raise ValueError(f"{name} must be an integer in [1, {upper}]")
 
-    m = cfg.model
-    t = cfg.train
-    nonembed = max(1, m.target_nonembed_params or m.target_params)
-    H = m.hidden_size
-    C = m.core_hidden_size
-
-    # --- Train defaults derived from model size ---
-
-    if "warmup_steps" not in train_yaml_keys:
-        # Larger models need more warmup. Linear scaling with parameter count.
-        # 25M -> 1000, 100M -> 4000, 1B -> 40000
-        t.warmup_steps = max(500, nonembed // 25000)
-
-    if "learning_rate" not in train_yaml_keys:
-        # muP-style scaling: lr proportional to 1/sqrt(nonembed_params)
-        # 25M -> 0.0006, 100M -> 0.0003, 1B -> 0.0001
-        t.learning_rate = max(1e-5, 0.003 / math.sqrt(nonembed / 1e6))
-
-    if "bp_iterations" not in train_yaml_keys:
-        t.bp_iterations = 3
-
-    if "suffix_probability" not in train_yaml_keys:
-        t.suffix_probability = 0.30
-
-    if "w_parity_diversity" not in train_yaml_keys:
-        t.w_parity_diversity = 0.05
-
-    if "w_attn_entropy" not in train_yaml_keys:
-        t.w_attn_entropy = 0.01
-
-    if "attn_entropy_floor" not in train_yaml_keys:
-        t.attn_entropy_floor = 0.5
-
-    if "checkpoint_interval" not in train_yaml_keys:
-        t.checkpoint_interval = max(100, t.max_steps // 300)
-
-    if "curriculum_stage2_start" not in train_yaml_keys:
-        t.curriculum_stage2_start = int(t.max_steps * 0.8)
-
-    if "checkpoint_format_version" not in train_yaml_keys:
-        t.checkpoint_format_version = 3
-
-    if "checkpoint_keep_last" not in train_yaml_keys:
-        t.checkpoint_keep_last = 3
-
-    if "sequential_cycles" not in train_yaml_keys:
-        t.sequential_cycles = 3
-
-    if "curriculum_enabled" not in train_yaml_keys:
-        t.curriculum_enabled = True
-
-    if "use_two_phase_schedule" not in train_yaml_keys:
-        t.use_two_phase_schedule = True
-
-    if "two_phase_split" not in train_yaml_keys:
-        t.two_phase_split = 0.5
-
-    if "phase1_mask_ratio" not in train_yaml_keys:
-        t.phase1_mask_ratio = 0.15
-
-    if "phase2_mask_ratio" not in train_yaml_keys:
-        t.phase2_mask_ratio = 0.30
-
-    if "phase3_mask_ratio" not in train_yaml_keys:
-        t.phase3_mask_ratio = 0.50
-
-    if "use_continuous_anneal" not in train_yaml_keys:
-        t.use_continuous_anneal = True
-
-    if "awgn_enabled" not in train_yaml_keys:
-        t.awgn_enabled = True
-
-    if "awgn_sigma_start" not in train_yaml_keys:
-        t.awgn_sigma_start = 0.50
-
-    if "awgn_sigma_end" not in train_yaml_keys:
-        t.awgn_sigma_end = 0.30
-
-    if "awgn_end_frac" not in train_yaml_keys:
-        t.awgn_end_frac = 0.5
-
-    if "distill_end_frac" not in train_yaml_keys:
-        t.distill_end_frac = 0.6
-
-    if "distill_kl_enabled" not in train_yaml_keys:
-        t.distill_kl_enabled = False
-
-    if "distill_use_temp_anneal" not in train_yaml_keys:
-        t.distill_use_temp_anneal = True
-
-    if "distill_temp_start" not in train_yaml_keys:
-        t.distill_temp_start = 4.0
-
-    if "distill_temp_end" not in train_yaml_keys:
-        t.distill_temp_end = 1.0
-
-    if "distill_temperature" not in train_yaml_keys:
-        t.distill_temperature = 2.0
-
-    if "distill_alpha_start" not in train_yaml_keys:
-        t.distill_alpha_start = 0.0
-
-    if "distill_alpha_end" not in train_yaml_keys:
-        t.distill_alpha_end = 0.0
-
-    if "distill_enabled" not in train_yaml_keys:
-        t.distill_enabled = False
-
-    if "freeze_embeddings" not in train_yaml_keys:
-        t.freeze_embeddings = False
-
-    if "w_ce" not in train_yaml_keys:
-        t.w_ce = 1.0
-
-    if "w_whiteness" not in train_yaml_keys:
-        t.w_whiteness = 0.0
-
-    if "w_parity" not in train_yaml_keys:
-        t.w_parity = 0.05
-
-    if "w_correction_alignment" not in train_yaml_keys:
-        t.w_correction_alignment = 0.0
-
-    if "w_rate_distortion" not in train_yaml_keys:
-        t.w_rate_distortion = 0.005
-
-    if "max_grad_norm" not in train_yaml_keys:
-        t.max_grad_norm = 1.0
-
-    if "weight_decay" not in train_yaml_keys:
-        t.weight_decay = 0.1
-
-    if "muon_lr" not in train_yaml_keys:
-        t.muon_lr = 0.02
-
-    if "muon_momentum" not in train_yaml_keys:
-        t.muon_momentum = 0.95
-
-    if "muon_weight_decay" not in train_yaml_keys:
-        t.muon_weight_decay = 0.5
-
-    if "muon_ns_steps" not in train_yaml_keys:
-        t.muon_ns_steps = 5
-
-    if "precision" not in train_yaml_keys:
-        t.precision = "bf16"
-
-    if "grad_accum_steps" not in train_yaml_keys:
-        t.grad_accum_steps = 2
-
-    # --- Inference defaults ---
-
-    if "temperature" not in inference_yaml_keys:
-        cfg.inference.temperature = 0.8
-    if "top_k" not in inference_yaml_keys:
-        cfg.inference.top_k = 50
-    if "min_new_tokens" not in inference_yaml_keys:
-        cfg.inference.min_new_tokens = 2
-    if "repetition_penalty" not in inference_yaml_keys:
-        cfg.inference.repetition_penalty = 1.2
-    if "repetition_window" not in inference_yaml_keys:
-        cfg.inference.repetition_window = 32
-    if "no_repeat_ngram_size" not in inference_yaml_keys:
-        cfg.inference.no_repeat_ngram_size = 2
-    if "max_iterations" not in inference_yaml_keys:
-        cfg.inference.max_iterations = 3
-    if "max_new_tokens" not in inference_yaml_keys:
-        cfg.inference.max_new_tokens = 64
+    bint("model.vocab_size", m.vocab_size, 1_000_000)
+    bint("model.hidden_size", m.hidden_size, 16_384)
+    bint("model.core_hidden_size", m.core_hidden_size, 16_384)
+    bint("train.seq_len", t.seq_len, 65_536)
+    bint("train.batch_size", t.batch_size, 4_096)
+    bint("inference.max_new_tokens", cfg.inference.max_new_tokens, 8_192)
+    if not 0 < m.core_hidden_size < m.hidden_size:
+        raise ValueError(
+            f"model.core_hidden_size ({m.core_hidden_size}) must satisfy "
+            f"0 < C < hidden_size ({m.hidden_size}). No compression => no RD."
+        )
+    if t.grad_accum_steps < 1:
+        raise ValueError("train.grad_accum_steps must be positive")
+    if t.eos_token_id == t.pad_token_id:
+        raise ValueError("eos_token_id and pad_token_id must be distinct")
+    if not 0 <= t.eos_token_id < m.vocab_size:
+        raise ValueError("eos_token_id must be within the model vocabulary")
+    if not 0 <= t.pad_token_id < m.vocab_size:
+        raise ValueError("pad_token_id must be within the model vocabulary")
+    if t.w_attn_entropy > 0 and t.attn_entropy_floor <= 0.0:
+        raise ValueError("train.attn_entropy_floor must be > 0 when w_attn_entropy > 0")
+    if t.w_perception < 0.0:
+        raise ValueError("train.w_perception must be >= 0 (RDP perception axis)")

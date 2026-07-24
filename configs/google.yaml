@@ -1,0 +1,101 @@
+# HAGI — Google Gemma teacher configuration (cloud, T4/V100 16GB).
+#
+# Ternary RD-channel causal LM (see docs/ARCHITECTURE.md). Trained from
+# scratch on Gemma-tokenized data (vocab 262146). Larger body budget than
+# smollm2.yaml; multimodal source coding enabled (image + audio). The
+# auto_configure solver derives hidden/layer/head sizes from
+# target_nonembed_params; everything else is an explicit knob here.
+
+model:
+  vocab_size: 262146
+  hidden_size: 768                 # explicit (overrides auto_configure)
+  core_hidden_size: 384            # C < H (real compression)
+  target_params: 400000000
+  target_nonembed_params: 400000000
+
+  attention:
+    max_seq_len: 8192
+    num_query_heads: 12            # 768 / 12 = 64 per head
+    head_dim: 64
+    rope_theta: 500000.0
+
+  embeddings:
+    factor_rank: 256
+    kernel_size: 5                  # causal depthwise conv (left-pad only)
+
+  multimodal:
+    enabled: true                   # image + audio source coding + early fusion
+    image_patch_size: 16
+    image_channels: 3
+    audio_mel_bins: 80
+
+  body:
+    context_layers: 12
+    expression_layers: 12
+    ternary:
+      use_ternary: true             # BitNet b1.58 on the 2D body masters
+      hebbian_expansion: 4
+    bottleneck:
+      bottleneck_in_path: false     # IB stays an auxiliary KL regularizer
+    predictive:
+      enabled: false                # optional extrinsic error highway (off)
+    ib_beta: 0.001
+    distortion_weight: 1.0
+    perception_weight: 0.01
+    kl_free_bits: 0.5
+    moe_enabled: false
+
+train:
+  max_steps: 200000
+  batch_size: 4
+  seq_len: 1024
+  warmup_steps: 8000
+  learning_rate: 0.0003
+  muon_lr: 0.02
+  grad_accum_steps: 4
+  precision: bf16
+
+  tokenizer: "google/gemma-3-1b-it"
+  eos_token_id: 1
+  pad_token_id: 0
+  data_dir: data
+
+  w_rate: 0.001
+  w_distortion: 1.0
+  w_perception: 0.01
+  w_ternary_bias: 0.0
+  w_attn_entropy: 0.01
+  attn_entropy_floor: 0.5
+
+  checkpoint_dir: checkpoints
+  checkpoint_interval: 2000
+  checkpoint_keep_last: 3
+
+  curriculum:
+    enabled: true
+    stage2_start: 160000
+    cycles_per_dataset: 3
+    stage1_order: [tinystories, python_instruct, smoltalk, wikipedia_en, wikipedia_ru, openwebmath, oscar_ru, slimpajama, edu]
+    stage2_datasets: [openwebmath, edu, slimpajama]
+
+  distill:
+    enabled: true                   # online hidden-state distillation from Gemma
+    teacher: "google/gemma-3-1b-it"
+    teacher_hidden_size: 1152
+    embed_teacher: "google/gemma-3-1b-it"
+    alpha_start: 0.1
+    alpha_end: 0.05
+    temperature: 2.0
+    use_temp_anneal: true
+    temp_start: 4.0
+    temp_end: 1.0
+    end_frac: 0.6
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  min_new_tokens: 2
+  repetition_penalty: 1.2
+  repetition_window: 64
+  no_repeat_ngram_size: 2
+  max_new_tokens: 128
