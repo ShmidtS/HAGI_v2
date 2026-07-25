@@ -1,12 +1,14 @@
-"""Causal autoregressive generation.
+"""Causal autoregressive generation with an incremental KV-cache.
 
-Standard GPT-style left-to-right token generation matching the causal
-training mode. Feeds the prompt, takes logits at the last position, samples
-the next token, appends it, and repeats.
+Standard GPT-style left-to-right token generation matching the causal training
+mode. The model sees the REAL context at every step — nothing is erased.
 
-The model sees the REAL context at every step — nothing is erased. The
-causal-mode mask contract (``prediction_mask`` all-True, ``semantic_unknown_mask``
-all-False) returns logits as ``[B*T, V]``; we take the last position per row.
+V27 uses the per-layer KV-cache (rehabilitated from V23's never-wired
+``kv_cache.py``): the prompt is prefetched once (KV cached), then each new
+token is a single-position forward pass that reuses the frozen prefix. This is
+O(T) generation instead of V25's O(T^2) full-recompute-per-step (the
+convolutional-code decoder-state analogy). The cache is allocated, used, and
+always detached.
 """
 
 from __future__ import annotations
@@ -81,9 +83,7 @@ def process_generation_logits(
             repeated = window[row].unique()
             scores = processed[row, repeated]
             processed[row, repeated] = torch.where(
-                scores < 0,
-                scores * repetition_penalty,
-                scores / repetition_penalty,
+                scores < 0, scores * repetition_penalty, scores / repetition_penalty,
             )
 
     n = no_repeat_ngram_size
@@ -126,9 +126,17 @@ def generate(
     repetition_penalty: float = 1.2,
     repetition_window: int = 64,
     no_repeat_ngram_size: int = 2,
+    use_cache: bool = True,
     generator: torch.Generator | None = None,
 ) -> GenerationOutput:
-    """Pure causal autoregressive generation (matches the causal training mode)."""
+    """Pure causal autoregressive generation with an incremental KV-cache.
+
+    Prefetch: the prompt is run once with the cache attached (prefilling all
+    prompt positions). Then each new token is a single-position forward pass
+    that appends its KV to the cache and attends to the full frozen prefix.
+
+    Set ``use_cache=False`` to fall back to full-recompute-per-step (O(T^2)).
+    """
     if prompt_ids.ndim != 2 or prompt_ids.dtype != torch.long:
         raise ValueError("prompt_ids must be a rank-2 LongTensor")
     if max_new_tokens < 1:
@@ -156,62 +164,77 @@ def generate(
     generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    for step in range(max_new_tokens):
-        if finished.all():
-            break
+    caches = None
+    if use_cache and hasattr(model, "allocate_for_cache"):
+        caches = model.allocate_for_cache(batch_size, next(model.parameters()).dtype, device)
 
-        current_len = prompt_len + step
-        input_ids = sequence[:, :current_len]
-        T_input = input_ids.shape[1]
-        # Causal next-token: the model sees the REAL context — nothing erased.
-        # semantic_unknown_mask all-False (marking the last token unknown fed
-        # the model its learned unknown_embed instead of the real token).
-        # prediction_mask all-True selects every position; logits come as
-        # [B*T, V] and we take the LAST per row.
-        valid_target_mask = torch.ones((batch_size, T_input), dtype=torch.bool, device=device)
-        prediction_mask = valid_target_mask.clone()
-        semantic_unknown_mask = torch.zeros((batch_size, T_input), dtype=torch.bool, device=device)
+    try:
+        # Prefetch the prompt once: cache holds KV for all prompt positions.
+        valid_target_mask = torch.ones((batch_size, prompt_len), dtype=torch.bool, device=device)
         output = model(
-            input_ids,
-            targets=None,
-            semantic_unknown_mask=semantic_unknown_mask,
-            prediction_mask=prediction_mask,
-            valid_target_mask=valid_target_mask,
-            attention_mode="causal",
+            prompt_ids, targets=None, prediction_mask=valid_target_mask,
+            valid_target_mask=valid_target_mask, attention_mode="causal",
         )
         if output.logits is None:
             raise ValueError("model output must include logits")
-        next_logits = output.logits.view(batch_size, T_input, -1)[:, -1, :]
+        next_logits = output.logits.view(batch_size, prompt_len, -1)[:, -1, :]
 
         for r in range(batch_size):
             if finished[r]:
                 next_logits[r] = float("-inf")
                 next_logits[r, pad_token_id] = 0.0
 
-        context = sequence[:, :current_len]
-        next_tokens = process_generation_logits(
-            next_logits,
-            context,
-            generated_lengths=generated_lengths,
-            forbidden_token_ids=invalid_token_ids,
-            eos_token_id=eos_token_id,
-            min_new_tokens=min_new_tokens,
-            repetition_penalty=repetition_penalty,
-            repetition_window=repetition_window,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            temperature=temperature,
-            top_k=top_k,
-            generator=generator,
-        )
+        for step in range(max_new_tokens):
+            if finished.all():
+                break
 
-        for r in range(batch_size):
-            if finished[r]:
-                continue
-            token = int(next_tokens[r].item())
-            sequence[r, current_len] = token
-            generated_lengths[r] += 1
-            if token == eos_token_id:
-                finished[r] = True
+            context = sequence[:, : prompt_len + step]
+            next_tokens = process_generation_logits(
+                next_logits, context,
+                generated_lengths=generated_lengths, forbidden_token_ids=invalid_token_ids,
+                eos_token_id=eos_token_id, min_new_tokens=min_new_tokens,
+                repetition_penalty=repetition_penalty, repetition_window=repetition_window,
+                no_repeat_ngram_size=no_repeat_ngram_size, temperature=temperature,
+                top_k=top_k, generator=generator,
+            )
+
+            for r in range(batch_size):
+                if finished[r]:
+                    continue
+                token = int(next_tokens[r].item())
+                sequence[r, prompt_len + step] = token
+                generated_lengths[r] += 1
+                if token == eos_token_id:
+                    finished[r] = True
+
+            if step + 1 >= max_new_tokens or finished.all():
+                break
+
+            # Single-position forward pass that reuses the cached prefix.
+            new_pos = prompt_len + step
+            new_token = sequence[:, new_pos:new_pos + 1]
+            if use_cache and caches is not None:
+                pos_tensor = torch.tensor([new_pos], device=device)
+                output = model(
+                    new_token, targets=None, attention_mode="causal", positions=pos_tensor,
+                )
+            else:
+                full_input = sequence[:, : new_pos + 1]
+                vtm = torch.ones((batch_size, full_input.shape[1]), dtype=torch.bool, device=device)
+                output = model(
+                    full_input, targets=None, prediction_mask=vtm, valid_target_mask=vtm,
+                    attention_mode="causal",
+                )
+            if output.logits is None:
+                raise ValueError("model output must include logits")
+            next_logits = output.logits.view(batch_size, -1, vocab_size)[:, -1, :]
+            for r in range(batch_size):
+                if finished[r]:
+                    next_logits[r] = float("-inf")
+                    next_logits[r, pad_token_id] = 0.0
+    finally:
+        if caches is not None and hasattr(model, "reset_cache"):
+            model.reset_cache()
 
     token_ids = sequence[:, : prompt_len + max_new_tokens]
     return GenerationOutput(token_ids=token_ids, generated_lengths=generated_lengths, finished=finished)

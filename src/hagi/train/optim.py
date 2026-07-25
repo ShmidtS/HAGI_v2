@@ -1,7 +1,12 @@
-"""Muon + AdamW hybrid optimizer.
+"""Muon + AdamW hybrid optimizer — TYPE-based routing.
 
-Muon for 2D weights (Newton-Schulz orthogonalization + scale-aware weight
-decay), AdamW for embeddings, 1D params, norms, gates, routers.
+Muon (Newton-Schulz orthogonalization + scale-aware weight decay) for the 2D
+ternary channel weights (every ``BitLinear.weight``); AdamW for everything
+else (embeddings, 1D gates, FP linears, norms, routers, IB/multimodal source
+codebooks). V27 routes by module TYPE, not by name-substring matching — this
+captures exactly the ternary body (including MoE expert bodies) with zero
+string matching and no manual exclusion list to maintain (the V25 fragility:
+``_MUON_EXCLUDE`` had to be extended for every new module).
 """
 
 from __future__ import annotations
@@ -11,13 +16,13 @@ from torch import nn
 from torch.optim import Optimizer
 
 from hagi.config import Config
+from hagi.model.ternary import BitLinear
 
 
 def newton_schulz5(G: torch.Tensor, steps: int = 5, coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)) -> torch.Tensor:
     """Newton-Schulz quintic iteration approximating G(G^T G)^{-1/2}.
 
     Orthogonalizes a 2D matrix so its singular values become 1.
-    Coefficients (a, b, c) default to (3.4445, -4.7750, 2.0315).
     """
     a, b, c = coeffs
     x = G.bfloat16()
@@ -37,7 +42,8 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, coeffs: tuple[float, float, 
 class Muon(Optimizer):
     """Momentum SGD with per-step Newton-Schulz orthogonalization.
 
-    Scale-aware weight decay: wd_eff = wd * min(max(1, sqrt(fan_out/fan_in)), wd_cap).
+    Scale-aware weight decay: ``wd_eff = wd * min(max(1, sqrt(fan_out/fan_in)), wd_cap)``.
+    Bounds ``||W||`` — the root fix for the train_v1_1 step-~10000 divergence.
     """
 
     def __init__(
@@ -54,13 +60,8 @@ class Muon(Optimizer):
         super().__init__(
             params,
             dict(
-                lr=lr,
-                momentum=momentum,
-                nesterov=nesterov,
-                ns_steps=ns_steps,
-                weight_decay=weight_decay,
-                ns_coeffs=ns_coeffs,
-                wd_cap=wd_cap,
+                lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                weight_decay=weight_decay, ns_coeffs=ns_coeffs, wd_cap=wd_cap,
             ),
         )
 
@@ -96,8 +97,6 @@ class CombinedOptimizer:
 
     Deliberately does not inherit from torch.optim.Optimizer because the two
     sub-optimizers manage disjoint parameter groups with different update rules.
-    Implements step, zero_grad, state_dict, and load_state_dict for compatibility
-    with checkpoint save/load and training loops.
     """
 
     def __init__(self, muon: Muon, adamw: torch.optim.AdamW):
@@ -115,62 +114,34 @@ class CombinedOptimizer:
         return None
 
     def state_dict(self):
-        return {
-            "muon": self.muon.state_dict(),
-            "adamw": self.adamw.state_dict(),
-        }
+        return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
 
     def load_state_dict(self, state_dict):
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
 
 
-_MUON_EXCLUDE = frozenset(
-    {
-        "embed",
-        "lm_compress",
-        "lm_expand",
-        "token_compress",
-        "token_expand",
-        "norm",
-        "router",
-        "gate",
-        # Rate-critical / source-codebook FP32 masters flow to AdamW. The
-        # ternary 2D body masters (qkv/out_proj/A0/A1/W/rate_up/predictor/
-        # update_proj/update_out/hep_feedback) are NOT here — they are 2D and
-        # ride Muon. Only the bottleneck KL/decoder linears, the multimodal
-        # source encoders, and the learned-uncertainty head stay FP32.
-        "to_mu",
-        "to_logvar",
-        "decompress",
-        "image_embed",
-        "audio_embed",
-        "shared_down",
-        "shared_up",
-        "log_var",
-    }
-)
+def _is_bitlinear_weight(module: nn.Module, name: str) -> bool:
+    """True if ``module`` is a BitLinear and ``name`` is its 'weight' attribute.
 
-
-def is_muon_param(name: str, param: nn.Parameter) -> bool:
-    """True if param should use Muon (2D weight, not in exclude list).
-
-    Uses exact word matching on dot/underscore-separated segments to avoid
-    false positives (e.g. 'gate' matching 'aggregate', 'norm' matching 'transform').
+    Type-based routing: only the 2D ternary channel masters ride Muon. This is
+    robust to module naming (no substring matching) and automatically covers
+    MoE expert bodies, the attention projections, and the FFN bilinear weights.
     """
-    if param.ndim != 2:
-        return False
-    for seg in name.lower().split("."):
-        if seg in _MUON_EXCLUDE:
-            return False
-        for part in seg.split("_"):
-            if part in _MUON_EXCLUDE:
-                return False
-    return True
+    return isinstance(module, BitLinear) and name == "weight"
+
+
+def _muon_params(model: nn.Module) -> list[nn.Parameter]:
+    """Collect every BitLinear.weight parameter (the ternary channel body)."""
+    params: list[nn.Parameter] = []
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if _is_bitlinear_weight(module, param_name) and param.requires_grad:
+                params.append(param)
+    return params
 
 
 def _can_attempt_fused_adamw(params: list[nn.Parameter]) -> bool:
-    """Return whether a fused AdamW probe is meaningful for this parameter group."""
     return bool(params) and all(
         param.device == params[0].device and param.dtype == params[0].dtype and param.is_floating_point()
         for param in params
@@ -178,7 +149,6 @@ def _can_attempt_fused_adamw(params: list[nn.Parameter]) -> bool:
 
 
 def supports_fused_adamw(params: list[nn.Parameter]) -> bool:
-    """Return whether parameters meet the legacy fused CUDA preconditions."""
     return _can_attempt_fused_adamw(params) and params[0].device.type == "cuda"
 
 
@@ -189,14 +159,10 @@ def _is_expected_fused_adamw_error(error: Exception) -> bool:
     return any(
         pattern in message
         for pattern in (
-            "fused adamw is not supported for this device",
-            "fused adamw is not supported for this dtype",
-            "fused adamw is not supported on this device",
-            "fused adamw is not supported on this dtype",
-            "fused is not supported for this device",
-            "fused is not supported for this dtype",
-            "fused is not supported on this device",
-            "fused is not supported on this dtype",
+            "fused adamw is not supported for this device", "fused adamw is not supported for this dtype",
+            "fused adamw is not supported on this device", "fused adamw is not supported on this dtype",
+            "fused is not supported for this device", "fused is not supported for this dtype",
+            "fused is not supported on this device", "fused is not supported on this dtype",
         )
     )
 
@@ -214,7 +180,6 @@ def build_adamw(
     kwargs = {"lr": lr, "betas": (beta1, beta2), "eps": eps}
     if not supports_fused_adamw(params):
         return torch.optim.AdamW(param_groups, **kwargs, fused=False)
-
     probe_param = nn.Parameter(torch.zeros(1, device=params[0].device, dtype=params[0].dtype))
     probe_param.grad = torch.ones_like(probe_param)
     try:
@@ -228,36 +193,30 @@ def build_adamw(
 
 
 def build_optimizer(model: nn.Module, cfg: Config) -> CombinedOptimizer:
-    """Build Muon (2D hidden weights) + AdamW (everything else)."""
+    """Build Muon (2D ternary channel weights) + AdamW (everything else).
+
+    Routing is by type: BitLinear.weight -> Muon; all other trainable params ->
+    AdamW. Every trainable parameter appears in exactly one group (verified).
+    """
     tc = cfg.train
-    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    muon_params = [p for n, p in named if is_muon_param(n, p)]
-    rest = [(n, p) for n, p in named if not is_muon_param(n, p)]
+    muon_params = _muon_params(model)
+    muon_ids = {id(p) for p in muon_params}
+    rest = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in muon_ids]
     decay = [p for n, p in rest if p.ndim >= 2 and "norm" not in n.lower()]
     no_decay = [p for n, p in rest if not (p.ndim >= 2 and "norm" not in n.lower())]
     optimized_ids = [id(p) for p in muon_params + decay + no_decay]
-    if len(optimized_ids) != len(set(optimized_ids)) or set(optimized_ids) != {id(p) for _, p in named}:
+    if len(optimized_ids) != len(set(optimized_ids)) or set(optimized_ids) != {id(p) for _, p in model.named_parameters() if p.requires_grad}:
         raise RuntimeError("every trainable parameter must appear in exactly one optimizer group")
 
     muon = Muon(
         muon_params,
-        lr=tc.muon.lr,
-        momentum=tc.muon.momentum,
-        nesterov=tc.muon.nesterov,
-        ns_steps=tc.muon.ns_steps,
-        weight_decay=tc.muon.weight_decay,
-        ns_coeffs=tc.muon.ns_coeffs,
-        wd_cap=tc.muon.wd_cap,
+        lr=tc.muon.lr, momentum=tc.muon.momentum, nesterov=tc.muon.nesterov,
+        ns_steps=tc.muon.ns_steps, weight_decay=tc.muon.weight_decay,
+        ns_coeffs=tc.muon.ns_coeffs, wd_cap=tc.muon.wd_cap,
     )
     muon.param_groups[0]["_muon"] = True
     adamw = build_adamw(
-        [
-            {"params": decay, "weight_decay": tc.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=tc.learning_rate,
-        beta1=tc.adam.beta1,
-        beta2=tc.adam.beta2,
-        eps=tc.adam.eps,
+        [{"params": decay, "weight_decay": tc.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
+        lr=tc.learning_rate, beta1=tc.adam.beta1, beta2=tc.adam.beta2, eps=tc.adam.eps,
     )
     return CombinedOptimizer(muon, adamw)

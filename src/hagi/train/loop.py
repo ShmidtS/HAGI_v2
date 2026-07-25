@@ -1,4 +1,4 @@
-"""Training loop for the ternary RD-channel LM.
+"""Training loop for the codec-channel LM.
 
 The model is a CAUSAL generative LM: every batch trains next-token prediction
 with a causal (or causal-dominant) attention mask, exactly matching the
@@ -6,10 +6,11 @@ inference path. There is no bidir-MLM/suffix/parity/AWGN machinery — those
 belonged to the abandoned self-inflicted-channel design and broke the
 train/infer alignment.
 
-Attention-mode curriculum: causal is dominant from step 0 (the inference
-regime); a small soft_causal/bidir slice adds a denser representation
-gradient early and is ramped out by mid-training. This avoids the
-out-of-distribution-at-generation failure of pure-bidir warmup.
+Causal is the inference regime and dominant from step 0. A small opt-in
+soft_causal/bidir slice (``attention_curriculum``-style mixing) adds a denser
+representation gradient early and is ramped out by mid-training — kept OFF by
+default for the cleanest train/infer alignment (V25 root-cause #2 of garbage
+was bidir-first warmup).
 """
 
 from __future__ import annotations
@@ -33,8 +34,6 @@ logger = logging.getLogger(__name__)
 def configure_runtime() -> None:
     import os
 
-    # Bounded caching allocator: varying prediction sizes fragment Windows
-    # VRAM without this; empty_cache() every step keeps reserved bounded.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.6")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -104,16 +103,19 @@ def gradient_stats(model: nn.Module, train_cfg) -> tuple[float, float]:
 def _sample_attention_mode(step: int, cfg: Config) -> tuple[str, float | None]:
     """Causal-dominant attention-mode curriculum.
 
-    Returns (attention_mode, soft_beta). Causal is the inference regime and is
-    dominant from step 0; soft_causal/bidir add a denser representation
-    gradient early and are ramped out by mid-training.
+    Causal is the inference regime and is dominant from step 0. When the
+    optional attention-curriculum mixing is enabled (``causal_prob_*`` etc. on
+    the config), a small soft_causal/bidir slice adds a denser representation
+    gradient early and is ramped out by mid-training. OFF by default.
     """
-    ac = cfg.train.attention_curriculum
-    warmup = max(int(cfg.train.warmup_steps), 1)
-    stable_end = int(cfg.train.max_steps * cfg.train.schedule.stable_fraction)
+    t = cfg.train
+    ac = getattr(t, "attention_curriculum", None)
+    if ac is None:
+        return "causal", None
+    warmup = max(int(t.warmup_steps), 1)
+    stable_end = int(t.max_steps * t.schedule.stable_fraction)
     progress = min(1.0, step / warmup)
     late = min(1.0, step / max(stable_end, 1))
-    # Linearly interpolate start->late probabilities over training progress.
     frac = late
     causal_prob = ac.causal_prob_start + (ac.causal_prob_late - ac.causal_prob_start) * frac
     soft_prob = ac.soft_prob_start + (ac.soft_prob_late - ac.soft_prob_start) * frac
@@ -126,12 +128,7 @@ def _sample_attention_mode(step: int, cfg: Config) -> tuple[str, float | None]:
 
 
 def _causal_next_token_loss(output, input_ids, targets, valid_target_mask):
-    """Next-token shifted CE from flat logits/indices for causal-style modes.
-
-    For causal/prefix/soft_causal the model selects ALL valid positions and
-    returns logits as [n_valid, V]; we shift targets by one to form the
-    next-token objective that matches inference.
-    """
+    """Next-token shifted CE from flat logits/indices for causal-style modes."""
     T = input_ids.size(1)
     idx = output.prediction_indices.to(output.logits.device)
     t = idx % T
@@ -181,7 +178,7 @@ def train_step(
     top2_mass_sum = 0.0
     entropy_sum = 0.0
     posterior_rows = 0
-    aux_sums = {name: 0.0 for name in ("rate", "distortion", "perception", "ternary_bias", "moe_lb", "attn_entropy")}
+    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "attn_entropy")}
     aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
@@ -198,16 +195,13 @@ def train_step(
 
         attention_mode, soft_beta = _sample_attention_mode(step, cfg)
         # Causal/prefix/soft_causal: predict at ALL valid positions, nothing
-        # erased (matches inference). bidir: would use masked prediction, but
-        # we keep the causal next-token objective for all modes so the model
-        # always trains the generation signal.
-        out_unknown_mask = torch.zeros_like(valid_target_mask)
+        # erased (matches inference). We keep the causal next-token objective
+        # for all modes so the model always trains the generation signal.
         out_prediction_mask = valid_target_mask
 
         output = model(
             input_ids,
             targets=None,
-            semantic_unknown_mask=out_unknown_mask,
             prediction_mask=out_prediction_mask,
             valid_target_mask=valid_target_mask,
             images=images,
@@ -217,37 +211,6 @@ def train_step(
         )
         output.ce_loss = _causal_next_token_loss(output, input_ids, targets, valid_target_mask)
         loss = loss_aggregator(output, step=step)
-
-        use_distill = (
-            teacher is not None
-            and getattr(teacher, "_loaded", False)
-            and cfg.train.distill.enabled is True
-            and step < distill_end_step
-            and getattr(model, "distill_align", None) is not None
-        )
-        if use_distill:
-            from hagi.train.distillation import alpha_at
-
-            visibility_mask = valid_target_mask
-            alpha = alpha_at(
-                step,
-                cfg.train.distill.alpha_start,
-                cfg.train.distill.alpha_end,
-                cfg.train.max_steps,
-                cfg.train.distill.end_frac,
-            )
-            with torch.inference_mode():
-                teacher_result = teacher.get_hidden(input_ids, visibility_mask=visibility_mask)
-            if teacher_result is not None:
-                loss = teacher.distillation_loss_chunked(
-                    student_hidden=output.hidden,
-                    teacher_hidden=teacher_result.hidden,
-                    reconstruction_loss=loss,
-                    visibility_mask=teacher_result.visibility_mask,
-                    align_projection=model.distill_align,
-                    alpha=alpha,
-                )
-                del teacher_result
 
         if not torch.isfinite(loss).all():
             logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — cancelling update")
@@ -268,7 +231,6 @@ def train_step(
             if output.logits is not None and output.prediction_indices is not None:
                 logits = output.logits.detach()
                 prediction_indices = output.prediction_indices.detach().to(targets.device)
-                selected_targets = targets.flatten().index_select(0, prediction_indices).to(logits.device)
                 row_count = logits.shape[0]
                 if output.ce_loss is not None:
                     masked_ce_sum += output.ce_loss.detach().item() * row_count
@@ -288,7 +250,7 @@ def train_step(
                 conf_rows += row_count
                 if want_post:
                     posterior_rows += row_count
-                del logits, prediction_indices, selected_targets
+                del logits, prediction_indices
 
             del output, loss, scaled_loss
 
@@ -327,8 +289,8 @@ def train_step(
         "posterior_entropy": posterior_entropy,
         "rate": mean_aux("rate"),
         "distortion": mean_aux("distortion"),
-        "perception": mean_aux("perception"),
-        "ternary_bias": mean_aux("ternary_bias"),
+        "vicreg": mean_aux("vicreg"),
+        "infonce": mean_aux("infonce"),
         "moe_lb": mean_aux("moe_lb"),
         "attn_entropy": mean_aux("attn_entropy"),
         "avg_confidence": avg_confidence,
@@ -363,7 +325,6 @@ def train(
     loss_aggregator = LossAggregator(cfg)
 
     step = start_step
-    distill_end_step = int(cfg.train.max_steps * cfg.train.distill.end_frac)
     ckpt_dir = cfg.train.checkpoint_dir
     ckpt_interval = cfg.train.checkpoint_interval
     ckpt_keep = cfg.train.checkpoint_keep_last
@@ -379,14 +340,7 @@ def train(
 
         set_lr(optimizer, step, cfg)
 
-        if teacher is not None and getattr(teacher, "_loaded", False) and step == distill_end_step:
-            logger.info(f"Step {step}: distillation ended — freeing teacher")
-            teacher.free()
-
-        metrics = train_step(
-            model, microbatches, optimizer, cfg, step,
-            teacher, loss_aggregator=loss_aggregator, distill_end_step=distill_end_step,
-        )
+        metrics = train_step(model, microbatches, optimizer, cfg, step, teacher, loss_aggregator=loss_aggregator)
 
         _maybe_release_caches(step, interval=cfg.train.logging.cache_release_interval)
 

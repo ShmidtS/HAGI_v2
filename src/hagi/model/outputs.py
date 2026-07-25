@@ -1,4 +1,10 @@
-"""Typed model outputs — auxiliary loss terms for the ternary RD-channel LM."""
+"""Typed model outputs — auxiliary loss terms for the codec-channel LM.
+
+Every auxiliary is computed off the main LM path. The genuine rate/distortion
+terms come from the information bottleneck; vicreg/infonce ground the
+multimodal joint embedding; moe_lb balances expert load; attn_entropy
+prevents attention collapse. A term is ``None`` when its subsystem is off.
+"""
 
 from __future__ import annotations
 
@@ -11,18 +17,20 @@ import torch
 class AuxLosses:
     """Auxiliary loss terms produced by the model forward pass.
 
-    All terms are ``None`` when inactive. The genuine RD terms (rate/distortion/
-    perception) come from the auxiliary information bottleneck; the attention
-    entropy penalty prevents attention collapse; ternary_bias and moe_lb are
-    opt-in regularizers.
+    All terms are ``None`` when their subsystem is inactive. The aggregator
+    weights them by the matching ``w_*`` config value.
     """
 
+    # Information bottleneck (always on).
     rate: torch.Tensor | None = None
     distortion: torch.Tensor | None = None
-    perception: torch.Tensor | None = None
-    attn_entropy: torch.Tensor | None = None
-    ternary_bias: torch.Tensor | None = None
+    # Grounded infomax (multimodal only).
+    vicreg: torch.Tensor | None = None
+    infonce: torch.Tensor | None = None
+    # Mixture of experts (MoE only).
     moe_lb: torch.Tensor | None = None
+    # Attention anti-collapse (training only).
+    attn_entropy: torch.Tensor | None = None
 
 
 @dataclass
@@ -33,5 +41,4 @@ class ModelOutput:
     hidden: torch.Tensor
     aux: AuxLosses
     ce_loss: torch.Tensor | None = None
-    iterations_used: torch.Tensor | None = None
     prediction_indices: torch.Tensor | None = None
