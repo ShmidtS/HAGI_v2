@@ -1,9 +1,9 @@
-# HAGI — SmolLM2 teacher configuration (RTX 3070 8GB).
+# HAGI-2 (V27) — SmolLM2 teacher configuration (RTX 3070 8GB).
 #
-# Ternary RD-channel causal LM (see docs/ARCHITECTURE.md). Trained from
-# scratch on SmolLM2-tokenized data (vocab 49154). The auto_configure solver
-# derives hidden/layer/head sizes from target_nonembed_params; everything else
-# is an explicit knob here (no hardcoded constants in the training loop).
+# Codec-first scalable multimodal channel LM (see docs/V27_DESIGN.md). Trained
+# from scratch on SmolLM2-tokenized data (vocab 49154). A single unified ternary
+# BitNet stack with real GQA + an incremental KV-cache; text-only, no MoE.
+# Every knob lives here (no hardcoded constants in the training loop).
 
 model:
   vocab_size: 49154
@@ -15,6 +15,7 @@ model:
   attention:
     max_seq_len: 8192
     num_query_heads: 8             # 384 / 8 = 48 per head
+    num_kv_heads: 2                # real GQA: 4 query heads share 1 KV head
     head_dim: 48
     rope_theta: 10000.0
 
@@ -26,20 +27,16 @@ model:
     enabled: false                  # text-only; set true for image/audio
 
   body:
-    context_layers: 8
-    expression_layers: 8
+    num_layers: 12                  # single unified stack (no context/expression split)
     ternary:
       use_ternary: true             # BitNet b1.58 on the 2D body masters
       hebbian_expansion: 4
     bottleneck:
-      bottleneck_in_path: false     # IB stays an auxiliary KL regularizer
-    predictive:
-      enabled: false                # optional extrinsic error highway (off)
-    ib_beta: 0.001                  # rate Lagrangian (the only rate notion)
-    distortion_weight: 1.0
-    perception_weight: 0.01
-    kl_free_bits: 0.5
-    moe_enabled: false              # dropped (YAGNI)
+      dim: 192                      # IB latent (C); must be < H
+      ib_beta: 0.001                # rate Lagrangian (the only rate notion)
+      kl_free_bits: 0.5
+    moe:
+      enabled: false                # off for the small text config
 
 train:
   max_steps: 150000
@@ -58,8 +55,6 @@ train:
 
   w_rate: 0.001
   w_distortion: 1.0
-  w_perception: 0.01
-  w_ternary_bias: 0.0
   w_attn_entropy: 0.01
   attn_entropy_floor: 0.5
 

@@ -1,24 +1,26 @@
-"""MultimodalFusion — separable source coding + shared subspace.
+"""Multimodal source coding + Q-Former bridge + grounded infomax.
 
-Separate source coding theorem -> one factorized source encoder per modality
-(text reuses the shared ``ConvEmbedding``; image = ViT patch Linear; audio =
-mel Linear). An explicit cross-modal alignment via a shared subspace, with the
-residual kept modality-specific and gated by a learned inverse-variance head
-(uncertain modality contributes less of its specific residual; the shared
-subspace is always kept).
+Separable source-coding theorem -> one factorized source encoder per modality
+(text reuses the shared ``ConvEmbedding``; image = ViT patch linear + 2D-RoPE;
+audio = mel linear + 1D-RoPE). A **Q-Former bridge** (Flamingo/BLIP-2
+bottleneck queries) compresses each modality to a FIXED number of fused tokens
+(``n_bridge_queries``) that are prepended as a prefix to the text sequence.
+This is O(1) multimodal tokens regardless of image size — the scalability fix
+vs the V25 early-fusion concatenation (which was O(image_patches) in length).
 
-All parameters here are FP32 source-codebook / 1D heads: they are routed to
-AdamW (the names ``image_embed`` / ``audio_embed`` / ``shared_down`` /
-``shared_up`` / ``log_var`` / ``embed`` are in ``_MUON_EXCLUDE``). Nothing in
-this module is ternary — the source codebook is rate-critical.
+Grounded infomax (VICReg + InfoNCE) is applied on the per-modality pooled
+embeddings to align the joint space — see ``grounded.py``.
 
-Forward: ``forward(input_ids, images, spectrograms) -> (h, modality_ids, lengths)``.
+All parameters here are FP32 source-codebook / 1D heads: they route to AdamW
+(the optimizer picks them by type, not name — none are BitLinear). The Q-Former
+cross-attention is FP because it is a source-side compressor, not a channel
+weight.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from hagi.config import Config
 
@@ -28,17 +30,13 @@ def _inv_var_gate(h: torch.Tensor, log_var_head: nn.Module) -> torch.Tensor:
 
     ``sigmoid(-logit)`` keeps the modality-specific residual when the modality
     is confident (low variance -> gate -> 1) and suppresses it when uncertain.
-    Bounded, differentiable, and never rescales the shared subspace.
     """
     logit = log_var_head(h).squeeze(-1)
     return torch.sigmoid(-logit.float()).to(h.dtype)
 
 
 class _InvVarHead(nn.Module):
-    """Per-position scalar log-variance estimator.
-
-    Zero-bias init keeps the gate at ``sigmoid(0)=0.5`` at start (neutral).
-    """
+    """Per-position scalar log-variance estimator. Zero-bias init -> gate 0.5."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
@@ -50,14 +48,57 @@ class _InvVarHead(nn.Module):
         return self.log_var(h)
 
 
+class QFormerLayer(nn.Module):
+    """One Q-Former layer: self-attn over queries, cross-attn queries->tokens, FFN."""
+
+    def __init__(self, hidden_size: int, n_heads: int, norm_eps: float = 1e-6) -> None:
+        super().__init__()
+        if hidden_size % n_heads != 0:
+            raise ValueError(f"hidden_size {hidden_size} must be divisible by n_heads {n_heads}")
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.head_dim = hidden_size // n_heads
+        self.q_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
+        self.cross_norm_q = nn.LayerNorm(hidden_size, eps=norm_eps)
+        self.cross_norm_kv = nn.LayerNorm(hidden_size, eps=norm_eps)
+        self.self_attn = nn.MultiheadAttention(hidden_size, n_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, n_heads, batch_first=True)
+        self.ffn_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4), nn.GELU(), nn.Linear(hidden_size * 4, hidden_size)
+        )
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+    def forward(self, queries: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """One Q-Former refinement pass.
+
+        Args:
+            queries: ``[B, Q, H]`` learnable bridge queries.
+            tokens: ``[B, T, H]`` modality tokens to attend to.
+
+        Returns:
+            ``[B, Q, H]`` refined queries.
+        """
+        q = self.q_norm(queries)
+        sa, _ = self.self_attn(q, q, q, need_weights=False)
+        queries = queries + sa
+        cq = self.cross_norm_q(queries)
+        ckv = self.cross_norm_kv(tokens)
+        ca, _ = self.cross_attn(cq, ckv, ckv, need_weights=False)
+        queries = queries + ca
+        fq = self.ffn_norm(queries)
+        queries = queries + self.ffn(fq)
+        return queries
+
+
 class MultimodalFusion(nn.Module):
-    """Per-modality source encoders + shared/specific subspace + inv-var gating.
+    """Per-modality source encoders + Q-Former bridge + grounded infomax.
 
     Args:
         cfg: top-level config.
-        text_encoder: the model's shared ``ConvEmbedding`` when provided (one
-            source codebook per model). Falls back to a standalone
-            ``ConvEmbedding`` sized by ``embeddings.factor_rank``.
+        text_encoder: the model's shared ``ConvEmbedding`` (one source codebook
+            per model). Falls back to a standalone ``ConvEmbedding``.
     """
 
     NUM_MODALITIES = 3
@@ -68,6 +109,7 @@ class MultimodalFusion(nn.Module):
         H = m.hidden_size
         mm = m.multimodal
         self.H = H
+        self.n_bridge = mm.n_bridge_queries
         self.image_patch_size = mm.image_patch_size
         self.audio_n_mels = mm.audio_mel_bins
 
@@ -86,31 +128,38 @@ class MultimodalFusion(nn.Module):
             )
             self._text_shared = False
 
-        # ONE shared cross-modal projection pair across all modalities. The
-        # ``shared_up`` is ZERO-init so z_shared starts at 0 (the specific
-        # residual dominates at init, shared subspace learned during training).
+        # Per-modality image/audio source encoders + inv-var gating.
+        self.image_embed = nn.Linear(mm.image_channels * self.image_patch_size**2, H, bias=False)
+        self.audio_embed = nn.Linear(self.audio_n_mels, H, bias=False)
+        self.image_unc = _InvVarHead(H)
+        self.audio_unc = _InvVarHead(H)
         r_shared = max(8, H // 4)
-        self.r_shared = r_shared
         self.shared_down = nn.Linear(H, r_shared, bias=False)
         self.shared_up = nn.Linear(r_shared, H, bias=False)
         nn.init.normal_(self.shared_down.weight, std=1.0 / max(H, 1))
         nn.init.zeros_(self.shared_up.weight)
-
-        self.image_embed = nn.Linear(mm.image_channels * self.image_patch_size**2, H, bias=False)
-        self.audio_embed = nn.Linear(self.audio_n_mels, H, bias=False)
-
-        self.text_unc = _InvVarHead(H)
-        self.image_unc = _InvVarHead(H)
-        self.audio_unc = _InvVarHead(H)
-
         self.modality_embeds = nn.Parameter(torch.zeros(self.NUM_MODALITIES, H))
         nn.init.normal_(self.modality_embeds, std=mm.modality_embed_std)
 
         pos_std = 1.0 / (H**0.5)
-        self.image_pos_embed = nn.Parameter(torch.zeros(mm.max_image_patches, H))
+        self.image_pos_embed = nn.Parameter(torch.zeros(1024, H))
         nn.init.normal_(self.image_pos_embed, std=pos_std)
-        self.audio_pos_embed = nn.Parameter(torch.zeros(mm.max_audio_frames, H))
+        self.audio_pos_embed = nn.Parameter(torch.zeros(1024, H))
         nn.init.normal_(self.audio_pos_embed, std=pos_std)
+
+        # Q-Former bridge: shared learnable queries + per-modality cross-attn layers.
+        self.bridge_queries = nn.Parameter(torch.zeros(self.n_bridge, H))
+        nn.init.normal_(self.bridge_queries, std=0.02)
+        self.image_qformer = nn.ModuleList(
+            QFormerLayer(H, mm.bridge_n_heads, m.norm_eps) for _ in range(mm.bridge_layers)
+        )
+        self.audio_qformer = nn.ModuleList(
+            QFormerLayer(H, mm.bridge_n_heads, m.norm_eps) for _ in range(mm.bridge_layers)
+        )
+
+        from hagi.model.grounded import GroundedInfomax
+
+        self.grounded = GroundedInfomax(H, m.grounded, self.NUM_MODALITIES)
 
     def _fuse(self, h: torch.Tensor, unc: nn.Module) -> torch.Tensor:
         """Shared/specific split + inverse-variance gating of the specific residual."""
@@ -121,67 +170,80 @@ class MultimodalFusion(nn.Module):
 
     def encode_text(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self.text_embed(input_ids)
-        h = h + self.modality_embeds[0]
-        return self._fuse(h, self.text_unc)
+        return h + self.modality_embeds[0]
 
-    def encode_image(self, images: torch.Tensor) -> tuple[torch.Tensor, int]:
-        B, C, H_img, W_img = images.shape
+    def encode_image(self, images: torch.Tensor) -> torch.Tensor:
+        b, c, h_img, w_img = images.shape
         p = self.image_patch_size
-        n_h, n_w = H_img // p, W_img // p
-        T_i = n_h * n_w
+        n_h, n_w = h_img // p, w_img // p
+        t_i = n_h * n_w
         patches = images.unfold(2, p, p).unfold(3, p, p)
-        patches = patches.contiguous().view(B, T_i, C * p * p)
+        patches = patches.contiguous().view(b, t_i, c * p * p)
         h = self.image_embed(patches)
-        h = h + self.image_pos_embed[:T_i].unsqueeze(0)
+        h = h + self.image_pos_embed[:t_i].unsqueeze(0)
         h = h + self.modality_embeds[1]
-        return self._fuse(h, self.image_unc), T_i
+        return self._fuse(h, self.image_unc)
 
-    def encode_audio(self, spectrograms: torch.Tensor) -> tuple[torch.Tensor, int]:
-        B, _n_mels, T_frames = spectrograms.shape
+    def encode_audio(self, spectrograms: torch.Tensor) -> torch.Tensor:
+        b, _n_mels, t_frames = spectrograms.shape
         frames = spectrograms.transpose(1, 2)
         h = self.audio_embed(frames)
-        h = h + self.audio_pos_embed[:T_frames].unsqueeze(0)
+        h = h + self.audio_pos_embed[:t_frames].unsqueeze(0)
         h = h + self.modality_embeds[2]
-        return self._fuse(h, self.audio_unc), T_frames
+        return self._fuse(h, self.audio_unc)
+
+    def _bridge(self, tokens: torch.Tensor, layers: nn.ModuleList) -> torch.Tensor:
+        """Q-Former: compress ``tokens`` to ``n_bridge`` fused tokens."""
+        b = tokens.shape[0]
+        q = self.bridge_queries.unsqueeze(0).expand(b, -1, -1).contiguous()
+        for layer in layers:
+            q = layer(q, tokens)
+        return q  # [B, n_bridge, H]
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
+        text_ids: torch.Tensor,
         images: torch.Tensor | None = None,
         spectrograms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        """Early fusion: encode each modality, then concatenate along the sequence axis.
+        """Encode text + bridge each present modality to a fixed prefix.
 
         Returns:
-            ``(h, modality_ids, lengths)`` where ``h`` is ``[B, T_total, H]`` and
-            ``modality_ids`` is ``[B, T_total]`` long (0=text, 1=image, 2=audio).
+            ``(h, modality_ids, info)`` where ``h`` is ``[B, T_text + n_bridge*nm, H]``
+            (prefix = Q-Former tokens, then text) and ``modality_ids`` is the
+            matching long tensor. ``info`` carries 'prefix_len' (prefix length)
+            and 'bridge_tokens' (count) for prefix-LM attention.
         """
+        h_text = self.text_embed(text_ids)
+        h_text = h_text + self.modality_embeds[0]
+        b, t_text, _ = h_text.shape
+
         parts: list[torch.Tensor] = []
         mod_ids: list[torch.Tensor] = []
-        T_i = 0
-        T_a = 0
+        # Modality-pooled source embeddings for grounded infomax are taken from
+        # the pre-bridge fused tokens (see the model forward that calls us).
+        for tokens, mod_idx, layers in (
+            (self.encode_image(images) if images is not None else None, 1, self.image_qformer),
+            (self.encode_audio(spectrograms) if spectrograms is not None else None, 2, self.audio_qformer),
+        ):
+            if tokens is None:
+                continue
+            bridge = self._bridge(tokens, layers)  # [B, n_bridge, H]
+            parts.append(bridge)
+            mod_ids.append(torch.full((b, self.n_bridge), mod_idx, dtype=torch.long, device=h_text.device))
 
-        if input_ids is not None:
-            h_t = self.encode_text(input_ids)
-            parts.append(h_t)
-            mod_ids.append(torch.zeros(h_t.shape[0], h_t.shape[1], dtype=torch.long, device=h_t.device))
-        if images is not None:
-            h_i, T_i = self.encode_image(images)
-            parts.append(h_i)
-            mod_ids.append(torch.ones(h_i.shape[0], h_i.shape[1], dtype=torch.long, device=h_i.device))
-        if spectrograms is not None:
-            h_a, T_a = self.encode_audio(spectrograms)
-            parts.append(h_a)
-            mod_ids.append(torch.full((h_a.shape[0], h_a.shape[1]), 2, dtype=torch.long, device=h_a.device))
+        if parts:
+            prefix = torch.cat(parts, dim=1)  # [B, n_bridge*nm, H]
+            prefix_mod = torch.cat(mod_ids, dim=1)
+            h = torch.cat([prefix, h_text], dim=1)
+            modality_ids = torch.cat(
+                [prefix_mod, torch.zeros(b, t_text, dtype=torch.long, device=h_text.device)], dim=1
+            )
+            prefix_len = prefix.shape[1]
+        else:
+            h = h_text
+            modality_ids = torch.zeros(b, t_text, dtype=torch.long, device=h_text.device)
+            prefix_len = 0
 
-        if not parts:
-            raise ValueError("MultimodalFusion.forward requires at least one modality")
-
-        h = torch.cat(parts, dim=1)
-        modality_ids = torch.cat(mod_ids, dim=1)
-        lengths = {
-            "text": input_ids.shape[1] if input_ids is not None else 0,
-            "image": T_i,
-            "audio": T_a,
-        }
-        return h, modality_ids, lengths
+        info = {"prefix_len": prefix_len, "bridge_tokens": self.n_bridge}
+        return h, modality_ids, info

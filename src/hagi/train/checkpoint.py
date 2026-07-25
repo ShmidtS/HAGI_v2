@@ -15,7 +15,7 @@ import torch.nn as nn
 from hagi.config import Config, _apply_dict, validate_config
 
 logger = logging.getLogger(__name__)
-CHECKPOINT_FORMAT_VERSION = 5
+CHECKPOINT_FORMAT_VERSION = 6
 CHECKPOINT_FIELDS = {"format_version", "model", "config", "completed_updates"}
 # Optional field persisted only by training checkpoints for resume. Inference
 # loaders ignore it.

@@ -1,22 +1,22 @@
-"""HAGI — ternary RD-channel causal language model.
+"""HAGI-2 — codec-first scalable multimodal channel LM.
 
-The model is a causal autoregressive LM framed as a communication channel.
-
-Main LM path (PROVEN to learn — causal_ce 10.0->4.3 in 300 steps on tinystories):
+Main LM path (causal, KV-cacheable):
   source-encode (CAUSAL conv, no future leak)
-    -> ternary context stack (the genuine channel)
-    -> causal expression stack
+    -> UNIFIED ternary stack (real GQA + RoPE; MoE on every moe_every-th block)
     -> final_norm
     -> factored LM head
 
 Auxiliary (off the main path, never intercepts the LM signal):
-  * variational InformationBottleneck: KL/distortion/perception regularizer on
-    h_ctx. Inserting it into the main path deadlocked from-scratch training.
-  * PredictiveDecoder: extrinsic error highway — opt-in (body.predictive.enabled).
+  * InformationBottleneck: KL / distortion regularizer on the context hidden.
+  * GroundedInfomax (VICReg + InfoNCE): multimodal joint-embedding alignment.
+  * MoE load-balance: Switch CV^2 (MoE only).
+  * attn entropy floor: anti-collapse (training only).
 
-The architecture is causal-first by design. Inserting the IB+PD into the main
-path, or using a non-causal embedding conv, both produce prompt-independent
-garbage at inference — see docs/ARCHITECTURE.md.
+The body is a SINGLE unified stack (V25 split it into context/expression, an
+artifact of the in-path-IB era; with the IB off-path the split only blocks the
+KV-cache). Multimodal input, when enabled, is encoded per-modality, compressed
+to a fixed prefix via the Q-Former bridge, and prepended to the text sequence
+(prefix-LM attention: prefix fully visible, text causal).
 """
 
 from __future__ import annotations
@@ -29,15 +29,19 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 
 from hagi.config import Config
-from hagi.model.block import AttentionConfig, HebbianFFNConfig, TransformerBlock
-from hagi.model.bottleneck import BottleneckConfig, InformationBottleneck
+from hagi.model.attention import AttentionConfig
+from hagi.model.block import TransformerBlock
+from hagi.model.bottleneck import InformationBottleneck
 from hagi.model.conv_embedding import ConvEmbedding
+from hagi.model.hebbian_ffn import HebbianFFNConfig
+from hagi.model.kv_cache import KVCache
+from hagi.model.moe import MoESwiGLU
 from hagi.model.norms import RMSNorm
 from hagi.model.outputs import AuxLosses, ModelOutput
 
 
 class HAGI(nn.Module):
-    """Ternary RD-channel causal LM.
+    """Codec-first multimodal channel LM.
 
     Args:
         cfg: top-level :class:`hagi.config.Config`.
@@ -54,6 +58,7 @@ class HAGI(nn.Module):
         self.inference_config = type("Inf", (), {"vocab_size": m.vocab_size})()
         self._use_ternary = bool(body.ternary.use_ternary)
         self._mm_on = bool(m.multimodal.enabled)
+        self._moe_on = bool(body.moe.enabled)
 
         # ---- Source encoder (factorized, CAUSAL conv) ----
         self.embed = ConvEmbedding(
@@ -63,73 +68,31 @@ class HAGI(nn.Module):
             kernel_size=m.embeddings.kernel_size,
             norm_eps=m.norm_eps,
         )
-        self.semantic_unknown_embed = nn.Parameter(torch.empty(H))
-        nn.init.normal_(self.semantic_unknown_embed, std=1.0 / math.sqrt(H))
-
-        # Sinusoidal pilot positional encoding (position-only, no future leak).
-        self._pilot_pe_theta = float(m.embeddings.pos_pe_theta)
-        self._pilot_pos_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         attn_cfg = AttentionConfig(
-            num_heads=max(1, m.attention.num_query_heads),
+            num_heads=m.attention.num_query_heads,
+            num_kv_heads=m.attention.num_kv_heads,
             head_dim=m.attention.head_dim,
             rope_theta=m.attention.rope_theta,
             attn_entropy_floor=cfg.train.attn_entropy_floor,
         )
-        ffn_cfg = HebbianFFNConfig(
-            expansion=body.ternary.hebbian_expansion, dropout=body.ternary.hebbian_dropout
-        )
+        ffn_cfg = HebbianFFNConfig(expansion=body.ternary.hebbian_expansion)
+        inter = body.moe.intermediate_size or (body.ternary.hebbian_expansion * H)
 
-        # ---- Ternary body: context (perception) + expression stacks ----
-        self.context_stack = nn.ModuleList(
-            TransformerBlock(H, attn_cfg, ffn_cfg, m.norm_eps, use_ternary=self._use_ternary)
-            for _ in range(body.context_layers)
-        )
-        self.expression = nn.ModuleList(
-            TransformerBlock(H, attn_cfg, ffn_cfg, m.norm_eps, use_ternary=self._use_ternary)
-            for _ in range(body.expression_layers)
-        )
-
-        # ---- Auxiliary information bottleneck (off the main path) ----
-        bn_cfg = BottleneckConfig(
-            dim=C,
-            ib_beta=body.ib_beta,
-            distortion_weight=body.distortion_weight,
-            perception_weight=body.perception_weight,
-            kl_free_bits=body.kl_free_bits,
-            logvar_clamp=body.logvar_clamp,
-            distortion_eps=body.distortion_eps,
-        )
-        self.bottleneck = InformationBottleneck(H, bn_cfg, m.norm_eps)
-
-        # ---- Optional predictive decoder (off the main path) ----
-        self.predictive_decoder = None
-        self.rate_up = None
-        self._predictive_in_path = bool(body.predictive.enabled)
-        if self._predictive_in_path:
-            from hagi.model.predictive import PredictiveConfig, PredictiveDecoder
-
-            pd_cfg = PredictiveConfig(
-                train_iterations=body.predictive.train_iterations,
-                infer_iterations=body.predictive.infer_iterations,
-                convergence_threshold=body.predictive.convergence_threshold,
-                update_hidden=body.predictive.update_hidden,
-            )
-            self.predictive_decoder = PredictiveDecoder(
-                C, H, pd_cfg, m.norm_eps,
-                use_kalman_blend=body.predictive.use_kalman_blend,
-                use_ternary=self._use_ternary,
-                hep_enabled=body.predictive.hep_enabled,
-            )
-            if self._use_ternary:
-                from hagi.model.ternary import BitLinear
-
-                self.rate_up = BitLinear(C, H, bias=False)
-            else:
-                self.rate_up = nn.Linear(C, H, bias=False)
-            nn.init.normal_(self.rate_up.weight, std=1.0 / math.sqrt(C))
+        # ---- UNIFIED ternary stack (the genuine channel) ----
+        moe_every = max(1, body.moe.moe_every) if self._moe_on else 0
+        self.blocks = nn.ModuleList()
+        for li in range(body.num_layers):
+            use_moe_here = self._moe_on and moe_every > 0 and (li % moe_every == (moe_every - 1))
+            mixer = None
+            if use_moe_here:
+                mixer = MoESwiGLU(H, inter, body.moe, m.norm_eps, use_ternary=self._use_ternary)
+            self.blocks.append(TransformerBlock(H, attn_cfg, ffn_cfg, m.norm_eps, use_ternary=self._use_ternary, mixer=mixer))
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
+
+        # ---- Auxiliary information bottleneck (off the main path) ----
+        self.bottleneck = InformationBottleneck(H, body.bottleneck, m.norm_eps)
 
         # ---- Factored LM head (independent rank-r factorization) ----
         r = m.embeddings.factor_rank
@@ -138,7 +101,7 @@ class HAGI(nn.Module):
         nn.init.normal_(self.lm_compress.weight, std=1.0 / math.sqrt(H))
         nn.init.normal_(self.lm_expand.weight, std=1.0 / math.sqrt(r))
 
-        # ---- Optional multimodal fusion ----
+        # ---- Optional multimodal fusion (per-modality + Q-Former + grounded) ----
         self.multimodal_input = None
         if self._mm_on:
             from hagi.model.multimodal import MultimodalFusion
@@ -153,9 +116,9 @@ class HAGI(nn.Module):
     def _init_weights(self) -> None:
         for name, mod in self.named_modules():
             if isinstance(mod, nn.Linear):
-                if "rate_up" in name or "lm_compress" in name or "lm_expand" in name:
+                if "lm_compress" in name or "lm_expand" in name:
                     continue
-                if name.endswith("out_proj") or name.endswith("W") or "update_out" in name:
+                if name.endswith("out_proj") or name.endswith("W") or name.endswith("down"):
                     continue
                 std = 1.0 / math.sqrt(max(1, mod.weight.shape[1]))
                 nn.init.normal_(mod.weight, mean=0.0, std=std)
@@ -166,49 +129,46 @@ class HAGI(nn.Module):
     def lm_head_weight(self) -> torch.Tensor:
         return self.lm_expand.weight @ self.lm_compress.weight
 
-    def _pilot_pe(self, T: int, H: int, device: torch.device) -> torch.Tensor:
-        key = (T, H)
-        if key not in self._pilot_pos_cache:
-            if len(self._pilot_pos_cache) > 8:
-                self._pilot_pos_cache.clear()
-            pos = torch.arange(T, dtype=torch.float32, device=device).unsqueeze(1)
-            div = torch.exp(
-                torch.arange(0, H, 2, dtype=torch.float32, device=device) * -(math.log(self._pilot_pe_theta) / max(H, 1))
-            )
-            pe = torch.zeros(T, H, device=device, dtype=torch.float32)
-            pe[:, 0::2] = torch.sin(pos * div[: pe[:, 0::2].shape[1]])
-            pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
-            self._pilot_pos_cache[key] = pe
-        return self._pilot_pos_cache[key]
+    def allocate_for_cache(self, batch_size: int, dtype: torch.dtype, device: torch.device) -> list[KVCache]:
+        """Allocate a per-layer KV-cache for incremental decoding.
 
-    def _stack_forward(self, h, stack, attention_mode="bidir", prefix_len=None, soft_beta=None):
-        """Run a block stack with grad-checkpointing; sum the attn-entropy penalty."""
+        Returns the list of caches (also attached to each attention layer).
+        """
+        m = self.cfg.model
+        caches: list[KVCache] = []
+        for blk in self.blocks:
+            cache = KVCache(m.attention.max_seq_len, m.attention.num_kv_heads, m.attention.head_dim, dtype, device)
+            blk.attn.attach_cache(cache)
+            caches.append(cache)
+        return caches
+
+    def reset_cache(self) -> None:
+        """Detach (and drop) the per-layer KV-cache and the conv-history cache."""
+        for blk in self.blocks:
+            blk.attn.detach_cache()
+        self.embed.reset_conv_cache()
+
+    def _stack_forward(self, h, attention_mode, prefix_len, soft_beta, positions):
+        """Run the unified block stack with grad-checkpointing; sum the attn-entropy penalty."""
         entropy_pen = None
-        checkpointing = self.training and len(stack) > 1
-        for blk in stack:
+        checkpointing = self.training and len(self.blocks) > 1
+        moe_lb_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
+        for blk in self.blocks:
             if checkpointing:
-                def run(b_in, *, blk=blk, am=attention_mode, pl=prefix_len, sb=soft_beta):
-                    return blk(b_in, attention_mode=am, prefix_len=pl, soft_beta=sb)
+                def run(b_in, *, b=blk, am=attention_mode, pl=prefix_len, sb=soft_beta, pos=positions):
+                    return b(b_in, attention_mode=am, prefix_len=pl, soft_beta=sb, positions=pos)
                 h = ckpt.checkpoint(run, h, use_reentrant=False)
             else:
-                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta)
+                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta, positions=positions)
             pen = getattr(blk, "_last_attn_entropy_penalty", None)
             if pen is not None:
                 entropy_pen = pen if entropy_pen is None else entropy_pen + pen
+            if blk.is_moe and self.training:
+                lb = blk.moe.last_load_balance if blk.moe is not None else None
+                if lb is not None and moe_lb_acc is not None:
+                    moe_lb_acc = moe_lb_acc + lb
         self._last_attn_entropy_penalty = entropy_pen
-        return h
-
-    def _encode_text(self, input_ids, semantic_unknown_mask):
-        embed_dev = self.embed.weight.device
-        ids_dev = input_ids.device
-        unknown = self.semantic_unknown_embed.to(device=embed_dev)
-        if embed_dev != ids_dev:
-            ids_on = input_ids.to(embed_dev)
-            mask_on = semantic_unknown_mask.to(embed_dev) if semantic_unknown_mask is not None else None
-            h = self.embed.forward_with_erasure(ids_on, unknown, mask_on).to(ids_dev)
-        else:
-            h = self.embed.forward_with_erasure(input_ids, unknown, semantic_unknown_mask)
-        h = h + (1.0 / math.sqrt(self._H)) * self._pilot_pe(h.shape[1], self._H, h.device).to(h.dtype).unsqueeze(0)
+        self._last_moe_lb = moe_lb_acc
         return h
 
     def forward(
@@ -216,7 +176,6 @@ class HAGI(nn.Module):
         input_ids=None,
         targets=None,
         *,
-        semantic_unknown_mask=None,
         prediction_mask=None,
         valid_target_mask=None,
         images=None,
@@ -224,60 +183,72 @@ class HAGI(nn.Module):
         attention_mode="causal",
         prefix_len=None,
         soft_beta=None,
+        positions=None,
         **_unused,
     ):
         """Forward pass.
 
-        The main path is context-stack -> expression-stack -> LM head. The IB
-        runs as an auxiliary regularizer on h_ctx; the optional predictive
-        decoder runs only when ``body.predictive.enabled``. ``attention_mode``
-        is normally ``"causal"`` (matches inference); training may mix in
-        ``"soft_causal"`` / ``"bidir"`` for a denser representation gradient.
+        Args:
+            input_ids: ``[B, T_text]`` token IDs.
+            targets: ``[B, T_text]`` next-token targets (optional).
+            prediction_mask: ``[B, T_text]`` positions to score.
+            valid_target_mask: ``[B, T_text]`` positions with a valid target.
+            images, spectrograms: optional modality inputs (multimodal only).
+            attention_mode: causal (default / inference) | bidir | prefix | soft_causal.
+            prefix_len: prefix length for prefix mode (multimodal bridge).
+            soft_beta: soft-causal decay.
+            positions: absolute positions for RoPE (None -> arange/cache offset).
+
+        Returns:
+            :class:`ModelOutput` with logits, hidden, aux, ce_loss.
         """
         if input_ids is None:
             raise ValueError("input_ids is required")
 
         # STAGE 1 — modal source encode.
         if self._mm_on and (images is not None or spectrograms is not None):
-            h, _mod_ids = self.multimodal_input(input_ids, images, spectrograms)[:2]
-            h = h + (1.0 / math.sqrt(self._H)) * self._pilot_pe(h.shape[1], self._H, h.device).to(h.dtype).unsqueeze(0)
+            h, modality_ids, mm_info = self.multimodal_input(input_ids, images, spectrograms)
+            if prefix_len is None and mm_info["prefix_len"] > 0:
+                prefix_len = mm_info["prefix_len"]
+                attention_mode = "prefix"
         else:
-            h = self._encode_text(input_ids, semantic_unknown_mask)
-        T_text = input_ids.shape[1]
+            h = self.embed(input_ids)
+            modality_ids = None
+            mm_info = {"prefix_len": 0}
 
-        # STAGE 2 — ternary context stack (the genuine channel).
-        h_ctx = self._stack_forward(h, self.context_stack, attention_mode, prefix_len, soft_beta)
+        # STAGE 2 — UNIFIED ternary stack (the genuine channel).
+        h_ctx = self._stack_forward(h, attention_mode, prefix_len, soft_beta, positions)
 
-        # STAGE 3 — auxiliary information bottleneck: rate/distortion/perception
-        # on h_ctx as KL regularization. Does NOT intercept the LM signal.
-        _, bn_info = self.bottleneck(h_ctx)
+        # STAGE 3 — auxiliary information bottleneck (off-path).
+        bn_info = self.bottleneck(h_ctx)
 
-        # STAGE 4 — MAIN LM PATH: causal expression stack directly on h_ctx.
-        if self._predictive_in_path:
-            z = bn_info["z"]
-            z_refined, pred_info = self.predictive_decoder(z, h_ctx, self.training)
-            h_dec = self.rate_up(z_refined)
-            h_dec = self._stack_forward(h_dec, self.expression, attention_mode="causal")
-            iters_used = pred_info["iterations_used"]
+        # STAGE 4 — MAIN LM PATH: final norm + factored head on text positions.
+        h_dec = self.final_norm(h_ctx)
+        t_text = input_ids.shape[1]
+        if self._mm_on and mm_info["prefix_len"] > 0:
+            h_text = h_dec[:, mm_info["prefix_len"]:]
         else:
-            h_dec = self._stack_forward(h_ctx, self.expression, attention_mode="causal")
-            iters_used = torch.zeros(h_ctx.shape[:2], dtype=torch.long, device=h_ctx.device)
-        h_dec = self.final_norm(h_dec)
+            h_text = h_dec[:, :t_text]
 
-        # STAGE 5 — decision device: slice text positions, factored LM head.
-        h_text = h_dec[:, :T_text]
         idx, logits = self._gather_logits(h_text, prediction_mask, valid_target_mask)
         ce_loss = self._ce(idx, logits, targets)
 
         aux = AuxLosses()
         aux.rate = bn_info["rate"]
         aux.distortion = bn_info["distortion"]
-        aux.perception = bn_info["perception"]
+        aux.moe_lb = getattr(self, "_last_moe_lb", None)
         aux.attn_entropy = getattr(self, "_last_attn_entropy_penalty", None)
 
+        # STAGE 5 — grounded infomax (multimodal, off-path). Computed on h_ctx
+        # over the full sequence (prefix + text) so the modality-pooled
+        # embeddings reflect the channel output, not the source encoder alone.
+        if self._mm_on and modality_ids is not None:
+            vicreg, infonce = self.multimodal_input.grounded(h_ctx, modality_ids)
+            aux.vicreg = vicreg
+            aux.infonce = infonce
+
         return ModelOutput(
-            logits=logits, hidden=h_text, aux=aux, ce_loss=ce_loss,
-            iterations_used=iters_used, prediction_indices=idx,
+            logits=logits, hidden=h_text, aux=aux, ce_loss=ce_loss, prediction_indices=idx,
         )
 
     def _gather_logits(self, h_text, prediction_mask, valid_target_mask):

@@ -1,18 +1,16 @@
-"""HAGI configuration — ternary RD-channel language model.
+"""HAGI-2 configuration — codec-first scalable multimodal channel LM.
 
-The model is a causal autoregressive LM framed as a communication channel:
-  * factorized source encoder (ConvEmbedding, CAUSAL conv — no future leak)
-  * ternary BitNet b1.58 transformer body (the genuine discrete channel;
-    quantization noise is the only impairment — there is no self-inflicted
-    AWGN/LDPC physical channel)
-  * auxiliary variational information bottleneck (KL rate regularizer, kept
-    OUT of the main LM path — inserting it deadlocked from-scratch training)
-  * optional predictive decoder (extrinsic error highway, off the main path)
-  * optional multimodal source coding (per-modality encoder + early fusion)
+The model is a causal autoregressive LM designed as a communication system.
+All knobs live here; ``auto_configure`` solves the hidden/layer/head sizes
+from a parameter budget and every other value is an explicit config entry
+(no hidden hardcoded constants scattered through the training loop).
 
-All knobs live here. ``auto_configure`` solves the hidden/layer sizes from a
-parameter budget; everything else is an explicit config value (no hidden
-hardcoded constants scattered through the training loop).
+V27 schema (supersedes V25): drops the dead/in-path knobs (the
+context/expression split, ``bottleneck_in_path``, ``predictive.*``,
+``w_ternary_bias``, the sinusoidal pilot PE theta) and adds real GQA
+(``num_kv_heads``), an incremental KV-cache, entropy-aware MoE
+(water-filling capacity allocation), a Q-Former multimodal bridge, and
+grounded infomax (VICReg + InfoNCE).
 """
 
 from __future__ import annotations
@@ -23,10 +21,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AttentionConfig:
-    """Grouped-query attention (bidir / causal / prefix / soft_causal at train)."""
+    """Grouped-query attention (causal by default; bidir/prefix/soft_causal opt-in)."""
 
     num_query_heads: int = 8
-    num_kv_heads: int = 4
+    num_kv_heads: int = 4  # real GQA (V25 ignored this); n_kv <= n_q
     head_dim: int = 64
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
@@ -34,53 +32,83 @@ class AttentionConfig:
 
 @dataclass
 class EmbeddingsConfig:
-    """Factorized source encoder V x r + r x H + causal depthwise Conv1d filter."""
+    """Factorized source encoder: V x r + r x H + causal depthwise Conv1d filter."""
 
     factor_rank: int = 128
     kernel_size: int = 5
-    use_conv_embedding: bool = True
     trainable: bool = True
-    pos_pe_theta: float = 10000.0  # sinusoidal pilot positional-encoding base
 
 
 @dataclass
 class MultimodalConfig:
-    """Per-modality source encoders + early sequence concatenation."""
+    """Per-modality source encoders + Q-Former bridge + grounded infomax."""
 
     enabled: bool = False
     image_patch_size: int = 16
     image_channels: int = 3
     audio_mel_bins: int = 80
-    modality_embed_dim: int = 32
     num_modalities: int = 3
     modality_embed_std: float = 0.02
-    max_image_patches: int = 1024
-    max_audio_frames: int = 1024
+    # Q-Former bridge: fixed-size fused multimodal prefix (O(1) in image size).
+    n_bridge_queries: int = 32
+    bridge_layers: int = 2
+    bridge_n_heads: int = 4
+
+
+@dataclass
+class GroundedInfomaxConfig:
+    """VICReg + InfoNCE auxiliary grounding for the multimodal joint embedding.
+
+    VICReg stabilizes the joint embedding (variance hinge against collapse,
+    invariance to augmentation, covariance decorrelation). InfoNCE maximizes
+    a lower bound on cross-modal mutual information (Slepian-Wolf distributed
+    source coding). Both are off-path auxiliaries.
+    """
+
+    vicreg_var_weight: float = 1.0
+    vicreg_inv_weight: float = 1.0
+    vicreg_cov_weight: float = 0.04
+    vicreg_gamma: float = 1.0  # per-dim std hinge target
+    infonce_temperature: float = 0.07
 
 
 @dataclass
 class BottleneckConfig:
-    """Auxiliary variational information bottleneck (H->C, off the main LM path).
+    """Auxiliary variational information bottleneck (H->C, off the main path).
 
-    The IB computes KL/distortion/perception on the context hidden as an
-    auxiliary regularizer. It does NOT intercept the LM signal — inserting it
-    in the main path deadlocks from-scratch training.
+    The IB computes KL/distortion on the context hidden as an auxiliary
+    regularizer. It does NOT intercept the LM signal — inserting it into the
+    main path deadlocks from-scratch training (CE stalls at ~ln(V)).
     """
 
-    bottleneck_in_path: bool = False  # ablation: restore the failed in-path design
+    dim: int = 192  # C: must satisfy C < H (real compression)
+    ib_beta: float = 0.001
+    distortion_weight: float = 1.0
+    kl_free_bits: float = 0.5
+    logvar_clamp: tuple[float, float] = (-10.0, 10.0)
+    distortion_eps: float = 1e-6
 
 
 @dataclass
-class PredictiveConfig:
-    """Optional extrinsic error highway (off the main path by default)."""
+class MoEConfig:
+    """Entropy-aware mixture of experts (water-filling capacity allocation).
 
-    enabled: bool = False  # off the main path; opt-in for ablation/research
-    train_iterations: int = 2
-    infer_iterations: int = 4
-    convergence_threshold: float = 0.01
-    update_hidden: int = 256
-    use_kalman_blend: bool = True
-    hep_enabled: bool = True
+    MoE is the scalability lever: it grows parameter count without growing
+    per-token compute. A shared expert always fires (DeepSeek-Mo style) so
+    routed experts specialize on the residual. The router input includes a
+    per-position entropy scalar so high-entropy positions can route to heavier
+    capacity — variable-rate coding (water-filling: allocate capacity to the
+    channels with highest SNR/entropy). Opt-in; off for the small text config.
+    """
+
+    enabled: bool = False
+    num_experts: int = 4
+    top_k: int = 1
+    n_shared: int = 1
+    moe_every: int = 2  # replace the FFN with MoE on every Nth block
+    intermediate_size: int = 0  # 0 -> derived from hebbian_expansion * H
+    router_init_std: float = 1.0
+    entropy_gate_weight: float = 1.0  # weight on the entropy scalar fed to the router
 
 
 @dataclass
@@ -89,31 +117,25 @@ class TernaryConfig:
 
     use_ternary: bool = True
     hebbian_expansion: int = 4  # m = expansion * H
-    hebbian_dropout: float = 0.0
 
 
 @dataclass
 class BodyConfig:
-    """Ternary transformer body: context (perception) + expression stacks."""
+    """Ternary transformer body: a single unified KV-cacheable stack."""
 
-    context_layers: int = 8
-    expression_layers: int = 8
+    num_layers: int = 12
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
-    predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
-    # Rate-distortion loss weights (the only genuine "rate" is the IB KL).
-    ib_beta: float = 0.001
+    moe: MoEConfig = field(default_factory=MoEConfig)
+    # Distortion beta-annealing target weight (ramped 0->full over warmup).
     distortion_weight: float = 1.0
-    perception_weight: float = 0.01
-    kl_free_bits: float = 0.5
     logvar_clamp: tuple[float, float] = (-10.0, 10.0)
     distortion_eps: float = 1e-6
-    moe_enabled: bool = False  # dropped (YAGNI); flag retained for opt-in
 
 
 @dataclass
 class DistillationConfig:
-    """Online hidden-state distillation from a causal teacher LM."""
+    """Online hidden-state distillation from a causal teacher LM (opt-in)."""
 
     enabled: bool = False
     teacher: str = "HuggingFaceTB/SmolLM2-360M"
@@ -130,11 +152,7 @@ class DistillationConfig:
 
 @dataclass
 class CurriculumConfig:
-    """Two-stage dataset curriculum + attention-mode mixing.
-
-    The model is a CAUSAL generative LM; attention_mode stays causal-dominant
-    from step 0 (bidir/soft_causal slices add a denser representation gradient).
-    """
+    """Two-stage dataset curriculum."""
 
     enabled: bool = True
     stage2_start: int = 100000
@@ -161,12 +179,13 @@ class ModelConfig:
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    grounded: GroundedInfomaxConfig = field(default_factory=GroundedInfomaxConfig)
     body: BodyConfig = field(default_factory=BodyConfig)
 
 
 @dataclass
 class AdamConfig:
-    """AdamW hyperparameters for embeddings, 1D params, norms, gates."""
+    """AdamW hyperparameters for embeddings, 1D params, norms, gates, FP linears."""
 
     beta1: float = 0.9
     beta2: float = 0.95
@@ -175,7 +194,7 @@ class AdamConfig:
 
 @dataclass
 class MuonConfig:
-    """Muon hyperparameters for 2D hidden weights (Newton-Schulz)."""
+    """Muon hyperparameters for 2D ternary channel weights (Newton-Schulz)."""
 
     lr: float = 0.02
     momentum: float = 0.95
@@ -188,41 +207,20 @@ class MuonConfig:
 
 @dataclass
 class ScheduleConfig:
-    """Cosine LR schedule shape (applied to both Adam and Muon base LR).
+    """Cosine LR schedule shape (applied to both Adam and Muon base LR)."""
 
-    Absolute bounds (``max_steps``/``warmup_steps``) live on ``TrainConfig``;
-    only the shape coefficients are here.
-    """
-
-    stable_fraction: float = 0.8  # flat LR until this fraction of max_steps
-    min_lr_ratio: float = 0.1  # cosine floor as a fraction of base LR
-
-
-@dataclass
-class AttentionCurriculumConfig:
-    """Causal-dominant attention-mode mixing during training.
-
-    ``causal`` is the inference regime and stays dominant from step 0;
-    ``soft_causal``/``bidir`` add a denser representation gradient early and
-    are ramped out as training progresses.
-    """
-
-    causal_prob_start: float = 0.50
-    causal_prob_late: float = 0.60
-    soft_prob_start: float = 0.30
-    soft_prob_late: float = 0.40
-    soft_beta_start: float = 0.5
-    soft_beta_end: float = 3.0
+    stable_fraction: float = 0.8
+    min_lr_ratio: float = 0.1
 
 
 @dataclass
 class LoggingConfig:
     """Diagnostic / logging cadence inside the training loop."""
 
-    posterior_interval: int = 20  # compute top-2 mass + posterior entropy every N steps
-    posterior_chunk_rows: int = 256  # row-chunk size for the posterior statistics
-    log_interval: int = 1  # metrics are yielded every N steps
-    cache_release_interval: int = 1  # cuda empty_cache cadence (0 disables)
+    posterior_interval: int = 20
+    posterior_chunk_rows: int = 256
+    log_interval: int = 1
+    cache_release_interval: int = 1
 
 
 @dataclass
@@ -241,15 +239,14 @@ class TrainConfig:
     muon: MuonConfig = field(default_factory=MuonConfig)
     adam: AdamConfig = field(default_factory=AdamConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
-    attention_curriculum: AttentionCurriculumConfig = field(default_factory=AttentionCurriculumConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     # Loss weights.
     w_ce: float = 1.0
     w_rate: float = 0.001
     w_distortion: float = 1.0
-    w_perception: float = 0.01
-    w_ternary_bias: float = 0.0
-    w_moe_load_balance: float = 0.01
+    w_vicreg: float = 0.1
+    w_infonce: float = 0.1
+    w_moe_lb: float = 0.01
     w_attn_entropy: float = 0.01
     attn_entropy_floor: float = 0.5
     # Data / tokens.
@@ -300,27 +297,25 @@ def _next_pow2(n: int) -> int:
 
 
 def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
-    """Solve hidden/layer sizes from a non-embedding parameter budget.
+    """Solve hidden/layer/head sizes from a non-embedding parameter budget.
 
-    The body is a ternary Hebbian-bilinear FFN + attention stack. Cost per
-    layer is dominated by the FFN (A0, A1: H x 4H; W: 4H x H) and attention
-    qkv+out (4 H^2). Two stacks (context + expression) each of depth L.
+    The body is a ternary Hebbian-bilinear FFN + GQA attention stack. Per-layer
+    cost: attention ~2 H^2 (qkv GQA + out), FFN ~3 m H at m = 4 H (A0+A1+W).
     """
     target = float(target_params)
     layers = max(2, round(math.log10(target / 1e5) * 3))
-    perc = max(1, layers // 2)
-    expr = perc
-    ffn_cost_per_layer = 2 * (_round_to_multiple(int(target ** 0.5)) * 4)  # rough
-    # Per-H^2 coefficient: attn ~4, FFN ~8 (A0+A1+W at m=4H => 3*4H^2 ~ 12, /2 master)
-    cost_per_h_sq = 4.0 + 6.0
-    H = _round_to_multiple(int(math.sqrt(target / (cost_per_h_sq * (perc + expr)))), 8)
+    cost_per_h_sq = 2.0 + 6.0  # attn ~2, FFN ~6
+    H = _round_to_multiple(int(math.sqrt(target / (cost_per_h_sq * layers))), 8)
     C = _round_to_multiple(H // 2, 8)
-    head_dim = _round_to_multiple(64, 8)
+    head_dim = 64
     n_q = max(2, _next_pow2(H // head_dim))
     head_dim = _round_to_multiple(H // n_q, 8)
     while n_q * head_dim < H:
         head_dim += 8
-    del ffn_cost_per_layer
+    # GQA ratio: kv heads = n_q / 4 (clamped to >= 1, divides n_q).
+    n_kv = max(1, n_q // 4)
+    while n_q % n_kv != 0:
+        n_kv -= 1
 
     m = ModelConfig()
     m.vocab_size = vocab_size
@@ -328,10 +323,10 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
     m.core_hidden_size = C
     m.target_params = target_params
     m.target_nonembed_params = int(target)
-    m.body.context_layers = perc
-    m.body.expression_layers = expr
+    m.body.num_layers = layers
+    m.body.bottleneck.dim = C
     m.attention.num_query_heads = n_q
-    m.attention.num_kv_heads = max(1, n_q // 2)
+    m.attention.num_kv_heads = n_kv
     m.attention.head_dim = head_dim
     return m
 
@@ -352,12 +347,9 @@ def load_config(path: str | None = None, **overrides: object) -> Config:
     import yaml
 
     cfg = Config()
-    yaml_keys = {"train": set(), "inference": set()}
     if path:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
-        yaml_keys["train"] = set(data.get("train", {}).keys())
-        yaml_keys["inference"] = set(data.get("inference", {}).keys())
         _apply_dict(cfg, data)
 
         tp = cfg.model.target_params
@@ -391,15 +383,15 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         model.attention.num_query_heads = auto.attention.num_query_heads
         model.attention.num_kv_heads = auto.attention.num_kv_heads
         model.attention.head_dim = auto.attention.head_dim
+    if "core_hidden_size" not in yaml_data:
+        model.body.bottleneck.dim = auto.core_hidden_size
     body = yaml_data.get("body", {})
-    if "context_layers" not in body:
-        model.body.context_layers = auto.body.context_layers
-    if "expression_layers" not in body:
-        model.body.expression_layers = auto.body.expression_layers
+    if "num_layers" not in body:
+        model.body.num_layers = auto.body.num_layers
 
 
 def validate_config(cfg: Config) -> None:
-    """Structural invariants for the ternary RD-channel LM."""
+    """Structural invariants for the codec-channel LM."""
     m, t = cfg.model, cfg.train
 
     def bint(name: str, value: int, upper: int) -> None:
@@ -412,10 +404,27 @@ def validate_config(cfg: Config) -> None:
     bint("train.seq_len", t.seq_len, 65_536)
     bint("train.batch_size", t.batch_size, 4_096)
     bint("inference.max_new_tokens", cfg.inference.max_new_tokens, 8_192)
+    bint("model.body.num_layers", m.body.num_layers, 1_000)
+    bint("model.attention.num_query_heads", m.attention.num_query_heads, 1_024)
+    bint("model.attention.num_kv_heads", m.attention.num_kv_heads, 1_024)
+    bint("model.attention.head_dim", m.attention.head_dim, 4_096)
+
     if not 0 < m.core_hidden_size < m.hidden_size:
         raise ValueError(
             f"model.core_hidden_size ({m.core_hidden_size}) must satisfy "
             f"0 < C < hidden_size ({m.hidden_size}). No compression => no RD."
+        )
+    if m.attention.num_kv_heads > m.attention.num_query_heads:
+        raise ValueError("attention.num_kv_heads must be <= num_query_heads (GQA)")
+    if m.attention.num_query_heads % m.attention.num_kv_heads != 0:
+        raise ValueError("attention.num_query_heads must be divisible by num_kv_heads (GQA)")
+    if m.hidden_size % m.attention.num_query_heads != 0:
+        raise ValueError("hidden_size must be divisible by num_query_heads")
+    hd = m.attention.head_dim
+    if m.attention.num_query_heads * hd != m.hidden_size:
+        raise ValueError(
+            f"num_query_heads * head_dim ({m.attention.num_query_heads}*{hd}) "
+            f"must equal hidden_size ({m.hidden_size})"
         )
     if t.grad_accum_steps < 1:
         raise ValueError("train.grad_accum_steps must be positive")
@@ -427,22 +436,29 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("pad_token_id must be within the model vocabulary")
     if t.w_attn_entropy > 0 and t.attn_entropy_floor <= 0.0:
         raise ValueError("train.attn_entropy_floor must be > 0 when w_attn_entropy > 0")
-    if t.w_perception < 0.0:
-        raise ValueError("train.w_perception must be >= 0 (RDP perception axis)")
     if not 0.0 < t.schedule.stable_fraction <= 1.0:
         raise ValueError("train.schedule.stable_fraction must be in (0, 1]")
     if not 0.0 <= t.schedule.min_lr_ratio < 1.0:
         raise ValueError("train.schedule.min_lr_ratio must be in [0, 1)")
-    ac = t.attention_curriculum
-    for name, value in (
-        ("causal_prob_start", ac.causal_prob_start),
-        ("causal_prob_late", ac.causal_prob_late),
-        ("soft_prob_start", ac.soft_prob_start),
-        ("soft_prob_late", ac.soft_prob_late),
-    ):
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"train.attention_curriculum.{name} must be in [0, 1]")
     if not 0.0 < t.muon.wd_cap <= 8.0:
         raise ValueError("train.muon.wd_cap must be positive")
     if len(t.muon.ns_coeffs) != 3:
         raise ValueError("train.muon.ns_coeffs must be a 3-tuple")
+    if m.body.num_layers % max(1, m.body.moe.moe_every) != 0 and m.body.moe.enabled:
+        raise ValueError("body.num_layers must be divisible by moe.moe_every when MoE is enabled")
+    if m.body.moe.enabled:
+        moe = m.body.moe
+        if moe.num_experts < 1:
+            raise ValueError("moe.num_experts must be >= 1")
+        if not 1 <= moe.top_k <= moe.num_experts:
+            raise ValueError("moe.top_k must be in [1, num_experts]")
+        if moe.n_shared < 0:
+            raise ValueError("moe.n_shared must be >= 0")
+    mm = m.multimodal
+    if mm.enabled:
+        if mm.n_bridge_queries < 1:
+            raise ValueError("multimodal.n_bridge_queries must be >= 1")
+        if mm.bridge_layers < 1:
+            raise ValueError("multimodal.bridge_layers must be >= 1")
+        if m.hidden_size % mm.bridge_n_heads != 0:
+            raise ValueError("multimodal.bridge_n_heads must divide hidden_size")

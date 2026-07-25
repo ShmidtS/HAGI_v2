@@ -137,7 +137,6 @@ def main() -> int:
         output = model(
             input_ids,
             targets=input_ids.clone(),
-            semantic_unknown_mask=torch.zeros_like(valid_target_mask),
             prediction_mask=valid_target_mask,
             valid_target_mask=valid_target_mask,
             attention_mode="causal",

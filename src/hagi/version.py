@@ -1,13 +1,16 @@
-"""HAGI version — single source of truth.
+"""HAGI-2 version — single source of truth.
 
-Ternary RD-channel causal language model. The model is reframed as a
-communication channel: a factorized source encoder (causal conv, no future
-leak), a ternary BitNet b1.58 transformer body (the genuine discrete channel
-— quantization noise is the only impairment; there is no self-inflicted
-AWGN/LDPC physical channel), an auxiliary variational information bottleneck
-(KL rate, kept off the main LM path), and an optional predictive decoder +
-multimodal fusion.
+Codec-first scalable multimodal channel LM. The model is a causal
+autoregressive language model designed as a communication system: a
+factorized per-modality source encoder (causal conv, no future leak), a
+single unified ternary BitNet b1.58 transformer body (the genuine discrete
+channel — quantization noise is the only impairment; there is no
+self-inflicted AWGN/LDPC physical channel), real grouped-query attention
+with an incremental KV-cache, an opt-in entropy-aware MoE (water-filling
+capacity allocation), a Q-Former multimodal bridge, and grounded infomax
+(VICReg + InfoNCE). All information-theoretic machinery is off-path
+auxiliary. See docs/V27_DESIGN.md.
 """
 
-__version__ = "1.0.0"
-__architecture__ = "ternary-rd-channel"
+__version__ = "2.0.0"
+__architecture__ = "hagi2-codec-channel"
