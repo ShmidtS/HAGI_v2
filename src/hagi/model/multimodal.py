@@ -8,6 +8,12 @@ bottleneck queries) compresses each modality to a FIXED number of fused tokens
 This is O(1) multimodal tokens regardless of image size — the scalability fix
 vs the V25 early-fusion concatenation (which was O(image_patches) in length).
 
+V28 replaces V27's fixed-1024-entry learned positional tables (which were
+neither 2D nor scalable past 32x32 patches) with genuine 2D-RoPE (image
+patches rotate by (row, col)) and 1D-RoPE (audio frames by frame index) from
+``rope.py``. Position is now a continuous rotation that generalizes to any
+image/audio size.
+
 Grounded infomax (VICReg + InfoNCE) is applied on the per-modality pooled
 embeddings to align the joint space — see ``grounded.py``.
 
@@ -23,6 +29,7 @@ import torch
 from torch import nn
 
 from hagi.config import Config
+from hagi.model.rope import rope_cos_sin, rope_cos_sin_2d
 
 
 def _inv_var_gate(h: torch.Tensor, log_var_head: nn.Module) -> torch.Tensor:
@@ -141,11 +148,17 @@ class MultimodalFusion(nn.Module):
         self.modality_embeds = nn.Parameter(torch.zeros(self.NUM_MODALITIES, H))
         nn.init.normal_(self.modality_embeds, std=mm.modality_embed_std)
 
-        pos_std = 1.0 / (H**0.5)
-        self.image_pos_embed = nn.Parameter(torch.zeros(1024, H))
-        nn.init.normal_(self.image_pos_embed, std=pos_std)
-        self.audio_pos_embed = nn.Parameter(torch.zeros(1024, H))
-        nn.init.normal_(self.audio_pos_embed, std=pos_std)
+        # 2D/1D-RoPE for image patches / audio frames (replaces V27 fixed-1024
+        # tables). Position is a continuous rotation, generalizing to any size.
+        # The rotary band lives at the modality head_dim = H // bridge_n_heads.
+        self._rope_head_dim = H // mm.bridge_n_heads
+        if self._rope_head_dim % 4 != 0:
+            raise ValueError(
+                f"multimodal bridge head_dim (H // bridge_n_heads = {self._rope_head_dim}) "
+                f"must be divisible by 4 for 2D-RoPE"
+            )
+        self._rope_theta = m.attention.rope_theta
+        self._image_patch_size = self.image_patch_size
 
         # Q-Former bridge: shared learnable queries + per-modality cross-attn layers.
         self.bridge_queries = nn.Parameter(torch.zeros(self.n_bridge, H))
@@ -168,6 +181,31 @@ class MultimodalFusion(nn.Module):
         gate = _inv_var_gate(h, unc).unsqueeze(-1)
         return z_shared + gate * z_specific
 
+    def _apply_modality_rope(self, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply 2D/1D-RoPE to modality tokens ``[B, T, H]``.
+
+        Reshapes to ``[B, n_heads, T, head_dim]`` and rotates via the half-split
+        scheme used by ``rope.apply_rope_2d`` / ``apply_rope``. ``head_dim`` =
+        ``H // bridge_n_heads`` so the rotary band matches the bridge heads.
+        """
+        b, t, hh = h.shape
+        hd = self._rope_head_dim
+        nh = hh // hd
+        x = h.view(b, t, nh, hd).permute(0, 2, 1, 3)  # [B, nh, T, hd]
+        cos4 = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, T, hd]
+        sin4 = sin.unsqueeze(0).unsqueeze(0)
+        half = hd // 2
+        from hagi.model.rope import rotate_half
+
+        def _rot2d(z: torch.Tensor) -> torch.Tensor:
+            z1, z2 = z[..., :half], z[..., half:]
+            r1 = (z1 * cos4[..., :half]) + (rotate_half(z1) * sin4[..., :half])
+            r2 = (z2 * cos4[..., half:]) + (rotate_half(z2) * sin4[..., half:])
+            return torch.cat([r1, r2], dim=-1)
+
+        x = _rot2d(x)
+        return x.permute(0, 2, 1, 3).reshape(b, t, hh)
+
     def encode_text(self, input_ids: torch.Tensor) -> torch.Tensor:
         h = self.text_embed(input_ids)
         return h + self.modality_embeds[0]
@@ -180,7 +218,11 @@ class MultimodalFusion(nn.Module):
         patches = images.unfold(2, p, p).unfold(3, p, p)
         patches = patches.contiguous().view(b, t_i, c * p * p)
         h = self.image_embed(patches)
-        h = h + self.image_pos_embed[:t_i].unsqueeze(0)
+        # 2D-RoPE: (row, col) per patch.
+        rows = torch.arange(n_h, device=h.device).view(n_h, 1).expand(n_h, n_w).reshape(-1).to(torch.float32)
+        cols = torch.arange(n_w, device=h.device).view(1, n_w).expand(n_h, n_w).reshape(-1).to(torch.float32)
+        cos, sin = rope_cos_sin_2d(rows, cols, self._rope_head_dim, self._rope_theta, h.device, h.dtype)
+        h = self._apply_modality_rope(h, cos, sin)
         h = h + self.modality_embeds[1]
         return self._fuse(h, self.image_unc)
 
@@ -188,7 +230,10 @@ class MultimodalFusion(nn.Module):
         b, _n_mels, t_frames = spectrograms.shape
         frames = spectrograms.transpose(1, 2)
         h = self.audio_embed(frames)
-        h = h + self.audio_pos_embed[:t_frames].unsqueeze(0)
+        # 1D-RoPE: frame index.
+        pos = torch.arange(t_frames, device=h.device, dtype=torch.float32)
+        cos, sin = rope_cos_sin(pos, self._rope_head_dim, self._rope_theta, h.device, h.dtype)
+        h = self._apply_modality_rope(h, cos, sin)
         h = h + self.modality_embeds[2]
         return self._fuse(h, self.audio_unc)
 
