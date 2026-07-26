@@ -1,10 +1,12 @@
-# HAGI-2 (V27) — Google Gemma teacher configuration (cloud, T4/V100 16GB).
+# HAGI-2 (V28) — Google Gemma teacher configuration (cloud, T4/V100 16GB).
 #
-# Codec-first scalable multimodal channel LM (see docs/V27_DESIGN.md). Trained
+# Codec-first scalable multimodal channel LM (see docs/V28_DESIGN.md). Trained
 # from scratch on Gemma-tokenized data (vocab 262146). Larger body budget than
-# smollm2.yaml; multimodal source coding (image + audio) with the Q-Former
-# bridge AND entropy-aware MoE (water-filling capacity allocation) enabled —
-# the scalable deployment.
+# smollm2.yaml; multimodal source coding (image + audio, 2D/1D-RoPE) with the
+# Q-Former bridge, **water-filling MoE** (SNR-gated routing + routing-entropy
+# capacity maximization), a hybrid sliding-window long-context channel, and the
+# off-path HEP predictive refiner (EXIT-halt gated) enabled — the scalable
+# deployment. Checkpoint format 7.
 
 model:
   vocab_size: 262146
@@ -19,6 +21,10 @@ model:
     num_kv_heads: 3                # real GQA: 4 query heads share 1 KV head
     head_dim: 64
     rope_theta: 500000.0
+
+  sliding:                         # hybrid sliding-window long-context channel
+    sliding_window: 1024           # local O(T*W) channel; 0 = full attention
+    full_every: 4                  # every 4th layer is full attention (global parity relay)
 
   embeddings:
     factor_rank: 256
@@ -50,6 +56,16 @@ model:
       top_k: 2
       n_shared: 1
       moe_every: 2                  # MoE on every 2nd block
+      snr_gate_weight: 1.0          # water-filling SNR proxy weight
+      route_entropy_weight: 0.01    # routing-entropy capacity maximization
+
+  refinement:                       # off-path HEP predictive refiner (opt-in)
+    enabled: true
+    iterations: 2
+    hep_enabled: true
+    exit_threshold: 0.05
+    exit_min_steps: 50
+    exit_window: 5
 
 train:
   max_steps: 200000
@@ -71,6 +87,8 @@ train:
   w_vicreg: 0.1
   w_infonce: 0.1
   w_moe_lb: 0.01
+  w_route_entropy: 0.01            # water-filling dual: maximize routing entropy
+  w_refine: 0.1                    # off-path HEP refinement
   w_attn_entropy: 0.01
   attn_entropy_floor: 0.5
 

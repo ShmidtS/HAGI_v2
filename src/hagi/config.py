@@ -1,16 +1,27 @@
-"""HAGI-2 configuration — codec-first scalable multimodal channel LM.
+"""HAGI-2 configuration — codec-first scalable multimodal channel LM (V28).
 
 The model is a causal autoregressive LM designed as a communication system.
 All knobs live here; ``auto_configure`` solves the hidden/layer/head sizes
 from a parameter budget and every other value is an explicit config entry
 (no hidden hardcoded constants scattered through the training loop).
 
-V27 schema (supersedes V25): drops the dead/in-path knobs (the
-context/expression split, ``bottleneck_in_path``, ``predictive.*``,
-``w_ternary_bias``, the sinusoidal pilot PE theta) and adds real GQA
-(``num_kv_heads``), an incremental KV-cache, entropy-aware MoE
-(water-filling capacity allocation), a Q-Former multimodal bridge, and
-grounded infomax (VICReg + InfoNCE).
+V28 schema (supersedes V27): keeps the verified bones (real GQA, incremental
+KV-cache, causal conv source encoder, ternary body, off-path auxiliaries,
+type-based optim routing) and makes the information-theoretic machinery honest
+and scalable:
+
+  * **Water-filling MoE** (``MoEConfig``): SNR-gated routing (capacity follows
+    per-position residual SNR) + routing-entropy capacity maximization + batched
+    expert dispatch. Replaces V27's magnitude-gate.
+  * **Sliding-window attention** (``SlidingWindowConfig``): opt-in O(T*W) local
+    channel; long-range relayed by full-attention layers.
+  * **Off-path predictive refinement** (``RefinementConfig``): rehabilitated HEP
+    extrinsic error highway, strictly off the main path, EXIT-halt gated.
+  * **2D/1D-RoPE** for multimodal patches/frames (no fixed positional table).
+  * **EXIT-chart convergence halt** on the distortion beta-anneal.
+
+V27 knobs dropped: ``entropy_gate_weight`` (renamed ``snr_gate_weight``).
+Checkpoint format bumped 6 -> 7 (incompatible with V27 — fresh retrain).
 """
 
 from __future__ import annotations
@@ -28,6 +39,30 @@ class AttentionConfig:
     head_dim: int = 64
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
+    sliding_window: int = 0  # 0 = full attention; >0 = windowed causal (local channel)
+
+
+@dataclass
+class SlidingWindowConfig:
+    """Hybrid sliding-window / full-attention layer placement.
+
+    A local (windowed) channel is O(T*W); full-attention layers act as global
+    parity relays so long-range signal survives. ``window_layers`` indexes (0-based)
+    are windowed; the rest are full attention. An empty index set with
+    ``sliding_window>0`` windows ALL layers.
+
+    Attributes:
+        sliding_window: window size W (0 = full attention everywhere).
+        window_layers: explicit per-layer window mask; if empty and W>0, all
+            layers are windowed. Length may be shorter than num_layers (trailing
+            layers default to full attention).
+        full_every: when >0, make every Nth layer full-attention and the rest
+            windowed (ignored if ``window_layers`` is non-empty).
+    """
+
+    sliding_window: int = 0
+    window_layers: tuple[int, ...] = ()
+    full_every: int = 0
 
 
 @dataclass
@@ -108,7 +143,8 @@ class MoEConfig:
     moe_every: int = 2  # replace the FFN with MoE on every Nth block
     intermediate_size: int = 0  # 0 -> derived from hebbian_expansion * H
     router_init_std: float = 1.0
-    entropy_gate_weight: float = 1.0  # weight on the entropy scalar fed to the router
+    snr_gate_weight: float = 1.0  # weight on the water-filling SNR proxy fed to the router
+    route_entropy_weight: float = 0.01  # weight on the routing-entropy capacity-maximization bonus
 
 
 @dataclass
@@ -167,6 +203,26 @@ class CurriculumConfig:
 
 
 @dataclass
+class RefinementConfig:
+    """Off-path HEP predictive refinement (opt-in).
+
+    Rehabilitated from the V25 ``predictive_v25.py`` and re-placed strictly OFF
+    the main LM path (the V25 in-path placement deadlocked from-scratch
+    training). A zero-init HEP feedback refines a CLONE of the context hidden;
+    an auxiliary CE+KL loss is the only gradient into the branch. EXIT-chart
+    novelty halts the distortion beta-anneal on convergence.
+    """
+
+    enabled: bool = False
+    iterations: int = 2  # refinement passes
+    update_hidden: int = 0  # 0 -> H; else MLP hidden width
+    hep_enabled: bool = True  # zero-init HEP feedback (depth-independent correction)
+    exit_threshold: float = 0.05  # novelty below this freezes the beta-anneal
+    exit_min_steps: int = 50
+    exit_window: int = 5
+
+
+@dataclass
 class ModelConfig:
     """Full model architecture."""
 
@@ -177,10 +233,12 @@ class ModelConfig:
     target_params: int = 0
     target_nonembed_params: int = 0
     attention: AttentionConfig = field(default_factory=AttentionConfig)
+    sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
     grounded: GroundedInfomaxConfig = field(default_factory=GroundedInfomaxConfig)
     body: BodyConfig = field(default_factory=BodyConfig)
+    refinement: RefinementConfig = field(default_factory=RefinementConfig)
 
 
 @dataclass
@@ -247,6 +305,8 @@ class TrainConfig:
     w_vicreg: float = 0.1
     w_infonce: float = 0.1
     w_moe_lb: float = 0.01
+    w_route_entropy: float = 0.01  # routing-entropy capacity maximization (MoE)
+    w_refine: float = 0.0  # off-path HEP refinement loss (opt-in)
     w_attn_entropy: float = 0.01
     attn_entropy_floor: float = 0.5
     # Data / tokens.
@@ -462,3 +522,43 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("multimodal.bridge_layers must be >= 1")
         if m.hidden_size % mm.bridge_n_heads != 0:
             raise ValueError("multimodal.bridge_n_heads must divide hidden_size")
+    # Sliding-window invariants.
+    sw = m.sliding
+    if sw.sliding_window < 0:
+        raise ValueError("sliding.sliding_window must be >= 0")
+    if sw.sliding_window > m.attention.max_seq_len:
+        raise ValueError("sliding.sliding_window must be <= attention.max_seq_len")
+    if any(idx < 0 or idx >= m.body.num_layers for idx in sw.window_layers):
+        raise ValueError("sliding.window_layers indices must be in [0, num_layers)")
+    # Refinement invariants.
+    rc = m.refinement
+    if rc.enabled:
+        if rc.iterations < 1:
+            raise ValueError("refinement.iterations must be >= 1")
+        if not 0.0 < rc.exit_threshold:
+            raise ValueError("refinement.exit_threshold must be positive")
+        if rc.exit_min_steps < 1 or rc.exit_window < 1:
+            raise ValueError("refinement.exit_min_steps / exit_window must be >= 1")
+
+
+def layer_sliding_windows(m: ModelConfig) -> list[int]:
+    """Resolve the per-layer sliding-window size for the body.
+
+    Returns a ``list[int]`` of length ``num_layers``: 0 means full attention,
+    ``>0`` means windowed causal for that layer. Resolution order:
+
+      1. Explicit ``window_layers`` index set (those layers windowed, rest full).
+      2. ``full_every`` > 0: every Nth layer full, the rest windowed.
+      3. ``sliding_window`` > 0 with neither of the above: ALL layers windowed.
+      4. ``sliding_window`` == 0: ALL layers full attention.
+    """
+    n = m.body.num_layers
+    w = m.sliding.sliding_window
+    if w == 0:
+        return [0] * n
+    if m.sliding.window_layers:
+        windowed = set(m.sliding.window_layers)
+        return [w if i in windowed else 0 for i in range(n)]
+    if m.sliding.full_every > 0:
+        return [0 if (i % m.sliding.full_every == 0) else w for i in range(n)]
+    return [w] * n

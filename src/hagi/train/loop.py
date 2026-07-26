@@ -178,7 +178,7 @@ def train_step(
     top2_mass_sum = 0.0
     entropy_sum = 0.0
     posterior_rows = 0
-    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "attn_entropy")}
+    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "route_entropy", "refinement", "attn_entropy")}
     aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
@@ -211,6 +211,9 @@ def train_step(
         )
         output.ce_loss = _causal_next_token_loss(output, input_ids, targets, valid_target_mask)
         loss = loss_aggregator(output, step=step)
+        # Feed the off-path refinement EXIT novelty into the aggregator's halt
+        # so the distortion beta-anneal freezes on representation convergence.
+        loss_aggregator.update_exit_novelty(output.aux.exit_novelty)
 
         if not torch.isfinite(loss).all():
             logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — cancelling update")
@@ -288,15 +291,19 @@ def train_step(
         "top2_mass": top2_mass,
         "posterior_entropy": posterior_entropy,
         "rate": mean_aux("rate"),
+        "rate_bits": mean_aux("rate") / math.log(2.0),  # channel semantic rate in bits/token
         "distortion": mean_aux("distortion"),
         "vicreg": mean_aux("vicreg"),
         "infonce": mean_aux("infonce"),
         "moe_lb": mean_aux("moe_lb"),
+        "route_entropy": mean_aux("route_entropy"),
+        "refinement": mean_aux("refinement"),
         "attn_entropy": mean_aux("attn_entropy"),
         "avg_confidence": avg_confidence,
         "grad_norm": gn,
         "grad_rms": grad_rms,
         "lr": lr_at(step, cfg),
+        "exit_halted": loss_aggregator.exit_halted,
         "step": step,
         "update_applied": True,
         "all_finite": True,

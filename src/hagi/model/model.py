@@ -1,15 +1,19 @@
-"""HAGI-2 — codec-first scalable multimodal channel LM.
+"""HAGI-2 (V28) — codec-first scalable multimodal channel LM.
 
 Main LM path (causal, KV-cacheable):
   source-encode (CAUSAL conv, no future leak)
-    -> UNIFIED ternary stack (real GQA + RoPE; MoE on every moe_every-th block)
+    -> UNIFIED ternary stack (real GQA + RoPE; water-filling MoE on every
+       moe_every-th block; optional sliding-window local channel)
     -> final_norm
     -> factored LM head
 
 Auxiliary (off the main path, never intercepts the LM signal):
   * InformationBottleneck: KL / distortion regularizer on the context hidden.
+  * PredictiveRefiner (opt-in): rehabilitated HEP extrinsic refinement of a
+    CLONE of the context hidden — strictly off-path (the V25 in-path placement
+    deadlocked from-scratch training). EXIT-halt gates the beta-anneal.
   * GroundedInfomax (VICReg + InfoNCE): multimodal joint-embedding alignment.
-  * MoE load-balance: Switch CV^2 (MoE only).
+  * MoE load-balance (Switch CV^2) + routing-entropy capacity maximization.
   * attn entropy floor: anti-collapse (training only).
 
 The body is a SINGLE unified stack (V25 split it into context/expression, an
@@ -80,6 +84,9 @@ class HAGI(nn.Module):
         inter = body.moe.intermediate_size or (body.ternary.hebbian_expansion * H)
 
         # ---- UNIFIED ternary stack (the genuine channel) ----
+        from hagi.config import layer_sliding_windows
+
+        per_layer_window = layer_sliding_windows(m)
         moe_every = max(1, body.moe.moe_every) if self._moe_on else 0
         self.blocks = nn.ModuleList()
         for li in range(body.num_layers):
@@ -87,7 +94,10 @@ class HAGI(nn.Module):
             mixer = None
             if use_moe_here:
                 mixer = MoESwiGLU(H, inter, body.moe, m.norm_eps, use_ternary=self._use_ternary)
-            self.blocks.append(TransformerBlock(H, attn_cfg, ffn_cfg, m.norm_eps, use_ternary=self._use_ternary, mixer=mixer))
+            block = TransformerBlock(H, attn_cfg, ffn_cfg, m.norm_eps, use_ternary=self._use_ternary, mixer=mixer)
+            # Per-layer sliding window (0 = full attention; >0 = local channel).
+            block.attn.sliding_window = per_layer_window[li] if per_layer_window else 0
+            self.blocks.append(block)
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
 
@@ -107,6 +117,15 @@ class HAGI(nn.Module):
             from hagi.model.multimodal import MultimodalFusion
 
             self.multimodal_input = MultimodalFusion(cfg, text_encoder=self.embed)
+
+        # ---- Optional off-path HEP predictive refinement (opt-in) ----
+        self.refinement_head = None
+        if m.refinement.enabled:
+            from hagi.model.refinement import RefinementHead
+
+            self.refinement_head = RefinementHead(
+                H, m.vocab_size, m.refinement, m.norm_eps, use_ternary=self._use_ternary
+            )
 
         self._init_weights()
         for mod in self.modules():
@@ -149,8 +168,9 @@ class HAGI(nn.Module):
         self.embed.reset_conv_cache()
 
     def _stack_forward(self, h, attention_mode, prefix_len, soft_beta, positions):
-        """Run the unified block stack with grad-checkpointing; sum the attn-entropy penalty."""
+        """Run the unified block stack with grad-checkpointing; sum attn-entropy + route-entropy."""
         entropy_pen = None
+        route_entropy_acc = None
         checkpointing = self.training and len(self.blocks) > 1
         moe_lb_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         for blk in self.blocks:
@@ -167,8 +187,12 @@ class HAGI(nn.Module):
                 lb = blk.moe.last_load_balance if blk.moe is not None else None
                 if lb is not None and moe_lb_acc is not None:
                     moe_lb_acc = moe_lb_acc + lb
+                re = blk.moe.last_routing_entropy if blk.moe is not None else None
+                if re is not None:
+                    route_entropy_acc = re if route_entropy_acc is None else route_entropy_acc + re
         self._last_attn_entropy_penalty = entropy_pen
         self._last_moe_lb = moe_lb_acc
+        self._last_route_entropy = route_entropy_acc
         return h
 
     def forward(
@@ -237,7 +261,27 @@ class HAGI(nn.Module):
         aux.rate = bn_info["rate"]
         aux.distortion = bn_info["distortion"]
         aux.moe_lb = getattr(self, "_last_moe_lb", None)
+        aux.route_entropy = getattr(self, "_last_route_entropy", None)
         aux.attn_entropy = getattr(self, "_last_attn_entropy_penalty", None)
+
+        # STAGE 4b — off-path HEP predictive refinement (opt-in). Runs on a CLONE
+        # of h_ctx; the main logits come from the UN-refined h_ctx (V25 lesson:
+        # in-path refinement deadlocks from-scratch training). The only gradient
+        # into the refinement branch is the auxiliary refinement loss.
+        if self.refinement_head is not None and self.training:
+            ref_loss, _h_refined = self.refinement_head(
+                h_ctx,
+                main_logits=logits if idx is not None else None,
+                targets=targets if targets is not None else None,
+                prediction_indices=idx,
+                refine_weight=self.cfg.train.w_refine,
+            )
+            aux.refinement = ref_loss
+            aux.exit_novelty = self.refinement_head.refiner.novelty()
+        elif self.refinement_head is not None:
+            # eval: still produce the diagnostic without building the loss graph.
+            self.refinement_head.refiner(h_ctx)
+            aux.exit_novelty = self.refinement_head.refiner.novelty()
 
         # STAGE 5 — grounded infomax (multimodal, off-path). Computed on h_ctx
         # over the full sequence (prefix + text) so the modality-pooled
