@@ -198,9 +198,14 @@ class WaterFillingMoE(nn.Module):
     def _batched_dispatch(self, flat: torch.Tensor, residual: torch.Tensor, topk_idx: torch.Tensor, topk_vals: torch.Tensor) -> torch.Tensor:
         """Group tokens by chosen expert via sort + segment offsets; batched matmul.
 
-        Falls back to the naive masked-dispatch loop for small token counts
-        (clearer, and exact for equivalence testing). The batched path is used
-        for large token counts where the python loop would dominate.
+        Always uses the batched path (sort + index_select + index_add_) — no
+        boolean masking, so no nonzero/index_put launches. The exact naive
+        masked-dispatch loop (:meth:`_naive_dispatch`) is kept as a reference
+        for equivalence testing but is no longer on the forward path: it was the
+        source of the nonzero/index_put launch storm the profiler attributed
+        13.7% CPU / 2.25% CUDA to on a launch-bound GPU. A single ``.tolist()``
+        pulls the per-expert offsets/counts in one host sync instead of
+        ``2*num_experts`` per-expert ``.item()`` syncs.
 
         Args:
             flat: ``[N, H]`` normed hidden.
@@ -215,10 +220,13 @@ class WaterFillingMoE(nn.Module):
         out = flat.new_zeros(n, self.hidden_size)
         if n == 0:
             return out
-        # Naive loop path: exact, used for small N and for equivalence tests.
-        if n <= 4096:
-            return self._naive_dispatch(residual, topk_idx, topk_vals)
-        # Batched path for large N.
+        # Batched path (sort + segment + index_select/index_add_): no boolean
+        # masking, so no nonzero/index_put launches. The naive masked-dispatch
+        # loop (below) was the source of the nonzero/index_put launch storm
+        # the profiler attributed 13.7% CPU / 2.25% CUDA to on a launch-bound
+        # GPU (ProfilerStep* 37.9% self CUDA = GPU starving under CPU dispatch).
+        # A single .tolist() pulls the per-expert offsets/counts in one host
+        # sync instead of 2*num_experts per-expert .item() syncs.
         flat_k = topk_idx.shape[1]
         # Flatten (token, slot) -> expert id, track source token.
         experts_flat = topk_idx.reshape(-1)  # [N*K]
@@ -232,9 +240,11 @@ class WaterFillingMoE(nn.Module):
         # Segment boundaries per expert.
         counts = torch.bincount(experts_sorted, minlength=self.num_experts)
         offsets = torch.cumsum(counts, dim=0) - counts
+        offsets_l = offsets.tolist()
+        counts_l = counts.tolist()
         for e in range(self.num_experts):
-            start = int(offsets[e].item())
-            cnt = int(counts[e].item())
+            start = offsets_l[e]
+            cnt = counts_l[e]
             if cnt == 0:
                 continue
             sel_tokens = tokens_sorted[start : start + cnt]
