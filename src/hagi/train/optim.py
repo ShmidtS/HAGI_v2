@@ -56,12 +56,14 @@ class Muon(Optimizer):
         weight_decay: float = 0.0,
         ns_coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
         wd_cap: float = 2.0,
+        momentum_offload: bool = True,
     ):
         super().__init__(
             params,
             dict(
                 lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                 weight_decay=weight_decay, ns_coeffs=ns_coeffs, wd_cap=wd_cap,
+                momentum_offload=momentum_offload,
             ),
         )
 
@@ -75,31 +77,46 @@ class Muon(Optimizer):
             wd = group.get("weight_decay", 0.0)
             ns_coeffs = group["ns_coeffs"]
             wd_cap = group["wd_cap"]
+            offload = group["momentum_offload"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 g = p.grad
                 state = self.state[p]
-                if "momentum_buffer" not in state:
-                    # Momentum lives on CPU to free ~16 GiB VRAM (Muon momentum
-                    # bf16 for the ternary body). On Strix Halo APU the GPU->CPU
-                    # "transfer" is a cache-coherence flush, not a PCIe DMA, so
-                    # the synchronous .to() is cheap. NS5 stays on GPU: its
-                    # matmuls are 100-1000x slower on CPU. See V28 OOM notes.
-                    state["momentum_buffer"] = torch.zeros_like(g, device="cpu")
-                buf = state["momentum_buffer"]
-                # Normalize device on resume: an older checkpoint may have
-                # saved momentum on GPU (pre-offload). Move it to CPU once.
-                if buf.device.type != "cpu":
-                    buf = buf.to("cpu")
-                    state["momentum_buffer"] = buf
                 fan_ratio = min(max(1.0, p.size(0) / p.size(1)) ** 0.5, wd_cap)
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd * fan_ratio)
-                g_cpu = g.detach().to("cpu")
-                buf.mul_(momentum).add_(g_cpu)
-                update_cpu = g_cpu.add(buf, alpha=momentum) if nesterov else buf
-                update = newton_schulz5(update_cpu.to(p.device), ns_steps, ns_coeffs)
+                if offload:
+                    # Offload path: momentum on CPU (frees ~16 GiB VRAM for the
+                    # 9.37B run). On Strix Halo APU the GPU->CPU "transfer" is a
+                    # cache-coherence flush, not a PCIe DMA. NS5 stays on GPU:
+                    # its matmuls are 100-1000x slower on CPU. See V28 OOM notes.
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g, device="cpu")
+                    buf = state["momentum_buffer"]
+                    # Normalize device on resume: an older checkpoint may have
+                    # saved momentum on GPU (pre-offload). Move it to CPU once.
+                    if buf.device.type != "cpu":
+                        buf = buf.to("cpu")
+                        state["momentum_buffer"] = buf
+                    g_cpu = g.detach().to("cpu")
+                    buf.mul_(momentum).add_(g_cpu)
+                    update_cpu = g_cpu.add(buf, alpha=momentum) if nesterov else buf
+                    update = newton_schulz5(update_cpu.to(p.device), ns_steps, ns_coeffs)
+                else:
+                    # On-device path: keep momentum on the same device as p. No
+                    # per-param host sync — critical on launch-bound small models
+                    # where copy_/to 22% CPU stalls the dispatch pipeline and
+                    # starves the GPU (ProfilerStep* ~37% self CUDA = idle).
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    if buf.device != p.device or buf.dtype != g.dtype:
+                        buf = buf.to(device=p.device, dtype=g.dtype)
+                        state["momentum_buffer"] = buf
+                    buf.mul_(momentum).add_(g)
+                    update = g.add(buf, alpha=momentum) if nesterov else buf
+                    update = newton_schulz5(update, ns_steps, ns_coeffs)
                 p.add_(update.reshape(p.shape), alpha=-lr * fan_ratio)
 
 
@@ -224,6 +241,7 @@ def build_optimizer(model: nn.Module, cfg: Config) -> CombinedOptimizer:
         lr=tc.muon.lr, momentum=tc.muon.momentum, nesterov=tc.muon.nesterov,
         ns_steps=tc.muon.ns_steps, weight_decay=tc.muon.weight_decay,
         ns_coeffs=tc.muon.ns_coeffs, wd_cap=tc.muon.wd_cap,
+        momentum_offload=tc.muon.momentum_offload,
     )
     muon.param_groups[0]["_muon"] = True
     adamw = build_adamw(
