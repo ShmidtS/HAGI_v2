@@ -30,13 +30,39 @@ import torch.nn.functional as F
 from torch import nn
 
 from hagi.config import RefinementConfig
-from hagi.model.exit_chart import EXITChartHalt
 from hagi.model.norms import RMSNorm
 from hagi.model.ternary import BitLinear
 
 
 def _proj(in_f: int, out_f: int, use_ternary: bool) -> nn.Module:
     return BitLinear(in_f, out_f, bias=False) if use_ternary else nn.Linear(in_f, out_f, bias=False)
+
+
+def _kl_main_to_ref(ref_logits: torch.Tensor, main_logits: torch.Tensor, row_chunk: int = 1024) -> torch.Tensor:
+    """KL(main || ref) averaged over rows, chunked over the row axis.
+
+    The fused form materializes two fp32 ``[N, V]`` log-softmax tensors; at
+    V=262144 and long context (N up to ~seq_len) that is ~17 GB and OOMs the
+    refinement branch. Chunking over rows keeps only ``[row_chunk, V]`` fp32
+    live at once. The short-context path (N <= row_chunk) is the original
+    fused expression, so dry-run / short-sequence behavior is unchanged.
+    """
+    n = ref_logits.shape[0]
+    if n == 0:
+        return ref_logits.new_zeros(())
+    main_det = main_logits.detach()
+    if n <= row_chunk:
+        ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
+        main_logp = F.log_softmax(main_det.float(), dim=-1)
+        return (main_logp.exp() * (main_logp - ref_logp)).sum(dim=-1).mean()
+    kl_per_row = ref_logits.new_zeros(n, dtype=torch.float32, device=ref_logits.device)
+    for i in range(0, n, row_chunk):
+        r = ref_logits[i : i + row_chunk].float()
+        m = main_det[i : i + row_chunk].float()
+        ref_logp = F.log_softmax(r, dim=-1)
+        main_logp = F.log_softmax(m, dim=-1)
+        kl_per_row[i : i + r.shape[0]] = (main_logp.exp() * (main_logp - ref_logp)).sum(dim=-1)
+    return kl_per_row.mean()
 
 
 class PredictiveRefiner(nn.Module):
@@ -121,10 +147,11 @@ class PredictiveRefiner(nn.Module):
 
 
 class RefinementHead(nn.Module):
-    """Wraps :class:`PredictiveRefiner` + an off-path prediction head + EXIT halt.
+    """Wraps :class:`PredictiveRefiner` + an off-path prediction head.
 
-    Computes the auxiliary refinement loss and exposes the EXIT halt so the
-    training loop can freeze the distortion beta-anneal on convergence.
+    Computes the auxiliary refinement loss and reports the refinement novelty
+    so the training loop's EXIT halt can freeze the distortion beta-anneal on
+    convergence.
 
     Args:
         hidden_size: H.
@@ -141,7 +168,6 @@ class RefinementHead(nn.Module):
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
         self.to_logits = nn.Linear(hidden_size, vocab_size, bias=False)
         nn.init.normal_(self.to_logits.weight, std=1.0 / (hidden_size**0.5))
-        self.exit = EXITChartHalt(cfg.exit_threshold, cfg.exit_min_steps, cfg.exit_window)
 
     def forward(
         self,
@@ -174,8 +200,9 @@ class RefinementHead(nn.Module):
         ce_refined = F.cross_entropy(ref_logits, sel_targets)
         # KL(refined || main): encourage the refined posterior to track the main
         # one (stability) while the CE pulls it toward the truth (improvement).
-        ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
-        main_logp = F.log_softmax(main_logits.float().detach(), dim=-1)
-        kl = (main_logp.exp() * (main_logp - ref_logp)).sum(dim=-1).mean()
+        # Chunked over rows: the fused form holds two fp32 [N, V] log-softmax
+        # tensors (~17 GB at long context, V=262144) and OOMs the refinement
+        # branch. See _kl_main_to_ref.
+        kl = _kl_main_to_ref(ref_logits, main_logits)
         loss = ce_refined + 0.1 * kl
         return loss, h_refined

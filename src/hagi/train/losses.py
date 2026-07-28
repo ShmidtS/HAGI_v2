@@ -9,6 +9,8 @@ Objective = cross-entropy + auxiliary regularizers:
   * moe_lb     = Switch CV^2 expert load-balance (MoE)
   * route_entropy = routing-entropy CAPACITY MAXIMIZATION (water-filling dual;
                  subtracted: higher routing entropy = more capacity used)
+  * water_filling = per-expert capacity allocator entropy-gap regularizer (MoE;
+                 added: minimize log(E)-H(p_alloc) -> spread capacity)
   * refinement = off-path HEP predictive-refinement loss (opt-in)
   * attn_entropy = anti-collapse penalty (active from step 0)
 
@@ -54,6 +56,7 @@ class LossAggregator:
         self.w_infonce = t.w_infonce
         self.w_moe_lb = t.w_moe_lb
         self.w_route_entropy = t.w_route_entropy
+        self.w_water_filling = t.w_water_filling
         self.w_refine = t.w_refine
         self.w_attn_entropy = t.w_attn_entropy
         self.warmup_steps = max(1, t.warmup_steps)
@@ -104,6 +107,11 @@ class LossAggregator:
         # Water-filling dual: spread capacity across the parallel expert channels.
         if aux.route_entropy is not None and self.w_route_entropy > 0.0:
             total = total - self.w_route_entropy * aux.route_entropy
+
+        # Water-filling allocator entropy-gap regularizer: ADD (minimize the gap
+        # log(E)-H(p_alloc) -> keep capacity spread across expert channels).
+        if aux.water_filling is not None and self.w_water_filling > 0.0:
+            total = total + self.w_water_filling * aux.water_filling
 
         # Off-path HEP refinement (opt-in).
         if aux.refinement is not None and self.w_refine > 0.0:

@@ -25,10 +25,17 @@ import torch.nn.functional as F
 from torch import nn
 
 from hagi.config import Config
+from hagi.model.exit_chart import EXITChartHalt
 from hagi.train.losses import LossAggregator
 from hagi.train.optim import CombinedOptimizer, build_optimizer
 
 logger = logging.getLogger(__name__)
+
+
+def _build_exit_halt(cfg: Config) -> EXITChartHalt:
+    """EXIT-chart halt for the distortion beta-anneal (refinement convergence)."""
+    rc = cfg.model.refinement
+    return EXITChartHalt(rc.exit_threshold, rc.exit_min_steps, rc.exit_window)
 
 
 def configure_runtime() -> None:
@@ -163,7 +170,7 @@ def train_step(
     model.train()
     device = next(model.parameters()).device
     if loss_aggregator is None:
-        loss_aggregator = LossAggregator(cfg)
+        loss_aggregator = LossAggregator(cfg, exit_halt=_build_exit_halt(cfg))
 
     accum = cfg.train.grad_accum_steps
     if len(microbatches) != accum:
@@ -178,7 +185,7 @@ def train_step(
     top2_mass_sum = 0.0
     entropy_sum = 0.0
     posterior_rows = 0
-    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "route_entropy", "refinement", "attn_entropy")}
+    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "route_entropy", "water_filling", "refinement", "attn_entropy")}
     aux_counts = {name: 0 for name in aux_sums}
     all_finite = True
 
@@ -297,6 +304,7 @@ def train_step(
         "infonce": mean_aux("infonce"),
         "moe_lb": mean_aux("moe_lb"),
         "route_entropy": mean_aux("route_entropy"),
+        "water_filling": mean_aux("water_filling"),
         "refinement": mean_aux("refinement"),
         "attn_entropy": mean_aux("attn_entropy"),
         "avg_confidence": avg_confidence,
@@ -329,7 +337,7 @@ def train(
     optimizer = build_optimizer(model, cfg)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
-    loss_aggregator = LossAggregator(cfg)
+    loss_aggregator = LossAggregator(cfg, exit_halt=_build_exit_halt(cfg))
 
     step = start_step
     ckpt_dir = cfg.train.checkpoint_dir

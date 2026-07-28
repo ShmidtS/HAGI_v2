@@ -36,6 +36,7 @@ from torch import nn
 from hagi.config import MoEConfig
 from hagi.model.norms import RMSNorm
 from hagi.model.ternary import BitLinear
+from hagi.model.water_filling import WaterFillingAllocator
 
 
 def _proj(in_f: int, out_f: int, use_ternary: bool) -> nn.Module:
@@ -89,6 +90,15 @@ class WaterFillingMoE(nn.Module):
         self._snr_gate_weight = float(cfg.snr_gate_weight)
         self._last_load_balance: torch.Tensor | None = None
         self._last_routing_entropy: torch.Tensor | None = None
+        self._last_water_filling_loss: torch.Tensor | None = None
+        # Water-filling capacity allocator: per-expert capacity gate (log-bias on
+        # the routing logits) steered by a per-expert SNR EMA on the shared-expert
+        # residual. allocation_logits is an FP Parameter -> AdamW (not Muon).
+        self.allocator = WaterFillingAllocator(
+            total_width=self.num_experts * intermediate_size,
+            num_experts=self.num_experts,
+            min_width=min(64, intermediate_size),
+        )
 
     @property
     def last_load_balance(self) -> torch.Tensor | None:
@@ -97,6 +107,25 @@ class WaterFillingMoE(nn.Module):
     @property
     def last_routing_entropy(self) -> torch.Tensor | None:
         return self._last_routing_entropy
+
+    @property
+    def last_water_filling_loss(self) -> torch.Tensor | None:
+        return self._last_water_filling_loss
+
+    @torch.no_grad()
+    def _update_allocator(self, residual: torch.Tensor, probs: torch.Tensor) -> None:
+        """Steer the allocator's SNR EMA from the routed shared-expert residual.
+
+        Per-expert residual variance (soft-weighted by the pre-allocation routing
+        probs) feeds the allocator's ``1/variance`` SNR EMA. The EMA is detached;
+        only :meth:`WaterFillingAllocator.allocation_probs` carries gradient
+        through ``allocation_logits``.
+        """
+        token_var = residual.detach().float().pow(2).mean(dim=-1)  # [N]
+        weights = probs.detach()  # [N, E]
+        w_sum = weights.sum(dim=0).clamp_min(1e-6)  # [E]
+        per_expert_var = (weights * token_var.unsqueeze(-1)).sum(dim=0) / w_sum  # [E]
+        self.allocator.update_snr_ema(per_expert_var.to(self.allocator.snr_ema))
 
     def _snr_gate(self, residual: torch.Tensor) -> torch.Tensor:
         """Water-filling SNR proxy: ``s = 1 / (||residual||_2 + eps)`` per token.
@@ -133,6 +162,16 @@ class WaterFillingMoE(nn.Module):
         logits = self.router(router_in)
         probs = F.softmax(logits, dim=-1)  # [N, E]
 
+        # Water-filling capacity allocation: the allocator's per-expert capacity
+        # gate is a log-bias on the routing logits. Uniform at init (constant
+        # shift -> softmax-invariant), so the cold start is unchanged; as the SNR
+        # EMA diverges the bias steers routing toward high-capacity (high-SNR)
+        # experts. Update the SNR EMA from the pre-bias routing weights.
+        if self.training:
+            self._update_allocator(residual, probs)
+        alloc_probs = self.allocator.allocation_probs()  # [E]
+        probs = F.softmax(logits + torch.log(alloc_probs + 1e-8).unsqueeze(0), dim=-1)
+
         topk_vals, topk_idx = probs.topk(self.top_k, dim=-1)
         topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
@@ -140,7 +179,8 @@ class WaterFillingMoE(nn.Module):
         routed_out = self._batched_dispatch(flat, residual, topk_idx, topk_vals)
         out = shared_out + routed_out
 
-        # Auxiliaries (training only): Switch CV^2 load balance + routing entropy.
+        # Auxiliaries (training only): Switch CV^2 load balance + routing entropy
+        # + water-filling allocator entropy-gap regularizer.
         if self.training:
             n = flat.shape[0]
             with torch.no_grad():
@@ -150,6 +190,7 @@ class WaterFillingMoE(nn.Module):
             # Routing entropy H(p): maximized -> capacity spread across channels.
             routed_prob_entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
             self._last_routing_entropy = routed_prob_entropy
+            self._last_water_filling_loss = self.allocator.regularization_loss()
 
         out = out.view(b, t, h)
         return x + out

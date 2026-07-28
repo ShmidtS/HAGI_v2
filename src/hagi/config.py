@@ -306,6 +306,7 @@ class TrainConfig:
     w_infonce: float = 0.1
     w_moe_lb: float = 0.01
     w_route_entropy: float = 0.01  # routing-entropy capacity maximization (MoE)
+    w_water_filling: float = 0.01  # water-filling allocator entropy-gap regularizer (MoE)
     w_refine: float = 0.0  # off-path HEP refinement loss (opt-in)
     w_attn_entropy: float = 0.01
     attn_entropy_floor: float = 0.5
