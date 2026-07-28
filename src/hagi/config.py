@@ -261,6 +261,11 @@ class MuonConfig:
     weight_decay: float = 0.5
     ns_coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
     wd_cap: float = 2.0  # scale-aware WD bound: min(max(sqrt(fan_out/fan_in)), cap)
+    # Keep the momentum_buffer on CPU (frees ~16 GiB VRAM on the 9.37B run).
+    # On launch-bound small models (148M, VRAM free) the 2 per-param host-syncs
+    # this costs (g.detach().to("cpu") + update.to(p.device)) stall the dispatch
+    # pipeline and starve the GPU; set False to keep momentum on-device.
+    momentum_offload: bool = True
 
 
 @dataclass

@@ -69,6 +69,8 @@ train:
   warmup_steps: 20
   learning_rate: 0.0003
   muon_lr: 0.02
+  muon:
+    momentum_offload: false       # 148M fits in VRAM with room to spare; offload only adds 2 per-param host-syncs that stall the launch-bound dispatch pipeline
   grad_accum_steps: 2
   precision: bf16
 
