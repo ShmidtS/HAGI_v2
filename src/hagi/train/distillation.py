@@ -27,7 +27,72 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+# ROCm Windows torch has no torch._C._distributed_c10d; transformers 5.x
+# (Gemma-4 teacher) eager-imports FSDP/DTensor and crashes at import time.
+# Install the no-op stubs before any transformers symbol is referenced.
+# Idempotent + no-op where real distributed torch is available.
+from ._rocm_fsdp_stub import install as _install_rocm_fsdp_stub  # noqa: E402
+
+_install_rocm_fsdp_stub()
+
 logger = logging.getLogger(__name__)
+
+
+def _resolve_hf_cache_path(name_or_path: str) -> str:
+    """Resolve a teacher name to a directly-loadable path.
+
+    HF Hub cache copied via SSH/`hf pull` uses a flat ``snapshots/<rev>/`` layout
+    WITHOUT the ``blobs/`` indirection that ``huggingface_hub.hf_hub_download``
+    expects. Passing the bare repo-id to ``from_pretrained(..., local_files_only=
+    True)`` then fails with ``LocalEntryNotFoundError`` (it tries to resolve
+    each file via ``blobs/refs`` and cannot).
+
+    When ``name_or_path`` is a repo-id whose cache directory exists, resolve to
+    the concrete snapshot folder (``refs/main`` → revision → ``snapshots/<rev>``)
+    so ``from_pretrained`` reads the files directly off disk.
+
+    A direct path that already exists on disk is returned unchanged.
+    """
+    import os
+    from pathlib import Path
+
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    cache_root = os.environ.get("HF_HOME", "") or os.path.expanduser("~/.cache/huggingface/hub")
+    repo_dir = Path(cache_root) / ("models--" + name_or_path.replace("/", "--"))
+    if not repo_dir.is_dir():
+        return name_or_path
+    ref_file = repo_dir / "refs" / "main"
+    rev: str | None = None
+    if ref_file.is_file():
+        try:
+            rev = ref_file.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            rev = None
+    if rev and (repo_dir / "snapshots" / rev).is_dir():
+        return str(repo_dir / "snapshots" / rev)
+    snaps = sorted(p for p in (repo_dir / "snapshots").glob("*/") if p.is_dir())
+    if snaps:
+        return str(snaps[0])
+    return name_or_path
+
+
+def _text_only_base(model: nn.Module) -> nn.Module:
+    """Descend a multimodal teacher to its text-only language_model.
+
+    Gemma4ForConditionalGeneration nests the text tower under
+    ``.model.language_model``; plain causal LMs expose embeddings at the top
+    level. We probe in order of specificity so a text-only forward never
+    reaches the vision/audio towers.
+    """
+    base = model
+    if hasattr(base, "model") and hasattr(base.model, "language_model"):
+        return base.model.language_model
+    if hasattr(base, "language_model"):
+        return base.language_model
+    if hasattr(base, "model"):
+        return base.model
+    return base
 
 
 @dataclass(frozen=True)
@@ -63,16 +128,20 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
         return False
 
     try:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+        teacher_path = _resolve_hf_cache_path(teacher_name)
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_path, dtype=torch.bfloat16, local_files_only=True)
     except (OSError, ValueError) as causal_error:
         try:
-            teacher = AutoModel.from_pretrained(teacher_name, dtype=torch.bfloat16, local_files_only=True)
+            teacher_path = _resolve_hf_cache_path(teacher_name)
+            teacher = AutoModel.from_pretrained(teacher_path, dtype=torch.bfloat16, local_files_only=True)
         except (OSError, ValueError) as base_error:
             logger.warning(f"Could not load {teacher_name}: causal={causal_error}; base={base_error}")
             return False
 
     teacher_emb = None
+    text_base = _text_only_base(teacher)
     for path in [
+        lambda m: text_base.embed_tokens.weight,
         lambda m: m.model.embed_tokens.weight,
         lambda m: m.embed_tokens.weight,
         lambda m: m.get_input_embeddings().weight,
@@ -88,22 +157,60 @@ def transfer_embeddings(model: nn.Module, teacher_name: str = "HuggingFaceTB/Smo
         gc.collect()
         return False
 
-    embed_weight = model.embed.weight
+    embed = model.embed
     V_t, H_t = teacher_emb.shape
-    V_s, H_s = embed_weight.shape
-    copy_size = min(V_t, V_s)
+    has_factorized = hasattr(embed, "token_compress") and hasattr(embed, "token_expand")
 
-    if H_t == H_s:
-        embed_weight.data[:copy_size] = teacher_emb[:copy_size].to(embed_weight.dtype)
+    if has_factorized:
+        # ConvEmbedding factorizes the effective V x H table as
+        # ``token_expand.weight @ token_compress.weight.t()`` (materialized shape
+        # (H, V), NOT (V, H)). The ``.weight`` property returns a fresh non-leaf
+        # tensor whose storage is NOT shared with the leaf parameters, so
+        # writing to ``.data`` of it is a silent no-op on the real model.
+        # Transfer by low-rank-factorizing the (projected) teacher table into
+        # the two leaf parameters directly via truncated SVD.
+        r = embed.factor_rank
+        H_s = embed.hidden_size
+        V_s = embed.vocab_size
+        copy_size = min(V_t, V_s)
+        target = teacher_emb[:copy_size].to(torch.float32)
+        if H_t != H_s:
+            proj = torch.randn(H_t, H_s, dtype=torch.float32) / (H_t**0.5)
+            target = target @ proj  # (copy_size, H_s)
+        # target (N, H_s) ~= U @ diag(S) @ V.t(), rank-q truncated SVD.
+        q = min(r, min(target.shape))
+        U, S, V = torch.svd_lowrank(target, q=q, niter=2)
+        sqrt_S = S.sqrt().unsqueeze(0)  # (1, q)
+        c_dst = embed.token_compress.weight  # (V_s, r) leaf
+        e_dst = embed.token_expand.weight  # (H_s, r) leaf
+        c_block = torch.zeros(copy_size, r, dtype=c_dst.dtype, device=c_dst.device)
+        e_block = torch.zeros(H_s, r, dtype=e_dst.dtype, device=e_dst.device)
+        c_block[:, :q] = (U * sqrt_S).to(device=c_dst.device, dtype=c_dst.dtype)
+        e_block[:, :q] = (V * sqrt_S).to(device=e_dst.device, dtype=e_dst.dtype)
+        c_dst.data[:copy_size] = c_block
+        e_dst.data = e_block
+        V_s_log, copy_log, proj_log = V_s, copy_size, (H_t != H_s)
     else:
-        proj = torch.randn(H_t, H_s, dtype=torch.float32) / (H_t**0.5)
-        projected = teacher_emb[:copy_size] @ proj
-        embed_weight.data[:copy_size] = projected.to(embed_weight.dtype)
-        logger.info(f"Embedding projected: {H_t}->{H_s} via random projection")
+        # Plain nn.Embedding(V, H): weight is (V, H), direct copy.
+        embed_weight = embed.weight
+        V_s_log, H_s = embed_weight.shape
+        copy_log = min(V_t, V_s_log)
+        if H_t == H_s:
+            embed_weight.data[:copy_log] = teacher_emb[:copy_log].to(embed_weight.dtype)
+        else:
+            proj = torch.randn(H_t, H_s, dtype=torch.float32) / (H_t**0.5)
+            projected = teacher_emb[:copy_log] @ proj
+            embed_weight.data[:copy_log] = projected.to(embed_weight.dtype)
+        proj_log = (H_t != H_s)
 
-    extra = V_s - V_t
-    if extra > 0:
-        logger.info(f"Embedding transferred {copy_size}/{V_s} tokens ({extra} extra kept init)")
+    extra = V_s_log - V_t
+    if has_factorized:
+        tag = f"factorized rank-{embed.factor_rank} SVD" + (" + random projection" if proj_log else "")
+        logger.info(f"Embedding transferred ({tag}): {copy_log}/{V_s_log} tokens, {H_t}->{H_s}")
+    elif extra > 0:
+        logger.info(f"Embedding transferred {copy_log}/{V_s_log} tokens ({extra} extra kept init)")
+    elif proj_log:
+        logger.info(f"Embedding projected: {H_t}->{H_s} via random projection")
     else:
         logger.info(f"Embedding weights transferred from {teacher_name}")
     del teacher
@@ -144,20 +251,18 @@ class DistillationTeacher:
             ) from error
 
         try:
+            teacher_path = _resolve_hf_cache_path(self.teacher_name)
             self._model = AutoModelForCausalLM.from_pretrained(
-                self.teacher_name, dtype=torch.bfloat16, local_files_only=True
+                teacher_path, dtype=torch.bfloat16, local_files_only=True
             )
             self._model.eval()
             for param in self._model.parameters():
                 param.requires_grad_(False)
 
-            # Gemma 4 multimodal: access language_model submodel for text-only
-            if hasattr(self._model, "language_model"):
-                self._base_model = self._model.language_model
-            elif hasattr(self._model, "model"):
-                self._base_model = self._model.model
-            else:
-                self._base_model = self._model
+            # Gemma 4 multimodal: descend to the text-only language_model so the
+            # teacher forward stays text-only (vision/audio towers otherwise
+            # expect pixel/audio inputs and crash a text-only forward).
+            self._base_model = _text_only_base(self._model)
 
             # lm_head: try multiple paths
             self._lm_head_weight = None

@@ -93,7 +93,10 @@ train:
   w_water_filling: 0.01
   w_refine: 0.1                    # off-path HEP refinement
   w_attn_entropy: 0.0             # OFF for 8B from-scratch (avoids O(T^2) scores transient)
-  attn_entropy_floor: 0.5
+  attn_entropy_floor: 0.0          # 0 disables the entropy computation entirely; must be 0
+                                  # when w_attn_entropy=0, else attention.py:187 still
+                                  # materializes scores (B,nh,T,T)=4GB at T=8192 and OOMs
+                                  # the backward recomputation.
 
   checkpoint_dir: checkpoints
   checkpoint_interval: 2000
