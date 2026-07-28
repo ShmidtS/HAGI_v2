@@ -81,14 +81,25 @@ class Muon(Optimizer):
                 g = p.grad
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
+                    # Momentum lives on CPU to free ~16 GiB VRAM (Muon momentum
+                    # bf16 for the ternary body). On Strix Halo APU the GPU->CPU
+                    # "transfer" is a cache-coherence flush, not a PCIe DMA, so
+                    # the synchronous .to() is cheap. NS5 stays on GPU: its
+                    # matmuls are 100-1000x slower on CPU. See V28 OOM notes.
+                    state["momentum_buffer"] = torch.zeros_like(g, device="cpu")
                 buf = state["momentum_buffer"]
+                # Normalize device on resume: an older checkpoint may have
+                # saved momentum on GPU (pre-offload). Move it to CPU once.
+                if buf.device.type != "cpu":
+                    buf = buf.to("cpu")
+                    state["momentum_buffer"] = buf
                 fan_ratio = min(max(1.0, p.size(0) / p.size(1)) ** 0.5, wd_cap)
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd * fan_ratio)
-                buf.mul_(momentum).add_(g)
-                update = g.add(buf, alpha=momentum) if nesterov else buf
-                update = newton_schulz5(update, ns_steps, ns_coeffs)
+                g_cpu = g.detach().to("cpu")
+                buf.mul_(momentum).add_(g_cpu)
+                update_cpu = g_cpu.add(buf, alpha=momentum) if nesterov else buf
+                update = newton_schulz5(update_cpu.to(p.device), ns_steps, ns_coeffs)
                 p.add_(update.reshape(p.shape), alpha=-lr * fan_ratio)
 
 

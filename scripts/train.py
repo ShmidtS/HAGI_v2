@@ -9,13 +9,45 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
-import logging
+import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
+# Bootstrap: make `hagi` importable when run as `python scripts/train.py`
+# (no PYTHONPATH / installed package required). Must precede any hagi import.
+_REPO_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+# gfx1151 (Radeon 8060S): enable experimental AOTriton kernels before torch
+# loads. setdefault so the caller can still override per-run.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+# Offline HF cache: teachers live in the local cache, no network egress needed.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# NOTE: expandable_segments is deliberately NOT set here. On ROCm Windows
+# gfx1151 (Radeon 8060S APU) it causes VA-space exhaustion — .to(device) OOMs
+# on a 64 MiB request with 94 GiB physically free (the allocator maps huge
+# VA segments that hit the per-process VA limit, not the memory limit).
+# Fragmentation from the 16x grad-accum backward churn is handled instead by
+# an empty_cache() immediately before optimizer.step (see loop.train_step),
+# which releases the transient recomputation tensors without reserving VA.
+# Must precede `import torch` (allocator init). setdefault respects a caller
+# override.
+
+import argparse
+import logging
+from datetime import datetime
+
 import torch
+
+# ROCm Windows torch ships without torch._C._distributed_c10d, so transformers
+# 5.x (Gemma-4) eager-imports of FSDP/DTensor crash at import time. Install the
+# no-op stubs before any transformers symbol is referenced. No-op on builds
+# where real distributed torch is available.
+from hagi.train._rocm_fsdp_stub import install as _install_rocm_fsdp_stub  # noqa: E402
+
+_install_rocm_fsdp_stub()
 
 
 def setup_file_logging(log_dir: str = "logs") -> str:

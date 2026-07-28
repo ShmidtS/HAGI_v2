@@ -41,7 +41,14 @@ def _build_exit_halt(cfg: Config) -> EXITChartHalt:
 def configure_runtime() -> None:
     import os
 
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.6")
+    # expandable_segments removed: on ROCm Windows gfx1151 it exhausts
+    # per-process VA-space (OOMs on small allocs with 90+ GiB physically
+    # free). Fragmentation from the 16x grad-accum backward churn is handled
+    # directly by an empty_cache() immediately before optimizer.step (see
+    # train_step), which releases transient recomputation tensors without
+    # reserving VA. garbage_collection_threshold alone (no expandable) lets
+    # the caching allocator return idle segments back to the driver.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -273,6 +280,14 @@ def train_step(
         raise FloatingPointError(f"training update {step} has non-finite loss or gradients; gradients cleared")
 
     gn, grad_rms = gradient_stats(model, cfg.train)
+    # Release the transient recomputation/activation tensors the 16x grad-accum
+    # backward churns before the optimizer step. Without this the caching
+    # allocator fragments and newton_schulz5 OOMs on a 32 MiB request with
+    # 50+ GiB physically free (bezfniya3 failure). expandable_segments would
+    # fix this on CUDA but exhausts per-process VA on ROCm Windows gfx1151
+    # (b6a1iq3la failure), so empty_cache is the platform-safe fix here.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     optimizer.step()
 
     if masked_rows == 0:
