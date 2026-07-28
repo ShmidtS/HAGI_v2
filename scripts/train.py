@@ -102,6 +102,12 @@ def main() -> int:
         default=None,
         help="Resume from checkpoint. Bare '--resume' picks the latest step-*.pt.",
     )
+    parser.add_argument(
+        "--profile",
+        type=int,
+        default=0,
+        help="Profile the first N training steps: dump a chrome trace + an operator table ranked by self CUDA time. 0 = off.",
+    )
     args = parser.parse_args()
 
     log_path = setup_file_logging(args.log_dir)
@@ -193,6 +199,42 @@ def main() -> int:
             f"Distillation: steps 0->{distill_end} "
             f"(alpha {cfg.train.distill.alpha_start}->{cfg.train.distill.alpha_end}, T={cfg.train.distill.temperature})"
         )
+
+    if args.profile > 0:
+        from torch.profiler import ProfilerActivity, profile, schedule
+
+        n_prof = int(args.profile)
+        # Skip step 0 (AOTriton autotune warmup inflates it). Profile the next
+        # n_prof optimizer steps; each step = grad_accum_steps micro-batches, so
+        # schedule needs wait=1 + warmup=grad_accum + active=grad_accum*n_prof.
+        ga = cfg.train.grad_accum_steps
+        sched = schedule(wait=1, warmup=ga, active=max(ga * n_prof, 1), repeat=1)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        trace_path = f"logs/profile_{ts}.json"
+        logger.info(f"Profiling first {n_prof} steps (skip step 0) -> {trace_path}")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=sched,
+            on_trace_ready=lambda p: (
+                p.export_chrome_trace(trace_path),
+                logger.info(f"trace saved: {trace_path}"),
+            ),
+        ) as prof:
+            step_i = 0
+            for metrics in train(
+                model, dataloader, cfg, teacher=teacher,
+                start_step=start_step, optimizer_state=optimizer_state,
+            ):
+                logger.info(format_training_metrics(metrics))
+                prof.step()
+                step_i += 1
+                if step_i >= n_prof + 1:
+                    break
+        # Operator table ranked by self CUDA time — the actual bottleneck.
+        logger.info("=== top-25 operators by self CUDA time (ms) ===")
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
+        logger.info("Training complete (profiled).")
+        return 0
 
     for metrics in train(
         model, dataloader, cfg, teacher=teacher,

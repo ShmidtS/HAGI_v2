@@ -255,15 +255,26 @@ def train_step(
                 with torch.no_grad():
                     logc = cfg.train.logging
                     want_post = (step % logc.posterior_interval == 0)
-                    chunk_rows = logc.posterior_chunk_rows
-                    for ci in range(0, logits.shape[0], chunk_rows):
-                        chunk = logits[ci : ci + chunk_rows].float()
-                        log_p = chunk.log_softmax(dim=-1)
-                        p = log_p.exp()
-                        confidence_sum += p.max(dim=-1).values.sum().item()
-                        if want_post:
+                    if want_post:
+                        # Full posterior: fp32 softmax per chunk for accurate
+                        # top2-mass + entropy (logged every posterior_interval).
+                        chunk_rows = logc.posterior_chunk_rows
+                        for ci in range(0, logits.shape[0], chunk_rows):
+                            chunk = logits[ci : ci + chunk_rows].float()
+                            log_p = chunk.log_softmax(dim=-1)
+                            p = log_p.exp()
+                            confidence_sum += p.max(dim=-1).values.sum().item()
                             top2_mass_sum += p.topk(min(2, chunk.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
                             entropy_sum += -(p * log_p).sum(dim=-1).sum().item()
+                    else:
+                        # Cheap path (most steps): max softmax prob as
+                        # exp(max_logit - logsumexp) — two reductions over bf16
+                        # logits, no [N,V] fp32 materialization, no per-chunk
+                        # .item() sync. Drops the detach/float/exp view-op tail
+                        # that left CUDA 37.9% idle under CPU dispatch.
+                        m = logits.max(dim=-1).values
+                        lse = torch.logsumexp(logits, dim=-1)
+                        confidence_sum += (m - lse).exp().sum().item()
                 conf_rows += row_count
                 if want_post:
                     posterior_rows += row_count
