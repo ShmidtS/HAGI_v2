@@ -72,6 +72,32 @@ def ternarize(
     return effective_weight, scale
 
 
+class _TernarizeSTE(torch.autograd.Function):
+    """Identity straight-through estimator for BitNet b1.58 ternarization.
+
+    Forward: ternarize the FP master into the effective {-scale,0,+scale}
+    weight. Backward: pass grad through unchanged. Saturated-region gradients
+    (|w/scale| >= 1) are NOT zeroed -- capacity-matched gradient transport for
+    Muon's Newton-Schulz.
+
+    Replaces the graph-building ``w + (eff - w).detach()`` form, which emits a
+    sub/add/detach per BitLinear forward (~17k detach/step on the small model,
+    aten::detach 2.76% + detach 1.41% self CUDA in the profiler) plus the
+    MulBackward0 nodes that dominate CPU-total. Function builds no autograd
+    graph for the ternarize math -- one launch in, one grad out.
+    """
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        scale = weight.abs().mean(dim=1, keepdim=True).clamp_min(eps)
+        qweight = (weight / scale).clamp(-1.0, 1.0).round()
+        return qweight * scale
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
 class BitLinear(nn.Module):
     """Drop-in 2D linear whose weight is ternarized in the forward pass.
 
@@ -117,12 +143,12 @@ class BitLinear(nn.Module):
             # ternary math ran in the master dtype; cast to x.dtype for the matmul.
             return F.linear(x, eff_weight.to(x.dtype), self.bias)
 
-        eff_weight, _scale = ternarize(self.weight, self.eps)
-        # Pure identity STE: forward uses the ternary effective weight,
-        # backward flows straight to the FP master. Saturated-region
-        # gradients (|w/scale| >= 1) are NOT zeroed -- capacity-matched
-        # gradient transport for Muon's Newton-Schulz.
-        w_ste = self.weight + (eff_weight - self.weight).detach()
+        # Pure identity STE via autograd.Function: forward ternarizes, backward
+        # passes grad through unchanged (saturated-region gradients NOT zeroed
+        # -- capacity-matched transport for Muon's Newton-Schulz). Replaces the
+        # graph-building w + (eff - w).detach() form that emitted sub/add/detach
+        # per forward (~17k detach/step + MulBackward0 nodes in the profiler).
+        w_ste = _TernarizeSTE.apply(self.weight, self.eps)
         return F.linear(x, w_ste, self.bias)
 
     def extra_repr(self) -> str:
