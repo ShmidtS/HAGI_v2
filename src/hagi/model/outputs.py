@@ -3,9 +3,10 @@
 Every auxiliary is computed off the main LM path. The genuine rate/distortion
 terms come from the information bottleneck; vicreg/infonce ground the
 multimodal joint embedding; moe_lb balances expert load; route_entropy spreads
-capacity across expert channels (water-filling dual); refinement is the off-path
-HEP predictive-refinement loss; attn_entropy prevents attention collapse. A
-term is ``None`` when its subsystem is off.
+capacity across expert channels (water-filling dual); water_filling is the
+per-expert capacity allocator entropy-gap regularizer; refinement is the
+off-path HEP predictive-refinement loss; attn_entropy prevents attention
+collapse. A term is ``None`` when its subsystem is off.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class AuxLosses:
     # Mixture of experts (MoE only).
     moe_lb: torch.Tensor | None = None
     route_entropy: torch.Tensor | None = None
+    water_filling: torch.Tensor | None = None
     # Off-path HEP predictive refinement (opt-in).
     refinement: torch.Tensor | None = None
     # EXIT-chart novelty of the refinement (diagnostic, not a loss).

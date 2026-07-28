@@ -173,6 +173,7 @@ class HAGI(nn.Module):
         route_entropy_acc = None
         checkpointing = self.training and len(self.blocks) > 1
         moe_lb_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
+        water_filling_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         for blk in self.blocks:
             if checkpointing:
                 def run(b_in, *, b=blk, am=attention_mode, pl=prefix_len, sb=soft_beta, pos=positions):
@@ -190,9 +191,13 @@ class HAGI(nn.Module):
                 re = blk.moe.last_routing_entropy if blk.moe is not None else None
                 if re is not None:
                     route_entropy_acc = re if route_entropy_acc is None else route_entropy_acc + re
+                wf = blk.moe.last_water_filling_loss if blk.moe is not None else None
+                if wf is not None and water_filling_acc is not None:
+                    water_filling_acc = water_filling_acc + wf
         self._last_attn_entropy_penalty = entropy_pen
         self._last_moe_lb = moe_lb_acc
         self._last_route_entropy = route_entropy_acc
+        self._last_water_filling = water_filling_acc
         return h
 
     def forward(
@@ -262,6 +267,7 @@ class HAGI(nn.Module):
         aux.distortion = bn_info["distortion"]
         aux.moe_lb = getattr(self, "_last_moe_lb", None)
         aux.route_entropy = getattr(self, "_last_route_entropy", None)
+        aux.water_filling = getattr(self, "_last_water_filling", None)
         aux.attn_entropy = getattr(self, "_last_attn_entropy_penalty", None)
 
         # STAGE 4b — off-path HEP predictive refinement (opt-in). Runs on a CLONE
