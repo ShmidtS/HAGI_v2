@@ -131,6 +131,7 @@ class HAGI(nn.Module):
                 H, m.vocab_size, m.refinement, m.norm_eps, use_ternary=self._use_ternary
             )
 
+        self._train_step_counter: int = 0
         self._init_weights()
         for mod in self.modules():
             if hasattr(mod, "set_attn_entropy_floor"):
@@ -171,20 +172,20 @@ class HAGI(nn.Module):
             blk.attn.detach_cache()
         self.embed.reset_conv_cache()
 
-    def _stack_forward(self, h, attention_mode, prefix_len, soft_beta, positions):
+    def _stack_forward(self, h, attention_mode, prefix_len, soft_beta, positions, compute_attn_entropy=True):
         """Run the unified block stack with grad-checkpointing; sum attn-entropy + route-entropy."""
         entropy_pen = None
         route_entropy_acc = None
-        checkpointing = self.training and len(self.blocks) > 1
+        checkpointing = self.training and len(self.blocks) > 1 and self.cfg.train.grad_checkpointing
         moe_lb_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         water_filling_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         for blk in self.blocks:
             if checkpointing:
-                def run(b_in, *, b=blk, am=attention_mode, pl=prefix_len, sb=soft_beta, pos=positions):
-                    return b(b_in, attention_mode=am, prefix_len=pl, soft_beta=sb, positions=pos)
+                def run(b_in, *, b=blk, am=attention_mode, pl=prefix_len, sb=soft_beta, pos=positions, cae=compute_attn_entropy):
+                    return b(b_in, attention_mode=am, prefix_len=pl, soft_beta=sb, positions=pos, compute_attn_entropy=cae)
                 h = ckpt.checkpoint(run, h, use_reentrant=False)
             else:
-                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta, positions=positions)
+                h = blk(h, attention_mode=attention_mode, prefix_len=prefix_len, soft_beta=soft_beta, positions=positions, compute_attn_entropy=compute_attn_entropy)
             pen = getattr(blk, "_last_attn_entropy_penalty", None)
             if pen is not None:
                 entropy_pen = pen if entropy_pen is None else entropy_pen + pen
@@ -216,15 +217,23 @@ class HAGI(nn.Module):
                 blk.moe.commit_ema_update()
 
     def ensure_fp32_params(self) -> None:
-        """Force KL-critical IB parameters to fp32 after bf16 model cast.
+        """Force KL-critical IB parameters and ALL norm weights to fp32 after bf16 model cast.
 
         Must be called AFTER ``cast_to_bf16(model)`` in the training loop.
         The IB rate and distortion decoders are numerically sensitive at bf16
         precision — the logvar clamp range and KL rate computation degrade to
         noise in bf16, causing unbounded rate growth (observed: 0.93 → 4.23
         over 48000 steps) and CE gradient conflict.
+
+        Norm weights initialized at 1.0 receive sub-bf16-epsilon gradients
+        (~1e-4..1e-5) that round to zero in bf16 (minimum representable step
+        from 1.0 is ~0.0078). Keeping them in fp32 allows AdamW to accumulate
+        small updates across steps.
         """
         self.bottleneck.ensure_fp32()
+        for mod in self.modules():
+            if isinstance(mod, RMSNorm) and hasattr(mod, 'weight'):
+                mod.weight.data = mod.weight.data.to(torch.float32)
 
     def forward(
         self,
@@ -272,7 +281,8 @@ class HAGI(nn.Module):
             mm_info = {"prefix_len": 0}
 
         # STAGE 2 — UNIFIED ternary stack (the genuine channel).
-        h_ctx = self._stack_forward(h, attention_mode, prefix_len, soft_beta, positions)
+        compute_attn_entropy = not self.training or (self._train_step_counter % max(1, self.cfg.train.logging.attn_entropy_interval) == 0)
+        h_ctx = self._stack_forward(h, attention_mode, prefix_len, soft_beta, positions, compute_attn_entropy=compute_attn_entropy)
 
         # STAGE 3 — auxiliary information bottleneck (off-path, no gradient into h_ctx).
         bn_info = self.bottleneck(h_ctx.detach())
@@ -291,6 +301,7 @@ class HAGI(nn.Module):
         aux = AuxLosses()
         aux.rate = bn_info["rate"]
         aux.distortion = bn_info["distortion"]
+        aux.ib_iters = bn_info.get("ib_iters", 1)
         aux.moe_lb = getattr(self, "_last_moe_lb", None)
         aux.route_entropy = getattr(self, "_last_route_entropy", None)
         aux.water_filling = getattr(self, "_last_water_filling", None)

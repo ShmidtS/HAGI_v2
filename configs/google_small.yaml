@@ -48,7 +48,7 @@ model:
       num_experts: 4
       top_k: 2
       n_shared: 1
-      moe_every: 5
+      moe_every: 2
 
   refinement:
     enabled: false
@@ -59,6 +59,7 @@ train:
   seq_len: 2048
   warmup_steps: 4000
   learning_rate: 0.0003
+  grad_checkpointing: false
   muon:
     lr: 0.01
     momentum_offload: false

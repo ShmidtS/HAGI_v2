@@ -118,6 +118,13 @@ class BottleneckConfig:
     ``kl_free_bits`` is a PER-DIMENSION floor on the KL rate. At 0.01 this
     allows ~2.56 nats/token for C=256 (vs the old 0.5 per-dim which forced
     128 nats/token and clamped every dimension to the floor).
+
+    Iterative latent refinement (opt-in): when ``iterative_ib_enabled`` and
+    ``ib_max_iters > 1``, the bottleneck runs multiple passes, feeding each
+    reconstruction back as the next input. EXIT-halt gates via SNR of the
+    latent state (``ib_snr_threshold``) or distortion stall between iterations
+    (``ib_distortion_epsilon``). At ``ib_max_iters=1`` behaviour is identical
+    to the standard single-pass bottleneck.
     """
 
     dim: int = 192  # C: must satisfy C < H (real compression)
@@ -125,6 +132,11 @@ class BottleneckConfig:
     kl_free_bits: float = 0.01  # per-dimension KL floor (was 0.5 — always clamped)
     logvar_clamp: tuple[float, float] = (-5.0, 5.0)
     distortion_eps: float = 1e-6
+    # Iterative latent refinement with EXIT-halt.
+    iterative_ib_enabled: bool = False
+    ib_max_iters: int = 1  # 1 = standard single-pass (backward compat)
+    ib_snr_threshold: float = 0.0  # 0.0 = disabled; latent SNR early-exit gate
+    ib_distortion_epsilon: float = 0.0  # 0.0 = disabled; distortion-stall early-exit gate
 
 
 @dataclass
@@ -284,6 +296,7 @@ class LoggingConfig:
     posterior_chunk_rows: int = 256
     log_interval: int = 1
     cache_release_interval: int = 20
+    attn_entropy_interval: int = 10  # compute attn entropy penalty every N steps (1 = every step)
 
 
 @dataclass
@@ -297,6 +310,7 @@ class TrainConfig:
     precision: str = "bf16"
     grad_accum_steps: int = 2
     max_grad_norm: float = 0.5
+    grad_checkpointing: bool = True  # disable for small models (<2GB VRAM) — pure overhead
     batch_size: int = 8
     seq_len: int = 512
     muon: MuonConfig = field(default_factory=MuonConfig)

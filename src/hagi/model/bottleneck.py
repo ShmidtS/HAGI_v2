@@ -12,6 +12,10 @@ path deadlocks from-scratch training (CE stalls at ~ln(V)).
   * Distortion = normalized reconstruction ``||h_ctx - h_hat||^2`` (denominator
     detached so the gradient pushes ``h_hat -> h_ctx`` only). Beta-annealed over
     warmup by the loss aggregator so it does not dominate CE at init.
+  * Iterative latent refinement (opt-in): when ``ib_max_iters > 1``, the
+    bottleneck runs multiple passes feeding each reconstruction back as input.
+    EXIT-halt via SNR of the latent state (``ib_snr_threshold``) or distortion
+    stall (``ib_distortion_epsilon``).
 
 At eval (``not self.training``) ``z = mu`` deterministically (reparam is train).
 """
@@ -29,6 +33,8 @@ class InformationBottleneck(nn.Module):
     """H -> C variational stochastic encoder + C -> H source decoder.
 
     forward(h) -> info dict carrying 'mu', 'rate', 'distortion' scalars.
+    When ``cfg.iterative_ib_enabled`` and ``cfg.ib_max_iters > 1``, runs
+    iterative latent refinement with EXIT-halt gating.
     """
 
     FP32_PARAM_NAMES = ("to_mu", "to_logvar", "decompress")
@@ -71,17 +77,17 @@ class InformationBottleneck(nn.Module):
         denom = h_f.pow(2).mean().detach() + eps
         return (h_f - h_hat.float()).pow(2).mean() / denom
 
-    def forward(self, h: torch.Tensor) -> dict:
-        """Compute rate / distortion on ``h`` (off the main path).
+    def _single_pass(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One encode-decode pass through the bottleneck.
 
         Args:
-            h: ``[B, T, H]`` context hidden.
+            h: ``[B, T, H]`` input hidden.
 
         Returns:
-            dict with 'mu', 'logvar', 'rate', 'distortion'.
+            ``(h_hat, mu, logvar, z)`` — reconstruction, latent params, latent sample.
         """
-        h_n = self.norm(h)  # norm in h.dtype (bf16), safe — variance is stable at any precision
-        h_n_f = h_n.float()  # to_mu/to_logvar are fp32 for KL numerical stability
+        h_n = self.norm(h)
+        h_n_f = h_n.float()
         mu = self.to_mu(h_n_f)
         logvar = torch.clamp(self.to_logvar(h_n_f), self.cfg.logvar_clamp[0], self.cfg.logvar_clamp[1])
         if self.training:
@@ -90,9 +96,69 @@ class InformationBottleneck(nn.Module):
         else:
             z = mu
         h_hat = self.decompress(z)
+        return h_hat, mu, logvar, z
+
+    @staticmethod
+    def _latent_snr(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Per-token SNR of the latent state z: ``||z||^2 / C`` proxy.
+
+        Higher SNR = the latent code carries more signal relative to its
+        dimensional capacity. Used as an EXIT-halt gate in iterative refinement:
+        if the latent is already high-SNR, further iterations are diminishing
+        returns.
+        """
+        return z.float().pow(2).sum(dim=-1).mean() / (z.shape[-1] + eps)
+
+    def forward(self, h: torch.Tensor) -> dict:
+        """Compute rate / distortion on ``h`` (off the main path).
+
+        Args:
+            h: ``[B, T, H]`` context hidden.
+
+        Returns:
+            dict with 'mu', 'logvar', 'rate', 'distortion', and diagnostic
+            'ib_iters' (number of iterations used, for histogram logging).
+        """
+        use_iterative = (
+            self.cfg.iterative_ib_enabled
+            and self.cfg.ib_max_iters > 1
+            and self.training
+        )
+        max_iters = self.cfg.ib_max_iters if use_iterative else 1
+
+        h_input = h
+        distortion_prev: torch.Tensor | None = None
+        iters_used = 1
+
+        for it in range(max_iters):
+            h_hat, mu, logvar, z = self._single_pass(h_input)
+
+            if use_iterative and it < max_iters - 1:
+                # EXIT-halt gate: SNR of the latent state.
+                if self.cfg.ib_snr_threshold > 0.0:
+                    snr_val = self._latent_snr(z)
+                    if snr_val > self.cfg.ib_snr_threshold:
+                        iters_used = it + 1
+                        break
+
+                # EXIT-halt gate: distortion stall.
+                if self.cfg.ib_distortion_epsilon > 0.0:
+                    d_curr = self.distortion_penalty(h, h_hat, self.cfg.distortion_eps)
+                    if distortion_prev is not None:
+                        delta = (distortion_prev - d_curr).abs()
+                        if delta < self.cfg.ib_distortion_epsilon:
+                            iters_used = it + 1
+                            break
+                    distortion_prev = d_curr.detach()
+
+                h_input = h_hat  # feed reconstruction as next input
+        else:
+            iters_used = max_iters  # no early break: completed all iterations
+
         return {
             "mu": mu,
             "logvar": logvar,
             "rate": self.kl_rate(mu, logvar, self.cfg.kl_free_bits),
             "distortion": self.distortion_penalty(h, h_hat, self.cfg.distortion_eps),
+            "ib_iters": iters_used,
         }

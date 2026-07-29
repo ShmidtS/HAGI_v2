@@ -198,6 +198,8 @@ def train_step(
     posterior_rows = 0
     aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "route_entropy", "water_filling", "refinement", "attn_entropy")}
     aux_counts = {name: 0 for name in aux_sums}
+    ib_iters_sum = 0
+    ib_iters_count = 0
     all_finite = True
 
     for micro_idx, batch in enumerate(microbatches):
@@ -249,6 +251,10 @@ def train_step(
                     aux_sums[name] += value.detach().item()
                     aux_counts[name] += 1
 
+            if output.aux.ib_iters is not None:
+                ib_iters_sum += output.aux.ib_iters
+                ib_iters_count += 1
+
             if output.logits is not None and output.prediction_indices is not None:
                 logits = output.logits.detach()
                 prediction_indices = output.prediction_indices.detach().to(targets.device)
@@ -292,6 +298,10 @@ def train_step(
     # use_reentrant=False see identical snr_ema.
     if hasattr(model, "commit_moe_ema_updates"):
         model.commit_moe_ema_updates()
+
+    # Increment step counter for attn-entropy interval gating.
+    if hasattr(model, "_train_step_counter"):
+        model._train_step_counter += 1
 
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
@@ -348,6 +358,7 @@ def train_step(
         "grad_rms": grad_rms,
         "lr": lr_at(step, cfg),
         "exit_halted": loss_aggregator.exit_halted,
+        "ib_iters": ib_iters_sum / max(ib_iters_count, 1),
         "step": step,
         "update_applied": True,
         "all_finite": True,
