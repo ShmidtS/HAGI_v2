@@ -99,15 +99,21 @@ class InformationBottleneck(nn.Module):
         return h_hat, mu, logvar, z
 
     @staticmethod
-    def _latent_snr(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """Per-token SNR of the latent state z: ``||z||^2 / C`` proxy.
+    def _latent_snr(mu: torch.Tensor, logvar: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Per-token SNR: ``||mu||^2 / mean(exp(logvar))``.
 
-        Higher SNR = the latent code carries more signal relative to its
-        dimensional capacity. Used as an EXIT-halt gate in iterative refinement:
-        if the latent is already high-SNR, further iterations are diminishing
+        Signal = latent mean (structured code), noise = average variance across
+        dimensions. At random init mu ~ N(0,~1) / sqrt(dim) so ||mu||^2 is tiny
+        and the noise floor dominates — SNR is low. As the IB learns structure,
+        ||mu|| rises relative to the noise, and SNR grows.
+
+        Higher SNR = the latent code carries real signal. Used as an EXIT-halt
+        gate: if SNR exceeds the threshold, further iterations are diminishing
         returns.
         """
-        return z.float().pow(2).sum(dim=-1).mean() / (z.shape[-1] + eps)
+        noise = torch.exp(logvar.float()).mean() + eps
+        signal = mu.float().pow(2).sum(dim=-1).mean()
+        return signal / noise
 
     def forward(self, h: torch.Tensor) -> dict:
         """Compute rate / distortion on ``h`` (off the main path).
@@ -134,22 +140,25 @@ class InformationBottleneck(nn.Module):
             h_hat, mu, logvar, z = self._single_pass(h_input)
 
             if use_iterative and it < max_iters - 1:
-                # EXIT-halt gate: SNR of the latent state.
-                if self.cfg.ib_snr_threshold > 0.0:
-                    snr_val = self._latent_snr(z)
-                    if snr_val > self.cfg.ib_snr_threshold:
-                        iters_used = it + 1
-                        break
-
-                # EXIT-halt gate: distortion stall.
-                if self.cfg.ib_distortion_epsilon > 0.0:
-                    d_curr = self.distortion_penalty(h, h_hat, self.cfg.distortion_eps)
-                    if distortion_prev is not None:
-                        delta = (distortion_prev - d_curr).abs()
-                        if delta < self.cfg.ib_distortion_epsilon:
+                # EXIT-halt gates skip iteration 0 (baseline pass) — they
+                # only gate after at least one refinement iteration.
+                if it > 0:
+                    # EXIT-halt gate: SNR of the latent state.
+                    if self.cfg.ib_snr_threshold > 0.0:
+                        snr_val = self._latent_snr(mu, logvar)
+                        if snr_val > self.cfg.ib_snr_threshold:
                             iters_used = it + 1
                             break
-                    distortion_prev = d_curr.detach()
+
+                    # EXIT-halt gate: distortion stall.
+                    if self.cfg.ib_distortion_epsilon > 0.0:
+                        d_curr = self.distortion_penalty(h, h_hat, self.cfg.distortion_eps)
+                        if distortion_prev is not None:
+                            delta = (distortion_prev - d_curr).abs()
+                            if delta < self.cfg.ib_distortion_epsilon:
+                                iters_used = it + 1
+                                break
+                        distortion_prev = d_curr.detach()
 
                 h_input = h_hat  # feed reconstruction as next input
         else:

@@ -94,7 +94,7 @@ class HAGI(nn.Module):
         moe_every = max(1, body.moe.moe_every) if self._moe_on else 0
         self.blocks = nn.ModuleList()
         for li in range(body.num_layers):
-            use_moe_here = self._moe_on and moe_every > 0 and (li % moe_every == (moe_every - 1))
+            use_moe_here = self._moe_on and moe_every > 0 and (li % moe_every == (moe_every - 1)) and li < body.num_layers - 1
             mixer = None
             if use_moe_here:
                 mixer = MoESwiGLU(H, inter, body.moe, m.norm_eps, use_ternary=self._use_ternary)
