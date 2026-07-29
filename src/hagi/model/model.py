@@ -200,6 +200,17 @@ class HAGI(nn.Module):
         self._last_water_filling = water_filling_acc
         return h
 
+    @torch.no_grad()
+    def commit_moe_ema_updates(self) -> None:
+        """Apply deferred MoE SNR EMA updates after backward, outside checkpoint scope.
+
+        Called from the training loop ONCE per step so forward stays
+        deterministic under ckpt.checkpoint(use_reentrant=False).
+        """
+        for blk in self.blocks:
+            if blk.is_moe and blk.moe is not None:
+                blk.moe.commit_ema_update()
+
     def forward(
         self,
         input_ids=None,

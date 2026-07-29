@@ -13,11 +13,11 @@ model:
   vocab_size: 262144
   hidden_size: 2048                # explicit (overrides auto_configure)
   core_hidden_size: 1024           # C < H (real compression: 2048 -> 1024)
-  target_params: 8000000000        # 8B non-embed budget (auto sizes skipped: all explicit)
-  target_nonembed_params: 8000000000
+  target_params: 1000000000        # 8B non-embed budget (auto sizes skipped: all explicit)
+  target_nonembed_params: 1000000000
 
   attention:
-    max_seq_len: 8192              # large context window
+    max_seq_len: 2048              # large context window
     num_query_heads: 32            # 2048 / 32 = 64 per head
     num_kv_heads: 8                # real GQA: 4 query heads share 1 KV head
     head_dim: 64
@@ -32,7 +32,7 @@ model:
     kernel_size: 5                  # causal depthwise conv (left-pad only)
 
   multimodal:
-    enabled: true                   # image + audio source coding + Q-Former bridge
+    enabled: false                   # image + audio source coding + Q-Former bridge
     image_patch_size: 16
     image_channels: 3
     audio_mel_bins: 80
@@ -71,12 +71,12 @@ model:
 
 train:
   max_steps: 200000
-  batch_size: 1                     # micro-batch; effective batch = 1 * 16 = 16
-  seq_len: 8192                     # large context window
+  batch_size: 4                     # micro-batch; effective batch = 1 * 16 = 16
+  seq_len: 2048                     # large context window
   warmup_steps: 8000
   learning_rate: 0.00015            # scaled down for ~8B from-scratch
   muon_lr: 0.02
-  grad_accum_steps: 16
+  grad_accum_steps: 4
   precision: bf16
 
   tokenizer: "google/gemma-4-E2B-it"
@@ -99,7 +99,7 @@ train:
                                   # the backward recomputation.
 
   checkpoint_dir: checkpoints
-  checkpoint_interval: 2000
+  checkpoint_interval: 500
   checkpoint_keep_last: 3
 
   curriculum:

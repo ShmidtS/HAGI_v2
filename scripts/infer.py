@@ -64,6 +64,10 @@ def build_generation_kwargs(args, inference_cfg, eos_token_id: int, pad_token_id
 
 
 def main() -> int:
+    import sys
+    if sys.stdout.encoding != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8")  # Windows cp1251 → utf-8
+
     from hagi.data.tokenizer import load_tokenizer
     from hagi.inference.generate import generate
 

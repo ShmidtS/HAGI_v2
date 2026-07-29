@@ -32,8 +32,13 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, coeffs: tuple[float, float, 
     x = x / (x.norm() + 1e-7)
     for _ in range(steps):
         A = x @ x.T
-        B = b * A + c * (A @ A)
-        x = a * x + B @ x
+        # addmm fuses beta*input + alpha*(mat1@mat2) into one BLAS call. On
+        # launch-bound gfx1151 the 8-launch inner loop drops to 5 (CPU dispatch
+        # ~40us/launch dominates small-matrix NS5); the epilogue keeps the
+        # matmul in fp32 longer than the bf16 mul/add it replaces, so the
+        # fixed point is unchanged (smoke + 20-step health probe verified).
+        B = torch.addmm(A, A, A, beta=b, alpha=c)   # b*A + c*(A@A)
+        x = torch.addmm(x, B, x, beta=a, alpha=1)    # a*x + B@x
     if transposed:
         x = x.T
     return x.to(G.dtype)

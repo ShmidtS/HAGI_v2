@@ -282,6 +282,13 @@ def train_step(
 
             del output, loss, scaled_loss
 
+    # Commit deferred MoE SNR EMA updates AFTER backward (outside any
+    # ckpt.checkpoint scope). The forward stashes residual+probs; this
+    # single call applies the EMA once per step so save/recompute in
+    # use_reentrant=False see identical snr_ema.
+    if hasattr(model, "commit_moe_ema_updates"):
+        model.commit_moe_ema_updates()
+
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
     if not all_finite:
