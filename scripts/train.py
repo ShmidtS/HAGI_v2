@@ -37,6 +37,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import argparse
 import logging
+import math
 from datetime import datetime
 
 import torch
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 
 def format_training_metrics(metrics: dict) -> str:
-    return (
+    line = (
         f"step {metrics['step']} | loss={metrics['loss']:.4f} | bpt={metrics.get('bpt', float('nan')):.2f} | "
         f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
         f"conf={metrics.get('avg_confidence', 0.0):.3f} | "
@@ -82,6 +83,12 @@ def format_training_metrics(metrics: dict) -> str:
         f"distortion={metrics.get('distortion', float('nan')):.4f} | "
         f"entropy={metrics.get('posterior_entropy', float('nan')):.4f}"
     )
+    moe_lb = metrics.get('moe_lb', float('nan'))
+    route_ent = metrics.get('route_entropy', float('nan'))
+    wf = metrics.get('water_filling', float('nan'))
+    if not (math.isnan(moe_lb) and math.isnan(route_ent) and math.isnan(wf)):
+        line += f" | moe_lb={moe_lb:.4f} | rout_ent={route_ent:.4f} | wf={wf:.4f}"
+    return line
 
 
 def main() -> int:

@@ -60,8 +60,9 @@ class TransformerBlock(nn.Module):
         prefix_len: torch.Tensor | int | None = None,
         soft_beta: float | None = None,
         positions: torch.Tensor | None = None,
+        compute_attn_entropy: bool = True,
     ) -> torch.Tensor:
-        attn_out, pen = self.attn(x, attention_mode, prefix_len, soft_beta, positions)
+        attn_out, pen = self.attn(x, attention_mode, prefix_len, soft_beta, positions, compute_attn_entropy=compute_attn_entropy)
         x = x + attn_out
         self._last_attn_entropy_penalty = pen
         x = self.ffn(x)

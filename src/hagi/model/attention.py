@@ -135,6 +135,7 @@ class Attention(nn.Module):
         prefix_len: torch.Tensor | int | None = None,
         soft_beta: float | None = None,
         positions: torch.Tensor | None = None,
+        compute_attn_entropy: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute attention.
 
@@ -184,7 +185,7 @@ class Attention(nn.Module):
         entropy_pen = None
         out = F.scaled_dot_product_attention(q, k_rep, v_rep, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
 
-        if self.attn_entropy_floor > 0.0 and self.training:
+        if self.attn_entropy_floor > 0.0 and self.training and compute_attn_entropy:
             scores = (q @ k_rep.transpose(-2, -1)) * scale
             if attn_mask is not None:
                 scores = scores + attn_mask

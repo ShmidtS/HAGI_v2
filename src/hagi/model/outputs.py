@@ -6,7 +6,8 @@ multimodal joint embedding; moe_lb balances expert load; route_entropy spreads
 capacity across expert channels (water-filling dual); water_filling is the
 per-expert capacity allocator entropy-gap regularizer; refinement is the
 off-path HEP predictive-refinement loss; attn_entropy prevents attention
-collapse. A term is ``None`` when its subsystem is off.
+collapse; ib_iters counts iterations used in the iterative IB refinement loop
+(diagnostic, not a loss). A term is ``None`` when its subsystem is off.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ class AuxLosses:
     # Information bottleneck (always on).
     rate: torch.Tensor | None = None
     distortion: torch.Tensor | None = None
+    # Iterative IB refinement iterations used (diagnostic, histogram).
+    ib_iters: int | None = None
     # Grounded infomax (multimodal only).
     vicreg: torch.Tensor | None = None
     infonce: torch.Tensor | None = None
