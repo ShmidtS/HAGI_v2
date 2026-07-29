@@ -43,13 +43,13 @@ model:
     bottleneck:
       dim: 256
       ib_beta: 0.001
-      # Iterative IB refinement (CTM-inspired, off by default).
-      iterative_ib_enabled: true
-      ib_max_iters: 3
-      ib_snr_threshold: 0.1
-      ib_distortion_epsilon: 0.01
-      # Latent memory bank (off by default).
-      memory_bank_size: 16
+      # Iterative IB refinement (CTM-inspired, off — IB posterior-collapsed at step 16k).
+      iterative_ib_enabled: false
+      ib_max_iters: 1
+      ib_snr_threshold: 0.0
+      ib_distortion_epsilon: 0.0
+      # Latent memory bank (off — z≈0, cross-attention wasted).
+      memory_bank_size: 0
       memory_num_heads: 4
       memory_head_dim: 32
     moe:

@@ -200,6 +200,8 @@ def train_step(
     aux_counts = {name: 0 for name in aux_sums}
     ib_iters_sum = 0
     ib_iters_count = 0
+    memory_usage_sum = 0.0
+    memory_usage_count = 0
     all_finite = True
 
     for micro_idx, batch in enumerate(microbatches):
@@ -254,6 +256,9 @@ def train_step(
             if output.aux.ib_iters is not None:
                 ib_iters_sum += output.aux.ib_iters
                 ib_iters_count += 1
+            if output.aux.memory_usage is not None:
+                memory_usage_sum += output.aux.memory_usage.detach().item()
+                memory_usage_count += 1
 
             if output.logits is not None and output.prediction_indices is not None:
                 logits = output.logits.detach()
@@ -359,6 +364,7 @@ def train_step(
         "lr": lr_at(step, cfg),
         "exit_halted": loss_aggregator.exit_halted,
         "ib_iters": ib_iters_sum / max(ib_iters_count, 1),
+        "memory_usage": memory_usage_sum / max(memory_usage_count, 1),
         "step": step,
         "update_applied": True,
         "all_finite": True,

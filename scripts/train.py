@@ -86,8 +86,14 @@ def format_training_metrics(metrics: dict) -> str:
     moe_lb = metrics.get('moe_lb', float('nan'))
     route_ent = metrics.get('route_entropy', float('nan'))
     wf = metrics.get('water_filling', float('nan'))
+    ib_iters = metrics.get('ib_iters', float('nan'))
+    mem_usage = metrics.get('memory_usage', None)
     if not (math.isnan(moe_lb) and math.isnan(route_ent) and math.isnan(wf)):
         line += f" | moe_lb={moe_lb:.4f} | rout_ent={route_ent:.4f} | wf={wf:.4f}"
+    if not math.isnan(ib_iters):
+        line += f" | ib_i={ib_iters:.1f}"
+    if mem_usage is not None and not math.isnan(mem_usage):
+        line += f" | mem={mem_usage:.2f}"
     return line
 
 
