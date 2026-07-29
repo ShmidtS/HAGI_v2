@@ -12,8 +12,8 @@ model:
   vocab_size: 262144
   hidden_size: 512                 # explicit (overrides auto_configure)
   core_hidden_size: 256            # C < H (real compression: 512 -> 256)
-  target_params: 200000000
-  target_nonembed_params: 200000000
+  target_params: 2000000000
+  target_nonembed_params: 2000000000
 
   attention:
     max_seq_len: 2048
@@ -63,10 +63,10 @@ model:
     exit_window: 5
 
 train:
-  max_steps: 200
+  max_steps: 200000
   batch_size: 1
   seq_len: 2048
-  warmup_steps: 20
+  warmup_steps: 2000
   learning_rate: 0.0003
   muon_lr: 0.02
   muon:
@@ -96,7 +96,7 @@ train:
 
   curriculum:
     enabled: true
-    stage2_start: 150
+    stage2_start: 160000
     cycles_per_dataset: 3
     stage1_order: [tinystories, python_instruct, smoltalk, wikipedia_en, wikipedia_ru, openwebmath, oscar_ru, slimpajama, edu]
     stage2_datasets: [openwebmath, edu, slimpajama]
@@ -111,4 +111,4 @@ inference:
   repetition_penalty: 1.2
   repetition_window: 64
   no_repeat_ngram_size: 2
-  max_new_tokens: 64
+  max_new_tokens: 2048

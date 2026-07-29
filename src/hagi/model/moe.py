@@ -91,6 +91,8 @@ class WaterFillingMoE(nn.Module):
         self._last_load_balance: torch.Tensor | None = None
         self._last_routing_entropy: torch.Tensor | None = None
         self._last_water_filling_loss: torch.Tensor | None = None
+        self._deferred_residual: torch.Tensor | None = None
+        self._deferred_probs: torch.Tensor | None = None
         # Water-filling capacity allocator: per-expert capacity gate (log-bias on
         # the routing logits) steered by a per-expert SNR EMA on the shared-expert
         # residual. allocation_logits is an FP Parameter -> AdamW (not Muon).
@@ -166,9 +168,14 @@ class WaterFillingMoE(nn.Module):
         # gate is a log-bias on the routing logits. Uniform at init (constant
         # shift -> softmax-invariant), so the cold start is unchanged; as the SNR
         # EMA diverges the bias steers routing toward high-capacity (high-SNR)
-        # experts. Update the SNR EMA from the pre-bias routing weights.
+        # experts. The EMA update is DEFERRED (stashed here, committed after
+        # backward via commit_ema_update()) to keep the forward deterministic
+        # under ckpt.checkpoint(use_reentrant=False): save and recompute must
+        # read the SAME snr_ema, otherwise routing diverges and bincount shape
+        # mismatches crash with CheckpointError.
         if self.training:
-            self._update_allocator(residual, probs)
+            self._deferred_residual = residual.detach()
+            self._deferred_probs = probs.detach()
         alloc_probs = self.allocator.allocation_probs()  # [E]
         probs = F.softmax(logits + torch.log(alloc_probs + 1e-8).unsqueeze(0), dim=-1)
 
@@ -194,6 +201,22 @@ class WaterFillingMoE(nn.Module):
 
         out = out.view(b, t, h)
         return x + out
+
+    @torch.no_grad()
+    def commit_ema_update(self) -> None:
+        """Apply the deferred SNR EMA update stashed during the last forward.
+
+        Called from the training loop ONCE per step, AFTER backward (outside
+        any ckpt.checkpoint scope). This keeps forward deterministic under
+        use_reentrant=False: save and recompute read the same snr_ema, so
+        routing log-bias -> probs -> topk_idx -> bincount counts are identical
+        across both passes.
+        """
+        if self._deferred_residual is None or self._deferred_probs is None:
+            return
+        self._update_allocator(self._deferred_residual, self._deferred_probs)
+        self._deferred_residual = None
+        self._deferred_probs = None
 
     def _batched_dispatch(self, flat: torch.Tensor, residual: torch.Tensor, topk_idx: torch.Tensor, topk_vals: torch.Tensor) -> torch.Tensor:
         """Group tokens by chosen expert via sort + segment offsets; batched matmul.
