@@ -38,7 +38,7 @@ class AttentionConfig:
     num_kv_heads: int = 4  # GQA: number of key/value heads (<= num_heads)
     head_dim: int = 64
     rope_theta: float = 10000.0
-    attn_entropy_floor: float = 0.5
+    attn_entropy_floor: float = 0.0  # 0.0 = auto (1/num_heads) at model init
     # Sliding-window causal attention (0 / None = full attention). A window W
     # makes each query attend to the last W keys (plus all future-masked),
     # turning attention into a local finite-memory (convolutional-code) channel:
@@ -112,7 +112,7 @@ class Attention(nn.Module):
         self.q_proj = _proj(cfg.num_heads * cfg.head_dim)
         self.kv_proj = _proj(2 * cfg.num_kv_heads * cfg.head_dim)
         self.out_proj = _proj(cfg.num_heads * cfg.head_dim)
-        nn.init.normal_(self.out_proj.weight, std=0.02)
+        nn.init.normal_(self.out_proj.weight, std=1.0 / (hidden_size ** 0.5))
         self.rope = RotaryEmbedding(self.head_dim, rope_theta=cfg.rope_theta)
         self.attn_entropy_floor = float(cfg.attn_entropy_floor)
         self.sliding_window = cfg.sliding_window  # None / 0 = full attention
@@ -194,7 +194,7 @@ class Attention(nn.Module):
                     torch.full((t, t_tot), float("-inf"), device=q.device, dtype=scores.dtype), diagonal=(t_tot - t + 1)
                 )
             attn_weights = torch.softmax(scores, dim=-1)
-            entropy = -(attn_weights * torch.log(attn_weights + 1e-8)).sum(dim=-1)
+            entropy = -(attn_weights * torch.log(attn_weights + 1e-12 / max(1, self.n_heads))).sum(dim=-1)
             entropy_pen = (self.attn_entropy_floor - entropy).clamp_min(0.0).mean()
 
         out = out.transpose(1, 2).contiguous().view(b, t, self.hidden_size)

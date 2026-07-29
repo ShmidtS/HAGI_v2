@@ -51,7 +51,7 @@ class SwiGLUExpert(nn.Module):
         self.gate = _proj(hidden_size, intermediate_size, use_ternary)
         self.up = _proj(hidden_size, intermediate_size, use_ternary)
         self.down = _proj(intermediate_size, hidden_size, use_ternary)
-        nn.init.normal_(self.down.weight, std=0.02)
+        nn.init.normal_(self.down.weight, std=1.0 / (intermediate_size ** 0.5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
@@ -84,8 +84,10 @@ class WaterFillingMoE(nn.Module):
         self.experts = nn.ModuleList(
             SwiGLUExpert(hidden_size, intermediate_size, use_ternary) for _ in range(cfg.num_experts)
         )
-        # Router: hidden (+ SNR scalar) -> routing logits. FP -> AdamW.
-        self.router = nn.Linear(hidden_size + 1, cfg.num_experts, bias=False)
+        # Router: hidden -> routing logits. FP -> AdamW.
+        # SNR gate is a multiplicative scalar on the logits (not a concatenated
+        # input dimension). This keeps the router input = H, not H+1.
+        self.router = nn.Linear(hidden_size, cfg.num_experts, bias=False)
         nn.init.normal_(self.router.weight, mean=0.0, std=cfg.router_init_std)
         self._snr_gate_weight = float(cfg.snr_gate_weight)
         self._last_load_balance: torch.Tensor | None = None
@@ -96,10 +98,11 @@ class WaterFillingMoE(nn.Module):
         # Water-filling capacity allocator: per-expert capacity gate (log-bias on
         # the routing logits) steered by a per-expert SNR EMA on the shared-expert
         # residual. allocation_logits is an FP Parameter -> AdamW (not Muon).
+        # min_width = max(16, H/8) — derived from hidden size.
         self.allocator = WaterFillingAllocator(
             total_width=self.num_experts * intermediate_size,
             num_experts=self.num_experts,
-            min_width=min(64, intermediate_size),
+            min_width=max(16, hidden_size // 8),
         )
 
     @property
@@ -160,8 +163,10 @@ class WaterFillingMoE(nn.Module):
         # SNR gate = water-filling signal on the shared-expert RESIDUAL.
         residual = flat - shared_out
         snr = self._snr_gate(residual)
-        router_in = torch.cat([flat, snr.unsqueeze(-1)], dim=-1)
-        logits = self.router(router_in)
+        logits = self.router(flat)  # [N, E] — router input = H (not H+1)
+        # SNR as multiplicative gate: scale logits by (1 + snr * weight) per token.
+        # This preserves the water-filling signal without wasting a router dimension.
+        logits = logits * (1.0 + snr.unsqueeze(-1))
         probs = F.softmax(logits, dim=-1)  # [N, E]
 
         # Water-filling capacity allocation: the allocator's per-expert capacity

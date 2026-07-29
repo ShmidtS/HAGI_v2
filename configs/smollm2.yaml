@@ -45,17 +45,18 @@ train:
   seq_len: 512
   warmup_steps: 1600
   learning_rate: 0.0003
-  muon_lr: 0.02
   grad_accum_steps: 2
   precision: bf16
+  muon:
+    lr: 0.02
 
   tokenizer: "HuggingFaceTB/SmolLM2-135M"
   eos_token_id: 0
   pad_token_id: 49152
   data_dir: data
 
-  w_rate: 0.001
-  w_distortion: 1.0
+  w_rate: 0.01
+  w_distortion: 0.01
   w_route_entropy: 0.0      # no MoE -> no routing entropy
   w_refine: 0.0             # refinement off for the clean baseline
   w_attn_entropy: 0.01

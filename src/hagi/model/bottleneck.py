@@ -33,6 +33,19 @@ class InformationBottleneck(nn.Module):
 
     FP32_PARAM_NAMES = ("to_mu", "to_logvar", "decompress")
 
+    def ensure_fp32(self) -> None:
+        """Convert KL-critical parameters to fp32 regardless of model-wide dtype.
+
+        The to_mu/to_logvar KL rate and decompress distortion decoder are
+        numerically sensitive: bf16 logvar clamps cause floating-point collapse
+        of the rate regularizer, leading to unbounded rate growth and CE
+        gradient conflict. This method is called after the bf16 model cast.
+        """
+        for name in self.FP32_PARAM_NAMES:
+            mod = getattr(self, name, None)
+            if mod is not None:
+                mod.to(torch.float32)
+
     def __init__(self, hidden_size: int, cfg: BottleneckConfig, norm_eps: float = 1e-6) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -67,9 +80,10 @@ class InformationBottleneck(nn.Module):
         Returns:
             dict with 'mu', 'logvar', 'rate', 'distortion'.
         """
-        h_n = self.norm(h)
-        mu = self.to_mu(h_n)
-        logvar = torch.clamp(self.to_logvar(h_n), self.cfg.logvar_clamp[0], self.cfg.logvar_clamp[1])
+        h_n = self.norm(h)  # norm in h.dtype (bf16), safe — variance is stable at any precision
+        h_n_f = h_n.float()  # fp32 for KL-critical linears: bf16 logvar clamps collapse rate
+        mu = self.to_mu(h_n_f)
+        logvar = torch.clamp(self.to_logvar(h_n_f), self.cfg.logvar_clamp[0], self.cfg.logvar_clamp[1])
         if self.training:
             std = torch.exp(0.5 * logvar)
             z = mu + std * torch.randn_like(std)
