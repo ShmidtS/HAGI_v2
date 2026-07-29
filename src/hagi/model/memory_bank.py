@@ -90,6 +90,7 @@ class LatentMemoryBank(nn.Module):
             ``h + cross_attn_output`` of shape ``[B, T, H]``.
         """
         B, T, _ = h.shape
+        z = z.to(dtype=h.dtype)
         bank = self._ensure_bank(z)
 
         # Push z into FIFO bank: append new, drop oldest.
