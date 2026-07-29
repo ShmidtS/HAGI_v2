@@ -81,7 +81,7 @@ class InformationBottleneck(nn.Module):
             dict with 'mu', 'logvar', 'rate', 'distortion'.
         """
         h_n = self.norm(h)  # norm in h.dtype (bf16), safe — variance is stable at any precision
-        h_n_f = h_n.float()  # fp32 for KL-critical linears: bf16 logvar clamps collapse rate
+        h_n_f = h_n.float()  # to_mu/to_logvar are fp32 for KL numerical stability
         mu = self.to_mu(h_n_f)
         logvar = torch.clamp(self.to_logvar(h_n_f), self.cfg.logvar_clamp[0], self.cfg.logvar_clamp[1])
         if self.training:

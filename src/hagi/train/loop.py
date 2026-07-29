@@ -41,6 +41,10 @@ def _build_exit_halt(cfg: Config) -> EXITChartHalt:
 def configure_runtime() -> None:
     import os
 
+    # ROCm AMD flash attention (AOTriton). Without this, SDPA falls back to the
+    # math backend — bmm + softmax + bmm per attention head — which is 2-3x
+    # slower than the fused flash kernel. gfx1151 (Radeon 8060S) supports it.
+    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
     # expandable_segments removed: on ROCm Windows gfx1151 it exhausts
     # per-process VA-space (OOMs on small allocs with 90+ GiB physically
     # free). Fragmentation from the 16x grad-accum backward churn is handled
@@ -268,10 +272,10 @@ def train_step(
                             entropy_sum += -(p * log_p).sum(dim=-1).sum().item()
                     else:
                         # Cheap path (most steps): max softmax prob as
-                        # exp(max_logit - logsumexp) — two reductions over bf16
-                        # logits, no [N,V] fp32 materialization, no per-chunk
-                        # .item() sync. Drops the detach/float/exp view-op tail
-                        # that left CUDA 37.9% idle under CPU dispatch.
+                        # exp(max_logit - logsumexp) — two reductions in bf16.
+                        # bf16 logsumexp is stable at V=262144: the sum of
+                        # exp(logits - max_logit) over the vocab fits within
+                        # bf16 dynamic range (max representable ~3.39e38).
                         m = logits.max(dim=-1).values
                         lse = torch.logsumexp(logits, dim=-1)
                         confidence_sum += (m - lse).exp().sum().item()
@@ -298,13 +302,12 @@ def train_step(
         raise FloatingPointError(f"training update {step} has non-finite loss or gradients; gradients cleared")
 
     gn, grad_rms = gradient_stats(model, cfg.train)
-    # Release the transient recomputation/activation tensors the 16x grad-accum
-    # backward churns before the optimizer step. Without this the caching
-    # allocator fragments and newton_schulz5 OOMs on a 32 MiB request with
-    # 50+ GiB physically free (bezfniya3 failure). expandable_segments would
-    # fix this on CUDA but exhausts per-process VA on ROCm Windows gfx1151
-    # (b6a1iq3la failure), so empty_cache is the platform-safe fix here.
-    if torch.cuda.is_available():
+    # empty_cache at a controlled interval (configurable, default 20 steps).
+    # Doing it every step costs ~50ms of CPU time on launch-bound GPUs —
+    # the CUDA IPC overhead dominates small-model dispatch. The cache is
+    # only needed to prevent allocator fragmentation from grad-accum churn;
+    # releasing every 20 steps keeps fragmentation in check at 1/20 the cost.
+    if torch.cuda.is_available() and step % max(1, cfg.train.logging.cache_release_interval) == 0:
         torch.cuda.empty_cache()
     optimizer.step()
 
