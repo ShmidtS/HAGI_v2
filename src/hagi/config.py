@@ -327,9 +327,9 @@ class TrainConfig:
     w_distortion: float = 0.01
     w_vicreg: float = 0.1
     w_infonce: float = 0.1
-    w_moe_lb: float = 0.01
+    w_moe_lb: float = 0.1  # was 0.01 — load balance stuck at 8.0 (all tokens on 1-2 experts)
     w_route_entropy: float = 0.01  # routing-entropy capacity maximization (MoE)
-    w_water_filling: float = 0.01  # water-filling allocator entropy-gap regularizer (MoE)
+    w_water_filling: float = 0.1  # was 0.01 — water-filling allocator entropy-gap regularizer (MoE)
     w_refine: float = 0.0  # off-path HEP refinement loss (opt-in)
     w_attn_entropy: float = 0.01
     attn_entropy_floor: float = 0.0  # 0.0 = auto (1/num_query_heads); set >0 to override
