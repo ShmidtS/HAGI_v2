@@ -52,6 +52,15 @@ model:
       dim: 1024                     # IB latent (C); must be < H
       ib_beta: 0.001
       kl_free_bits: 0.5
+      # Iterative IB refinement (CTM-inspired, off by default).
+      iterative_ib_enabled: false
+      ib_max_iters: 1
+      ib_snr_threshold: 0.0
+      ib_distortion_epsilon: 0.0
+      # Latent memory bank (off by default).
+      memory_bank_size: 0
+      memory_num_heads: 4
+      memory_head_dim: 32
     moe:
       enabled: true                 # water-filling capacity allocation (scalability lever)
       num_experts: 8                # params grow without per-token compute growth
