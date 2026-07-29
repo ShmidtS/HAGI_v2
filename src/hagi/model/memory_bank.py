@@ -88,44 +88,44 @@ class LatentMemoryBank(nn.Module):
 
         Returns:
             ``h + cross_attn_output`` of shape ``[B, T, H]``.
+
+        The bank is built functionally — old states are detached (no gradient
+        through time) and concatenated with the current z so gradients flow
+        only through the current step's k_proj/v_proj path.
         """
         B, T, _ = h.shape
         z = z.to(dtype=h.dtype)
-        bank = self._ensure_bank(z)
 
-        # Push z into FIFO bank: append new, drop oldest.
-        fill = int(self._bank_fill.item())
-        if T >= self.bank_size:
-            # The new batch alone fills/exceeds the bank — just take the last bank_size.
-            bank[:, :] = z[:, -self.bank_size:, :]
-            fill = self.bank_size
+        # Build bank: concat old (detached) + new z, keep last bank_size.
+        if self._bank is not None and self._bank.shape[0] == B:
+            old_bank = self._bank.detach()
+            old_fill = int(self._bank_fill.item())
         else:
-            room = self.bank_size - fill
-            take = min(room, T)
-            if take > 0:
-                bank[:, fill:fill + take, :] = z[:, :take, :]
-                fill += take
-            if fill > self.bank_size:
-                fill = self.bank_size
+            old_bank = z.new_zeros(B, 0, self.latent_dim)
+            old_fill = 0
+
+        combined = torch.cat([old_bank, z], dim=1)               # [B, old_fill+T, C]
+        if combined.shape[1] < self.bank_size:
+            pad = combined.new_zeros(B, self.bank_size - combined.shape[1], self.latent_dim)
+            combined = torch.cat([pad, combined], dim=1)          # left-pad to bank_size
+        bank = combined[:, -self.bank_size:, :]                  # [B, bank_size, C]
+        fill = min(self.bank_size, old_fill + T)
+
+        # Store detached for next forward — no gradient through time.
+        self._bank = bank.detach()
         self._bank_fill = torch.tensor(fill)
 
-        # Mask: only attend over filled slots (fill may be < bank_size early in seq).
-        attn_mask = torch.arange(self.bank_size, device=h.device).unsqueeze(0) < fill
-        # attn_mask: [1, bank_size] -> broadcast to [B, num_heads, T_q, bank_size]
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 1, bank_size]
+        # Mask: only attend over rightmost filled slots (left-padded with zeros).
+        attn_mask = torch.arange(self.bank_size, device=h.device) >= (self.bank_size - fill)
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, bank_size]
 
         # Cross-attention: Q from h, K/V from bank.
         q = self._reshape_for_attn(self.q_proj(h), self.num_heads, self.head_dim)
-        # q: [B, num_heads, T, head_dim]
         k = self._reshape_for_attn(self.k_proj(bank), self.num_heads, self.head_dim)
-        # k: [B, num_heads, bank_size, head_dim]
         v = self._reshape_for_attn(self.v_proj(bank), self.num_heads, self.head_dim)
-        # v: [B, num_heads, bank_size, head_dim]
 
-        # scaled_dot_product_attention: Q[*, heads, T_q, d] over K/V[*, heads, T_kv, d]
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
-        # out: [B, num_heads, T, head_dim]
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)  # [B, T, inner]
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
         out = self.out_proj(out)
 
         return h + out

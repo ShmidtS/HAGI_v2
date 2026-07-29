@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hagi.model.memory_bank import LatentMemoryBank
+from tests.conftest import assert_finite
 
 
 DIM = 64
@@ -31,6 +32,7 @@ class TestLatentMemoryBankShapes:
         h = torch.randn(2, 4, DIM)
         z = torch.randn(2, 4, LATENT_DIM)
         out = bank(h, z)
+        assert_finite(out, "out")
         assert out.shape == (2, 4, DIM)
 
     def test_output_residual(self, bank):
