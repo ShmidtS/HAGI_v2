@@ -43,6 +43,8 @@ class AuxLosses:
     exit_novelty: float | None = None
     # Attention anti-collapse (training only).
     attn_entropy: torch.Tensor | None = None
+    # Latent memory bank fill level (diagnostic, not a loss).
+    memory_usage: torch.Tensor | None = None
 
 
 @dataclass

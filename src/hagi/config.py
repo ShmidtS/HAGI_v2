@@ -137,6 +137,10 @@ class BottleneckConfig:
     ib_max_iters: int = 1  # 1 = standard single-pass (backward compat)
     ib_snr_threshold: float = 0.0  # 0.0 = disabled; latent SNR early-exit gate
     ib_distortion_epsilon: float = 0.0  # 0.0 = disabled; distortion-stall early-exit gate
+    # CTM-inspired latent memory bank (cross-attends h_ctx over recent z states).
+    memory_bank_size: int = 0  # 0 = disabled (backward compat)
+    memory_num_heads: int = 4
+    memory_head_dim: int = 32
 
 
 @dataclass

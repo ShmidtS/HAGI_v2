@@ -108,6 +108,20 @@ class HAGI(nn.Module):
         # ---- Auxiliary information bottleneck (off the main path) ----
         self.bottleneck = InformationBottleneck(H, body.bottleneck, m.norm_eps)
 
+        # ---- CTM-inspired latent memory bank (opt-in, after bottleneck) ----
+        bn_cfg = body.bottleneck
+        self.memory_bank = None
+        if bn_cfg.memory_bank_size > 0:
+            from hagi.model.memory_bank import LatentMemoryBank
+
+            self.memory_bank = LatentMemoryBank(
+                dim=H,
+                latent_dim=bn_cfg.dim,
+                bank_size=bn_cfg.memory_bank_size,
+                num_heads=bn_cfg.memory_num_heads,
+                head_dim=bn_cfg.memory_head_dim,
+            )
+
         # ---- Factored LM head (independent rank-r factorization) ----
         r = m.embeddings.factor_rank
         self.lm_compress = nn.Linear(H, r, bias=False)
@@ -287,6 +301,11 @@ class HAGI(nn.Module):
         # STAGE 3 — auxiliary information bottleneck (off-path, no gradient into h_ctx).
         bn_info = self.bottleneck(h_ctx.detach())
 
+        # STAGE 3b — latent memory bank: cross-attend h_ctx over recent z states.
+        if self.memory_bank is not None:
+            z_latent = bn_info["z"]
+            h_ctx = self.memory_bank(h_ctx, z_latent)
+
         # STAGE 4 — MAIN LM PATH: final norm + factored head on text positions.
         h_dec = self.final_norm(h_ctx)
         t_text = input_ids.shape[1]
@@ -306,6 +325,8 @@ class HAGI(nn.Module):
         aux.route_entropy = getattr(self, "_last_route_entropy", None)
         aux.water_filling = getattr(self, "_last_water_filling", None)
         aux.attn_entropy = getattr(self, "_last_attn_entropy_penalty", None)
+        if self.memory_bank is not None:
+            aux.memory_usage = self.memory_bank._bank_fill.float() / max(1, self.memory_bank.bank_size)
 
         # STAGE 4b — off-path HEP predictive refinement (opt-in). Runs on a CLONE
         # of h_ctx; the main logits come from the UN-refined h_ctx (V25 lesson:

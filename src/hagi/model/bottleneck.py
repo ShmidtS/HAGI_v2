@@ -158,6 +158,7 @@ class InformationBottleneck(nn.Module):
         return {
             "mu": mu,
             "logvar": logvar,
+            "z": z,
             "rate": self.kl_rate(mu, logvar, self.cfg.kl_free_bits),
             "distortion": self.distortion_penalty(h, h_hat, self.cfg.distortion_eps),
             "ib_iters": iters_used,
