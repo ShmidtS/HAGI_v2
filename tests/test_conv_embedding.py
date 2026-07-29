@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hagi.model.conv_embedding import ConvEmbedding
+from tests.conftest import assert_finite
 
 
 @pytest.fixture
@@ -15,7 +16,9 @@ def embed():
 
 class TestConvEmbedding:
     def test_output_shape(self, embed):
-        assert embed(torch.randint(0, 1000, (2, 16))).shape == (2, 16, 64)
+        out = embed(torch.randint(0, 1000, (2, 16)))
+        assert_finite(out, "out")
+        assert out.shape == (2, 16, 64)
 
     def test_weight_shape(self, embed):
         # ConvEmbedding.weight = token_expand.weight @ token_compress.weight.t()
@@ -26,6 +29,7 @@ class TestConvEmbedding:
     def test_causal_no_future_leak(self, embed):
         ids1 = torch.randint(0, 1000, (2, 16))
         h1 = embed(ids1)
+        assert_finite(h1, "h1")
         ids2 = ids1.clone()
         ids2[:, 8] = (ids2[:, 8] + 1) % 1000
         h2 = embed(ids2)

@@ -6,12 +6,15 @@ import pytest
 import torch
 
 from hagi.model.ternary import ternarize, BitLinear, _TernarizeSTE
+from tests.conftest import assert_finite
 
 
 class TestTernarize:
     def test_values_are_ternary(self):
         w = torch.randn(16, 32)
         eff, scale = ternarize(w)
+        assert_finite(eff, "eff")
+        assert_finite(scale, "scale")
         assert eff.shape == w.shape
         assert scale.shape == (16, 1)
         for i in range(16):
@@ -21,16 +24,21 @@ class TestTernarize:
 
     def test_scale_positive(self):
         _, scale = ternarize(torch.randn(8, 64) * 0.5, eps=1e-5)
+        assert_finite(scale, "scale")
         assert (scale > 0).all()
 
     def test_constant_input(self):
         w = torch.ones(4, 8) * 3.0
         eff, scale = ternarize(w)
+        assert_finite(eff, "eff")
+        assert_finite(scale, "scale")
         assert abs(scale[0, 0].item() - 3.0) < 1e-3
         assert (eff == 3.0).all()
 
     def test_zero_row(self):
         eff, scale = ternarize(torch.zeros(4, 8), eps=1e-5)
+        assert_finite(eff, "eff")
+        assert_finite(scale, "scale")
         assert (eff == 0).all()
         assert (scale == 1e-5).all()
 
@@ -46,10 +54,12 @@ class TestTernarize:
 class TestBitLinear:
     def test_forward_shape(self):
         y = BitLinear(32, 16)(torch.randn(4, 32))
+        assert_finite(y, "y")
         assert y.shape == (4, 16)
 
     def test_forward_with_bias(self):
         y = BitLinear(32, 16, bias=True)(torch.randn(4, 32))
+        assert_finite(y, "y")
         assert y.shape == (4, 16)
 
     def test_gradient_flows(self):
@@ -63,6 +73,7 @@ class TestBitLinear:
         layer = BitLinear(32, 16)
         with torch.inference_mode():
             y = layer(torch.randn(4, 32))
+        assert_finite(y, "y")
         assert not y.requires_grad
 
     def test_extra_repr(self):

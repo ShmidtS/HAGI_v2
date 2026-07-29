@@ -7,6 +7,7 @@ import torch
 
 from hagi.config import BottleneckConfig
 from hagi.model.bottleneck import InformationBottleneck
+from tests.conftest import assert_finite
 
 
 @pytest.fixture
@@ -20,14 +21,17 @@ class TestInformationBottleneck:
         ib.eval()
         out = ib(torch.randn(2, 16, 64))
         assert isinstance(out["rate"], torch.Tensor) and out["rate"].ndim == 0
+        assert_finite(out["rate"], "rate")
 
     def test_distortion_nonnegative(self, ib):
         ib.eval()
         out = ib(torch.randn(2, 16, 64))
+        assert_finite(out["distortion"], "distortion")
         assert out["distortion"].item() >= 0.0
 
     def test_mu_shape(self, ib):
         out = ib(torch.randn(2, 16, 64))
+        assert_finite(out["mu"], "mu")
         # IB forward: norm(h) -> to_mu yields [B, T, C] = [2, 16, 32]
         assert out["mu"].shape == (2, 16, 32)
 
@@ -36,6 +40,8 @@ class TestInformationBottleneck:
         h = torch.randn(2, 8, 64)
         r1 = ib(h)["rate"]
         r2 = ib(h)["rate"]
+        assert_finite(r1, "r1")
+        assert_finite(r2, "r2")
         assert torch.equal(r1, r2)
 
     def test_training_stochastic(self, ib):
@@ -43,6 +49,8 @@ class TestInformationBottleneck:
         h = torch.randn(2, 8, 64)
         r1 = ib(h)["rate"]
         r2 = ib(h)["rate"]
+        assert_finite(r1, "r1")
+        assert_finite(r2, "r2")
         # With small random init the KL rate values can be very similar.
         # The key property is determinism vs stochasticity — but small-logvar
         # init means the std is tiny, so z ≈ mu even in training mode.
@@ -50,7 +58,9 @@ class TestInformationBottleneck:
         assert r1.ndim == 0 and r2.ndim == 0
 
     def test_rate_positive(self, ib):
-        assert ib(torch.randn(2, 8, 64))["rate"].item() > 0.0
+        rate = ib(torch.randn(2, 8, 64))["rate"]
+        assert_finite(rate, "rate")
+        assert rate.item() > 0.0
 
     def test_ensure_fp32(self, ib):
         ib.to(torch.bfloat16)
@@ -63,5 +73,6 @@ class TestInformationBottleneck:
     def test_kl_rate_zero_at_identity(self):
         cfg = BottleneckConfig(dim=32, kl_free_bits=0.0, logvar_clamp=(-5., 5.), distortion_eps=1e-6)
         ib = InformationBottleneck(64, cfg)
-        rate = ib(torch.randn(2, 4, 64))["rate"].item()
-        assert rate >= 0.0
+        rate = ib(torch.randn(2, 4, 64))["rate"]
+        assert_finite(rate, "rate")
+        assert rate.item() >= 0.0

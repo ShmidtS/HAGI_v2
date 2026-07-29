@@ -7,6 +7,7 @@ import torch
 
 from hagi.config import MoEConfig
 from hagi.model.moe import WaterFillingMoE
+from tests.conftest import assert_finite
 
 
 @pytest.fixture
@@ -17,11 +18,15 @@ def moe():
 
 class TestWaterFillingMoE:
     def test_output_shape(self, moe):
-        assert moe(torch.randn(2, 16, 64)).shape == (2, 16, 64)
+        out = moe(torch.randn(2, 16, 64))
+        assert_finite(out, "out")
+        assert out.shape == (2, 16, 64)
 
     def test_not_identity(self, moe):
         x = torch.randn(2, 16, 64)
-        assert not torch.allclose(moe(x), x)
+        out = moe(x)
+        assert_finite(out, "out")
+        assert not torch.allclose(out, x)
 
     def test_expert_counts(self, moe):
         assert len(moe.shared_experts) == 1 and len(moe.experts) == 4
@@ -64,4 +69,6 @@ class TestWaterFillingMoE:
         cfg = MoEConfig(enabled=True, num_experts=4, top_k=2, n_shared=0, moe_every=1, intermediate_size=64)
         moe2 = WaterFillingMoE(32, 64, cfg, use_ternary=False)
         moe2.eval()
-        assert moe2(torch.randn(2, 16, 32)).shape == (2, 16, 32)
+        out = moe2(torch.randn(2, 16, 32))
+        assert_finite(out, "out")
+        assert out.shape == (2, 16, 32)

@@ -6,6 +6,7 @@ import torch
 
 from hagi.config import RefinementConfig
 from hagi.model.refinement import PredictiveRefiner
+from tests.conftest import assert_finite
 
 
 def _refiner(**kw):
@@ -20,11 +21,15 @@ def _refiner(**kw):
 
 class TestPredictiveRefiner:
     def test_output_shape(self):
-        assert _refiner()(torch.randn(2, 16, 64)).shape == (2, 16, 64)
+        out = _refiner()(torch.randn(2, 16, 64))
+        assert_finite(out, "out")
+        assert out.shape == (2, 16, 64)
 
     def test_output_different(self):
         h = torch.randn(2, 16, 64)
-        assert not torch.allclose(_refiner()(h), h)
+        out = _refiner()(h)
+        assert_finite(out, "out")
+        assert not torch.allclose(out, h)
 
     def test_novelty_float(self):
         r = _refiner()
@@ -37,12 +42,18 @@ class TestPredictiveRefiner:
     def test_no_hep_works(self):
         r = _refiner(hep=False)
         assert r.hep is None
-        assert r(torch.randn(2, 8, 64)).shape == (2, 8, 64)
+        out = r(torch.randn(2, 8, 64))
+        assert_finite(out, "out")
+        assert out.shape == (2, 8, 64)
 
     def test_more_iterations_more_change(self):
         r1 = _refiner(its=1, hep=False)
         r4 = _refiner(its=4, hep=False)
         h = torch.randn(2, 4, 64)
-        d1 = (r1(h) - h).norm().item()
+        out1 = r1(h)
+        out4 = r4(h)
+        assert_finite(out1, "out1")
+        assert_finite(out4, "out4")
+        d1 = (out1 - h).norm().item()
         d4 = (r4(h) - h).norm().item()
         assert d1 > 0 and d4 > 0
