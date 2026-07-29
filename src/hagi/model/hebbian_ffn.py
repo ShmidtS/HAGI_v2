@@ -60,10 +60,10 @@ class HebbianBilinearFFN(nn.Module):
         self.A1 = _proj(hidden_size, m, use_ternary)
         self.W = _proj(m, hidden_size, use_ternary)
         if isinstance(self.W, BitLinear):
-            nn.init.normal_(self.W.weight, std=0.02)
+            nn.init.normal_(self.W.weight, std=1.0 / (m ** 0.5))
         else:
             assert isinstance(self.W, nn.Linear)
-            nn.init.normal_(self.W.weight, std=0.02)
+            nn.init.normal_(self.W.weight, std=1.0 / (m ** 0.5))
         self.gate = nn.Parameter(torch.zeros(hidden_size))
         self.dropout = nn.Dropout(cfg.dropout)
 

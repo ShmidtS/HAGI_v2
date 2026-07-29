@@ -32,6 +32,8 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     model = model.to(dev)
     if cfg.train.precision == "bf16":
         model.to(torch.bfloat16)
+        if hasattr(model, "ensure_fp32_params"):
+            model.ensure_fp32_params()
     model.eval()
     return model, cfg, step, dev
 

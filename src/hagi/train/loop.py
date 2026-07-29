@@ -366,6 +366,8 @@ def train(
 
     if torch.cuda.is_available() and cfg.train.precision == "bf16":
         cast_to_bf16(model)
+        if hasattr(model, "ensure_fp32_params"):
+            model.ensure_fp32_params()
 
     optimizer = build_optimizer(model, cfg)
     if optimizer_state is not None:

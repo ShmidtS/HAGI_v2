@@ -73,12 +73,16 @@ class HAGI(nn.Module):
             norm_eps=m.norm_eps,
         )
 
+        attn_entropy_floor = cfg.train.attn_entropy_floor
+        if attn_entropy_floor <= 0.0:
+            attn_entropy_floor = 1.0 / max(1, m.attention.num_query_heads)
+
         attn_cfg = AttentionConfig(
             num_heads=m.attention.num_query_heads,
             num_kv_heads=m.attention.num_kv_heads,
             head_dim=m.attention.head_dim,
             rope_theta=m.attention.rope_theta,
-            attn_entropy_floor=cfg.train.attn_entropy_floor,
+            attn_entropy_floor=attn_entropy_floor,
         )
         ffn_cfg = HebbianFFNConfig(expansion=body.ternary.hebbian_expansion)
         inter = body.moe.intermediate_size or (body.ternary.hebbian_expansion * H)
@@ -130,7 +134,7 @@ class HAGI(nn.Module):
         self._init_weights()
         for mod in self.modules():
             if hasattr(mod, "set_attn_entropy_floor"):
-                mod.set_attn_entropy_floor(cfg.train.attn_entropy_floor)
+                mod.set_attn_entropy_floor(attn_entropy_floor)
 
     def _init_weights(self) -> None:
         for name, mod in self.named_modules():
@@ -211,6 +215,17 @@ class HAGI(nn.Module):
             if blk.is_moe and blk.moe is not None:
                 blk.moe.commit_ema_update()
 
+    def ensure_fp32_params(self) -> None:
+        """Force KL-critical IB parameters to fp32 after bf16 model cast.
+
+        Must be called AFTER ``cast_to_bf16(model)`` in the training loop.
+        The IB rate and distortion decoders are numerically sensitive at bf16
+        precision — the logvar clamp range and KL rate computation degrade to
+        noise in bf16, causing unbounded rate growth (observed: 0.93 → 4.23
+        over 48000 steps) and CE gradient conflict.
+        """
+        self.bottleneck.ensure_fp32()
+
     def forward(
         self,
         input_ids=None,
@@ -259,8 +274,8 @@ class HAGI(nn.Module):
         # STAGE 2 — UNIFIED ternary stack (the genuine channel).
         h_ctx = self._stack_forward(h, attention_mode, prefix_len, soft_beta, positions)
 
-        # STAGE 3 — auxiliary information bottleneck (off-path).
-        bn_info = self.bottleneck(h_ctx)
+        # STAGE 3 — auxiliary information bottleneck (off-path, no gradient into h_ctx).
+        bn_info = self.bottleneck(h_ctx.detach())
 
         # STAGE 4 — MAIN LM PATH: final norm + factored head on text positions.
         h_dec = self.final_norm(h_ctx)
@@ -283,11 +298,13 @@ class HAGI(nn.Module):
 
         # STAGE 4b — off-path HEP predictive refinement (opt-in). Runs on a CLONE
         # of h_ctx; the main logits come from the UN-refined h_ctx (V25 lesson:
-        # in-path refinement deadlocks from-scratch training). The only gradient
-        # into the refinement branch is the auxiliary refinement loss.
+        # in-path refinement deadlocks from-scratch training). h_ctx.detach()
+        # ensures the only gradient into the refinement branch is the auxiliary
+        # refinement loss — no gradient flows from refinement back into the main
+        # LM hidden.
         if self.refinement_head is not None and self.training:
             ref_loss, _h_refined = self.refinement_head(
-                h_ctx,
+                h_ctx.detach(),
                 main_logits=logits if idx is not None else None,
                 targets=targets if targets is not None else None,
                 prediction_indices=idx,

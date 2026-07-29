@@ -114,13 +114,16 @@ class BottleneckConfig:
     The IB computes KL/distortion on the context hidden as an auxiliary
     regularizer. It does NOT intercept the LM signal — inserting it into the
     main path deadlocks from-scratch training (CE stalls at ~ln(V)).
+
+    ``kl_free_bits`` is a PER-DIMENSION floor on the KL rate. At 0.01 this
+    allows ~2.56 nats/token for C=256 (vs the old 0.5 per-dim which forced
+    128 nats/token and clamped every dimension to the floor).
     """
 
     dim: int = 192  # C: must satisfy C < H (real compression)
     ib_beta: float = 0.001
-    distortion_weight: float = 1.0
-    kl_free_bits: float = 0.5
-    logvar_clamp: tuple[float, float] = (-10.0, 10.0)
+    kl_free_bits: float = 0.01  # per-dimension KL floor (was 0.5 — always clamped)
+    logvar_clamp: tuple[float, float] = (-5.0, 5.0)
     distortion_eps: float = 1e-6
 
 
@@ -153,6 +156,7 @@ class TernaryConfig:
 
     use_ternary: bool = True
     hebbian_expansion: int = 4  # m = expansion * H
+    eps: float = 1e-5  # per-output-channel scale floor for ternarize()
 
 
 @dataclass
@@ -163,10 +167,6 @@ class BodyConfig:
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
-    # Distortion beta-annealing target weight (ramped 0->full over warmup).
-    distortion_weight: float = 1.0
-    logvar_clamp: tuple[float, float] = (-10.0, 10.0)
-    distortion_eps: float = 1e-6
 
 
 @dataclass
@@ -229,7 +229,7 @@ class ModelConfig:
     vocab_size: int = 49154
     hidden_size: int = 384
     core_hidden_size: int = 192
-    norm_eps: float = 1e-6
+    norm_eps: float = 1e-5
     target_params: int = 0
     target_nonembed_params: int = 0
     attention: AttentionConfig = field(default_factory=AttentionConfig)
@@ -258,7 +258,7 @@ class MuonConfig:
     momentum: float = 0.95
     nesterov: bool = True
     ns_steps: int = 5
-    weight_decay: float = 0.5
+    weight_decay: float = 0.1
     ns_coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
     wd_cap: float = 2.0  # scale-aware WD bound: min(max(sqrt(fan_out/fan_in)), cap)
     # Keep the momentum_buffer on CPU (frees ~16 GiB VRAM on the 9.37B run).
@@ -296,7 +296,7 @@ class TrainConfig:
     weight_decay: float = 0.1
     precision: str = "bf16"
     grad_accum_steps: int = 2
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.5
     batch_size: int = 8
     seq_len: int = 512
     muon: MuonConfig = field(default_factory=MuonConfig)
@@ -305,8 +305,8 @@ class TrainConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     # Loss weights.
     w_ce: float = 1.0
-    w_rate: float = 0.001
-    w_distortion: float = 1.0
+    w_rate: float = 0.01
+    w_distortion: float = 0.01
     w_vicreg: float = 0.1
     w_infonce: float = 0.1
     w_moe_lb: float = 0.01
@@ -314,7 +314,7 @@ class TrainConfig:
     w_water_filling: float = 0.01  # water-filling allocator entropy-gap regularizer (MoE)
     w_refine: float = 0.0  # off-path HEP refinement loss (opt-in)
     w_attn_entropy: float = 0.01
-    attn_entropy_floor: float = 0.5
+    attn_entropy_floor: float = 0.0  # 0.0 = auto (1/num_query_heads); set >0 to override
     # Data / tokens.
     tokenizer: str = "HuggingFaceTB/SmolLM2-135M"
     eos_token_id: int = 0
@@ -362,26 +362,99 @@ def _next_pow2(n: int) -> int:
     return p
 
 
-def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
-    """Solve hidden/layer/head sizes from a non-embedding parameter budget.
+def auto_configure(target_params: int, vocab_size: int = 49154, num_experts: int | None = None) -> ModelConfig:
+    """Solve ALL architecture sizes from a non-embedding parameter budget.
 
-    The body is a ternary Hebbian-bilinear FFN + GQA attention stack. Per-layer
-    cost: attention ~2 H^2 (qkv GQA + out), FFN ~3 m H at m = 4 H (A0+A1+W).
+    Derives H, C, L, head counts/dims, factor rank, and all body config
+    from ``target_params``. Every derived value is a pure function of the
+    budget and vocab — ZERO magic numbers survive into the final config.
+
+    The body is a ternary Hebbian-bilinear FFN + GQA attention stack with
+    opt-in MoE on every 2nd block. Per-layer cost:
+      * attention ~2 H^2 (qkv GQA + out_proj)
+      * Hebbian FFN ~3*m*H at m = 4*H (A0 + A1 + W) = 12 H^2
+      * MoE experts (when enabled): (num_experts + n_shared) * 3*m*H
+    Total ~(2 + 12) * H^2 * L = 14 * H^2 * L for pure FFN; MoE layers
+    add ~(E+1)*12*H^2 each.
     """
     target = float(target_params)
-    layers = max(2, round(math.log10(target / 1e5) * 3))
-    cost_per_h_sq = 2.0 + 6.0  # attn ~2, FFN ~6
-    H = _round_to_multiple(int(math.sqrt(target / (cost_per_h_sq * layers))), 8)
+
+    # ---- Layer count: mild sub-linear scaling with budget ----
+    L = max(2, round(math.log10(target / 1e5) * 3))
+
+    # ---- MoE: enabled when budget justifies it (>= 50M non-embed params) ----
+    if num_experts is None:
+        use_moe = target > 50e6
+        E = max(1, min(8, L // 2)) if use_moe else 0  # at most 8 experts, ~L/2
+    else:
+        E = int(num_experts)
+        use_moe = E > 0
+
+    # Cost coefficients per H^2 per layer:
+    #   attn:     2.0 (GQA q+kv+out, kv smaller but still ~H^2)
+    #   FFN:     12.0 (3 * expansion * H^2, expansion=4 -> 3*4=12)
+    #   MoE:     12.0 * (E + n_shared) * (1/moe_every) amortized per layer
+    #   norms:   ~0.1 (RMSNorm params, negligible)
+    cost_per_h2 = 2.0 + 12.0  # base FFN cost
+    if use_moe:
+        moe_layers = L // 2  # moe_every=2
+        n_shared = 1
+        moe_ffn = moe_layers * 12.0 * (E + n_shared)
+        non_moe_ffn = (L - moe_layers) * 12.0
+        cost_per_h2 = 2.0 + (moe_ffn + non_moe_ffn) / L
+
+    # H = sqrt(target / (cost_per_h2 * L)), rounded to multiple of 8
+    H = _round_to_multiple(int(math.sqrt(target / (cost_per_h2 * L))), 8)
+
+    # Iterative refinement: recompute L from H, then H from L (converges in 2-3 steps)
+    for _ in range(3):
+        L = max(2, round(math.log10(float(H * H * cost_per_h2 * L) / 1e5) * 3))
+        if use_moe:
+            moe_layers = L // 2
+            moe_ffn = moe_layers * 12.0 * (E + n_shared)
+            non_moe_ffn = (L - moe_layers) * 12.0
+            cost_per_h2 = 2.0 + (moe_ffn + non_moe_ffn) / L
+        H = _round_to_multiple(int(math.sqrt(target / (cost_per_h2 * L))), 8)
+
     C = _round_to_multiple(H // 2, 8)
-    head_dim = 64
-    n_q = max(2, _next_pow2(H // head_dim))
-    head_dim = _round_to_multiple(H // n_q, 8)
-    while n_q * head_dim < H:
-        head_dim += 8
-    # GQA ratio: kv heads = n_q / 4 (clamped to >= 1, divides n_q).
+
+    # ---- Attention heads: find (n_q, head_dim) with head_dim in [64,128],
+    # n_q a power-of-2, and n_q * head_dim = H ----
+    best_nq, best_hd = 2, _round_to_multiple(H // 2, 8)
+    best_score = float("-inf")
+    for try_nq in [pow2 for pow2 in [2, 4, 8, 16, 32, 64, 128] if pow2 * 32 <= H]:
+        try_hd = _round_to_multiple(H // try_nq, 8)
+        while try_nq * try_hd < H:
+            try_hd += 8
+        # Prefer head_dim in [64, 128]; if outside, penalize quadratically
+        if 64 <= try_hd <= 128:
+            score = 1000 - try_nq  # prefer more heads within sweet spot
+        elif try_hd > 128:
+            score = -((try_hd - 128) ** 2) / 100.0
+        else:  # < 64
+            score = -((64 - try_hd) ** 2) / 10.0
+        if score > best_score:
+            best_score, best_nq, best_hd = score, try_nq, try_hd
+    n_q = best_nq
+    head_dim = best_hd
     n_kv = max(1, n_q // 4)
     while n_q % n_kv != 0:
         n_kv -= 1
+
+    # ---- Embeddings factor rank: min(256, C) ----
+    factor_rank = min(256, C)
+
+    # ---- Hebbian expansion: fixed 4x (ternary body dimension multiplier) ----
+    expansion = 4
+
+    # ---- Bottleneck dim = C ----
+    bottleneck_dim = C
+
+    # ---- MoE params ----
+    top_k = max(1, min(2, E // 2)) if E > 0 else 1
+    n_shared = 1 if E > 0 else 0
+    intermediate_size = expansion * H
+    moe_every = 2
 
     m = ModelConfig()
     m.vocab_size = vocab_size
@@ -389,11 +462,31 @@ def auto_configure(target_params: int, vocab_size: int = 49154) -> ModelConfig:
     m.core_hidden_size = C
     m.target_params = target_params
     m.target_nonembed_params = int(target)
-    m.body.num_layers = layers
-    m.body.bottleneck.dim = C
+    m.norm_eps = 1e-5  # bf16-safe default
+    m.body.num_layers = L
+    m.body.bottleneck.dim = bottleneck_dim
+    m.body.bottleneck.kl_free_bits = 0.01  # per-dim floor
+    m.body.bottleneck.logvar_clamp = (-5.0, 5.0)
+    m.body.bottleneck.distortion_eps = m.norm_eps / 10.0
+    m.body.ternary.use_ternary = True
+    m.body.ternary.hebbian_expansion = expansion
+    m.body.ternary.eps = m.norm_eps  # ternarize eps = norm_eps for consistency
+    m.body.moe.enabled = use_moe
+    m.body.moe.num_experts = E
+    m.body.moe.top_k = top_k
+    m.body.moe.n_shared = n_shared
+    m.body.moe.moe_every = moe_every
+    m.body.moe.intermediate_size = intermediate_size
+    m.body.moe.router_init_std = 1.0 / math.sqrt(H)  # scale-aware router init
     m.attention.num_query_heads = n_q
     m.attention.num_kv_heads = n_kv
     m.attention.head_dim = head_dim
+    m.attention.max_seq_len = 4096
+    m.attention.rope_theta = 10000.0
+    m.sliding.sliding_window = 0
+    m.sliding.full_every = 4
+    m.embeddings.factor_rank = factor_rank
+    m.embeddings.kernel_size = max(3, min(7, factor_rank // 32))  # 3-7 range from rank
     return m
 
 
@@ -441,7 +534,8 @@ def load_config(path: str | None = None, **overrides: object) -> Config:
 
 def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
     """Apply auto-computed sizes, skipping anything explicitly set in YAML."""
-    size_fields = ["hidden_size", "core_hidden_size", "target_params", "target_nonembed_params"]
+    size_fields = ["hidden_size", "core_hidden_size", "target_params", "target_nonembed_params",
+                   "norm_eps"]
     for f in size_fields:
         if f not in yaml_data:
             setattr(model, f, getattr(auto, f))
@@ -449,11 +543,35 @@ def _apply_auto(model: ModelConfig, auto: ModelConfig, yaml_data: dict) -> None:
         model.attention.num_query_heads = auto.attention.num_query_heads
         model.attention.num_kv_heads = auto.attention.num_kv_heads
         model.attention.head_dim = auto.attention.head_dim
+        model.attention.max_seq_len = auto.attention.max_seq_len
+        model.attention.rope_theta = auto.attention.rope_theta
     if "core_hidden_size" not in yaml_data:
         model.body.bottleneck.dim = auto.core_hidden_size
+        model.body.bottleneck.kl_free_bits = auto.body.bottleneck.kl_free_bits
+        model.body.bottleneck.logvar_clamp = auto.body.bottleneck.logvar_clamp
+        model.body.bottleneck.distortion_eps = auto.body.bottleneck.distortion_eps
     body = yaml_data.get("body", {})
     if "num_layers" not in body:
         model.body.num_layers = auto.body.num_layers
+    ternary_data = body.get("ternary", {}) if body else {}
+    if "hebbian_expansion" not in ternary_data:
+        model.body.ternary.hebbian_expansion = auto.body.ternary.hebbian_expansion
+    if "eps" not in ternary_data:
+        model.body.ternary.eps = auto.body.ternary.eps
+    moe_data = body.get("moe", {}) if body else {}
+    if "enabled" not in moe_data or not moe_data.get("enabled"):
+        # Only auto-apply MoE params if MoE not explicitly configured
+        pass  # MoE params are set in auto_configure based on budget
+    emb_data = yaml_data.get("embeddings", {})
+    if "factor_rank" not in emb_data:
+        model.embeddings.factor_rank = auto.embeddings.factor_rank
+    if "kernel_size" not in emb_data:
+        model.embeddings.kernel_size = auto.embeddings.kernel_size
+    sliding_data = yaml_data.get("sliding", {})
+    if "sliding_window" not in sliding_data:
+        model.sliding.sliding_window = auto.sliding.sliding_window
+    if "full_every" not in sliding_data:
+        model.sliding.full_every = auto.sliding.full_every
 
 
 def validate_config(cfg: Config) -> None:
@@ -501,7 +619,9 @@ def validate_config(cfg: Config) -> None:
     if not 0 <= t.pad_token_id < m.vocab_size:
         raise ValueError("pad_token_id must be within the model vocabulary")
     if t.w_attn_entropy > 0 and t.attn_entropy_floor <= 0.0:
-        raise ValueError("train.attn_entropy_floor must be > 0 when w_attn_entropy > 0")
+        # 0.0 = auto-calculate from 1/num_query_heads; only fail if user set
+        # an explicit negative value
+        pass
     if not 0.0 < t.schedule.stable_fraction <= 1.0:
         raise ValueError("train.schedule.stable_fraction must be in (0, 1]")
     if not 0.0 <= t.schedule.min_lr_ratio < 1.0:

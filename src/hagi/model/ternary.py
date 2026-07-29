@@ -128,7 +128,7 @@ class BitLinear(nn.Module):
         self.out_features = out_features
         self.eps = eps
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        nn.init.normal_(self.weight, std=0.02)
+        nn.init.normal_(self.weight, std=1.0 / (in_features ** 0.5))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:

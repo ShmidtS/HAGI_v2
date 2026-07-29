@@ -53,7 +53,7 @@ class WaterFillingAllocator(nn.Module):
         self,
         total_width: int,
         num_experts: int,
-        min_width: int = 64,
+        min_width: int = 0,  # 0 = auto: max(16, total_width // (num_experts * 8))
         temperature: float = 1.0,
         snr_weight: float = 1.0,
     ) -> None:
@@ -69,6 +69,10 @@ class WaterFillingAllocator(nn.Module):
             raise ValueError("temperature must be positive")
         self.total_width = int(total_width)
         self.num_experts = int(num_experts)
+        if min_width <= 0:
+            # auto: at least 16, at most 1/32 of per-expert average width
+            per_expert_avg = max(1, total_width // num_experts)
+            min_width = max(16, per_expert_avg // 32)
         self.min_width = int(min_width)
         self.temperature = float(temperature)
         self.snr_weight = float(snr_weight)
