@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hagi.model.attention import Attention, AttentionConfig, repeat_kv
+from tests.conftest import assert_finite
 
 
 class TestRepeatKV:
@@ -39,18 +40,22 @@ def attn_with_penalty():
 class TestAttentionModes:
     def test_causal(self, attn):
         out, pen = attn(torch.randn(2, 16, 128), "causal")
+        assert_finite(out, "out")
         assert out.shape == (2, 16, 128) and pen is None
 
     def test_bidir(self, attn):
         out, _ = attn(torch.randn(2, 8, 128), "bidir")
+        assert_finite(out, "out")
         assert out.shape == (2, 8, 128)
 
     def test_prefix(self, attn):
         out, _ = attn(torch.randn(2, 12, 128), "prefix", prefix_len=4)
+        assert_finite(out, "out")
         assert out.shape == (2, 12, 128)
 
     def test_soft_causal(self, attn):
         out, _ = attn(torch.randn(2, 10, 128), "soft_causal", soft_beta=2.0)
+        assert_finite(out, "out")
         assert out.shape == (2, 10, 128)
 
     def test_unknown_mode_raises(self, attn):
@@ -74,6 +79,7 @@ class TestSlidingWindow:
     def test_windowed_causal(self, attn):
         attn.sliding_window = 4
         out, _ = attn(torch.randn(2, 16, 128), "causal")
+        assert_finite(out, "out")
         assert out.shape == (2, 16, 128)
 
     def test_windowed_bidir(self, attn):

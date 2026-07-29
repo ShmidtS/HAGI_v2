@@ -33,13 +33,16 @@ formalization/.lake-build.log
 docs/superpowers/
 
 # Python
-__pycache__/
+__pycache__
 .venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 dist/
 tests/
+*.pyc
+
+
 
 # checkpoints and model weights
 checkpoints/

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from hagi.model.hebbian_ffn import HebbianBilinearFFN, HebbianFFNConfig
+from tests.conftest import assert_finite
 
 
 def _ffn(h=64):
@@ -13,11 +14,15 @@ def _ffn(h=64):
 
 class TestHebbianBilinearFFN:
     def test_output_shape(self):
-        assert _ffn()(torch.randn(2, 16, 64)).shape == (2, 16, 64)
+        out = _ffn()(torch.randn(2, 16, 64))
+        assert_finite(out, "out")
+        assert out.shape == (2, 16, 64)
 
     def test_not_identity(self):
         x = torch.randn(2, 16, 64)
-        assert not torch.allclose(_ffn()(x), x)
+        out = _ffn()(x)
+        assert_finite(out, "out")
+        assert not torch.allclose(out, x)
 
     def test_gate_init_zero(self):
         assert (_ffn().gate == 0).all()

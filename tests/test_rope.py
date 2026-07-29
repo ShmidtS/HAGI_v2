@@ -9,6 +9,8 @@ from hagi.model.rope import (
     RotaryEmbedding, apply_rope, rope_cos_sin, rope_cos_sin_2d, rotate_half,
 )
 
+from tests.conftest import assert_finite
+
 
 class TestRotaryEmbedding:
     def test_inv_freq_shape(self):
@@ -16,11 +18,15 @@ class TestRotaryEmbedding:
 
     def test_cos_sin_shape(self):
         cos, sin = RotaryEmbedding(64)(torch.arange(16), torch.device("cpu"), torch.float32)
+        assert_finite(cos, "cos")
+        assert_finite(sin, "sin")
         assert cos.shape == (16, 64)
         assert sin.shape == (16, 64)
 
     def test_cos_sin_in_range(self):
         cos, sin = RotaryEmbedding(64)(torch.arange(8), torch.device("cpu"), torch.float32)
+        assert_finite(cos, "cos")
+        assert_finite(sin, "sin")
         assert (cos >= -1).all() and (cos <= 1).all()
 
     def test_caching(self):
@@ -52,6 +58,8 @@ class TestApplyRoPE:
         k = torch.randn(2, 2, 16, 32)
         cos, sin = rope_cos_sin(torch.arange(16).float(), 32, 10000., torch.device("cpu"), torch.float32)
         qr, kr = apply_rope(q, k, cos, sin)
+        assert_finite(qr, "qr")
+        assert_finite(kr, "kr")
         assert qr.shape == q.shape and kr.shape == k.shape
 
     def test_different_from_input(self):
@@ -59,6 +67,7 @@ class TestApplyRoPE:
         k = torch.ones(1, 2, 4, 16)
         cos, sin = rope_cos_sin(torch.arange(4).float(), 16, 10000., torch.device("cpu"), torch.float32)
         qr, _ = apply_rope(q, k, cos, sin)
+        assert_finite(qr, "qr")
         assert not torch.allclose(qr, q)
 
 

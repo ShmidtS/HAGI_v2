@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hagi.model.water_filling import WaterFillingAllocator
+from tests.conftest import assert_finite
 
 
 @pytest.fixture

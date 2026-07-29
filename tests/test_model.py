@@ -6,6 +6,7 @@ import torch
 
 from hagi.config import Config, auto_configure
 from hagi.model.model import HAGI
+from tests.conftest import assert_finite
 
 
 def _valid_cfg():
@@ -44,6 +45,7 @@ class TestHAGIForward:
         ids = torch.randint(0, 1000, (2, 16))
         vtm = torch.ones(2, 16, dtype=torch.bool)
         out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="causal")
+        assert_finite(out.logits, "logits")
         # Both masks provided -> _gather_logits selects positions -> [B*T, V]
         assert out.logits.shape == (32, 1000)
 
@@ -52,6 +54,7 @@ class TestHAGIForward:
         ids = torch.randint(0, 1000, (2, 8))
         vtm = torch.ones(2, 8, dtype=torch.bool)
         out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="bidir")
+        assert_finite(out.logits, "logits")
         assert out.logits.shape == (16, 1000)
 
     def test_prefix(self):
@@ -59,6 +62,7 @@ class TestHAGIForward:
         ids = torch.randint(0, 1000, (2, 12))
         vtm = torch.ones(2, 12, dtype=torch.bool)
         out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="prefix", prefix_len=4)
+        assert_finite(out.logits, "logits")
         assert out.logits.shape == (24, 1000)
 
     def test_aux_rate_not_none(self):
@@ -66,6 +70,8 @@ class TestHAGIForward:
         out = m(torch.randint(0, 1000, (2, 16)), targets=torch.randint(0, 1000, (2, 16)),
                 prediction_mask=_vtm(16), valid_target_mask=_vtm(16), attention_mode="causal")
         assert out.aux.rate is not None and out.aux.distortion is not None
+        assert_finite(out.aux.rate, "rate")
+        assert_finite(out.aux.distortion, "distortion")
         assert out.aux.moe_lb is None
 
     def test_hidden_shape(self):
@@ -73,6 +79,7 @@ class TestHAGIForward:
         ids = torch.randint(0, 1000, (2, 16))
         out = m(ids, targets=None, prediction_mask=_vtm(16),
                 valid_target_mask=_vtm(16), attention_mode="causal")
+        assert_finite(out.hidden, "hidden")
         assert out.hidden.shape == (2, 16, 256)
 
     def test_no_refinement_when_disabled(self):
@@ -96,6 +103,7 @@ class TestHAGICache:
         m.allocate_for_cache(2, torch.float32, torch.device("cpu"))
         out = m(torch.randint(0, 1000, (2, 16)), targets=None, prediction_mask=_vtm(16),
                 valid_target_mask=_vtm(16), attention_mode="causal")
+        assert_finite(out.logits, "logits")
         assert out.logits is not None
         m.reset_cache()
         assert all(blk.attn._kv_cache is None for blk in m.blocks)
@@ -126,4 +134,5 @@ class TestHAGIInit:
         ids = torch.randint(0, m_cfg.vocab_size, (1, 8))
         vtm = torch.ones(1, 8, dtype=torch.bool)
         out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="causal")
+        assert_finite(out.logits, "logits")
         assert out.logits is not None
