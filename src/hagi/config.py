@@ -283,7 +283,7 @@ class LoggingConfig:
     posterior_interval: int = 20
     posterior_chunk_rows: int = 256
     log_interval: int = 1
-    cache_release_interval: int = 1
+    cache_release_interval: int = 20
 
 
 @dataclass

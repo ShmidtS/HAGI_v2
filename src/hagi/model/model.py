@@ -175,7 +175,7 @@ class HAGI(nn.Module):
         """Run the unified block stack with grad-checkpointing; sum attn-entropy + route-entropy."""
         entropy_pen = None
         route_entropy_acc = None
-        checkpointing = self.training and len(self.blocks) > 1
+        checkpointing = False  # disabled: 168M model fits in VRAM, recompute overhead > benefit
         moe_lb_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         water_filling_acc = h.new_zeros(()) if any(blk.is_moe for blk in self.blocks) else None
         for blk in self.blocks:

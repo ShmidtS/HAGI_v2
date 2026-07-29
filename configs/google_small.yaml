@@ -48,7 +48,7 @@ model:
       num_experts: 4
       top_k: 2
       n_shared: 1
-      moe_every: 2
+      moe_every: 5
 
   refinement:
     enabled: false
