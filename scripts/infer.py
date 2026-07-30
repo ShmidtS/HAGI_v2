@@ -22,6 +22,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
     """Load model + config from checkpoint."""
     from hagi.model.model import HAGI
     from hagi.train.checkpoint import cfg_from_dict, load_checkpoint_payload, load_model_checkpoint
+    from hagi.train.loop import configure_runtime
+
+    configure_runtime()  # ROCm flash attention — must match training path
 
     target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
     ckpt_payload = load_checkpoint_payload(checkpoint_path, "cpu")

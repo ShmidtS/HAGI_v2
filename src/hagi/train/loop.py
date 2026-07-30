@@ -404,6 +404,8 @@ def train(
     while step < cfg.train.max_steps:
         if hasattr(dataloader, "set_optimizer_step"):
             dataloader.set_optimizer_step(step)
+        elif hasattr(dataloader, "dataset") and hasattr(dataloader.dataset, "set_optimizer_step"):
+            dataloader.dataset.set_optimizer_step(step)
         microbatches = list(islice(data_iter, cfg.train.grad_accum_steps))
         if len(microbatches) != cfg.train.grad_accum_steps:
             break
