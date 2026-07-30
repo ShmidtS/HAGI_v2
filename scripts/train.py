@@ -198,10 +198,10 @@ def main() -> int:
             logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
         return 0
 
-    from hagi.data.sequential import build_sequential_dataloader
+    from hagi.data.mixed import build_proportional_dataloader
 
-    dataloader = build_sequential_dataloader(cfg, data_dir=args.data_dir)
-    logger.info(f"Sequential cycling dataloader from {args.data_dir}")
+    dataloader = build_proportional_dataloader(cfg, data_dir=args.data_dir)
+    logger.info(f"Proportional mix dataloader from {args.data_dir}")
 
     from hagi.train.loop import train
 
