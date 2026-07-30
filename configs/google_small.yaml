@@ -22,8 +22,8 @@ model:
     rope_theta: 10000.0
 
   sliding:
-    sliding_window: 512
-    full_every: 4
+    sliding_window: 0
+    full_every: 1
 
   embeddings:
     factor_rank: 128

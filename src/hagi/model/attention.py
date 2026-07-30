@@ -295,7 +295,12 @@ def _build_full_mask(t_total: int, t_q: int, mode: str, prefix_len, soft_beta, s
     # Apply the sliding window on top of the base structure: a query attends to
     # keys within [q - (W-1), q] only. Keys outside the window are masked even
     # if the base structure allowed them.
-    if sliding_window:
+    #
+    # EXCEPTION: when t_q==1 (single-token decode), full attention is used
+    # regardless of the window setting. A single query costs O(t_total) which
+    # is negligible, and cutting off the prompt at single-token decode is
+    # catastrophic — the model literally cannot see the prompt start.
+    if sliding_window and t_q > 1:
         within_window = k_idx.view(1, t_total) >= (q_idx.view(t_q, 1) - (sliding_window - 1))
         mask = mask.masked_fill(~within_window.unsqueeze(0), float("-inf"))
 
