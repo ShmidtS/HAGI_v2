@@ -105,8 +105,11 @@ class HAGI(nn.Module):
 
         self.final_norm = RMSNorm(H, eps=m.norm_eps)
 
-        # ---- Auxiliary information bottleneck (off the main path) ----
-        self.bottleneck = InformationBottleneck(H, body.bottleneck, m.norm_eps)
+        # ---- Auxiliary information bottleneck (off the main path, optional) ----
+        bn_cfg = body.bottleneck
+        self.bottleneck = None
+        if bn_cfg.ib_beta > 0.0 and bn_cfg.dim > 0:
+            self.bottleneck = InformationBottleneck(H, bn_cfg, m.norm_eps)
 
         # ---- CTM-inspired latent memory bank (opt-in, after bottleneck) ----
         bn_cfg = body.bottleneck
@@ -244,7 +247,8 @@ class HAGI(nn.Module):
         from 1.0 is ~0.0078). Keeping them in fp32 allows AdamW to accumulate
         small updates across steps.
         """
-        self.bottleneck.ensure_fp32()
+        if self.bottleneck is not None:
+            self.bottleneck.ensure_fp32()
         for mod in self.modules():
             if isinstance(mod, RMSNorm) and hasattr(mod, 'weight'):
                 mod.weight.data = mod.weight.data.to(torch.float32)
@@ -299,10 +303,13 @@ class HAGI(nn.Module):
         h_ctx = self._stack_forward(h, attention_mode, prefix_len, soft_beta, positions, compute_attn_entropy=compute_attn_entropy)
 
         # STAGE 3 — auxiliary information bottleneck (off-path, no gradient into h_ctx).
-        bn_info = self.bottleneck(h_ctx.detach())
+        if self.bottleneck is not None:
+            bn_info = self.bottleneck(h_ctx.detach())
+        else:
+            bn_info = {"rate": None, "distortion": None, "ib_iters": 0, "z": None}
 
         # STAGE 3b — latent memory bank: cross-attend h_ctx over recent z states.
-        if self.memory_bank is not None:
+        if self.memory_bank is not None and bn_info["z"] is not None:
             z_latent = bn_info["z"]
             h_ctx = self.memory_bank(h_ctx, z_latent)
 
@@ -320,7 +327,7 @@ class HAGI(nn.Module):
         aux = AuxLosses()
         aux.rate = bn_info["rate"]
         aux.distortion = bn_info["distortion"]
-        aux.ib_iters = bn_info.get("ib_iters", 1)
+        aux.ib_iters = bn_info.get("ib_iters", 0)
         aux.moe_lb = getattr(self, "_last_moe_lb", None)
         aux.route_entropy = getattr(self, "_last_route_entropy", None)
         aux.water_filling = getattr(self, "_last_water_filling", None)

@@ -42,7 +42,7 @@ model:
       hebbian_expansion: 4
     bottleneck:
       dim: 256
-      ib_beta: 0.001
+      ib_beta: 0.0                # disabled — posterior collapse at step 8k (rate→0.02, h_hat≈0)
       # Iterative IB refinement (CTM-inspired, off — IB posterior-collapsed at step 16k).
       iterative_ib_enabled: false
       ib_max_iters: 1
