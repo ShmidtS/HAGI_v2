@@ -1,10 +1,10 @@
-"""HAGI training entry point. All params come from the YAML config.
+"""Training entry point. Every parameter comes from the YAML config.
 
 Usage:
-    python scripts/train.py --config configs/smollm2.yaml
-    python scripts/train.py --dry-run
-    python scripts/train.py --no-distill
-    python scripts/train.py --data-dir data --steps 50000
+    python scripts/train.py --config configs/v31_1b.yaml
+    python scripts/train.py --config configs/v31_1b.yaml --dry-run
+    python scripts/train.py --config configs/v31_1b.yaml --resume
+    python scripts/train.py --config configs/v31_1b.yaml --steps 500 --profile 3
 """
 
 from __future__ import annotations
@@ -13,250 +13,222 @@ import os
 import sys
 from pathlib import Path
 
-# Bootstrap: make `hagi` importable when run as `python scripts/train.py`
-# (no PYTHONPATH / installed package required). Must precede any hagi import.
-_REPO_SRC = Path(__file__).resolve().parent.parent / "src"
-if str(_REPO_SRC) not in sys.path:
-    sys.path.insert(0, str(_REPO_SRC))
+# Make `hagi` importable when run directly, before any hagi import.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-# gfx1151 (Radeon 8060S): enable experimental AOTriton kernels before torch
-# loads. setdefault so the caller can still override per-run.
+# Must precede `import torch`: the allocator and the ROCm kernel selection read
+# these at initialization.
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-# Offline HF cache: teachers live in the local cache, no network egress needed.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-# NOTE: expandable_segments is deliberately NOT set here. On ROCm Windows
-# gfx1151 (Radeon 8060S APU) it causes VA-space exhaustion — .to(device) OOMs
-# on a 64 MiB request with 94 GiB physically free (the allocator maps huge
-# VA segments that hit the per-process VA limit, not the memory limit).
-# Fragmentation from the 16x grad-accum backward churn is handled instead by
-# an empty_cache() immediately before optimizer.step (see loop.train_step),
-# which releases the transient recomputation tensors without reserving VA.
-# Must precede `import torch` (allocator init). setdefault respects a caller
-# override.
 
-import argparse
-import logging
-import math
-from datetime import datetime
+import argparse  # noqa: E402
+import logging  # noqa: E402
+from datetime import datetime  # noqa: E402
 
-import torch
+import torch  # noqa: E402
 
-# ROCm Windows torch ships without torch._C._distributed_c10d, so transformers
-# 5.x (Gemma-4) eager-imports of FSDP/DTensor crash at import time. Install the
-# no-op stubs before any transformers symbol is referenced. No-op on builds
-# where real distributed torch is available.
-from hagi.train._rocm_fsdp_stub import install as _install_rocm_fsdp_stub  # noqa: E402
+# ROCm Windows torch ships without torch._C._distributed_c10d, so transformers'
+# eager FSDP/DTensor imports crash at import time. No-op elsewhere.
+from hagi.train._rocm_fsdp_stub import install as install_rocm_stub  # noqa: E402
 
-_install_rocm_fsdp_stub()
-
-
-def setup_file_logging(log_dir: str = "logs") -> str:
-    """Add file handler to root logger. Returns log file path."""
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = f"{log_dir}/train_{timestamp}.log"
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-    return log_path
-
+install_rocm_stub()
 
 logger = logging.getLogger(__name__)
 
 
-def format_training_metrics(metrics: dict) -> str:
-    line = (
-        f"step {metrics['step']} | loss={metrics['loss']:.4f} | bpt={metrics.get('bpt', float('nan')):.2f} | "
-        f"lr={metrics['lr']:.6f} | grad={metrics['grad_norm']:.3f} | "
-        f"conf={metrics.get('avg_confidence', 0.0):.3f} | "
-        f"masked_ce={metrics.get('masked_ce', float('nan')):.4f} | "
-        f"rate={metrics.get('rate', float('nan')):.4f} | "
-        f"distortion={metrics.get('distortion', float('nan')):.4f} | "
-        f"entropy={metrics.get('posterior_entropy', float('nan')):.4f}"
+def setup_logging(log_dir: str) -> str:
+    """Log to stderr and to a timestamped file. Returns the file path."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    path = f"{log_dir}/train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    for handler in (logging.StreamHandler(), logging.FileHandler(path, encoding="utf-8")):
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
+    return path
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def dry_run(model, cfg, device: torch.device) -> int:
+    """One forward/backward on synthetic data: shapes, loss sanity, peak memory.
+
+    The check that matters is ``ce`` against the right baseline, and the baseline
+    depends on how the targets were drawn:
+
+    * Targets drawn **uniformly** — an untrained model without a source prior sits
+      at ``ln V``. With a unigram prior it sits far *above* ``ln V``, because a
+      uniformly drawn target is by construction improbable under the corpus
+      marginal. That is correct behaviour, not a failure.
+    * Targets drawn from the **unigram distribution** — the model sits at the
+      unigram entropy, which is the honest zero-order baseline and the number the
+      real corpus will start from.
+
+    So the targets are sampled from the model's own prior when one is loaded. A
+    value materially above the corresponding baseline means the head or the target
+    alignment is wrong, and catching that here costs seconds instead of hours.
+    """
+    import math
+
+    from hagi.train.loop import cast_model
+
+    cast_model(model, cfg.train.precision)
+    batch, seq = 2, min(cfg.train.data.seq_len, 256)
+    ids = torch.randint(0, cfg.model.vocab_size, (batch, seq), device=device)
+    doc_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
+    doc_ids[:, seq // 2 :] = 1
+
+    prior = getattr(model.head, "log_prior", None)
+    if prior is not None:
+        probs = prior.detach().float().exp()
+        targets = torch.multinomial(probs, batch * seq, replacement=True).view(batch, seq).to(device)
+        baseline = float(-(probs * prior.detach().float()).sum())
+        baseline_name = "unigram entropy"
+    else:
+        targets = torch.randint(0, cfg.model.vocab_size, (batch, seq), device=device)
+        baseline = math.log(cfg.model.vocab_size)
+        baseline_name = "ln V"
+
+    model.train()
+    output = model(ids, targets, doc_ids=doc_ids)
+    ce = float(output.ce.detach())
+    output.loss.backward()
+
+    logger.info(
+        "dry run: loss=%.4f ce=%.4f (%s baseline %.4f) z=%.4f tokens=%d",
+        float(output.loss.detach()),
+        ce,
+        baseline_name,
+        baseline,
+        float(output.z_loss.detach()),
+        output.n_tokens,
     )
-    moe_lb = metrics.get('moe_lb', float('nan'))
-    route_ent = metrics.get('route_entropy', float('nan'))
-    wf = metrics.get('water_filling', float('nan'))
-    ib_iters = metrics.get('ib_iters', float('nan'))
-    mem_usage = metrics.get('memory_usage', None)
-    if not (math.isnan(moe_lb) and math.isnan(route_ent) and math.isnan(wf)):
-        line += f" | moe_lb={moe_lb:.4f} | rout_ent={route_ent:.4f} | wf={wf:.4f}"
-    if not math.isnan(ib_iters):
-        line += f" | ib_i={ib_iters:.1f}"
-    if mem_usage is not None and not math.isnan(mem_usage):
-        line += f" | mem={mem_usage:.2f}"
-    return line
+    if ce > baseline * 1.10:
+        logger.warning("ce exceeds the %s baseline by >10%% at init — check target alignment", baseline_name)
+
+    without_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    if without_grad:
+        logger.error("parameters received no gradient: %s", without_grad[:20])
+        return 1
+    logger.info("all %d trainable parameters received gradient", sum(1 for _ in model.parameters()))
+
+    if device.type == "cuda":
+        logger.info("peak VRAM: %.3f GB", torch.cuda.max_memory_allocated() / 1e9)
+    return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="HAGI training on real data")
-    parser.add_argument("--config", default="configs/smollm2.yaml")
-    parser.add_argument("--data-dir", default="data", help="Directory with .bin files + mix.json")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--steps", type=int, default=None, help="Override max_steps")
+    parser = argparse.ArgumentParser(description="Train the HAGI channel language model")
+    parser.add_argument("--config", default="configs/v31_1b.yaml")
+    parser.add_argument("--data-dir", default=None, help="overrides train.data.data_dir")
+    parser.add_argument("--steps", type=int, default=None, help="overrides train.max_steps")
+    parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--no-distill", action="store_true")
-    parser.add_argument("--no-embed-transfer", action="store_true")
-    parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory")
-    parser.add_argument("--log-dir", default="logs", help="Directory for log files")
+    parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--resume",
-        nargs="?",
-        const="latest",
-        default=None,
-        help="Resume from checkpoint. Bare '--resume' picks the latest step-*.pt.",
+        "--resume", nargs="?", const="latest", default=None, help="path, or bare flag for the latest"
     )
-    parser.add_argument(
-        "--profile",
-        type=int,
-        default=0,
-        help="Profile the first N training steps: dump a chrome trace + an operator table ranked by self CUDA time. 0 = off.",
-    )
+    parser.add_argument("--profile", type=int, default=0, help="profile the first N steps; 0 = off")
     args = parser.parse_args()
 
-    log_path = setup_file_logging(args.log_dir)
-    logger.info(f"Log file: {log_path}")
+    log_path = setup_logging(args.log_dir)
+    logger.info("log file: %s", log_path)
 
-    from hagi.config import load_config
+    from hagi.config import describe, load_config
     from hagi.model.model import HAGI
+    from hagi.version import __architecture__, __version__
 
-    overrides = {}
+    overrides: dict[str, object] = {}
     if args.steps is not None:
         overrides["train.max_steps"] = args.steps
-    if args.no_distill:
-        overrides["train.distill.enabled"] = False
     if args.checkpoint_dir is not None:
         overrides["train.checkpoint_dir"] = args.checkpoint_dir
-    cfg = load_config(path=args.config, **overrides)
+    if args.data_dir is not None:
+        overrides["train.data.data_dir"] = args.data_dir
+    cfg = load_config(args.config, **overrides)
 
-    from hagi.train.checkpoint import assert_fresh_checkpoint_root, latest_checkpoint, load_checkpoint_payload
-
-    assert_fresh_checkpoint_root(cfg.train.checkpoint_dir)
-
-    device = torch.device(
-        "cuda"
-        if args.device == "auto" and torch.cuda.is_available()
-        else ("cpu" if args.device == "auto" else args.device)
-    )
-    logger.info(f"Device: {device} | Config: {args.config} | Data: {args.data_dir}")
-
-    teacher = None
-    if cfg.train.distill.enabled is True:
-        from hagi.train.distillation import create_distillation_teacher
-
-        teacher = create_distillation_teacher(cfg, device)
+    device = resolve_device(args.device)
+    logger.info("hagi %s (%s) | device %s | config %s", __version__, __architecture__, device, args.config)
+    for line in describe(cfg).splitlines():
+        logger.info("  %s", line)
 
     model = HAGI(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Parameters: {n_params / 1e6:.1f}M")
+    counts = model.param_summary()
+    logger.info(
+        "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",
+        counts["total"] / 1e6,
+        counts["body"] / 1e6,
+        counts["embedding"] / 1e6,
+        counts["active_body"] / 1e6,
+    )
 
     start_step = 0
     optimizer_state = None
     if args.resume is not None:
-        from hagi.train.checkpoint import load_model_checkpoint
+        from hagi.train.checkpoint import latest_checkpoint, load_model, load_payload
 
-        ckpt_path = args.resume if args.resume != "latest" else latest_checkpoint(cfg.train.checkpoint_dir)
-        if ckpt_path is None:
-            raise FileNotFoundError(f"--resume: no step-*.pt found in {cfg.train.checkpoint_dir}")
-        completed, _ = load_model_checkpoint(ckpt_path, model, str(device))
-        start_step = completed
-        optimizer_state = load_checkpoint_payload(ckpt_path, str(device)).get("optimizer")
-        logger.info(f"Resumed from {ckpt_path} at step {completed} (optimizer state: {'yes' if optimizer_state else 'no'})")
-
-    if cfg.train.distill.enabled is True and not args.no_embed_transfer and start_step == 0:
-        from hagi.train.distillation import transfer_embeddings
-
-        transfer_embeddings(model, cfg.train.distill.embed_teacher)
+        path = args.resume if args.resume != "latest" else latest_checkpoint(cfg.train.checkpoint_dir)
+        if path is None:
+            raise FileNotFoundError(f"--resume: no step-*.pt in {cfg.train.checkpoint_dir}")
+        start_step, _ = load_model(path, model, str(device))
+        optimizer_state = load_payload(path, str(device)).get("optimizer")
+        logger.info(
+            "resumed %s at step %d (optimizer state: %s)",
+            path,
+            start_step,
+            "yes" if optimizer_state else "no — expect a loss spike",
+        )
 
     if args.dry_run:
-        B, T = 2, min(cfg.train.seq_len, 128)
-        input_ids = torch.randint(0, cfg.model.vocab_size, (B, T), device=device)
-        valid_target_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        from hagi.train.losses import LossAggregator
+        return dry_run(model, cfg, device)
 
-        aggregator = LossAggregator(cfg)
-        model.train()
-        output = model(
-            input_ids,
-            targets=input_ids.clone(),
-            prediction_mask=valid_target_mask,
-            valid_target_mask=valid_target_mask,
-            attention_mode="causal",
-        )
-        total_loss = aggregator(output, step=0)
-        logger.info(f"Loss: {total_loss.item():.4f}")
-        if device.type == "cuda":
-            logger.info(f"VRAM: {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
-        return 0
+    from hagi.data.dataset import build_dataloader
+    from hagi.train.loop import format_metrics, train
 
-    from hagi.data.mixed import build_proportional_dataloader
-
-    dataloader = build_proportional_dataloader(cfg, data_dir=args.data_dir)
-    logger.info(f"Proportional mix dataloader from {args.data_dir}")
-
-    from hagi.train.loop import train
-
-    logger.info(f"Training: {cfg.train.max_steps} steps, B={cfg.train.batch_size} T={cfg.train.seq_len}")
-    if teacher is not None and teacher.is_loaded:
-        distill_end = int(cfg.train.max_steps * cfg.train.distill.end_frac)
-        logger.info(
-            f"Distillation: steps 0->{distill_end} "
-            f"(alpha {cfg.train.distill.alpha_start}->{cfg.train.distill.alpha_end}, T={cfg.train.distill.temperature})"
-        )
+    dataloader = build_dataloader(cfg, args.data_dir)
+    tokens_per_step = cfg.train.batch_size * cfg.train.grad_accum_steps * cfg.train.data.seq_len
+    logger.info(
+        "training %d steps | %d tokens/step | %.2fB tokens total",
+        cfg.train.max_steps,
+        tokens_per_step,
+        tokens_per_step * cfg.train.max_steps / 1e9,
+    )
 
     if args.profile > 0:
         from torch.profiler import ProfilerActivity, profile, schedule
 
-        n_prof = int(args.profile)
-        # Skip step 0 (AOTriton autotune warmup inflates it). Profile the next
-        # n_prof optimizer steps; each step = grad_accum_steps micro-batches, so
-        # schedule needs wait=1 + warmup=grad_accum + active=grad_accum*n_prof.
-        ga = cfg.train.grad_accum_steps
-        sched = schedule(wait=1, warmup=ga, active=max(ga * n_prof, 1), repeat=1)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        trace_path = f"logs/profile_{ts}.json"
-        logger.info(f"Profiling first {n_prof} steps (skip step 0) -> {trace_path}")
+        accum = cfg.train.grad_accum_steps
+        trace = f"{args.log_dir}/profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        logger.info("profiling %d steps (step 0 skipped: kernel autotune) -> %s", args.profile, trace)
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=sched,
-            on_trace_ready=lambda p: (
-                p.export_chrome_trace(trace_path),
-                logger.info(f"trace saved: {trace_path}"),
-            ),
+            schedule=schedule(wait=1, warmup=accum, active=max(accum * args.profile, 1), repeat=1),
+            on_trace_ready=lambda p: p.export_chrome_trace(trace),
         ) as prof:
-            step_i = 0
-            for metrics in train(
-                model, dataloader, cfg, teacher=teacher,
-                start_step=start_step, optimizer_state=optimizer_state,
+            for index, metrics in enumerate(
+                train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state)
             ):
-                logger.info(format_training_metrics(metrics))
+                logger.info(format_metrics(metrics))
                 prof.step()
-                step_i += 1
-                if step_i >= n_prof + 1:
+                if index >= args.profile:
                     break
-        # Operator table ranked by self CUDA time — the actual bottleneck.
-        logger.info("=== top-25 operators by self CUDA time (ms) ===")
         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
-        logger.info("Training complete (profiled).")
         return 0
 
-    for metrics in train(
-        model, dataloader, cfg, teacher=teacher,
-        start_step=start_step, optimizer_state=optimizer_state,
-    ):
-        logger.info(format_training_metrics(metrics))
-    logger.info("Training complete.")
+    for metrics in train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state):
+        logger.info(format_metrics(metrics))
+    logger.info("training complete")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

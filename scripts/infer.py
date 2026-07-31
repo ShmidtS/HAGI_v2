@@ -1,146 +1,150 @@
-"""HAGI inference — load checkpoint and generate text.
+"""
+Интерактивный диалог с HAGI v31.
 
-Usage:
-    python scripts/infer.py --checkpoint checkpoints/step-001000.pt
-    python scripts/infer.py --checkpoint checkpoints/step-001000.pt --prompt "Once upon a time"
-    python scripts/infer.py --checkpoint checkpoints/step-001000.pt --interactive
+- Устройство выбирается автоматически: cuda (ROCm/NVIDIA), иначе cpu.
+- Непрерывный цикл: после ответа снова спрашивает prompt.
+- История диалога сохраняется и подставляется в контекст каждого следующего
+  запроса (с обрезкой до attention.max_seq_len).
+
+Примеры:
+  python scripts/infer.py --checkpoint checkpoints_v31_1b/step-0030000.pt
+  python scripts/infer.py --checkpoint_dir checkpoints_v31_1b --max_tokens 256
+  python scripts/infer.py --checkpoint ... --prompt "Привет" --device cuda
+
+Выход из диалога: пустая строка, "exit", "quit" или Ctrl+C.
 """
 
-from __future__ import annotations
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import argparse
-import logging
-import sys
+import os
+
+# Включить экспериментальный flash-attention на AMD ROCm (как в train.py),
+# иначе SDPA падает на медленный math-бэкенд.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 import torch
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+from hagi.config import load_config
+from hagi.inference.generate import generate
+from hagi.model.model import HAGI
+from hagi.train.loop import cast_model
+
+try:
+    import gigatoken as gt
+except ImportError:
+    print("Требуется gigatoken: pip install gigatoken")
+    sys.exit(1)
 
 
-def load_model_from_checkpoint(checkpoint_path: str, device: str = "auto"):
-    """Load model + config from checkpoint."""
-    from hagi.model.model import HAGI
-    from hagi.train.checkpoint import cfg_from_dict, load_checkpoint_payload, load_model_checkpoint
-    from hagi.train.loop import configure_runtime
-
-    configure_runtime()  # ROCm flash attention — must match training path
-
-    target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
-    ckpt_payload = load_checkpoint_payload(checkpoint_path, "cpu")
-    cfg = cfg_from_dict(ckpt_payload["config"])
-    dev = torch.device(target)
-    model = HAGI(cfg)
-    step, cfg = load_model_checkpoint(checkpoint_path, model, "cpu")
-    model = model.to(dev)
-    if cfg.train.precision == "bf16":
-        model.to(torch.bfloat16)
-        if hasattr(model, "ensure_fp32_params"):
-            model.ensure_fp32_params()
-    model.eval()
-    return model, cfg, step, dev
+def find_latest_ckpt(ckpt_dir: str) -> Path | None:
+    pts = sorted(Path(ckpt_dir).glob("step-*.pt"), key=lambda p: int(p.stem.split("-")[-1]))
+    return pts[-1] if pts else None
 
 
-def tokens_to_text(token_ids: torch.Tensor, tokenizer) -> str:
-    """Decode token IDs through the checkpoint tokenizer."""
-    return tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+def resolve_ckpt(args) -> Path:
+    if args.checkpoint is not None:
+        return Path(args.checkpoint)
+    if args.checkpoint_dir is not None:
+        path = find_latest_ckpt(args.checkpoint_dir)
+        if path is None:
+            print(f"В {args.checkpoint_dir} нет checkpoint-ов")
+            sys.exit(1)
+        return path
+    print("Укажите --checkpoint или --checkpoint_dir")
+    sys.exit(1)
 
 
-def text_to_tokens(text: str, tokenizer, device: str = "cuda") -> torch.Tensor:
-    """Encode text to token IDs (no BOS — model trained on raw chunks)."""
-    ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False)
-    return ids.to(device)
-
-
-def build_generation_kwargs(args, inference_cfg, eos_token_id: int, pad_token_id: int, forbidden_token_ids: tuple[int, ...]):
-    """Build generation settings from checkpoint config plus explicit CLI overrides."""
-    return {
-        "max_new_tokens": args.max_tokens if args.max_tokens is not None else inference_cfg.max_new_tokens,
-        "eos_token_id": eos_token_id,
-        "pad_token_id": pad_token_id,
-        "forbidden_token_ids": forbidden_token_ids,
-        "min_new_tokens": inference_cfg.min_new_tokens,
-        "temperature": args.temperature if args.temperature is not None else inference_cfg.temperature,
-        "top_k": args.top_k if args.top_k is not None else inference_cfg.top_k,
-        "repetition_penalty": inference_cfg.repetition_penalty,
-        "repetition_window": inference_cfg.repetition_window,
-        "no_repeat_ngram_size": inference_cfg.no_repeat_ngram_size,
-    }
+def decode_text(tokenizer, ids) -> str:
+    """gigatoken.decode возвращает bytes — приводим к UTF-8 строке."""
+    raw = tokenizer.decode(ids)
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
 
 
 def main() -> int:
-    import sys
-    if sys.stdout.encoding != "utf-8":
-        sys.stdout.reconfigure(encoding="utf-8")  # Windows cp1251 → utf-8
+    ap = argparse.ArgumentParser(description="Интерактивный диалог HAGI v31")
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--checkpoint_dir", default=None)
+    ap.add_argument("--config", default="configs/v31_1b.yaml")
+    ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
+    ap.add_argument("--prompt", default=None, help="первый prompt (иначе интерактив)")
+    ap.add_argument("--max_tokens", type=int, default=128)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top_k", type=int, default=50)
+    ap.add_argument("--top_p", type=float, default=0.95)
+    ap.add_argument("--repetition_penalty", type=float, default=1.05)
+    args = ap.parse_args()
 
-    from hagi.data.tokenizer import load_tokenizer
-    from hagi.inference.generate import generate
-
-    parser = argparse.ArgumentParser(description="HAGI inference")
-    parser.add_argument("--checkpoint", default="checkpoints/step-001000.pt")
-    parser.add_argument("--prompt", default="Once upon a time", help="Text prompt")
-    parser.add_argument("--interactive", action="store_true", help="Interactive REPL mode")
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Override config generated-token cap")
-    parser.add_argument("--temperature", type=float, default=None, help="Override config temperature")
-    parser.add_argument("--top-k", type=int, default=None, help="Override config top_k")
-    parser.add_argument("--tokenizer", default=None, help="Tokenizer name (auto-detected from checkpoint config)")
-    args = parser.parse_args()
-
-    model, cfg, step, dev = load_model_from_checkpoint(args.checkpoint, args.device)
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Loaded checkpoint: step {step} | {n_params / 1e6:.1f}M params | device: {dev}")
-
-    tokenizer_name = args.tokenizer or cfg.train.tokenizer
-    logger.info(f"Using tokenizer: {tokenizer_name}")
-
-    tokenizer = load_tokenizer(tokenizer_name, local_files_only=True)
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is None:
-        raise ValueError("tokenizer must define eos_token_id")
-    pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = cfg.train.pad_token_id
-    if eos_token_id != cfg.train.eos_token_id:
-        raise ValueError(f"tokenizer eos_token_id {eos_token_id} != checkpoint {cfg.train.eos_token_id}")
-    if pad_token_id != cfg.train.pad_token_id:
-        raise ValueError(f"pad_token_id {pad_token_id} != checkpoint {cfg.train.pad_token_id}")
-    forbidden_token_ids = tuple(
-        token_id for token_id in tokenizer.all_special_ids if token_id not in (eos_token_id, pad_token_id)
+    device = torch.device(args.device) if args.device != "auto" else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
+    print(f"device: {device}")
 
-    gen_kwargs = build_generation_kwargs(args, cfg.inference, eos_token_id, pad_token_id, forbidden_token_ids)
+    cfg = load_config(args.config)
+    max_seq_len = cfg.model.attention.max_seq_len
+    budget = max_seq_len - args.max_tokens  # сколько токенов истории влезает
+    if budget < 8:
+        print(f"max_tokens {args.max_tokens} почти равен max_seq_len {max_seq_len}; уменьшите max_tokens")
+        return 1
 
-    if args.interactive:
-        logger.info("Interactive mode. Type 'quit' to exit.")
+    ckpt_path = resolve_ckpt(args)
+    model = HAGI(cfg).to(device)
+    state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
+    model.load_state_dict(state["model"] if "model" in state else state, strict=True)
+    cast_model(model, cfg.train.precision)  # bf16 + fp32-гейны, как в обучении
+    model.eval()
+
+    tokenizer = gt.Tokenizer(cfg.train.tokenizer)
+    history: list[int] = []  # все токены диалога (user + assistant)
+
+    def encode(text: str) -> list[int]:
+        """gigatoken.encode может вернуть np.ndarray — нормализуем в list[int]."""
+        raw = tokenizer.encode(text)
+        return list(raw) if not isinstance(raw, list) else raw
+
+    def run_turn(user_ids: list[int]) -> list[int]:
+        """Один запрос с полной историей в контексте. Возвращает новые токены."""
+        context = (history + user_ids)[-budget:]
+        prompt_tensor = torch.tensor([context], dtype=torch.long, device=device)
+        output = generate(
+            model, prompt_tensor,
+            max_new_tokens=args.max_tokens,
+            eos_token_id=cfg.train.data.eos_token_id,
+            pad_token_id=cfg.train.data.pad_token_id,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+        )
+        full = output.token_ids[0].tolist()
+        return full[len(context):]
+
+    try:
+        if args.prompt is not None:
+            user_ids = encode(args.prompt)
+            new = run_turn(user_ids)
+            history.extend(user_ids + new)
+            print(decode_text(tokenizer, new))
         while True:
             try:
-                prompt = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
+                text = input("\n> ")
+            except EOFError:
                 break
-            if prompt.lower() in ("quit", "exit", "q"):
+            if not text.strip() or text.strip().lower() in {"exit", "quit", "q"}:
                 break
-            if not prompt:
-                continue
-            prompt_ids = text_to_tokens(prompt, tokenizer, str(dev))
-            if prompt_ids.shape[1] == 0:
-                continue
-            output = generate(model, prompt_ids, **gen_kwargs)
-            generated = output.token_ids[0, prompt_ids.shape[1]: prompt_ids.shape[1] + output.generated_lengths[0]]
-            response = tokens_to_text(generated, tokenizer)
-            print(f"HAGI: {response}")
-        return 0
-
-    prompt_ids = text_to_tokens(args.prompt, tokenizer, str(dev))
-    logger.info(f"Prompt: {args.prompt} ({prompt_ids.shape[1]} tokens)")
-    output = generate(model, prompt_ids, **gen_kwargs)
-    generated_length = output.generated_lengths[0].item()
-    generated = output.token_ids[0, prompt_ids.shape[1]: prompt_ids.shape[1] + generated_length]
-    response = tokens_to_text(generated, tokenizer)
-    logger.info(f"Generated {generated_length} tokens:")
-    print(response)
+            user_ids = encode(text)
+            new = run_turn(user_ids)
+            history.extend(user_ids + new)
+            print(decode_text(tokenizer, new))
+    except KeyboardInterrupt:
+        print("\n(прервано)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

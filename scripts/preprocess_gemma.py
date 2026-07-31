@@ -15,12 +15,13 @@ extend is amortized O(1), so this is O(n) overall (no np.append O(n^2)).
 Usage: python scripts/preprocess_gemma.py [name1 name2 ...]
   (no args -> process all *.jsonl present in data/raw/)
 """
+import glob
+import json
 import os
 import sys
-import json
 import time
-import glob
 from array import array
+
 import gigatoken as gt
 
 RAW_DIR = r"C:\HAGI_v2\data\raw"
@@ -72,7 +73,7 @@ def process_file(tok, name):
 
     open(op, "wb").close()
     t0 = time.time()
-    with open(rp, "r", encoding="utf-8", errors="replace") as fin, \
+    with open(rp, encoding="utf-8", errors="replace") as fin, \
          open(op, "ab") as fout:
         for line in fin:
             line = line.strip()

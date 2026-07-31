@@ -1,16 +1,23 @@
-"""Training loop for the codec-channel LM.
+"""Training loop.
 
-The model is a CAUSAL generative LM: every batch trains next-token prediction
-with a causal (or causal-dominant) attention mask, exactly matching the
-inference path. There is no bidir-MLM/suffix/parity/AWGN machinery — those
-belonged to the abandoned self-inflicted-channel design and broke the
-train/infer alignment.
+One objective, computed once per microbatch. There is no loss aggregator, no
+beta-anneal, no attention-mode curriculum and no distillation teacher — every one
+of those existed in V28 and every one was disabled in both shipped configs.
 
-Causal is the inference regime and dominant from step 0. A small opt-in
-soft_causal/bidir slice (``attention_curriculum``-style mixing) adds a denser
-representation gradient early and is ramped out by mid-training — kept OFF by
-default for the cleanest train/infer alignment (V25 root-cause #2 of garbage
-was bidir-first warmup).
+The loop's real job is to make failure *visible*. A language model that is
+diverging looks exactly like one that is training slowly, for thousands of steps,
+unless you are watching the right observables. The three that matter here:
+
+* ``ce`` in nats/token, against the measured unigram entropy of 8.06 nats. A
+  model above that is worse than counting token frequencies.
+* ``qk_gain`` — the mean QK-norm gain. Rising means the correlator is heading for
+  saturation, which is the V30 failure (ce 2.32 at step 19k, 6.6 at step 53k).
+* ``moe/entropy_ratio`` — the usable fraction of expert channels. Falling toward
+  ``1/E`` means routing has collapsed and most parameters are dead.
+
+Gradient accumulation weights each microbatch by its scored-token count, so
+microbatches of unequal size (packed windows with different loss masks) average
+correctly instead of over-weighting sparse ones.
 """
 
 from __future__ import annotations
@@ -18,416 +25,286 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator
-from itertools import islice
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hagi.config import Config
-from hagi.model.exit_chart import EXITChartHalt
-from hagi.train.losses import LossAggregator
-from hagi.train.optim import CombinedOptimizer, build_optimizer
+from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 
 logger = logging.getLogger(__name__)
 
 
-def _build_exit_halt(cfg: Config) -> EXITChartHalt:
-    """EXIT-chart halt for the distortion beta-anneal (refinement convergence)."""
-    rc = cfg.model.refinement
-    return EXITChartHalt(rc.exit_threshold, rc.exit_min_steps, rc.exit_window)
-
-
 def configure_runtime() -> None:
+    """Set backend flags that materially change throughput."""
     import os
 
-    # ROCm AMD flash attention (AOTriton). Without this, SDPA falls back to the
-    # math backend — bmm + softmax + bmm per attention head — which is 2-3x
-    # slower than the fused flash kernel. gfx1151 (Radeon 8060S) supports it.
+    # ROCm flash-attention kernels. Without this SDPA falls back to the math
+    # backend (unfused bmm + softmax + bmm), which is 2-3x slower and allocates
+    # the full attention matrix.
     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-    # expandable_segments removed: on ROCm Windows gfx1151 it exhausts
-    # per-process VA-space (OOMs on small allocs with 90+ GiB physically
-    # free). Fragmentation from the 16x grad-accum backward churn is handled
-    # directly by an empty_cache() immediately before optimizer.step (see
-    # train_step), which releases transient recomputation tensors without
-    # reserving VA. garbage_collection_threshold alone (no expandable) lets
-    # the caching allocator return idle segments back to the driver.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
 
-def _maybe_release_caches(step: int, interval: int = 1) -> None:
-    if interval <= 0:
-        return
-    if step > 0 and step % interval == 0 and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+def cast_model(model: nn.Module, precision: str) -> None:
+    """Cast the model to ``precision``, keeping marked parameters in fp32.
 
+    A parameter is kept in fp32 when its module sets ``keep_fp32 = True``. Three
+    kinds carry the marker, for the same underlying reason — a small parameter
+    whose meaningful updates are below bf16's local resolution:
 
-def _cosine_lr(step: int, warmup: int, max_steps: int, base_lr: float, stable_fraction: float, min_lr_ratio: float) -> float:
-    """Linear warmup from 0, then stable, then cosine decay to ``min_lr_ratio`` floor."""
-    if step < warmup:
-        return base_lr * step / max(warmup, 1)
-    stable_end = int(max_steps * stable_fraction)
-    if step < stable_end:
-        return base_lr
-    decay_steps = max(max_steps - stable_end, 1)
-    progress = (step - stable_end) / decay_steps
-    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+    * **Normalization gains.** A gain at 1.0 receives gradients around 1e-4 to
+      1e-5. The smallest bf16 step above 1.0 is ~0.0078, so those updates round
+      to zero and every normalization layer stays frozen at its initialization
+      for the entire run.
+    * **The receiver gain.** One scalar controlling the whole output
+      distribution's sharpness, starting at ``1/sqrt(H)`` ~ 0.022.
+    * **The MoE router.** Top-k over E logits compares nearby numbers; at a 7-bit
+      mantissa the ordering of two close experts becomes arbitrary, which turns
+      routing into noise the balance controller then chases.
 
-
-def lr_at(step: int, cfg: Config) -> float:
-    """Adam LR at ``step`` from the cosine schedule config."""
-    t, s = cfg.train, cfg.train.schedule
-    return _cosine_lr(step, t.warmup_steps, t.max_steps, t.learning_rate, s.stable_fraction, s.min_lr_ratio)
-
-
-def muon_lr_at(step: int, cfg: Config) -> float:
-    """Muon LR at ``step`` (same cosine shape, scaled to ``muon.lr``)."""
-    t, s = cfg.train, cfg.train.schedule
-    return _cosine_lr(step, t.warmup_steps, t.max_steps, t.muon.lr, s.stable_fraction, s.min_lr_ratio)
-
-
-def set_lr(optimizer: CombinedOptimizer, step: int, cfg: Config) -> None:
-    lr_adam = lr_at(step, cfg)
-    lr_muon = muon_lr_at(step, cfg)
-    for group in optimizer.param_groups:
-        if group.get("_muon", False):
-            group["lr"] = lr_muon
-        else:
-            group["lr"] = lr_adam
-
-
-def cast_to_bf16(model: nn.Module) -> None:
-    model.to(torch.bfloat16)
-
-
-def gradient_stats(model: nn.Module, train_cfg) -> tuple[float, float]:
-    grads = [p.grad for p in model.parameters() if p.grad is not None]
-    if not grads:
-        return 0.0, 0.0
-    total_sq = torch.stack([g.pow(2).sum() for g in grads]).sum()
-    total_elements = sum(g.numel() for g in grads)
-    raw_norm = total_sq.sqrt().item()
-    grad_rms = (total_sq / max(total_elements, 1)).sqrt().item()
-    max_grad_norm = getattr(train_cfg, "max_grad_norm", None)
-    if max_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    return raw_norm, grad_rms
-
-
-def _sample_attention_mode(step: int, cfg: Config) -> tuple[str, float | None]:
-    """Causal-dominant attention-mode curriculum.
-
-    Causal is the inference regime and is dominant from step 0. When the
-    optional attention-curriculum mixing is enabled (``causal_prob_*`` etc. on
-    the config), a small soft_causal/bidir slice adds a denser representation
-    gradient early and is ramped out by mid-training. OFF by default.
+    Cost is a few times ``L * H`` parameters' worth of memory, which is
+    negligible against the body, and it is not optional.
     """
-    t = cfg.train
-    ac = getattr(t, "attention_curriculum", None)
-    if ac is None:
-        return "causal", None
-    warmup = max(int(t.warmup_steps), 1)
-    stable_end = int(t.max_steps * t.schedule.stable_fraction)
-    progress = min(1.0, step / warmup)
-    late = min(1.0, step / max(stable_end, 1))
-    frac = late
-    causal_prob = ac.causal_prob_start + (ac.causal_prob_late - ac.causal_prob_start) * frac
-    soft_prob = ac.soft_prob_start + (ac.soft_prob_late - ac.soft_prob_start) * frac
-    r = float(torch.rand(1).item())
-    if r < causal_prob:
-        return "causal", None
-    if r < causal_prob + soft_prob:
-        return "soft_causal", ac.soft_beta_start + (ac.soft_beta_end - ac.soft_beta_start) * progress
-    return "bidir", None
+    if precision == "fp32":
+        return
+    model.to(torch.bfloat16)
+    for module in model.modules():
+        if getattr(module, "keep_fp32", False):
+            for param in module.parameters(recurse=False):
+                param.data = param.data.float()
 
 
-def _causal_next_token_loss(output, input_ids, targets, valid_target_mask):
-    """Next-token shifted CE from flat logits/indices for causal-style modes."""
-    T = input_ids.size(1)
-    idx = output.prediction_indices.to(output.logits.device)
-    t = idx % T
-    keep = t < (T - 1)
-    if not keep.any():
-        return output.logits.new_zeros(())
-    idx_keep = idx[keep]
-    target_idx = idx_keep + 1
-    shift_logits = output.logits[keep]
-    shift_targets = targets.view(-1).index_select(0, target_idx.to(targets.device)).to(shift_logits.device)
-    target_valid = (
-        valid_target_mask.view(-1)
-        .index_select(0, target_idx.to(valid_target_mask.device))
-        .to(shift_logits.device)
-    )
-    if target_valid.any():
-        return F.cross_entropy(shift_logits[target_valid], shift_targets[target_valid])
-    return output.logits.new_zeros(())
+def clip_gradients(model: nn.Module, max_norm: float) -> float:
+    """Clip the global gradient norm; return the pre-clip value.
+
+    The pre-clip norm is the diagnostic worth logging: once clipping is active the
+    post-clip value is constant by construction and tells you nothing.
+    """
+    return float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
 
 
-def train_step(
-    model: nn.Module,
-    microbatches: list[dict],
-    optimizer: CombinedOptimizer,
-    cfg: Config,
-    step: int,
-    teacher=None,
-    loss_aggregator: LossAggregator | None = None,
-    distill_end_step: int = 0,
-) -> dict:
-    """Single training step with gradient accumulation (causal next-token)."""
-    model.train()
-    device = next(model.parameters()).device
-    if loss_aggregator is None:
-        loss_aggregator = LossAggregator(cfg, exit_halt=_build_exit_halt(cfg))
+def clip_gradients_by_group(model: nn.Module, max_norm: float) -> tuple[float, float]:
+    """Clip Muon (body) and AdamW (codebook/conv/norms/gains) norms separately.
 
-    accum = cfg.train.grad_accum_steps
-    if len(microbatches) != accum:
-        raise ValueError(f"expected {accum} microbatches, got {len(microbatches)}")
-    optimizer.zero_grad(set_to_none=True)
+    A tied codebook is ``V*H`` parameters with dense token-frequency gradients,
+    so its per-step gradient norm dwarfs the body's; a single global clip then
+    spends most of its budget on the codebook and shrinks the body's update to a
+    fraction of its step. Measured on the V31 1B run: codebook 8.92 + conv 5.32
+    against a total of 10.59, leaving the 100 body matrices only ~19% of the
+    clip budget at every step. Splitting the clip lets each group move at its own
+    scale; the body's step is no longer a hostage of the codebook's.
 
-    total_loss = 0.0
-    masked_ce_sum = 0.0
-    masked_rows = 0
-    confidence_sum = 0.0
-    conf_rows = 0
-    top2_mass_sum = 0.0
-    entropy_sum = 0.0
-    posterior_rows = 0
-    aux_sums = {name: 0.0 for name in ("rate", "distortion", "vicreg", "infonce", "moe_lb", "route_entropy", "water_filling", "refinement", "attn_entropy")}
-    aux_counts = {name: 0 for name in aux_sums}
-    ib_iters_sum = 0
-    ib_iters_count = 0
-    memory_usage_sum = 0.0
-    memory_usage_count = 0
-    all_finite = True
+    Returns ``(body_norm, rest_norm)`` pre-clip, or NaN for a group with no
+    parameters.
+    """
+    body = _muon_parameters(model)
+    rest = [p for p in model.parameters() if p not in set(body)]
+    body_norm = float(torch.nn.utils.clip_grad_norm_(body, max_norm)) if body else float("nan")
+    rest_norm = float(torch.nn.utils.clip_grad_norm_(rest, max_norm)) if rest else float("nan")
+    return body_norm, rest_norm
 
-    for micro_idx, batch in enumerate(microbatches):
-        input_ids = batch["input_ids"].to(device)
-        targets = batch["targets"].to(device)
-        valid_target_mask = batch["valid_target_mask"].to(device)
-        images = batch.get("images")
-        if images is not None:
-            images = images.to(device)
-        spectrograms = batch.get("spectrograms")
-        if spectrograms is not None:
-            spectrograms = spectrograms.to(device)
 
-        attention_mode, soft_beta = _sample_attention_mode(step, cfg)
-        # Causal/prefix/soft_causal: predict at ALL valid positions, nothing
-        # erased (matches inference). We keep the causal next-token objective
-        # for all modes so the model always trains the generation signal.
-        out_prediction_mask = valid_target_mask
+class Trainer:
+    """Owns the model, optimizer and step counter.
 
-        output = model(
-            input_ids,
-            targets=None,
-            prediction_mask=out_prediction_mask,
-            valid_target_mask=valid_target_mask,
-            images=images,
-            spectrograms=spectrograms,
-            attention_mode=attention_mode,
-            soft_beta=soft_beta,
-        )
-        output.ce_loss = _causal_next_token_loss(output, input_ids, targets, valid_target_mask)
-        loss = loss_aggregator(output, step=step)
-        # Feed the off-path refinement EXIT novelty into the aggregator's halt
-        # so the distortion beta-anneal freezes on representation convergence.
-        loss_aggregator.update_exit_novelty(output.aux.exit_novelty)
+    Args:
+        model: the model (already on device).
+        cfg: top-level config.
+        start_step: resume point.
+    """
 
-        if not torch.isfinite(loss).all():
-            logger.warning(f"Step {step} micro {micro_idx}: non-finite loss — cancelling update")
-            all_finite = False
-            break
+    def __init__(self, model: nn.Module, cfg: Config, start_step: int = 0) -> None:
+        self.model = model
+        self.cfg = cfg
+        self.step = start_step
+        cast_model(model, cfg.train.precision)
+        self.optimizer = build_optimizer(model, cfg)
 
-        scaled_loss = loss / accum
-        scaled_loss.backward()
-        total_loss += loss.item()
+    def load_optimizer_state(self, state: dict) -> None:
+        self.optimizer.load_state_dict(state)
 
-        with torch.no_grad():
-            for name in aux_sums:
-                value = getattr(output.aux, name)
-                if value is not None:
-                    aux_sums[name] += value.detach().item()
-                    aux_counts[name] += 1
+    def train_step(self, microbatches: list[dict]) -> dict:
+        """One optimizer step over a list of microbatches.
 
-            if output.aux.ib_iters is not None:
-                ib_iters_sum += output.aux.ib_iters
-                ib_iters_count += 1
-            if output.aux.memory_usage is not None:
-                memory_usage_sum += output.aux.memory_usage.detach().item()
-                memory_usage_count += 1
+        Returns:
+            Metrics for logging. ``update_applied`` is False when the step was
+            skipped for non-finite gradients.
 
-            if output.logits is not None and output.prediction_indices is not None:
-                logits = output.logits.detach()
-                prediction_indices = output.prediction_indices.detach().to(targets.device)
-                row_count = logits.shape[0]
-                if output.ce_loss is not None:
-                    masked_ce_sum += output.ce_loss.detach().item() * row_count
-                masked_rows += row_count
-                with torch.no_grad():
-                    logc = cfg.train.logging
-                    want_post = (step % logc.posterior_interval == 0)
-                    if want_post:
-                        # Full posterior: fp32 softmax per chunk for accurate
-                        # top2-mass + entropy (logged every posterior_interval).
-                        chunk_rows = logc.posterior_chunk_rows
-                        for ci in range(0, logits.shape[0], chunk_rows):
-                            chunk = logits[ci : ci + chunk_rows].float()
-                            log_p = chunk.log_softmax(dim=-1)
-                            p = log_p.exp()
-                            confidence_sum += p.max(dim=-1).values.sum().item()
-                            top2_mass_sum += p.topk(min(2, chunk.shape[-1]), dim=-1).values.sum(dim=-1).sum().item()
-                            entropy_sum += -(p * log_p).sum(dim=-1).sum().item()
-                    else:
-                        # Cheap path (most steps): max softmax prob as
-                        # exp(max_logit - logsumexp) — two reductions in bf16.
-                        # bf16 logsumexp is stable at V=262144: the sum of
-                        # exp(logits - max_logit) over the vocab fits within
-                        # bf16 dynamic range (max representable ~3.39e38).
-                        m = logits.max(dim=-1).values
-                        lse = torch.logsumexp(logits, dim=-1)
-                        confidence_sum += (m - lse).exp().sum().item()
-                conf_rows += row_count
-                if want_post:
-                    posterior_rows += row_count
-                del logits, prediction_indices
+        Raises:
+            ValueError: on an empty microbatch list.
+        """
+        if not microbatches:
+            raise ValueError("train_step needs at least one microbatch")
 
-            del output, loss, scaled_loss
+        model, cfg = self.model, self.cfg
+        model.train()
+        device = next(model.parameters()).device
+        self.optimizer.zero_grad(set_to_none=True)
 
-    # Commit deferred MoE SNR EMA updates AFTER backward (outside any
-    # ckpt.checkpoint scope). The forward stashes residual+probs; this
-    # single call applies the EMA once per step so save/recompute in
-    # use_reentrant=False see identical snr_ema.
-    if hasattr(model, "commit_moe_ema_updates"):
-        model.commit_moe_ema_updates()
+        # Weight each microbatch by its scored-token count so unequal microbatches
+        # average correctly rather than over-weighting sparse ones.
+        token_counts: list[int] = []
+        for batch in microbatches:
+            mask = batch.get("loss_mask")
+            token_counts.append(int(mask.sum()) if mask is not None else batch["targets"].numel())
+        total_tokens = max(sum(token_counts), 1)
 
-    # Increment step counter for attn-entropy interval gating.
-    if hasattr(model, "_train_step_counter"):
-        model._train_step_counter += 1
+        ce_sum = 0.0
+        loss_sum = 0.0
+        z_sum = 0.0
+        router_z_sum = 0.0
+        for batch, count in zip(microbatches, token_counts, strict=True):
+            output = model(
+                batch["input_ids"].to(device, non_blocking=True),
+                batch["targets"].to(device, non_blocking=True),
+                doc_ids=batch["doc_ids"].to(device, non_blocking=True) if "doc_ids" in batch else None,
+                loss_mask=batch["loss_mask"].to(device, non_blocking=True) if "loss_mask" in batch else None,
+                images=batch["images"].to(device, non_blocking=True) if "images" in batch else None,
+                spectrograms=batch["spectrograms"].to(device, non_blocking=True)
+                if "spectrograms" in batch
+                else None,
+            )
+            weight = count / total_tokens
+            (output.loss * weight).backward()
 
-    grads = [p.grad for p in model.parameters() if p.grad is not None]
-    all_finite = all_finite and all(torch.isfinite(grad).all().item() for grad in grads)
-    if not all_finite:
-        optimizer.zero_grad(set_to_none=True)
-        for param in model.parameters():
-            param.grad = None
-        raise FloatingPointError(f"training update {step} has non-finite loss or gradients; gradients cleared")
+            ce_sum += float(output.ce.detach()) * weight
+            loss_sum += float(output.loss.detach()) * weight
+            z_sum += float(output.z_loss.detach()) * weight if output.z_loss is not None else 0.0
+            router_z_sum += (
+                float(output.router_z_loss.detach()) * weight
+                if output.router_z_loss is not None
+                else 0.0
+            )
+            del output
 
-    gn, grad_rms = gradient_stats(model, cfg.train)
-    # empty_cache at a controlled interval (configurable, default 20 steps).
-    # Doing it every step costs ~50ms of CPU time on launch-bound GPUs —
-    # the CUDA IPC overhead dominates small-model dispatch. The cache is
-    # only needed to prevent allocator fragmentation from grad-accum churn;
-    # releasing every 20 steps keeps fragmentation in check at 1/20 the cost.
-    if torch.cuda.is_available() and step % max(1, cfg.train.logging.cache_release_interval) == 0:
-        torch.cuda.empty_cache()
-    optimizer.step()
+        body_norm, rest_norm = clip_gradients_by_group(model, cfg.train.max_grad_norm)
+        if not (math.isfinite(body_norm) and math.isfinite(rest_norm)):
+            # Skip rather than raise: one bad microbatch in a long run should cost
+            # one step, not the run. A persistent problem shows up as a run of
+            # skipped steps in the log.
+            logger.warning(
+                "step %d: non-finite gradient norm (body=%s rest=%s), update skipped",
+                self.step,
+                body_norm,
+                rest_norm,
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            return {
+                "step": self.step,
+                "update_applied": False,
+                "grad_norm": body_norm if math.isfinite(body_norm) else rest_norm,
+                "body_grad_norm": body_norm,
+                "rest_grad_norm": rest_norm,
+            }
 
-    if masked_rows == 0:
-        return {"loss": 0.0, "step": step, "grad_norm": gn, "grad_rms": grad_rms}
+        adam_lr, muon_lr = set_learning_rate(self.optimizer, self.step, cfg)
+        self.optimizer.step()
 
-    masked_ce = masked_ce_sum / masked_rows
-    avg_confidence = confidence_sum / conf_rows if conf_rows else float("nan")
-    if posterior_rows:
-        top2_mass = top2_mass_sum / posterior_rows
-        posterior_entropy = entropy_sum / posterior_rows
-    else:
-        top2_mass = min(1.0, max(0.0, avg_confidence * 1.5)) if conf_rows else float("nan")
-        posterior_entropy = float("nan") if not conf_rows else max(0.0, -math.log(max(avg_confidence, 1e-8)))
+        # Controller updates go after the optimizer step, outside any
+        # checkpointed region, so the forward stays pure and recomputation
+        # reproduces the same expert selection.
+        if hasattr(model, "commit_controller_updates"):
+            model.commit_controller_updates()
 
-    def mean_aux(name: str) -> float:
-        return aux_sums[name] / max(aux_counts[name], 1)
+        metrics = {
+            "step": self.step,
+            "loss": loss_sum,
+            "ce": ce_sum,
+            "bpt": ce_sum / math.log(2.0),
+            "ppl": math.exp(min(ce_sum, 20.0)),
+            "z_loss": z_sum,
+            "router_z_loss": router_z_sum,
+            "grad_norm": body_norm,
+            "body_grad_norm": body_norm,
+            "rest_grad_norm": rest_norm,
+            "lr": adam_lr,
+            "muon_lr": muon_lr,
+            "tokens": total_tokens,
+            "update_applied": True,
+        }
+        if self.step % max(1, cfg.train.logging.diag_interval) == 0 and hasattr(model, "diagnostics"):
+            metrics.update(model.diagnostics())
+        self.step += 1
+        return metrics
 
-    return {
-        "loss": total_loss / max(accum, 1),
-        "objective_loss": total_loss / max(accum, 1),
-        "masked_ce": masked_ce,
-        "bpt": masked_ce / math.log(2.0),
-        "top2_mass": top2_mass,
-        "posterior_entropy": posterior_entropy,
-        "rate": mean_aux("rate"),
-        "rate_bits": mean_aux("rate") / math.log(2.0),  # channel semantic rate in bits/token
-        "distortion": mean_aux("distortion"),
-        "vicreg": mean_aux("vicreg"),
-        "infonce": mean_aux("infonce"),
-        "moe_lb": mean_aux("moe_lb"),
-        "route_entropy": mean_aux("route_entropy"),
-        "water_filling": mean_aux("water_filling"),
-        "refinement": mean_aux("refinement"),
-        "attn_entropy": mean_aux("attn_entropy"),
-        "avg_confidence": avg_confidence,
-        "grad_norm": gn,
-        "grad_rms": grad_rms,
-        "lr": lr_at(step, cfg),
-        "exit_halted": loss_aggregator.exit_halted,
-        "ib_iters": ib_iters_sum / max(ib_iters_count, 1),
-        "memory_usage": memory_usage_sum / max(memory_usage_count, 1),
-        "step": step,
-        "update_applied": True,
-        "all_finite": True,
-    }
+
+def format_metrics(metrics: dict) -> str:
+    """One-line log record. ``ce`` first: it is the only number that matters."""
+    if not metrics.get("update_applied", True):
+        return f"step {metrics['step']} | SKIPPED (grad_norm={metrics['grad_norm']})"
+    parts = [
+        f"step {metrics['step']}",
+        f"ce={metrics['ce']:.4f}",
+        f"bpt={metrics['bpt']:.3f}",
+        f"ppl={metrics['ppl']:.1f}",
+        f"grad={metrics['grad_norm']:.3f}",
+        f"lr={metrics['lr']:.2e}",
+    ]
+    if "body_grad_norm" in metrics:
+        parts.append(f"gb={metrics['body_grad_norm']:.3f}")
+        parts.append(f"gr={metrics['rest_grad_norm']:.3f}")
+    for key in ("qk_gain", "residual_gain", "logit_scale", "moe/entropy_ratio", "moe/max_load", "moe/bias_span"):
+        if key in metrics:
+            parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+    return " | ".join(parts)
 
 
 def train(
     model: nn.Module,
     dataloader,
     cfg: Config,
-    teacher=None,
     start_step: int = 0,
     optimizer_state: dict | None = None,
 ) -> Iterator[dict]:
-    from hagi.train.checkpoint import assert_fresh_checkpoint_root, save_checkpoint
+    """Run training, yielding metrics at the configured interval.
+
+    Checkpoints are written by step count; the caller only logs.
+    """
+    from hagi.train.checkpoint import save_checkpoint
 
     configure_runtime()
-    assert_fresh_checkpoint_root(cfg.train.checkpoint_dir)
-
-    if torch.cuda.is_available() and cfg.train.precision == "bf16":
-        cast_to_bf16(model)
-        if hasattr(model, "ensure_fp32_params"):
-            model.ensure_fp32_params()
-
-    optimizer = build_optimizer(model, cfg)
+    trainer = Trainer(model, cfg, start_step)
     if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
-    loss_aggregator = LossAggregator(cfg, exit_halt=_build_exit_halt(cfg))
+        trainer.load_optimizer_state(optimizer_state)
 
-    step = start_step
-    ckpt_dir = cfg.train.checkpoint_dir
-    ckpt_interval = cfg.train.checkpoint_interval
-    ckpt_keep = cfg.train.checkpoint_keep_last
-    last_checkpoint_step = step if step > 0 else None
-
+    accum = cfg.train.grad_accum_steps
     data_iter = iter(dataloader)
-    while step < cfg.train.max_steps:
-        if hasattr(dataloader, "set_optimizer_step"):
-            dataloader.set_optimizer_step(step)
-        elif hasattr(dataloader, "dataset") and hasattr(dataloader.dataset, "set_optimizer_step"):
-            dataloader.dataset.set_optimizer_step(step)
-        microbatches = list(islice(data_iter, cfg.train.grad_accum_steps))
-        if len(microbatches) != cfg.train.grad_accum_steps:
-            break
 
-        set_lr(optimizer, step, cfg)
+    while trainer.step < cfg.train.max_steps:
+        microbatches = []
+        for _ in range(accum):
+            try:
+                microbatches.append(next(data_iter))
+            except StopIteration:
+                data_iter = iter(dataloader)
+                microbatches.append(next(data_iter))
 
-        metrics = train_step(model, microbatches, optimizer, cfg, step, teacher, loss_aggregator=loss_aggregator)
+        step_index = trainer.step
+        metrics = trainer.train_step(microbatches)
 
-        _maybe_release_caches(step, interval=cfg.train.logging.cache_release_interval)
-
-        if step % cfg.train.logging.log_interval == 0:
+        if step_index % max(1, cfg.train.logging.log_interval) == 0:
             yield metrics
 
-        if not metrics["update_applied"]:
-            continue
+        completed = step_index + 1
+        if cfg.train.checkpoint_interval > 0 and completed % cfg.train.checkpoint_interval == 0:
+            save_checkpoint(
+                model,
+                cfg,
+                completed,
+                cfg.train.checkpoint_dir,
+                cfg.train.checkpoint_keep_last,
+                optimizer=trainer.optimizer,
+            )
 
-        completed_updates = step + 1
-        if ckpt_interval > 0 and completed_updates % ckpt_interval == 0:
-            save_checkpoint(model, cfg, completed_updates, ckpt_dir, ckpt_keep, optimizer=optimizer)
-            last_checkpoint_step = completed_updates
-
-        step += 1
-
-    if ckpt_interval > 0 and last_checkpoint_step != step:
-        save_checkpoint(model, cfg, step, ckpt_dir, ckpt_keep, optimizer=optimizer)
+    save_checkpoint(
+        model,
+        cfg,
+        trainer.step,
+        cfg.train.checkpoint_dir,
+        cfg.train.checkpoint_keep_last,
+        optimizer=trainer.optimizer,
+    )
