@@ -1,138 +1,256 @@
-"""End-to-end tests for HAGI model forward pass."""
+"""End-to-end model: loss path, packed masking, KV-cache decode, diagnostics.
+
+The two assertions worth the runtime: every trainable parameter receives a
+gradient (a parameter with none trains at rate zero forever and nothing reports
+it), and incremental decoding reproduces the full forward (a cache that drifts
+produces a model whose generation quality has nothing to do with its training
+loss).
+"""
 
 from __future__ import annotations
 
+import math
+
+import pytest
 import torch
 
-from hagi.config import Config, auto_configure
 from hagi.model.model import HAGI
-from tests.conftest import assert_finite
+from tests.conftest import TINY_VOCAB, assert_finite, tiny_config
 
 
-def _valid_cfg():
-    """Create a self-consistent config for testing."""
-    cfg = Config()
-    m = cfg.model
-    # Use consistent sizes: H=256, C=128, n_q=4, n_kv=2, hd=64 (4*64=256)
-    m.vocab_size = 1000
-    m.hidden_size = 256
-    m.core_hidden_size = 128
-    m.attention.num_query_heads = 4
-    m.attention.num_kv_heads = 2
-    m.attention.head_dim = 64
-    m.body.num_layers = 4
-    m.body.bottleneck.dim = 128
-    m.embeddings.factor_rank = 64
-    m.sliding.sliding_window = 0
-    m.sliding.full_every = 0
-    cfg.train.pad_token_id = 999  # must be < vocab_size
-    return cfg
+def batch(b=2, t=16, vocab=TINY_VOCAB):
+    ids = torch.randint(0, vocab, (b, t))
+    targets = torch.randint(0, vocab, (b, t))
+    return ids, targets
 
 
-def _model():
-    m = HAGI(_valid_cfg())
-    m.eval()
-    return m
+class TestForward:
+    def test_hidden_only_without_targets(self):
+        cfg = tiny_config()
+        out = HAGI(cfg)(batch()[0])
+        assert out.hidden.shape == (2, 16, cfg.model.hidden_size)
+        assert out.loss is None and out.ce is None
+
+    def test_loss_path(self):
+        cfg = tiny_config()
+        ids, targets = batch()
+        out = HAGI(cfg)(ids, targets)
+        assert out.n_tokens == 32
+        assert_finite(out.loss, "loss")
+        assert float(out.ce.detach()) > 0
+
+    def test_untrained_ce_is_near_ln_v(self):
+        """Without a prior, an untrained model must sit at ``ln V``."""
+        cfg = tiny_config()
+        ids, targets = batch(b=4, t=32)
+        out = HAGI(cfg).eval()(ids, targets)
+        assert abs(float(out.ce.detach()) - math.log(TINY_VOCAB)) < 0.5
+
+    def test_return_logits(self):
+        cfg = tiny_config()
+        out = HAGI(cfg)(batch()[0], return_logits=True)
+        assert out.logits.shape == (2, 16, TINY_VOCAB)
+
+    def test_target_shape_mismatch_raises(self):
+        model = HAGI(tiny_config())
+        with pytest.raises(ValueError):
+            model(torch.randint(0, TINY_VOCAB, (2, 16)), torch.randint(0, TINY_VOCAB, (2, 8)))
+
+    def test_loss_mask_selects_positions(self):
+        cfg = tiny_config()
+        model = HAGI(cfg)
+        ids, targets = batch()
+        mask = torch.zeros(2, 16, dtype=torch.bool)
+        mask[:, :4] = True
+        out = model(ids, targets, loss_mask=mask)
+        assert out.n_tokens == 8
+
+    def test_all_parameters_receive_gradient(self):
+        cfg = tiny_config()
+        model = HAGI(cfg)
+        ids, targets = batch()
+        model(ids, targets).loss.backward()
+        missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+        assert not missing, f"no gradient reached: {missing}"
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"model.sliding.window": 8},
+            {"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2},
+            {"model.embedding.conv_kernel": 1},
+            {"model.embedding.tie_lm_head": False},
+            {"model.ternary.enabled": False},
+            {"train.grad_checkpointing": True},
+        ],
+        ids=["windowed", "moe", "no_conv", "untied", "no_ternary", "checkpointing"],
+    )
+    def test_variants_train_end_to_end(self, overrides):
+        cfg = tiny_config(**overrides)
+        model = HAGI(cfg)
+        model.train()
+        ids, targets = batch()
+        out = model(ids, targets)
+        out.loss.backward()
+        assert_finite(out.loss, "loss")
+        missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+        assert not missing, f"no gradient reached: {missing}"
 
 
-def _vtm(t):
-    return torch.ones(2, t, dtype=torch.bool)
+class TestPackedDocuments:
+    def test_doc_boundary_blocks_leakage(self):
+        """A token in document 1 must not be affected by document 0's content."""
+        cfg = tiny_config()
+        model = HAGI(cfg).eval()
+        ids = torch.randint(0, TINY_VOCAB, (1, 12))
+        doc_ids = torch.tensor([[0] * 6 + [1] * 6])
+
+        with torch.no_grad():
+            base = model(ids, doc_ids=doc_ids).hidden
+            changed = ids.clone()
+            changed[0, 0] = (int(ids[0, 0]) + 7) % TINY_VOCAB
+            perturbed = model(changed, doc_ids=doc_ids).hidden
+
+        # The causal filter has a k-1 reach, so only positions at or beyond
+        # conv_kernel-1 past the boundary are fully isolated.
+        reach = cfg.model.embedding.conv_kernel - 1
+        assert float((base[:, 6 + reach :] - perturbed[:, 6 + reach :]).abs().max()) < 1e-5
+
+    def test_cross_doc_attention_does_leak(self):
+        """The control: without doc_ids the same perturbation must propagate."""
+        cfg = tiny_config()
+        model = HAGI(cfg).eval()
+        ids = torch.randint(0, TINY_VOCAB, (1, 12))
+        with torch.no_grad():
+            base = model(ids).hidden
+            changed = ids.clone()
+            changed[0, 0] = (int(ids[0, 0]) + 7) % TINY_VOCAB
+            perturbed = model(changed).hidden
+        assert float((base[:, 8:] - perturbed[:, 8:]).abs().max()) > 1e-6
 
 
-class TestHAGIForward:
-    def test_causal_logits_shape(self):
-        m = _model()
-        ids = torch.randint(0, 1000, (2, 16))
-        vtm = torch.ones(2, 16, dtype=torch.bool)
-        out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="causal")
-        assert_finite(out.logits, "logits")
-        # Both masks provided -> _gather_logits selects positions -> [B*T, V]
-        assert out.logits.shape == (32, 1000)
+class TestDecode:
+    @pytest.mark.parametrize(
+        "overrides",
+        [{}, {"model.sliding.window": 8}, {"model.embedding.conv_kernel": 1}],
+        ids=["full", "windowed", "no_conv"],
+    )
+    def test_incremental_matches_full(self, overrides):
+        cfg = tiny_config(**overrides)
+        model = HAGI(cfg).eval()
+        ids = torch.randint(0, TINY_VOCAB, (1, 10))
 
-    def test_bidir(self):
-        m = _model()
-        ids = torch.randint(0, 1000, (2, 8))
-        vtm = torch.ones(2, 8, dtype=torch.bool)
-        out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="bidir")
-        assert_finite(out.logits, "logits")
-        assert out.logits.shape == (16, 1000)
+        with torch.no_grad():
+            full = model(ids, return_logits=True).logits
 
-    def test_prefix(self):
-        m = _model()
-        ids = torch.randint(0, 1000, (2, 12))
-        vtm = torch.ones(2, 12, dtype=torch.bool)
-        out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="prefix", prefix_len=4)
-        assert_finite(out.logits, "logits")
-        assert out.logits.shape == (24, 1000)
+            model.reset_cache()
+            model.allocate_cache(torch.float32, torch.device("cpu"))
+            steps = []
+            for t in range(10):
+                out = model(
+                    ids[:, t : t + 1],
+                    positions=torch.arange(t, t + 1),
+                    use_cache=True,
+                    return_logits=True,
+                )
+                steps.append(out.logits)
+            model.reset_cache()
 
-    def test_aux_rate_not_none(self):
-        m = _model()
-        out = m(torch.randint(0, 1000, (2, 16)), targets=torch.randint(0, 1000, (2, 16)),
-                prediction_mask=_vtm(16), valid_target_mask=_vtm(16), attention_mode="causal")
-        assert out.aux.rate is not None and out.aux.distortion is not None
-        assert_finite(out.aux.rate, "rate")
-        assert_finite(out.aux.distortion, "distortion")
-        assert out.aux.moe_lb is None
+        incremental = torch.cat(steps, dim=1)
+        assert float((full - incremental).abs().max()) < 1e-4
+        agreement = float((full.argmax(-1) == incremental.argmax(-1)).float().mean())
+        assert agreement == 1.0, f"argmax agreement {agreement:.3f}"
 
-    def test_hidden_shape(self):
-        m = _model()
-        ids = torch.randint(0, 1000, (2, 16))
-        out = m(ids, targets=None, prediction_mask=_vtm(16),
-                valid_target_mask=_vtm(16), attention_mode="causal")
-        assert_finite(out.hidden, "hidden")
-        assert out.hidden.shape == (2, 16, 256)
-
-    def test_no_refinement_when_disabled(self):
-        m = _model()
-        ids = torch.randint(0, 1000, (2, 8))
-        out = m(ids, targets=None, prediction_mask=_vtm(8),
-                valid_target_mask=_vtm(8), attention_mode="causal")
-        assert out.aux.refinement is None
-
-
-class TestHAGICache:
-    def test_allocate_for_cache(self):
-        m = _model()
-        caches = m.allocate_for_cache(2, torch.float32, torch.device("cpu"))
-        assert len(caches) == 4  # num_layers=4
-        for c in caches:
-            assert c.max_seq_len == 4096 and c.n_kv_heads == 2
-
-    def test_cached_forward(self):
-        m = _model()
-        m.allocate_for_cache(2, torch.float32, torch.device("cpu"))
-        out = m(torch.randint(0, 1000, (2, 16)), targets=None, prediction_mask=_vtm(16),
-                valid_target_mask=_vtm(16), attention_mode="causal")
-        assert_finite(out.logits, "logits")
-        assert out.logits is not None
-        m.reset_cache()
-        assert all(blk.attn._kv_cache is None for blk in m.blocks)
+    def test_prefill_then_decode(self):
+        cfg = tiny_config()
+        model = HAGI(cfg).eval()
+        ids = torch.randint(0, TINY_VOCAB, (1, 8))
+        with torch.no_grad():
+            full = model(ids, return_logits=True).logits
+            model.reset_cache()
+            model.allocate_cache(torch.float32, torch.device("cpu"))
+            prefill = model(ids[:, :5], use_cache=True, return_logits=True).logits
+            rest = [
+                model(
+                    ids[:, t : t + 1],
+                    positions=torch.arange(t, t + 1),
+                    use_cache=True,
+                    return_logits=True,
+                ).logits
+                for t in range(5, 8)
+            ]
+            model.reset_cache()
+        combined = torch.cat([prefill, *rest], dim=1)
+        assert float((full - combined).abs().max()) < 1e-4
 
 
-class TestHAGIInit:
-    def test_lm_head_weight_shape(self):
-        w = HAGI(_valid_cfg()).lm_head_weight
-        assert w.shape == (1000, 256)
+class TestStructure:
+    def test_residual_scale_follows_depth(self):
+        shallow = HAGI(tiny_config(**{"model.num_layers": 2}))
+        deep = HAGI(tiny_config(**{"model.num_layers": 8}))
+        shallow_std = float(shallow.blocks[0].attn.out_proj.weight.detach().std())
+        deep_std = float(deep.blocks[0].attn.out_proj.weight.detach().std())
+        assert deep_std < shallow_std
 
-    def test_params_nonzero(self):
-        assert sum(p.numel() for p in HAGI(_valid_cfg()).parameters()) > 0
+    def test_head_is_tied_to_the_codebook(self):
+        model = HAGI(tiny_config())
+        assert model.head.weight is model.encoder.weight
 
-    def test_ternary_on_by_default(self):
-        assert HAGI(_valid_cfg())._use_ternary is True
+    def test_untied_head_owns_its_projection(self):
+        model = HAGI(tiny_config(**{"model.embedding.tie_lm_head": False}))
+        assert model.head.weight is not model.encoder.weight
 
-    def test_auto_configured_instantiates(self):
-        """auto_configure should produce a valid config — verify with a stable budget."""
-        m_cfg = auto_configure(25_000_000)  # medium budget, avoids edge cases
-        cfg = Config()
-        cfg.model = m_cfg
-        cfg.train.pad_token_id = m_cfg.vocab_size - 1
-        # Validate the auto-configured cfg first
-        from hagi.config import validate_config
-        validate_config(cfg)
-        m = HAGI(cfg)
-        m.eval()
-        ids = torch.randint(0, m_cfg.vocab_size, (1, 8))
-        vtm = torch.ones(1, 8, dtype=torch.bool)
-        out = m(ids, targets=None, prediction_mask=vtm, valid_target_mask=vtm, attention_mode="causal")
-        assert_finite(out.logits, "logits")
-        assert out.logits is not None
+    def test_param_summary_matches_reality(self):
+        cfg = tiny_config()
+        model = HAGI(cfg)
+        assert model.param_summary()["total"] == sum(p.numel() for p in model.parameters())
+
+
+class TestDiagnostics:
+    def test_dense_keys(self):
+        stats = HAGI(tiny_config()).diagnostics()
+        assert set(stats) == {"qk_gain", "residual_gain", "logit_scale"}
+        assert stats["logit_scale"] == pytest.approx(tiny_config().model.hidden_size**-0.5)
+
+    def test_moe_keys_present(self):
+        cfg = tiny_config(
+            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2}
+        )
+        stats = HAGI(cfg).diagnostics()
+        assert "moe/entropy_ratio" in stats and "moe/bias_span" in stats
+
+    def test_no_qk_gain_without_qk_norm(self):
+        stats = HAGI(tiny_config(**{"model.attention.qk_norm": False})).diagnostics()
+        assert "qk_gain" not in stats
+
+    def test_controller_commit_is_a_noop_when_dense(self):
+        HAGI(tiny_config()).commit_controller_updates()
+
+
+class TestObjective:
+    def test_z_loss_is_included_when_weighted(self):
+        cfg = tiny_config()
+        cfg.train.z_loss_weight = 1.0
+        ids, targets = batch()
+        out = HAGI(cfg)(ids, targets)
+        assert float(out.loss.detach()) > float(out.ce.detach())
+
+    def test_router_z_loss_summed_over_moe_layers(self):
+        cfg = tiny_config(
+            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 1}
+        )
+        cfg.train.moe_z_loss_weight = 1.0
+        model = HAGI(cfg)
+        model.train()
+        out = model(*batch())
+        assert out.router_z_loss is not None
+        assert float(out.router_z_loss.detach()) > 0
+
+    def test_no_router_z_loss_at_eval(self):
+        cfg = tiny_config(
+            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 1}
+        )
+        model = HAGI(cfg).eval()
+        with torch.no_grad():
+            out = model(*batch())
+        assert out.router_z_loss is None

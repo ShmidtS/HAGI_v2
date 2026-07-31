@@ -1,301 +1,221 @@
-"""Water-filling Mixture of Experts (MoE) — capacity allocation by SNR.
+"""Mixture of experts — variable-rate coding with bias-controlled balance.
 
-V28 rewrite of the V27 ``MoESwiGLU``. The V27 router fed ``flat.pow(2).mean(-1)
-.sqrt()`` (the RMS MAGNITUDE of h) into the router and called it an "entropy
-gate" / "water-filling". That was information-theoretically dishonest: magnitude
-is not entropy, not SNR, and the V27 forward was a python ``for k: for e:``
-masked-dispatch loop.
+MoE is the mechanism that decouples capacity from per-token compute: total
+parameters grow with ``num_experts`` while the FLOPs per token grow only with
+``top_k``. Read as a code, each expert is a sub-codebook and the router performs
+variable-rate assignment — tokens are sent to the experts that code them best.
 
-This module implements genuine water-filling capacity allocation:
+Balance is the whole problem. If routing collapses onto a few experts the
+effective capacity drops to those experts and the remaining parameters are dead
+weight; the routing distribution's entropy is exactly the usable fraction of the
+parallel channels.
 
-  * **SNR proxy gate** (the real water-filling signal). Capacity (routed-expert
-    power) should follow the per-position SNR of the residual channel. The shared
-    expert carries the baseline capacity; the routed experts specialize on the
-    residual. A position whose residual after the shared expert is large has low
-    SNR (much unexplained variance ~ noise); a small residual means high SNR.
-    Water-filling ``P_i = max(0, mu - 1/SNR_i)`` allocates power to high-SNR
-    channels, so the gate signal is ``s = 1/(||residual|| + eps)`` (detached).
-  * **Entropy-regularized routing** = capacity maximization over the simplex:
-    the routing loss adds a *routing-entropy maximization* bonus on top of the
-    Switch CV^2 load balance, so all expert channels stay in use (no channel is
-    starved -> capacity is maximized across the parallel expert channels).
-  * **Batched expert dispatch** (no python masking loop): tokens are grouped by
-    chosen expert via sort + segment offsets, experts run as batched matmuls.
-    Scales with experts without per-token python overhead.
+V31 balances with a **bias controller** instead of an auxiliary loss:
 
-Information-theoretically it is water-filling: allocate capacity (power/dims)
-to the parallel channels (positions) with the highest SNR.
+    logits_e   = router(x)_e
+    selection  = top_k(logits_e + b_e)
+    weights    = softmax over the selected logits, WITHOUT b
+    b_e       <- b_e + gamma * sign(mean_load - load_e)         (no gradient)
+
+Two properties make this work where the V28 auxiliary loss did not:
+
+* The bias affects *selection* only, never the combining weights. The gradient
+  the experts receive is the pure language-modelling gradient — nothing competes
+  with it, and the balance mechanism cannot distort the function being learned.
+* It is a feedback controller with a fixed step, so it corrects an imbalance at a
+  guaranteed rate regardless of how strong the opposing LM gradient is. The V28
+  CV^2 penalty was a *gradient*, so a stronger LM gradient simply overruled it:
+  measured ``moe_lb = 8.2`` against the 8.0 ceiling for E=4/top_k=2 (complete
+  collapse) for 50k steps while the penalty was active with weight 0.1.
+
+Also removed from V28: the "water-filling" SNR gate. It multiplied the routing
+logits by ``1 + 1/||residual||``, which sharpens the softmax (a temperature
+reduction, not a power allocation), and the companion allocator added a log-bias
+toward experts whose residual was already smallest. Both push the same direction
+— toward whichever expert is already winning. Water-filling assigns *more* power
+to high-SNR channels only under a total-power constraint that makes the
+assignment zero-sum; there was no such constraint here, so the result was
+positive feedback with nothing opposing it.
+
+The dispatch is a sort-by-expert plus segmented matmul: no boolean masking, one
+host sync for the segment offsets, and cost proportional to assigned tokens.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from hagi.config import MoEConfig
+from hagi.model.ffn import SwiGLU
 from hagi.model.norms import RMSNorm
-from hagi.model.ternary import BitLinear
-from hagi.model.water_filling import WaterFillingAllocator
 
 
-def _proj(in_f: int, out_f: int, use_ternary: bool) -> nn.Module:
-    return BitLinear(in_f, out_f, bias=False) if use_ternary else nn.Linear(in_f, out_f, bias=False)
-
-
-class SwiGLUExpert(nn.Module):
-    """SwiGLU expert: down(silu(gate x) * (up x)). Body ternary when use_ternary."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int, use_ternary: bool) -> None:
-        super().__init__()
-        self.gate = _proj(hidden_size, intermediate_size, use_ternary)
-        self.up = _proj(hidden_size, intermediate_size, use_ternary)
-        self.down = _proj(intermediate_size, hidden_size, use_ternary)
-        nn.init.normal_(self.down.weight, std=1.0 / (intermediate_size ** 0.5))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
-
-
-class WaterFillingMoE(nn.Module):
-    """Top-k routed MoE + shared experts + SNR-gated water-filling routing.
+class MoE(nn.Module):
+    """Top-k routed experts + always-on shared experts.
 
     Args:
         hidden_size: H.
-        intermediate_size: per-expert FFN width.
-        cfg: MoE config (num_experts, top_k, n_shared, snr_gate_weight,
-            route_entropy_weight).
+        intermediate_size: per-expert mixer width.
+        cfg: MoE configuration.
         norm_eps: RMSNorm epsilon.
-        use_ternary: ternarize expert bodies via BitLinear.
+        use_ternary: quantize expert bodies.
+        residual_scale: init scale on every expert's down-projection.
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int, cfg: MoEConfig, norm_eps: float = 1e-6, use_ternary: bool = True) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        cfg: MoEConfig,
+        norm_eps: float = 1e-5,
+        use_ternary: bool = True,
+        residual_scale: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
+        if cfg.num_experts < 2:
+            raise ValueError("MoE needs at least 2 experts")
+        if not 1 <= cfg.top_k <= cfg.num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
         self.num_experts = cfg.num_experts
         self.top_k = cfg.top_k
         self.n_shared = cfg.n_shared
+        self.hidden_size = hidden_size
+        self.bias_update_rate = float(cfg.bias_update_rate)
+
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.shared_experts = nn.ModuleList(
-            SwiGLUExpert(hidden_size, intermediate_size, use_ternary) for _ in range(cfg.n_shared)
-        )
         self.experts = nn.ModuleList(
-            SwiGLUExpert(hidden_size, intermediate_size, use_ternary) for _ in range(cfg.num_experts)
+            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale)
+            for _ in range(cfg.num_experts)
         )
-        # Router: hidden -> routing logits. FP -> AdamW.
-        # SNR gate is a multiplicative scalar on the logits (not a concatenated
-        # input dimension). This keeps the router input = H, not H+1.
+        self.shared = nn.ModuleList(
+            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale)
+            for _ in range(cfg.n_shared)
+        )
+
+        # Router stays floating point and rides AdamW: it is a decision function,
+        # not a channel weight, and ternarizing a 2->E decision boundary quantizes
+        # the decision itself. It is also kept in fp32 under bf16 training — top-k
+        # over E logits is a comparison of nearby numbers, and bf16's 7-bit
+        # mantissa makes the ordering of two close experts arbitrary.
         self.router = nn.Linear(hidden_size, cfg.num_experts, bias=False)
-        nn.init.normal_(self.router.weight, mean=0.0, std=cfg.router_init_std)
-        self._snr_gate_weight = float(cfg.snr_gate_weight)
-        self._last_load_balance: torch.Tensor | None = None
-        self._last_routing_entropy: torch.Tensor | None = None
-        self._last_water_filling_loss: torch.Tensor | None = None
-        self._deferred_residual: torch.Tensor | None = None
-        self._deferred_probs: torch.Tensor | None = None
-        # Water-filling capacity allocator: per-expert capacity gate (log-bias on
-        # the routing logits) steered by a per-expert SNR EMA on the shared-expert
-        # residual. allocation_logits is an FP Parameter -> AdamW (not Muon).
-        # min_width = max(16, H/8) — derived from hidden size.
-        self.allocator = WaterFillingAllocator(
-            total_width=self.num_experts * intermediate_size,
-            num_experts=self.num_experts,
-            min_width=max(16, hidden_size // 8),
-        )
+        std = cfg.router_init_std if cfg.router_init_std > 0 else hidden_size**-0.5
+        nn.init.normal_(self.router.weight, mean=0.0, std=std)
+        self.router.keep_fp32 = True
 
-    @property
-    def last_load_balance(self) -> torch.Tensor | None:
-        return self._last_load_balance
-
-    @property
-    def last_routing_entropy(self) -> torch.Tensor | None:
-        return self._last_routing_entropy
-
-    @property
-    def last_water_filling_loss(self) -> torch.Tensor | None:
-        return self._last_water_filling_loss
-
-    @torch.no_grad()
-    def _update_allocator(self, residual: torch.Tensor, probs: torch.Tensor) -> None:
-        """Steer the allocator's SNR EMA from the routed shared-expert residual.
-
-        Per-expert residual variance (soft-weighted by the pre-allocation routing
-        probs) feeds the allocator's ``1/variance`` SNR EMA. The EMA is detached;
-        only :meth:`WaterFillingAllocator.allocation_probs` carries gradient
-        through ``allocation_logits``.
-        """
-        token_var = residual.detach().float().pow(2).mean(dim=-1)  # [N]
-        weights = probs.detach()  # [N, E]
-        w_sum = weights.sum(dim=0).clamp_min(1e-6)  # [E]
-        per_expert_var = (weights * token_var.unsqueeze(-1)).sum(dim=0) / w_sum  # [E]
-        self.allocator.update_snr_ema(per_expert_var.to(self.allocator.snr_ema))
-
-    def _snr_gate(self, residual: torch.Tensor) -> torch.Tensor:
-        """Water-filling SNR proxy: ``s = 1 / (||residual||_2 + eps)`` per token.
-
-        The residual is what the shared experts leave unexplained. High residual
-        = noisy channel = low SNR -> less routed capacity; low residual = high
-        SNR -> more capacity. Detached so the router cannot game the gate.
-        """
-        r = residual.detach().float().pow(2).mean(dim=-1).clamp_min(1e-6).sqrt()
-        return (1.0 / r).to(residual.dtype) * self._snr_gate_weight
+        # Controller state. A buffer, not a parameter: it is updated by a rule,
+        # never by autograd, and it must survive checkpointing.
+        self.register_buffer("expert_bias", torch.zeros(cfg.num_experts))
+        self.register_buffer("load_ema", torch.full((cfg.num_experts,), 1.0 / cfg.num_experts))
+        self._pending_load: torch.Tensor | None = None
+        self.last_router_z_loss: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Routed (water-filling) + shared expert output, residual-added to ``x``.
-
-        Args:
-            x: ``[B, T, H]``.
-
-        Returns:
-            ``[B, T, H]``.
-        """
+        """Mixer branch output for ``[B, T, H]`` (residual added by the block)."""
         b, t, h = x.shape
-        h_n = self.norm(x)
-        flat = h_n.reshape(b * t, h)
+        flat = self.norm(x).reshape(b * t, h)
 
-        # Shared experts always fire (carry the common capacity).
-        shared_out = flat.new_zeros(flat.shape)
-        for se in self.shared_experts:
-            shared_out = shared_out + se(flat)
+        logits = self.router(flat.float())
 
-        # SNR gate = water-filling signal on the shared-expert RESIDUAL.
-        residual = flat - shared_out
-        snr = self._snr_gate(residual)
-        logits = self.router(flat)  # [N, E] — router input = H (not H+1)
-        # SNR as multiplicative gate: scale logits by (1 + snr * weight) per token.
-        # This preserves the water-filling signal without wasting a router dimension.
-        logits = logits * (1.0 + snr.unsqueeze(-1))
-        probs = F.softmax(logits, dim=-1)  # [N, E]
+        # Selection uses the bias; combining weights do not. Softmax over only the
+        # selected logits keeps the weights a proper distribution over the experts
+        # that actually run, so the branch output scale is independent of top_k.
+        _, idx = (logits + self.expert_bias).topk(self.top_k, dim=-1)
+        sel_logits = logits.gather(-1, idx)
+        weights = sel_logits.softmax(dim=-1).to(flat.dtype)
 
-        # Water-filling capacity allocation: the allocator's per-expert capacity
-        # gate is a log-bias on the routing logits. Uniform at init (constant
-        # shift -> softmax-invariant), so the cold start is unchanged; as the SNR
-        # EMA diverges the bias steers routing toward high-capacity (high-SNR)
-        # experts. The EMA update is DEFERRED (stashed here, committed after
-        # backward via commit_ema_update()) to keep the forward deterministic
-        # under ckpt.checkpoint(use_reentrant=False): save and recompute must
-        # read the SAME snr_ema, otherwise routing diverges and bincount shape
-        # mismatches crash with CheckpointError.
+        out = self._dispatch(flat, idx, weights)
+        for expert in self.shared:
+            out = out + expert(flat)
+
         if self.training:
-            self._deferred_residual = residual.detach()
-            self._deferred_probs = probs.detach()
-        alloc_probs = self.allocator.allocation_probs()  # [E]
-        probs = F.softmax(logits + torch.log(alloc_probs + 1e-8).unsqueeze(0), dim=-1)
-
-        topk_vals, topk_idx = probs.topk(self.top_k, dim=-1)
-        topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-8)
-
-        # Batched dispatch: route shared-residual tokens to their chosen experts.
-        routed_out = self._batched_dispatch(flat, residual, topk_idx, topk_vals)
-        out = shared_out + routed_out
-
-        # Auxiliaries (training only): Switch CV^2 load balance + routing entropy
-        # + water-filling allocator entropy-gap regularizer.
-        if self.training:
-            n = flat.shape[0]
             with torch.no_grad():
-                f = torch.bincount(topk_idx.reshape(-1), minlength=self.num_experts).float() / max(n, 1)
-            p_mean = probs.mean(dim=0)
-            self._last_load_balance = self.num_experts * (f * p_mean).sum()
-            # Routing entropy H(p): maximized -> capacity spread across channels.
-            routed_prob_entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-            self._last_routing_entropy = routed_prob_entropy
-            self._last_water_filling_loss = self.allocator.regularization_loss()
+                counts = torch.bincount(idx.reshape(-1), minlength=self.num_experts).float()
+                self._pending_load = counts / counts.sum().clamp_min(1.0)
+            # z-loss on the router: the log-partition function does not change the
+            # routing decision, but an unbounded one makes top-k selection depend
+            # on differences between large numbers. Pinning it keeps the decision
+            # numerically meaningful.
+            self.last_router_z_loss = logits.logsumexp(dim=-1).pow(2).mean()
+        else:
+            self.last_router_z_loss = None
 
-        out = out.view(b, t, h)
-        return x + out
+        return out.view(b, t, h)
 
     @torch.no_grad()
-    def commit_ema_update(self) -> None:
-        """Apply the deferred SNR EMA update stashed during the last forward.
+    def commit_bias_update(self) -> None:
+        """Apply one controller step from the last forward's measured load.
 
-        Called from the training loop ONCE per step, AFTER backward (outside
-        any ckpt.checkpoint scope). This keeps forward deterministic under
-        use_reentrant=False: save and recompute read the same snr_ema, so
-        routing log-bias -> probs -> topk_idx -> bincount counts are identical
-        across both passes.
+        Called once per optimizer step, after backward. Deferring it keeps the
+        forward pure, which is required under activation checkpointing: the
+        recomputed forward must select the same experts as the original, or the
+        recomputed graph does not match the saved one.
         """
-        if self._deferred_residual is None or self._deferred_probs is None:
+        if self._pending_load is None:
             return
-        self._update_allocator(self._deferred_residual, self._deferred_probs)
-        self._deferred_residual = None
-        self._deferred_probs = None
+        load = self._pending_load.to(self.load_ema)
+        self.load_ema.mul_(0.99).add_(load, alpha=0.01)
+        if self.bias_update_rate > 0:
+            target = 1.0 / self.num_experts
+            self.expert_bias.add_(self.bias_update_rate * torch.sign(target - load))
+            # Anchor the gauge: only bias *differences* affect top-k, so removing
+            # the mean prevents a slow common-mode drift into a range where the
+            # bias dominates the logits.
+            self.expert_bias.sub_(self.expert_bias.mean())
+        self._pending_load = None
 
-    def _batched_dispatch(self, flat: torch.Tensor, residual: torch.Tensor, topk_idx: torch.Tensor, topk_vals: torch.Tensor) -> torch.Tensor:
-        """Group tokens by chosen expert via sort + segment offsets; batched matmul.
+    def load_stats(self) -> dict[str, float]:
+        """Balance diagnostics: normalized routing entropy and worst-case load.
 
-        Always uses the batched path (sort + index_select + index_add_) — no
-        boolean masking, so no nonzero/index_put launches. The exact naive
-        masked-dispatch loop (:meth:`_naive_dispatch`) is kept as a reference
-        for equivalence testing but is no longer on the forward path: it was the
-        source of the nonzero/index_put launch storm the profiler attributed
-        13.7% CPU / 2.25% CUDA to on a launch-bound GPU. A single ``.tolist()``
-        pulls the per-expert offsets/counts in one host sync instead of
-        ``2*num_experts`` per-expert ``.item()`` syncs.
+        ``entropy_ratio`` is ``H(load) / log(E)`` — the usable fraction of the
+        expert channels. 1.0 is perfect balance; ``1/E``-ish means collapse.
+        """
+        load = self.load_ema.float()
+        p = load / load.sum().clamp_min(1e-9)
+        entropy = -(p * p.clamp_min(1e-9).log()).sum()
+        max_entropy = torch.log(torch.tensor(float(self.num_experts)))
+        return {
+            "entropy_ratio": float(entropy / max_entropy),
+            "max_load": float(p.max()),
+            "min_load": float(p.min()),
+            "bias_span": float(self.expert_bias.max() - self.expert_bias.min()),
+        }
+
+    def _dispatch(self, flat: torch.Tensor, idx: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Sort tokens by expert, run each expert on its contiguous segment.
 
         Args:
-            flat: ``[N, H]`` normed hidden.
-            residual: ``[N, H]`` shared-expert residual (the routed-expert input).
-            topk_idx: ``[N, K]`` chosen expert indices.
-            topk_vals: ``[N, K]`` normalized routing weights.
+            flat: ``[N, H]`` normalized hidden states.
+            idx: ``[N, K]`` selected expert indices.
+            weights: ``[N, K]`` combining weights.
 
         Returns:
-            ``[N, H]`` summed routed-expert output.
+            ``[N, H]`` weighted sum of expert outputs.
         """
         n = flat.shape[0]
         out = flat.new_zeros(n, self.hidden_size)
         if n == 0:
             return out
-        # Batched path (sort + segment + index_select/index_add_): no boolean
-        # masking, so no nonzero/index_put launches. The naive masked-dispatch
-        # loop (below) was the source of the nonzero/index_put launch storm
-        # the profiler attributed 13.7% CPU / 2.25% CUDA to on a launch-bound
-        # GPU (ProfilerStep* 37.9% self CUDA = GPU starving under CPU dispatch).
-        # A single .tolist() pulls the per-expert offsets/counts in one host
-        # sync instead of 2*num_experts per-expert .item() syncs.
-        flat_k = topk_idx.shape[1]
-        # Flatten (token, slot) -> expert id, track source token.
-        experts_flat = topk_idx.reshape(-1)  # [N*K]
-        weights_flat = topk_vals.reshape(-1)  # [N*K]
-        token_src = torch.arange(n, device=flat.device).repeat_interleave(flat_k)  # [N*K]
-        # Sort by expert id so each expert's tokens are contiguous.
+
+        experts_flat = idx.reshape(-1)
+        weights_flat = weights.reshape(-1)
+        token_src = torch.arange(n, device=flat.device).repeat_interleave(idx.shape[1])
+
         order = torch.argsort(experts_flat, stable=True)
-        experts_sorted = experts_flat[order]
         tokens_sorted = token_src[order]
-        weights_sorted = weights_flat[order]
-        # Segment boundaries per expert.
-        counts = torch.bincount(experts_sorted, minlength=self.num_experts)
+        weights_sorted = weights_flat[order].unsqueeze(-1)
+        counts = torch.bincount(experts_flat[order], minlength=self.num_experts)
         offsets = torch.cumsum(counts, dim=0) - counts
-        offsets_l = offsets.tolist()
-        counts_l = counts.tolist()
+
+        # One host sync for all segment boundaries rather than 2E per-expert syncs.
+        offsets_list = offsets.tolist()
+        counts_list = counts.tolist()
         for e in range(self.num_experts):
-            start = offsets_l[e]
-            cnt = counts_l[e]
-            if cnt == 0:
+            count = counts_list[e]
+            if count == 0:
                 continue
-            sel_tokens = tokens_sorted[start : start + cnt]
-            sel_weights = weights_sorted[start : start + cnt].unsqueeze(-1)  # [cnt,1]
-            sel_res = residual.index_select(0, sel_tokens)
-            expert_out = self.experts[e](sel_res) * sel_weights
-            out.index_add_(0, sel_tokens, expert_out.to(out.dtype))
+            start = offsets_list[e]
+            sel = tokens_sorted[start : start + count]
+            expert_out = self.experts[e](flat.index_select(0, sel))
+            out.index_add_(0, sel, (expert_out * weights_sorted[start : start + count]).to(out.dtype))
         return out
-
-    def _naive_dispatch(self, residual: torch.Tensor, topk_idx: torch.Tensor, topk_vals: torch.Tensor) -> torch.Tensor:
-        """Naive masked-dispatch (the V27 pattern) — exact, for small N / tests."""
-        n = residual.shape[0]
-        out = residual.new_zeros(n, self.hidden_size)
-        for k in range(self.top_k):
-            idx_k = topk_idx[:, k]  # [N]
-            w_k = topk_vals[:, k].unsqueeze(-1)  # [N,1]
-            for e in range(self.num_experts):
-                mask = idx_k == e
-                if not mask.any():
-                    continue
-                out[mask] = out[mask] + self.experts[e](residual[mask]) * w_k[mask]
-        return out
-
-
-# Back-compat alias: existing imports / smoke tests use ``MoESwiGLU``.
-MoESwiGLU = WaterFillingMoE

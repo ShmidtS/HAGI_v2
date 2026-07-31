@@ -1,19 +1,31 @@
-"""Ternary attention with real grouped-query attention (GQA), RoPE, KV-cache.
+"""Grouped-query attention with QK-norm, RoPE, KV-cache and windowing.
 
-Pre-norm MHA with RoPE and four attention modes (bidir / causal / prefix /
-soft_causal) so a single stack supports both masked training and causal AR
-generation. Grouped-query attention: ``num_query_heads`` query heads share
-``num_kv_heads`` key/value heads (KV is repeated across the group). This is
-the V25 gap — V25 *claimed* GQA but ignored ``num_kv_heads`` and ran full MHA.
+Attention is the *correlator* of the channel: it scores a query against every
+key and uses the softmax of those scores as a soft demodulation weight. Three
+properties matter information-theoretically, and V31 enforces all three.
 
-An optional per-layer :class:`~hagi.model.kv_cache.KVCache` makes autoregressive
-generation O(T) instead of O(T^2): frozen positions' KV are reused rather than
-recomputed. Only the 2D projections (qkv, out_proj) are ternary via
-``BitLinear`` when ``use_ternary``; RoPE inv_freq and the attn_norm gain are FP.
+**Bounded logit range (QK-norm).** The information a softmax transports from
+scores to output is maximal when the distribution is neither uniform nor
+saturated. With unnormalized q/k, the logit scale rides on ``||q|| ||k||``, which
+grows with the projection norms — and a matrix-sign optimizer like Muon removes
+the ``1/||W||`` brake that plain SGD has, so those norms drift outward
+monotonically. Past a point the softmax saturates: the layer stops transporting
+information *and* stops passing gradient. RMS-normalizing each head's q and k
+makes the logit scale a function of ``head_dim`` alone. This is the single
+highest-value change in V31: the V30 run's ce went 2.32 -> 6.6 between step 19k
+and 53k with no configuration change, which is what runaway logit scale looks
+like.
 
-The attention-entropy anti-collapse penalty is computed from a fresh
-softmax of the scores (training only) and surfaced as a side output for the
-loss aggregator.
+**Finite memory where it is cheap (sliding window).** A windowed causal layer is
+a finite-state channel: O(T*W) work, memory bounded by W. Long-range dependence
+is relayed by the full-attention layers, which act as global parity checks.
+
+**Frozen state (KV-cache).** Once a position's key/value are computed they never
+change, so decoding is O(T) rather than O(T^2).
+
+Masks are built by the caller and shared across layers — with packed sequences
+the mask also encodes document boundaries, and rebuilding that per layer is pure
+waste.
 """
 
 from __future__ import annotations
@@ -24,102 +36,83 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from hagi.model.ffn import BranchScale, linear
 from hagi.model.kv_cache import KVCache
-from hagi.model.norms import RMSNorm
+from hagi.model.norms import HeadNorm, RMSNorm
 from hagi.model.rope import RotaryEmbedding, apply_rope
-from hagi.model.ternary import BitLinear
 
 
 @dataclass
 class AttentionConfig:
-    """Local attention config for the ternary block."""
+    """Per-layer attention geometry."""
 
-    num_heads: int = 8  # number of query heads
-    num_kv_heads: int = 4  # GQA: number of key/value heads (<= num_heads)
+    num_heads: int = 24
+    num_kv_heads: int = 6
     head_dim: int = 64
     rope_theta: float = 10000.0
-    attn_entropy_floor: float = 0.0  # 0.0 = auto (1/num_heads) at model init
-    # Sliding-window causal attention (0 / None = full attention). A window W
-    # makes each query attend to the last W keys (plus all future-masked),
-    # turning attention into a local finite-memory (convolutional-code) channel:
-    # O(T*W) instead of O(T^2). Long-range signal is relayed by any full-attention
-    # layers in the stack (global parity).
-    sliding_window: int | None = None
+    qk_norm: bool = True
+    sliding_window: int = 0  # 0 = full attention
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads along the head axis for GQA.
-
-    Args:
-        x: ``[B, n_kv, T, hd]``.
-        n_rep: ``num_query_heads // num_kv_heads``.
-
-    Returns:
-        ``[B, n_q, T, hd]``.
-    """
+    """Expand ``[B, n_kv, T, hd]`` to ``[B, n_kv*n_rep, T, hd]`` for GQA."""
     if n_rep == 1:
         return x
     b, n_kv, t, hd = x.shape
     return x[:, :, None, :, :].expand(b, n_kv, n_rep, t, hd).reshape(b, n_kv * n_rep, t, hd)
 
 
-def _build_prefix_mask(b: int, t: int, prefix_len: torch.Tensor | int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    if prefix_len is None:
-        raise ValueError("prefix_len required for attention_mode='prefix'")
-    pl = torch.full((b,), prefix_len, device=device, dtype=torch.long) if isinstance(prefix_len, int) else prefix_len.to(device=device, dtype=torch.long)
-    idx = torch.arange(t, device=device)
-    causal_allowed = idx.view(t, 1) <= idx.view(1, t)
-    mask = torch.zeros(b, 1, t, t, device=device, dtype=dtype)
-    mask.masked_fill_(~causal_allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
-    pl_b = pl.view(b, 1, 1, 1)
-    both_prefix = (idx.view(1, 1, t, 1) < pl_b) & (idx.view(1, 1, 1, t) < pl_b)
-    mask.masked_fill_(both_prefix, 0.0)
-    return mask
-
-
-def _build_soft_causal_mask(t: int, beta: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    idx = torch.arange(t, device=device)
-    dist = (idx.view(1, t) - idx.view(t, 1)).clamp(min=0)
-    return (-beta * dist.float().to(dtype)).unsqueeze(0).unsqueeze(0)
-
-
 class Attention(nn.Module):
-    """Pre-norm GQA + RoPE with bidir / causal / prefix / soft_causal modes.
+    """Pre-norm GQA with QK-norm, RoPE, optional window and KV-cache.
 
     Args:
-        hidden_size: H (must equal num_heads * head_dim).
-        cfg: attention config.
+        hidden_size: H, must equal ``num_heads * head_dim``.
+        cfg: attention geometry (including this layer's window).
         norm_eps: RMSNorm epsilon.
-        use_ternary: ternarize the 2D qkv / out_proj via BitLinear.
+        use_ternary: quantize the 2D projections.
+        residual_scale: init scale on ``out_proj`` (depth scaling).
     """
 
-    def __init__(self, hidden_size: int, cfg: AttentionConfig, norm_eps: float = 1e-6, use_ternary: bool = True) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        cfg: AttentionConfig,
+        norm_eps: float = 1e-5,
+        use_ternary: bool = True,
+        residual_scale: float = 1.0,
+    ) -> None:
         super().__init__()
         if hidden_size != cfg.num_heads * cfg.head_dim:
-            raise ValueError(f"hidden_size={hidden_size} must equal num_heads*head_dim={cfg.num_heads}*{cfg.head_dim}")
-        if cfg.num_heads % cfg.num_kv_heads != 0:
-            raise ValueError(f"num_heads ({cfg.num_heads}) must be divisible by num_kv_heads ({cfg.num_kv_heads})")
+            raise ValueError(
+                f"hidden_size={hidden_size} must equal num_heads*head_dim="
+                f"{cfg.num_heads}*{cfg.head_dim}"
+            )
+        if cfg.num_kv_heads < 1 or cfg.num_heads % cfg.num_kv_heads:
+            raise ValueError(
+                f"num_heads ({cfg.num_heads}) must be a positive multiple of "
+                f"num_kv_heads ({cfg.num_kv_heads})"
+            )
         self.hidden_size = hidden_size
         self.n_heads = cfg.num_heads
         self.n_kv_heads = cfg.num_kv_heads
         self.head_dim = cfg.head_dim
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
+        self.sliding_window = int(cfg.sliding_window or 0)
+
+        def proj(out_features: int) -> nn.Module:
+            return linear(hidden_size, out_features, use_ternary)
+
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.q_proj = proj(cfg.num_heads * cfg.head_dim)
+        self.kv_proj = proj(2 * cfg.num_kv_heads * cfg.head_dim)
+        self.out_proj = proj(cfg.num_heads * cfg.head_dim)
+        nn.init.normal_(self.out_proj.weight, std=residual_scale / hidden_size**0.5)
 
-        def _proj(out_features: int) -> nn.Module:
-            return BitLinear(hidden_size, out_features, bias=False) if use_ternary else nn.Linear(hidden_size, out_features, bias=False)
-
-        self.q_proj = _proj(cfg.num_heads * cfg.head_dim)
-        self.kv_proj = _proj(2 * cfg.num_kv_heads * cfg.head_dim)
-        self.out_proj = _proj(cfg.num_heads * cfg.head_dim)
-        nn.init.normal_(self.out_proj.weight, std=1.0 / (hidden_size ** 0.5))
-        self.rope = RotaryEmbedding(self.head_dim, rope_theta=cfg.rope_theta)
-        self.attn_entropy_floor = float(cfg.attn_entropy_floor)
-        self.sliding_window = cfg.sliding_window  # None / 0 = full attention
+        self.q_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
+        self.k_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
+        self.rope = RotaryEmbedding(cfg.head_dim, rope_theta=cfg.rope_theta)
+        self.branch_scale = BranchScale(residual_scale)
         self._kv_cache: KVCache | None = None
-
-    def set_attn_entropy_floor(self, floor: float) -> None:
-        self.attn_entropy_floor = float(floor)
 
     def attach_cache(self, cache: KVCache) -> None:
         """Bind a KV-cache for incremental decoding."""
@@ -131,26 +124,20 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mode: str = "causal",
-        prefix_len: torch.Tensor | int | None = None,
-        soft_beta: float | None = None,
         positions: torch.Tensor | None = None,
-        compute_attn_entropy: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Compute attention.
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Attention branch output for ``[B, T, H]`` (residual added by the caller).
 
         Args:
-            x: ``[B, T, H]``.
-            attention_mode: one of bidir / causal / prefix / soft_causal.
-            prefix_len: prefix length for prefix mode.
-            soft_beta: soft-causal decay (default 2.0).
-            positions: ``[T]`` absolute positions for RoPE. Defaults to
-                ``arange(T)`` offset by the current cache length when a cache
-                is attached (so a decode step applies RoPE at the right place).
+            x: ``[B, T, H]`` residual-stream input.
+            positions: ``[T]`` absolute positions for RoPE; defaults to
+                ``arange(T)`` offset by the cache length.
+            mask: additive mask broadcastable to ``[B, 1, T, T_total]``. None
+                means plain causal, which uses SDPA's fused causal kernel.
 
         Returns:
-            ``(out, entropy_penalty)`` where ``out`` is ``[B, T, H]`` and the
-            penalty is ``None`` at eval / when the floor is 0.
+            ``[B, T, H]``.
         """
         h = self.attn_norm(x)
         b, t, _ = h.shape
@@ -160,9 +147,14 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        cache_len = 0
-        if self._kv_cache is not None:
-            cache_len = self._kv_cache.length
+        # QK-norm before RoPE (Gemma-2 / Chameleon convention). RoPE is a
+        # rotation and preserves norms, so the order only decides which tensor
+        # the learnable gain scales.
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        cache_len = self._kv_cache.length if self._kv_cache is not None else 0
         if positions is None:
             positions = torch.arange(cache_len, cache_len + t, device=q.device)
         cos, sin = self.rope(positions, q.device, q.dtype)
@@ -171,137 +163,84 @@ class Attention(nn.Module):
         if self._kv_cache is not None:
             self._kv_cache.update(k, v)
             k, v = self._kv_cache.get()
-            # Full-sequence attention: every query attends to all cached keys.
-            # The causal / mask structure is applied below over the full T_total.
-            attn_mask = _build_full_mask(k.shape[2], t, attention_mode, prefix_len, soft_beta, self.sliding_window, q.device, q.dtype)
-            is_causal = False  # mask already encoded
+
+        k = repeat_kv(k, self.n_rep)
+        v = repeat_kv(v, self.n_rep)
+
+        if mask is not None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        elif t == 1:
+            # Single-token decode: one query against the whole cached prefix, all
+            # of which is in the past. Nothing to mask.
+            out = F.scaled_dot_product_attention(q, k, v)
         else:
-            attn_mask, is_causal = _build_mask(t, attention_mode, prefix_len, soft_beta, self.sliding_window, b, q.device, q.dtype)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        scale = 1.0 / (self.head_dim**0.5)
-        k_rep = repeat_kv(k, self.n_rep)
-        v_rep = repeat_kv(v, self.n_rep)
-
-        entropy_pen = None
-        out = F.scaled_dot_product_attention(q, k_rep, v_rep, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
-
-        if self.attn_entropy_floor > 0.0 and self.training and compute_attn_entropy:
-            scores = (q @ k_rep.transpose(-2, -1)) * scale
-            if attn_mask is not None:
-                scores = scores + attn_mask
-            if is_causal:
-                t_tot = k_rep.shape[2]
-                scores = scores + torch.triu(
-                    torch.full((t, t_tot), float("-inf"), device=q.device, dtype=scores.dtype), diagonal=(t_tot - t + 1)
-                )
-            attn_weights = torch.softmax(scores, dim=-1)
-            entropy = -(attn_weights * torch.log(attn_weights + 1e-12 / max(1, self.n_heads))).sum(dim=-1)
-            entropy_pen = (self.attn_entropy_floor - entropy).clamp_min(0.0).mean()
-
-        out = out.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
-        return self.out_proj(out), entropy_pen
+        return self.branch_scale(
+            self.out_proj(out.transpose(1, 2).reshape(b, t, self.hidden_size))
+        )
 
 
-def _build_mask(t: int, mode: str, prefix_len, soft_beta, sliding_window, b: int, device, dtype) -> tuple[torch.Tensor | None, bool]:
-    """Build the attention mask for the non-cached path. Returns (mask, is_causal).
+def build_attention_mask(
+    t_q: int,
+    t_total: int,
+    *,
+    window: int = 0,
+    doc_ids: torch.Tensor | None = None,
+    prefix_len: int = 0,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Build the additive attention mask, or None when plain causal suffices.
 
-    ``sliding_window`` (None / 0 = full attention) further restricts each query
-    to its last W keys on top of the causal/soft/prefix structure. When the
-    window is active the result is always an explicit mask (is_causal=False).
+    Composes three constraints:
+
+    * **Causal** — a query attends only to positions at or before it. This is the
+      objective's definition; violating it makes next-token prediction trivial at
+      training time and impossible at inference.
+    * **Document boundaries** — with packed sequences one window holds several
+      independent documents. Attention across a boundary leaks one source into
+      another, so ``doc_ids`` restricts each query to its own document.
+    * **Window** — a query attends only to the last ``window`` positions.
+
+    A multimodal prefix (``prefix_len > 0``) is exempt from all three: prefix
+    tokens are mutually visible and visible to every text position, because the
+    prefix is side information available in full before decoding starts.
+
+    Args:
+        t_q: number of query positions.
+        t_total: number of key positions (>= t_q; the difference is cached).
+        window: window size, 0 for unlimited.
+        doc_ids: ``[B, t_total]`` document id per key position (queries take the
+            last ``t_q``). None disables the boundary constraint.
+        prefix_len: leading positions that bypass causality.
+        device, dtype: output device/dtype.
+
+    Returns:
+        ``[B, 1, t_q, t_total]`` (or ``[1, 1, t_q, t_total]`` when ``doc_ids`` is
+        None) additive mask with ``-inf`` at disallowed pairs, or None when the
+        result is exactly plain causal.
     """
-    if not sliding_window:
-        if mode == "bidir":
-            return None, False
-        if mode == "causal":
-            return None, True
-        if mode == "prefix":
-            return _build_prefix_mask(b, t, prefix_len, device, dtype), False
-        if mode == "soft_causal":
-            beta = 2.0 if soft_beta is None else soft_beta
-            return _build_soft_causal_mask(t, beta, device, dtype), False
-        raise ValueError(f"unknown attention_mode {mode!r}")
+    if window <= 0 and doc_ids is None and prefix_len <= 0:
+        return None
 
-    # Windowed path: explicit additive mask combining the per-mode structure
-    # with the local-window restriction. ``allowed[t_q, t_k]`` is True where a
-    # query MAY attend before windowing.
-    idx = torch.arange(t, device=device)
-    if mode == "bidir":
-        allowed = torch.ones(t, t, dtype=torch.bool, device=device)
-    elif mode == "causal":
-        allowed = idx.view(t, 1) >= idx.view(1, t)
-    elif mode == "prefix":
-        if prefix_len is None:
-            raise ValueError("prefix_len required for attention_mode='prefix'")
-        pl_b = torch.full((b,), prefix_len, device=device, dtype=torch.long) if isinstance(prefix_len, int) else prefix_len.to(device=device, dtype=torch.long)
-        causal_allowed = idx.view(t, 1) <= idx.view(1, t)  # [t,t]
-        both_prefix = (idx.view(1, 1, t, 1) < pl_b.view(b, 1, 1, 1)) & (idx.view(1, 1, 1, t) < pl_b.view(b, 1, 1, 1))  # [b,1,t,t]
-        allowed_b = causal_allowed.view(1, 1, t, t) | both_prefix  # [b,1,t,t]
-        within_window = idx.view(1, 1, t) >= (idx.view(1, t, 1) - (sliding_window - 1))  # [1,t,t]
-        allowed_b = allowed_b & within_window.unsqueeze(0)  # [b,1,t,t]
-        mask = torch.zeros(b, 1, t, t, device=device, dtype=dtype)
-        mask.masked_fill_(~allowed_b, float("-inf"))
-        return mask, False
-    elif mode == "soft_causal":
-        beta = 2.0 if soft_beta is None else soft_beta
-        dist = (idx.view(1, t) - idx.view(t, 1)).clamp(min=0)
-        base = (-beta * dist.float().to(dtype)).unsqueeze(0)  # [1,t,t]
-        within_window = idx.view(1, t) >= (idx.view(t, 1) - (sliding_window - 1))
-        base = base.masked_fill(~within_window.unsqueeze(0), float("-inf"))
-        return base, False
-    else:
-        raise ValueError(f"unknown attention_mode {mode!r}")
+    q_pos = torch.arange(t_total - t_q, t_total, device=device).view(t_q, 1)
+    k_pos = torch.arange(t_total, device=device).view(1, t_total)
+    allowed = k_pos <= q_pos
+    if window > 0:
+        allowed = allowed & (k_pos > q_pos - window)
+    allowed = allowed.view(1, 1, t_q, t_total)
 
-    # causal / bidir windowed: combine allowed with the window, build [1,t,t].
-    within_window = idx.view(1, t) >= (idx.view(t, 1) - (sliding_window - 1))  # [t,t]
-    allowed = allowed & within_window
-    mask = torch.zeros(1, t, t, device=device, dtype=dtype)
-    mask.masked_fill_(~allowed.unsqueeze(0), float("-inf"))
-    return mask, False
+    if doc_ids is not None:
+        if doc_ids.shape[1] != t_total:
+            raise ValueError(f"doc_ids has {doc_ids.shape[1]} positions, expected {t_total}")
+        q_doc = doc_ids[:, t_total - t_q :].unsqueeze(-1)  # [B, t_q, 1]
+        same_doc = (q_doc == doc_ids.unsqueeze(1)).unsqueeze(1)  # [B, 1, t_q, t_total]
+        allowed = allowed & same_doc
 
+    if prefix_len > 0:
+        is_prefix_key = (k_pos < prefix_len).view(1, 1, 1, t_total)
+        allowed = allowed | is_prefix_key
 
-def _build_full_mask(t_total: int, t_q: int, mode: str, prefix_len, soft_beta, sliding_window, device, dtype) -> torch.Tensor:
-    """Build an explicit additive mask over ``[t_q, t_total]`` for the cached path.
-
-    ``t_q`` is the number of query positions (the new block); ``t_total`` is the
-    full cached length. For causal generation of a single token, ``t_q == 1``
-    and the single row is fully unmasked (every query attends to all keys). For
-    cached prefill of a block, rows are causal over their own block.
-
-    ``sliding_window`` (None / 0 = full) restricts each query to its last W keys
-    on top of the base structure (a local finite-memory channel).
-    """
-    q_idx = torch.arange(t_total - t_q, t_total, device=device)
-    k_idx = torch.arange(t_total, device=device)
-    # base: causal (query i attends to keys 0..i)
-    allowed = k_idx.view(1, t_total) <= (q_idx.view(t_q, 1))
-    mask = torch.zeros(1, t_q, t_total, device=device, dtype=dtype)
-    mask.masked_fill_(~allowed.unsqueeze(0), float("-inf"))
-
-    if mode == "bidir":
-        mask = torch.zeros(1, t_q, t_total, device=device, dtype=dtype)
-    elif mode == "prefix":
-        if prefix_len is None:
-            raise ValueError("prefix_len required for attention_mode='prefix'")
-        pl = prefix_len if isinstance(prefix_len, int) else int(prefix_len[0].item())
-        prefix_keys = k_idx < pl
-        mask.masked_fill_(prefix_keys.view(1, 1, t_total), 0.0)
-    elif mode == "soft_causal":
-        beta = 2.0 if soft_beta is None else soft_beta
-        dist = (q_idx.view(t_q, 1) - k_idx.view(1, t_total)).clamp(min=0)
-        mask = (-beta * dist.float().to(dtype)).unsqueeze(0)
-    elif mode != "causal":
-        raise ValueError(f"unknown attention_mode {mode!r}")
-
-    # Apply the sliding window on top of the base structure: a query attends to
-    # keys within [q - (W-1), q] only. Keys outside the window are masked even
-    # if the base structure allowed them.
-    #
-    # EXCEPTION: when t_q==1 (single-token decode), full attention is used
-    # regardless of the window setting. A single query costs O(t_total) which
-    # is negligible, and cutting off the prompt at single-token decode is
-    # catastrophic — the model literally cannot see the prompt start.
-    if sliding_window and t_q > 1:
-        within_window = k_idx.view(1, t_total) >= (q_idx.view(t_q, 1) - (sliding_window - 1))
-        mask = mask.masked_fill(~within_window.unsqueeze(0), float("-inf"))
-
-    return mask
+    mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
+    return mask.masked_fill(~allowed, float("-inf"))

@@ -1,58 +1,45 @@
-"""Typed model outputs — auxiliary loss terms for the codec-channel LM.
+"""Typed model output.
 
-Every auxiliary is computed off the main LM path. The genuine rate/distortion
-terms come from the information bottleneck; vicreg/infonce ground the
-multimodal joint embedding; moe_lb balances expert load; route_entropy spreads
-capacity across expert channels (water-filling dual); water_filling is the
-per-expert capacity allocator entropy-gap regularizer; refinement is the
-off-path HEP predictive-refinement loss; attn_entropy prevents attention
-collapse; ib_iters counts iterations used in the iterative IB refinement loop
-(diagnostic, not a loss). A term is ``None`` when its subsystem is off.
+The V28 output carried eleven auxiliary loss slots (rate, distortion, vicreg,
+infonce, moe_lb, route_entropy, water_filling, refinement, exit_novelty,
+attn_entropy, memory_usage). In both shipped configs, nine of them were
+identically zero or disabled. V31 keeps two terms that condition the numerics and
+one that grounds a second modality, and reports load balance as a *diagnostic*
+rather than as a loss — because it is corrected by a controller, not by gradient.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 
 @dataclass
-class AuxLosses:
-    """Auxiliary loss terms produced by the model forward pass.
+class ModelOutput:
+    """Result of a forward pass.
 
-    All terms are ``None`` when their subsystem is inactive. The aggregator
-    weights them by the matching ``w_*`` config value.
+    Attributes:
+        loss: total scalar objective, or None when no targets were supplied.
+        ce: cross-entropy in nats/token — the channel's actual coding cost, and
+            the only number that says whether training is working.
+        z_loss: mean squared log-partition of the LM head (unweighted).
+        router_z_loss: same for the MoE routers, summed over MoE layers.
+        grounding: cross-modal InfoNCE plus anti-collapse terms (multimodal only).
+        hidden: final normalized hidden states, ``[B, T, H]``.
+        logits: only populated for generation/diagnostics — training never
+            materializes an ``[N, V]`` tensor.
+        n_tokens: number of scored positions, for correct averaging across
+            gradient-accumulation microbatches of unequal size.
+        diagnostics: scalar observables (expert balance, logit scale, ...).
     """
 
-    # Information bottleneck (always on).
-    rate: torch.Tensor | None = None
-    distortion: torch.Tensor | None = None
-    # Iterative IB refinement iterations used (diagnostic, histogram).
-    ib_iters: int | None = None
-    # Grounded infomax (multimodal only).
-    vicreg: torch.Tensor | None = None
-    infonce: torch.Tensor | None = None
-    # Mixture of experts (MoE only).
-    moe_lb: torch.Tensor | None = None
-    route_entropy: torch.Tensor | None = None
-    water_filling: torch.Tensor | None = None
-    # Off-path HEP predictive refinement (opt-in).
-    refinement: torch.Tensor | None = None
-    # EXIT-chart novelty of the refinement (diagnostic, not a loss).
-    exit_novelty: float | None = None
-    # Attention anti-collapse (training only).
-    attn_entropy: torch.Tensor | None = None
-    # Latent memory bank fill level (diagnostic, not a loss).
-    memory_usage: torch.Tensor | None = None
-
-
-@dataclass
-class ModelOutput:
-    """Unified output from model forward pass (training and inference)."""
-
-    logits: torch.Tensor | None
-    hidden: torch.Tensor
-    aux: AuxLosses
-    ce_loss: torch.Tensor | None = None
-    prediction_indices: torch.Tensor | None = None
+    loss: torch.Tensor | None = None
+    ce: torch.Tensor | None = None
+    z_loss: torch.Tensor | None = None
+    router_z_loss: torch.Tensor | None = None
+    grounding: torch.Tensor | None = None
+    hidden: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
+    n_tokens: int = 0
+    diagnostics: dict[str, float] = field(default_factory=dict)

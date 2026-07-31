@@ -1,6 +1,17 @@
-"""RMSNorm.
+"""Normalization layers — automatic gain control for the channel.
 
-5G analog: RMSNorm = signal normalization before modulation (AGC).
+Two norms, both RMS-based:
+
+* :class:`RMSNorm` — the residual-stream AGC. Variance is always computed in
+  fp32: at bf16 the 7-bit mantissa makes ``mean(x^2)`` lossy enough to bias the
+  gain, and the gain error is a multiplicative distortion applied to every
+  downstream matmul.
+* :class:`HeadNorm` — per-head QK normalization. Normalizing q and k before the
+  correlator bounds the logit dynamic range, so the softmax stays inside its
+  high-slope region. A saturated softmax transports ~zero information from the
+  score to the output *and* has ~zero gradient, which is the dominant
+  divergence mode of a deep pre-norm stack trained with a matrix-sign
+  optimizer (observed in V30: ce 2.32 -> 6.6 between step 19k and 53k).
 """
 
 from __future__ import annotations
@@ -11,31 +22,54 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with optional fp32 variance computation.
+    """RMSNorm with an fp32 variance accumulator and a learnable gain.
 
-    When input is bf16/fp16 on CUDA, upcast to fp32 for the variance
-    computation (7 mantissa bits -> 23 bits). The elementwise multiply
-    returns the original dtype.
-
-    Note: weight may be fp32 (for gradient precision) while input is bf16.
-    F.rms_norm handles this correctly in the non-fused path; on CUDA the
-    fp32_variance path already upcasts input to match.
+    Args:
+        dim: normalized (last) dimension.
+        eps: variance floor.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, fp32_variance: bool = True):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
         super().__init__()
-        self.eps = eps
-        self.fp32_variance = fp32_variance
+        self.dim = dim
+        self.eps = float(eps)
+        # A gain at 1.0 receives gradients around 1e-4; the smallest bf16 step
+        # above 1.0 is ~0.0078, so under bf16 those updates round to zero and the
+        # layer is frozen at initialization for the whole run. See
+        # hagi.train.loop.cast_model, which reads this marker.
+        self.keep_fp32 = True
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.fp32_variance and x.is_cuda:
-            orig_dtype = x.dtype
-            x_f32 = x.float()
-            out = F.rms_norm(x_f32, x_f32.shape[-1:], self.weight.float(), self.eps)
-            return out.to(orig_dtype)
-        # Non-CUDA or fp32_variance disabled: cast weight to match input dtype
-        # for fused kernel compatibility. The fp32 master is preserved for
-        # gradient accumulation in the optimizer.
-        weight = self.weight.to(x.dtype) if self.weight.dtype != x.dtype else self.weight
-        return F.rms_norm(x, x.shape[-1:], weight, self.eps)
+        out = F.rms_norm(x.float(), (self.dim,), self.weight.float(), self.eps)
+        return out.to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, eps={self.eps}"
+
+
+class HeadNorm(nn.Module):
+    """Per-head RMSNorm over ``head_dim`` for QK normalization.
+
+    Applied to ``[B, n_heads, T, head_dim]`` (or any tensor whose last
+    dimension is ``head_dim``). One shared gain vector across heads keeps the
+    parameter cost at ``head_dim`` and avoids per-head gain drift.
+
+    Args:
+        head_dim: per-head dimension.
+        eps: variance floor.
+    """
+
+    def __init__(self, head_dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.eps = float(eps)
+        self.keep_fp32 = True
+        self.weight = nn.Parameter(torch.ones(head_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.rms_norm(x.float(), (self.head_dim,), self.weight.float(), self.eps)
+        return out.to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return f"head_dim={self.head_dim}, eps={self.eps}"

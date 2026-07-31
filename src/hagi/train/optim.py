@@ -1,54 +1,98 @@
-"""Muon + AdamW hybrid optimizer — TYPE-based routing.
+"""Optimizers: Muon for 2D channel weights, AdamW for everything else.
 
-Muon (Newton-Schulz orthogonalization + scale-aware weight decay) for the 2D
-ternary channel weights (every ``BitLinear.weight``); AdamW for everything
-else (embeddings, 1D gates, FP linears, norms, routers, IB/multimodal source
-codebooks). V27 routes by module TYPE, not by name-substring matching — this
-captures exactly the ternary body (including MoE expert bodies) with zero
-string matching and no manual exclusion list to maintain (the V25 fragility:
-``_MUON_EXCLUDE`` had to be extended for every new module).
+The split is not a heuristic — the two parameter classes have different geometry.
+
+**2D channel weights (Muon).** A hidden-mixing matrix acts on a vector space, and
+what matters is its action across directions. Newton-Schulz orthogonalization
+sets every singular value of the *update* to 1, so all directions advance
+equally. On a ternary master this is exactly right: the quantizer reads only the
+sign pattern relative to the row absmean, so an isotropic update explores the
+reachable ternary patterns efficiently rather than concentrating on whichever
+directions the raw gradient happens to favour.
+
+**Everything else (AdamW).** Codebooks, 1D gains, biases, routers. A codebook's
+rows are updated at wildly different frequencies (token frequency spans five
+orders of magnitude on this corpus), which is precisely the case per-coordinate
+adaptivity exists for. Orthogonalization is undefined for 1D and actively wrong
+for a codebook — it would equalize the step size of a token seen once and a token
+seen ten million times.
+
+Routing is by an explicit ``is_channel_weight`` marker set at construction, not
+by module type and not by name substring. The V25 predecessor kept a
+``_MUON_EXCLUDE`` list of name fragments that had to be extended for every new
+module; a missed entry silently sent a codebook through Newton-Schulz. A marker
+also keeps the partition stable when ternary quantization is disabled for an
+ablation — Muon's argument is about matrix geometry, not storage rate, so an
+ablation on the rate constraint must not also change the optimizer.
+
+**Weight-norm drift.** Muon removes the ``1/||W||`` brake that plain SGD applies,
+so spectral norms grow. Two things make that safe here rather than requiring a
+spectral cap: the ternary quantizer's per-row absmean scale cancels any uniform
+outward drift (simulated over 20k Muon steps: effective weight RMS 0.0293 ->
+0.0308, i.e. flat), and QK-norm removes the one place where a growing norm
+directly damages the forward pass. Decoupled weight decay scaled by
+``sqrt(fan_out/fan_in)`` handles the residual, so wide-output matrices are not
+under-regularized relative to square ones.
 """
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.optim import Optimizer
 
 from hagi.config import Config
-from hagi.model.ternary import BitLinear
 
 
-def newton_schulz5(G: torch.Tensor, steps: int = 5, coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)) -> torch.Tensor:
-    """Newton-Schulz quintic iteration approximating G(G^T G)^{-1/2}.
+def newton_schulz(
+    grad: torch.Tensor, steps: int = 5, coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+) -> torch.Tensor:
+    """Approximate the matrix sign of ``grad`` (all singular values -> 1).
 
-    Orthogonalizes a 2D matrix so its singular values become 1.
+    A quintic iteration ``X <- aX + bX(X^T X) + cX(X^T X)^2`` with coefficients
+    tuned to converge from the whole unit-norm ball in five steps. Run in bf16:
+    the iteration is a fixed-point map whose basin is far wider than bf16's
+    precision, and the halved bandwidth matters because this runs once per 2D
+    parameter per step.
+
+    Args:
+        grad: 2D update.
+        steps: iteration count.
+        coeffs: the (a, b, c) quintic coefficients.
+
+    Returns:
+        Orthogonalized update in ``grad``'s dtype.
     """
     a, b, c = coeffs
-    x = G.bfloat16()
-    transposed = x.size(0) > x.size(1)
+    x = grad.bfloat16()
+    transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
     x = x / (x.norm() + 1e-7)
     for _ in range(steps):
-        A = x @ x.T
-        # addmm fuses beta*input + alpha*(mat1@mat2) into one BLAS call. On
-        # launch-bound gfx1151 the 8-launch inner loop drops to 5 (CPU dispatch
-        # ~40us/launch dominates small-matrix NS5); the epilogue keeps the
-        # matmul in fp32 longer than the bf16 mul/add it replaces, so the
-        # fixed point is unchanged (smoke + 20-step health probe verified).
-        B = torch.addmm(A, A, A, beta=b, alpha=c)   # b*A + c*(A@A)
-        x = torch.addmm(x, B, x, beta=a, alpha=1)    # a*x + B@x
+        gram = x @ x.T
+        # addmm fuses b*gram + c*(gram@gram) into one call; the epilogue keeps the
+        # product in higher precision than the separate mul/add it replaces, so
+        # the fixed point is unchanged and the launch count drops.
+        poly = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+        x = torch.addmm(x, poly, x, beta=a, alpha=1)
     if transposed:
         x = x.T
-    return x.to(G.dtype)
+    return x.to(grad.dtype)
 
 
-class Muon(Optimizer):
-    """Momentum SGD with per-step Newton-Schulz orthogonalization.
+class Muon(torch.optim.Optimizer):
+    """Momentum SGD with Newton-Schulz orthogonalized updates.
 
-    Scale-aware weight decay: ``wd_eff = wd * min(max(1, sqrt(fan_out/fan_in)), wd_cap)``.
-    Bounds ``||W||`` — the root fix for the train_v1_1 step-~10000 divergence.
+    Args:
+        params: 2D parameters only.
+        lr: learning rate.
+        momentum: heavy-ball coefficient.
+        nesterov: use the Nesterov form of the lookahead.
+        ns_steps: Newton-Schulz iterations.
+        ns_coeffs: quintic coefficients.
+        weight_decay: decoupled decay, scaled per-parameter by fan ratio.
+        wd_cap: cap on that scaling.
+        momentum_offload: keep momentum buffers in host memory.
     """
 
     def __init__(
@@ -58,16 +102,21 @@ class Muon(Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
-        weight_decay: float = 0.0,
         ns_coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+        weight_decay: float = 0.0,
         wd_cap: float = 2.0,
-        momentum_offload: bool = True,
-    ):
+        momentum_offload: bool = False,
+    ) -> None:
         super().__init__(
             params,
             dict(
-                lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
-                weight_decay=weight_decay, ns_coeffs=ns_coeffs, wd_cap=wd_cap,
+                lr=lr,
+                momentum=momentum,
+                nesterov=nesterov,
+                ns_steps=ns_steps,
+                ns_coeffs=ns_coeffs,
+                weight_decay=weight_decay,
+                wd_cap=wd_cap,
                 momentum_offload=momentum_offload,
             ),
         )
@@ -77,180 +126,207 @@ class Muon(Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
-            wd = group.get("weight_decay", 0.0)
-            ns_coeffs = group["ns_coeffs"]
-            wd_cap = group["wd_cap"]
             offload = group["momentum_offload"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
+                if p.ndim != 2:
+                    raise ValueError(f"Muon requires 2D parameters, got shape {tuple(p.shape)}")
+                grad = p.grad
                 state = self.state[p]
-                fan_ratio = min(max(1.0, p.size(0) / p.size(1)) ** 0.5, wd_cap)
-                if wd != 0.0:
-                    p.mul_(1.0 - lr * wd * fan_ratio)
+
+                # Wide-output matrices see more gradient signal per row, so a
+                # single decay rate under-regularizes them relative to square ones.
+                fan_ratio = min((p.shape[0] / p.shape[1]) ** 0.5, group["wd_cap"])
+                fan_ratio = max(1.0, fan_ratio)
+                if group["weight_decay"] != 0.0:
+                    p.mul_(1.0 - lr * group["weight_decay"] * fan_ratio)
+
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(grad, device="cpu" if offload else grad.device)
+                    state["momentum_buffer"] = buf
                 if offload:
-                    # Offload path: momentum on CPU (frees ~16 GiB VRAM for the
-                    # 9.37B run). On Strix Halo APU the GPU->CPU "transfer" is a
-                    # cache-coherence flush, not a PCIe DMA. NS5 stays on GPU:
-                    # its matmuls are 100-1000x slower on CPU. See V28 OOM notes.
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g, device="cpu")
-                    buf = state["momentum_buffer"]
-                    # Normalize device on resume: an older checkpoint may have
-                    # saved momentum on GPU (pre-offload). Move it to CPU once.
                     if buf.device.type != "cpu":
                         buf = buf.to("cpu")
                         state["momentum_buffer"] = buf
-                    g_cpu = g.detach().to("cpu")
-                    buf.mul_(momentum).add_(g_cpu)
-                    update_cpu = g_cpu.add(buf, alpha=momentum) if nesterov else buf
-                    update = newton_schulz5(update_cpu.to(p.device), ns_steps, ns_coeffs)
+                    grad_host = grad.detach().to("cpu")
+                    buf.mul_(momentum).add_(grad_host)
+                    update = grad_host.add(buf, alpha=momentum) if group["nesterov"] else buf
+                    update = update.to(p.device)
                 else:
-                    # On-device path: keep momentum on the same device as p. No
-                    # per-param host sync — critical on launch-bound small models
-                    # where copy_/to 22% CPU stalls the dispatch pipeline and
-                    # starves the GPU (ProfilerStep* ~37% self CUDA = idle).
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    if buf.device != p.device or buf.dtype != g.dtype:
-                        buf = buf.to(device=p.device, dtype=g.dtype)
+                    if buf.device != grad.device or buf.dtype != grad.dtype:
+                        buf = buf.to(device=grad.device, dtype=grad.dtype)
                         state["momentum_buffer"] = buf
-                    buf.mul_(momentum).add_(g)
-                    update = g.add(buf, alpha=momentum) if nesterov else buf
-                    update = newton_schulz5(update, ns_steps, ns_coeffs)
-                p.add_(update.reshape(p.shape), alpha=-lr * fan_ratio)
+                    buf.mul_(momentum).add_(grad)
+                    update = grad.add(buf, alpha=momentum) if group["nesterov"] else buf
+
+                # Newton-Schulz stays on the accelerator regardless of offload:
+                # its matmuls are orders of magnitude slower on CPU.
+                p.add_(newton_schulz(update, group["ns_steps"], group["ns_coeffs"]), alpha=-lr * fan_ratio)
 
 
-class CombinedOptimizer:
-    """Steps Muon and AdamW together with a unified interface.
+class HybridOptimizer:
+    """Drives Muon and AdamW as one optimizer over disjoint parameter groups.
 
-    Deliberately does not inherit from torch.optim.Optimizer because the two
-    sub-optimizers manage disjoint parameter groups with different update rules.
+    Not an ``Optimizer`` subclass: the two carry incompatible per-group state and
+    a shared ``param_groups`` list would make LR scheduling ambiguous. The
+    ``_muon`` flag on each group is what the scheduler uses to apply the two base
+    learning rates.
     """
 
-    def __init__(self, muon: Muon, adamw: torch.optim.AdamW):
+    def __init__(self, muon: Muon, adamw: torch.optim.AdamW) -> None:
         self.muon = muon
         self.adamw = adamw
         self.param_groups = muon.param_groups + adamw.param_groups
 
-    def zero_grad(self, set_to_none: bool = True):
+    def zero_grad(self, set_to_none: bool = True) -> None:
         self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
 
-    def step(self, closure=None) -> float | None:
+    def step(self) -> None:
         self.muon.step()
         self.adamw.step()
-        return None
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
 
-    def load_state_dict(self, state_dict):
-        self.muon.load_state_dict(state_dict["muon"])
-        self.adamw.load_state_dict(state_dict["adamw"])
+    def load_state_dict(self, state: dict) -> None:
+        self.muon.load_state_dict(state["muon"])
+        self.adamw.load_state_dict(state["adamw"])
 
 
-def _is_bitlinear_weight(module: nn.Module, name: str) -> bool:
-    """True if ``module`` is a BitLinear and ``name`` is its 'weight' attribute.
+def _muon_parameters(model: nn.Module) -> list[nn.Parameter]:
+    """Collect every 2D hidden-mixing weight — the channel masters.
 
-    Type-based routing: only the 2D ternary channel masters ride Muon. This is
-    robust to module naming (no substring matching) and automatically covers
-    MoE expert bodies, the attention projections, and the FFN bilinear weights.
+    Selection is by the ``is_channel_weight`` marker that
+    :func:`~hagi.model.ffn.linear` and :class:`~hagi.model.ternary.BitLinear` set
+    on construction. Marker rather than module type, so that disabling
+    quantization for an ablation does not silently move the entire body from
+    Muon to AdamW and change what the ablation is measuring. Marker rather than
+    name substring, so that a renamed module cannot fall out of the partition —
+    the V25 predecessor kept a ``_MUON_EXCLUDE`` list of name fragments and a
+    missed entry sent a codebook through Newton-Schulz.
     """
-    return isinstance(module, BitLinear) and name == "weight"
+    found: list[nn.Parameter] = []
+    for module in model.modules():
+        if getattr(module, "is_channel_weight", False):
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, nn.Parameter) and weight.requires_grad and weight.ndim == 2:
+                found.append(weight)
+    return found
 
 
-def _muon_params(model: nn.Module) -> list[nn.Parameter]:
-    """Collect every BitLinear.weight parameter (the ternary channel body)."""
-    params: list[nn.Parameter] = []
-    for module_name, module in model.named_modules():
-        for param_name, param in module.named_parameters(recurse=False):
-            if _is_bitlinear_weight(module, param_name) and param.requires_grad:
-                params.append(param)
-    return params
-
-
-def _can_attempt_fused_adamw(params: list[nn.Parameter]) -> bool:
-    return bool(params) and all(
-        param.device == params[0].device and param.dtype == params[0].dtype and param.is_floating_point()
-        for param in params
+def _supports_fused_adamw(params: list[nn.Parameter]) -> bool:
+    if not params:
+        return False
+    first = params[0]
+    return first.device.type == "cuda" and all(
+        p.device == first.device and p.dtype == first.dtype and p.is_floating_point() for p in params
     )
 
 
-def supports_fused_adamw(params: list[nn.Parameter]) -> bool:
-    return _can_attempt_fused_adamw(params) and params[0].device.type == "cuda"
+def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
+    """Partition parameters and construct both optimizers.
 
+    Every trainable parameter lands in exactly one group; the assertion is not
+    decorative — a parameter in zero groups trains silently at learning rate 0,
+    and one in two groups gets a double update.
 
-def _is_expected_fused_adamw_error(error: Exception) -> bool:
-    message = str(error).lower()
-    if "unexpected keyword argument 'fused'" in message or 'unexpected keyword argument "fused"' in message:
-        return True
-    return any(
-        pattern in message
-        for pattern in (
-            "fused adamw is not supported for this device", "fused adamw is not supported for this dtype",
-            "fused adamw is not supported on this device", "fused adamw is not supported on this dtype",
-            "fused is not supported for this device", "fused is not supported for this dtype",
-            "fused is not supported on this device", "fused is not supported on this dtype",
-        )
-    )
-
-
-def build_adamw(
-    param_groups: list[dict],
-    *,
-    lr: float,
-    beta1: float = 0.9,
-    beta2: float = 0.95,
-    eps: float = 1e-8,
-) -> torch.optim.AdamW:
-    """Build AdamW, probing fused support without touching model parameters."""
-    params = [param for group in param_groups for param in group["params"]]
-    kwargs = {"lr": lr, "betas": (beta1, beta2), "eps": eps}
-    if not supports_fused_adamw(params):
-        return torch.optim.AdamW(param_groups, **kwargs, fused=False)
-    probe_param = nn.Parameter(torch.zeros(1, device=params[0].device, dtype=params[0].dtype))
-    probe_param.grad = torch.ones_like(probe_param)
-    try:
-        probe = torch.optim.AdamW([{"params": [probe_param], "weight_decay": 0.0}], **kwargs, fused=True)
-        probe.step()
-    except (RuntimeError, TypeError, NotImplementedError) as error:
-        if not _is_expected_fused_adamw_error(error):
-            raise
-        return torch.optim.AdamW(param_groups, **kwargs, fused=False)
-    return torch.optim.AdamW(param_groups, **kwargs, fused=True)
-
-
-def build_optimizer(model: nn.Module, cfg: Config) -> CombinedOptimizer:
-    """Build Muon (2D ternary channel weights) + AdamW (everything else).
-
-    Routing is by type: BitLinear.weight -> Muon; all other trainable params ->
-    AdamW. Every trainable parameter appears in exactly one group (verified).
+    Weight decay is applied to 2D matrices only. Decaying a 1D gain pulls a
+    normalization layer's scale toward zero, which is a change to the function
+    rather than a regularizer on capacity.
     """
     tc = cfg.train
-    muon_params = _muon_params(model)
+    muon_params = _muon_parameters(model)
     muon_ids = {id(p) for p in muon_params}
-    rest = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in muon_ids]
-    decay = [p for n, p in rest if p.ndim >= 2 and "norm" not in n.lower()]
-    no_decay = [p for n, p in rest if not (p.ndim >= 2 and "norm" not in n.lower())]
-    optimized_ids = [id(p) for p in muon_params + decay + no_decay]
-    if len(optimized_ids) != len(set(optimized_ids)) or set(optimized_ids) != {id(p) for _, p in model.named_parameters() if p.requires_grad}:
-        raise RuntimeError("every trainable parameter must appear in exactly one optimizer group")
+
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad or id(p) in muon_ids:
+            continue
+        if p.ndim >= 2 and "norm" not in name.lower():
+            decay.append(p)
+        else:
+            no_decay.append(p)
+
+    assigned = [id(p) for p in muon_params + decay + no_decay]
+    trainable = {id(p) for p in model.parameters() if p.requires_grad}
+    if len(assigned) != len(set(assigned)) or set(assigned) != trainable:
+        raise RuntimeError(
+            f"parameter partition is not a bijection: {len(assigned)} assigned "
+            f"({len(set(assigned))} unique) vs {len(trainable)} trainable"
+        )
 
     muon = Muon(
         muon_params,
-        lr=tc.muon.lr, momentum=tc.muon.momentum, nesterov=tc.muon.nesterov,
-        ns_steps=tc.muon.ns_steps, weight_decay=tc.muon.weight_decay,
-        ns_coeffs=tc.muon.ns_coeffs, wd_cap=tc.muon.wd_cap,
+        lr=tc.muon.lr,
+        momentum=tc.muon.momentum,
+        nesterov=tc.muon.nesterov,
+        ns_steps=tc.muon.ns_steps,
+        ns_coeffs=tuple(tc.muon.ns_coeffs),
+        weight_decay=tc.muon.weight_decay,
+        wd_cap=tc.muon.wd_cap,
         momentum_offload=tc.muon.momentum_offload,
     )
-    muon.param_groups[0]["_muon"] = True
-    adamw = build_adamw(
-        [{"params": decay, "weight_decay": tc.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
-        lr=tc.learning_rate, beta1=tc.adam.beta1, beta2=tc.adam.beta2, eps=tc.adam.eps,
-    )
-    return CombinedOptimizer(muon, adamw)
+    for group in muon.param_groups:
+        group["_muon"] = True
+
+    groups = [
+        {"params": decay, "weight_decay": tc.adam.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    kwargs = dict(lr=tc.learning_rate, betas=(tc.adam.beta1, tc.adam.beta2), eps=float(tc.adam.eps))
+    all_adam = decay + no_decay
+    try:
+        adamw = torch.optim.AdamW(groups, **kwargs, fused=_supports_fused_adamw(all_adam))
+    except (RuntimeError, TypeError, NotImplementedError):
+        adamw = torch.optim.AdamW(groups, **kwargs, fused=False)
+
+    return HybridOptimizer(muon, adamw)
+
+
+def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:
+    """Warmup - stable - decay schedule value at ``step``.
+
+    Three phases:
+
+    * **Warmup** — linear from 0. Mandatory with a matrix-sign optimizer: the
+      first orthogonalized updates are full-magnitude in every direction at once.
+    * **Stable** — either constant or ``1/sqrt(1 + t/tau)``. The inverse-square-
+      root form is horizon-free (extending a run needs no re-tuning) and
+      minimax-optimal for last-iterate convergence in the stochastic convex
+      setting; a long constant phase at peak learning rate is where late-training
+      instability comes from.
+    * **Decay** — linear to ``min_lr_ratio``. The final cooldown is where most of
+      the loss improvement is realized, and it is the only phase that needs to
+      know the total horizon.
+    """
+    s = cfg.train.schedule
+    total = cfg.train.max_steps
+    if step < s.warmup_steps:
+        return base_lr * step / max(s.warmup_steps, 1)
+
+    decay_start = int(total * (1.0 - s.decay_fraction))
+    if s.inverse_sqrt_stable:
+        tau = s.inverse_sqrt_tau or max(s.warmup_steps, 1)
+        shape = (1.0 + (min(step, decay_start) - s.warmup_steps) / tau) ** -0.5
+    else:
+        shape = 1.0
+
+    if step < decay_start:
+        return base_lr * max(shape, s.min_lr_ratio)
+
+    progress = (step - decay_start) / max(total - decay_start, 1)
+    level = shape * (1.0 - progress) + s.min_lr_ratio * progress
+    return base_lr * max(level, s.min_lr_ratio)
+
+
+def set_learning_rate(optimizer: HybridOptimizer, step: int, cfg: Config) -> tuple[float, float]:
+    """Apply the schedule to both base rates. Returns ``(adam_lr, muon_lr)``."""
+    adam_lr = learning_rate_at(step, cfg.train.learning_rate, cfg)
+    muon_lr = learning_rate_at(step, cfg.train.muon.lr, cfg)
+    for group in optimizer.param_groups:
+        group["lr"] = muon_lr if group.get("_muon") else adam_lr
+    return adam_lr, muon_lr
