@@ -142,18 +142,66 @@ budget is 196k steps = 3.21B tokens over ~7 days.
 
 ### Why not a bottleneck head
 
-Head matmul is 54% of step time at V=131072. A bottleneck `H -> 288 -> V`
+Head matmul was 54% of step time at V=131072. A bottleneck `H -> 288 -> V`
 head measured 2.7x faster, but V31's factored-head measurement showed a
 ~0.5-0.9 nats loss at these ranks, which is ~1.6x perplexity — too expensive to
 trade for speed. The vocab compaction to 131072 already halved the head; a
 further compaction to 65536 (98.3% mass) is the clean next lever if needed.
 
+## V32.3 — second compaction 65536 -> 32768
+
+Measured exact step-cost split on the V32.2 config (batch 12 x 1024, V=65536,
+ROCm, no flash-attn):
+
+```
+fwd+bwd  2.03s   = head backward 1.05s (51%)
+                   + blocks backward 0.69s
+                   + fwd blocks 0.41s
+Muon NS   0.70s  (204 matrices, all > 1e5 params)
+AdamW     0.13s
+```
+
+The head dominates because the chunked CE's backward materializes **four**
+`[N,V,H]` projections (forward 1 + backward recompute + `g@W` + `g^T h`) plus an
+fp32 softmax pass over all V. Every one scales linearly in V.
+
+**Logit sparsity was measured and rejected.** At init the logits std is only
+0.02 (receiver gain 0.029), so all 65536 logits sit within `max-1.0`; a top-K
+truncation would save nothing. The cheap lever is vocabulary size itself.
+
+Compaction to **V=32768** (96.2% mass, unk 1-8%) halves all four projections and
+the softmax:
+
+```
+V32.2:  2.90s/step   4280 tok/s   head 75.5M params
+V32.3:  2.41s/step   5106 tok/s   head 37.7M params   (+19%)
+```
+
+Head params drop to 37.7M; body share rises to ~94%. Budget re-scaled to
+212k steps = 2.6B tokens.
+
+### Map consistency pitfall (measured)
+
+`compact_vocab.py`'s recompaction path builds the 65536->32768 map from the
+65536-space `.compact.bin`, which **loses the original 262144-space identity**:
+the transitive map disagrees with a direct full map by ±1-4 ids (frequency-sort
+tie-break). For inference the tokenizer emits old-space ids, so `vocab_map.npz`
+must be the **full 262144->32768 map** and the binaries must be rebuilt from raw
+`.bin` through it (`scripts/rebuild_compact2.py`). Verified roundtrip: survivors
+32768/32768 exact, dropped tokens -> UNK(3).
+
+### Stability note
+
+The V=65536 run died silently at step 280 (rest_grad_norm grew 0.24 -> 1.1, no
+traceback, process vanished). A fresh V=32768 run stays stable over 165+ steps
+(gr 0.21-0.44 tracking the warmup lr, gb 0.009). The smaller codebook also
+shrinks the AdamW codebook-grad contribution that was the growing component.
+
 ## How to train
 
 ```bash
 # data/ already carries the compact streams and vocab_map.npz; if re-running:
-python scripts/compact_vocab.py --data-dir data --target-vocab 131072
-
+python scripts/rebuild_compact2.py          # full 262144->32768 map + binaries
 python scripts/train.py --config configs/v32_1b.yaml --dry-run   # ~8.0 ce at init
-python scripts/train.py --config configs/v32_1b.yaml             # 108k steps
+python scripts/train.py --config configs/v32_1b.yaml             # 212k steps
 ```
