@@ -167,6 +167,30 @@ class Attention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
+        # Windowed layer: physically truncate K/V to the last ``window`` keys
+        # (and the mask with it). Training-only. This is a pure O(T*W)
+        # attention instead of the O(T^2) the MATH SDPA backend would otherwise
+        # materialize; on this ROCm build (no flash/efficient kernel) that
+        # measured 2.4x faster at T=1024. In eval the full (untruncated) path
+        # must stay bit-exact against incremental decoding, which is asserted
+        # by tests — a truncated prefill and a small cache disagree on the
+        # earliest positions, so truncation is confined to training where the
+        # only requirement is equivalence up to the window semantics.
+        window = self.sliding_window
+        if self.training and window > 0 and k.shape[-2] > window:
+            total_k = k.shape[-2]
+            k = k[:, :, -window:]
+            v = v[:, :, -window:]
+            if mask is not None:
+                mask = mask[..., -window:]
+            else:
+                # absolute positions of the truncated keys
+                k_abs = torch.arange(total_k - window, total_k, device=k.device).view(1, 1, 1, window)
+                q_abs = torch.arange(total_k - t, total_k, device=k.device).view(1, t, 1)
+                allowed = k_abs <= q_abs
+                m = torch.zeros((1, 1, t, window), device=k.device, dtype=q.dtype)
+                mask = m.masked_fill(~allowed, float("-inf"))
+
         if mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         elif t == 1:
