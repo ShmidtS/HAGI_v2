@@ -158,13 +158,19 @@ class Trainer:
         z_sum = 0.0
         router_z_sum = 0.0
         for batch, count in zip(microbatches, token_counts, strict=True):
+            # non_blocking=True on .to() is disabled: on this ROCm build the
+            # async H2D transfer raced the compute stream and produced
+            # intermittent "HIP error: unspecified launch failure" in CUDAEvent
+            # (crash after ~10 steps, only in train_step, never in a manual
+            # blocking loop). The transfer is small (a few tens of MB per
+            # batch); blocking costs nothing measurable.
             output = model(
-                batch["input_ids"].to(device, non_blocking=True),
-                batch["targets"].to(device, non_blocking=True),
-                doc_ids=batch["doc_ids"].to(device, non_blocking=True) if "doc_ids" in batch else None,
-                loss_mask=batch["loss_mask"].to(device, non_blocking=True) if "loss_mask" in batch else None,
-                images=batch["images"].to(device, non_blocking=True) if "images" in batch else None,
-                spectrograms=batch["spectrograms"].to(device, non_blocking=True)
+                batch["input_ids"].to(device),
+                batch["targets"].to(device),
+                doc_ids=batch["doc_ids"].to(device) if "doc_ids" in batch else None,
+                loss_mask=batch["loss_mask"].to(device) if "loss_mask" in batch else None,
+                images=batch["images"].to(device) if "images" in batch else None,
+                spectrograms=batch["spectrograms"].to(device)
                 if "spectrograms" in batch
                 else None,
             )
