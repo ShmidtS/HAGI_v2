@@ -42,18 +42,20 @@ TOKEN_DTYPE = np.uint32
 
 
 def dataset_path(data_dir: str | Path, name: str) -> Path:
-    """Resolve ``<data_dir>/<name>.bin``, preferring a compacted stream.
+    """Resolve ``<data_dir>/<name>.bin``, preferring the compacted streams.
 
-    ``scripts/compact_vocab.py`` writes ``<name>.compact.bin`` against a dense id
-    map. When present, the compact stream is used so the model never sees dropped
+    ``scripts/compact_vocab.py`` writes ``<name>.compact.bin`` (and a second
+    compaction run writes ``<name>.compact2.bin``) against a dense id map. When
+    present, the most-compacted stream is used so the model never sees dropped
     ids; otherwise the raw stream is used. Rejects traversal in ``name``.
     """
     if not isinstance(name, str) or not name or Path(name).name != name or "\\" in name:
         raise ValueError(f"invalid dataset name: {name!r}")
     base = Path(data_dir) / f"{name}.bin"
-    compact = base.with_suffix(".compact.bin")
-    if compact.exists():
-        return compact
+    for suffix in (".compact2.bin", ".compact.bin"):
+        compact = base.with_suffix(suffix)
+        if compact.exists():
+            return compact
     return base
 
 

@@ -146,6 +146,18 @@ def main() -> int:
     np.save(data_dir / "unigram.compact.npy", new_counts)
     print(f"saved: {data_dir / 'unigram.compact.npy'}")
 
+    # Recompact from the *current* compact streams when they exist (a second
+    # compaction run: 131072 -> 65536), else from the raw tokenizer streams.
+    # The map's input space must match the file's id space; for a recompaction
+    # that is the existing compact space, which is len(old_to_new) = len(counts).
+    candidates = sorted(data_dir.glob("*.compact.bin"))
+    if candidates:
+        for source in candidates:
+            dest = source.with_name(source.name.replace(".compact.bin", ".compact2.bin"))
+            written, replaced = rewrite_stream(source, dest, old_to_new, fallback)
+            print(f"{source.name} -> {dest.name}: {written / 1e6:.1f}M tokens, {replaced / max(written, 1):.6f} unk")
+        return 0
+
     for source in sorted(data_dir.glob("*.bin")):
         if source.name.endswith(".compact.bin"):
             continue

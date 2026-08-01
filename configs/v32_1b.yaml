@@ -35,7 +35,8 @@
 # *.compact.bin when present (hagi/data/dataset.py:dataset_path).
 
 model:
-  vocab_size: 131072           # compacted from 262144 (99.9% mass retained)
+  vocab_size: 65536            # compacted from 262144 (98.2% mass retained);
+                               # halves the head matmul (54% of step time at 131072)
   hidden_size: 1152
   num_layers: 13
   norm_eps: 1.0e-5
