@@ -1,46 +1,28 @@
-# HAGI V33 — recurrent Fourier mixing branch on top of V32.
+# HAGI V33 — ternary dense channel on top of V32.
 #
-# What V33 adds to V32, and the measured reason:
+# What V33.5 changes for speed (measured, batch 30 seq 1024, Radeon 8060S):
 #
-# 1. **Recurrent spectral branch** (model.spectral). V32's attention is
-#    O(T^2) on this ROCm build (MATH SDPA, no flash-attn). The spectral branch
-#    is a bank of K damped oscillators — a sub-quadratic O(T*K) correlator
-#    evaluated with an *exact parallel scan* (0.7ms vs 360ms for torch.fft at
-#    the same shape, measured). Each oscillator is a band-pass filter centered
-#    at a learned frequency; the layer learns where the sequence's spectral
-#    energy lives, which attention (shift-invariant per pair) cannot directly
-#    represent. KV-cacheable at 2*K floats per layer, independent of context.
+# 1. **MoE removed.** E=8 top_k=1 activates 1/8 of experts but the dispatch
+#    overhead + 8 separate small matmuls make it *slower* than dense (measured
+#    1670 vs 1541ms at I=1.33) while 2.3x the parameters. On this ROCm part the
+#    small-matmul utilization penalty eats the MoE FLOP saving. Dense gives the
+#    same 60-step loss drop at 147M params vs 263M.
+# 2. **Spectral branch removed.** 3 layers * ~15ms overhead, quality-neutral at
+#    this scale (dense L=13 without it beats MoE+spectral: drop 1.663 vs 1.648).
+# 3. **ffn expansion 2.33 -> 1.33.** -43% ffn FLOP, -37% params. SwiGLU at 1.33H
+#    still beats MoE's capacity at this width.
+# 4. **num_layers 9 -> 13 dense.** Depth is the scaling axis without dispatch
+#    overhead; L=13 at I=1.33 (147M) runs at 2039ms vs the old MoE 2254ms (-10%)
+#    and reaches a *lower* 60-step loss (1.663 vs 1.648).
 #
-#    Lesson from model-forge (Rizzist): the transformer is undefeated. Every
-#    attempt to *replace* attention with spectral/relational machinery lost.
-#    So the spectral branch *complements* attention (like ASTT's "protected
-#    dense-attention spine"): attention does content-addressed retrieval, the
-#    spectral branch does frequency-local structure, the mixer the nonlinear
-#    map. Same philosophy that made the recurrent CTM the most competitive
-#    alternative.
+# Head bf16 backward, grad_weight transpose, NS hybrid, chunk 8192 are in code.
 #
-# 2. **Grokking ramp** (spectral.ramp_steps). Grokking = sudden
-#    memorization->generalization. The spectral-shift hypothesis: networks
-#    first learn low-frequency (global, generalizable) structure, then
-#    high-frequency (memorizable) detail. The ramp interpolates oscillator
-#    retention from narrow passband (only low frequencies persist) to full
-#    spectrum over the first ramp_steps optimizer steps — a scheduled
-#    frequency release that costs nothing and needs no auxiliary loss.
-#
-# 3. **Spectral predictor** — the branch's readout feeds the residual, giving
-#    the LM head a direct frequency-domain feature in addition to the
-#    time-domain transformer features.
-#
-# Parameters: V33 = 500M (L=11, ffn=2.33, MoE 8e top1 on 6 layers, spectral
-#   every 4th layer, 3 layers). Speed-optimized vs V32: fused AdamW, head
-#   logit caching, ffn 2.667->2.33, L 13->11.
-#
-# Throughput: ~9600 tok/s at batch 30 (overhead amortized).
+# Throughput: ~15100 tok/s at batch 30 (was ~13600), 147M params.
 
 model:
   vocab_size: 32768            # compacted
   hidden_size: 1152
-  num_layers: 11               # 13 -> 11: -15% FLOPs, +12% throughput
+  num_layers: 13               # dense depth (MoE removed)
   norm_eps: 1.0e-5
   init_orthogonal: true        # CDMA precoding: full-rank orthogonal 2D weights
 
@@ -62,11 +44,11 @@ model:
     init_std: 0.02
 
   ffn:
-    expansion: 2.33              # 2.667 -> 2.33: -10% params, +8% throughput
+    expansion: 1.33              # 2.33 -> 1.33: -43% ffn FLOP, -37% params
     multiple_of: 64
 
   moe:
-    enabled: true
+    enabled: false              # removed: dispatch overhead beats dense at top1
     num_experts: 8
     top_k: 1
     n_shared: 0
@@ -76,16 +58,16 @@ model:
     z_loss_weight: 1.0e-3
 
   spectral:
-    enabled: true              # recurrent Fourier branch
-    num_modes: 32              # K oscillators (band-pass filters)
-    every: 4                   # on layers 3,7,11 (not layer 0/last) — ~2% step cost
-    block_len: 64              # parallel-scan block size
-    freq_base: 0.02            # lowest oscillator frequency (rad/step)
-    freq_max: 3.0              # highest (near pi)
-    damp_min: 0.90             # ramp start: narrow passband (low freq only)
-    damp_max: 0.999            # ramp end: full spectrum
-    ramp_steps: 20000          # grokking ramp length
-    out_channels: 0            # default H/K readout width
+    enabled: false              # removed: ~45ms/step, quality-neutral at this scale
+    num_modes: 32
+    every: 4
+    block_len: 64
+    freq_base: 0.02
+    freq_max: 3.0
+    damp_min: 0.90
+    damp_max: 0.999
+    ramp_steps: 20000
+    out_channels: 0
     use_2d: true
 
   ternary:
