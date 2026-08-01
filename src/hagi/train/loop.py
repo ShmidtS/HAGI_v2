@@ -191,22 +191,25 @@ class Trainer:
         if not (math.isfinite(body_norm) and math.isfinite(rest_norm)):
             # Skip rather than raise: one bad microbatch in a long run should cost
             # one step, not the run. A persistent problem shows up as a run of
-            # skipped steps in the log.
-            logger.warning(
-                "step %d: non-finite gradient norm (body=%s rest=%s), update skipped",
-                self.step,
-                body_norm,
-                rest_norm,
-            )
-            self.optimizer.zero_grad(set_to_none=True)
-            return {
-                "step": self.step,
-                "update_applied": False,
-                "grad_norm": body_norm if math.isfinite(body_norm) else rest_norm,
-                "body_grad_norm": body_norm,
-                "rest_grad_norm": rest_norm,
-            }
-
+            # skipped steps in the log. ``body_norm`` is NaN when Muon is disabled
+            # (no body group); only ``rest_norm`` then gates the update.
+            body_ok = math.isfinite(body_norm) or len(_muon_parameters(model)) == 0
+            rest_ok = math.isfinite(rest_norm)
+            if not (body_ok and rest_ok):
+                logger.warning(
+                    "step %d: non-finite gradient norm (body=%s rest=%s), update skipped",
+                    self.step,
+                    body_norm,
+                    rest_norm,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                return {
+                    "step": self.step,
+                    "update_applied": False,
+                    "grad_norm": body_norm if body_ok else rest_norm,
+                    "body_grad_norm": body_norm,
+                    "rest_grad_norm": rest_norm,
+                }
         adam_lr, muon_lr = set_learning_rate(self.optimizer, self.step, cfg)
         self.optimizer.step()
 

@@ -173,26 +173,32 @@ class HybridOptimizer:
     a shared ``param_groups`` list would make LR scheduling ambiguous. The
     ``_muon`` flag on each group is what the scheduler uses to apply the two base
     learning rates.
+
+    ``muon`` may be None when Muon is disabled (``train.use_muon=False``): the
+    whole model then rides AdamW and the Muon accessors become no-ops.
     """
 
-    def __init__(self, muon: Muon, adamw: torch.optim.AdamW) -> None:
+    def __init__(self, muon: Muon | None, adamw: torch.optim.AdamW) -> None:
         self.muon = muon
         self.adamw = adamw
-        self.param_groups = muon.param_groups + adamw.param_groups
+        self.param_groups = (muon.param_groups if muon else []) + adamw.param_groups
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        self.muon.zero_grad(set_to_none=set_to_none)
+        if self.muon is not None:
+            self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
-        self.muon.step()
+        if self.muon is not None:
+            self.muon.step()
         self.adamw.step()
 
     def state_dict(self) -> dict:
-        return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
+        return {"muon": self.muon.state_dict() if self.muon else {}, "adamw": self.adamw.state_dict()}
 
     def load_state_dict(self, state: dict) -> None:
-        self.muon.load_state_dict(state["muon"])
+        if self.muon is not None and state.get("muon"):
+            self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
 
 
@@ -238,7 +244,7 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     rather than a regularizer on capacity.
     """
     tc = cfg.train
-    muon_params = _muon_parameters(model)
+    muon_params = _muon_parameters(model) if tc.use_muon else []
     muon_ids = {id(p) for p in muon_params}
 
     decay: list[nn.Parameter] = []
@@ -259,19 +265,22 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
             f"({len(set(assigned))} unique) vs {len(trainable)} trainable"
         )
 
-    muon = Muon(
-        muon_params,
-        lr=tc.muon.lr,
-        momentum=tc.muon.momentum,
-        nesterov=tc.muon.nesterov,
-        ns_steps=tc.muon.ns_steps,
-        ns_coeffs=tuple(tc.muon.ns_coeffs),
-        weight_decay=tc.muon.weight_decay,
-        wd_cap=tc.muon.wd_cap,
-        momentum_offload=tc.muon.momentum_offload,
-    )
-    for group in muon.param_groups:
-        group["_muon"] = True
+    if muon_params:
+        muon = Muon(
+            muon_params,
+            lr=tc.muon.lr,
+            momentum=tc.muon.momentum,
+            nesterov=tc.muon.nesterov,
+            ns_steps=tc.muon.ns_steps,
+            ns_coeffs=tuple(tc.muon.ns_coeffs),
+            weight_decay=tc.muon.weight_decay,
+            wd_cap=tc.muon.wd_cap,
+            momentum_offload=tc.muon.momentum_offload,
+        )
+        for group in muon.param_groups:
+            group["_muon"] = True
+    else:
+        muon = None
 
     groups = [
         {"params": decay, "weight_decay": tc.adam.weight_decay},

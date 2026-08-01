@@ -430,6 +430,12 @@ class TrainConfig:
     precision: str = "bf16"
     grad_checkpointing: bool = True
     compile_model: bool = False
+    # Muon's Newton-Schulz orthogonalization costs ~29% of step time on this
+    # ROCm build (measured 0.70s of 2.41s). BitNet b1.58 weights are ternary:
+    # the quantizer reads only the sign pattern relative to row absmean, so the
+    # per-direction isotropy Muon provides buys nothing that AdamW does not.
+    # Default off; Muon remains selectable for fp16/dense bodies where it helps.
+    use_muon: bool = False
     muon: MuonConfig = field(default_factory=MuonConfig)
     adam: AdamConfig = field(default_factory=AdamConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
