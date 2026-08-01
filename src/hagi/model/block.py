@@ -21,10 +21,16 @@ from torch import nn
 from hagi.model.attention import Attention, AttentionConfig
 from hagi.model.ffn import FeedForward
 from hagi.model.moe import MoE
+from hagi.model.spectral import SpectralRecurrence
 
 
 class Block(nn.Module):
-    """One layer: ``x + attn(x)`` then ``x + mixer(x)``.
+    """One layer: ``x + attn(x)`` then ``x + spectral(x)`` (if selected) then ``x + mixer(x)``.
+
+    The spectral branch is optional and adds its increment between attention and
+    the mixer. It is a *parallel* path, not a replacement: attention handles
+    content-addressable retrieval, the spectral branch handles frequency-local
+    structure, and the mixer the per-position nonlinear map.
 
     Args:
         hidden_size: H.
@@ -33,6 +39,8 @@ class Block(nn.Module):
         norm_eps: RMSNorm epsilon.
         use_ternary: quantize the 2D weights.
         residual_scale: init scale for both branches' output projections.
+        spectral_cfg: spectral configuration, or None for no spectral branch.
+        use_spectral: whether this layer carries the spectral branch.
     """
 
     def __init__(
@@ -43,22 +51,38 @@ class Block(nn.Module):
         norm_eps: float = 1e-5,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        spectral_cfg=None,
+        use_spectral: bool = False,
     ) -> None:
         super().__init__()
         self.attn = Attention(hidden_size, attn_cfg, norm_eps, use_ternary, residual_scale)
         self.mixer = mixer
+        self.spectral = None
+        if use_spectral and spectral_cfg is not None:
+            from hagi.config import SpectralConfig
+
+            if not isinstance(spectral_cfg, SpectralConfig):
+                raise TypeError("spectral_cfg must be a SpectralConfig when use_spectral=True")
+            self.spectral = SpectralRecurrence(hidden_size, spectral_cfg, norm_eps, use_ternary, residual_scale)
 
     @property
     def is_moe(self) -> bool:
         return isinstance(self.mixer, MoE)
+
+    @property
+    def has_spectral(self) -> bool:
+        return self.spectral is not None
 
     def forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
+        use_spectral_state: bool = False,
     ) -> torch.Tensor:
         x = x + self.attn(x, positions, mask)
+        if self.spectral is not None:
+            x = x + self.spectral(x, use_state=use_spectral_state)
         return x + self.mixer(x)
 
 

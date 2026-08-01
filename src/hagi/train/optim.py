@@ -246,18 +246,22 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     tc = cfg.train
     muon_params = _muon_parameters(model) if tc.use_muon else []
     muon_ids = {id(p) for p in muon_params}
+    channel_ids = {id(p) for p in _muon_parameters(model)}
 
+    body: list[nn.Parameter] = []
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in muon_ids:
             continue
-        if p.ndim >= 2 and "norm" not in name.lower():
+        if id(p) in channel_ids:
+            body.append(p)
+        elif p.ndim >= 2 and "norm" not in name.lower():
             decay.append(p)
         else:
             no_decay.append(p)
 
-    assigned = [id(p) for p in muon_params + decay + no_decay]
+    assigned = [id(p) for p in muon_params + body + decay + no_decay]
     trainable = {id(p) for p in model.parameters() if p.requires_grad}
     if len(assigned) != len(set(assigned)) or set(assigned) != trainable:
         raise RuntimeError(
@@ -282,14 +286,38 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     else:
         muon = None
 
-    groups = [
-        {"params": decay, "weight_decay": tc.adam.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
-    kwargs = dict(lr=tc.learning_rate, betas=(tc.adam.beta1, tc.adam.beta2), eps=float(tc.adam.eps))
-    all_adam = decay + no_decay
+    base = tc.learning_rate
+    body_lr = base * float(tc.adam.body_lr_scale)
+    # Split every semantic group by dtype. The fused AdamW kernel requires all
+    # parameters in a group to share one dtype, and cast_model leaves the body in
+    # bf16 but norms/gains/routers in fp32 — a mixed group silently disables the
+    # fused kernel (measured 157ms vs 95ms for a step, 1.66x). Splitting into
+    # dtype-homogeneous groups restores fused for every parameter.
+    def _split_by_dtype(params: list[nn.Parameter]) -> list[list[nn.Parameter]]:
+        groups = []
+        for dtype in (torch.bfloat16, torch.float32, torch.float16, torch.float64):
+            same = [p for p in params if p.dtype == dtype]
+            if same:
+                groups.append(same)
+        return groups
+
+    groups = []
+    for sub in _split_by_dtype(body):
+        groups.append(
+            {"params": sub, "weight_decay": tc.adam.weight_decay, "lr": body_lr, "_body": True}
+        )
+    for sub in _split_by_dtype(decay):
+        groups.append({"params": sub, "weight_decay": tc.adam.weight_decay})
+    for sub in _split_by_dtype(no_decay):
+        groups.append({"params": sub, "weight_decay": 0.0})
+
+    kwargs = dict(lr=base, betas=(tc.adam.beta1, tc.adam.beta2), eps=float(tc.adam.eps))
+    # Fused is per-optimizer, not per-group: it needs *every* group to be
+    # dtype-homogeneous. After the split above each group is, so the global
+    # support check now reflects what fused actually requires.
+    fused = all(_supports_fused_adamw(g["params"]) for g in groups)
     try:
-        adamw = torch.optim.AdamW(groups, **kwargs, fused=_supports_fused_adamw(all_adam))
+        adamw = torch.optim.AdamW(groups, **kwargs, fused=fused)
     except (RuntimeError, TypeError, NotImplementedError):
         adamw = torch.optim.AdamW(groups, **kwargs, fused=False)
 
@@ -333,9 +361,19 @@ def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:
 
 
 def set_learning_rate(optimizer: HybridOptimizer, step: int, cfg: Config) -> tuple[float, float]:
-    """Apply the schedule to both base rates. Returns ``(adam_lr, muon_lr)``."""
+    """Apply the schedule to both base rates. Returns ``(adam_lr, muon_lr)``.
+
+    The body group carries a ``body_lr_scale`` multiplier (AdamConfig), so its
+    effective LR tracks the schedule at ``base * scale`` rather than ``base``.
+    """
     adam_lr = learning_rate_at(step, cfg.train.learning_rate, cfg)
     muon_lr = learning_rate_at(step, cfg.train.muon.lr, cfg)
+    body_scale = float(cfg.train.adam.body_lr_scale)
     for group in optimizer.param_groups:
-        group["lr"] = muon_lr if group.get("_muon") else adam_lr
+        if group.get("_muon"):
+            group["lr"] = muon_lr
+        elif group.get("_body"):
+            group["lr"] = adam_lr * body_scale
+        else:
+            group["lr"] = adam_lr
     return adam_lr, muon_lr

@@ -37,6 +37,7 @@ from hagi.config import (
     ffn_width,
     layer_windows,
     moe_layers,
+    spectral_layers,
 )
 from hagi.model.attention import AttentionConfig, build_attention_mask
 from hagi.model.block import Block, build_mixer
@@ -75,6 +76,7 @@ class HAGI(nn.Module):
         residual_scale = (2.0 * m.num_layers) ** -0.5
         windows = layer_windows(m)
         is_moe = moe_layers(m)
+        is_spectral = spectral_layers(m)
         intermediate = ffn_width(m)
 
         self.blocks = nn.ModuleList()
@@ -90,7 +92,18 @@ class HAGI(nn.Module):
             mixer = build_mixer(
                 h, intermediate, m.moe, is_moe[layer], m.norm_eps, use_ternary, residual_scale
             )
-            self.blocks.append(Block(h, attn_cfg, mixer, m.norm_eps, use_ternary, residual_scale))
+            self.blocks.append(
+                Block(
+                    h,
+                    attn_cfg,
+                    mixer,
+                    m.norm_eps,
+                    use_ternary,
+                    residual_scale,
+                    spectral_cfg=m.spectral if m.spectral.enabled else None,
+                    use_spectral=is_spectral[layer],
+                )
+            )
 
         self.out_norm = RMSNorm(h, eps=m.norm_eps)
         self.head = LMHead(
@@ -108,6 +121,7 @@ class HAGI(nn.Module):
 
         self._window_layers = windows
         self._uniform_window = windows[0] if len(set(windows)) == 1 else None
+        self._step_for_ramp = 0
 
     def param_summary(self) -> dict[str, int]:
         """Analytic parameter counts by group (see :func:`~hagi.config.count_params`)."""
@@ -127,18 +141,28 @@ class HAGI(nn.Module):
         """Detach all KV-caches and clear the source filter's decode state."""
         for block in self.blocks:
             block.attn.detach_cache()
+            if block.has_spectral:
+                block.spectral.reset_state()
         self.encoder.reset_state()
 
     def commit_controller_updates(self) -> None:
-        """Apply every MoE router's deferred bias update.
+        """Apply every MoE router's deferred bias update and the spectral ramp.
 
         Called once per optimizer step after backward. Deferring keeps the
         forward pure, which activation checkpointing requires: the recomputed
         forward must select the same experts as the original.
         """
+        m = self.cfg.model
+        ramp = m.spectral.ramp_steps if m.spectral.enabled else 0
         for block in self.blocks:
             if block.is_moe:
                 block.mixer.commit_bias_update()
+            if block.has_spectral and ramp > 0:
+                block.spectral.update_ramp(self._step_for_ramp)
+
+    def set_step_counter(self, step: int) -> None:
+        """Record the current optimizer step for the spectral ramp."""
+        self._step_for_ramp = int(step)
 
     def _run_blocks(
         self,
@@ -147,6 +171,7 @@ class HAGI(nn.Module):
         doc_ids: torch.Tensor | None,
         prefix_len: int,
         t_total: int,
+        use_state: bool = False,
     ) -> torch.Tensor:
         """Run the stack, building one mask per distinct window size.
 
@@ -171,9 +196,9 @@ class HAGI(nn.Module):
                 )
             mask = mask_by_window[window]
             if checkpointing:
-                h = checkpoint_util.checkpoint(block, h, positions, mask, use_reentrant=False)
+                h = checkpoint_util.checkpoint(block, h, positions, mask, use_state, use_reentrant=False)
             else:
-                h = block(h, positions, mask)
+                h = block(h, positions, mask, use_spectral_state=use_state)
         return h
 
     def forward(
@@ -225,7 +250,7 @@ class HAGI(nn.Module):
 
         cache_len = self.blocks[0].attn._kv_cache.length if use_cache and self.blocks else 0
         t_total = cache_len + h.shape[1]
-        h = self._run_blocks(h, positions, doc_ids, prefix_len, t_total)
+        h = self._run_blocks(h, positions, doc_ids, prefix_len, t_total, use_state=use_cache)
         h = self.out_norm(h)
 
         text_hidden = h[:, prefix_len:] if prefix_len else h
@@ -303,4 +328,7 @@ class HAGI(nn.Module):
             stats["qk_gain"] = float(torch.stack(gains).mean())
         stats["residual_gain"] = float(self.out_norm.weight.abs().mean())
         stats["logit_scale"] = float(self.head.logit_scale)
+        spec_blocks = [b.spectral for b in self.blocks if b.has_spectral]
+        if spec_blocks:
+            stats["spectral_ramp"] = float(spec_blocks[0]._ramp)
         return stats
