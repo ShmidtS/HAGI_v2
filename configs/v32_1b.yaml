@@ -65,8 +65,9 @@ model:
   moe:
     enabled: true              # scaling lever: total params grow, FLOPs/token don't
     num_experts: 8
-    top_k: 2
-    n_shared: 0                # no always-on shared expert: top_k=2 already routes every
+    top_k: 1                   # Switch-style routing: one expert per token. Half the
+                               # routed FFN FLOPs of top_k=2; balance measured 1.000
+    n_shared: 0                # no always-on shared expert: top_k=1 already routes every
                                # token; the shared copy was 10.6M params of constant compute
     moe_every: 2
     bias_update_rate: 0.001    # bias controller (aux-loss-free balance)
@@ -88,14 +89,14 @@ model:
     enabled: false             # off for text-only; bridge is fixed-rate and opt-in
 
 train:
-  # Budget: ~2.9B tokens over ~7 days of continuous training at the optimized
-  # throughput (~4900 tok/s after bf16 CE + no grad-checkpointing + n_shared=0
-  # + window truncation). This ROCm build has no flash-attention (only the MATH
-  # SDPA backend), so throughput was the bottleneck; the optimizations above
-  # raised it 71%. 176k optimizer steps at 16384 tokens/step.
-  max_steps: 176000
-  batch_size: 8
-  grad_accum_steps: 2          # 8 x 2 = 16 sequences/step, seq_len 1024
+  # Budget: ~3.2B tokens over ~7 days at the optimized throughput (~5350 tok/s
+  # after bf16 CE + no grad-checkpointing + n_shared=0 + window truncation +
+  # top_k=1). This ROCm build has no flash-attention (only the MATH SDPA
+  # backend), so throughput was the bottleneck; the optimizations above raised
+  # it 87%. 196k optimizer steps at 16384 tokens/step.
+  max_steps: 196000
+  batch_size: 16
+  grad_accum_steps: 1          # 16 sequences/step, seq_len 1024 (no accum overhead)
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
   data:
     data_dir: data
