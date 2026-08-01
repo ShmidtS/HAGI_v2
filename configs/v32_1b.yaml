@@ -92,13 +92,15 @@ model:
     enabled: false             # off for text-only; bridge is fixed-rate and opt-in
 
 train:
-  # Budget: ~2.6B tokens over ~7 days at the optimized throughput. This ROCm
+  # Budget: ~4.6B tokens over ~7 days at the optimized throughput. This ROCm
   # build has no flash-attention (only MATH SDPA), capping compute; compaction
-  # to V=32768 + bf16 CE + no grad-ckpt + n_shared=0 + window truncation +
-  # top_k=1 + batch 12 raised throughput to ~5000 tok/s (2.45s/step).
+  # to V=32768 + Muon-off (AdamW on ternary body) + bf16 CE + no grad-ckpt +
+  # n_shared=0 + window truncation + top_k=1 + batch 12 raised throughput to
+  # ~7270 tok/s (1.69s/step). Muon's Newton-Schulz cost 0.70s/step but buys
+  # nothing on ternary weights (sign-pattern quantizer; matches BitNet paper).
   # Batch 12 beats 8 (+15%, better matmul utilization) without the batch-16
-  # HIPBLAS [12288,8] router crash. 212k optimizer steps at 12288 tokens/step.
-  max_steps: 212000
+  # HIPBLAS [12288,8] router crash. 373k optimizer steps at 12288 tokens/step.
+  max_steps: 373000
   batch_size: 12
   grad_accum_steps: 1          # 12 sequences/step, seq_len 1024
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
