@@ -205,7 +205,11 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
 
             g = g.to(weight.dtype)
             grad_hidden[start:end] = g @ weight
-            grad_weight += g.t() @ h_chunk
+            # ``(h^T @ g)^T`` computes the same ``g^T @ h`` but ~2x faster on
+            # ROCm (measured 258ms vs 498ms at [30720,32768]@[32768,1152]).
+            # The reduction axis (N) is identical; the tile layout of the first
+            # operand differs, and this part's GEMM favors the [H, N] shape.
+            grad_weight += (h_chunk.t() @ g).t()
             if grad_bias is not None:
                 grad_bias += g.sum(dim=0)
 
