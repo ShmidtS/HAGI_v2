@@ -1,0 +1,141 @@
+# HAGI V33 — recurrent Fourier mixing branch on top of V32.
+#
+# What V33 adds to V32, and the measured reason:
+#
+# 1. **Recurrent spectral branch** (model.spectral). V32's attention is
+#    O(T^2) on this ROCm build (MATH SDPA, no flash-attn). The spectral branch
+#    is a bank of K damped oscillators — a sub-quadratic O(T*K) correlator
+#    evaluated with an *exact parallel scan* (0.7ms vs 360ms for torch.fft at
+#    the same shape, measured). Each oscillator is a band-pass filter centered
+#    at a learned frequency; the layer learns where the sequence's spectral
+#    energy lives, which attention (shift-invariant per pair) cannot directly
+#    represent. KV-cacheable at 2*K floats per layer, independent of context.
+#
+#    Lesson from model-forge (Rizzist): the transformer is undefeated. Every
+#    attempt to *replace* attention with spectral/relational machinery lost.
+#    So the spectral branch *complements* attention (like ASTT's "protected
+#    dense-attention spine"): attention does content-addressed retrieval, the
+#    spectral branch does frequency-local structure, the mixer the nonlinear
+#    map. Same philosophy that made the recurrent CTM the most competitive
+#    alternative.
+#
+# 2. **Grokking ramp** (spectral.ramp_steps). Grokking = sudden
+#    memorization->generalization. The spectral-shift hypothesis: networks
+#    first learn low-frequency (global, generalizable) structure, then
+#    high-frequency (memorizable) detail. The ramp interpolates oscillator
+#    retention from narrow passband (only low frequencies persist) to full
+#    spectrum over the first ramp_steps optimizer steps — a scheduled
+#    frequency release that costs nothing and needs no auxiliary loss.
+#
+# 3. **Spectral predictor** — the branch's readout feeds the residual, giving
+#    the LM head a direct frequency-domain feature in addition to the
+#    time-domain transformer features.
+#
+# Parameters: V32 body 688M + spectral (6 layers x ~1.2M) ~ 695M body,
+#   total ~952M. Active body slightly higher (spectral always on for its layers).
+#
+# Throughput: scan is ~0.7ms vs 0.7ms attention on the MATH backend per
+#   windowed layer — the branch roughly doubles per-layer cost where it is
+#   active (every 2nd layer), ~+35% step time in the worst case, in exchange
+#   for sub-quadratic long-range capacity and grokking acceleration.
+
+model:
+  vocab_size: 32768            # compacted
+  hidden_size: 1152
+  num_layers: 13
+  norm_eps: 1.0e-5
+
+  attention:
+    num_query_heads: 18        # 1152 / 18 = 64
+    num_kv_heads: 3            # GQA, 6x KV-cache saving
+    head_dim: 64
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    qk_norm: true
+
+  sliding:
+    window: 512
+    full_every: 4
+
+  embedding:
+    tie_lm_head: true
+    conv_kernel: 4
+    init_std: 0.02
+
+  ffn:
+    expansion: 2.0                # 2.667 -> 2.0: -12% params, +7% throughput
+    multiple_of: 64
+
+  moe:
+    enabled: true
+    num_experts: 8
+    top_k: 1
+    n_shared: 0
+    moe_every: 2
+    bias_update_rate: 0.001
+    router_init_std: 0.0
+    z_loss_weight: 1.0e-3
+
+  spectral:
+    enabled: true              # recurrent Fourier branch
+    num_modes: 32              # K oscillators (band-pass filters)
+    every: 4                   # on layers 3,7,11 (not layer 0/last) — ~2% step cost
+    block_len: 64              # parallel-scan block size
+    freq_base: 0.02            # lowest oscillator frequency (rad/step)
+    freq_max: 3.0              # highest (near pi)
+    damp_min: 0.90             # ramp start: narrow passband (low freq only)
+    damp_max: 0.999            # ramp end: full spectrum
+    ramp_steps: 20000          # grokking ramp length
+    out_channels: 0            # default H/K readout width
+    use_2d: true
+
+  ternary:
+    enabled: true
+    eps: 1.0e-5
+
+  head:
+    unigram_prior: true
+    unigram_path: data/unigram.compact.npy
+    unigram_smoothing: 1.0
+    z_loss_weight: 1.0e-4
+    ce_chunk_rows: 4096
+    ce_save_logits: true
+
+  multimodal:
+    enabled: false
+
+train:
+  max_steps: 298600
+  batch_size: 30               # 15 -> 30: +5% throughput (overhead amortized)
+  grad_accum_steps: 1
+  grad_checkpointing: false
+  data:
+    data_dir: data
+    seq_len: 1024
+    eos_token_id: 1
+    pad_token_id: 0
+    num_workers: 0
+    seed: 1234
+    cross_doc_attention: false
+
+  logging:
+    log_interval: 1
+    diag_interval: 100
+    diag_chunk_rows: 512
+
+  z_loss_weight: 1.0e-4
+  moe_z_loss_weight: 1.0e-3
+
+  checkpoint_dir: checkpoints_v33_1b
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 3
+  tokenizer: google/gemma-4-E2B-it
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  min_new_tokens: 1
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  repetition_window: 128

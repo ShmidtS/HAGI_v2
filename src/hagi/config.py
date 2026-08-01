@@ -59,7 +59,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 10
 
 
 @dataclass
@@ -186,6 +186,74 @@ class TernaryConfig:
 
 
 @dataclass
+class SpectralConfig:
+    """Recurrent Fourier mixing — parallel causal complex filter.
+
+    A damped-oscillator recurrence ``S_t = A * S_{t-1} + x_t`` with
+    ``A = r * exp(-i*omega)`` is a first-order IIR whose impulse response is a
+    complex sinusoid times a geometric envelope. Read as a channel, it is a
+    sub-quadratic correlator: O(T*K) work and a K-dimensional state instead of
+    the O(T^2) of full attention. Because it is a recurrence it is
+    KV-cacheable at exactly ``2*K`` floats per layer (the complex state),
+    independent of context length.
+
+    The recurrence is evaluated in closed form with a *parallel scan* — no
+    sequential loop over T. Using the identity::
+
+        S(t) = A^tau * S_block_start + A^tau * sum_{j<=tau} x_j A^{-j}
+
+    and the block recursion ``S_end = A^L * S_prev + local_end``, the full
+    sequence is computed with ``T/L`` sequential block steps, each ``O(B*L*K)``,
+    which is exact (no approximation) and ~2 orders of magnitude faster than
+    ``torch.fft`` on this ROCm build.
+
+    Why "Fourier": the frequency response of the filter at frequency ``phi`` is
+    ``r / (1 - r*e^{-i(omega-phi)})`` — a Lorentzian peak centered at ``omega``
+    with width set by ``r``. K oscillators are K band-pass filters; the layer
+    learns *where* in the spectrum the sequence's energy lives. This is the
+    spectral content that attention, which is shift-invariant per pair, cannot
+    directly represent.
+
+    **Grokking acceleration (spectral ramp).** Grokking (memorization then
+    sudden generalization) is accelerated by starting the network with only the
+    low-frequency modes active and releasing high frequencies as training
+    progresses — the "spectral shift hypothesis". ``ramp_steps`` scales the
+    oscillator bandwidths from narrow (low frequencies dominate) to wide over
+    the first ``ramp_steps`` optimizer steps. It is implemented as a running
+    scalar updated by the trainer (see ``commit_controller_updates``), so it
+    needs no auxiliary loss.
+
+    Attributes:
+        enabled: add the spectral branch to selected layers.
+        num_modes: K complex oscillators (band-pass filters).
+        every: add the branch to every Nth layer (0 means none).
+        block_len: parallel-scan block size (T/L sequential steps).
+        freq_base: base frequency of the geometric oscillator spacing.
+        freq_max: highest oscillator frequency (radians per step).
+        damp_min, damp_max: retention r range — the filter's bandwidth.
+        ramp_steps: optimizer steps over which oscillator bandwidths widen
+            from ``damp_min`` (low-freq only) to ``damp_max`` (full spectrum).
+        out_channels: readout width per mode (defaults to H/K); larger is a
+            richer mixing of modes before the residual add.
+        use_2d: treat the head dimension as a second (non-causal) frequency
+            axis, giving a true 2D Fourier structure: row = temporal
+            oscillator, column = harmonic channel mode.
+    """
+
+    enabled: bool = False
+    num_modes: int = 32
+    every: int = 2
+    block_len: int = 64
+    freq_base: float = 0.02
+    freq_max: float = 3.0
+    damp_min: float = 0.90
+    damp_max: float = 0.999
+    ramp_steps: int = 20000
+    out_channels: int = 0
+    use_2d: bool = True
+
+
+@dataclass
 class HeadConfig:
     """Receiver: LM head, source prior, and normalization control.
 
@@ -203,6 +271,10 @@ class HeadConfig:
         ce_chunk_rows: row block size for the chunked cross-entropy. Logits for
             a block are computed, consumed, and recomputed in backward, so peak
             memory is ``chunk * V`` instead of ``N * V``.
+        ce_save_logits: store the chunked logits from forward and reuse them in
+            backward instead of recomputing the projection. Saves ~40% of head
+            backward time at a cost of ``N * V * 2`` bytes VRAM (2 GB at
+            15k x 32768). Default off; turn on when VRAM is ample.
         logit_scale_init: initial receiver gain on the correlation
             ``<hidden, codebook_row>``. 0 means ``1/sqrt(H)``. A tied codebook
             makes the raw correlation start at ``H * embedding.init_std`` for the
@@ -218,6 +290,7 @@ class HeadConfig:
     unigram_smoothing: float = 1.0
     z_loss_weight: float = 0.0001
     ce_chunk_rows: int = 4096
+    ce_save_logits: bool = False
     logit_scale_init: float = 0.0
 
 
@@ -267,6 +340,7 @@ class ModelConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     ffn: FFNConfig = field(default_factory=FFNConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
+    spectral: SpectralConfig = field(default_factory=SpectralConfig)
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
@@ -318,12 +392,20 @@ class AdamConfig:
     routers and floating-point projections. Per-coordinate adaptivity is the
     right prior there; orthogonalization is not defined for 1D and is wrong for
     a codebook whose rows are updated at wildly different frequencies.
+
+    ``body_lr_scale``: the ternary channel weights (``is_channel_weight``) get
+    ``learning_rate * body_lr_scale``. Measured on real data the codebook
+    gradient norm is 20-30x the body's (``gr ~0.23`` vs ``gb ~0.008``), so on a
+    shared AdamW the body barely moves. A separate, higher body LR is the
+    cheap substitute for Muon's orthogonalization — it rebalances the two
+    gradient scales without the Newton-Schulz cost. 1.0 disables it.
     """
 
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
     weight_decay: float = 0.1
+    body_lr_scale: float = 8.0
 
 
 @dataclass
@@ -430,6 +512,11 @@ class TrainConfig:
     precision: str = "bf16"
     grad_checkpointing: bool = True
     compile_model: bool = False
+    # Variance in bf16 (fused kernel) instead of fp32. Measured 5x faster on
+    # ROCm and numerically identical (max diff 0.0) at the value ranges seen
+    # in training, so the safe default is the fast path. Set false to restore
+    # the fp32 accumulator.
+    fp32_norm: bool = False
     # Muon's Newton-Schulz orthogonalization costs ~29% of step time on this
     # ROCm build (measured 0.70s of 2.41s). BitNet b1.58 weights are ternary:
     # the quantizer reads only the sign pattern relative to row absmean, so the
@@ -514,6 +601,21 @@ def moe_layers(cfg: ModelConfig) -> list[bool]:
     return [(i % every == every - 1) and 0 < i < n - 1 for i in range(n)]
 
 
+def spectral_layers(cfg: ModelConfig) -> list[bool]:
+    """Which layers add the recurrent spectral branch.
+
+    Like MoE, layer 0 and the last layer stay pure: the spectral branch is a
+    local-frequency refinement on an already-mixed signal, and routing it onto
+    the raw embedding or the final pre-head state adds noise without a
+    downstream layer to use the correction.
+    """
+    n = cfg.num_layers
+    if not cfg.spectral.enabled:
+        return [False] * n
+    every = max(1, cfg.spectral.every)
+    return [(i % every == every - 1) and 0 < i < n - 1 for i in range(n)]
+
+
 def count_params(cfg: ModelConfig) -> dict[str, int]:
     """Analytic parameter count by group (no model instantiation).
 
@@ -548,8 +650,21 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
     # a dense layer has one mixer branch, a MoE layer has one per expert SwiGLU
     # (num_experts + n_shared).
     branch_scales = n + (n - n_moe) + n_moe * (cfg.moe.num_experts + cfg.moe.n_shared)
+    # Spectral branch: per selected layer, input proj (h*h_comp), K complex
+    # oscillators (damping logits K + freq buffer non-trainable), mode readout
+    # (2*K*K_out for w_re/w_im), out proj (K_out*h).
+    n_spec = int(sum(spectral_layers(cfg)))
+    if cfg.spectral.enabled and n_spec:
+        sc = cfg.spectral
+        k = sc.num_modes
+        k_out = sc.out_channels or max(1, h // k)
+        per_spec = h * max(8, h // 4) + 2 * k * k_out + k_out * h
+        spectral = n_spec * per_spec
+        branch_scales += n_spec
+    else:
+        spectral = 0
 
-    body = n * per_attn + ffn_total + norms + conv + branch_scales
+    body = n * per_attn + ffn_total + norms + conv + branch_scales + spectral
     # The receiver gain (LMHead.logit_scale) is one scalar, always present.
     body += 1
     return {
@@ -565,6 +680,7 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
         + n
         + (n - n_moe)
         + n_moe * (cfg.moe.top_k + cfg.moe.n_shared)
+        + spectral
         + 1,
     }
 

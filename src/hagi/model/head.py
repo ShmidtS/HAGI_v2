@@ -86,11 +86,18 @@ def load_unigram_logprior(
 class _ChunkedCrossEntropy(torch.autograd.Function):
     """Cross-entropy over ``hidden @ weight.T`` without materializing all logits.
 
-    Forward computes per-chunk logits, reduces to the loss sum, and discards
-    them. Backward recomputes each chunk's logits and forms the gradient
-    ``(softmax - onehot)`` in place, accumulating into ``grad_hidden`` and
-    ``grad_weight``. The recompute costs one extra projection matmul and saves
-    ``N * V`` floats of activation memory.
+    Forward computes per-chunk logits, reduces to the loss sum, and — unless
+    ``save_logits=True`` — discards them. Backward recomputes each chunk's logits
+    and forms the gradient ``(softmax - onehot)`` in place, accumulating into
+    ``grad_hidden`` and ``grad_weight``. The recompute costs one extra projection
+    matmul and saves ``N * V`` floats of activation memory.
+
+    With ``save_logits=True`` the forward stores the chunked logits on ``ctx``
+    and backward reuses them, trading the recompute matmul (~40% of backward
+    time) for ``N * V * 2`` bytes of VRAM. Worth it when VRAM is ample (the 1B
+    config sits in 115GB with ~15GB used). Logits are held in a list, not saved
+    through ``save_for_backward``: autograd's saved-tensor machinery would add
+    them to the graph and keep them alive for the whole backward.
 
     ``z_loss_weight > 0`` adds ``w * logsumexp(z)^2`` per row, whose gradient is
     ``2 * w * lse * softmax`` — folded into the same pass.
@@ -105,6 +112,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         bias: torch.Tensor | None,
         chunk_rows: int,
         z_loss_weight: float,
+        save_logits: bool = False,
     ):
         n = hidden.shape[0]
         # Matmul/softmax run in the parameter dtype (bf16 under bf16 training)
@@ -114,6 +122,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         acc_dtype = torch.float64 if hidden.dtype == torch.float64 else torch.float32
         loss_sum = hidden.new_zeros((), dtype=acc_dtype)
         z_sum = hidden.new_zeros((), dtype=acc_dtype)
+        saved_logits: list[torch.Tensor] = [] if save_logits else None
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
             h_chunk = hidden[start:end]
@@ -133,11 +142,14 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             loss_sum += (lse - picked).sum()
             if z_loss_weight > 0:
                 z_sum += lse.squeeze(-1).pow(2).sum()
+            if save_logits:
+                saved_logits.append(logits.detach())
         ctx.save_for_backward(hidden, weight, targets, bias)
         ctx.chunk_rows = chunk_rows
         ctx.z_loss_weight = z_loss_weight
         ctx.n = n
         ctx.work_dtype = work_dtype
+        ctx.saved_logits = saved_logits
         return loss_sum / max(n, 1), z_sum / max(n, 1)
 
     @staticmethod
@@ -152,12 +164,16 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         grad_weight = torch.zeros_like(weight)
         grad_bias = torch.zeros_like(bias) if bias is not None and bias.requires_grad else None
 
-        for start in range(0, n, ctx.chunk_rows):
+        saved = ctx.saved_logits
+        for idx, start in enumerate(range(0, n, ctx.chunk_rows)):
             end = min(start + ctx.chunk_rows, n)
             h_chunk = hidden[start:end]
-            logits = F.linear(h_chunk, weight)
-            if bias is not None:
-                logits = logits + bias.to(work_dtype)
+            if saved is not None:
+                logits = saved[idx]
+            else:
+                logits = F.linear(h_chunk, weight)
+                if bias is not None:
+                    logits = logits + bias.to(work_dtype)
             if work_dtype in (torch.float16, torch.bfloat16):
                 # The matmul stays in work dtype, but the softmax gradient is
                 # computed in fp32: grad_weight = (softmax - onehot)^T h feeds a
@@ -192,7 +208,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             if grad_bias is not None:
                 grad_bias += g.sum(dim=0)
 
-        return grad_hidden, grad_weight, None, grad_bias, None, None
+        return grad_hidden, grad_weight, None, grad_bias, None, None, None
 
 
 class LMHead(nn.Module):
@@ -294,7 +310,13 @@ class LMHead(nn.Module):
         # gradient to it through this multiply, with no extra pass over [N, V].
         scaled = hidden * self.logit_scale.to(hidden.dtype)
         ce, z = _ChunkedCrossEntropy.apply(
-            scaled, self.weight, targets, bias, self.chunk_rows, self.z_loss_weight
+            scaled,
+            self.weight,
+            targets,
+            bias,
+            self.chunk_rows,
+            self.z_loss_weight,
+            self.cfg.ce_save_logits,
         )
         return ce, z
 
