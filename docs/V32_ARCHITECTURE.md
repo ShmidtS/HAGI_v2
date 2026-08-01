@@ -197,11 +197,36 @@ traceback, process vanished). A fresh V=32768 run stays stable over 165+ steps
 (gr 0.21-0.44 tracking the warmup lr, gb 0.009). The smaller codebook also
 shrinks the AdamW codebook-grad contribution that was the growing component.
 
+## V32.4 — Muon off for the ternary body (the big win)
+
+Newton-Schulz orthogonalization cost **0.70s/step = 29%** of the 2.41s step,
+measured on 204 matrices (all > 1e5 elements). But the argument for Muon's
+isotropic updates does not survive ternary quantization: BitNet b1.58 weights
+are read by the forward only as a sign pattern relative to per-row absmean, so
+every direction of the master already explores the reachable ternary patterns —
+per-direction isotropy buys nothing that AdamW's per-coordinate adaptivity does
+not. This is also how the original BitNet b1.58 (Microsoft, 2024) trains.
+
+`train.use_muon=False` is now the default; Muon stays selectable for fp16/dense
+bodies. `HybridOptimizer` tolerates `muon=None` (the whole model rides AdamW).
+
+Measured: **1.69s/step = 7271 tok/s (+42%)**, gr stable 0.22-0.27 over 100
+steps (identical to Muon), ce 8.5 -> 8.1 normal, 332 tests pass. Budget
+re-scaled to 373k steps = 4.6B tokens.
+
+```
+Throughput history (this ROCm build):
+V31  4.0s/step
+V32.2 2.90s/step  (V=65536, bf16 CE, batch 12)
+V32.3 2.41s/step  (V=32768)
+V32.4 1.69s/step  (Muon off)  <- 7271 tok/s
+```
+
 ## How to train
 
 ```bash
 # data/ already carries the compact streams and vocab_map.npz; if re-running:
 python scripts/rebuild_compact2.py          # full 262144->32768 map + binaries
 python scripts/train.py --config configs/v32_1b.yaml --dry-run   # ~8.0 ce at init
-python scripts/train.py --config configs/v32_1b.yaml             # 212k steps
+python scripts/train.py --config configs/v32_1b.yaml             # 373k steps
 ```
