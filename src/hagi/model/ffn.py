@@ -66,7 +66,46 @@ class BranchScale(nn.Module):
         )
 
 
-def linear(in_features: int, out_features: int, use_ternary: bool) -> nn.Module:
+def orthogonalize_(weight: torch.Tensor) -> torch.Tensor:
+    """In-place orthogonal init: all singular values = 1 (CDMA/OFDM precoding).
+
+    A channel weight initialized as i.i.d. Gaussian has minimum singular value
+    ~0 at large width (measured: q_proj singular ratio ~5e4), i.e. directions of
+    the input space the layer structurally cannot transmit — spectral holes in
+    the precoding. Orthogonalizing at init (QR of a Gaussian, sign-corrected)
+    gives a full-rank transmit matrix where every direction is equally
+    transmitted, matching how 5G assigns orthogonal spreading codes per stream.
+    For ternary weights this is free: the quantizer reads only the sign pattern
+    relative to row absmean, and an orthogonal master has maximal sign diversity
+    from step 0.
+    """
+    out, in_ = weight.shape
+    with torch.no_grad():
+        # QR on GPU when available: ~10-40x faster than CPU for [2688, 1152]
+        # (measured 0.49s vs 5.4s). The model builds on CPU, so the weight
+        # briefly round-trips; the one-time cost still beats minutes of CPU QR.
+        use_gpu = weight.device.type != "cuda" and torch.cuda.is_available()
+        dev = "cuda" if use_gpu else weight.device
+        wf = weight.to(dev).float()
+        if out >= in_:
+            # Wide or square: columns orthonormal (all singular values 1).
+            q, r = torch.linalg.qr(torch.randn_like(wf))
+            q *= torch.sign(torch.diag(r)).unsqueeze(0)
+            weight.copy_(q.to(weight.dtype))
+        else:
+            # Narrow: rows orthonormal. QR the taller transpose, take Q.T.
+            q, r = torch.linalg.qr(torch.randn(in_, out, device=dev).float())
+            q *= torch.sign(torch.diag(r)).unsqueeze(0)
+            weight.copy_(q.to(weight.dtype).T)
+    return weight
+
+
+def linear(
+    in_features: int,
+    out_features: int,
+    use_ternary: bool,
+    init_orthogonal: bool = False,
+) -> nn.Module:
     """2D channel weight: ternary master or plain floating-point linear.
 
     The returned module carries ``is_channel_weight = True``. That marker is what
@@ -75,11 +114,19 @@ def linear(in_features: int, out_features: int, use_ternary: bool) -> nn.Module:
     about the geometry of a hidden-mixing matrix, not about its storage rate, so
     disabling quantization for an ablation must not also change which optimizer
     every matrix in the body rides.
+
+    ``init_orthogonal`` (CDMA precoding): give the weight a full-rank orthogonal
+    start (all singular values 1) instead of i.i.d. Gaussian, so no input
+    direction is structurally dropped from step 0. Only the 2D channel weights
+    take it — the codebook is a source codec, not a precoder, and orthogonality
+    is undefined for 1D gains.
     """
     module = BitLinear(in_features, out_features, bias=False) if use_ternary else nn.Linear(
         in_features, out_features, bias=False
     )
-    if not use_ternary:
+    if init_orthogonal:
+        orthogonalize_(module.weight)
+    elif not use_ternary:
         nn.init.normal_(module.weight, std=in_features**-0.5)
     module.is_channel_weight = True
     return module
@@ -106,12 +153,19 @@ class SwiGLU(nn.Module):
         intermediate_size: int,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
-        self.gate = linear(hidden_size, intermediate_size, use_ternary)
-        self.up = linear(hidden_size, intermediate_size, use_ternary)
-        self.down = linear(intermediate_size, hidden_size, use_ternary)
-        nn.init.normal_(self.down.weight, std=residual_scale / intermediate_size**0.5)
+        self.gate = linear(hidden_size, intermediate_size, use_ternary, init_orthogonal)
+        self.up = linear(hidden_size, intermediate_size, use_ternary, init_orthogonal)
+        self.down = linear(intermediate_size, hidden_size, use_ternary, init_orthogonal)
+        if init_orthogonal:
+            # Orthogonal init sets singular values to 1; rescale down to the
+            # depth-preserving variance like the normal init below.
+            with torch.no_grad():
+                self.down.weight.mul_(residual_scale)
+        else:
+            nn.init.normal_(self.down.weight, std=residual_scale / intermediate_size**0.5)
         self.branch_scale = BranchScale(residual_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -137,10 +191,11 @@ class FeedForward(nn.Module):
         norm_eps: float = 1e-5,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.mixer = SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale)
+        self.mixer = SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale, init_orthogonal)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mixer(self.norm(x))

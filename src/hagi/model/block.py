@@ -53,9 +53,10 @@ class Block(nn.Module):
         residual_scale: float = 1.0,
         spectral_cfg=None,
         use_spectral: bool = False,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
-        self.attn = Attention(hidden_size, attn_cfg, norm_eps, use_ternary, residual_scale)
+        self.attn = Attention(hidden_size, attn_cfg, norm_eps, use_ternary, residual_scale, init_orthogonal)
         self.mixer = mixer
         self.spectral = None
         if use_spectral and spectral_cfg is not None:
@@ -63,7 +64,7 @@ class Block(nn.Module):
 
             if not isinstance(spectral_cfg, SpectralConfig):
                 raise TypeError("spectral_cfg must be a SpectralConfig when use_spectral=True")
-            self.spectral = SpectralRecurrence(hidden_size, spectral_cfg, norm_eps, use_ternary, residual_scale)
+            self.spectral = SpectralRecurrence(hidden_size, spectral_cfg, norm_eps, use_ternary, residual_scale, init_orthogonal)
 
     @property
     def is_moe(self) -> bool:
@@ -94,8 +95,9 @@ def build_mixer(
     norm_eps: float,
     use_ternary: bool,
     residual_scale: float,
+    init_orthogonal: bool = False,
 ) -> nn.Module:
     """Construct the layer's mixer: MoE when selected, dense SwiGLU otherwise."""
     if use_moe:
-        return MoE(hidden_size, intermediate_size, moe_cfg, norm_eps, use_ternary, residual_scale)
-    return FeedForward(hidden_size, intermediate_size, norm_eps, use_ternary, residual_scale)
+        return MoE(hidden_size, intermediate_size, moe_cfg, norm_eps, use_ternary, residual_scale, init_orthogonal)
+    return FeedForward(hidden_size, intermediate_size, norm_eps, use_ternary, residual_scale, init_orthogonal)

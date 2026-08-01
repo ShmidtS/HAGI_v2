@@ -335,6 +335,13 @@ class ModelConfig:
     num_layers: int = 24
     norm_eps: float = 1e-5
     target_params: int = 0
+    # CDMA/OFDM precoding init: give every 2D channel weight a full-rank
+    # orthogonal start (all singular values = 1) instead of i.i.d. Gaussian,
+    # whose minimum singular value is ~0 at large width — a spectral hole in the
+    # transmit matrix. Free (one-time QR), keeps every input direction
+    # transmitted from step 0. Codebook (a source codec, not a precoder) and 1D
+    # gains are excluded.
+    init_orthogonal: bool = False
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)

@@ -80,6 +80,7 @@ class Attention(nn.Module):
         norm_eps: float = 1e-5,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size != cfg.num_heads * cfg.head_dim:
@@ -100,13 +101,17 @@ class Attention(nn.Module):
         self.sliding_window = int(cfg.sliding_window or 0)
 
         def proj(out_features: int) -> nn.Module:
-            return linear(hidden_size, out_features, use_ternary)
+            return linear(hidden_size, out_features, use_ternary, init_orthogonal)
 
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
         self.q_proj = proj(cfg.num_heads * cfg.head_dim)
         self.kv_proj = proj(2 * cfg.num_kv_heads * cfg.head_dim)
         self.out_proj = proj(cfg.num_heads * cfg.head_dim)
-        nn.init.normal_(self.out_proj.weight, std=residual_scale / hidden_size**0.5)
+        if init_orthogonal:
+            with torch.no_grad():
+                self.out_proj.weight.mul_(residual_scale)
+        else:
+            nn.init.normal_(self.out_proj.weight, std=residual_scale / hidden_size**0.5)
 
         self.q_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
         self.k_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None

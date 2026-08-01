@@ -168,6 +168,7 @@ class SpectralRecurrence(nn.Module):
         norm_eps: float = 1e-5,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -185,7 +186,11 @@ class SpectralRecurrence(nn.Module):
         # projection width before the split into real/imaginary.
         self.h_in = max(8, int(round(h / 4)))
         self.in_proj = BitLinear(h, self.h_in, bias=False) if use_ternary else nn.Linear(h, self.h_in, bias=False)
-        if not use_ternary:
+        if init_orthogonal:
+            from hagi.model.ffn import orthogonalize_
+
+            orthogonalize_(self.in_proj.weight)
+        elif not use_ternary:
             nn.init.normal_(self.in_proj.weight, std=self.h_in**-0.5)
         self.in_proj.is_channel_weight = True
 

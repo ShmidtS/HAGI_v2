@@ -71,6 +71,7 @@ class MoE(nn.Module):
         norm_eps: float = 1e-5,
         use_ternary: bool = True,
         residual_scale: float = 1.0,
+        init_orthogonal: bool = False,
     ) -> None:
         super().__init__()
         if cfg.num_experts < 2:
@@ -85,11 +86,11 @@ class MoE(nn.Module):
 
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
         self.experts = nn.ModuleList(
-            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale)
+            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale, init_orthogonal)
             for _ in range(cfg.num_experts)
         )
         self.shared = nn.ModuleList(
-            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale)
+            SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale, init_orthogonal)
             for _ in range(cfg.n_shared)
         )
 

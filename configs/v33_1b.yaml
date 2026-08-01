@@ -42,6 +42,7 @@ model:
   hidden_size: 1152
   num_layers: 11               # 13 -> 11: -15% FLOPs, +12% throughput
   norm_eps: 1.0e-5
+  init_orthogonal: true        # CDMA precoding: full-rank orthogonal 2D weights
 
   attention:
     num_query_heads: 18        # 1152 / 18 = 64
