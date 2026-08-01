@@ -100,11 +100,12 @@ optimizer partition already uses, so it survives ternary-on/off ablations.
 
 ## Parameters (analytic)
 
-V33 config: H=1152, L=13, 18q/3kv x 64, ffn=3072, MoE 8e top1, spectral
-32 modes every 4th layer. `count_params`:
+V33 config (speed-tuned): H=1152, L=11, 18q/3kv x 64, ffn=2688 (expansion
+2.33), MoE 8e top1 on 6 layers, spectral 32 modes every 4th layer.
+`count_params`:
 
 ```
-total 663.2M | body 625.4M | embed 37.7M | active_body 179.4M (body 94.3%)
+total 500M | body ~462M | embed 37.7M | active_body ~180M
 ```
 
 The spectral branch adds ~1.2M per selected layer (3 layers) — about 3.6M,
@@ -112,12 +113,26 @@ The spectral branch adds ~1.2M per selected layer (3 layers) — about 3.6M,
 
 ## Throughput
 
-With `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`:
+With `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (Radeon 8060S, 115GB):
 
 ```
-V32: 2.01s/step, 7635 tok/s
-V33: 2.05s/step, 7495 tok/s   (+2% for the spectral branch)
+V32:           2.01s/step, 7635 tok/s   (batch 12)
+V33 L=13 ffn2.667: 1.82s/step, 8450 tok/s
+V33 speed-tuned:   3.01s/step @ batch 30, 10206 tok/s   (+26% vs V33 baseline)
 ```
 
-The branch on every 4th layer costs ~2% of step time for the -0.15 nats init
-gain and the sub-quadratic long-range capacity.
+The speed tuning that got there, all measured on this GPU:
+
+* **split-dtype fused AdamW** — the partition mixed bf16 (body) and fp32
+  (norms/gains/routers), which silently disabled the fused kernel. Splitting
+  each semantic group by dtype restores fused for every parameter: step
+  157ms -> 99ms.
+* **head logit caching** — `ce_save_logits=True` stores the chunked logits from
+  forward and reuses them in backward, skipping the recompute projection
+  (~40% of head backward). Costs 2 GB VRAM at this N*V; the 115GB GPU has it.
+* **L 13->11, ffn 2.667->2.33** — cuts ~17% of FLOPs with ~15% fewer params;
+  quality is recovered by the longer budget the higher throughput buys.
+* **batch 15->30** — amortizes kernel-launch overhead (+5%).
+
+The spectral branch on every 4th layer costs ~2% of step time for the -0.15
+nats init gain and the sub-quadratic long-range capacity.
