@@ -220,7 +220,30 @@ V31  4.0s/step
 V32.2 2.90s/step  (V=65536, bf16 CE, batch 12)
 V32.3 2.41s/step  (V=32768)
 V32.4 1.69s/step  (Muon off)  <- 7271 tok/s
+V32.5 2.04s/step  (batch 15)  <- 7525 tok/s (measured, persistent iterator)
 ```
+
+## V32.5 — batch 12 -> 15, num_workers 2 -> 0
+
+Two config fixes found by a fresh profile sweep (2026-08-01, torch 2.10.0+rocm7.13):
+
+**1. `num_workers: 2` crashed the DataLoader.** On Windows+ROCm, `num_workers > 0`
+raises "DataLoader worker exited unexpectedly" the moment a worker touches the
+memmap stream (reproduced: smoke run died on first fetch). The dataset is already
+a streamed memmap; main-process load costs ~1ms. Fixed to `0`.
+
+**2. `batch_size 12 -> 15` is the measured throughput peak.** A sweep of batches
+8-15 with the real trainer (persistent iterator, warmup, 8 steady steps):
+batch 12 = 7284 tok/s, batch 15 = 7525 tok/s (+3.3%). Batch 16 still crashes the
+ROCm HIPBLAS `[12288,8]` router kernel, so 15 is the ceiling. Steps rescaled
+373k -> 298.6k so the token budget (4.59B) and wall-clock are unchanged.
+
+This ROCm build was re-examined: **flash-attention is now live** (torch
+2.10.0+rocm7.13, `flash_sdp_enabled=True`, bf16 masks supported), so the masked
+windowed path already runs flash kernels; `torch.compile` remains unavailable
+(no Triton), CUDA graphs remain ~1.0x. Profile confirms the step is dominated by
+pure backward matmul (`aten::mm` 44%, backward 70% of step) — a physical FLOP
+limit with no software fix short of flash/Triton.
 
 ## How to train
 
@@ -228,5 +251,5 @@ V32.4 1.69s/step  (Muon off)  <- 7271 tok/s
 # data/ already carries the compact streams and vocab_map.npz; if re-running:
 python scripts/rebuild_compact2.py          # full 262144->32768 map + binaries
 python scripts/train.py --config configs/v32_1b.yaml --dry-run   # ~8.0 ce at init
-python scripts/train.py --config configs/v32_1b.yaml             # 373k steps
+python scripts/train.py --config configs/v32_1b.yaml             # 298.6k steps
 ```

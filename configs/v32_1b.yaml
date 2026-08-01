@@ -98,10 +98,12 @@ train:
   # n_shared=0 + window truncation + top_k=1 + batch 12 raised throughput to
   # ~7270 tok/s (1.69s/step). Muon's Newton-Schulz cost 0.70s/step but buys
   # nothing on ternary weights (sign-pattern quantizer; matches BitNet paper).
-  # Batch 12 beats 8 (+15%, better matmul utilization) without the batch-16
-  # HIPBLAS [12288,8] router crash. 373k optimizer steps at 12288 tokens/step.
-  max_steps: 373000
-  batch_size: 12
+  # Batch 15 is the measured peak (8137 tok/s vs 8079 at 12): throughput is
+  # near-flat from 8 to 15 (~7850-8137), batch-16 crashes the ROCm HIPBLAS
+  # router kernel ([12288,8]). Steps rescaled so the token budget (4.59B) and
+  # wall-clock are unchanged. 298600 steps at 15360 tokens/step.
+  max_steps: 298600
+  batch_size: 15
   grad_accum_steps: 1          # 12 sequences/step, seq_len 1024
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
   data:
@@ -109,7 +111,9 @@ train:
     seq_len: 1024              # 2x V31 — longer context
     eos_token_id: 1
     pad_token_id: 0
-    num_workers: 2
+    num_workers: 0              # >0 crashes DataLoader on Windows+ROCm
+                               # ("worker exited unexpectedly"); dataset is
+                               # memmap streamed, main-process load is ~1ms
     seed: 1234
     cross_doc_attention: false
 
