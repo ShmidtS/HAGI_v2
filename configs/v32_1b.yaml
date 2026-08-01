@@ -90,18 +90,15 @@ model:
     enabled: false             # off for text-only; bridge is fixed-rate and opt-in
 
 train:
-  # Budget: ~3.2B tokens over ~7 days at the optimized throughput (~5350 tok/s
-  # after bf16 CE + no grad-checkpointing + n_shared=0 + window truncation +
-  # top_k=1). This ROCm build has no flash-attention (only the MATH SDPA
-  # backend), so throughput was the bottleneck; the optimizations above raised
-  # it 87%. 196k optimizer steps at 16384 tokens/step.
-  max_steps: 196000
-  batch_size: 8
-  grad_accum_steps: 2          # batch 16 (accum 1) crashed on step 2: HIPBLAS
-                               # "unspecified launch failure" on the router's
-                               # [16384, 8] backward shape — a batch-16-only
-                               # ROCm kernel bug. 8x2 is stable (700+ steps) at
-                               # ~2% less throughput.
+  # Budget: ~2.2B tokens over ~7 days at the optimized throughput. This ROCm
+  # build has no flash-attention (only MATH SDPA), capping compute; compaction
+  # to V=65536 + bf16 CE + no grad-ckpt + n_shared=0 + window truncation +
+  # top_k=1 + batch 12 raised throughput from 2862 to ~3700 tok/s (+29%).
+  # Batch 12 beats 8 (+15%, better matmul utilization) without the batch-16
+  # HIPBLAS [12288,8] router crash. 177k optimizer steps at 12288 tokens/step.
+  max_steps: 177000
+  batch_size: 12
+  grad_accum_steps: 1          # 12 sequences/step, seq_len 1024
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
   data:
     data_dir: data
