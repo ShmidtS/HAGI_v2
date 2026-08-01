@@ -1,0 +1,125 @@
+# HAGI V32 — 1B-scale multimodal-capable text model, AMD Radeon 8060S (96 GB).
+#
+# What changed from V31, and the measured reason:
+#
+# 1. Vocabulary compacted 262144 -> 131072 (scripts/compact_vocab.py). Only
+#    176512 of 262144 ids occur in this corpus; the top 131072 carry 99.9% of
+#    token mass. The codebook drops from 537M to 268M params (V*H paid once
+#    against a tied head). More importantly, body share of total goes from
+#    29% to 82% — the V31 config repeated V30's pathology of a body too small
+#    relative to the codebook to learn language. See docs/V31_ARCHITECTURE.md.
+#
+# 2. MoE enabled. V31 shipped dense (E=8 in config but moe.enabled=false).
+#    MoE is the only lever that grows total capacity without growing per-token
+#    compute — the scaling mechanism. E=8, top_k=2: ~306M active / 688M body.
+#    Load balance is a bias controller (no auxiliary loss competing with CE).
+#
+# 3. Sliding window 256 -> 1024, seq_len 512 -> 1024. The V31 window was
+#    shorter than the sequence, so every position could attend to at most half
+#    the context. At W=seq_len the window stops clipping long-range dependence
+#    inside the training window; full-attention relays every 4 layers carry
+#    global structure. Long-context generation beyond W is still bounded.
+#
+# 4. Training budget 0.41B -> 6.55B tokens. V31 ran 200k steps at 2048
+#    tokens/step = 0.41B tokens against a ~3.2B-token corpus — roughly one
+#    epoch of edu plus a pass over the rest. V32 runs 200k steps at 32768
+#    tokens/step. The model is trained on the corpus, not beside it.
+#
+# Parameters (analytic): H=1152 L=13, 18q/3kv x 64, ffn=3072, MoE E=8 top_k=2,
+#   body=688M embed=151M total=965M (body 82%), active body=306M.
+#
+# Before training, the unigram prior must point at the compacted counts:
+#   python scripts/compact_vocab.py --data-dir data --target-vocab 131072
+# (already run — produces data/unigram.compact.npy). The corpus .compact.bin
+# streams and data/vocab_map.npz live in data/. Dataset loader prefers
+# *.compact.bin when present (hagi/data/dataset.py:dataset_path).
+
+model:
+  vocab_size: 131072           # compacted from 262144 (99.9% mass retained)
+  hidden_size: 1152
+  num_layers: 13
+  norm_eps: 1.0e-5
+
+  attention:
+    num_query_heads: 18        # 1152 / 18 = 64
+    num_kv_heads: 3            # GQA, 6x KV-cache saving
+    head_dim: 64
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    qk_norm: true
+
+  sliding:
+    window: 1024               # == seq_len; full-attention relays every 4 layers
+    full_every: 4
+
+  embedding:
+    tie_lm_head: true
+    conv_kernel: 4
+    init_std: 0.02
+
+  ffn:
+    expansion: 2.667           # 8/3 SwiGLU (equal params to a 4x MLP)
+    multiple_of: 64
+
+  moe:
+    enabled: true              # scaling lever: total params grow, FLOPs/token don't
+    num_experts: 8
+    top_k: 2
+    n_shared: 1
+    moe_every: 2
+    bias_update_rate: 0.001    # bias controller (aux-loss-free balance)
+    router_init_std: 0.0
+    z_loss_weight: 1.0e-3
+
+  ternary:
+    enabled: true              # 1.585 bits/weight — the rate constraint
+    eps: 1.0e-5
+
+  head:
+    unigram_prior: true
+    unigram_path: data/unigram.compact.npy   # compacted counts
+    unigram_smoothing: 1.0
+    z_loss_weight: 1.0e-4
+    ce_chunk_rows: 4096
+
+  multimodal:
+    enabled: false             # off for text-only; bridge is fixed-rate and opt-in
+
+train:
+  # Budget: ~1.77B tokens over ~7 days of continuous training. This ROCm build
+  # has no flash-attention (only the MATH SDPA backend, ~13.8ms per layer at
+  # T=1024), capping throughput near 3000 tokens/s regardless of batch/seq.
+  # 108k optimizer steps at 16384 tokens/step. 4x the V31 budget (0.41B).
+  max_steps: 108000
+  batch_size: 4
+  grad_accum_steps: 4          # 4 x 4 = 16 sequences/step, seq_len 1024
+  data:
+    data_dir: data
+    seq_len: 1024              # 2x V31 — longer context, window no longer clips it
+    eos_token_id: 1
+    pad_token_id: 0
+    num_workers: 2
+    seed: 1234
+    cross_doc_attention: false
+
+  logging:
+    log_interval: 1
+    diag_interval: 100
+    diag_chunk_rows: 512
+
+  z_loss_weight: 1.0e-4
+  moe_z_loss_weight: 1.0e-3    # router z-loss now live (MoE on)
+
+  checkpoint_dir: checkpoints_v32_1b
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 3
+  tokenizer: google/gemma-4-E2B-it
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  min_new_tokens: 1
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  repetition_window: 128

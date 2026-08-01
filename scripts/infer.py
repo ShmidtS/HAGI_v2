@@ -58,8 +58,10 @@ def resolve_ckpt(args) -> Path:
     sys.exit(1)
 
 
-def decode_text(tokenizer, ids) -> str:
-    """gigatoken.decode возвращает bytes — приводим к UTF-8 строке."""
+def decode_text(tokenizer, ids, vocab_map=None) -> str:
+    """Если модель в компактном пространстве, маппим обратно в старое для токенизатора."""
+    if vocab_map is not None:
+        ids = vocab_map.to_old(ids).tolist()
     raw = tokenizer.decode(ids)
     if isinstance(raw, bytes):
         return raw.decode("utf-8", errors="replace")
@@ -86,6 +88,18 @@ def main() -> int:
     print(f"device: {device}")
 
     cfg = load_config(args.config)
+    # If the corpus was compacted (vocab_map.npz present), the model operates in
+    # the compact id space; the tokenizer emits old-space ids and the map bridges
+    # the two. Dropped ids fall back to UNK (id 3, always reserved).
+    vocab_map = None
+    map_path = Path(cfg.train.data.data_dir) / "vocab_map.npz"
+    if map_path.exists() and cfg.model.vocab_size < 262144:
+        from hagi.data.vocab_map import VocabMap
+
+        vocab_map = VocabMap(map_path)
+        print(f"compact vocabulary: model={cfg.model.vocab_size} tokens, "
+              f"map={map_path.name} (old {vocab_map.old_vocab} -> new {vocab_map.new_vocab})")
+
     max_seq_len = cfg.model.attention.max_seq_len
     budget = max_seq_len - args.max_tokens  # сколько токенов истории влезает
     if budget < 8:
@@ -100,12 +114,15 @@ def main() -> int:
     model.eval()
 
     tokenizer = gt.Tokenizer(cfg.train.tokenizer)
-    history: list[int] = []  # все токены диалога (user + assistant)
+    history: list[int] = []  # все токены диалога в компактном id-пространстве
 
     def encode(text: str) -> list[int]:
-        """gigatoken.encode может вернуть np.ndarray — нормализуем в list[int]."""
+        """Токенизируем в старое пространство, затем маппим в компактное."""
         raw = tokenizer.encode(text)
-        return list(raw) if not isinstance(raw, list) else raw
+        old = list(raw) if not isinstance(raw, list) else raw
+        if vocab_map is not None:
+            return vocab_map.to_compact(old).tolist()
+        return old
 
     def run_turn(user_ids: list[int]) -> list[int]:
         """Один запрос с полной историей в контексте. Возвращает новые токены."""
@@ -129,7 +146,7 @@ def main() -> int:
             user_ids = encode(args.prompt)
             new = run_turn(user_ids)
             history.extend(user_ids + new)
-            print(decode_text(tokenizer, new))
+            print(decode_text(tokenizer, new, vocab_map))
         while True:
             try:
                 text = input("\n> ")
@@ -140,7 +157,7 @@ def main() -> int:
             user_ids = encode(text)
             new = run_turn(user_ids)
             history.extend(user_ids + new)
-            print(decode_text(tokenizer, new))
+            print(decode_text(tokenizer, new, vocab_map))
     except KeyboardInterrupt:
         print("\n(прервано)")
     return 0

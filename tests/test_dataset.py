@@ -44,6 +44,15 @@ class TestPaths:
     def test_resolves_bin(self, tmp_path):
         assert dataset_path(tmp_path, "edu").name == "edu.bin"
 
+    def test_prefers_compact_bin(self, tmp_path):
+        write_bin(tmp_path / "edu.bin", [1, 2, 3])
+        write_bin(tmp_path / "edu.compact.bin", [1, 2, 3])
+        assert dataset_path(tmp_path, "edu").name == "edu.compact.bin"
+
+    def test_falls_back_to_raw_when_no_compact(self, tmp_path):
+        write_bin(tmp_path / "edu.bin", [1, 2, 3])
+        assert dataset_path(tmp_path, "edu").name == "edu.bin"
+
     @pytest.mark.parametrize("name", ["", "../escape", "sub/dir", "back\\slash"])
     def test_rejects_traversal(self, tmp_path, name):
         with pytest.raises(ValueError):
