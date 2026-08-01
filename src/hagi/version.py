@@ -20,5 +20,5 @@ QK-normalized GQA, bias-controlled MoE, recurrent spectral branch, tied
 receiver with unigram prior and chunked cross-entropy.
 """
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 __architecture__ = "hagi-channel-v33"
