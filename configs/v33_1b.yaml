@@ -108,6 +108,7 @@ train:
   batch_size: 30               # 15 -> 30: +5% throughput (overhead amortized)
   grad_accum_steps: 1
   grad_checkpointing: false
+  use_muon: true               # CDMA precoding: orthogonalized updates for 2D channel weights
   data:
     data_dir: data
     seq_len: 1024
