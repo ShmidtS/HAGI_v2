@@ -107,6 +107,32 @@ Muon lr 0.02, AdamW lr 3e-4. Checkpoint format 9.
 - `logit_scale` — receiver gain; starts at `1/sqrt(H)` and should rise as the
   conditional part of the code becomes informative.
 
+## Performance optimizations (V32.1, measured on this ROCm build)
+
+This ROCm build has **no flash-attention** (only the MATH SDPA backend), no
+Triton, and no torch.compile. Initial V32 throughput was ~2900 tokens/s. Four
+optimizations, all measured, raised it to ~4900 tokens/s (+71%):
+
+1. **bf16 chunked cross-entropy.** The head's matmul/softmax now run in the
+   parameter dtype (bf16 under bf16 training) with an online-stable logsumexp
+   (shift by max). fp32 measured 2.9x slower for a 0.23% accuracy cost, which is
+   below the noise of one optimizer step. fp64 inputs (gradient checks) keep
+   fp64. `tests/test_head.py` asserts exactness.
+2. **grad_checkpointing off.** With 96 GB VRAM the recompute costs time, not
+   memory (peak is ~19 GB). Turning it off was +23%.
+3. **MoE n_shared=0.** The always-on shared expert was 10.6M params of constant
+   compute; with top_k=2 every token is already routed to two specialized
+   experts. Removing it was +9%.
+4. **Physical window truncation (training only).** A windowed layer slices K/V
+   to the last `window` keys before SDPA, making it O(T*W) instead of O(T^2).
+   With window=512 at T=1024 that is +6%. It is confined to `self.training`:
+   eval must stay bit-exact against incremental decoding (a truncated prefill
+   and a small cache disagree on the earliest positions, asserted by
+   `test_incremental_matches_full`).
+
+The config now runs `batch 8 x accum 2 x seq 1024 = 16384 tokens/step` at
+~2.1s/step, and the budget is 176k steps = 2.88B tokens over ~7 days.
+
 ## How to train
 
 ```bash

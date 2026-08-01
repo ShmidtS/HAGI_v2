@@ -49,7 +49,8 @@ model:
     qk_norm: true
 
   sliding:
-    window: 1024               # == seq_len; full-attention relays every 4 layers
+    window: 512               # half of seq_len: windowed layers are O(T*W) not O(T^2);
+                              # full-attention relays every 4 layers carry long-range deps
     full_every: 4
 
   embedding:
@@ -65,7 +66,8 @@ model:
     enabled: true              # scaling lever: total params grow, FLOPs/token don't
     num_experts: 8
     top_k: 2
-    n_shared: 1
+    n_shared: 0                # no always-on shared expert: top_k=2 already routes every
+                               # token; the shared copy was 10.6M params of constant compute
     moe_every: 2
     bias_update_rate: 0.001    # bias controller (aux-loss-free balance)
     router_init_std: 0.0
@@ -86,16 +88,18 @@ model:
     enabled: false             # off for text-only; bridge is fixed-rate and opt-in
 
 train:
-  # Budget: ~1.77B tokens over ~7 days of continuous training. This ROCm build
-  # has no flash-attention (only the MATH SDPA backend, ~13.8ms per layer at
-  # T=1024), capping throughput near 3000 tokens/s regardless of batch/seq.
-  # 108k optimizer steps at 16384 tokens/step. 4x the V31 budget (0.41B).
-  max_steps: 108000
-  batch_size: 4
-  grad_accum_steps: 4          # 4 x 4 = 16 sequences/step, seq_len 1024
+  # Budget: ~2.9B tokens over ~7 days of continuous training at the optimized
+  # throughput (~4900 tok/s after bf16 CE + no grad-checkpointing + n_shared=0
+  # + window truncation). This ROCm build has no flash-attention (only the MATH
+  # SDPA backend), so throughput was the bottleneck; the optimizations above
+  # raised it 71%. 176k optimizer steps at 16384 tokens/step.
+  max_steps: 176000
+  batch_size: 8
+  grad_accum_steps: 2          # 8 x 2 = 16 sequences/step, seq_len 1024
+  grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
   data:
     data_dir: data
-    seq_len: 1024              # 2x V31 — longer context, window no longer clips it
+    seq_len: 1024              # 2x V31 — longer context
     eos_token_id: 1
     pad_token_id: 0
     num_workers: 2
