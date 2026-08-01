@@ -97,7 +97,7 @@ model:
     unigram_path: data/unigram.compact.npy
     unigram_smoothing: 1.0
     z_loss_weight: 1.0e-4
-    ce_chunk_rows: 4096
+    ce_chunk_rows: 8192
     ce_save_logits: true
 
   multimodal:
