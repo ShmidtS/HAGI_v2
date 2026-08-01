@@ -28,7 +28,6 @@ os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 import torch
 
-from hagi.config import load_config
 from hagi.inference.generate import generate
 from hagi.model.model import HAGI
 from hagi.train.loop import cast_model
@@ -72,7 +71,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Интерактивный диалог HAGI v31")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--checkpoint_dir", default=None)
-    ap.add_argument("--config", default="configs/v31_1b.yaml")
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
     ap.add_argument("--prompt", default=None, help="первый prompt (иначе интерактив)")
     ap.add_argument("--max_tokens", type=int, default=128)
@@ -87,7 +85,13 @@ def main() -> int:
     )
     print(f"device: {device}")
 
-    cfg = load_config(args.config)
+    # The checkpoint carries its own config; read it so the model always matches
+    # the weights (a CLI --config that differs silently corrupts every shape).
+    ckpt_path = resolve_ckpt(args)
+    from hagi.train.checkpoint import config_from_dict, load_payload
+
+    payload = load_payload(ckpt_path, device)
+    cfg = config_from_dict(payload["config"])
     # If the corpus was compacted (vocab_map.npz present), the model operates in
     # the compact id space; the tokenizer emits old-space ids and the map bridges
     # the two. Dropped ids fall back to UNK (id 3, always reserved).
@@ -106,7 +110,6 @@ def main() -> int:
         print(f"max_tokens {args.max_tokens} почти равен max_seq_len {max_seq_len}; уменьшите max_tokens")
         return 1
 
-    ckpt_path = resolve_ckpt(args)
     model = HAGI(cfg).to(device)
     state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
     model.load_state_dict(state["model"] if "model" in state else state, strict=True)
