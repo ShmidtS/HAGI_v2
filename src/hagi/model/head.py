@@ -159,15 +159,22 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             if bias is not None:
                 logits = logits + bias.to(work_dtype)
             if work_dtype in (torch.float16, torch.bfloat16):
-                maxv = logits.max(dim=-1, keepdim=True).values
-                lse = ((logits - maxv).exp().sum(dim=-1, keepdim=True).log() + maxv)
-                probs = (logits - maxv).exp().to(work_dtype)  # probs in work dtype
+                # The matmul stays in work dtype, but the softmax gradient is
+                # computed in fp32: grad_weight = (softmax - onehot)^T h feeds a
+                # codebook whose rare-token rows are updated from tiny
+                # probabilities, and bf16's 7-bit mantissa rounds those off.
+                # Measured: bf16 probs raised the codebook grad norm ~20x and
+                # the run diverged to NaN around step 250. fp32 softmax is not
+                # a matmul, so keeping it fp32 costs almost nothing.
+                logits_f = logits.float()
+                lse = logits_f.logsumexp(dim=-1, keepdim=True)
+                probs = (logits_f - lse).exp()
                 g = probs.clone()
                 g.scatter_add_(-1, targets[start:end].unsqueeze(-1), torch.full_like(lse, -1.0))
-                # scale_ce and z-term applied in work dtype
                 g.mul_(scale_ce)
                 if scale_z != 0.0:
                     g.add_(probs * (2.0 * scale_z * lse))
+                g = g.to(work_dtype)
             else:
                 acc_dtype = torch.float64 if hidden.dtype == torch.float64 else torch.float32
                 logits = logits.to(acc_dtype)
