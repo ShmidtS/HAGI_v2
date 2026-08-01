@@ -80,6 +80,7 @@ class HAGI(nn.Module):
         intermediate = ffn_width(m)
 
         self.blocks = nn.ModuleList()
+        init_ortho = m.init_orthogonal
         for layer in range(m.num_layers):
             attn_cfg = AttentionConfig(
                 num_heads=m.attention.num_query_heads,
@@ -90,7 +91,7 @@ class HAGI(nn.Module):
                 sliding_window=windows[layer],
             )
             mixer = build_mixer(
-                h, intermediate, m.moe, is_moe[layer], m.norm_eps, use_ternary, residual_scale
+                h, intermediate, m.moe, is_moe[layer], m.norm_eps, use_ternary, residual_scale, init_ortho
             )
             self.blocks.append(
                 Block(
@@ -102,6 +103,7 @@ class HAGI(nn.Module):
                     residual_scale,
                     spectral_cfg=m.spectral if m.spectral.enabled else None,
                     use_spectral=is_spectral[layer],
+                    init_orthogonal=init_ortho,
                 )
             )
 

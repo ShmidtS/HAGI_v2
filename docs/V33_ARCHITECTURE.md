@@ -98,6 +98,21 @@ lr_body = learning_rate * body_lr_scale    (default 8.0)
 The body group is identified by the same `is_channel_weight` marker the
 optimizer partition already uses, so it survives ternary-on/off ablations.
 
+## Orthogonal channel init (CDMA precoding)
+
+Every 2D channel weight now starts full-rank. An i.i.d. Gaussian init at
+width 1152 has minimum singular value ~0 (measured: q_proj singular ratio
+~5e4) — directions of the input space the layer structurally cannot transmit.
+The QR-based init sets all singular values to 1 (measured 0.998-1.003), so
+every input direction is transmitted from step 0. This is the OFDM/CDMA
+precoding picture: assign the transmit matrix an orthogonal basis once, rather
+than re-orthogonalizing every step (which is what Muon's Newton-Schulz does,
+at 0.65s/step). The codebook (a source codec, not a precoder) and 1D gains are
+excluded; `down`/`out_proj` rescale by `residual_scale` to keep depth scaling.
+
+Zero runtime cost (one-time QR at build, ~8s). Loss at init is identical to
+Gaussian init (11.82 vs 11.82) while the transmit matrices are full-rank.
+
 ## Parameters (analytic)
 
 V33 config (speed-tuned): H=1152, L=11, 18q/3kv x 64, ffn=2688 (expansion
