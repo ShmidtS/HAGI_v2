@@ -59,7 +59,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-CHECKPOINT_FORMAT_VERSION = 8
+CHECKPOINT_FORMAT_VERSION = 9
 
 
 @dataclass
@@ -795,8 +795,16 @@ def validate_config(cfg: Config) -> None:
             raise ValueError(f"data.{name} ({tok}) is outside the vocabulary")
 
     s = t.schedule
-    if s.warmup_steps < 0 or s.warmup_steps >= t.max_steps:
-        raise ValueError("schedule.warmup_steps must be in [0, max_steps)")
+    if s.warmup_steps < 0:
+        raise ValueError("schedule.warmup_steps must be non-negative")
+    # warmup may equal or exceed max_steps only for short smoke runs (--steps N):
+    # the schedule then never leaves the ramp, which is the intended behaviour of
+    # a tiny validation run, not a misconfiguration. Real runs keep warmup << total.
+    if s.warmup_steps >= t.max_steps and t.max_steps >= 1000:
+        raise ValueError(
+            f"schedule.warmup_steps ({s.warmup_steps}) must be < max_steps ({t.max_steps}) "
+            "for a real training run"
+        )
     if not 0.0 < s.decay_fraction < 1.0:
         raise ValueError("schedule.decay_fraction must be in (0, 1)")
     if not 0.0 <= s.min_lr_ratio < 1.0:
