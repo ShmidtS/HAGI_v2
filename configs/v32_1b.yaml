@@ -2,12 +2,13 @@
 #
 # What changed from V31, and the measured reason:
 #
-# 1. Vocabulary compacted 262144 -> 131072 (scripts/compact_vocab.py). Only
-#    176512 of 262144 ids occur in this corpus; the top 131072 carry 99.9% of
-#    token mass. The codebook drops from 537M to 268M params (V*H paid once
+# 1. Vocabulary compacted 262144 -> 32768 (scripts/compact_vocab.py). Only
+#    176512 of 262144 ids occur in this corpus; the top 32768 carry 96.2% of
+#    token mass. The codebook drops from 537M to 37.7M params (V*H paid once
 #    against a tied head). More importantly, body share of total goes from
-#    29% to 82% — the V31 config repeated V30's pathology of a body too small
+#    29% to ~94% — the V31 config repeated V30's pathology of a body too small
 #    relative to the codebook to learn language. See docs/V31_ARCHITECTURE.md.
+#    V=65536->32768 additionally halves the head matmul (~45% of step time).
 #
 # 2. MoE enabled. V31 shipped dense (E=8 in config but moe.enabled=false).
 #    MoE is the only lever that grows total capacity without growing per-token
@@ -35,8 +36,9 @@
 # *.compact.bin when present (hagi/data/dataset.py:dataset_path).
 
 model:
-  vocab_size: 65536            # compacted from 262144 (98.2% mass retained);
-                               # halves the head matmul (54% of step time at 131072)
+  vocab_size: 32768            # compacted from 262144 (96.2% mass retained);
+                               # the head matmul is ~45% of step time; halving V
+                               # halves the head's 4 projections + fp32 softmax
   hidden_size: 1152
   num_layers: 13
   norm_eps: 1.0e-5
@@ -90,13 +92,13 @@ model:
     enabled: false             # off for text-only; bridge is fixed-rate and opt-in
 
 train:
-  # Budget: ~2.2B tokens over ~7 days at the optimized throughput. This ROCm
+  # Budget: ~2.6B tokens over ~7 days at the optimized throughput. This ROCm
   # build has no flash-attention (only MATH SDPA), capping compute; compaction
-  # to V=65536 + bf16 CE + no grad-ckpt + n_shared=0 + window truncation +
-  # top_k=1 + batch 12 raised throughput from 2862 to ~3700 tok/s (+29%).
+  # to V=32768 + bf16 CE + no grad-ckpt + n_shared=0 + window truncation +
+  # top_k=1 + batch 12 raised throughput to ~5000 tok/s (2.45s/step).
   # Batch 12 beats 8 (+15%, better matmul utilization) without the batch-16
-  # HIPBLAS [12288,8] router crash. 177k optimizer steps at 12288 tokens/step.
-  max_steps: 177000
+  # HIPBLAS [12288,8] router crash. 212k optimizer steps at 12288 tokens/step.
+  max_steps: 212000
   batch_size: 12
   grad_accum_steps: 1          # 12 sequences/step, seq_len 1024
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
