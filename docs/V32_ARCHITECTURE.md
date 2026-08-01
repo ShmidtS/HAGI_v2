@@ -129,9 +129,24 @@ optimizations, all measured, raised it to ~4900 tokens/s (+71%):
    eval must stay bit-exact against incremental decoding (a truncated prefill
    and a small cache disagree on the earliest positions, asserted by
    `test_incremental_matches_full`).
+5. **MoE top_k=1 (Switch-style routing).** Half the routed FFN FLOPs of top_k=2;
+   load balance is still measured at entropy_ratio=1.000 (the bias controller is
+   selection-only, so top-1 routing stays balanced). +11%.
+6. **Batch 16, accum 1.** No grad-accum kernel relaunch overhead. +2%.
 
-The config now runs `batch 8 x accum 2 x seq 1024 = 16384 tokens/step` at
-~2.1s/step, and the budget is 176k steps = 2.88B tokens over ~7 days.
+CUDA graphs measured 1.00x (matmul-bound, not launch-bound) and fp16 == bf16 on
+this GPU, so neither helps further.
+
+The config runs `batch 16 x seq 1024 = 16384 tokens/step` at ~3.3s/step and the
+budget is 196k steps = 3.21B tokens over ~7 days.
+
+### Why not a bottleneck head
+
+Head matmul is 54% of step time at V=131072. A bottleneck `H -> 288 -> V`
+head measured 2.7x faster, but V31's factored-head measurement showed a
+~0.5-0.9 nats loss at these ranks, which is ~1.6x perplexity — too expensive to
+trade for speed. The vocab compaction to 131072 already halved the head; a
+further compaction to 65536 (98.3% mass) is the clean next lever if needed.
 
 ## How to train
 

@@ -95,8 +95,12 @@ train:
   # backend), so throughput was the bottleneck; the optimizations above raised
   # it 87%. 196k optimizer steps at 16384 tokens/step.
   max_steps: 196000
-  batch_size: 16
-  grad_accum_steps: 1          # 16 sequences/step, seq_len 1024 (no accum overhead)
+  batch_size: 8
+  grad_accum_steps: 2          # batch 16 (accum 1) crashed on step 2: HIPBLAS
+                               # "unspecified launch failure" on the router's
+                               # [16384, 8] backward shape — a batch-16-only
+                               # ROCm kernel bug. 8x2 is stable (700+ steps) at
+                               # ~2% less throughput.
   grad_checkpointing: false    # 96 GB VRAM: recompute costs time, not memory
   data:
     data_dir: data
