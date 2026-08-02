@@ -27,6 +27,7 @@ import os
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 import torch
+import numpy as np
 
 from hagi.inference.generate import generate
 from hagi.model.model import HAGI
@@ -92,6 +93,27 @@ def main() -> int:
 
     payload = load_payload(ckpt_path, device)
     cfg = config_from_dict(payload["config"])
+    vocab = cfg.model.vocab_size
+
+    # Ids the model must never emit: special tokens (PAD/BOS/UNK/MASK/multimodal),
+    # the <unusedN> filler ids, and any token absent from the compact corpus
+    # (unigram count 0). A two-pass compaction left UNK at 6% of the training
+    # stream, so the model learned it as an ordinary token; without a ban every
+    # generation occasionally emits <unk> (and <unusedN>). These ids carry no
+    # linguistic content — banning them cannot change meaning, only garbage.
+    banned_ids: set[int] = set()
+    if cfg.model.head.unigram_prior and cfg.model.head.unigram_path:
+        unigram = np.load(cfg.model.head.unigram_path)
+        for cid, count in enumerate(unigram):
+            if count == 0:
+                banned_ids.add(cid)
+    # Special tokens always reserved at the bottom of the compact vocab.
+    special_tokens = {0, 2, 3, 4, 5}  # pad, bos, unk, mask, multimodal
+    banned_ids.update(cid for cid in special_tokens if cid < vocab)
+    # <unusedN> fillers (old ids 6..255 survive the compaction via reserve-below).
+    if vocab >= 256:
+        banned_ids.update(range(6, min(256, vocab)))
+    print(f"banned ids at generation: {len(banned_ids)} (special + unused + zero-count)")
     # If the corpus was compacted (vocab_map.npz present), the model operates in
     # the compact id space; the tokenizer emits old-space ids and the map bridges
     # the two. Dropped ids fall back to UNK (id 3, always reserved).
@@ -140,6 +162,7 @@ def main() -> int:
             top_k=args.top_k,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
+            banned=tuple(sorted(banned_ids)),
         )
         full = output.token_ids[0].tolist()
         return full[len(context):]
