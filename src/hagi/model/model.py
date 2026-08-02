@@ -113,6 +113,7 @@ class HAGI(nn.Module):
             m.vocab_size,
             m.head,
             tied_weight=self.encoder.weight if m.embedding.tie_lm_head else None,
+            xm_cfg=m.xm if m.xm.enabled else None,
         )
 
         self.bridge = None

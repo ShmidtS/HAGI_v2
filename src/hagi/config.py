@@ -327,6 +327,52 @@ class MultimodalConfig:
 
 
 @dataclass
+class XMConfig:
+    """Explorative Modeling — best-of-K list decoding on high-entropy positions.
+
+    Forward XM (Gladstone, Ji, Du — arxiv 2607.27372) factors the *training
+    loop* instead of the generation procedure: fix a data target, draw K
+    candidates from the model's own generation, train on the closest. This
+    scales *generative expressivity* — how many modes a prediction can commit
+    to — which ordinary next-token factorization fixes at design time.
+
+    Channel reading: the LM head is a *list decoder*. Standard CE forces one
+    hypothesis (the blur: the mean of all valid continuations, which matches no
+    real continuation). Best-of-K emits K hypotheses (one per mode-code) and
+    keeps the one nearest the received target — the maximum-likelihood decision
+    over K codewords. Gradient flows only through the winner (Algorithm 1).
+
+    Theory (Proposition 1, Appendix F): at large K this is maximum likelihood
+    of a K-component mixture; K=1 is ordinary MLE. Gains grow with scale
+    (4.1x FLOP, 6.2x sample, 47% parameter efficiency measured on image/video/
+    language).
+
+    On the bandwidth-bound Radeon 8060S the head *forward* costs 141ms vs
+    551ms for head backward (both at N=30720, V=32768). Best-of-K adds only
+    K-1 forward passes (cheap) while backward stays through the single winner —
+    so exploration is nearly free relative to its quality gain.
+
+    Attributes:
+        enabled: turn best-of-K exploration on.
+        num_modes: K learnable mode-codes (hypotheses per position).
+        entropy_gate: explore only positions whose conditional entropy exceeds
+            this fraction of ln(V). Where the next token is unambiguous there
+            is nothing to explore; spending the budget there is wasted forward
+            passes. 0.0 explores everywhere.
+        mode_std: init std of the mode-code embeddings (small, so a mode is a
+            perturbation of the base prediction, not a new prediction).
+        min_modes: positions below ``entropy_gate`` still get this many
+            candidates (1 = the base prediction, i.e. ordinary CE).
+    """
+
+    enabled: bool = False
+    num_modes: int = 4
+    entropy_gate: float = 0.7
+    mode_std: float = 0.05
+    min_modes: int = 1
+
+
+@dataclass
 class ModelConfig:
     """Full architecture."""
 
@@ -351,6 +397,7 @@ class ModelConfig:
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    xm: XMConfig = field(default_factory=XMConfig)
 
 
 @dataclass
@@ -961,6 +1008,17 @@ def validate_config(cfg: Config) -> None:
                 "multimodal bridge head_dim (hidden_size // bridge_heads) must be "
                 "divisible by 4 for 2D-RoPE (row and column bands each need even width)"
             )
+
+    xm = m.xm
+    if xm.enabled:
+        if xm.num_modes < 2:
+            raise ValueError("xm.num_modes must be >= 2 (1 mode is ordinary CE)")
+        if not 0.0 <= xm.entropy_gate <= 1.0:
+            raise ValueError("xm.entropy_gate must be in [0, 1]")
+        if xm.mode_std <= 0:
+            raise ValueError("xm.mode_std must be positive")
+        if xm.min_modes < 1:
+            raise ValueError("xm.min_modes must be >= 1")
 
     if cfg.inference.temperature < 0 or cfg.inference.top_k < 0:
         raise ValueError("inference.temperature and top_k must be non-negative")

@@ -104,8 +104,14 @@ class Attention(nn.Module):
             return linear(hidden_size, out_features, use_ternary, init_orthogonal)
 
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.q_proj = proj(cfg.num_heads * cfg.head_dim)
-        self.kv_proj = proj(2 * cfg.num_kv_heads * cfg.head_dim)
+        # Fused QKV projection: one [H, H + 2*K*Hd] matrix instead of separate
+        # q and kv projections. On a launch-bound part (Radeon 8060S iGPU) this
+        # halves the number of linear calls per layer and lets backward read the
+        # weight once instead of twice — measured ~6% on the isolated matmul,
+        # more when launch overhead dominates.
+        n_q_out = cfg.num_heads * cfg.head_dim
+        n_kv_out = 2 * cfg.num_kv_heads * cfg.head_dim
+        self.qkv_proj = proj(n_q_out + n_kv_out)
         self.out_proj = proj(cfg.num_heads * cfg.head_dim)
         if init_orthogonal:
             with torch.no_grad():
@@ -146,8 +152,11 @@ class Attention(nn.Module):
         """
         h = self.attn_norm(x)
         b, t, _ = h.shape
-        q = self.q_proj(h).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(h).view(b, t, 2, self.n_kv_heads, self.head_dim)
+        # One fused projection, then split into q / k / v heads.
+        qkv = self.qkv_proj(h)
+        n_q = self.n_heads * self.head_dim
+        q = qkv[..., :n_q].view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        kv = qkv[..., n_q:].view(b, t, 2, self.n_kv_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
