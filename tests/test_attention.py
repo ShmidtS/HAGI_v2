@@ -144,8 +144,10 @@ class TestAttention:
         """
         def logit_range(module: Attention) -> float:
             h = module.attn_norm(torch.randn(1, 8, 64))
-            q = module.q_proj(h).view(1, 8, 4, 16).transpose(1, 2)
-            kv = module.kv_proj(h).view(1, 8, 2, 2, 16)
+            qkv = module.qkv_proj(h)
+            n_q = module.n_heads * module.head_dim
+            q = qkv[..., :n_q].view(1, 8, 4, 16).transpose(1, 2)
+            kv = qkv[..., n_q:].view(1, 8, 2, 2, 16)
             k = kv.unbind(dim=2)[0].transpose(1, 2)
             if module.q_norm is not None:
                 q, k = module.q_norm(q), module.k_norm(k)
@@ -162,8 +164,7 @@ class TestAttention:
             torch.manual_seed(7)
             base_plain = logit_range(plain)
             for module in (normed, plain):
-                module.q_proj.weight.mul_(8.0)
-                module.kv_proj.weight.mul_(8.0)
+                module.qkv_proj.weight.mul_(8.0)
             torch.manual_seed(7)
             grown_normed = logit_range(normed)
             torch.manual_seed(7)
