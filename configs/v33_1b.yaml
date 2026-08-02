@@ -91,6 +91,9 @@ train:
   grad_accum_steps: 1
   grad_checkpointing: false
   use_muon: true               # CDMA precoding: orthogonalized updates for 2D channel weights
+  schedule:
+    inverse_sqrt_stable: false  # const stable phase; inverse_sqrt tau=2000 decays LR 2-11x below peak
+    inverse_sqrt_tau: 0
   data:
     data_dir: data
     seq_len: 1024
