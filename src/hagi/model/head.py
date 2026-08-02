@@ -374,8 +374,34 @@ class LMHead(nn.Module):
         with torch.no_grad():
             log_z, log_pt, entropy = _head_stats_blocks(scaled, weight, targets, bias, self.chunk_rows)
             base_ce = log_z - log_pt  # [N]
+            # Entropy gate. ``entropy`` is the *posterior* entropy, which is
+            # upper-bounded by the *prior* entropy (the unigram entropy when a
+            # source prior is active — 8.06 nats on this corpus — not ln V =
+            # 12.48). Using a fraction of ln V as the threshold therefore never
+            # fires when a unigram prior is loaded: no position can reach
+            # 0.9*ln V, exploration silently never happens, and XM pays its
+            # forward cost for zero benefit (the V34 "no quality" result is this
+            # bug, not a property of best-of-K). Gate against the achievable
+            # maximum instead: the prior entropy when a prior is present, ln V
+            # otherwise.
             max_h = float(torch.log(torch.tensor(self.vocab_size, dtype=torch.float32)))
+            if self.log_prior is not None:
+                p = self.log_prior.double().exp()
+                max_h = float(-(p * p.clamp_min(1e-12).log()).sum())
             explore = entropy > (gate * max_h)
+            # Budget cap: within the entropy-gated set keep only the
+            # highest-entropy ``explore_fraction``. On a near-uniform model the
+            # gate alone fires on ~100% of positions and K full head passes
+            # cost +55% step time for zero signal; the fraction targets the
+            # genuinely ambiguous tail instead.
+            frac = float(getattr(xm, "explore_fraction", 1.0))
+            if frac < 1.0:
+                n_ex = int(explore.sum())
+                keep = max(1, int(round(n_ex * frac)))
+                ex_ent = entropy.masked_fill(~explore, -1e9)
+                _, top_idx = ex_ent.topk(keep)
+                explore = torch.zeros_like(explore)
+                explore[top_idx] = True
 
         n_explore = int(explore.sum())
         if n_explore == 0:
