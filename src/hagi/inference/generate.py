@@ -116,6 +116,7 @@ def generate(
     min_new_tokens: int = 1,
     use_cache: bool = True,
     generator: torch.Generator | None = None,
+    banned: tuple[int, ...] = (),
 ) -> GenerationOutput:
     """Sample a continuation for each prompt row.
 
@@ -132,6 +133,8 @@ def generate(
         use_cache: incremental decoding; False recomputes the full prefix each
             step (same output, O(T^2) cost) and is useful for verifying the cache.
         generator: seeded RNG for reproducible sampling.
+        banned: token ids to forbid at every step (e.g. UNK / unused fillers the
+            model learned as ordinary tokens from a corrupt compaction).
 
     Returns:
         :class:`GenerationOutput`.
@@ -165,7 +168,7 @@ def generate(
 
         for step in range(max_new_tokens):
             context = sequence[:, : prompt_len + step]
-            banned = (pad_token_id,)
+            banned = tuple(set(banned) | {pad_token_id})
             logits = filter_logits(
                 next_logits,
                 context,
