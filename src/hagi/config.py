@@ -356,9 +356,17 @@ class XMConfig:
         enabled: turn best-of-K exploration on.
         num_modes: K learnable mode-codes (hypotheses per position).
         entropy_gate: explore only positions whose conditional entropy exceeds
-            this fraction of ln(V). Where the next token is unambiguous there
-            is nothing to explore; spending the budget there is wasted forward
-            passes. 0.0 explores everywhere.
+            this fraction of the *achievable* maximum — the unigram entropy when
+            a source prior is loaded (8.06 nats on this corpus), else ln(V).
+            Where the next token is unambiguous there is nothing to explore;
+            spending the budget there is wasted forward passes. 0.0 explores
+            everywhere.
+        explore_fraction: additionally keep only the ``explore_fraction``
+            highest-entropy positions *within* the gated set. At initialization
+            the model is near-uniform, so entropy_gate alone fires on ~100% of
+            positions and best-of-K costs K full head passes; capping the
+            fraction bounds the exploration budget while still targeting the
+            genuinely ambiguous tail.
         mode_std: init std of the mode-code embeddings (small, so a mode is a
             perturbation of the base prediction, not a new prediction).
         min_modes: positions below ``entropy_gate`` still get this many
@@ -368,6 +376,7 @@ class XMConfig:
     enabled: bool = False
     num_modes: int = 4
     entropy_gate: float = 0.7
+    explore_fraction: float = 0.2
     mode_std: float = 0.05
     min_modes: int = 1
 
@@ -1015,6 +1024,8 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("xm.num_modes must be >= 2 (1 mode is ordinary CE)")
         if not 0.0 <= xm.entropy_gate <= 1.0:
             raise ValueError("xm.entropy_gate must be in [0, 1]")
+        if not 0.0 < xm.explore_fraction <= 1.0:
+            raise ValueError("xm.explore_fraction must be in (0, 1]")
         if xm.mode_std <= 0:
             raise ValueError("xm.mode_std must be positive")
         if xm.min_modes < 1:
