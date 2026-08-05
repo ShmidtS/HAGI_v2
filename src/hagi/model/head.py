@@ -332,18 +332,64 @@ class LMHead(nn.Module):
         # The gain is applied outside the custom Function: autograd then routes a
         # gradient to it through this multiply, with no extra pass over [N, V].
         scaled = hidden * self.logit_scale.to(hidden.dtype)
-        if self.mode_codes is None:
-            ce, z = _ChunkedCrossEntropy.apply(
-                scaled,
-                self.weight,
-                targets,
-                bias,
-                self.chunk_rows,
-                self.z_loss_weight,
-                self.cfg.ce_save_logits,
-            )
-            return ce, z
-        return self._loss_xm(scaled, targets, bias)
+        if self.mode_codes is not None:
+            return self._loss_xm(scaled, targets, bias)
+        k = int(getattr(self.cfg, "sampled_softmax_k", 0) or 0)
+        if k > 0:
+            return self._loss_sampled(scaled, targets, bias, k)
+        ce, z = _ChunkedCrossEntropy.apply(
+            scaled,
+            self.weight,
+            targets,
+            bias,
+            self.chunk_rows,
+            self.z_loss_weight,
+            self.cfg.ce_save_logits,
+        )
+        return ce, z
+
+    def _loss_sampled(
+        self,
+        scaled: torch.Tensor,
+        targets: torch.Tensor,
+        bias: torch.Tensor | None,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sampled softmax over {target} ∪ K uniform negatives (Jean et al.).
+
+        Information view: full CE measures the partition over the whole alphabet
+        (exact decoding metric). Sampled softmax replaces that with a *local*
+        partition on a random code-subset of size K+1 — a Monte-Carlo surrogate
+        of the same mutual-information gradient with cost O(N·K·H) instead of
+        O(N·V·H). With uniform proposal ``q=1/V`` the ``-log q`` correction is
+        constant and cancels inside the softmax; the unigram prior (when on)
+        already reweights the candidates toward the source distribution.
+
+        The true class is always index 0 of the candidate set so the CE is
+        simply ``-log_softmax(logits)[:, 0]``. Collisions (negative == target)
+        are remapped cheaply; they are rare at V ≫ K.
+        """
+        n = scaled.shape[0]
+        v = self.vocab_size
+        device = scaled.device
+        neg = torch.randint(0, v, (n, k), device=device)
+        # Cheap collision fix: shift colliding negatives by +1 (mod V).
+        coll = neg.eq(targets.unsqueeze(1))
+        if bool(coll.any()):
+            neg = torch.where(coll, (neg + 1).remainder(v), neg)
+        cand = torch.cat([targets.unsqueeze(1), neg], dim=1)  # [N, K+1]
+        # Gather codebook rows then correlator: [N,K+1,H] · [N,1,H] → [N,K+1].
+        rows = F.embedding(cand, self.weight)
+        logits = (scaled.unsqueeze(1).to(rows.dtype) * rows).sum(dim=-1)
+        if bias is not None:
+            logits = logits + bias[cand].to(logits.dtype)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ce = -log_probs[:, 0].mean()
+        if self.z_loss_weight > 0:
+            z_loss = logits.float().logsumexp(dim=-1).pow(2).mean()
+        else:
+            z_loss = scaled.new_zeros((), dtype=torch.float32)
+        return ce, z_loss
 
     def _loss_xm(self, scaled: torch.Tensor, targets: torch.Tensor, bias) -> tuple[torch.Tensor, torch.Tensor]:
         """Best-of-K list decoding over mode-codes (memory-saving mode).

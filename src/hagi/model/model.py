@@ -1,28 +1,17 @@
-"""HAGI V31 — a causal language model stated as a communication system.
+"""HAGI V39 — sampled-softmax receiver + thinner ternary channel.
 
-    tokens
+    tokens (+ optional image/audio)
       -> source coder        (codebook + causal pulse-shaping filter)
-      -> [multimodal prefix] (per-modality coders + fixed-rate bridge)
-      -> channel             (L ternary blocks: QK-normed GQA + SwiGLU/MoE)
+      -> [multimodal prefix] (fixed-rate bridge; dropout + water-fill)
+      -> channel             (L ternary blocks × loop_depth:
+                              QK-norm GQA + correct local window + SwiGLU)
       -> output norm
-      -> receiver            (tied head + unigram prior + chunked CE)
+      -> receiver            (tied head + unigram prior +
+                              punctured CE and/or sampled softmax)
 
-One path. Every tensor that leaves the source coder reaches the receiver; there
-are no auxiliary branches reading detached copies of the hidden state, and no
-loss terms competing with the coding objective. That is a deliberate reversal of
-V28, which had five off-path modules (variational bottleneck, latent memory bank,
-HEP refiner, EXIT halt, water-filling allocator) and shipped with all of them
-disabled in both production configs — the code paths remained, the complexity
-remained, and the failure modes they introduced remained.
-
-The objective:
-
-    loss = CE + w_z * z_loss + w_router_z * router_z_loss [+ w_ground * grounding]
-
-CE is the channel's coding cost. The two z-losses bound log-partition drift,
-which is numerical conditioning rather than a modelling preference. Grounding
-appears only when a second modality is present. Load balance is *not* a loss: it
-is a bias controller inside the router, so nothing competes with CE for gradient.
+One path. Objective: CE (+ z_loss) on a rate-reduced supervision stream.
+V39 stacks L↓, puncture p, and sampled-K local partition for bandwidth-bound
+parts without changing the ternary channel noise model.
 """
 
 from __future__ import annotations
@@ -70,10 +59,12 @@ class HAGI(nn.Module):
             init_std=m.embedding.init_std,
         )
 
-        # Residual scaling: 2L branches each of variance s^2 keep the stream at
-        # O(1) when s = 1/sqrt(2L). Without it the stream's variance grows
-        # linearly in depth and the first phase of training is spent undoing it.
-        residual_scale = (2.0 * m.num_layers) ** -0.5
+        # Residual scaling: 2 * L_eff branches each of variance s^2 keep the stream
+        # at O(1) when s = 1/sqrt(2*L_eff). With loop_depth > 1 the same unique
+        # blocks are applied multiple times, so the effective branch count is
+        # num_layers * loop_depth (not just num_layers).
+        loop = max(1, int(m.loop_depth))
+        residual_scale = (2.0 * m.num_layers * loop) ** -0.5
         windows = layer_windows(m)
         is_moe = moe_layers(m)
         is_spectral = spectral_layers(m)
@@ -81,6 +72,11 @@ class HAGI(nn.Module):
 
         self.blocks = nn.ModuleList()
         init_ortho = m.init_orthogonal
+        # One RoPE table shared by every layer (identical head_dim / theta).
+        from hagi.model.rope import RotaryEmbedding
+
+        shared_rope = RotaryEmbedding(m.attention.head_dim, rope_theta=m.attention.rope_theta)
+        self.rope = shared_rope  # registered so buffers move with .to(device)
         for layer in range(m.num_layers):
             attn_cfg = AttentionConfig(
                 num_heads=m.attention.num_query_heads,
@@ -104,6 +100,7 @@ class HAGI(nn.Module):
                     spectral_cfg=m.spectral if m.spectral.enabled else None,
                     use_spectral=is_spectral[layer],
                     init_orthogonal=init_ortho,
+                    rope=shared_rope,
                 )
             )
 
@@ -124,6 +121,7 @@ class HAGI(nn.Module):
 
         self._window_layers = windows
         self._uniform_window = windows[0] if len(set(windows)) == 1 else None
+        self._loop_depth = loop
         self._step_for_ramp = 0
 
     def param_summary(self) -> dict[str, int]:
@@ -181,27 +179,47 @@ class HAGI(nn.Module):
         Masks depend only on ``(t_q, t_total, window, doc_ids, prefix_len)``, so
         layers sharing a window share a mask. With the default 1:3 relay pattern
         that is two mask builds per forward instead of L.
+
+        With ``loop_depth > 1`` the unique blocks are applied repeatedly
+        (weight-tied depth). Each pass reuses the same mask cache; only the
+        first pass may write into a KV-cache (decode is single-pass).
         """
         t_q = h.shape[1]
         checkpointing = self.training and self.cfg.train.grad_checkpointing
         mask_by_window: dict[int, torch.Tensor | None] = {}
 
-        for block, window in zip(self.blocks, self._window_layers, strict=True):
+        # Prefetch masks once; loops reuse them.
+        # Pure window (no docs / no multimodal prefix): leave mask=None so the
+        # layer runs correct O(T·W) local_window_attention instead of building
+        # a dense T×T band and paying the math-SDPA full-score tax.
+        for window in self._window_layers:
             if window not in mask_by_window:
-                mask_by_window[window] = build_attention_mask(
-                    t_q,
-                    t_total,
-                    window=window,
-                    doc_ids=doc_ids,
-                    prefix_len=prefix_len,
-                    device=h.device,
-                    dtype=h.dtype,
-                )
-            mask = mask_by_window[window]
-            if checkpointing:
-                h = checkpoint_util.checkpoint(block, h, positions, mask, use_state, use_reentrant=False)
-            else:
-                h = block(h, positions, mask, use_spectral_state=use_state)
+                if window > 0 and doc_ids is None and prefix_len <= 0:
+                    mask_by_window[window] = None
+                else:
+                    mask_by_window[window] = build_attention_mask(
+                        t_q,
+                        t_total,
+                        window=window,
+                        doc_ids=doc_ids,
+                        prefix_len=prefix_len,
+                        device=h.device,
+                        dtype=h.dtype,
+                    )
+
+        loops = self._loop_depth if not use_state else 1
+        for loop_i in range(loops):
+            # Only the outermost pass of a looped stack may use spectral
+            # decode state / KV write semantics; inner loops are pure.
+            loop_use_state = use_state and loop_i == 0
+            for block, window in zip(self.blocks, self._window_layers, strict=True):
+                mask = mask_by_window[window]
+                if checkpointing:
+                    h = checkpoint_util.checkpoint(
+                        block, h, positions, mask, loop_use_state, use_reentrant=False
+                    )
+                else:
+                    h = block(h, positions, mask, use_spectral_state=loop_use_state)
         return h
 
     def forward(
@@ -294,8 +312,10 @@ class HAGI(nn.Module):
         grounding = None
         if self.bridge is not None and modal_pooled is not None:
             text_pooled = text_hidden.float().mean(dim=1)
+            gw = float(self.cfg.model.multimodal.grounding_weight)
             grounding = self.bridge.grounding(text_pooled, modal_pooled.float())
-            loss = loss + grounding
+            if gw != 0.0:
+                loss = loss + gw * grounding
 
         out.loss = loss
         out.ce = ce

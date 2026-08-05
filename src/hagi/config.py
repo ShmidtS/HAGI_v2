@@ -283,6 +283,13 @@ class HeadConfig:
             emits a +41 logit before it has learned anything and the free
             unigram prior is destroyed. The gain is one learnable scalar; it
             starts the receiver at the prior and lets training raise the gain.
+        sampled_softmax_k: number of *negative* classes drawn per scored row for
+            sampled softmax (Jean et al.). 0 = full vocabulary CE (chunked).
+            K>0 replaces the O(N·V) receiver with O(N·K·H) gather+dot over
+            {target} ∪ K uniform negatives. Biased but consistent as K→V;
+            with the unigram prior already in the logits, uniform proposal is
+            enough. Measured on 8060S: K=64 at p=0.5 is ~2.8× faster than full
+            CE on the same N; K≥256 loses to full CE (gather traffic).
     """
 
     unigram_prior: bool = False
@@ -292,6 +299,7 @@ class HeadConfig:
     ce_chunk_rows: int = 4096
     ce_save_logits: bool = False
     logit_scale_init: float = 0.0
+    sampled_softmax_k: int = 0
 
 
 @dataclass
@@ -313,6 +321,17 @@ class MultimodalConfig:
         infonce_temperature: temperature of the cross-modal MI bound.
         variance_gamma: per-dimension standard-deviation floor of the anti-
             collapse hinge.
+        modality_dropout: train-time probability of dropping each non-text
+            modality independently. Forces the text channel to remain
+            self-sufficient (no free-ride on always-present side information)
+            and is the multimodal analogue of a Rayleigh fade.
+        waterfill_enabled: reallocate bridge tokens across modalities by a
+            soft water-filling rule on per-modality pooled energy (more tokens
+            to the higher-SNR modality). When False every present modality
+            gets exactly ``n_bridge_queries`` tokens.
+        waterfill_min_rate: floor fraction of ``n_bridge_queries`` any live
+            modality keeps under water-filling (prevents total starvation).
+        grounding_weight: multiplier on the off-path InfoNCE+VICReg term.
     """
 
     enabled: bool = False
@@ -324,6 +343,10 @@ class MultimodalConfig:
     bridge_heads: int = 8
     infonce_temperature: float = 0.07
     variance_gamma: float = 1.0
+    modality_dropout: float = 0.0
+    waterfill_enabled: bool = False
+    waterfill_min_rate: float = 0.25
+    grounding_weight: float = 1.0
 
 
 @dataclass
@@ -388,6 +411,12 @@ class ModelConfig:
     vocab_size: int = 262144
     hidden_size: int = 1536
     num_layers: int = 24
+    # Weight-tied loop depth. Each of the ``num_layers`` unique blocks is applied
+    # ``loop_depth`` times in sequence (Mobius / DeepLoop). Effective depth is
+    # ``num_layers * loop_depth`` while parameter count and optimizer state stay
+    # at ``num_layers``. Residual scale is computed from the *effective* depth
+    # so stream variance stays O(1). 1 disables looping (standard stack).
+    loop_depth: int = 1
     norm_eps: float = 1e-5
     target_params: int = 0
     # CDMA/OFDM precoding init: give every 2D channel weight a full-rank
@@ -586,6 +615,22 @@ class TrainConfig:
     # per-direction isotropy Muon provides buys nothing that AdamW does not.
     # Default off; Muon remains selectable for fp16/dense bodies where it helps.
     use_muon: bool = False
+    # Freeze BitLinear ternary maps once per optimizer step across grad_accum
+    # microbatches (OFDM coherence-interval analogy). Masters only change on
+    # optimizer.step, so re-quantizing every microbatch is pure waste. STE via
+    # W+(Q-W).detach() keeps the gradient on the master. No-op when accum=1.
+    ternary_step_cache: bool = True
+    # Punctured CE (erasure channel on the supervision stream). Fraction of
+    # positions that contribute to the head CE each step. Body still sees the
+    # full sequence; only the receiver cost is thinned. Unbiased Monte-Carlo
+    # estimate of full CE under Bernoulli sampling (keep_mode=bernoulli);
+    # stride is a regular lattice puncture. Measured on 8060S: keep=0.5 →
+    # +27% body tok/s at fixed L=6 (head is ~1/3 of step and linear in N).
+    # 1.0 = score every token (legacy).
+    ce_keep_rate: float = 1.0
+    # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
+    # a step-dependent phase so the lattice covers the sequence over time.
+    ce_keep_mode: str = "bernoulli"
     muon: MuonConfig = field(default_factory=MuonConfig)
     adam: AdamConfig = field(default_factory=AdamConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -912,6 +957,7 @@ def validate_config(cfg: Config) -> None:
     positive_int("model.vocab_size", m.vocab_size, 1 << 21)
     positive_int("model.hidden_size", m.hidden_size, 1 << 15)
     positive_int("model.num_layers", m.num_layers, 512)
+    positive_int("model.loop_depth", m.loop_depth, 64)
     positive_int("model.attention.num_query_heads", a.num_query_heads, 1024)
     positive_int("model.attention.num_kv_heads", a.num_kv_heads, 1024)
     positive_int("model.attention.head_dim", a.head_dim, 512)
@@ -968,6 +1014,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("head.unigram_prior requires head.unigram_path")
     if m.head.ce_chunk_rows < 1:
         raise ValueError("head.ce_chunk_rows must be >= 1")
+    if m.head.sampled_softmax_k < 0:
+        raise ValueError("head.sampled_softmax_k must be >= 0 (0 = full CE)")
+    if m.head.sampled_softmax_k >= m.vocab_size:
+        raise ValueError("head.sampled_softmax_k must be < vocab_size")
     if m.head.logit_scale_init < 0:
         raise ValueError("head.logit_scale_init must be >= 0 (0 means 1/sqrt(H))")
     if m.head.z_loss_weight < 0 or t.z_loss_weight < 0 or t.moe_z_loss_weight < 0:
@@ -1001,6 +1051,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("train.precision must be 'bf16' or 'fp32'")
     if t.max_grad_norm <= 0:
         raise ValueError("train.max_grad_norm must be positive")
+    if not 0.0 < t.ce_keep_rate <= 1.0:
+        raise ValueError("train.ce_keep_rate must be in (0, 1]")
+    if t.ce_keep_mode not in {"bernoulli", "stride"}:
+        raise ValueError("train.ce_keep_mode must be 'bernoulli' or 'stride'")
     if not 0.0 < t.muon.wd_cap <= 8.0:
         raise ValueError("muon.wd_cap must be in (0, 8]")
     if len(t.muon.ns_coeffs) != 3:
@@ -1017,6 +1071,12 @@ def validate_config(cfg: Config) -> None:
                 "multimodal bridge head_dim (hidden_size // bridge_heads) must be "
                 "divisible by 4 for 2D-RoPE (row and column bands each need even width)"
             )
+    if not 0.0 <= mm.modality_dropout <= 1.0:
+        raise ValueError("multimodal.modality_dropout must be in [0, 1]")
+    if not 0.0 < mm.waterfill_min_rate <= 1.0:
+        raise ValueError("multimodal.waterfill_min_rate must be in (0, 1]")
+    if mm.grounding_weight < 0:
+        raise ValueError("multimodal.grounding_weight must be non-negative")
 
     xm = m.xm
     if xm.enabled:
@@ -1044,8 +1104,12 @@ def describe(cfg: Config) -> str:
     windows = layer_windows(m)
     n_full = sum(1 for w in windows if w == 0)
     bits = math.log2(3) if m.ternary.enabled else 16.0
+    loop = max(1, int(m.loop_depth))
+    eff_l = m.num_layers * loop
     lines = [
-        f"H={m.hidden_size} L={m.num_layers} heads={m.attention.num_query_heads}q/"
+        f"H={m.hidden_size} L={m.num_layers}"
+        + (f"x{loop}={eff_l}" if loop > 1 else "")
+        + f" heads={m.attention.num_query_heads}q/"
         f"{m.attention.num_kv_heads}kv x {m.attention.head_dim} ffn={ffn_width(m)}",
         f"vocab={m.vocab_size} tied_head={m.embedding.tie_lm_head} conv_k={m.embedding.conv_kernel}",
         f"params total={counts['total'] / 1e6:.1f}M body={counts['body'] / 1e6:.1f}M "
@@ -1054,6 +1118,11 @@ def describe(cfg: Config) -> str:
         f"attention: {n_full} full / {m.num_layers - n_full} windowed(W={m.sliding.window})",
         f"moe: {'on ' + str(m.moe.num_experts) + 'e top' + str(m.moe.top_k) if m.moe.enabled else 'off'}"
         f" on layers {[i for i, f in enumerate(moe_layers(m)) if f]}",
+        f"spectral: {'on every ' + str(m.spectral.every) if m.spectral.enabled else 'off'}"
+        f" | mm: {'on' if m.multimodal.enabled else 'off'}"
+        f" | ternary_cache: {cfg.train.ternary_step_cache}"
+        f" | ce_keep: {cfg.train.ce_keep_rate:g}/{cfg.train.ce_keep_mode}"
+        f" | sampled_k: {m.head.sampled_softmax_k or 'full'}",
         f"weight rate: {bits:.3f} bits/weight -> body {counts['body'] * bits / 8 / 1e9:.3f} GB packed",
     ]
     return "\n".join(lines)

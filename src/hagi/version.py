@@ -1,24 +1,19 @@
 """Version and architecture identity — single source of truth.
 
-V33 adds two measured mechanisms to V32:
+V39 (hagi-channel-v39) — three stacked rate reductions on the ternary channel:
 
-1. **Recurrent spectral (Fourier) branch.** A bank of damped oscillators —
-   ``S_t = A*S_{t-1} + x_t`` with ``A = r*exp(-i*omega)`` — evaluated with an
-   exact parallel scan (O(T*K), 0.7ms vs 360ms for ``torch.fft`` on ROCm). It
-   *complements* attention (content-addressed retrieval) with frequency-local
-   structure, and carries a grokking ramp that releases high frequencies over
-   the first ``ramp_steps`` steps. At init it measures ce=7.48 vs the unigram
-   entropy 7.63 — a free -0.15 nats/token.
-2. **Body-scaled learning rate** (``adam.body_lr_scale=8``). The codebook
-   gradient norm is 20-30x the body's (gb~0.007 vs gr~0.22); a separate,
-   higher LR for the 2D channel weights rebalances the two without Muon's
-   Newton-Schulz cost.
+1. **L=4 body** — less activation traffic; full_every=2 keeps two global relays.
+2. **Punctured CE p=0.5** — erasure on supervision (V38); body still full T.
+3. **Sampled softmax K=64** — local partition over {target}∪K negatives
+   (Jean et al.); train-only; generation uses full logits.
 
-The channel model is unchanged from V32: full-rank source codebook with a
-causal pulse-shaping filter, ternary (BitNet b1.58) transformer channel with
-QK-normalized GQA, bias-controlled MoE, recurrent spectral branch, tied
-receiver with unigram prior and chunked cross-entropy.
+Measured ~41k body tok/s on 8060S (~2.3 s/step) vs V38 ~24k / V35 ~16k.
+
+Channel SSOT: ternary weight rate is the only channel noise. CE (full or
+sampled) is the coding cost; puncture only thins its measurement.
+
+Checkpoint format 10. Train from scratch.
 """
 
-__version__ = "3.3.2"
-__architecture__ = "hagi-channel-v33"
+__version__ = "3.9.0"
+__architecture__ = "hagi-channel-v39"

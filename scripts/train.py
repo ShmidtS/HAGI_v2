@@ -127,7 +127,7 @@ def dry_run(model, cfg, device: torch.device) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train the HAGI channel language model")
-    parser.add_argument("--config", default="configs/v31_1b.yaml")
+    parser.add_argument("--config", default="configs/v39_1b.yaml")
     parser.add_argument("--data-dir", default=None, help="overrides train.data.data_dir")
     parser.add_argument("--steps", type=int, default=None, help="overrides train.max_steps")
     parser.add_argument("--checkpoint-dir", default=None)

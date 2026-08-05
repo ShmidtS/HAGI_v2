@@ -63,6 +63,31 @@ class TestTernarize:
         assert torch.equal(pattern_a, pattern_b)
 
 
+class TestStepCache:
+    def test_cached_forward_matches_live_quantize(self):
+        layer = BitLinear(16, 8)
+        x = torch.randn(4, 16)
+        with torch.no_grad():
+            live = layer(x)
+        layer.cache_quantized()
+        with torch.no_grad():
+            cached = layer(x)
+        assert torch.allclose(live, cached, atol=1e-5, rtol=1e-5)
+        layer.clear_quantized()
+        assert layer._step_q is None
+
+    def test_cached_path_still_trains_master(self):
+        layer = BitLinear(8, 4)
+        x = torch.randn(3, 8)
+        layer.cache_quantized()
+        layer(x).sum().backward()
+        assert layer.weight.grad is not None
+        assert_finite(layer.weight.grad, "weight grad")
+        # STE identity: non-zero grad even on saturated rows after cache.
+        assert float(layer.weight.grad.abs().sum()) > 0
+        layer.clear_quantized()
+
+
 class TestSTE:
     def test_gradient_is_identity(self):
         layer = BitLinear(8, 4)

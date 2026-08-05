@@ -192,6 +192,22 @@ class TestStructure:
         deep_std = float(deep.blocks[0].attn.out_proj.weight.detach().std())
         assert deep_std < shallow_std
 
+    def test_loop_depth_scales_residual_like_deeper_stack(self):
+        plain = HAGI(tiny_config(**{"model.num_layers": 2, "model.loop_depth": 1}))
+        looped = HAGI(tiny_config(**{"model.num_layers": 2, "model.loop_depth": 4}))
+        plain_std = float(plain.blocks[0].attn.out_proj.weight.detach().std())
+        loop_std = float(looped.blocks[0].attn.out_proj.weight.detach().std())
+        assert loop_std < plain_std
+        assert looped._loop_depth == 4
+
+    def test_loop_depth_forward_shape(self):
+        cfg = tiny_config(**{"model.loop_depth": 2})
+        model = HAGI(cfg)
+        ids, targets = batch()
+        out = model(ids, targets)
+        assert out.hidden.shape == (2, 16, cfg.model.hidden_size)
+        assert_finite(out.loss, "looped loss")
+
     def test_head_is_tied_to_the_codebook(self):
         model = HAGI(tiny_config())
         assert model.head.weight is model.encoder.weight
