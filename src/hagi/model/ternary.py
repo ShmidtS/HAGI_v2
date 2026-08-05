@@ -73,6 +73,15 @@ class BitLinear(nn.Module):
     floating point in the caller — quantizing the source codebook destroys the
     token identity code, and quantizing a 1D gain has no rate benefit.
 
+    **Step cache (OFDM coherence interval).** Within one optimizer step the
+    master ``W`` is constant across ``grad_accum`` microbatches. Recomputing the
+    ternary map on every microbatch is pure waste: the quantizer is a slow
+    function of ``W`` (sign flips ~0.05%/step). :meth:`cache_quantized` freezes
+    ``Q*s`` for the step; the forward then uses the classic STE rewrite
+    ``W + (Q - W).detach()`` so the matmul sees ``Q`` while the gradient still
+    flows to the master as the identity. Cleared by :meth:`clear_quantized`
+    after the optimizer step.
+
     Args:
         in_features: input width.
         out_features: output width.
@@ -95,8 +104,24 @@ class BitLinear(nn.Module):
             self.bias: nn.Parameter | None = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter("bias", None)
+        # Per-step quantized weight (set by the trainer around grad accumulation).
+        self._step_q: torch.Tensor | None = None
+
+    def cache_quantized(self) -> None:
+        """Freeze the ternary map for the current optimizer step."""
+        with torch.no_grad():
+            self._step_q, _ = ternarize(self.weight, self.eps)
+
+    def clear_quantized(self) -> None:
+        """Drop the step cache (call after the optimizer step)."""
+        self._step_q = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._step_q is not None:
+            # STE with a precomputed Q: forward equals Q, backward dL/dW = dL/dQ.
+            q = self._step_q.to(dtype=self.weight.dtype, device=self.weight.device)
+            eff = self.weight + (q - self.weight).detach()
+            return F.linear(x, eff.to(x.dtype), self.bias)
         if not torch.is_grad_enabled():
             eff, _ = ternarize(self.weight, self.eps)
             return F.linear(x, eff.to(x.dtype), self.bias)
@@ -107,3 +132,17 @@ class BitLinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, quant=b1.58"
         )
+
+
+def cache_ternary_weights(model: nn.Module) -> None:
+    """Freeze every BitLinear's ternary map for one optimizer step."""
+    for module in model.modules():
+        if isinstance(module, BitLinear):
+            module.cache_quantized()
+
+
+def clear_ternary_weights(model: nn.Module) -> None:
+    """Clear every BitLinear step cache."""
+    for module in model.modules():
+        if isinstance(module, BitLinear):
+            module.clear_quantized()

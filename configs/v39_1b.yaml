@@ -1,0 +1,170 @@
+# HAGI V39 — sampled-softmax receiver + thinner channel (info-theoretic stack).
+#
+# Stack of three rate reductions on the same channel model:
+#
+#   1. BODY DEPTH L=4 (finite-state cascade length). Activation traffic ∝ L.
+#      Measured body-only f+b: L6=882ms → L4=591ms (−33%). full_every=2 keeps
+#      two global parity relays in four layers (layers 0,2).
+#   2. PUNCTURED CE p=0.5 (erasure on supervision; V38). Body still uses every
+#      symbol; receiver scores ~half the positions. Unbiased under Bernoulli.
+#   3. SAMPLED SOFTMAX K=64 (Jean et al.). Local partition over {target}∪K
+#      uniform negatives replaces O(N·V) full CE with O(N·K·H). Head cost at
+#      N=half drops ~349ms → ~123ms. K≥256 loses to full CE on this ROCm part
+#      (gather traffic dominates).
+#
+# Measured end-to-end (8060S, B=30×3 T=1024 bf16):
+#   V35 L8 full CE          ~5770 ms ·  16k body tok/s
+#   V37 L6 full CE          ~4840 ms ·  19k
+#   V38 L6 p=0.5 full CE    ~3800 ms ·  24k
+#   V39 L4 p=0.5 K=64       ~2260 ms ·  41k   ← ship
+#   L4 p=0.25 K=64          ~1960 ms ·  47k   (higher variance estimator)
+#   L3 p=0.5 K=64           ~1760 ms ·  52k   (capacity thin)
+#
+# Ship keeps L=4 capacity + p=0.5 unbiased puncture + K=64 local decoder.
+# Generation still uses full logits (sampled path is train-only).
+#
+# Also retained: correct local_window, shared RoPE, ternary step cache,
+# cross_doc fused path, MoE/spectral/XM off.
+#
+# Train from scratch. Checkpoint format 10.
+
+model:
+  vocab_size: 32768
+  hidden_size: 1152
+  num_layers: 4
+  loop_depth: 1
+  norm_eps: 1.0e-5
+  init_orthogonal: true
+
+  attention:
+    num_query_heads: 18
+    num_kv_heads: 3
+    head_dim: 64
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    qk_norm: true
+
+  sliding:
+    window: 256
+    full_every: 2
+
+  embedding:
+    tie_lm_head: true
+    conv_kernel: 4
+    init_std: 0.02
+
+  ffn:
+    expansion: 1.33
+    multiple_of: 64
+
+  moe:
+    enabled: false
+    num_experts: 8
+    top_k: 1
+    n_shared: 0
+    moe_every: 2
+    bias_update_rate: 0.001
+    router_init_std: 0.0
+    z_loss_weight: 1.0e-3
+
+  spectral:
+    enabled: false
+    num_modes: 32
+    every: 4
+    block_len: 64
+    freq_base: 0.02
+    freq_max: 3.0
+    damp_min: 0.90
+    damp_max: 0.999
+    ramp_steps: 20000
+    out_channels: 0
+    use_2d: true
+
+  ternary:
+    enabled: true
+    eps: 1.0e-5
+
+  head:
+    unigram_prior: true
+    unigram_path: data/unigram.compact.npy
+    unigram_smoothing: 1.0
+    z_loss_weight: 1.0e-4
+    ce_chunk_rows: 16384
+    ce_save_logits: true
+    # Local partition size: target + 64 uniform negatives.
+    sampled_softmax_k: 64
+
+  multimodal:
+    enabled: false
+    n_bridge_queries: 32
+    bridge_layers: 2
+    bridge_heads: 8
+    modality_dropout: 0.3
+    waterfill_enabled: true
+    waterfill_min_rate: 0.25
+    grounding_weight: 0.1
+    infonce_temperature: 0.07
+    variance_gamma: 1.0
+
+  xm:
+    enabled: false
+    num_modes: 3
+    entropy_gate: 0.9
+    explore_fraction: 0.2
+    mode_std: 0.1
+    min_modes: 1
+
+train:
+  max_steps: 298600
+  batch_size: 30
+  grad_accum_steps: 3
+  grad_checkpointing: false
+  use_muon: false
+  ternary_step_cache: true
+  ce_keep_rate: 0.5
+  ce_keep_mode: bernoulli
+  learning_rate: 3.0e-4
+  max_grad_norm: 1.0
+  precision: bf16
+  compile_model: false
+  adam:
+    body_lr_scale: 8.0
+    beta1: 0.9
+    beta2: 0.95
+    weight_decay: 0.1
+  schedule:
+    warmup_steps: 2000
+    decay_fraction: 0.2
+    min_lr_ratio: 0.02
+    inverse_sqrt_stable: false
+    inverse_sqrt_tau: 0
+  data:
+    data_dir: data
+    seq_len: 1024
+    eos_token_id: 1
+    pad_token_id: 0
+    num_workers: 2
+    seed: 1234
+    cross_doc_attention: true
+
+  logging:
+    log_interval: 1
+    diag_interval: 100
+    diag_chunk_rows: 512
+
+  z_loss_weight: 1.0e-4
+  moe_z_loss_weight: 1.0e-3
+
+  checkpoint_dir: checkpoints_v39_1b
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 3
+  tokenizer: google/gemma-4-E2B-it
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  min_new_tokens: 1
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  repetition_window: 128

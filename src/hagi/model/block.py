@@ -54,9 +54,12 @@ class Block(nn.Module):
         spectral_cfg=None,
         use_spectral: bool = False,
         init_orthogonal: bool = False,
+        rope=None,
     ) -> None:
         super().__init__()
-        self.attn = Attention(hidden_size, attn_cfg, norm_eps, use_ternary, residual_scale, init_orthogonal)
+        self.attn = Attention(
+            hidden_size, attn_cfg, norm_eps, use_ternary, residual_scale, init_orthogonal, rope=rope
+        )
         self.mixer = mixer
         self.spectral = None
         if use_spectral and spectral_cfg is not None:

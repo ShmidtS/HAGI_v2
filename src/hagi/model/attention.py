@@ -62,6 +62,63 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x[:, :, None, :, :].expand(b, n_kv, n_rep, t, hd).reshape(b, n_kv * n_rep, t, hd)
 
 
+def local_window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window: int,
+) -> torch.Tensor:
+    """Causal sliding-window SDPA with correct support for every query position.
+
+    The previous train-time optimization truncated K/V to the *last* ``window``
+    keys of the sequence. That is only valid for the final ``window`` queries;
+    earlier positions received an all-``-inf`` score row and a zero attention
+    output (measured: early-token branch norm 0.0). That is both a silent
+    correctness bug and wasted capacity on a bandwidth-bound part.
+
+    This path processes queries in chunks of size ``window``. Query block
+    ``[i0, i1)`` attends only to keys ``[max(0, i0-window+1), i1)`` — exact
+    window semantics, O(T·W) work, no full ``T×T`` materialization. On the
+    Radeon 8060S ROCm math SDPA backend this measured ~7.5 ms vs ~12 ms for a
+    dense window mask at ``T=1024, W=256``.
+
+    Args:
+        q, k, v: ``[B, heads, T, head_dim]`` (GQA already expanded on k/v).
+        window: positive window width W.
+
+    Returns:
+        Attention output, same shape as ``q``.
+    """
+    if window <= 0:
+        raise ValueError(f"local_window_attention requires window > 0, got {window}")
+    t = q.shape[-2]
+    if t <= window:
+        # Every query's full causal past fits inside the window.
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    outs: list[torch.Tensor] = []
+    step = window
+    for i0 in range(0, t, step):
+        i1 = min(t, i0 + step)
+        k0 = max(0, i0 - window + 1)
+        qi = q[:, :, i0:i1]
+        ki = k[:, :, k0:i1]
+        vi = v[:, :, k0:i1]
+        if k0 == 0 and i0 == 0:
+            # Prefill of the first block: standard lower-triangular causal.
+            outs.append(F.scaled_dot_product_attention(qi, ki, vi, is_causal=True))
+            continue
+        tq = i1 - i0
+        tk = i1 - k0
+        q_abs = torch.arange(i0, i1, device=q.device).view(1, 1, tq, 1)
+        k_abs = torch.arange(k0, i1, device=q.device).view(1, 1, 1, tk)
+        allowed = (k_abs <= q_abs) & (k_abs > q_abs - window)
+        band = qi.new_zeros(1, 1, tq, tk)
+        band = band.masked_fill(~allowed, float("-inf"))
+        outs.append(F.scaled_dot_product_attention(qi, ki, vi, attn_mask=band))
+    return torch.cat(outs, dim=2)
+
+
 class Attention(nn.Module):
     """Pre-norm GQA with QK-norm, RoPE, optional window and KV-cache.
 
@@ -81,6 +138,7 @@ class Attention(nn.Module):
         use_ternary: bool = True,
         residual_scale: float = 1.0,
         init_orthogonal: bool = False,
+        rope: RotaryEmbedding | None = None,
     ) -> None:
         super().__init__()
         if hidden_size != cfg.num_heads * cfg.head_dim:
@@ -121,7 +179,8 @@ class Attention(nn.Module):
 
         self.q_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
         self.k_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
-        self.rope = RotaryEmbedding(cfg.head_dim, rope_theta=cfg.rope_theta)
+        # Shared RoPE across layers (same head_dim/theta) — one table, one cache.
+        self.rope = rope if rope is not None else RotaryEmbedding(cfg.head_dim, rope_theta=cfg.rope_theta)
         self.branch_scale = BranchScale(residual_scale)
         self._kv_cache: KVCache | None = None
 
@@ -181,35 +240,21 @@ class Attention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        # Windowed layer: physically truncate K/V to the last ``window`` keys
-        # (and the mask with it). Training-only. This is a pure O(T*W)
-        # attention instead of the O(T^2) the MATH SDPA backend would otherwise
-        # materialize; on this ROCm build (no flash/efficient kernel) that
-        # measured 2.4x faster at T=1024. In eval the full (untruncated) path
-        # must stay bit-exact against incremental decoding, which is asserted
-        # by tests — a truncated prefill and a small cache disagree on the
-        # earliest positions, so truncation is confined to training where the
-        # only requirement is equivalence up to the window semantics.
         window = self.sliding_window
-        if self.training and window > 0 and k.shape[-2] > window:
-            total_k = k.shape[-2]
-            k = k[:, :, -window:]
-            v = v[:, :, -window:]
-            if mask is not None:
-                mask = mask[..., -window:]
-            else:
-                # absolute positions of the truncated keys
-                k_abs = torch.arange(total_k - window, total_k, device=k.device).view(1, 1, 1, window)
-                q_abs = torch.arange(total_k - t, total_k, device=k.device).view(1, t, 1)
-                allowed = k_abs <= q_abs
-                m = torch.zeros((1, 1, t, window), device=k.device, dtype=q.dtype)
-                mask = m.masked_fill(~allowed, float("-inf"))
-
         if mask is not None:
+            # Caller-built mask already encodes window / docs / prefix. Never
+            # truncate K/V to the sequence tail — that zeros early queries.
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        elif (
+            self.training
+            and window > 0
+            and self._kv_cache is None
+            and k.shape[-2] == t
+        ):
+            # Pure window, no doc/prefix constraints: O(T·W) local SDPA.
+            out = local_window_attention(q, k, v, window)
         elif t == 1:
-            # Single-token decode: one query against the whole cached prefix, all
-            # of which is in the past. Nothing to mask.
+            # Single-token decode: one query against the whole cached prefix.
             out = F.scaled_dot_product_attention(q, k, v)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)

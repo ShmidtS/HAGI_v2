@@ -31,9 +31,60 @@ from torch import nn
 
 from hagi.config import Config
 from hagi.model.norms import HeadNorm, RMSNorm
+from hagi.model.ternary import cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 
 logger = logging.getLogger(__name__)
+
+
+def puncture_loss_mask(
+    shape: tuple[int, ...],
+    *,
+    rate: float,
+    mode: str,
+    step: int,
+    device: torch.device,
+    base: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor | None:
+    """Build / thin a boolean loss mask — erasure channel on supervision.
+
+    Information-theoretically this is *puncturing* the coding objective: the
+    body still processes every symbol (full channel use), but the receiver only
+    scores a rate-``p`` subset. Under Bernoulli sampling the per-step CE is an
+    unbiased estimator of the full-sequence CE; stride is a deterministic lattice
+    with the same average rate and lower variance.
+
+    Combined with an existing ``base`` mask via logical AND (packing pads,
+    curriculum filters, etc. still apply).
+
+    Returns:
+        Boolean ``[B, T]`` mask, or None when ``rate >= 1`` and ``base is None``
+        (caller scores everything).
+    """
+    if rate >= 1.0 and base is None:
+        return None
+    if rate >= 1.0:
+        return base.bool() if base is not None else None
+
+    if mode == "bernoulli":
+        keep = torch.rand(shape, device=device, generator=generator) < float(rate)
+    elif mode == "stride":
+        # Keep every k-th position; phase rotates with the optimizer step so the
+        # lattice covers the sequence over a short horizon.
+        k = max(1, int(round(1.0 / float(rate))))
+        phase = int(step) % k
+        t = shape[-1]
+        idx = torch.arange(t, device=device)
+        keep_1d = ((idx % k) == phase)
+        # Broadcast to [B, T] (or whatever leading dims ``shape`` carries).
+        keep = keep_1d.expand(shape)
+    else:
+        raise ValueError(f"unknown ce_keep_mode {mode!r}")
+
+    if base is not None:
+        keep = keep & base.bool().to(device=device)
+    return keep
 
 
 def configure_runtime() -> None:
@@ -153,19 +204,69 @@ class Trainer:
         device = next(model.parameters()).device
         self.optimizer.zero_grad(set_to_none=True)
 
+        # OFDM coherence interval: the ternary map Q*s is constant across the
+        # microbatches of one optimizer step (the master W only changes on
+        # optimizer.step). Cache it once; clear after the step so the next
+        # step recomputes against the updated master.
+        use_ternary_cache = (
+            cfg.model.ternary.enabled
+            and getattr(cfg.train, "ternary_step_cache", True)
+            and len(microbatches) > 1
+        )
+        if use_ternary_cache:
+            cache_ternary_weights(model)
+
+        # Puncture the supervision stream (erasure channel on CE). Applied on
+        # device after H2D so we do not rewrite host batches. Existing packing
+        # masks are AND-ed in.
+        keep_rate = float(getattr(cfg.train, "ce_keep_rate", 1.0))
+        keep_mode = str(getattr(cfg.train, "ce_keep_mode", "bernoulli"))
+
         # Weight each microbatch by its scored-token count so unequal microbatches
         # average correctly rather than over-weighting sparse ones.
+        prepared: list[tuple[dict, torch.Tensor | None]] = []
         token_counts: list[int] = []
         for batch in microbatches:
-            mask = batch.get("loss_mask")
-            token_counts.append(int(mask.sum()) if mask is not None else batch["targets"].numel())
+            ids = batch["input_ids"].to(device)
+            targets = batch["targets"].to(device)
+            base_mask = batch["loss_mask"].to(device) if "loss_mask" in batch else None
+            mask = puncture_loss_mask(
+                tuple(targets.shape),
+                rate=keep_rate,
+                mode=keep_mode,
+                step=self.step,
+                device=device,
+                base=base_mask,
+            )
+            count = int(mask.sum()) if mask is not None else int(targets.numel())
+            # Degenerate puncture (all dropped) — fall back to full score so the
+            # step still produces a finite gradient rather than a zero graph.
+            if count == 0:
+                mask = base_mask
+                count = int(mask.sum()) if mask is not None else int(targets.numel())
+            token_counts.append(max(count, 1))
+            prepared.append(
+                (
+                    {
+                        "input_ids": ids,
+                        "targets": targets,
+                        "doc_ids": batch["doc_ids"].to(device) if "doc_ids" in batch else None,
+                        "loss_mask": mask,
+                        "images": batch["images"].to(device) if "images" in batch else None,
+                        "spectrograms": batch["spectrograms"].to(device)
+                        if "spectrograms" in batch
+                        else None,
+                    },
+                    mask,
+                )
+            )
         total_tokens = max(sum(token_counts), 1)
 
         ce_sum = 0.0
         loss_sum = 0.0
         z_sum = 0.0
         router_z_sum = 0.0
-        for batch, count in zip(microbatches, token_counts, strict=True):
+        for (batch, _mask), count in zip(prepared, token_counts, strict=True):
             # non_blocking=True on .to() is disabled: on this ROCm build the
             # async H2D transfer raced the compute stream and produced
             # intermittent "HIP error: unspecified launch failure" in CUDAEvent
@@ -173,14 +274,12 @@ class Trainer:
             # blocking loop). The transfer is small (a few tens of MB per
             # batch); blocking costs nothing measurable.
             output = model(
-                batch["input_ids"].to(device),
-                batch["targets"].to(device),
-                doc_ids=batch["doc_ids"].to(device) if "doc_ids" in batch else None,
-                loss_mask=batch["loss_mask"].to(device) if "loss_mask" in batch else None,
-                images=batch["images"].to(device) if "images" in batch else None,
-                spectrograms=batch["spectrograms"].to(device)
-                if "spectrograms" in batch
-                else None,
+                batch["input_ids"],
+                batch["targets"],
+                doc_ids=batch["doc_ids"],
+                loss_mask=batch["loss_mask"],
+                images=batch["images"],
+                spectrograms=batch["spectrograms"],
             )
             weight = count / total_tokens
             (output.loss * weight).backward()
@@ -211,6 +310,8 @@ class Trainer:
                     rest_norm,
                 )
                 self.optimizer.zero_grad(set_to_none=True)
+                if use_ternary_cache:
+                    clear_ternary_weights(model)
                 return {
                     "step": self.step,
                     "update_applied": False,
@@ -220,6 +321,9 @@ class Trainer:
                 }
         adam_lr, muon_lr = set_learning_rate(self.optimizer, self.step, cfg)
         self.optimizer.step()
+
+        if use_ternary_cache:
+            clear_ternary_weights(model)
 
         # Controller updates go after the optimizer step, outside any
         # checkpointed region, so the forward stays pure and recomputation
@@ -244,6 +348,7 @@ class Trainer:
             "lr": adam_lr,
             "muon_lr": muon_lr,
             "tokens": total_tokens,
+            "ce_keep_rate": keep_rate,
             "update_applied": True,
         }
         if self.step % max(1, cfg.train.logging.diag_interval) == 0 and hasattr(model, "diagnostics"):
@@ -267,7 +372,16 @@ def format_metrics(metrics: dict) -> str:
     if "body_grad_norm" in metrics:
         parts.append(f"gb={metrics['body_grad_norm']:.3f}")
         parts.append(f"gr={metrics['rest_grad_norm']:.3f}")
-    for key in ("qk_gain", "residual_gain", "logit_scale", "moe/entropy_ratio", "moe/max_load", "moe/bias_span", "spectral_ramp"):
+    for key in (
+        "qk_gain",
+        "residual_gain",
+        "logit_scale",
+        "moe/entropy_ratio",
+        "moe/max_load",
+        "moe/bias_span",
+        "spectral_ramp",
+        "ce_keep_rate",
+    ):
         if key in metrics:
             parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
     return " | ".join(parts)

@@ -104,6 +104,36 @@ class TestGQA:
                 assert torch.equal(out[0, group * 3 + rep], x[0, group])
 
 
+class TestLocalWindow:
+    def test_early_tokens_nonzero_in_train(self):
+        """Regression: tail-truncate zeroed queries before T-W."""
+        cfg = AttentionConfig(num_heads=4, num_kv_heads=2, head_dim=16, sliding_window=8)
+        attn = Attention(64, cfg, use_ternary=False).train()
+        x = torch.randn(1, 32, 64)
+        out = attn(x)
+        assert_finite(out, "windowed train out")
+        early = float(out[0, :8].detach().abs().mean())
+        late = float(out[0, -8:].detach().abs().mean())
+        assert early > 0.0, "early queries still blacked out"
+        # Same order of magnitude — not a dead prefix.
+        assert early > 0.05 * late
+
+    def test_matches_dense_window_mask(self):
+        from hagi.model.attention import local_window_attention
+
+        torch.manual_seed(0)
+        b, h, t, hd, w = 1, 2, 24, 8, 6
+        q = torch.randn(b, h, t, hd)
+        k = torch.randn(b, h, t, hd)
+        v = torch.randn(b, h, t, hd)
+        dense = build_attention_mask(
+            t, t, window=w, device=q.device, dtype=q.dtype
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=dense)
+        got = local_window_attention(q, k, v, w)
+        assert torch.allclose(ref, got, atol=1e-5, rtol=1e-4)
+
+
 class TestAttention:
     def make(self, **kw) -> Attention:
         cfg = AttentionConfig(num_heads=4, num_kv_heads=2, head_dim=16, **kw)
