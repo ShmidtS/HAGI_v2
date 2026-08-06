@@ -21,8 +21,9 @@ class ModelOutput:
 
     Attributes:
         loss: total scalar objective, or None when no targets were supplied.
-        ce: cross-entropy in nats/token — the channel's actual coding cost, and
-            the only number that says whether training is working.
+        ce: training receiver cost in nats/token. With sampled softmax this is
+            a local conditional-NCE partition, not the full coding cost.
+        exact_ce: optional exact full-alphabet CE diagnostic on sampled rows.
         z_loss: mean squared log-partition of the LM head (unweighted).
         router_z_loss: same for the MoE routers, summed over MoE layers.
         grounding: cross-modal InfoNCE plus anti-collapse terms (multimodal only).
@@ -36,6 +37,7 @@ class ModelOutput:
 
     loss: torch.Tensor | None = None
     ce: torch.Tensor | None = None
+    exact_ce: torch.Tensor | None = None
     z_loss: torch.Tensor | None = None
     router_z_loss: torch.Tensor | None = None
     grounding: torch.Tensor | None = None

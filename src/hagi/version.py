@@ -1,19 +1,29 @@
-"""Version and architecture identity — single source of truth.
+"""Version and architecture identity -- single source of truth.
 
-V39 (hagi-channel-v39) — three stacked rate reductions on the ternary channel:
+V41 (hagi-channel-v41) keeps V40's source-matched communication contract and
+improves the receiver's finite-sample channel:
 
-1. **L=4 body** — less activation traffic; full_every=2 keeps two global relays.
-2. **Punctured CE p=0.5** — erasure on supervision (V38); body still full T.
-3. **Sampled softmax K=64** — local partition over {target}∪K negatives
-   (Jean et al.); train-only; generation uses full logits.
+1. Source coder: tied codebook, causal pulse shaping, fixed unigram prior.
+2. Channel: four dense ternary blocks with two local W=256 correlators and two
+   full-attention relays.
+3. Receiver: full-rank tied decoder. A shared K=64 bank is interleaved 50/50:
+   deterministic in-batch target symbols provide hard, diverse interferers;
+   source-prior draws preserve matched conditional NCE. The bank stays one GEMM.
+4. Truth channel: independent-RNG exact full-vocabulary CE calibration. Proposal
+   RNG can no longer change the measured rows in architecture A/B tests.
+5. Full supervision and fixed-rate multimodal input remain unchanged. Text is
+   self-sufficient; water filling stays off.
 
-Measured ~41k body tok/s on 8060S (~2.3 s/step) vs V38 ~24k / V35 ~16k.
+History reuse: early HAGI interleavers tried to transform hidden channels. V41
+uses interleaving where probability theory supports it: variance reduction and
+coverage in the sampled receiver, without another main-path module.
 
-Channel SSOT: ternary weight rate is the only channel noise. CE (full or
-sampled) is the coding cost; puncture only thins its measurement.
+Controlled 100-step packed-corpus A/B on Radeon 8060S (seed 999, exact 8192-row
+CE every 10 steps): 50% in-batch reached exact CE 7.1775 at step 90 versus
+7.5412 for prior-only. Median wall-time was 1848 vs 1843 ms (+0.28%).
 
-Checkpoint format 10. Train from scratch.
+Checkpoint format 12. Train from scratch.
 """
 
-__version__ = "3.9.0"
-__architecture__ = "hagi-channel-v39"
+__version__ = "4.1.0"
+__architecture__ = "hagi-channel-v41"

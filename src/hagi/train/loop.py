@@ -266,7 +266,11 @@ class Trainer:
         loss_sum = 0.0
         z_sum = 0.0
         router_z_sum = 0.0
-        for (batch, _mask), count in zip(prepared, token_counts, strict=True):
+        exact_ce_value: float | None = None
+        exact_interval = int(cfg.train.logging.exact_ce_interval)
+        for microbatch_index, ((batch, _mask), count) in enumerate(
+            zip(prepared, token_counts, strict=True)
+        ):
             # non_blocking=True on .to() is disabled: on this ROCm build the
             # async H2D transfer raced the compute stream and produced
             # intermittent "HIP error: unspecified launch failure" in CUDAEvent
@@ -281,6 +285,23 @@ class Trainer:
                 images=batch["images"],
                 spectrograms=batch["spectrograms"],
             )
+            if microbatch_index == 0 and exact_interval > 0 and self.step % exact_interval == 0:
+                flat_hidden = output.hidden.detach().reshape(-1, output.hidden.shape[-1])
+                flat_targets = batch["targets"].reshape(-1)
+                rows = min(int(cfg.train.logging.exact_ce_rows), flat_targets.numel())
+                # Use an independent RNG stream so receiver proposal sampling
+                # cannot change the calibration rows. This keeps the estimate
+                # random/unbiased while making architecture A/B reproducible.
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(cfg.train.logging.exact_ce_seed) + self.step)
+                sample = torch.randperm(flat_targets.numel(), device=device, generator=generator)[:rows]
+                with torch.no_grad():
+                    exact_ce_value = float(
+                        model.head.exact_loss(
+                            flat_hidden.index_select(0, sample),
+                            flat_targets.index_select(0, sample),
+                        )
+                    )
             weight = count / total_tokens
             (output.loss * weight).backward()
 
@@ -334,6 +355,7 @@ class Trainer:
         if hasattr(model, "commit_controller_updates"):
             model.commit_controller_updates()
 
+        receiver = "conditional_nce" if cfg.model.head.sampled_softmax_k > 0 else "exact_ce"
         metrics = {
             "step": self.step,
             "loss": loss_sum,
@@ -349,8 +371,17 @@ class Trainer:
             "muon_lr": muon_lr,
             "tokens": total_tokens,
             "ce_keep_rate": keep_rate,
+            "receiver": receiver,
             "update_applied": True,
         }
+        if receiver == "conditional_nce":
+            metrics["nce"] = ce_sum
+            metrics["nce_bits"] = ce_sum / math.log(2.0)
+        if exact_ce_value is not None:
+            metrics["exact_ce"] = exact_ce_value
+            metrics["exact_bpt"] = exact_ce_value / math.log(2.0)
+            metrics["exact_ppl"] = math.exp(min(exact_ce_value, 20.0))
+            metrics["kl"] = max(exact_ce_value - ce_sum, 0.0)
         if self.step % max(1, cfg.train.logging.diag_interval) == 0 and hasattr(model, "diagnostics"):
             metrics.update(model.diagnostics())
         self.step += 1
@@ -358,20 +389,20 @@ class Trainer:
 
 
 def format_metrics(metrics: dict) -> str:
-    """One-line log record. ``ce`` first: it is the only number that matters."""
+    """One-line record naming local NCE separately from exact coding cost."""
     if not metrics.get("update_applied", True):
-        return f"step {metrics['step']} | SKIPPED (grad_norm={metrics['grad_norm']})"
+        return f"step {metrics['step']} | skipped"
+    receiver = metrics.get("receiver", "exact_ce")
+    objective_name = "nce" if receiver == "conditional_nce" else "ce"
+    bits_name = "nce_bits" if receiver == "conditional_nce" else "bpt"
     parts = [
         f"step {metrics['step']}",
-        f"ce={metrics['ce']:.4f}",
-        f"bpt={metrics['bpt']:.3f}",
-        f"ppl={metrics['ppl']:.1f}",
-        f"grad={metrics['grad_norm']:.3f}",
-        f"lr={metrics['lr']:.2e}",
+        f"{objective_name}={metrics['ce']:.4f}",
+        f"{bits_name}={metrics['bpt']:.3f}",
     ]
-    if "body_grad_norm" in metrics:
-        parts.append(f"gb={metrics['body_grad_norm']:.3f}")
-        parts.append(f"gr={metrics['rest_grad_norm']:.3f}")
+    parts.append(f"ppl={metrics['ppl']:.1f}")
+    if "exact_ce" in metrics:
+        parts.append(f"exact_ce={metrics['exact_ce']:.4f}")
     for key in (
         "qk_gain",
         "residual_gain",
@@ -380,10 +411,10 @@ def format_metrics(metrics: dict) -> str:
         "moe/max_load",
         "moe/bias_span",
         "spectral_ramp",
-        "ce_keep_rate",
     ):
         if key in metrics:
             parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+    parts.append(f"kl={metrics.get('kl', 0.0):.4f}")
     return " | ".join(parts)
 
 

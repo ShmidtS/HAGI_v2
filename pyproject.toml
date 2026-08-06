@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hagi"
-version = "1.0.0"
+version = "4.1.0"
 description = "HAGI — ternary RD-channel causal language model (BitNet b1.58)"
 requires-python = ">=3.12"
 dependencies = ["numpy", "torch>=2.0", "pyyaml", "gigatoken"]

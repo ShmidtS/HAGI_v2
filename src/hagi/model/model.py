@@ -1,17 +1,13 @@
-"""HAGI V39 — sampled-softmax receiver + thinner ternary channel.
+"""HAGI V40 -- source-matched conditional ternary channel.
 
-    tokens (+ optional image/audio)
-      -> source coder        (codebook + causal pulse-shaping filter)
-      -> [multimodal prefix] (fixed-rate bridge; dropout + water-fill)
-      -> channel             (L ternary blocks × loop_depth:
-                              QK-norm GQA + correct local window + SwiGLU)
-      -> output norm
-      -> receiver            (tied head + unigram prior +
-                              punctured CE and/or sampled softmax)
+    tokens (+ optional fixed-rate image/audio prefix)
+      -> source coder       (codebook + causal pulse-shaping filter)
+      -> ternary channel    (L=4, local/global QK-normalized GQA + SwiGLU)
+      -> conditional head  (shared-bank NCE, q = unigram source prior)
+      -> exact receiver    (full alphabet for generation and calibration)
 
-One path. Objective: CE (+ z_loss) on a rate-reduced supervision stream.
-V39 stacks L↓, puncture p, and sampled-K local partition for bandwidth-bound
-parts without changing the ternary channel noise model.
+The training path scores every text symbol. Conditional NCE provides the fast
+gradient signal; periodic exact CE is the coding-cost SSOT.
 """
 
 from __future__ import annotations
@@ -85,6 +81,7 @@ class HAGI(nn.Module):
                 rope_theta=m.attention.rope_theta,
                 qk_norm=m.attention.qk_norm,
                 sliding_window=windows[layer],
+                history_stride=m.sliding.history_stride,
             )
             mixer = build_mixer(
                 h, intermediate, m.moe, is_moe[layer], m.norm_eps, use_ternary, residual_scale, init_ortho
@@ -154,6 +151,10 @@ class HAGI(nn.Module):
         forward must select the same experts as the original.
         """
         m = self.cfg.model
+        gain_max = float(getattr(m.head, "logit_scale_max", 0.0))
+        if gain_max > 0:
+            with torch.no_grad():
+                self.head.logit_scale.clamp_(max=gain_max)
         ramp = m.spectral.ramp_steps if m.spectral.enabled else 0
         for block in self.blocks:
             if block.is_moe:

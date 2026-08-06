@@ -1,32 +1,22 @@
-# HAGI V39 — sampled-softmax receiver + thinner channel (info-theoretic stack).
+# HAGI V41 — in-batch interleaved conditional receiver.
 #
 # Stack of three rate reductions on the same channel model:
 #
 #   1. BODY DEPTH L=4 (finite-state cascade length). Activation traffic ∝ L.
 #      Measured body-only f+b: L6=882ms → L4=591ms (−33%). full_every=2 keeps
 #      two global parity relays in four layers (layers 0,2).
-#   2. PUNCTURED CE p=0.5 (erasure on supervision; V38). Body still uses every
-#      symbol; receiver scores ~half the positions. Unbiased under Bernoulli.
-#   3. SAMPLED SOFTMAX K=64 (Jean et al.). Local partition over {target}∪K
-#      uniform negatives replaces O(N·V) full CE with O(N·K·H). Head cost at
-#      N=half drops ~349ms → ~123ms. K≥256 loses to full CE on this ROCm part
-#      (gather traffic dominates).
+#   2. FULL SUPERVISION p=1.0. The shared receiver makes puncturing save <1%
+#      wall-time (1807ms at p=.5 vs 1819ms at p=1), so V40 scores every symbol.
+#   3. INTERLEAVED CONDITIONAL NCE K=64. Half the shared bank comes from
+#      deterministic in-batch targets (hard source interferers), half from the
+#      unigram prior. This improves exact CE for ~0.3% wall-time.
 #
-# Measured end-to-end (8060S, B=30×3 T=1024 bf16):
-#   V35 L8 full CE          ~5770 ms ·  16k body tok/s
-#   V37 L6 full CE          ~4840 ms ·  19k
-#   V38 L6 p=0.5 full CE    ~3800 ms ·  24k
-#   V39 L4 p=0.5 K=64       ~2260 ms ·  41k   ← ship
-#   L4 p=0.25 K=64          ~1960 ms ·  47k   (higher variance estimator)
-#   L3 p=0.5 K=64           ~1760 ms ·  52k   (capacity thin)
-#
-# Ship keeps L=4 capacity + p=0.5 unbiased puncture + K=64 local decoder.
-# Generation still uses full logits (sampled path is train-only).
-#
-# Also retained: correct local_window, shared RoPE, ternary step cache,
-# cross_doc fused path, MoE/spectral/XM off.
-#
-# Train from scratch. Checkpoint format 10.
+# V40 measured end-to-end (8060S, B=30×3 T=1024 bf16):
+#   shared NCE p=0.5       1807 ms · 51.0k body tok/s
+#   shared NCE p=1.0       1819 ms · 50.7k body tok/s  <- ship
+#   exact CE p=1.0         4282 ms · 21.5k body tok/s
+# Full supervision costs 0.7% wall-time and halves estimator variance from
+# puncturing. exact_ce periodically measures the true coding cost.
 
 model:
   vocab_size: 32768
@@ -47,6 +37,7 @@ model:
   sliding:
     window: 256
     full_every: 2
+    history_stride: 4
 
   embedding:
     tie_lm_head: true
@@ -91,8 +82,13 @@ model:
     z_loss_weight: 1.0e-4
     ce_chunk_rows: 16384
     ce_save_logits: true
-    # Local partition size: target + 64 uniform negatives.
+    # Shared local partition: target + 64 source-prior negatives.
     sampled_softmax_k: 64
+    # Match source statistics so frequent interferers are represented.
+    sampled_proposal: prior
+    sampled_in_batch_fraction: 0.5
+    # Local partitions are easier than full-vocabulary decoding; bound gain.
+    logit_scale_max: 1.0
 
   multimodal:
     enabled: false
@@ -100,7 +96,7 @@ model:
     bridge_layers: 2
     bridge_heads: 8
     modality_dropout: 0.3
-    waterfill_enabled: true
+    waterfill_enabled: false
     waterfill_min_rate: 0.25
     grounding_weight: 0.1
     infonce_temperature: 0.07
@@ -121,7 +117,7 @@ train:
   grad_checkpointing: false
   use_muon: false
   ternary_step_cache: true
-  ce_keep_rate: 0.5
+  ce_keep_rate: 1.0
   ce_keep_mode: bernoulli
   learning_rate: 3.0e-4
   max_grad_norm: 1.0
@@ -151,11 +147,13 @@ train:
     log_interval: 1
     diag_interval: 100
     diag_chunk_rows: 512
+    exact_ce_interval: 100
+    exact_ce_rows: 512
 
   z_loss_weight: 1.0e-4
   moe_z_loss_weight: 1.0e-3
 
-  checkpoint_dir: checkpoints_v39_1b
+  checkpoint_dir: checkpoints_v41_1b
   checkpoint_interval: 1000
   checkpoint_keep_last: 3
   tokenizer: google/gemma-4-E2B-it

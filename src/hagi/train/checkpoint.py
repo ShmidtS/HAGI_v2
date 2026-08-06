@@ -5,9 +5,10 @@ field is validated before the model is touched, because a partially-applied load
 produces a model that runs, trains, and is silently wrong — the most expensive
 failure mode available.
 
-Format 8 (V31). Deliberately incompatible with 7: the V31 module graph shares no
-parameter names with V28's, so a permissive loader would either fail deep inside
-``load_state_dict`` or, worse, succeed on the subset that happens to match.
+Format 12 (V41). Deliberately incompatible with earlier receiver semantics:
+the interleaved conditional bank changes the training contract even though most
+parameter shapes remain compatible. A permissive load would silently resume the
+wrong objective.
 """
 
 from __future__ import annotations

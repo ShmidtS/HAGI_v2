@@ -1,7 +1,9 @@
-"""HAGI V31 configuration — a communication system, stated once, in one place.
+"""HAGI V40 configuration -- source-matched conditional channel.
 
-Every architectural choice below has an information-theoretic justification, and
-every knob lives here. The naming follows the channel model:
+The current SSOT is source coder -> ternary body -> conditional NCE receiver,
+with periodic exact full-alphabet CE as the coding-cost calibration channel.
+Every architectural knob lives here; the history below records why removed
+constraints are not silently reintroduced.
 
     source symbols          tokens
     source code             tied codebook + unigram logit prior
@@ -50,8 +52,7 @@ What V31 adds:
   * WSD learning-rate schedule (horizon-free: the stable phase can be extended
     and only the cooldown depends on the total step budget).
 
-Checkpoint format 8. Incompatible with 7 by construction — V31 trains from
-scratch.
+Checkpoint format 12. V41 changes receiver sampling semantics and trains from scratch.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-CHECKPOINT_FORMAT_VERSION = 10
+CHECKPOINT_FORMAT_VERSION = 12
 
 
 @dataclass
@@ -96,6 +97,7 @@ class SlidingWindowConfig:
 
     window: int = 0
     full_every: int = 4
+    history_stride: int = 0
 
 
 @dataclass
@@ -285,11 +287,15 @@ class HeadConfig:
             starts the receiver at the prior and lets training raise the gain.
         sampled_softmax_k: number of *negative* classes drawn per scored row for
             sampled softmax (Jean et al.). 0 = full vocabulary CE (chunked).
-            K>0 replaces the O(N·V) receiver with O(N·K·H) gather+dot over
-            {target} ∪ K uniform negatives. Biased but consistent as K→V;
-            with the unigram prior already in the logits, uniform proposal is
-            enough. Measured on 8060S: K=64 at p=0.5 is ~2.8× faster than full
-            CE on the same N; K≥256 loses to full CE (gather traffic).
+            K>0 replaces the O(N·V) receiver with target dots plus a shared
+            O(N·K) negative-bank GEMM. Biased but consistent as K→V.
+        sampled_proposal: negative sampling distribution: ``uniform`` or
+            ``prior``. The latter turns the sampled receiver into conditional
+            NCE: it learns the likelihood ratio against the source prior, which
+            is added back exactly once by the full-vocabulary receiver.
+        logit_scale_max: post-step upper bound for the receiver gain. 0 disables
+            the bound. This prevents sampled partitions from driving a gain that
+            is unstable when generation returns to the full vocabulary.
     """
 
     unigram_prior: bool = False
@@ -300,6 +306,9 @@ class HeadConfig:
     ce_save_logits: bool = False
     logit_scale_init: float = 0.0
     sampled_softmax_k: int = 0
+    sampled_proposal: str = "uniform"
+    sampled_in_batch_fraction: float = 0.0
+    logit_scale_max: float = 0.0
 
 
 @dataclass
@@ -570,15 +579,18 @@ class DataConfig:
 class LoggingConfig:
     """Diagnostic cadence.
 
-    ``diag_interval`` gates the expensive fp32 posterior statistics (entropy,
-    top-2 mass, per-expert load). These are the observables that tell you
-    *which* failure is happening — attention saturation, expert collapse,
-    normalization drift — so they are cheap to keep and expensive to lack.
+    ``diag_interval`` gates model-state diagnostics. ``exact_ce_interval``
+    gates an exact full-alphabet receiver measurement on ``exact_ce_rows``
+    randomly selected positions. The latter is the coding-cost SSOT when the
+    training receiver uses a biased local partition; zero disables it.
     """
 
     log_interval: int = 10
     diag_interval: int = 100
     diag_chunk_rows: int = 512
+    exact_ce_interval: int = 0
+    exact_ce_rows: int = 512
+    exact_ce_seed: int = 1729
 
 
 @dataclass
@@ -981,6 +993,8 @@ def validate_config(cfg: Config) -> None:
 
     if m.sliding.window < 0 or m.sliding.window > a.max_seq_len:
         raise ValueError("sliding.window must be in [0, attention.max_seq_len]")
+    if m.sliding.history_stride < 0:
+        raise ValueError("sliding.history_stride must be >= 0")
     if m.sliding.window > 0 and m.sliding.full_every < 2:
         raise ValueError(
             f"sliding.window={m.sliding.window} with full_every={m.sliding.full_every} makes every "
@@ -1018,6 +1032,14 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("head.sampled_softmax_k must be >= 0 (0 = full CE)")
     if m.head.sampled_softmax_k >= m.vocab_size:
         raise ValueError("head.sampled_softmax_k must be < vocab_size")
+    if m.head.sampled_proposal not in {"uniform", "prior"}:
+        raise ValueError("head.sampled_proposal must be 'uniform' or 'prior'")
+    if m.head.sampled_proposal == "prior" and not m.head.unigram_prior:
+        raise ValueError("head.sampled_proposal='prior' requires unigram_prior")
+    if not 0.0 <= m.head.sampled_in_batch_fraction <= 1.0:
+        raise ValueError("head.sampled_in_batch_fraction must be in [0, 1]")
+    if m.head.logit_scale_max < 0:
+        raise ValueError("head.logit_scale_max must be >= 0 (0 = disabled)")
     if m.head.logit_scale_init < 0:
         raise ValueError("head.logit_scale_init must be >= 0 (0 means 1/sqrt(H))")
     if m.head.z_loss_weight < 0 or t.z_loss_weight < 0 or t.moe_z_loss_weight < 0:
@@ -1051,6 +1073,11 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("train.precision must be 'bf16' or 'fp32'")
     if t.max_grad_norm <= 0:
         raise ValueError("train.max_grad_norm must be positive")
+    if t.logging.exact_ce_interval < 0:
+        raise ValueError("train.logging.exact_ce_interval must be >= 0")
+    positive_int("train.logging.exact_ce_rows", t.logging.exact_ce_rows, 1 << 20)
+    if type(t.logging.exact_ce_seed) is not int or t.logging.exact_ce_seed < 0:
+        raise ValueError("train.logging.exact_ce_seed must be a non-negative integer")
     if not 0.0 < t.ce_keep_rate <= 1.0:
         raise ValueError("train.ce_keep_rate must be in (0, 1]")
     if t.ce_keep_mode not in {"bernoulli", "stride"}:

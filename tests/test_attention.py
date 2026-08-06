@@ -105,7 +105,24 @@ class TestGQA:
 
 
 class TestLocalWindow:
-    def test_early_tokens_nonzero_in_train(self):
+    def test_compressed_history_matches_full_when_stride_is_one(self):
+        from hagi.model.attention import compressed_history_attention
+
+        torch.manual_seed(0)
+        q = torch.randn(1, 2, 12, 8)
+        k = torch.randn(1, 2, 12, 8)
+        v = torch.randn(1, 2, 12, 8)
+        got = compressed_history_attention(q, k, v, window=4, stride=1)
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+
+    def test_compressed_history_has_finite_shape(self):
+        from hagi.model.attention import compressed_history_attention
+
+        q = torch.randn(1, 2, 20, 8)
+        got = compressed_history_attention(q, q, q, window=4, stride=4)
+        assert got.shape == q.shape and torch.isfinite(got).all()
+
         """Regression: tail-truncate zeroed queries before T-W."""
         cfg = AttentionConfig(num_heads=4, num_kv_heads=2, head_dim=16, sliding_window=8)
         attn = Attention(64, cfg, use_ternary=False).train()
