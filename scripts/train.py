@@ -1,10 +1,10 @@
 """Training entry point. Every parameter comes from the YAML config.
 
 Usage:
-    python scripts/train.py --config configs/v31_1b.yaml
-    python scripts/train.py --config configs/v31_1b.yaml --dry-run
-    python scripts/train.py --config configs/v31_1b.yaml --resume
-    python scripts/train.py --config configs/v31_1b.yaml --steps 500 --profile 3
+    python scripts/train.py --config configs/v40_1b.yaml
+    python scripts/train.py --config configs/v40_1b.yaml --dry-run
+    python scripts/train.py --config configs/v40_1b.yaml --resume
+    python scripts/train.py --config configs/v40_1b.yaml --steps 500 --profile 3
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def setup_logging(log_dir: str) -> str:
     path = f"{log_dir}/train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fmt = logging.Formatter("%(asctime)s | %(message)s")
     for handler in (logging.StreamHandler(), logging.FileHandler(path, encoding="utf-8")):
         handler.setFormatter(fmt)
         root.addHandler(handler)
@@ -100,19 +100,30 @@ def dry_run(model, cfg, device: torch.device) -> int:
     model.train()
     output = model(ids, targets, doc_ids=doc_ids)
     ce = float(output.ce.detach())
+    receiver = "nce" if cfg.model.head.sampled_softmax_k > 0 else "ce"
+    exact_ce = None
+    if cfg.model.head.sampled_softmax_k > 0:
+        rows = min(int(cfg.train.logging.exact_ce_rows), batch * seq)
+        flat_hidden = output.hidden.detach().reshape(-1, output.hidden.shape[-1])[:rows]
+        flat_targets = targets.reshape(-1)[:rows]
+        with torch.no_grad():
+            exact_ce = float(model.head.exact_loss(flat_hidden, flat_targets).detach())
     output.loss.backward()
 
     logger.info(
-        "dry run: loss=%.4f ce=%.4f (%s baseline %.4f) z=%.4f tokens=%d",
+        "dry run: loss=%.4f %s=%.4f exact_ce=%s (%s baseline %.4f) z=%.4f tokens=%d",
         float(output.loss.detach()),
+        receiver,
         ce,
+        f"{exact_ce:.4f}" if exact_ce is not None else "n/a",
         baseline_name,
         baseline,
         float(output.z_loss.detach()),
         output.n_tokens,
     )
-    if ce > baseline * 1.10:
-        logger.warning("ce exceeds the %s baseline by >10%% at init — check target alignment", baseline_name)
+    measured_ce = exact_ce if exact_ce is not None else ce
+    if measured_ce > baseline * 1.10:
+        logger.warning("exact CE exceeds the %s baseline by >10%% at init — check target alignment", baseline_name)
 
     without_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
     if without_grad:
@@ -127,7 +138,7 @@ def dry_run(model, cfg, device: torch.device) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train the HAGI channel language model")
-    parser.add_argument("--config", default="configs/v39_1b.yaml")
+    parser.add_argument("--config", default="configs/v41_1b.yaml")
     parser.add_argument("--data-dir", default=None, help="overrides train.data.data_dir")
     parser.add_argument("--steps", type=int, default=None, help="overrides train.max_steps")
     parser.add_argument("--checkpoint-dir", default=None)

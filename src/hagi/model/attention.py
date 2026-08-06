@@ -52,6 +52,8 @@ class AttentionConfig:
     rope_theta: float = 10000.0
     qk_norm: bool = True
     sliding_window: int = 0  # 0 = full attention
+    history_stride: int = 0
+
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -119,6 +121,32 @@ def local_window_attention(
     return torch.cat(outs, dim=2)
 
 
+def compressed_history_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int, stride: int
+) -> torch.Tensor:
+    """Local attention plus a strided, causal summary of older KV states."""
+    t = q.shape[-2]
+    if t <= window or stride <= 0:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    outs: list[torch.Tensor] = []
+    for i0 in range(0, t, window):
+        i1 = min(t, i0 + window)
+        local_start = max(0, i1 - window)
+        old = torch.arange(0, local_start, stride, device=q.device)
+        recent = torch.arange(local_start, i1, device=q.device)
+        indices = torch.cat([old, recent])
+        ki = k.index_select(-2, indices)
+        vi = v.index_select(-2, indices)
+        q_abs = torch.arange(i0, i1, device=q.device).view(1, 1, -1, 1)
+        k_abs = indices.view(1, 1, 1, -1)
+        allowed = k_abs <= q_abs
+        bias = q.new_zeros(1, 1, i1 - i0, indices.numel())
+
+        bias = bias.masked_fill(~allowed, float("-inf"))
+        outs.append(F.scaled_dot_product_attention(q[:, :, i0:i1], ki, vi, attn_mask=bias))
+    return torch.cat(outs, dim=2)
+
+
 class Attention(nn.Module):
     """Pre-norm GQA with QK-norm, RoPE, optional window and KV-cache.
 
@@ -157,6 +185,7 @@ class Attention(nn.Module):
         self.head_dim = cfg.head_dim
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.sliding_window = int(cfg.sliding_window or 0)
+        self.history_stride = int(getattr(cfg, "history_stride", 0) or 0)
 
         def proj(out_features: int) -> nn.Module:
             return linear(hidden_size, out_features, use_ternary, init_orthogonal)
@@ -242,15 +271,17 @@ class Attention(nn.Module):
 
         window = self.sliding_window
         if mask is not None:
-            # Caller-built mask already encodes window / docs / prefix. Never
-            # truncate K/V to the sequence tail — that zeros early queries.
+            # Caller-built mask already encodes window / docs / prefix.
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         elif (
             self.training
-            and window > 0
+            and self.history_stride > 0
+            and self.sliding_window > 0
             and self._kv_cache is None
             and k.shape[-2] == t
         ):
+            out = compressed_history_attention(q, k, v, self.sliding_window, self.history_stride)
+        elif self.training and self.sliding_window > 0 and self._kv_cache is None and k.shape[-2] == t:
             # Pure window, no doc/prefix constraints: O(T·W) local SDPA.
             out = local_window_attention(q, k, v, window)
         elif t == 1:

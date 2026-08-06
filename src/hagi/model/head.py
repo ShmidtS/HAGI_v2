@@ -348,6 +348,48 @@ class LMHead(nn.Module):
         )
         return ce, z
 
+    def exact_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Exact full-alphabet CE for evaluation and calibration diagnostics."""
+        if hidden.ndim != 2 or targets.ndim != 1 or hidden.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"expected hidden [N, H] and targets [N], got {tuple(hidden.shape)} and {tuple(targets.shape)}"
+            )
+        if hidden.shape[0] == 0:
+            return hidden.new_zeros((), dtype=torch.float32)
+        bias = self.log_prior.to(hidden.dtype) if self.log_prior is not None else None
+        scaled = hidden * self.logit_scale.to(hidden.dtype)
+        ce, _ = _ChunkedCrossEntropy.apply(
+            scaled,
+            self.weight,
+            targets,
+            bias,
+            min(self.chunk_rows, hidden.shape[0]),
+            0.0,
+            False,
+        )
+        return ce
+
+    def _sample_negatives(self, targets: torch.Tensor, k: int) -> torch.Tensor:
+        """Build the shared in-batch/prior interference bank."""
+        device = targets.device
+        v = self.vocab_size
+        proposal = str(getattr(self.cfg, "sampled_proposal", "uniform"))
+        in_batch_fraction = float(getattr(self.cfg, "sampled_in_batch_fraction", 0.0))
+        n_in_batch = min(k, round(k * in_batch_fraction))
+        if n_in_batch:
+            stride = max(1, targets.numel() // n_in_batch)
+            in_batch = targets[::stride][:n_in_batch]
+        else:
+            in_batch = targets.new_empty(0)
+        n_random = k - in_batch.numel()
+        if proposal == "prior":
+            if self.log_prior is None:
+                raise ValueError("sampled_proposal='prior' requires a unigram prior")
+            random_neg = torch.multinomial(self.log_prior.exp(), n_random, replacement=True).to(device)
+        else:
+            random_neg = torch.randint(0, v, (n_random,), device=device)
+        return torch.cat([in_batch, random_neg])
+
     def _loss_sampled(
         self,
         scaled: torch.Tensor,
@@ -355,34 +397,38 @@ class LMHead(nn.Module):
         bias: torch.Tensor | None,
         k: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sampled softmax over {target} ∪ K uniform negatives (Jean et al.).
+        """Sampled softmax over each target and a shared negative bank.
 
         Information view: full CE measures the partition over the whole alphabet
         (exact decoding metric). Sampled softmax replaces that with a *local*
         partition on a random code-subset of size K+1 — a Monte-Carlo surrogate
-        of the same mutual-information gradient with cost O(N·K·H) instead of
-        O(N·V·H). With uniform proposal ``q=1/V`` the ``-log q`` correction is
-        constant and cancels inside the softmax; the unigram prior (when on)
-        already reweights the candidates toward the source distribution.
+        of the same mutual-information gradient. One bank is shared by all rows,
+        turning the negative correlator into a GEMM and avoiding the bandwidth-
+        dominant ``[N,K,H]`` codebook gather. When negatives follow the source
+        prior, the logits are likelihood-ratio scores: the fixed prior is not
+        added inside the local partition, because the proposal already carries
+        it. The full receiver adds the prior exactly once.
 
         The true class is always index 0 of the candidate set so the CE is
-        simply ``-log_softmax(logits)[:, 0]``. Collisions (negative == target)
-        are remapped cheaply; they are rare at V ≫ K.
+        simply ``-log_softmax(logits)[:, 0]``.
         """
         n = scaled.shape[0]
-        v = self.vocab_size
-        device = scaled.device
-        neg = torch.randint(0, v, (n, k), device=device)
-        # Cheap collision fix: shift colliding negatives by +1 (mod V).
-        coll = neg.eq(targets.unsqueeze(1))
-        if bool(coll.any()):
-            neg = torch.where(coll, (neg + 1).remainder(v), neg)
-        cand = torch.cat([targets.unsqueeze(1), neg], dim=1)  # [N, K+1]
-        # Gather codebook rows then correlator: [N,K+1,H] · [N,1,H] → [N,K+1].
-        rows = F.embedding(cand, self.weight)
-        logits = (scaled.unsqueeze(1).to(rows.dtype) * rows).sum(dim=-1)
-        if bias is not None:
-            logits = logits + bias[cand].to(logits.dtype)
+        proposal = str(getattr(self.cfg, "sampled_proposal", "uniform"))
+        neg = self._sample_negatives(targets, k)
+
+        target_rows = F.embedding(targets, self.weight)
+        target_logits = (scaled.to(target_rows.dtype) * target_rows).sum(dim=-1, keepdim=True)
+        negative_logits = scaled @ self.weight.index_select(0, neg).t()
+        # A sampled target is not a negative class for that row.
+        negative_logits = negative_logits.masked_fill(targets.unsqueeze(1).eq(neg), float("-inf"))
+        logits = torch.cat([target_logits, negative_logits], dim=1)
+        # Under q=prior this is conditional NCE: sampled classes already carry
+        # source frequency through q, so adding log_prior here would count the
+        # prior twice. Uniform q is constant and retains the ordinary bias.
+        if bias is not None and proposal == "uniform":
+            target_bias = bias.index_select(0, targets).unsqueeze(1)
+            negative_bias = bias.index_select(0, neg).unsqueeze(0)
+            logits = logits + torch.cat([target_bias, negative_bias.expand(n, -1)], dim=1).to(logits.dtype)
         log_probs = F.log_softmax(logits.float(), dim=-1)
         ce = -log_probs[:, 0].mean()
         if self.z_loss_weight > 0:
