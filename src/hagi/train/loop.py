@@ -145,24 +145,20 @@ def clip_gradients(model: nn.Module, max_norm: float) -> float:
     return float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
 
 
-def clip_gradients_by_group(model: nn.Module, max_norm: float) -> tuple[float, float]:
-    """Clip Muon (body) and AdamW (codebook/conv/norms/gains) norms separately.
+def clip_gradients_by_group(
+    model: nn.Module, max_norm: float
+) -> tuple[torch.Tensor | float, torch.Tensor | float]:
+    """Clip Muon and AdamW groups, leaving device norms unsynchronized.
 
-    A tied codebook is ``V*H`` parameters with dense token-frequency gradients,
-    so its per-step gradient norm dwarfs the body's; a single global clip then
-    spends most of its budget on the codebook and shrinks the body's update to a
-    fraction of its step. Measured on the V31 1B run: codebook 8.92 + conv 5.32
-    against a total of 10.59, leaving the 100 body matrices only ~19% of the
-    clip budget at every step. Splitting the clip lets each group move at its own
-    scale; the body's step is no longer a hostage of the codebook's.
-
-    Returns ``(body_norm, rest_norm)`` pre-clip, or NaN for a group with no
-    parameters.
+    The caller decides when host visibility is required.  Returning the scalar
+    tensors produced by ``clip_grad_norm_`` avoids two implicit GPU-to-CPU
+    synchronizations in every optimizer step; CPU callers still receive tensors
+    that compare and convert like scalars.
     """
     body = _muon_parameters(model)
     rest = [p for p in model.parameters() if p not in set(body)]
-    body_norm = float(torch.nn.utils.clip_grad_norm_(body, max_norm)) if body else float("nan")
-    rest_norm = float(torch.nn.utils.clip_grad_norm_(rest, max_norm)) if rest else float("nan")
+    body_norm = torch.nn.utils.clip_grad_norm_(body, max_norm) if body else float("nan")
+    rest_norm = torch.nn.utils.clip_grad_norm_(rest, max_norm) if rest else float("nan")
     return body_norm, rest_norm
 
 
@@ -213,11 +209,11 @@ class Trainer:
         # OFDM coherence interval: the ternary map Q*s is constant across the
         # microbatches of one optimizer step (the master W only changes on
         # optimizer.step). Cache it once; clear after the step so the next
-        # step recomputes against the updated master.
-        use_ternary_cache = (
-            cfg.model.ternary.enabled
-            and getattr(cfg.train, "ternary_step_cache", True)
-            and len(microbatches) > 1
+        # step recomputes against the updated master. Always on: the cached
+        # path is also the host-bound fix (zero per-forward copies), so it is
+        # a win even at grad_accum=1.
+        use_ternary_cache = cfg.model.ternary.enabled and getattr(
+            cfg.train, "ternary_step_cache", True
         )
         if use_ternary_cache:
             cache_ternary_weights(model)
@@ -231,7 +227,7 @@ class Trainer:
         # Weight each microbatch by its scored-token count so unequal microbatches
         # average correctly rather than over-weighting sparse ones.
         prepared: list[tuple[dict, torch.Tensor | None]] = []
-        token_counts: list[int] = []
+        token_counts: list[torch.Tensor] = []
         for batch in microbatches:
             ids = batch["input_ids"].to(device)
             targets = batch["targets"].to(device)
@@ -244,13 +240,14 @@ class Trainer:
                 device=device,
                 base=base_mask,
             )
-            count = int(mask.sum()) if mask is not None else int(targets.numel())
-            # Degenerate puncture (all dropped) — fall back to full score so the
-            # step still produces a finite gradient rather than a zero graph.
-            if count == 0:
-                mask = base_mask
-                count = int(mask.sum()) if mask is not None else int(targets.numel())
-            token_counts.append(max(count, 1))
+            # Keep counts on device.  Converting each mask sum with int() forced
+            # one full HIP stream synchronization per microbatch.
+            count = (
+                mask.sum(dtype=torch.int64)
+                if mask is not None
+                else torch.tensor(targets.numel(), device=device, dtype=torch.int64)
+            )
+            token_counts.append(count.clamp_min(1))
             prepared.append(
                 (
                     {
@@ -266,11 +263,11 @@ class Trainer:
                     mask,
                 )
             )
-        total_tokens = max(sum(token_counts), 1)
+        total_tokens = torch.stack(token_counts).sum().clamp_min(1)
 
-        ce_sum = 0.0
-        loss_sum = 0.0
-        z_sum = 0.0
+        ce_sum = torch.zeros((), device=device, dtype=torch.float32)
+        loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        z_sum = torch.zeros((), device=device, dtype=torch.float32)
         exact_ce_value: float | None = None
         exact_interval = int(cfg.train.logging.exact_ce_interval)
         for microbatch_index, ((batch, _mask), count) in enumerate(
@@ -313,15 +310,21 @@ class Trainer:
                             flat_targets.index_select(0, sample),
                         )
                     )
-            weight = count / total_tokens
+            weight = count.to(torch.float32) / total_tokens
             (output.loss * weight).backward()
 
-            ce_sum += float(output.ce.detach()) * weight
-            loss_sum += float(output.loss.detach()) * weight
-            z_sum += float(output.z_loss.detach()) * weight if output.z_loss is not None else 0.0
+            ce_sum = ce_sum + output.ce.detach().float() * weight
+            loss_sum = loss_sum + output.loss.detach().float() * weight
+            if output.z_loss is not None:
+                z_sum = z_sum + output.z_loss.detach().float() * weight
             del output
 
-        body_norm, rest_norm = clip_gradients_by_group(model, cfg.train.max_grad_norm)
+        body_norm_raw, rest_norm_raw = clip_gradients_by_group(model, cfg.train.max_grad_norm)
+        body_norm_tensor = torch.as_tensor(body_norm_raw, device=device, dtype=torch.float32)
+        rest_norm_tensor = torch.as_tensor(rest_norm_raw, device=device, dtype=torch.float32)
+        # One synchronization is necessary before mutating parameters: an invalid
+        # norm must skip optimizer.step.  Transfer both decisions together.
+        body_norm, rest_norm = torch.stack((body_norm_tensor, rest_norm_tensor)).tolist()
         if not (math.isfinite(body_norm) and math.isfinite(rest_norm)):
             # Skip rather than raise: one bad microbatch in a long run should cost
             # one step, not the run. A persistent problem shows up as a run of
@@ -355,27 +358,32 @@ class Trainer:
         if hasattr(model, "commit_controller_updates"):
             model.commit_controller_updates()
 
+        # Metrics cross the device boundary once, after all scheduled GPU work.
+        # Previously every float()/int() below synchronized the HIP stream.
+        loss_value, ce_value, z_value, tokens_value = torch.stack(
+            (loss_sum, ce_sum, z_sum, total_tokens.to(torch.float32))
+        ).tolist()
         receiver = "conditional_nce" if cfg.model.head.sampled_softmax_k > 0 else "exact_ce"
         metrics = {
             "step": self.step,
-            "loss": loss_sum,
-            "ce": ce_sum,
-            "bpt": ce_sum / math.log(2.0),
-            "ppl": math.exp(min(ce_sum, 20.0)),
-            "z_loss": z_sum,
+            "loss": loss_value,
+            "ce": ce_value,
+            "bpt": ce_value / math.log(2.0),
+            "ppl": math.exp(min(ce_value, 20.0)),
+            "z_loss": z_value,
             "grad_norm": body_norm,
             "body_grad_norm": body_norm,
             "rest_grad_norm": rest_norm,
             "lr": adam_lr,
             "muon_lr": muon_lr,
-            "tokens": total_tokens,
+            "tokens": int(tokens_value),
             "ce_keep_rate": keep_rate,
             "receiver": receiver,
             "update_applied": True,
         }
         if receiver == "conditional_nce":
-            metrics["nce"] = ce_sum
-            metrics["nce_bits"] = ce_sum / math.log(2.0)
+            metrics["nce"] = ce_value
+            metrics["nce_bits"] = ce_value / math.log(2.0)
         if exact_ce_value is not None:
             metrics["exact_ce"] = exact_ce_value
             metrics["exact_bpt"] = exact_ce_value / math.log(2.0)

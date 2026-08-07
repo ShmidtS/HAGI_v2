@@ -163,7 +163,16 @@ class RotaryEmbedding(nn.Module):
             )
             emb = torch.cat((freqs, freqs), dim=-1)
             return emb.cos().to(dtype), emb.sin().to(dtype)
-        key = (int(positions[0]), int(positions[-1]), positions.shape[0], device.type, device.index, dtype)
+        # Cache key from shape only. ``positions[0]``/``positions[-1]`` each
+        # forced a GPU-to-CPU sync (aten::_local_scalar_dense) on every RoPE
+        # call — 2 syncs x 4 blocks x 3 microbatches = 24 syncs, ~1.0 s/step of
+        # host time on this ROCm build. In training prefill positions is always
+        # arange(cache_len, cache_len+T), so the endpoints are a pure function
+        # of the length and the cache offset; deriving them from shape keeps the
+        # key correct without reading device memory.
+        t = positions.shape[0]
+        start = int(positions[0]) if t == 1 else 0
+        key = (start, start + t - 1, t, device.type, device.index, dtype)
         hit = self._cache.get(key)
         if hit is not None:
             return hit

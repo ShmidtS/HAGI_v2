@@ -52,16 +52,16 @@
 
 model:
   vocab_size: 32768
-  hidden_size: 1152
-  num_layers: 4
+  hidden_size: 512
+  num_layers: 8
   loop_depth: 1
   norm_eps: 1.0e-5
   init_orthogonal: true
 
   attention:
-    num_query_heads: 18
-    num_kv_heads: 3
-    head_dim: 64
+    num_query_heads: 4
+    num_kv_heads: 1
+    head_dim: 128
     rope_theta: 10000.0
     max_seq_len: 4096
     qk_norm: true
@@ -76,12 +76,12 @@ model:
     history_stride: 0
 
   embedding:
-    tie_lm_head: true
+    tie_lm_head: false
     conv_kernel: 4
     init_std: 0.02
 
   ffn:
-    expansion: 1.33
+    expansion: 2.0
     multiple_of: 64
 
   ternary:
@@ -115,7 +115,7 @@ train:
   # T=512, B=48: attention FLOPs 4× cheaper than T=1024. Token throughput
   # 48×3×512 = 73 728/step (80% of V41). Compensate with more steps if needed.
   batch_size: 48
-  grad_accum_steps: 3
+  grad_accum_steps: 1
   grad_checkpointing: false
   use_muon: false
   ternary_step_cache: true
@@ -144,7 +144,7 @@ train:
     inverse_sqrt_tau: 0
   data:
     data_dir: data
-    seq_len: 512
+    seq_len: 1024
     eos_token_id: 1
     pad_token_id: 0
     num_workers: 2

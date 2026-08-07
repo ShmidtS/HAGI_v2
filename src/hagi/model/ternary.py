@@ -66,6 +66,30 @@ class _TernarizeSTE(torch.autograd.Function):
         return grad_output, None
 
 
+class _CachedSTE(torch.autograd.Function):
+    """Straight-through estimator over a precomputed ternary map.
+
+    Forward returns the cached ``q`` (the quantized weight) directly — zero
+    host-side copies, zero per-forward quantizer work. Backward is the identity
+    on the master ``weight`` (STE), so the gradient flows to the fp master as if
+    the forward had used it. The quantizer ran once, in
+    :meth:`BitLinear.cache_quantized`, at the start of the optimizer step.
+
+    This is the wall-time fix for the host-bound profile: the old per-forward
+    ``weight + (q - weight).detach()`` materialized two ``[out, in]`` copies on
+    the host per layer per microbatch (measured 634 ms of ``aten::copy_`` CPU
+    time — 65% of step time — on the Radeon 8060S).
+    """
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, q: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return q
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        return grad_output, None
+
+
 class BitLinear(nn.Module):
     """Linear layer whose 2D weight is ternarized in the forward pass.
 
@@ -108,7 +132,12 @@ class BitLinear(nn.Module):
         self._step_q: torch.Tensor | None = None
 
     def cache_quantized(self) -> None:
-        """Freeze the ternary map for the current optimizer step."""
+        """Freeze the ternary map for the current optimizer step.
+
+        Quantizes the master once and stores the *effective* weight ``q``. The
+        forward then returns ``q`` directly through :class:`_CachedSTE` (no
+        host copies, no per-forward quantizer).
+        """
         with torch.no_grad():
             self._step_q, _ = ternarize(self.weight, self.eps)
 
@@ -118,10 +147,9 @@ class BitLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._step_q is not None:
-            # STE with a precomputed Q: forward equals Q, backward dL/dW = dL/dQ.
-            q = self._step_q.to(dtype=self.weight.dtype, device=self.weight.device)
-            eff = self.weight + (q - self.weight).detach()
-            return F.linear(x, eff.to(x.dtype), self.bias)
+            # STE over the precomputed map: forward = q, backward = identity on
+            # the master. Zero host-side copies (the host-bound fix).
+            return F.linear(x, _CachedSTE.apply(self.weight, self._step_q), self.bias)
         if not torch.is_grad_enabled():
             eff, _ = ternarize(self.weight, self.eps)
             return F.linear(x, eff.to(x.dtype), self.bias)

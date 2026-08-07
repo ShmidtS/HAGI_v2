@@ -156,7 +156,8 @@ class TestValidation:
             assert cfg.model.sliding.window == 0
             assert cfg.train.data.seq_len == 512
             assert cfg.train.ce_keep_rate == 0.5
-            assert cfg.train.batch_size == 48
+            assert cfg.train.batch_size == 96
+            assert cfg.train.grad_accum_steps == 1
             assert all(w == 0 for w in layer_windows(cfg.model))
 
 
