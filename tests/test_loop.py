@@ -137,6 +137,15 @@ class TestTrainStep:
         with pytest.raises(ValueError):
             trainer.train_step([])
 
+    def test_compile_model_flag_is_accepted(self):
+        """compile_model=True should not crash the Trainer constructor."""
+        cfg = tiny_config(**{"train.compile_model": True})
+        # On CPU, torch.compile may or may not succeed; either way the
+        # Trainer must construct without raising.
+        model = HAGI(cfg)
+        trainer = Trainer(model, cfg)
+        assert trainer.step == 0
+
     def test_parameters_move(self):
         cfg = tiny_config()
         model = HAGI(cfg)

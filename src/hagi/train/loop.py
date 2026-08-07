@@ -95,6 +95,9 @@ def configure_runtime() -> None:
     # the full attention matrix.
     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    # Allow torch.compile to capture scalar outputs (loss values) without graph
+    # breaks. Without this, every metrics.float() call splits the compiled graph.
+    os.environ.setdefault("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS", "1")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -177,6 +180,13 @@ class Trainer:
         self.cfg = cfg
         self.step = start_step
         cast_model(model, cfg.train.precision)
+        if getattr(cfg.train, "compile_model", False):
+            try:
+                self.model = torch.compile(model, mode="default")
+                logger.info("torch.compile enabled (mode=default)")
+            except Exception as exc:
+                logger.warning("torch.compile failed (%s), continuing uncompiled", exc)
+                self.model = model
         self.optimizer = build_optimizer(model, cfg)
 
     def load_optimizer_state(self, state: dict) -> None:
@@ -272,6 +282,12 @@ class Trainer:
             # (crash after ~10 steps, only in train_step, never in a manual
             # blocking loop). The transfer is small (a few tens of MB per
             # batch); blocking costs nothing measurable.
+            #
+            # Mark step boundary for CUDA graphs when the model is compiled:
+            # without this, reduce-overhead mode reuses static output buffers
+            # across microbatches and backward reads stale data.
+            if getattr(cfg.train, "compile_model", False):
+                torch.compiler.cudagraph_mark_step_begin()
             output = model(
                 batch["input_ids"],
                 batch["targets"],
