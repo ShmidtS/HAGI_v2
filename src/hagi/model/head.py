@@ -224,9 +224,6 @@ class LMHead(nn.Module):
         vocab_size: V.
         cfg: head configuration.
         tied_weight: the source codebook to share, or None to own a projection.
-        xm_cfg: optional :class:`~hagi.config.XMConfig` for best-of-K list
-            decoding. When enabled, ``loss`` explores K mode-codes on
-            high-entropy positions and keeps only the winner's gradient.
     """
 
     def __init__(
@@ -235,7 +232,6 @@ class LMHead(nn.Module):
         vocab_size: int,
         cfg: HeadConfig,
         tied_weight: torch.Tensor | None = None,
-        xm_cfg=None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -277,13 +273,6 @@ class LMHead(nn.Module):
         else:
             self.log_prior = None
 
-        xm = xm_cfg
-        if xm is not None and xm.enabled:
-            self._xm = xm
-            self._make_mode_codes(xm)
-        else:
-            self._xm = None
-            self.mode_codes = None
 
     @property
     def is_tied(self) -> bool:
@@ -308,12 +297,6 @@ class LMHead(nn.Module):
     def loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Mean cross-entropy and mean z-loss over ``[N, H]`` rows.
 
-        With XM enabled (``cfg.xm.enabled``), this becomes best-of-K list
-        decoding: for positions above the entropy gate, K mode-codes are added
-        to ``hidden`` and the per-position CE is computed for each candidate;
-        only the minimum (the candidate nearest the target, i.e. the maximum-
-        likelihood hypothesis) contributes. See :class:`~hagi.config.XMConfig`.
-
         Args:
             hidden: ``[N, H]`` selected positions.
             targets: ``[N]`` target ids.
@@ -332,8 +315,6 @@ class LMHead(nn.Module):
         # The gain is applied outside the custom Function: autograd then routes a
         # gradient to it through this multiply, with no extra pass over [N, V].
         scaled = hidden * self.logit_scale.to(hidden.dtype)
-        if self.mode_codes is not None:
-            return self._loss_xm(scaled, targets, bias)
         k = int(getattr(self.cfg, "sampled_softmax_k", 0) or 0)
         if k > 0:
             return self._loss_sampled(scaled, targets, bias, k)
@@ -437,192 +418,10 @@ class LMHead(nn.Module):
             z_loss = scaled.new_zeros((), dtype=torch.float32)
         return ce, z_loss
 
-    def _loss_xm(self, scaled: torch.Tensor, targets: torch.Tensor, bias) -> tuple[torch.Tensor, torch.Tensor]:
-        """Best-of-K list decoding over mode-codes (memory-saving mode).
-
-        The paper's memory-saving variant (Appendix C): all K candidates are
-        forwarded *without* gradients, the winner (minimum CE) is selected, and
-        only it is re-forwarded with gradients to train on. This keeps the
-        activation memory of standard training — backward goes through one
-        candidate, not K — at the cost of one extra forward pass per explored
-        row. On the bandwidth-bound Radeon the head forward is 141ms vs 551ms
-        for head backward, so K=4 exploration costs ~4*141ms extra forward
-        while backward stays a single 551ms pass.
-
-        Rows below the entropy gate use the base prediction (candidate 0),
-        i.e. ordinary CE.
-        """
-        n, h = scaled.shape
-        xm = self._xm
-        k = int(xm.num_modes)
-        gate = float(xm.entropy_gate)
-        weight = self.weight
-
-        # Base logits in no-grad: log-partition, target logit and posterior
-        # entropy in ONE [N,V] pass. The entropy gate uses the *posterior
-        # entropy* H = <p, log p> = lse - <p, logits> (always <= ln V), not CE —
-        # CE on an ambiguous target can far exceed ln V, which would make the
-        # gate fire on every position.
-        with torch.no_grad():
-            log_z, log_pt, entropy = _head_stats_blocks(scaled, weight, targets, bias, self.chunk_rows)
-            base_ce = log_z - log_pt  # [N]
-            # Entropy gate. ``entropy`` is the *posterior* entropy, which is
-            # upper-bounded by the *prior* entropy (the unigram entropy when a
-            # source prior is active — 8.06 nats on this corpus — not ln V =
-            # 12.48). Using a fraction of ln V as the threshold therefore never
-            # fires when a unigram prior is loaded: no position can reach
-            # 0.9*ln V, exploration silently never happens, and XM pays its
-            # forward cost for zero benefit (the V34 "no quality" result is this
-            # bug, not a property of best-of-K). Gate against the achievable
-            # maximum instead: the prior entropy when a prior is present, ln V
-            # otherwise.
-            max_h = float(torch.log(torch.tensor(self.vocab_size, dtype=torch.float32)))
-            if self.log_prior is not None:
-                p = self.log_prior.double().exp()
-                max_h = float(-(p * p.clamp_min(1e-12).log()).sum())
-            explore = entropy > (gate * max_h)
-            # Budget cap: within the entropy-gated set keep only the
-            # highest-entropy ``explore_fraction``. On a near-uniform model the
-            # gate alone fires on ~100% of positions and K full head passes
-            # cost +55% step time for zero signal; the fraction targets the
-            # genuinely ambiguous tail instead.
-            frac = float(getattr(xm, "explore_fraction", 1.0))
-            if frac < 1.0:
-                n_ex = int(explore.sum())
-                keep = max(1, int(round(n_ex * frac)))
-                ex_ent = entropy.masked_fill(~explore, -1e9)
-                _, top_idx = ex_ent.topk(keep)
-                explore = torch.zeros_like(explore)
-                explore[top_idx] = True
-
-        n_explore = int(explore.sum())
-        if n_explore == 0:
-            ce, z = _ChunkedCrossEntropy.apply(
-                scaled, weight, targets, bias, self.chunk_rows, self.z_loss_weight, self.cfg.ce_save_logits
-            )
-            return ce, z
-
-        # Candidate hidden states: mode_code[j] added to explored rows only.
-        # Non-explored rows stay at the base prediction (candidate 0).
-        mode_dt = self.mode_codes.to(scaled.dtype)  # [K, H]
-        with torch.no_grad():
-            exp_idx = explore.nonzero(as_tuple=True)[0]
-            exp_hidden = scaled.index_select(0, exp_idx)  # [n_explore, H]
-            exp_tgt = targets.index_select(0, exp_idx)
-            # [K, n_explore, H] candidates via broadcasting.
-            cand = exp_hidden.unsqueeze(0) + mode_dt.unsqueeze(1)  # [K, n_explore, H]
-            flat = cand.reshape(k * n_explore, h)
-            ce_rows = _ce_rows_blocks(
-                flat, weight, exp_tgt.repeat(k), bias, self.chunk_rows
-            ).reshape(k, n_explore)
-            winner = ce_rows.argmin(dim=0)  # [n_explore] winner per explored row
-            base_exp = base_ce.index_select(0, exp_idx)
-            # Keep the base prediction where exploration found nothing better.
-            better = ce_rows.min(dim=0).values < base_exp
-            winner = winner.clone()
-            winner[~better] = 0
-
-        # Re-forward only the winner with gradients (memory-saving: one
-        # backward, not K). Winner hidden = base + mode_code[winner] on explored
-        # rows; base on non-explored rows and on rows where the base won.
-        win_offset = torch.zeros_like(scaled)
-        win_offset[exp_idx] = mode_dt[winner]
-        win_hidden = scaled + win_offset
-        ce, z = _ChunkedCrossEntropy.apply(
-            win_hidden, weight, targets, bias, self.chunk_rows, self.z_loss_weight, self.cfg.ce_save_logits
-        )
-        return ce, z
-
-    def _make_mode_codes(self, xm) -> None:
-        """Create the learnable K mode-code embeddings (best-of-K hypotheses).
-
-        Small init std: a mode is a perturbation of the base prediction toward
-        a distinct hypothesis, not a new prediction. ``keep_fp32`` so the tiny
-        codes do not round to zero under bf16.
-        """
-        k, h = int(xm.num_modes), self.hidden_size
-        self.mode_codes = nn.Parameter(torch.randn(k, h) * float(xm.mode_std))
-        self.mode_codes.keep_fp32 = True
-
     def extra_repr(self) -> str:
         return (
             f"vocab_size={self.vocab_size}, tied={self.is_tied}, "
             f"unigram_prior={self.log_prior is not None}, chunk_rows={self.chunk_rows}"
         )
-
-
-# ---------------------------------------------------------------------------
-# XM helpers: chunked per-row quantities over V without materializing [N, V].
-# Each returns a [N] tensor; the chunk loop keeps peak memory at chunk*V.
-# ``weight`` is the tied/untied output projection ([V, H]) resolved by the
-# calling LMHead.
-# ---------------------------------------------------------------------------
-
-
-def _head_stats_blocks(
-    hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, bias, chunk_rows: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-row (log_partition, log_p_target, posterior_entropy) in ONE [N,V] pass.
-
-    All three are derived from the same per-row logits, so computing them
-    separately would do three [N,V] matmuls on a bandwidth-bound part. This
-    does one, keeping the gate and the base CE essentially free over the
-    winner re-forward.
-    """
-    n = hidden.shape[0]
-    log_z = torch.empty(n, device=hidden.device, dtype=torch.float32)
-    log_pt = torch.empty(n, device=hidden.device, dtype=torch.float32)
-    entropy = torch.empty(n, device=hidden.device, dtype=torch.float32)
-    for start in range(0, n, chunk_rows):
-        end = min(start + chunk_rows, n)
-        logits = F.linear(hidden[start:end], weight)
-        if bias is not None:
-            logits = logits + bias.to(logits.dtype)
-        z = logits.float()
-        lse = z.logsumexp(dim=-1, keepdim=True)
-        p = (z - lse).exp()
-        log_z[start:end] = lse.squeeze(-1)
-        log_pt[start:end] = z.gather(-1, targets[start:end].unsqueeze(-1)).squeeze(-1)
-        entropy[start:end] = lse.squeeze(-1) - (p * z).sum(dim=-1)
-    return log_z, log_pt, entropy
-
-
-def _log_partition_blocks(
-    hidden: torch.Tensor, weight: torch.Tensor, bias, chunk_rows: int
-) -> torch.Tensor:
-    """Per-row logsumexp(logits) = log sum_v exp(<h, w_v> + b_v)."""
-    n = hidden.shape[0]
-    out = torch.empty(n, device=hidden.device, dtype=torch.float32)
-    for start in range(0, n, chunk_rows):
-        end = min(start + chunk_rows, n)
-        logits = F.linear(hidden[start:end], weight)
-        if bias is not None:
-            logits = logits + bias.to(logits.dtype)
-        out[start:end] = logits.float().logsumexp(dim=-1)
-    return out
-
-
-def _log_p_target(
-    hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, bias, chunk_rows: int
-) -> torch.Tensor:
-    """Per-row log p(target) = <h, w_target> + b_target."""
-    n = hidden.shape[0]
-    out = torch.empty(n, device=hidden.device, dtype=torch.float32)
-    for start in range(0, n, chunk_rows):
-        end = min(start + chunk_rows, n)
-        logits = F.linear(hidden[start:end], weight)
-        if bias is not None:
-            logits = logits + bias.to(logits.dtype)
-        out[start:end] = logits.gather(-1, targets[start:end].unsqueeze(-1)).squeeze(-1).float()
-    return out
-
-
-def _ce_rows_blocks(
-    hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, bias, chunk_rows: int
-) -> torch.Tensor:
-    """Per-row CE = logsumexp - log p(target)."""
-    return _log_partition_blocks(hidden, weight, bias, chunk_rows) - _log_p_target(
-        hidden, weight, targets, bias, chunk_rows
-    )
 
 

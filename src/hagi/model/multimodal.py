@@ -189,8 +189,6 @@ class MultimodalBridge(nn.Module):
         self.out_norm = RMSNorm(h, eps=m.norm_eps)
         self.grounding = Grounding(h, mm.infonce_temperature, mm.variance_gamma)
         self.modality_dropout = float(mm.modality_dropout)
-        self.waterfill_enabled = bool(mm.waterfill_enabled)
-        self.waterfill_min_rate = float(mm.waterfill_min_rate)
         self.n_bridge = int(mm.n_bridge_queries)
 
     def _apply_rope(self, tokens: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -230,49 +228,12 @@ class MultimodalBridge(nn.Module):
         cos, sin = rope_cos_sin(pos, self.head_dim, self.rope_theta, tokens.device, tokens.dtype)
         return self._apply_rope(tokens, cos, sin)
 
-    def bridge(self, tokens: torch.Tensor, layers: nn.ModuleList, n_queries: int | None = None) -> torch.Tensor:
-        """Compress ``[B, T, H]`` modality tokens to ``[B, n_queries, H]``.
-
-        ``n_queries`` defaults to the configured fixed rate. Under water-filling
-        a modality may receive fewer queries; the shared query bank is sliced.
-        """
-        q_count = int(n_queries) if n_queries is not None else self.n_bridge
-        q_count = max(1, min(q_count, self.queries.shape[0]))
-        q = self.queries[:q_count].unsqueeze(0).expand(tokens.shape[0], -1, -1).to(tokens.dtype)
+    def bridge(self, tokens: torch.Tensor, layers: nn.ModuleList) -> torch.Tensor:
+        """Compress ``[B, T, H]`` modality tokens to the fixed bridge rate."""
+        q = self.queries.unsqueeze(0).expand(tokens.shape[0], -1, -1).to(tokens.dtype)
         for layer in layers:
             q = layer(q, tokens)
         return self.out_norm(q)
-
-    def _waterfill_rates(self, energies: list[float]) -> list[int]:
-        """Allocate ``n_bridge`` tokens across live modalities by energy.
-
-        Classic water-filling under a total-rate constraint: more tokens to the
-        higher-energy (higher-SNR) source, with a floor so no live modality is
-        starved to zero. Energies are non-negative scalars already measured
-        from the encoded tokens.
-        """
-        n = len(energies)
-        if n == 0:
-            return []
-        if n == 1 or not self.waterfill_enabled:
-            return [self.n_bridge] * n
-        total = float(sum(max(e, 0.0) for e in energies))
-        floor = max(1, int(round(self.n_bridge * self.waterfill_min_rate)))
-        floor = min(floor, self.n_bridge // n)
-        remaining = self.n_bridge - floor * n
-        if total <= 0 or remaining <= 0:
-            # Equal split when energies are degenerate.
-            base, extra = divmod(self.n_bridge, n)
-            return [base + (1 if i < extra else 0) for i in range(n)]
-        raw = [remaining * (max(e, 0.0) / total) for e in energies]
-        rates = [floor + int(r) for r in raw]
-        # Distribute residual tokens to the highest-energy modalities so the
-        # sum is exact.
-        deficit = self.n_bridge - sum(rates)
-        order = sorted(range(n), key=lambda i: energies[i], reverse=True)
-        for k in range(abs(deficit)):
-            rates[order[k % n]] += 1 if deficit > 0 else -1
-        return [max(1, r) for r in rates]
 
     def forward(
         self, images: torch.Tensor | None = None, spectrograms: torch.Tensor | None = None
@@ -280,9 +241,8 @@ class MultimodalBridge(nn.Module):
         """Encode and bridge whichever modalities are present.
 
         Train-time modality dropout independently drops each non-text source
-        with probability ``modality_dropout`` (Rayleigh-fade analogue): the text
-        channel must stay self-sufficient. Water-filling reallocates the fixed
-        bridge budget across surviving modalities by pooled energy.
+        with probability ``modality_dropout`` so the text channel remains
+        self-sufficient. Every surviving modality uses the same fixed rate.
 
         Returns:
             ``(prefix, modal_pooled)`` — ``prefix`` is ``[B, sum n_i, H]`` for
@@ -301,11 +261,6 @@ class MultimodalBridge(nn.Module):
         if not encoded:
             return None, None
 
-        energies = [float(tok.detach().float().pow(2).mean()) for tok, _ in encoded]
-        rates = self._waterfill_rates(energies)
-        parts = [
-            self.bridge(tokens, layers, n_queries=rate)
-            for (tokens, layers), rate in zip(encoded, rates, strict=True)
-        ]
+        parts = [self.bridge(tokens, layers) for tokens, layers in encoded]
         prefix = torch.cat(parts, dim=1)
         return prefix, prefix.mean(dim=1)

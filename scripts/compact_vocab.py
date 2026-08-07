@@ -183,7 +183,6 @@ def main() -> int:
     candidates = sorted(data_dir.glob("*.compact.bin"))
     if candidates:
         new_counts = np.zeros(len(new_to_old), dtype=np.int64)
-        fallback_id = int(old_to_new[args.unk_token_id])
         for source in candidates:
             dest = source.with_name(source.name.replace(".compact.bin", ".compact2.bin"))
             written, replaced = rewrite_stream(source, dest, old_to_new, fallback, drop=args.drop)

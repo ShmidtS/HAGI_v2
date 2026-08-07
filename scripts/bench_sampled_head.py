@@ -1,4 +1,4 @@
-"""A/B benchmark for the V39 sampled receiver on the active GPU.
+"""A/B benchmark for the V41 sampled receiver on the active GPU.
 
 Compares the retired per-row codebook gather with the production shared-bank
 GEMM at identical N/H/V/K. Both paths include forward and backward.

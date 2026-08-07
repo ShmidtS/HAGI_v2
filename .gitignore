@@ -39,10 +39,7 @@ __pycache__
 .pytest_cache/
 .mypy_cache/
 dist/
-tests/
 *.pyc
-
-
 
 # checkpoints and model weights
 checkpoints/

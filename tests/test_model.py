@@ -77,13 +77,12 @@ class TestForward:
         "overrides",
         [
             {"model.sliding.window": 8},
-            {"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2},
             {"model.embedding.conv_kernel": 1},
             {"model.embedding.tie_lm_head": False},
             {"model.ternary.enabled": False},
             {"train.grad_checkpointing": True},
         ],
-        ids=["windowed", "moe", "no_conv", "untied", "no_ternary", "checkpointing"],
+        ids=["windowed", "no_conv", "untied", "no_ternary", "checkpointing"],
     )
     def test_variants_train_end_to_end(self, overrides):
         cfg = tiny_config(**overrides)
@@ -228,13 +227,6 @@ class TestDiagnostics:
         assert set(stats) == {"qk_gain", "residual_gain", "logit_scale"}
         assert stats["logit_scale"] == pytest.approx(tiny_config().model.hidden_size**-0.5)
 
-    def test_moe_keys_present(self):
-        cfg = tiny_config(
-            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2}
-        )
-        stats = HAGI(cfg).diagnostics()
-        assert "moe/entropy_ratio" in stats and "moe/bias_span" in stats
-
     def test_no_qk_gain_without_qk_norm(self):
         stats = HAGI(tiny_config(**{"model.attention.qk_norm": False})).diagnostics()
         assert "qk_gain" not in stats
@@ -250,23 +242,3 @@ class TestObjective:
         ids, targets = batch()
         out = HAGI(cfg)(ids, targets)
         assert float(out.loss.detach()) > float(out.ce.detach())
-
-    def test_router_z_loss_summed_over_moe_layers(self):
-        cfg = tiny_config(
-            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 1}
-        )
-        cfg.train.moe_z_loss_weight = 1.0
-        model = HAGI(cfg)
-        model.train()
-        out = model(*batch())
-        assert out.router_z_loss is not None
-        assert float(out.router_z_loss.detach()) > 0
-
-    def test_no_router_z_loss_at_eval(self):
-        cfg = tiny_config(
-            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 1}
-        )
-        model = HAGI(cfg).eval()
-        with torch.no_grad():
-            out = model(*batch())
-        assert out.router_z_loss is None

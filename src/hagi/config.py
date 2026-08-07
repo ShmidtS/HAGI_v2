@@ -1,4 +1,4 @@
-"""HAGI V40 configuration -- source-matched conditional channel.
+"""HAGI V41 configuration - source-matched conditional channel.
 
 The current SSOT is source coder -> ternary body -> conditional NCE receiver,
 with periodic exact full-alphabet CE as the coding-cost calibration channel.
@@ -10,7 +10,6 @@ constraints are not silently reintroduced.
     transmit filter         causal depthwise conv (pulse shaping)
     channel                 ternary (b1.58) transformer stack
     correlator              QK-normalized GQA
-    variable-rate coding    MoE with bias-corrected (auxiliary-loss-free) routing
     finite-state channel    sliding-window layers, full-attention relays
     receiver                tied LM head + chunked cross-entropy
 
@@ -24,11 +23,8 @@ What V31 removes from V28/V30, and why (all of it was measured, not guessed):
   * **Off-path HEP refinement + EXIT halt.** Never enabled (``w_refine=0`` in
     every config). Its only live effect was gating a beta-anneal for a loss term
     that was itself disabled.
-  * **SNR-gated water-filling MoE.** The gate multiplied routing logits by
-    ``1 + 1/||residual||``, which is a *temperature reduction*, and the
-    allocator added a log-bias toward experts whose residual was already small.
-    Together: rich-get-richer with no opposing force. Measured ``moe_lb = 8.2``
-    against a ceiling of 8.0 for E=4/top_k=2 — total collapse.
+  * **SNR-gated water-filling router.** Historical experiments collapsed the
+    allocation onto already-favored paths, so no adaptive allocator remains.
   * **Rank-r factored LM head.** A rank-128 head cannot represent the
     conditional distribution: fitting a known full-rank target left 1.42 nats of
     residual KL at r=128 versus 0.92 at r>=512. That is a permanent ~0.5
@@ -42,8 +38,6 @@ What V31 adds:
   * Unigram logit prior (zero-order source code; the network learns only the
     conditional correction — worth ~4.4 nats/token at initialization).
   * QK-norm (keeps the softmax out of saturation under matrix-sign updates).
-  * Auxiliary-loss-free load balancing (routing entropy maximized by a bias
-    controller, so no gradient competes with the LM signal).
   * Optional vocabulary compaction (85,632 of 262,144 symbols are unreachable
     in this corpus; emitting logits for them wastes head FLOPs and forces the
     model to spend capacity suppressing them).
@@ -135,49 +129,6 @@ class FFNConfig:
     multiple_of: int = 128
 
 
-@dataclass
-class MoEConfig:
-    """Mixture of experts with auxiliary-loss-free load balancing.
-
-    MoE is the only lever that grows capacity without growing per-token
-    compute, which makes it the scaling mechanism. Variable-rate coding: each
-    token is assigned to the experts that code it best.
-
-    Balancing uses a per-expert *bias* added to the routing logits before
-    top-k, updated by a controller rather than by gradient descent:
-
-        b_e <- b_e + gamma * sign(load_target - load_e)
-
-    The bias affects selection only, never the combining weights, so it steers
-    routing entropy toward the maximum without adding a gradient that competes
-    with the language-modelling signal. This is why V28's auxiliary CV^2 loss
-    could sit at its ceiling for 50k steps without correcting anything: it was
-    fighting the LM gradient and losing.
-
-    Attributes:
-        enabled: replace the dense FFN with MoE on selected layers.
-        num_experts: number of routed experts E.
-        top_k: experts activated per token.
-        n_shared: always-on experts carrying the common code (their output is
-            added unconditionally, so routed experts specialize on what is left).
-        moe_every: MoE on every Nth layer; layer 0 and the last layer stay dense
-            (routing on an un-mixed or final representation is unstable).
-        bias_update_rate: gamma of the balancing controller. 0 disables it.
-        router_init_std: 0 means ``1/sqrt(H)``.
-        z_loss_weight: penalty on the router's log-partition function; keeps
-            routing logits from drifting to a scale where top-k is numerically
-            arbitrary.
-    """
-
-    enabled: bool = False
-    num_experts: int = 8
-    top_k: int = 2
-    n_shared: int = 1
-    moe_every: int = 2
-    bias_update_rate: float = 0.001
-    router_init_std: float = 0.0
-    z_loss_weight: float = 0.001
-
 
 @dataclass
 class TernaryConfig:
@@ -186,73 +137,6 @@ class TernaryConfig:
     enabled: bool = True
     eps: float = 1e-5
 
-
-@dataclass
-class SpectralConfig:
-    """Recurrent Fourier mixing — parallel causal complex filter.
-
-    A damped-oscillator recurrence ``S_t = A * S_{t-1} + x_t`` with
-    ``A = r * exp(-i*omega)`` is a first-order IIR whose impulse response is a
-    complex sinusoid times a geometric envelope. Read as a channel, it is a
-    sub-quadratic correlator: O(T*K) work and a K-dimensional state instead of
-    the O(T^2) of full attention. Because it is a recurrence it is
-    KV-cacheable at exactly ``2*K`` floats per layer (the complex state),
-    independent of context length.
-
-    The recurrence is evaluated in closed form with a *parallel scan* — no
-    sequential loop over T. Using the identity::
-
-        S(t) = A^tau * S_block_start + A^tau * sum_{j<=tau} x_j A^{-j}
-
-    and the block recursion ``S_end = A^L * S_prev + local_end``, the full
-    sequence is computed with ``T/L`` sequential block steps, each ``O(B*L*K)``,
-    which is exact (no approximation) and ~2 orders of magnitude faster than
-    ``torch.fft`` on this ROCm build.
-
-    Why "Fourier": the frequency response of the filter at frequency ``phi`` is
-    ``r / (1 - r*e^{-i(omega-phi)})`` — a Lorentzian peak centered at ``omega``
-    with width set by ``r``. K oscillators are K band-pass filters; the layer
-    learns *where* in the spectrum the sequence's energy lives. This is the
-    spectral content that attention, which is shift-invariant per pair, cannot
-    directly represent.
-
-    **Grokking acceleration (spectral ramp).** Grokking (memorization then
-    sudden generalization) is accelerated by starting the network with only the
-    low-frequency modes active and releasing high frequencies as training
-    progresses — the "spectral shift hypothesis". ``ramp_steps`` scales the
-    oscillator bandwidths from narrow (low frequencies dominate) to wide over
-    the first ``ramp_steps`` optimizer steps. It is implemented as a running
-    scalar updated by the trainer (see ``commit_controller_updates``), so it
-    needs no auxiliary loss.
-
-    Attributes:
-        enabled: add the spectral branch to selected layers.
-        num_modes: K complex oscillators (band-pass filters).
-        every: add the branch to every Nth layer (0 means none).
-        block_len: parallel-scan block size (T/L sequential steps).
-        freq_base: base frequency of the geometric oscillator spacing.
-        freq_max: highest oscillator frequency (radians per step).
-        damp_min, damp_max: retention r range — the filter's bandwidth.
-        ramp_steps: optimizer steps over which oscillator bandwidths widen
-            from ``damp_min`` (low-freq only) to ``damp_max`` (full spectrum).
-        out_channels: readout width per mode (defaults to H/K); larger is a
-            richer mixing of modes before the residual add.
-        use_2d: treat the head dimension as a second (non-causal) frequency
-            axis, giving a true 2D Fourier structure: row = temporal
-            oscillator, column = harmonic channel mode.
-    """
-
-    enabled: bool = False
-    num_modes: int = 32
-    every: int = 2
-    block_len: int = 64
-    freq_base: float = 0.02
-    freq_max: float = 3.0
-    damp_min: float = 0.90
-    damp_max: float = 0.999
-    ramp_steps: int = 20000
-    out_channels: int = 0
-    use_2d: bool = True
 
 
 @dataclass
@@ -334,12 +218,6 @@ class MultimodalConfig:
             modality independently. Forces the text channel to remain
             self-sufficient (no free-ride on always-present side information)
             and is the multimodal analogue of a Rayleigh fade.
-        waterfill_enabled: reallocate bridge tokens across modalities by a
-            soft water-filling rule on per-modality pooled energy (more tokens
-            to the higher-SNR modality). When False every present modality
-            gets exactly ``n_bridge_queries`` tokens.
-        waterfill_min_rate: floor fraction of ``n_bridge_queries`` any live
-            modality keeps under water-filling (prevents total starvation).
         grounding_weight: multiplier on the off-path InfoNCE+VICReg term.
     """
 
@@ -353,64 +231,8 @@ class MultimodalConfig:
     infonce_temperature: float = 0.07
     variance_gamma: float = 1.0
     modality_dropout: float = 0.0
-    waterfill_enabled: bool = False
-    waterfill_min_rate: float = 0.25
     grounding_weight: float = 1.0
 
-
-@dataclass
-class XMConfig:
-    """Explorative Modeling — best-of-K list decoding on high-entropy positions.
-
-    Forward XM (Gladstone, Ji, Du — arxiv 2607.27372) factors the *training
-    loop* instead of the generation procedure: fix a data target, draw K
-    candidates from the model's own generation, train on the closest. This
-    scales *generative expressivity* — how many modes a prediction can commit
-    to — which ordinary next-token factorization fixes at design time.
-
-    Channel reading: the LM head is a *list decoder*. Standard CE forces one
-    hypothesis (the blur: the mean of all valid continuations, which matches no
-    real continuation). Best-of-K emits K hypotheses (one per mode-code) and
-    keeps the one nearest the received target — the maximum-likelihood decision
-    over K codewords. Gradient flows only through the winner (Algorithm 1).
-
-    Theory (Proposition 1, Appendix F): at large K this is maximum likelihood
-    of a K-component mixture; K=1 is ordinary MLE. Gains grow with scale
-    (4.1x FLOP, 6.2x sample, 47% parameter efficiency measured on image/video/
-    language).
-
-    On the bandwidth-bound Radeon 8060S the head *forward* costs 141ms vs
-    551ms for head backward (both at N=30720, V=32768). Best-of-K adds only
-    K-1 forward passes (cheap) while backward stays through the single winner —
-    so exploration is nearly free relative to its quality gain.
-
-    Attributes:
-        enabled: turn best-of-K exploration on.
-        num_modes: K learnable mode-codes (hypotheses per position).
-        entropy_gate: explore only positions whose conditional entropy exceeds
-            this fraction of the *achievable* maximum — the unigram entropy when
-            a source prior is loaded (8.06 nats on this corpus), else ln(V).
-            Where the next token is unambiguous there is nothing to explore;
-            spending the budget there is wasted forward passes. 0.0 explores
-            everywhere.
-        explore_fraction: additionally keep only the ``explore_fraction``
-            highest-entropy positions *within* the gated set. At initialization
-            the model is near-uniform, so entropy_gate alone fires on ~100% of
-            positions and best-of-K costs K full head passes; capping the
-            fraction bounds the exploration budget while still targeting the
-            genuinely ambiguous tail.
-        mode_std: init std of the mode-code embeddings (small, so a mode is a
-            perturbation of the base prediction, not a new prediction).
-        min_modes: positions below ``entropy_gate`` still get this many
-            candidates (1 = the base prediction, i.e. ordinary CE).
-    """
-
-    enabled: bool = False
-    num_modes: int = 4
-    entropy_gate: float = 0.7
-    explore_fraction: float = 0.2
-    mode_std: float = 0.05
-    min_modes: int = 1
 
 
 @dataclass
@@ -439,12 +261,9 @@ class ModelConfig:
     sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     ffn: FFNConfig = field(default_factory=FFNConfig)
-    moe: MoEConfig = field(default_factory=MoEConfig)
-    spectral: SpectralConfig = field(default_factory=SpectralConfig)
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
-    xm: XMConfig = field(default_factory=XMConfig)
 
 
 @dataclass
@@ -597,15 +416,8 @@ class LoggingConfig:
 class TrainConfig:
     """Training hyperparameters.
 
-    The objective is a single term plus two conditioning penalties:
-
-        loss = CE + z_loss_weight * z_loss + moe_z_loss_weight * router_z_loss
-
-    There is no rate term, no distortion term, no refinement term and no
-    load-balance term. Load balance is handled by the bias controller inside the
-    router; the rate constraint is the ternary quantizer. Every objective that
-    competes with CE for gradient must justify itself, and none of the removed
-    ones could.
+    The objective is cross-entropy plus the receiver z-loss conditioning
+    penalty. The ternary quantizer is the channel-rate constraint.
     """
 
     max_steps: int = 200000
@@ -649,7 +461,6 @@ class TrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     z_loss_weight: float = 0.0001
-    moe_z_loss_weight: float = 0.001
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 1000
     checkpoint_keep_last: int = 3
@@ -706,35 +517,6 @@ def layer_windows(cfg: ModelConfig) -> list[int]:
     return [0 if i % every == 0 else w for i in range(n)]
 
 
-def moe_layers(cfg: ModelConfig) -> list[bool]:
-    """Which layers use MoE.
-
-    Layer 0 and the final layer stay dense. Routing on the first layer's output
-    means routing on something barely different from the raw embedding; routing
-    on the last means the router's decision is never refined downstream. Both
-    are known-unstable placements.
-    """
-    n = cfg.num_layers
-    if not cfg.moe.enabled:
-        return [False] * n
-    every = max(1, cfg.moe.moe_every)
-    return [(i % every == every - 1) and 0 < i < n - 1 for i in range(n)]
-
-
-def spectral_layers(cfg: ModelConfig) -> list[bool]:
-    """Which layers add the recurrent spectral branch.
-
-    Like MoE, layer 0 and the last layer stay pure: the spectral branch is a
-    local-frequency refinement on an already-mixed signal, and routing it onto
-    the raw embedding or the final pre-head state adds noise without a
-    downstream layer to use the correction.
-    """
-    n = cfg.num_layers
-    if not cfg.spectral.enabled:
-        return [False] * n
-    every = max(1, cfg.spectral.every)
-    return [(i % every == every - 1) and 0 < i < n - 1 for i in range(n)]
-
 
 def count_params(cfg: ModelConfig) -> dict[str, int]:
     """Analytic parameter count by group (no model instantiation).
@@ -761,47 +543,15 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
         per_attn += 2 * a.head_dim
 
     per_dense_ffn = 3 * h * inter
-    is_moe = moe_layers(cfg)
-    n_moe = sum(is_moe)
-    experts_per_moe = cfg.moe.num_experts + cfg.moe.n_shared
-    ffn_total = (n - n_moe) * per_dense_ffn + n_moe * (experts_per_moe * per_dense_ffn + h * cfg.moe.num_experts)
     norms = n * 2 * h + h
-    # One BranchScale per residual branch: every layer has an attention branch;
-    # a dense layer has one mixer branch, a MoE layer has one per expert SwiGLU
-    # (num_experts + n_shared).
-    branch_scales = n + (n - n_moe) + n_moe * (cfg.moe.num_experts + cfg.moe.n_shared)
-    # Spectral branch: per selected layer, input proj (h*h_comp), K complex
-    # oscillators (damping logits K + freq buffer non-trainable), mode readout
-    # (2*K*K_out for w_re/w_im), out proj (K_out*h).
-    n_spec = int(sum(spectral_layers(cfg)))
-    if cfg.spectral.enabled and n_spec:
-        sc = cfg.spectral
-        k = sc.num_modes
-        k_out = sc.out_channels or max(1, h // k)
-        per_spec = h * max(8, h // 4) + 2 * k * k_out + k_out * h
-        spectral = n_spec * per_spec
-        branch_scales += n_spec
-    else:
-        spectral = 0
-
-    body = n * per_attn + ffn_total + norms + conv + branch_scales + spectral
-    # The receiver gain (LMHead.logit_scale) is one scalar, always present.
-    body += 1
+    branch_scales = 2 * n
+    body = n * per_attn + n * per_dense_ffn + norms + conv + branch_scales + 1
     return {
         "embedding": embed,
         "lm_head": head,
         "body": body,
         "total": embed + head + body,
-        "active_body": n * per_attn
-        + (n - n_moe) * per_dense_ffn
-        + n_moe * ((cfg.moe.top_k + cfg.moe.n_shared) * per_dense_ffn)
-        + norms
-        + conv
-        + n
-        + (n - n_moe)
-        + n_moe * (cfg.moe.top_k + cfg.moe.n_shared)
-        + spectral
-        + 1,
+        "active_body": body,
     }
 
 
@@ -809,7 +559,6 @@ def auto_configure(
     target_body_params: int,
     vocab_size: int = 262144,
     *,
-    num_experts: int = 0,
     aspect_ratio: float = 80.0,
 ) -> ModelConfig:
     """Solve H, L and head geometry from a *body* parameter budget.
@@ -828,8 +577,6 @@ def auto_configure(
     Args:
         target_body_params: non-embedding parameter budget.
         vocab_size: source alphabet size.
-        num_experts: E>0 enables MoE; the budget then buys *total* parameters,
-            not active ones.
         aspect_ratio: target ``H / L``.
 
     Returns:
@@ -839,9 +586,6 @@ def auto_configure(
         raise ValueError("target_body_params must be positive")
 
     per_layer_h2 = 2.0 + 3.0 * (8.0 / 3.0)
-    if num_experts > 0:
-        # Half the layers are MoE, each holding (E + 1) expert copies of the FFN.
-        per_layer_h2 = 2.0 + 3.0 * (8.0 / 3.0) * (0.5 + 0.5 * (num_experts + 1))
 
     # H^2 * L = target / c  and  L = H / ratio  ->  H = (target * ratio / c)^(1/3)
     hidden = (target_body_params * aspect_ratio / per_layer_h2) ** (1.0 / 3.0)
@@ -863,21 +607,15 @@ def auto_configure(
         probe.attention.num_query_heads = n_q
         probe.attention.num_kv_heads = n_kv
         probe.attention.head_dim = head_dim
-        probe.moe.enabled = num_experts > 0
-        if num_experts > 0:
-            probe.moe.num_experts = num_experts
-            probe.moe.top_k = max(1, min(2, num_experts // 4))
         return probe
 
-    # The closed form ignores FFN width rounding, QK-norm gains and MoE router
-    # weights (7-50% error). H is coarse (multiple of 128), so correcting through
-    # H alone oscillates; instead fix H from the cube root and solve L exactly.
+    # The closed form ignores FFN width rounding and QK-norm gains. H is
+    # coarse (multiple of 128), so correcting through H alone oscillates;
+    # instead fix H from the cube root and solve L exactly.
     #
-    # The exact marginal cost of a layer is recovered as a finite difference of
-    # the analytic count. It must be measured over a span containing the
-    # dense/MoE layer pattern at its steady ratio — a 2-vs-3 difference lands
-    # entirely on one MoE layer and overestimates the marginal cost by ~E times.
-    span = 2 * ModelConfig().moe.moe_every if num_experts > 0 else 1
+    # The exact marginal cost of a layer is recovered as a finite difference
+    # of the analytic count.
+    span = 1
     lo, hi = 4 * span, 12 * span
     layers = max(2, layers)
     for _ in range(8):
@@ -933,9 +671,6 @@ def load_config(path: str | None = None, **overrides: object) -> Config:
             auto = auto_configure(
                 budget,
                 int(model_data.get("vocab_size", cfg.model.vocab_size)),
-                num_experts=int((model_data.get("moe", {}) or {}).get("num_experts", 0))
-                if (model_data.get("moe", {}) or {}).get("enabled")
-                else 0,
             )
             cfg.model = auto
         _apply_dict(cfg, data)
@@ -1008,22 +743,6 @@ def validate_config(cfg: Config) -> None:
     if m.ffn.intermediate_size < 0 or m.ffn.multiple_of < 1:
         raise ValueError("ffn.intermediate_size must be >= 0 and multiple_of >= 1")
 
-    if m.moe.enabled:
-        moe = m.moe
-        if moe.num_experts < 2:
-            raise ValueError("moe.num_experts must be >= 2 (1 expert is a dense FFN)")
-        if not 1 <= moe.top_k <= moe.num_experts:
-            raise ValueError("moe.top_k must be in [1, num_experts]")
-        if moe.n_shared < 0:
-            raise ValueError("moe.n_shared must be >= 0")
-        if moe.bias_update_rate < 0:
-            raise ValueError("moe.bias_update_rate must be >= 0")
-        if not any(moe_layers(m)):
-            raise ValueError(
-                f"moe.enabled with moe_every={moe.moe_every} and num_layers={m.num_layers} "
-                "selects no layer (layer 0 and the last layer stay dense)"
-            )
-
     if m.head.unigram_prior and not m.head.unigram_path:
         raise ValueError("head.unigram_prior requires head.unigram_path")
     if m.head.ce_chunk_rows < 1:
@@ -1042,7 +761,7 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("head.logit_scale_max must be >= 0 (0 = disabled)")
     if m.head.logit_scale_init < 0:
         raise ValueError("head.logit_scale_init must be >= 0 (0 means 1/sqrt(H))")
-    if m.head.z_loss_weight < 0 or t.z_loss_weight < 0 or t.moe_z_loss_weight < 0:
+    if m.head.z_loss_weight < 0 or t.z_loss_weight < 0:
         raise ValueError("z-loss weights must be non-negative")
 
     if t.data.eos_token_id == t.data.pad_token_id:
@@ -1100,23 +819,8 @@ def validate_config(cfg: Config) -> None:
             )
     if not 0.0 <= mm.modality_dropout <= 1.0:
         raise ValueError("multimodal.modality_dropout must be in [0, 1]")
-    if not 0.0 < mm.waterfill_min_rate <= 1.0:
-        raise ValueError("multimodal.waterfill_min_rate must be in (0, 1]")
     if mm.grounding_weight < 0:
         raise ValueError("multimodal.grounding_weight must be non-negative")
-
-    xm = m.xm
-    if xm.enabled:
-        if xm.num_modes < 2:
-            raise ValueError("xm.num_modes must be >= 2 (1 mode is ordinary CE)")
-        if not 0.0 <= xm.entropy_gate <= 1.0:
-            raise ValueError("xm.entropy_gate must be in [0, 1]")
-        if not 0.0 < xm.explore_fraction <= 1.0:
-            raise ValueError("xm.explore_fraction must be in (0, 1]")
-        if xm.mode_std <= 0:
-            raise ValueError("xm.mode_std must be positive")
-        if xm.min_modes < 1:
-            raise ValueError("xm.min_modes must be >= 1")
 
     if cfg.inference.temperature < 0 or cfg.inference.top_k < 0:
         raise ValueError("inference.temperature and top_k must be non-negative")
@@ -1143,10 +847,7 @@ def describe(cfg: Config) -> str:
         f"embed={counts['embedding'] / 1e6:.1f}M active_body={counts['active_body'] / 1e6:.1f}M",
         f"body share of total: {counts['body'] / max(counts['total'], 1):.1%}",
         f"attention: {n_full} full / {m.num_layers - n_full} windowed(W={m.sliding.window})",
-        f"moe: {'on ' + str(m.moe.num_experts) + 'e top' + str(m.moe.top_k) if m.moe.enabled else 'off'}"
-        f" on layers {[i for i, f in enumerate(moe_layers(m)) if f]}",
-        f"spectral: {'on every ' + str(m.spectral.every) if m.spectral.enabled else 'off'}"
-        f" | mm: {'on' if m.multimodal.enabled else 'off'}"
+        f"mm: {'on' if m.multimodal.enabled else 'off'}"
         f" | ternary_cache: {cfg.train.ternary_step_cache}"
         f" | ce_keep: {cfg.train.ce_keep_rate:g}/{cfg.train.ce_keep_mode}"
         f" | sampled_k: {m.head.sampled_softmax_k or 'full'}",

@@ -135,10 +135,8 @@ def linear(
 class SwiGLU(nn.Module):
     """``down(silu(gate(x)) * up(x))`` with no internal residual or norm.
 
-    Used both as the dense mixer body (wrapped by :class:`FeedForward`) and as a
-    single MoE expert, which is why normalization and the residual live in the
-    caller: an expert must not re-normalize a hidden state that the router
-    already normalized.
+    Used as the dense mixer body wrapped by :class:`FeedForward`.
+    Normalization and the residual live in the caller.
 
     Args:
         hidden_size: H.

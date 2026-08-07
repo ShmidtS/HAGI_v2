@@ -48,29 +48,6 @@ model:
     expansion: 1.33
     multiple_of: 64
 
-  moe:
-    enabled: false
-    num_experts: 8
-    top_k: 1
-    n_shared: 0
-    moe_every: 2
-    bias_update_rate: 0.001
-    router_init_std: 0.0
-    z_loss_weight: 1.0e-3
-
-  spectral:
-    enabled: false
-    num_modes: 32
-    every: 4
-    block_len: 64
-    freq_base: 0.02
-    freq_max: 3.0
-    damp_min: 0.90
-    damp_max: 0.999
-    ramp_steps: 20000
-    out_channels: 0
-    use_2d: true
-
   ternary:
     enabled: true
     eps: 1.0e-5
@@ -96,19 +73,9 @@ model:
     bridge_layers: 2
     bridge_heads: 8
     modality_dropout: 0.3
-    waterfill_enabled: false
-    waterfill_min_rate: 0.25
     grounding_weight: 0.1
     infonce_temperature: 0.07
     variance_gamma: 1.0
-
-  xm:
-    enabled: false
-    num_modes: 3
-    entropy_gate: 0.9
-    explore_fraction: 0.2
-    mode_std: 0.1
-    min_modes: 1
 
 train:
   max_steps: 298600
@@ -151,8 +118,6 @@ train:
     exact_ce_rows: 512
 
   z_loss_weight: 1.0e-4
-  moe_z_loss_weight: 1.0e-3
-
   checkpoint_dir: checkpoints_v41_1b
   checkpoint_interval: 1000
   checkpoint_keep_last: 3
