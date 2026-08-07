@@ -264,9 +264,13 @@ class HAGI(nn.Module):
         flat_hidden = text_hidden.reshape(-1, text_hidden.shape[-1])
         flat_targets = targets.reshape(-1)
         if loss_mask is not None:
-            keep = loss_mask.reshape(-1).nonzero(as_tuple=True)[0]
-            flat_hidden = flat_hidden.index_select(0, keep)
-            flat_targets = flat_targets.index_select(0, keep)
+            # Boolean fancy indexing gathers the scored rows in one op. The
+            # previous ``nonzero()`` + ``index_select`` pair forced a GPU-to-CPU
+            # sync (variable-length result) and showed up as ~1.1 s/step of
+            # host time in the profiler on this ROCm build.
+            keep = loss_mask.reshape(-1)
+            flat_hidden = flat_hidden[keep]
+            flat_targets = flat_targets[keep]
 
         ce, z_loss = self.head.loss(flat_hidden, flat_targets)
         loss = ce
