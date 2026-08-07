@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from compact_vocab import BLOCK, build_map, rewrite_stream  # noqa: E402
+from compact_vocab import build_map, rewrite_stream  # noqa: E402
 
 data_dir = Path("data")
 counts = np.load(data_dir / "unigram.npy")

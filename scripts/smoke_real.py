@@ -16,11 +16,11 @@ from hagi.model.model import HAGI
 from hagi.train.loop import Trainer
 
 cfg = load_config(
-    "configs/v31_1b.yaml",
+    "configs/v41_1b.yaml",
     **{
         "model.hidden_size": 128,
         "model.num_layers": 4,
-        "model.vocab_size": 262144,
+        "model.vocab_size": 32768,
         "model.attention.num_query_heads": 4,
         "model.attention.num_kv_heads": 2,
         "model.attention.head_dim": 32,
@@ -59,4 +59,4 @@ for batch in dataloader:
     )
     step += 1
 
-print("baseline = 8.05 (unigram entropy at 262144 vocab)")
+print("baseline = 7.63 (unigram entropy at 32768 vocab)")

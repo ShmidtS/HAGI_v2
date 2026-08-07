@@ -71,20 +71,6 @@ class TestRoundTrip:
         load_model(path2, fresh)
         assert float(fresh.head.logit_scale.detach()) == pytest.approx(0.5)
 
-    def test_moe_controller_state_is_persisted(self, tmp_path):
-        cfg = tiny_config(
-            **{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2}
-        )
-        model = HAGI(cfg)
-        moe = next(b.mixer for b in model.blocks if b.is_moe)
-        with torch.no_grad():
-            moe.expert_bias.copy_(torch.tensor([0.1, -0.2, 0.3, -0.2]))
-        path = save_checkpoint(model, cfg, 1, tmp_path)
-        fresh = HAGI(cfg)
-        load_model(path, fresh)
-        fresh_moe = next(b.mixer for b in fresh.blocks if b.is_moe)
-        assert torch.allclose(fresh_moe.expert_bias, moe.expert_bias)
-
 
 class TestRejection:
     def payload(self, saved, **changes):

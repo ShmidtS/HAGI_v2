@@ -1,10 +1,10 @@
 """Training entry point. Every parameter comes from the YAML config.
 
 Usage:
-    python scripts/train.py --config configs/v40_1b.yaml
-    python scripts/train.py --config configs/v40_1b.yaml --dry-run
-    python scripts/train.py --config configs/v40_1b.yaml --resume
-    python scripts/train.py --config configs/v40_1b.yaml --steps 500 --profile 3
+    python scripts/train.py --config configs/v41_1b.yaml
+    python scripts/train.py --config configs/v41_1b.yaml --dry-run
+    python scripts/train.py --config configs/v41_1b.yaml --resume
+    python scripts/train.py --config configs/v41_1b.yaml --steps 500 --profile 3
 """
 
 from __future__ import annotations

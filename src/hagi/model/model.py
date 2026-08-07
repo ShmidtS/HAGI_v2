@@ -1,4 +1,4 @@
-"""HAGI V40 -- source-matched conditional ternary channel.
+"""HAGI V41: source-matched conditional ternary channel.
 
     tokens (+ optional fixed-rate image/audio prefix)
       -> source coder       (codebook + causal pulse-shaping filter)
@@ -16,17 +16,11 @@ import torch
 import torch.utils.checkpoint as checkpoint_util
 from torch import nn
 
-from hagi.config import (
-    Config,
-    count_params,
-    ffn_width,
-    layer_windows,
-    moe_layers,
-    spectral_layers,
-)
+from hagi.config import Config, count_params, ffn_width, layer_windows
 from hagi.model.attention import AttentionConfig, build_attention_mask
-from hagi.model.block import Block, build_mixer
+from hagi.model.block import Block
 from hagi.model.embedding import SourceEncoder
+from hagi.model.ffn import FeedForward
 from hagi.model.head import LMHead
 from hagi.model.kv_cache import KVCache
 from hagi.model.norms import RMSNorm
@@ -62,8 +56,6 @@ class HAGI(nn.Module):
         loop = max(1, int(m.loop_depth))
         residual_scale = (2.0 * m.num_layers * loop) ** -0.5
         windows = layer_windows(m)
-        is_moe = moe_layers(m)
-        is_spectral = spectral_layers(m)
         intermediate = ffn_width(m)
 
         self.blocks = nn.ModuleList()
@@ -83,8 +75,13 @@ class HAGI(nn.Module):
                 sliding_window=windows[layer],
                 history_stride=m.sliding.history_stride,
             )
-            mixer = build_mixer(
-                h, intermediate, m.moe, is_moe[layer], m.norm_eps, use_ternary, residual_scale, init_ortho
+            mixer = FeedForward(
+                h,
+                intermediate,
+                m.norm_eps,
+                use_ternary,
+                residual_scale,
+                init_ortho,
             )
             self.blocks.append(
                 Block(
@@ -94,12 +91,11 @@ class HAGI(nn.Module):
                     m.norm_eps,
                     use_ternary,
                     residual_scale,
-                    spectral_cfg=m.spectral if m.spectral.enabled else None,
-                    use_spectral=is_spectral[layer],
                     init_orthogonal=init_ortho,
                     rope=shared_rope,
                 )
             )
+
 
         self.out_norm = RMSNorm(h, eps=m.norm_eps)
         self.head = LMHead(
@@ -107,7 +103,6 @@ class HAGI(nn.Module):
             m.vocab_size,
             m.head,
             tied_weight=self.encoder.weight if m.embedding.tie_lm_head else None,
-            xm_cfg=m.xm if m.xm.enabled else None,
         )
 
         self.bridge = None
@@ -119,7 +114,6 @@ class HAGI(nn.Module):
         self._window_layers = windows
         self._uniform_window = windows[0] if len(set(windows)) == 1 else None
         self._loop_depth = loop
-        self._step_for_ramp = 0
 
     def param_summary(self) -> dict[str, int]:
         """Analytic parameter counts by group (see :func:`~hagi.config.count_params`)."""
@@ -139,32 +133,14 @@ class HAGI(nn.Module):
         """Detach all KV-caches and clear the source filter's decode state."""
         for block in self.blocks:
             block.attn.detach_cache()
-            if block.has_spectral:
-                block.spectral.reset_state()
         self.encoder.reset_state()
 
     def commit_controller_updates(self) -> None:
-        """Apply every MoE router's deferred bias update and the spectral ramp.
-
-        Called once per optimizer step after backward. Deferring keeps the
-        forward pure, which activation checkpointing requires: the recomputed
-        forward must select the same experts as the original.
-        """
-        m = self.cfg.model
-        gain_max = float(getattr(m.head, "logit_scale_max", 0.0))
+        """Clamp the sampled receiver gain after an optimizer update."""
+        gain_max = float(self.cfg.model.head.logit_scale_max)
         if gain_max > 0:
             with torch.no_grad():
                 self.head.logit_scale.clamp_(max=gain_max)
-        ramp = m.spectral.ramp_steps if m.spectral.enabled else 0
-        for block in self.blocks:
-            if block.is_moe:
-                block.mixer.commit_bias_update()
-            if block.has_spectral and ramp > 0:
-                block.spectral.update_ramp(self._step_for_ramp)
-
-    def set_step_counter(self, step: int) -> None:
-        """Record the current optimizer step for the spectral ramp."""
-        self._step_for_ramp = int(step)
 
     def _run_blocks(
         self,
@@ -209,18 +185,13 @@ class HAGI(nn.Module):
                     )
 
         loops = self._loop_depth if not use_state else 1
-        for loop_i in range(loops):
-            # Only the outermost pass of a looped stack may use spectral
-            # decode state / KV write semantics; inner loops are pure.
-            loop_use_state = use_state and loop_i == 0
+        for _ in range(loops):
             for block, window in zip(self.blocks, self._window_layers, strict=True):
                 mask = mask_by_window[window]
                 if checkpointing:
-                    h = checkpoint_util.checkpoint(
-                        block, h, positions, mask, loop_use_state, use_reentrant=False
-                    )
+                    h = checkpoint_util.checkpoint(block, h, positions, mask, use_reentrant=False)
                 else:
-                    h = block(h, positions, mask, use_spectral_state=loop_use_state)
+                    h = block(h, positions, mask)
         return h
 
     def forward(
@@ -302,14 +273,6 @@ class HAGI(nn.Module):
         if self.cfg.train.z_loss_weight > 0:
             loss = loss + self.cfg.train.z_loss_weight * z_loss
 
-        router_z = None
-        for block in self.blocks:
-            if block.is_moe and block.mixer.last_router_z_loss is not None:
-                term = block.mixer.last_router_z_loss
-                router_z = term if router_z is None else router_z + term
-        if router_z is not None and self.cfg.train.moe_z_loss_weight > 0:
-            loss = loss + self.cfg.train.moe_z_loss_weight * router_z
-
         grounding = None
         if self.bridge is not None and modal_pooled is not None:
             text_pooled = text_hidden.float().mean(dim=1)
@@ -321,7 +284,6 @@ class HAGI(nn.Module):
         out.loss = loss
         out.ce = ce
         out.z_loss = z_loss
-        out.router_z_loss = router_z
         out.grounding = grounding
         out.n_tokens = int(flat_targets.numel())
         return out
@@ -330,8 +292,6 @@ class HAGI(nn.Module):
     def diagnostics(self) -> dict[str, float]:
         """Scalar observables that identify *which* failure mode is active.
 
-        * ``moe/entropy_ratio`` — usable fraction of the expert channels;
-          decaying toward ``1/E`` means routing collapse.
         * ``qk_gain`` — mean QK-norm gain; a rising value is the leading
           indicator of softmax saturation.
         * ``residual_gain`` — mean output-norm gain; tracks stream scale drift.
@@ -341,18 +301,9 @@ class HAGI(nn.Module):
           toward 0 means the head has given up and is emitting the prior.
         """
         stats: dict[str, float] = {}
-        moe_blocks = [b for b in self.blocks if b.is_moe]
-        if moe_blocks:
-            per_block = [b.mixer.load_stats() for b in moe_blocks]
-            for key in per_block[0]:
-                stats[f"moe/{key}"] = sum(s[key] for s in per_block) / len(per_block)
-
         gains = [b.attn.q_norm.weight.abs().mean() for b in self.blocks if b.attn.q_norm is not None]
         if gains:
             stats["qk_gain"] = float(torch.stack(gains).mean())
         stats["residual_gain"] = float(self.out_norm.weight.abs().mean())
         stats["logit_scale"] = float(self.head.logit_scale)
-        spec_blocks = [b.spectral for b in self.blocks if b.has_spectral]
-        if spec_blocks:
-            stats["spectral_ramp"] = float(spec_blocks[0]._ramp)
         return stats

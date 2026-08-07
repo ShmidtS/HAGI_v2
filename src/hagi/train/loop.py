@@ -12,8 +12,7 @@ unless you are watching the right observables. The three that matter here:
   model above that is worse than counting token frequencies.
 * ``qk_gain`` — the mean QK-norm gain. Rising means the correlator is heading for
   saturation, which is the V30 failure (ce 2.32 at step 19k, 6.6 at step 53k).
-* ``moe/entropy_ratio`` — the usable fraction of expert channels. Falling toward
-  ``1/E`` means routing has collapsed and most parameters are dead.
+* ``logit_scale`` — receiver gain, which should rise as the channel learns.
 
 Gradient accumulation weights each microbatch by its scored-token count, so
 microbatches of unequal size (packed windows with different loss masks) average
@@ -113,10 +112,7 @@ def cast_model(model: nn.Module, precision: str) -> None:
       to zero and every normalization layer stays frozen at its initialization
       for the entire run.
     * **The receiver gain.** One scalar controlling the whole output
-      distribution's sharpness, starting at ``1/sqrt(H)`` ~ 0.022.
-    * **The MoE router.** Top-k over E logits compares nearby numbers; at a 7-bit
-      mantissa the ordering of two close experts becomes arbitrary, which turns
-      routing into noise the balance controller then chases.
+      distribution's sharpness, starting at ``1/sqrt(H)`` ~0.022.
 
     Cost is a few times ``L * H`` parameters' worth of memory, which is
     negligible against the body, and it is not optional.
@@ -265,7 +261,6 @@ class Trainer:
         ce_sum = 0.0
         loss_sum = 0.0
         z_sum = 0.0
-        router_z_sum = 0.0
         exact_ce_value: float | None = None
         exact_interval = int(cfg.train.logging.exact_ce_interval)
         for microbatch_index, ((batch, _mask), count) in enumerate(
@@ -308,11 +303,6 @@ class Trainer:
             ce_sum += float(output.ce.detach()) * weight
             loss_sum += float(output.loss.detach()) * weight
             z_sum += float(output.z_loss.detach()) * weight if output.z_loss is not None else 0.0
-            router_z_sum += (
-                float(output.router_z_loss.detach()) * weight
-                if output.router_z_loss is not None
-                else 0.0
-            )
             del output
 
         body_norm, rest_norm = clip_gradients_by_group(model, cfg.train.max_grad_norm)
@@ -346,12 +336,6 @@ class Trainer:
         if use_ternary_cache:
             clear_ternary_weights(model)
 
-        # Controller updates go after the optimizer step, outside any
-        # checkpointed region, so the forward stays pure and recomputation
-        # reproduces the same expert selection. The spectral ramp needs the
-        # *next* step counter, so set it before the controllers run.
-        if hasattr(model, "set_step_counter"):
-            model.set_step_counter(self.step)
         if hasattr(model, "commit_controller_updates"):
             model.commit_controller_updates()
 
@@ -363,7 +347,6 @@ class Trainer:
             "bpt": ce_sum / math.log(2.0),
             "ppl": math.exp(min(ce_sum, 20.0)),
             "z_loss": z_sum,
-            "router_z_loss": router_z_sum,
             "grad_norm": body_norm,
             "body_grad_norm": body_norm,
             "rest_grad_norm": rest_norm,
@@ -407,10 +390,6 @@ def format_metrics(metrics: dict) -> str:
         "qk_gain",
         "residual_gain",
         "logit_scale",
-        "moe/entropy_ratio",
-        "moe/max_load",
-        "moe/bias_span",
-        "spectral_ramp",
     ):
         if key in metrics:
             parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")

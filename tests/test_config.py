@@ -20,7 +20,6 @@ from hagi.config import (
     describe,
     ffn_width,
     layer_windows,
-    moe_layers,
     validate_config,
 )
 from hagi.model.model import HAGI
@@ -38,22 +37,15 @@ class TestParamCount:
             {"model.embedding.conv_kernel": 1},
             {"model.attention.qk_norm": False},
             {"model.sliding.window": 16},
-            {"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.moe_every": 2},
-            {"model.moe.enabled": True, "model.moe.num_experts": 3, "model.moe.n_shared": 0},
             {"model.ffn.intermediate_size": 96},
         ],
-        ids=["dense", "untied", "no_conv", "no_qknorm", "windowed", "moe4", "moe_no_shared", "explicit_ffn"],
+        ids=["dense", "untied", "no_conv", "no_qknorm", "windowed", "explicit_ffn"],
     )
     def test_analytic_equals_real(self, overrides):
         cfg = tiny_config(**overrides)
         model = HAGI(cfg)
         real = sum(p.numel() for p in model.parameters())
         assert count_params(cfg.model)["total"] == real
-
-    def test_active_body_below_total_under_moe(self):
-        cfg = tiny_config(**{"model.moe.enabled": True, "model.moe.num_experts": 4, "model.moe.top_k": 1})
-        counts = count_params(cfg.model)
-        assert counts["active_body"] < counts["body"]
 
     def test_active_body_equals_body_when_dense(self):
         counts = count_params(tiny_config().model)
@@ -75,15 +67,6 @@ class TestLayerPatterns:
 
     def test_window_zero_is_all_full(self):
         assert layer_windows(tiny_config().model) == [0] * 4
-
-    def test_moe_skips_first_and_last(self):
-        cfg = tiny_config(**{"model.moe.enabled": True, "model.moe.moe_every": 1})
-        flags = moe_layers(cfg.model)
-        assert not flags[0] and not flags[-1]
-        assert any(flags)
-
-    def test_moe_disabled_selects_nothing(self):
-        assert moe_layers(tiny_config().model) == [False] * 4
 
     def test_ffn_width_rounds_up(self):
         cfg = tiny_config()
@@ -143,13 +126,6 @@ class TestValidation:
         cfg = tiny_config()
         cfg.model.head.unigram_prior = True
         cfg.model.head.unigram_path = ""
-        with pytest.raises(ValueError):
-            validate_config(cfg)
-
-    def test_moe_selecting_no_layer_rejected(self):
-        cfg = tiny_config()
-        cfg.model.moe.enabled = True
-        cfg.model.moe.moe_every = 99
         with pytest.raises(ValueError):
             validate_config(cfg)
 

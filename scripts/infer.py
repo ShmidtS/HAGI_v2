@@ -1,5 +1,5 @@
 """
-Интерактивный диалог с HAGI v31.
+Интерактивный диалог с HAGI V41.
 
 - Устройство выбирается автоматически: cuda (ROCm/NVIDIA), иначе cpu.
 - Непрерывный цикл: после ответа снова спрашивает prompt.
@@ -7,8 +7,8 @@
   запроса (с обрезкой до attention.max_seq_len).
 
 Примеры:
-  python scripts/infer.py --checkpoint checkpoints_v31_1b/step-0030000.pt
-  python scripts/infer.py --checkpoint_dir checkpoints_v31_1b --max_tokens 256
+  python scripts/infer.py --checkpoint checkpoints_v41_1b/step-0030000.pt
+  python scripts/infer.py --checkpoint_dir checkpoints_v41_1b --max_tokens 256
   python scripts/infer.py --checkpoint ... --prompt "Привет" --device cuda
 
 Выход из диалога: пустая строка, "exit", "quit" или Ctrl+C.
@@ -26,8 +26,8 @@ import os
 # иначе SDPA падает на медленный math-бэкенд.
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
-import torch
 import numpy as np
+import torch
 
 from hagi.inference.generate import generate
 from hagi.model.model import HAGI
@@ -69,7 +69,7 @@ def decode_text(tokenizer, ids, vocab_map=None) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Интерактивный диалог HAGI v31")
+    ap = argparse.ArgumentParser(description="Интерактивный диалог HAGI V41")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--checkpoint_dir", default=None)
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
