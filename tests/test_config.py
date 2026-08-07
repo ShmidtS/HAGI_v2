@@ -132,6 +132,33 @@ class TestValidation:
     def test_default_config_is_valid(self):
         validate_config(Config())
 
+    def test_window_zero_allows_full_every(self):
+        """W=0 means all layers are full-attention — full_every is irrelevant."""
+        cfg = tiny_config()
+        cfg.model.sliding.window = 0
+        cfg.model.sliding.full_every = 4
+        validate_config(cfg)  # should not raise
+        assert all(w == 0 for w in layer_windows(cfg.model))
+
+    def test_window_zero_with_full_every_one(self):
+        cfg = tiny_config()
+        cfg.model.sliding.window = 0
+        cfg.model.sliding.full_every = 1
+        validate_config(cfg)
+
+    def test_v42_config_loads(self):
+        """V42 config (W=0, T=512, ce_keep=0.5) loads and validates."""
+        from hagi.config import load_config
+        import pathlib
+        path = pathlib.Path(__file__).parent.parent / "configs" / "v42_1b.yaml"
+        if path.exists():
+            cfg = load_config(str(path))
+            assert cfg.model.sliding.window == 0
+            assert cfg.train.data.seq_len == 512
+            assert cfg.train.ce_keep_rate == 0.5
+            assert cfg.train.batch_size == 48
+            assert all(w == 0 for w in layer_windows(cfg.model))
+
 
 class TestApplyDict:
     def test_unknown_key_raises(self):

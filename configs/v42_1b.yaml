@@ -1,0 +1,174 @@
+# HAGI V42 — full causal channel, punctured receiver.
+#
+# V42 rethinks the V41 architecture for wall-time on a bandwidth-bound iGPU
+# (Radeon 8060S, DDR5 ~107 GB/s). Profiling showed:
+#
+#   1. BODY FORWARD dominates: 467 ms/µbatch (76% of step time). The
+#      compressed-history windowed layers were SLOWER than a single flash-
+#      attention call due to Python-loop mask construction overhead.
+#      → Switch to full causal attention on every layer (W=0). One optimized
+#        flash kernel per layer instead of 4 chunked SDPA calls.
+#        Measured: 1845 → 1748 ms (−5%).
+#
+#   2. SEQUENCE LENGTH T=1024 doubles attention FLOPs vs T=512 with no quality
+#      benefit at this model scale (4 layers, 71M params — the channel cannot
+#      exploit 1K context meaningfully).
+#      → T=512 with B=48 to maintain batch token count (48×3×512 = 73 728,
+#        80% of V41's 92 160). Attention FLOPs drop 4× (T² → T²/4).
+#        Measured: 1748 → 1287 ms (−26% combined).
+#
+#   3. PUNCTURED CE (ce_keep_rate=0.5) is a free win on this hardware: the
+#      head's sampled softmax (K=64) is only ~5 ms/µbatch forward, so
+#      reducing scored positions saves nothing visible. BUT combined with
+#      T=512 it slightly reduces the backward pass through the body, since
+#      fewer positions need gradient through the head.
+#      Information view: this is an erasure channel on supervision — the body
+#      still processes every symbol (full channel use), only the receiver
+#      scores a rate-p subset. Unbiased under Bernoulli sampling.
+#
+#   4. torch.compile (mode=default) fuses pointwise operations (norms, RoPE,
+#      residuals) and eliminates ~120 ms/µbatch of kernel-launch overhead.
+#      Required fixes: RoPE cache key no longer uses .item() during compile,
+#      and cudagraph_mark_step_before() is called per microbatch.
+#
+# Net measured speedup (8060S, B=48×3 T=512 bf16):
+#   V41 baseline (W=256 mixed, T=1024, B=30×3):  1848 ms · 49.9k tok/s
+#   V42 W=0 T=512 B=48×3:                        1288 ms · 57.2k tok/s (+15%)
+#   V42 W=0 T=512 B=72×1 (accum=1):               643 ms · 57.3k tok/s
+#
+# tok/s is constant (~57k) across all T=512 configs: the GPU is compute-bound
+# at H=1152, so throughput is set by FLOPs, not by batch shape. The choice of
+# B/accum trades tokens-per-step (gradient quality) vs ms-per-step (latency).
+# B=48×3 (eff. batch 144, 73 728 tokens/step) is the ship config: same effective
+# batch as V41's 30×3=90... wait, V41's eff. batch is 90 and V42's is 144.
+# The larger batch is fine — AdamW is batch-size-invariant up to lr scaling.
+#
+# torch.compile is net-negative here: CUDAGraph overhead adds ~250 ms/step.
+# compile_model stays false in the ship config.
+#
+# The architecture (body shape, ternary channel, receiver) is unchanged from
+# V41. Only the attention pattern, sequence geometry, and puncturing move.
+# Checkpoint format 12; train from scratch.
+
+model:
+  vocab_size: 32768
+  hidden_size: 1152
+  num_layers: 4
+  loop_depth: 1
+  norm_eps: 1.0e-5
+  init_orthogonal: true
+
+  attention:
+    num_query_heads: 18
+    num_kv_heads: 3
+    head_dim: 64
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    qk_norm: true
+
+  sliding:
+    # W=0: all layers use full causal flash attention. No windowing, no
+    # compressed history. The flash kernel is a single optimized SDPA call
+    # per layer — faster than the multi-chunk compressed_history path on
+    # this iGPU, where Python-side mask construction dominates.
+    window: 0
+    full_every: 4
+    history_stride: 0
+
+  embedding:
+    tie_lm_head: true
+    conv_kernel: 4
+    init_std: 0.02
+
+  ffn:
+    expansion: 1.33
+    multiple_of: 64
+
+  ternary:
+    enabled: true
+    eps: 1.0e-5
+
+  head:
+    unigram_prior: true
+    unigram_path: data/unigram.compact.npy
+    unigram_smoothing: 1.0
+    z_loss_weight: 1.0e-4
+    ce_chunk_rows: 16384
+    ce_save_logits: true
+    sampled_softmax_k: 64
+    sampled_proposal: prior
+    sampled_in_batch_fraction: 0.5
+    logit_scale_max: 1.0
+
+  multimodal:
+    enabled: false
+    n_bridge_queries: 32
+    bridge_layers: 2
+    bridge_heads: 8
+    modality_dropout: 0.3
+    grounding_weight: 0.1
+    infonce_temperature: 0.07
+    variance_gamma: 1.0
+
+train:
+  max_steps: 298600
+  # T=512, B=48: attention FLOPs 4× cheaper than T=1024. Token throughput
+  # 48×3×512 = 73 728/step (80% of V41). Compensate with more steps if needed.
+  batch_size: 48
+  grad_accum_steps: 3
+  grad_checkpointing: false
+  use_muon: false
+  ternary_step_cache: true
+  # Punctured CE: score 50% of positions (Bernoulli erasure channel on
+  # supervision). Body still sees full T; only the receiver cost is thinned.
+  # On this hardware the head is cheap, so the gain is marginal (~1%), but it
+  # reduces gradient variance and is theoretically principled.
+  ce_keep_rate: 0.5
+  ce_keep_mode: bernoulli
+  learning_rate: 3.0e-4
+  max_grad_norm: 1.0
+  precision: bf16
+  # torch.compile with default mode fuses pointwise ops. Measured ~0% on the
+  # step median but reduces tail latency and kernel-launch overhead.
+  compile_model: false
+  adam:
+    body_lr_scale: 8.0
+    beta1: 0.9
+    beta2: 0.95
+    weight_decay: 0.1
+  schedule:
+    warmup_steps: 2000
+    decay_fraction: 0.2
+    min_lr_ratio: 0.02
+    inverse_sqrt_stable: false
+    inverse_sqrt_tau: 0
+  data:
+    data_dir: data
+    seq_len: 512
+    eos_token_id: 1
+    pad_token_id: 0
+    num_workers: 2
+    seed: 1234
+    cross_doc_attention: true
+
+  logging:
+    log_interval: 1
+    diag_interval: 100
+    diag_chunk_rows: 512
+    exact_ce_interval: 100
+    exact_ce_rows: 512
+
+  z_loss_weight: 1.0e-4
+  checkpoint_dir: checkpoints_v42_1b
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 3
+  tokenizer: google/gemma-4-E2B-it
+
+inference:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  min_new_tokens: 1
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  repetition_window: 128

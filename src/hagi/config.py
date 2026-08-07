@@ -735,6 +735,8 @@ def validate_config(cfg: Config) -> None:
             f"sliding.window={m.sliding.window} with full_every={m.sliding.full_every} makes every "
             "layer a full-attention relay, silently ignoring the window; set window=0 to disable it"
         )
+    # window=0 means all layers are full-attention (W=0 disables windowing).
+    # The "no relay" check only applies when window > 0 and full_every > 1.
     if m.sliding.window > 0 and m.sliding.full_every > 1 and all(w > 0 for w in layer_windows(m)):
         raise ValueError("sliding-window config leaves no full-attention relay layer")
 

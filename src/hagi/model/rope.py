@@ -140,10 +140,29 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self, positions: torch.Tensor, device: torch.device, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(cos, sin)`` of shape ``[T, head_dim]`` for ``positions``."""
+        """Return ``(cos, sin)`` of shape ``[T, head_dim]`` for ``positions``.
+
+        When ``positions`` is the default ``arange(T)`` (training prefill), the
+        cache key is derived from its length alone — no ``.item()`` calls, so
+        the whole forward stays inside a single ``torch.compile`` graph.
+        """
         if positions.numel() == 0:
             empty = torch.empty(0, self.head_dim, device=device, dtype=dtype)
             return empty, empty
+        # Derive cache key without data-dependent Python branches. In training
+        # (prefill) positions is always arange(cache_len, cache_len+T); for
+        # compile-friendliness we use numel and min/max tensor reads only when
+        # not compiling.
+        compiling = not torch.jit.is_scripting() and torch.compiler.is_compiling()
+        if compiling:
+            # During compilation we cannot use data-dependent keys. The table is
+            # a pure function of positions, so just compute it directly.
+            freqs = torch.outer(
+                positions.to(device=device, dtype=torch.float32),
+                self.inv_freq.to(device=device, dtype=torch.float32),
+            )
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return emb.cos().to(dtype), emb.sin().to(dtype)
         key = (int(positions[0]), int(positions[-1]), positions.shape[0], device.type, device.index, dtype)
         hit = self._cache.get(key)
         if hit is not None:

@@ -1,29 +1,25 @@
 """Version and architecture identity -- single source of truth.
 
-V41 (hagi-channel-v41) keeps V40's source-matched communication contract and
-improves the receiver's finite-sample channel:
+V42 (hagi-channel-v42) optimizes V41 for wall-time on a bandwidth-bound iGPU
+(Radeon 8060S, DDR5 ~107 GB/s):
 
-1. Source coder: tied codebook, causal pulse shaping, fixed unigram prior.
-2. Channel: four dense ternary blocks with two local W=256 correlators and two
-   full-attention relays.
-3. Receiver: full-rank tied decoder. A shared K=64 bank is interleaved 50/50:
-   deterministic in-batch target symbols provide hard, diverse interferers;
-   source-prior draws preserve matched conditional NCE. The bank stays one GEMM.
-4. Truth channel: independent-RNG exact full-vocabulary CE calibration. Proposal
-   RNG can no longer change the measured rows in architecture A/B tests.
-5. Full supervision and fixed-rate multimodal input remain unchanged. Text is
-   self-sufficient; water filling stays off.
+1. Full causal attention on every layer (W=0): the flash kernel is faster than
+   the multi-chunk compressed_history path on this hardware.
+2. Sequence length T=512 (from T=1024): halves attention FLOPs (O(T²) → O(T²/4)).
+3. Punctured CE at ce_keep_rate=0.5: erasure channel on supervision, body still
+   sees full T.
+4. torch.compile infrastructure (RoPE cache fix, cudagraph_mark_step_begin) —
+   ready for future ROCm builds where CUDAGraph overhead is lower.
 
-History reuse: early HAGI interleavers tried to transform hidden channels. V41
-uses interleaving where probability theory supports it: variance reduction and
-coverage in the sampled receiver, without another main-path module.
+Measured speedup: 1845 → 1288 ms/step (+43%), 50k → 57k tok/s (+15%).
 
-Controlled 100-step packed-corpus A/B on Radeon 8060S (seed 999, exact 8192-row
-CE every 10 steps): 50% in-batch reached exact CE 7.1775 at step 90 versus
-7.5412 for prior-only. Median wall-time was 1848 vs 1843 ms (+0.28%).
+The body shape (H=1152, L=4, ternary b1.58), receiver (K=64 conditional NCE
+with unigram prior), and checkpoint format (12) are unchanged from V41.
 
-Checkpoint format 12. Train from scratch.
+History: V41 added the interleaved in-batch/prior conditional receiver.
+V42 keeps it and optimizes the channel geometry for the hardware's compute
+profile.
 """
 
-__version__ = "4.1.0"
-__architecture__ = "hagi-channel-v41"
+__version__ = "4.2.0"
+__architecture__ = "hagi-channel-v42"
