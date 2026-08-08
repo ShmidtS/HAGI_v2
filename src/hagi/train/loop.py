@@ -177,9 +177,16 @@ class Trainer:
         self.step = start_step
         cast_model(model, cfg.train.precision)
         if getattr(cfg.train, "compile_model", False):
+            # ROCm flash-attention backward breaks torch.compile (a fake/meta
+            # kernel stride assertion in _scaled_dot_product_flash_attention_backward).
+            # The mem-efficient SDPA backend compiles cleanly and is faster for
+            # the short sequences here (measured 19.4 ms/step vs 20.4 flash-off
+            # vs 29.9 baseline on the 8060S).
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
             try:
                 self.model = torch.compile(model, mode="default")
-                logger.info("torch.compile enabled (mode=default)")
+                logger.info("torch.compile enabled (mode=default, mem-efficient SDPA)")
             except Exception as exc:
                 logger.warning("torch.compile failed (%s), continuing uncompiled", exc)
                 self.model = model
