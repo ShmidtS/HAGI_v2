@@ -133,6 +133,10 @@ def main() -> int:
         return 1
 
     model = HAGI(cfg).to(device)
+    if cfg.merge.enabled:
+        from hagi.model.merge import MergedHAGI
+
+        model = MergedHAGI(cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale).to(device)
     state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
     model.load_state_dict(state["model"] if "model" in state else state, strict=True)
     cast_model(model, cfg.train.precision)  # bf16 + fp32-гейны, как в обучении

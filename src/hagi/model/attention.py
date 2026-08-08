@@ -53,6 +53,7 @@ class AttentionConfig:
     qk_norm: bool = True
     sliding_window: int = 0  # 0 = full attention
     history_stride: int = 0
+    per_head_qk: bool = False  # per-head QK gain (block-diagonal expert merge)
 
 
 
@@ -206,8 +207,16 @@ class Attention(nn.Module):
         else:
             nn.init.normal_(self.out_proj.weight, std=residual_scale / hidden_size**0.5)
 
-        self.q_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
-        self.k_norm = HeadNorm(cfg.head_dim, eps=norm_eps) if cfg.qk_norm else None
+        self.q_norm = (
+            HeadNorm(cfg.head_dim, eps=norm_eps, per_head=cfg.per_head_qk, n_heads=cfg.num_heads)
+            if cfg.qk_norm
+            else None
+        )
+        self.k_norm = (
+            HeadNorm(cfg.head_dim, eps=norm_eps, per_head=cfg.per_head_qk, n_heads=cfg.num_kv_heads)
+            if cfg.qk_norm
+            else None
+        )
         # Shared RoPE across layers (same head_dim/theta) — one table, one cache.
         self.rope = rope if rope is not None else RotaryEmbedding(cfg.head_dim, rope_theta=cfg.rope_theta)
         self.branch_scale = BranchScale(residual_scale)

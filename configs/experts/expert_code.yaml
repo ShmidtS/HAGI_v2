@@ -1,0 +1,101 @@
+model:
+  vocab_size: 32768
+  hidden_size: 128
+  num_layers: 3
+  loop_depth: 1
+  norm_eps: 1.0e-05
+  init_orthogonal: true
+  attention:
+    num_query_heads: 2
+    num_kv_heads: 1
+    head_dim: 64
+    rope_theta: 10000.0
+    max_seq_len: 4096
+    qk_norm: true
+  sliding:
+    window: 0
+    full_every: 4
+    history_stride: 0
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+    init_std: 0.02
+  ffn:
+    expansion: 0.5
+    multiple_of: 64
+  ternary:
+    enabled: true
+    eps: 1.0e-05
+  head:
+    unigram_prior: true
+    unigram_path: data/unigram.compact.npy
+    unigram_smoothing: 1.0
+    z_loss_weight: 0.0001
+    ce_chunk_rows: 16384
+    ce_save_logits: true
+    sampled_softmax_k: 2048
+    sampled_proposal: prior
+    sampled_in_batch_fraction: 0.5
+    logit_scale_max: 1.0
+  multimodal:
+    enabled: false
+    n_bridge_queries: 32
+    bridge_layers: 2
+    bridge_heads: 8
+    modality_dropout: 0.3
+    grounding_weight: 0.1
+    infonce_temperature: 0.07
+    variance_gamma: 1.0
+train:
+  max_steps: 20000
+  batch_size: 256
+  grad_accum_steps: 1
+  grad_checkpointing: false
+  use_muon: false
+  ternary_step_cache: true
+  ce_keep_rate: 0.25
+  ce_keep_mode: stride
+  learning_rate: 0.0003
+  max_grad_norm: 1.0
+  precision: bf16
+  compile_model: true
+  adam:
+    body_lr_scale: 8.0
+    beta1: 0.9
+    beta2: 0.95
+    weight_decay: 0.1
+  schedule:
+    warmup_steps: 500
+    decay_fraction: 0.2
+    min_lr_ratio: 0.02
+    inverse_sqrt_stable: false
+    inverse_sqrt_tau: 0
+  data:
+    data_dir: data
+    seq_len: 128
+    eos_token_id: 1
+    pad_token_id: 0
+    num_workers: 2
+    seed: 1234
+    cross_doc_attention: true
+    weights:
+      python_instruct: 1.0
+  logging:
+    log_interval: 100
+    diag_interval: 100
+    diag_chunk_rows: 512
+    exact_ce_interval: 100
+    exact_ce_rows: 512
+  z_loss_weight: 0.0001
+  checkpoint_dir: checkpoints_experts/code
+  checkpoint_interval: 1000
+  checkpoint_keep_last: 2
+  tokenizer: google/gemma-4-E2B-it
+inference:
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  min_new_tokens: 1
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  repetition_window: 128
