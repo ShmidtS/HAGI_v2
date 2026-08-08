@@ -468,6 +468,43 @@ class TrainConfig:
 
 
 @dataclass
+class MergeConfig:
+    """Block-diagonal expert merge (train-many-small, merge-into-big).
+
+    Each small expert (hidden_size = ``expert_hidden``) is trained to
+    saturation on its own corpus, then the N experts are concatenated
+    block-diagonally into one model of ``hidden_size = N * expert_hidden``.
+    The merged model starts as N independent sub-networks (the off-diagonal
+    blocks are zero); a small number of cross-block ``CrossMixer`` layers
+    (identity-init, gain 0) are the only new connections, and short joint
+    training teaches the blocks to interact.
+
+    Attributes:
+        enabled: build a :class:`~hagi.model.merge.MergedHAGI` instead of a
+            plain :class:`~hagi.model.model.HAGI`.
+        n_experts: number of experts to merge (N).
+        expert_hidden: per-expert hidden width H_i. The merged model's
+            ``model.hidden_size`` must equal ``n_experts * expert_hidden``.
+        expert_checkpoints: paths to the N expert ``step-*.pt`` checkpoints,
+            in block order. When empty, the merge falls back to replicating
+            the current model's weights N times (for machinery smoke tests).
+        mixer_init_scale: initial gain of each cross-block mixer. 0 makes
+            the merged model exactly N independent experts at step 0.
+        freeze_experts: when True, freeze every parameter except the
+            cross-block mixers (``mixers.*``). This is the "train only the
+            Cross-Expert Mixer" mode: the experts' weights are frozen and
+            only the mixer connections learn. Requires ``enabled=True``.
+    """
+
+    enabled: bool = False
+    n_experts: int = 4
+    expert_hidden: int = 128
+    expert_checkpoints: list[str] = field(default_factory=list)
+    mixer_init_scale: float = 0.0
+    freeze_experts: bool = False
+
+
+@dataclass
 class InferenceConfig:
     """Generation parameters."""
 
@@ -487,6 +524,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
 
 
 def _round_up(value: int, multiple: int) -> int:

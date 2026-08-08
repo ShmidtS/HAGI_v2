@@ -41,6 +41,18 @@ class HAGI(nn.Module):
         h = m.hidden_size
         use_ternary = m.ternary.enabled
 
+        # Block-diagonal expert merge: the body is built from N experts whose
+        # hidden spaces are concatenated. The merged model's head geometry must
+        # keep each expert's query heads attending only to that expert's kv
+        # heads (block-diagonal attention), so num_query_heads = N * q_per_exp
+        # and num_kv_heads = N * kv_per_exp.
+        n_exp = max(1, int(getattr(cfg.merge, "n_experts", 1) or 1))
+        if getattr(cfg.merge, "enabled", False) and h % n_exp != 0:
+            raise ValueError(f"hidden_size {h} must be divisible by n_experts {n_exp}")
+        # Per-head QK gains are only needed when the body is a block-diagonal
+        # merge of multiple experts; a plain model keeps one shared gain.
+        self._n_experts = n_exp if getattr(cfg.merge, "enabled", False) else 1
+
         self.encoder = SourceEncoder(
             vocab_size=m.vocab_size,
             hidden_size=h,
@@ -74,6 +86,7 @@ class HAGI(nn.Module):
                 qk_norm=m.attention.qk_norm,
                 sliding_window=windows[layer],
                 history_stride=m.sliding.history_stride,
+                per_head_qk=self._n_experts > 1,
             )
             mixer = FeedForward(
                 h,

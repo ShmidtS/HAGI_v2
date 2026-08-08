@@ -173,6 +173,23 @@ def main() -> int:
         logger.info("  %s", line)
 
     model = HAGI(cfg).to(device)
+    if cfg.merge.enabled:
+        from hagi.model.merge import MergedHAGI, merge_experts
+
+        if cfg.merge.expert_checkpoints:
+            from hagi.train.checkpoint import load_payload
+
+            states = [load_payload(p, str(device))["model"] for p in cfg.merge.expert_checkpoints]
+            model = merge_experts(
+                cfg,
+                states,
+                n_mixers=1,
+                mixer_init_scale=cfg.merge.mixer_init_scale,
+            ).to(device)
+        else:
+            # No expert checkpoints configured: build the merged body from the
+            # current (random) weights so the machinery is exercised.
+            model = MergedHAGI(cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale).to(device)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",
@@ -181,6 +198,20 @@ def main() -> int:
         counts["embedding"] / 1e6,
         counts["active_body"] / 1e6,
     )
+
+    # "Train only the Cross-Expert Mixer" mode: freeze every parameter except
+    # the cross-block mixers. The experts' weights stay frozen; only the mixer
+    # connections learn. Requires a merged model (merge.enabled).
+    if cfg.merge.enabled and cfg.merge.freeze_experts:
+        frozen = 0
+        for name, param in model.named_parameters():
+            if not name.startswith("mixers."):
+                param.requires_grad = False
+                frozen += 1
+        logger.info(
+            "freeze_experts: froze %d parameter tensors; only mixers.* trainable",
+            frozen,
+        )
 
     start_step = 0
     optimizer_state = None
