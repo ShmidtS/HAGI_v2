@@ -38,7 +38,11 @@
 #      attention/GEMM backward (227 vs 223 ms), and a two-pass forward costs
 #      more than it saves at small T.
 #
-# Checkpoint format 12; train from scratch.
+  # Punctured receiver (ce_keep_rate=0.5) is DISABLED: on this host-bound iGPU
+  # the boolean-gather (nonzero+index) cost ~188 ms CPU/step, more than the ~2%
+  # head compute it saves. rate=1.0 scores every token and is faster.
+  #
+  # Checkpoint format 12; train from scratch.
 
 model:
   vocab_size: 32768
@@ -114,7 +118,10 @@ train:
   ternary_step_cache: true
   # Punctured CE: score 50% of positions (Bernoulli erasure channel on
   # supervision). Body still sees full T; only the receiver cost is thinned.
-  ce_keep_rate: 0.5
+  # DISABLED (rate=1.0): measured on this host-bound iGPU the boolean-gather
+  # (nonzero+index) costs ~188 ms CPU/step, more than the ~2% head compute it
+  # saves. Scoring every token is faster and doubles the scored-token count.
+  ce_keep_rate: 1.0
   ce_keep_mode: bernoulli
   learning_rate: 3.0e-4
   max_grad_norm: 1.0

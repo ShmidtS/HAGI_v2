@@ -38,6 +38,9 @@ def main() -> int:
     parser.add_argument("--exact-ce-rows", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--grad-checkpointing", action="store_true")
+    parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -73,6 +76,12 @@ def main() -> int:
         overrides["train.schedule.warmup_steps"] = args.warmup_steps
     if args.learning_rate is not None:
         overrides["train.learning_rate"] = args.learning_rate
+    if args.compile:
+        overrides["train.compile_model"] = True
+    if args.grad_checkpointing:
+        overrides["train.grad_checkpointing"] = True
+    if args.seq_len is not None:
+        overrides["train.data.seq_len"] = args.seq_len
 
     configure_runtime()
     torch.manual_seed(args.seed)
