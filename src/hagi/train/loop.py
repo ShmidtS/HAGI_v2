@@ -29,7 +29,7 @@ import torch
 from torch import nn
 
 from hagi.config import Config
-from hagi.model.norms import HeadNorm, RMSNorm
+from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 
@@ -132,7 +132,7 @@ def cast_model(model: nn.Module, precision: str) -> None:
         if getattr(module, "keep_fp32", False):
             for param in module.parameters(recurse=False):
                 param.data = param.data.float()
-        if isinstance(module, (RMSNorm, HeadNorm)):
+        if isinstance(module, (RMSNorm, HeadNorm, BlockRMSNorm)):
             module.fp32_variance = False
 
 
