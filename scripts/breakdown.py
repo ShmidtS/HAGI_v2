@@ -21,7 +21,6 @@ from hagi.config import load_config
 from hagi.data.dataset import build_dataloader
 from hagi.model.model import HAGI
 from hagi.train.loop import Trainer, configure_runtime
-from hagi.train.optim import _muon_parameters
 
 
 def main() -> int:

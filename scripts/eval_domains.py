@@ -30,7 +30,6 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from hagi.config import load_config  # noqa: E402
-from hagi.data.dataset import build_dataloader  # noqa: E402
 from hagi.model.merge import MergedHAGI  # noqa: E402
 from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.checkpoint import load_model  # noqa: E402
@@ -50,8 +49,9 @@ def eval_domain(model: torch.nn.Module, cfg, domain: str, batches: int, device) 
     weights = DOMAINS[domain]
     # Build a single-domain dataloader by overriding the mix.
     dc = cfg.train.data
-    from hagi.data.dataset import PackedMixDataset, load_mix
     from torch.utils.data import DataLoader
+
+    from hagi.data.dataset import PackedMixDataset, load_mix
 
     root = dc.data_dir
     mix = load_mix(root, weights)

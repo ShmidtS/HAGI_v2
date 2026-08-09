@@ -33,6 +33,7 @@ does not perturb the experts' internal dynamics — it only mixes their outputs.
 from __future__ import annotations
 
 import math
+
 import torch
 from torch import nn
 
@@ -511,7 +512,6 @@ def merge_experts(
     h = m.hidden_size
     if h % n != 0:
         raise ValueError(f"hidden_size {h} must be divisible by n_experts {n}")
-    expert_hidden = h // n
 
     model = MergedHAGI(cfg, n_mixers=n_mixers, mixer_init_scale=mixer_init_scale)
     sd = model.state_dict()
