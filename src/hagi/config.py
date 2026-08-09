@@ -257,6 +257,14 @@ class ModelConfig:
     # transmitted from step 0. Codebook (a source codec, not a precoder) and 1D
     # gains are excluded.
     init_orthogonal: bool = False
+    # Master RNG seed for model initialization. When training N experts for a
+    # block-diagonal merge, every expert must start from the *same* random
+    # initialization (the method's core requirement): the merged model is only
+    # a faithful concatenation of N trained subspaces if those subspaces grew
+    # from one shared prior. train.py calls torch.manual_seed(this) immediately
+    # before constructing the model, so all experts with the same seed draw
+    # identical weights. 0 disables seeding (current RNG state is used).
+    init_seed: int = 0
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -464,6 +472,19 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 1000
     checkpoint_keep_last: int = 3
+    # Early-stop on validation-CE plateau (the method's "saturate" step).
+    # Training stops once the exact_ce has not improved by more than
+    # ``saturation_tol`` over a window of ``saturation_patience`` logged
+    # samples. This is what makes "train to saturation" concrete instead of a
+    # fixed step count. Disabled when ``saturation_patience`` is 0.
+    saturation_patience: int = 0
+    saturation_tol: float = 0.01
+    saturation_min_steps: int = 0
+    # Recursive-growth primitive: load weights from a checkpoint as an
+    # *initialization* (step 0, fresh optimizer) rather than a resume. A
+    # level-N expert starts from the merged level-(N-1) model (the shared
+    # prior) and specializes on its own domain. Empty string = disabled.
+    init_from: str = ""
     tokenizer: str = "google/gemma-4-E2B-it"
 
 
@@ -494,6 +515,25 @@ class MergeConfig:
             cross-block mixers (``mixers.*``). This is the "train only the
             Cross-Expert Mixer" mode: the experts' weights are frozen and
             only the mixer connections learn. Requires ``enabled=True``.
+        mixer_type: which cross-block mixer to build. Default ``hadamard``.
+
+            * ``hadamard`` — a fixed fast-Hadamard transform over the expert
+              axis ``(H_N ⊗ I_H)`` plus a small trainable low-rank residual
+              (``HadamardMixer``). The Hadamard gives every block a sum/
+              difference view of the others at step 0 for O(NH log N) FLOPs
+              (no learned communication to discover); the low-rank residual
+              (rank ``mixer_rank``) is the only learned part. Requires
+              ``n_experts`` to be a power of two. This is the default: it is
+              ~16x cheaper in parameters and ~23% faster per step than the
+              full SwiGLU, with identical step-0 logits (head pre-rotated).
+            * ``swiglu`` — the original full-width SwiGLU (``CrossMixer``).
+              Three dense ``H x 2H`` matrices; the only cross-block channel.
+
+        mixer_rank: rank of the low-rank residual in ``HadamardMixer``. The
+            residual is ``down(silu(gate(x)) * up(x))`` with ``gate/up``
+            ``H x rank`` and ``down`` ``rank x H``, so its FLOPs are
+            ``O(H * rank)`` instead of the SwiGLU's ``O(H^2)``. Ignored when
+            ``mixer_type == "swiglu"``.
     """
 
     enabled: bool = False
@@ -502,6 +542,8 @@ class MergeConfig:
     expert_checkpoints: list[str] = field(default_factory=list)
     mixer_init_scale: float = 0.0
     freeze_experts: bool = False
+    mixer_type: str = "hadamard"
+    mixer_rank: int = 64
 
 
 @dataclass
@@ -866,6 +908,17 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("inference.temperature and top_k must be non-negative")
     if not 0.0 < cfg.inference.top_p <= 1.0:
         raise ValueError("inference.top_p must be in (0, 1]")
+
+    mg = cfg.merge
+    if mg.enabled:
+        if mg.mixer_type not in {"swiglu", "hadamard"}:
+            raise ValueError("merge.mixer_type must be 'swiglu' or 'hadamard'")
+        if mg.mixer_type == "hadamard" and (mg.n_experts & (mg.n_experts - 1)):
+            raise ValueError(
+                f"merge.mixer_type='hadamard' requires n_experts to be a power of two, got {mg.n_experts}"
+            )
+        if mg.mixer_rank < 1:
+            raise ValueError("merge.mixer_rank must be >= 1")
 
 
 def describe(cfg: Config) -> str:

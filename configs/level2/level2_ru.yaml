@@ -1,13 +1,13 @@
 model:
   vocab_size: 32768
-  hidden_size: 128
+  hidden_size: 512
   num_layers: 3
   loop_depth: 1
   norm_eps: 1.0e-05
   init_orthogonal: true
   attention:
-    num_query_heads: 2
-    num_kv_heads: 1
+    num_query_heads: 8
+    num_kv_heads: 4
     head_dim: 64
     rope_theta: 10000.0
     max_seq_len: 4096
@@ -39,14 +39,17 @@ model:
     logit_scale_max: 1.0
   multimodal:
     enabled: false
-    n_bridge_queries: 32
-    bridge_layers: 2
-    bridge_heads: 8
-    modality_dropout: 0.3
-    grounding_weight: 0.1
-    infonce_temperature: 0.07
-    variance_gamma: 1.0
-  init_seed: 1234
+merge:
+  enabled: true
+  n_experts: 4
+  expert_hidden: 128
+  expert_checkpoints:
+  - C:\HAGI_v2\checkpoints_experts\ru\step-0024601.pt
+  - C:\HAGI_v2\checkpoints_experts\en\step-0005501.pt
+  - C:\HAGI_v2\checkpoints_experts\math\step-0007401.pt
+  - C:\HAGI_v2\checkpoints_experts\code\step-0006101.pt
+  mixer_init_scale: 0.0
+  freeze_experts: false
 train:
   max_steps: 100000
   batch_size: 256
@@ -56,7 +59,7 @@ train:
   ternary_step_cache: true
   ce_keep_rate: 0.25
   ce_keep_mode: stride
-  learning_rate: 0.0003
+  learning_rate: 3.0e-05
   max_grad_norm: 1.0
   precision: bf16
   compile_model: true
@@ -80,7 +83,8 @@ train:
     seed: 1234
     cross_doc_attention: true
     weights:
-      python_instruct: 1.0
+      wikipedia_ru: 1.0
+      oscar_ru: 1.0
   logging:
     log_interval: 100
     diag_interval: 100
@@ -88,13 +92,14 @@ train:
     exact_ce_interval: 100
     exact_ce_rows: 512
   z_loss_weight: 0.0001
-  checkpoint_dir: checkpoints_experts/code
+  checkpoint_dir: checkpoints_level2/ru
   checkpoint_interval: 1000
   checkpoint_keep_last: 2
   tokenizer: google/gemma-4-E2B-it
   saturation_patience: 20
   saturation_tol: 0.01
   saturation_min_steps: 2000
+  init_from: C:\HAGI_v2\checkpoints_v48_merged\step-0004000.pt
 inference:
   temperature: 0.8
   top_k: 50

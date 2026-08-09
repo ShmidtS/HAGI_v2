@@ -207,6 +207,16 @@ class HAGI(nn.Module):
                     h = block(h, positions, mask)
         return h
 
+    def _apply_mixers(self, h: torch.Tensor) -> torch.Tensor:
+        """Post-norm cross-block mixers (identity for a plain model).
+
+        Overridden by :class:`~hagi.model.merge.MergedHAGI` to run the
+        cross-block mixers on the normalized residual stream. The hook lives
+        here so the ordering (blocks -> out_norm -> mixers -> head) is shared
+        by every model and the head always sees ``mixer(out_norm(h))``.
+        """
+        return h
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -258,6 +268,11 @@ class HAGI(nn.Module):
         t_total = cache_len + h.shape[1]
         h = self._run_blocks(h, positions, doc_ids, prefix_len, t_total, use_state=use_cache)
         h = self.out_norm(h)
+        # Hook for merged models: cross-block mixers run *after* the output
+        # norm so the head sees ``mixer(out_norm(h))``. This ordering is what
+        # makes the Hadamard mixer's head pre-rotation exact (see
+        # :meth:`MergedHAGI._apply_mixers`).
+        h = self._apply_mixers(h)
 
         text_hidden = h[:, prefix_len:] if prefix_len else h
         out = ModelOutput(hidden=text_hidden)

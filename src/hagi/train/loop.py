@@ -434,10 +434,16 @@ def train(
     cfg: Config,
     start_step: int = 0,
     optimizer_state: dict | None = None,
+    start_offset: int = 0,
 ) -> Iterator[dict]:
     """Run training, yielding metrics at the configured interval.
 
     Checkpoints are written by step count; the caller only logs.
+
+    ``start_offset`` is the token offset this run began at (the previous
+    expert's consumed tokens). It is added to the run's own consumed tokens
+    when writing ``consumed.json`` so the file always holds the *cumulative*
+    offset for the next expert, not just this slice's consumption.
     """
     from hagi.train.checkpoint import save_checkpoint
 
@@ -447,7 +453,31 @@ def train(
         trainer.load_optimizer_state(optimizer_state)
 
     accum = cfg.train.grad_accum_steps
+
+    def _write_consumed() -> None:
+        """Record how many tokens this expert consumed, for the next expert's
+        start offset. consumed = steps * batch * seq * accum (tokens actually
+        used for training). Written to ``consumed.json`` in the checkpoint dir.
+        """
+        import json
+        from pathlib import Path
+        consumed = start_offset + trainer.step * cfg.train.batch_size * cfg.train.data.seq_len * accum
+        # Write to the corpus root (parent of the slice dir) so the pipeline's
+        # ``_consumed`` can read the cumulative offset regardless of slice.
+        out = Path(cfg.train.checkpoint_dir).parent / "consumed.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"consumed_tokens": int(consumed), "step": int(trainer.step)}))
+        logger.info("consumed %d tokens (step %d) -> %s", consumed, trainer.step, out)
     data_iter = iter(dataloader)
+
+    # Saturation early-stop: track the best exact_ce and stop once it has not
+    # improved by more than ``saturation_tol`` over ``saturation_patience``
+    # logged samples. This is the method's "saturate" step made concrete.
+    patience = int(cfg.train.saturation_patience)
+    tol = float(cfg.train.saturation_tol)
+    min_steps = int(cfg.train.saturation_min_steps)
+    best_exact_ce: float | None = None
+    no_improve_count = 0
 
     while trainer.step < cfg.train.max_steps:
         microbatches = []
@@ -455,14 +485,49 @@ def train(
             try:
                 microbatches.append(next(data_iter))
             except StopIteration:
-                data_iter = iter(dataloader)
-                microbatches.append(next(data_iter))
+                # The corpus slice is exhausted (every source stream hit EOF).
+                # This is a legitimate stop condition — the expert has consumed
+                # all remaining data. Save the checkpoint and stop, so the
+                # pipeline can start the next expert from the new offset.
+                logger.info(
+                    "data exhausted at step %d; saving checkpoint and stopping",
+                    trainer.step,
+                )
+                _write_consumed()
+                save_checkpoint(
+                    model,
+                    cfg,
+                    trainer.step,
+                    cfg.train.checkpoint_dir,
+                    cfg.train.checkpoint_keep_last,
+                    optimizer=trainer.optimizer,
+                )
+                return
 
         step_index = trainer.step
         metrics = trainer.train_step(microbatches)
 
         if step_index % max(1, cfg.train.logging.log_interval) == 0:
             yield metrics
+
+        # Saturation check on the exact_ce (the coding-cost SSOT). Only
+        # evaluated when exact_ce is actually measured (exact_ce_interval>0).
+        if patience > 0 and "exact_ce" in metrics and trainer.step >= min_steps:
+            ce = float(metrics["exact_ce"])
+            if best_exact_ce is None or ce < best_exact_ce - tol:
+                best_exact_ce = ce
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                if no_improve_count >= patience:
+                    logger.info(
+                        "saturation: exact_ce %.4f not improved by %.4f over %d samples; stopping at step %d",
+                        ce,
+                        tol,
+                        patience,
+                        trainer.step,
+                    )
+                    break
 
         completed = step_index + 1
         if cfg.train.checkpoint_interval > 0 and completed % cfg.train.checkpoint_interval == 0:
@@ -475,6 +540,7 @@ def train(
                 optimizer=trainer.optimizer,
             )
 
+    _write_consumed()
     save_checkpoint(
         model,
         cfg,

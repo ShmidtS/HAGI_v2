@@ -80,7 +80,7 @@ train:
     seed: 1234
     cross_doc_attention: true
     weights:
-      python_instruct: 1.0
+      slimpajama: 1.0
   logging:
     log_interval: 100
     diag_interval: 100
@@ -88,7 +88,7 @@ train:
     exact_ce_interval: 100
     exact_ce_rows: 512
   z_loss_weight: 0.0001
-  checkpoint_dir: checkpoints_experts/code
+  checkpoint_dir: checkpoints_corpus/slimpajama
   checkpoint_interval: 1000
   checkpoint_keep_last: 2
   tokenizer: google/gemma-4-E2B-it

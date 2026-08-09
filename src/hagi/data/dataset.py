@@ -101,18 +101,33 @@ def load_mix(data_dir: str | Path, overrides: dict[str, float] | None = None) ->
 class PackedStream:
     """A memory-mapped token stream that yields packed windows.
 
-    Reading is sequential from a randomized start offset. Sequential access keeps
-    the OS page cache effective — a random seek per window on a 5 GB file makes
-    the loader disk-bound rather than compute-bound.
+    Reading is sequential from a start offset. Sequential access keeps the OS
+    page cache effective — a random seek per window on a 5 GB file makes the
+    loader disk-bound rather than compute-bound.
+
+    The stream is *finite*: it yields windows until the end of the file is
+    reached, then signals exhaustion (``next_window`` returns ``None``). This is
+    the recursive-growth primitive — an expert trains on a contiguous slice of
+    the corpus, and the next expert continues from where the previous one
+    stopped (``start_offset`` = consumed tokens).
 
     Args:
         path: ``.bin`` of flat uint32 tokens.
         seq_len: window length.
         eos_token_id: document delimiter, used to derive ``doc_ids``.
         rng: seeded generator for the start offset.
+        start_offset: token index to begin reading from (0 = start of file).
+            Lets the next expert continue from where the previous one stopped.
     """
 
-    def __init__(self, path: Path, seq_len: int, eos_token_id: int, rng: np.random.Generator) -> None:
+    def __init__(
+        self,
+        path: Path,
+        seq_len: int,
+        eos_token_id: int,
+        rng: np.random.Generator,
+        start_offset: int = 0,
+    ) -> None:
         self.path = path
         self.seq_len = seq_len
         self.eos_token_id = eos_token_id
@@ -120,18 +135,29 @@ class PackedStream:
         self.n_tokens = len(self.tokens)
         if self.n_tokens < seq_len + 1:
             raise ValueError(f"{path.name} holds {self.n_tokens} tokens, need at least {seq_len + 1}")
-        self.cursor = int(rng.integers(0, self.n_tokens - seq_len - 1))
+        # Clamp the start offset so a full window fits before EOF.
+        self.cursor = int(min(max(start_offset, 0), self.n_tokens - seq_len - 1))
+        self.exhausted = False
 
-    def next_window(self) -> np.ndarray:
-        """Return ``seq_len + 1`` contiguous tokens, wrapping at end of file.
+    @property
+    def consumed(self) -> int:
+        """Tokens consumed so far (from the start of the file)."""
+        return self.cursor
+
+    def next_window(self) -> np.ndarray | None:
+        """Return ``seq_len + 1`` contiguous tokens, or ``None`` at EOF.
 
         The extra token is the final position's target, so no window loses its
-        last prediction to the boundary.
+        last prediction to the boundary. Unlike the old infinite stream, this
+        does NOT wrap at EOF — it returns ``None`` so the caller knows the
+        corpus slice is exhausted.
         """
+        if self.exhausted:
+            return None
         end = self.cursor + self.seq_len + 1
         if end > self.n_tokens:
-            self.cursor = 0
-            end = self.seq_len + 1
+            self.exhausted = True
+            return None
         window = np.asarray(self.tokens[self.cursor : end], dtype=np.int64)
         self.cursor += self.seq_len
         return window
@@ -147,6 +173,11 @@ class PackedMixDataset(IterableDataset):
     Each worker gets its own generator seed and its own start offsets, so workers
     do not duplicate each other's windows.
 
+    The dataset is *finite*: it raises ``StopIteration`` once every source
+    stream is exhausted. This is the recursive-growth primitive — an expert
+    trains on a contiguous slice of the corpus, and the next expert continues
+    from where the previous one stopped.
+
     Args:
         data_dir: corpus directory.
         seq_len: window length.
@@ -155,6 +186,9 @@ class PackedMixDataset(IterableDataset):
         seed: base seed; each worker adds its id.
         cross_doc_attention: when True, ``doc_ids`` is omitted and attention is
             allowed to cross document boundaries (cheaper, slightly wrong).
+        start_offsets: per-source token offsets to begin reading from (0 = start
+            of file). Lets the next expert continue from where the previous one
+            stopped. Keys are source names.
     """
 
     def __init__(
@@ -165,6 +199,7 @@ class PackedMixDataset(IterableDataset):
         weights: dict[str, float],
         seed: int = 1234,
         cross_doc_attention: bool = False,
+        start_offsets: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self.data_dir = data_dir
@@ -173,6 +208,7 @@ class PackedMixDataset(IterableDataset):
         self.weights = weights
         self.seed = seed
         self.cross_doc_attention = cross_doc_attention
+        self.start_offsets = start_offsets or {}
 
     def __iter__(self):
         info = get_worker_info()
@@ -183,12 +219,28 @@ class PackedMixDataset(IterableDataset):
         probs = np.array([self.weights[n] for n in names], dtype=np.float64)
         probs /= probs.sum()
         streams = [
-            PackedStream(dataset_path(self.data_dir, n), self.seq_len, self.eos_token_id, rng)
+            PackedStream(
+                dataset_path(self.data_dir, n),
+                self.seq_len,
+                self.eos_token_id,
+                rng,
+                start_offset=self.start_offsets.get(n, 0),
+            )
             for n in names
         ]
 
         while True:
-            window = streams[int(rng.choice(len(streams), p=probs))].next_window()
+            # Pick a source proportional to its weight, but skip exhausted ones.
+            active = [i for i, s in enumerate(streams) if not s.exhausted]
+            if not active:
+                # Every source is exhausted: the corpus slice is done.
+                return
+            active_probs = probs[active]
+            active_probs = active_probs / active_probs.sum()
+            idx = int(rng.choice(len(active), p=active_probs))
+            window = streams[active[idx]].next_window()
+            if window is None:
+                continue
             input_ids = torch.from_numpy(window[:-1])
             targets = torch.from_numpy(window[1:])
             item = {"input_ids": input_ids, "targets": targets}
@@ -202,15 +254,28 @@ class PackedMixDataset(IterableDataset):
             yield item
 
 
-def build_dataloader(cfg, data_dir: str | None = None) -> DataLoader:
+def build_dataloader(
+    cfg,
+    data_dir: str | None = None,
+    start_offsets: dict[str, int] | None = None,
+    start_offset: int = 0,
+) -> DataLoader:
     """Build the training dataloader from ``cfg.train.data``.
 
     Args:
         cfg: top-level config.
         data_dir: overrides ``cfg.train.data.data_dir``.
+        start_offsets: per-source token offsets to begin reading from (0 = start
+            of file). Lets the next expert continue from where the previous one
+            stopped. Keys are source names.
+        start_offset: a single token offset applied to every source (used when
+            the expert trains on one corpus). Ignored if ``start_offsets`` is
+            given.
 
     Returns:
         A :class:`DataLoader` yielding dicts of ``[B, seq_len]`` int64 tensors.
+        The dataset is finite: it raises ``StopIteration`` once every source
+        stream is exhausted.
     """
     dc = cfg.train.data
     root = data_dir or dc.data_dir
@@ -220,6 +285,8 @@ def build_dataloader(cfg, data_dir: str | None = None) -> DataLoader:
         len(weights),
         ", ".join(f"{n}={w:.3f}" for n, w in sorted(weights.items(), key=lambda kv: -kv[1])),
     )
+    if start_offsets is None and start_offset:
+        start_offsets = {name: start_offset for name in weights}
     dataset = PackedMixDataset(
         data_dir=root,
         seq_len=dc.seq_len,
@@ -227,6 +294,7 @@ def build_dataloader(cfg, data_dir: str | None = None) -> DataLoader:
         weights=weights,
         seed=dc.seed,
         cross_doc_attention=dc.cross_doc_attention,
+        start_offsets=start_offsets,
     )
     return DataLoader(
         dataset,
