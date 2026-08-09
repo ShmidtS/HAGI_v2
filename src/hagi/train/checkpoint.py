@@ -89,8 +89,19 @@ def load_payload(path: str | Path, device: str = "cpu") -> dict:
     return dict(state)
 
 
-def load_model(path: str | Path, model: nn.Module, device: str = "cpu") -> tuple[int, Config]:
+def load_model(
+    path: str | Path,
+    model: nn.Module,
+    device: str = "cpu",
+    skip_prefixes: tuple[str, ...] = (),
+) -> tuple[int, Config]:
     """Validate a checkpoint fully, then load its weights.
+
+    ``skip_prefixes`` names parameter prefixes that are *not* loaded from the
+    checkpoint (they keep the model's current values). Used for recursive
+    growth when the target model's cross-expert mixers have a different
+    geometry than the source (e.g. a fresh Hadamard mixer initialized from a
+    SwiGLU-merged prior): the body/embed/head transfer, the mixers stay fresh.
 
     The key and shape comparison happens *before* any copy. ``load_state_dict``
     with ``strict=True`` reports mismatched keys, but it reports them at the end —
@@ -107,6 +118,9 @@ def load_model(path: str | Path, model: nn.Module, device: str = "cpu") -> tuple
 
     incoming = state["model"]
     current = model.state_dict()
+    if skip_prefixes:
+        incoming = {k: v for k, v in incoming.items() if not k.startswith(skip_prefixes)}
+        current = {k: v for k, v in current.items() if not k.startswith(skip_prefixes)}
     missing = sorted(set(current) - set(incoming))
     unexpected = sorted(set(incoming) - set(current))
     if missing or unexpected:
@@ -122,7 +136,10 @@ def load_model(path: str | Path, model: nn.Module, device: str = "cpu") -> tuple
         raise _fail(f"tensor shapes differ: {mismatched[:8]}")
 
     try:
-        model.load_state_dict(incoming, strict=True)
+        # With skip_prefixes we intentionally omit keys (e.g. fresh mixers), so
+        # strict=False is required; the shape check above already guarantees the
+        # keys we *do* load match, so nothing else is silently skipped.
+        model.load_state_dict(incoming, strict=not skip_prefixes)
     except Exception as exc:  # pragma: no cover - the checks above are exhaustive
         raise _fail(f"state_dict could not be applied: {exc}") from exc
     return state["completed_steps"], cfg

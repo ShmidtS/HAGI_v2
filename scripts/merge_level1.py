@@ -89,6 +89,8 @@ def make_merged_config(ckpts: list[Path], n: int) -> Path:
             "expert_checkpoints": [str(p) for p in ckpts],
             "freeze_experts": False,
             "mixer_init_scale": 0.0,
+            "mixer_type": "hadamard",
+            "mixer_hadamard_groups": [2, 2],
         },
         "train": {
             "max_steps": 4000,
@@ -143,16 +145,16 @@ def main() -> int:
         print(f"  expert: {ck}")
 
     if len(ckpts) < 2:
-        print(f"ERROR: need ≥2 experts to merge, found {len(ckpts)}", file=sys.stderr)
+        print(f"ERROR: need >=2 experts to merge, found {len(ckpts)}", file=sys.stderr)
         return 1
 
     n = len(ckpts)
     Hm = EXPERT_HIDDEN * n
     embed = VOCAB * Hm
-    print(f"\n{n} experts × H={EXPERT_HIDDEN} → H_merged={Hm}")
+    print(f"\n{n} experts x H={EXPERT_HIDDEN} -> H_merged={Hm}")
     print(f"  estimated embed+head = {2*embed/1e6:.0f}M")
     print(f"  estimated body = {n*71.7:.0f}M")
-    print(f"  estimated total ≈ {(2*embed + n*71.7e6)/1e6:.0f}M")
+    print(f"  estimated total ~ {(2*embed + n*71.7e6)/1e6:.0f}M")
 
     cfg_path = make_merged_config(ckpts, n)
 

@@ -534,6 +534,14 @@ class MergeConfig:
             ``H x rank`` and ``down`` ``rank x H``, so its FLOPs are
             ``O(H * rank)`` instead of the SwiGLU's ``O(H^2)``. Ignored when
             ``mixer_type == "swiglu"``.
+        mixer_hadamard_groups: recursive/local Hadamard group sizes, e.g.
+            ``[2, 2]`` for 4 experts (a 2-level tree: local Hadamard within
+            each pair, then the pairs again). The product must equal
+            ``n_experts`` and each entry must be a power of two. When set, the
+            fixed transform is the Kronecker product ``H_{g_k} ⊗ ... ⊗ H_{g_1}``
+            instead of the flat ``H_n`` — the same orthonormal mixing but with
+            the sum/difference channels ordered by the hierarchy (ready for a
+            16→4→1 growth pipeline). When None, the flat ``H_n`` is used.
     """
 
     enabled: bool = False
@@ -544,6 +552,7 @@ class MergeConfig:
     freeze_experts: bool = False
     mixer_type: str = "hadamard"
     mixer_rank: int = 64
+    mixer_hadamard_groups: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -913,12 +922,20 @@ def validate_config(cfg: Config) -> None:
     if mg.enabled:
         if mg.mixer_type not in {"swiglu", "hadamard"}:
             raise ValueError("merge.mixer_type must be 'swiglu' or 'hadamard'")
-        if mg.mixer_type == "hadamard" and (mg.n_experts & (mg.n_experts - 1)):
-            raise ValueError(
-                f"merge.mixer_type='hadamard' requires n_experts to be a power of two, got {mg.n_experts}"
-            )
         if mg.mixer_rank < 1:
             raise ValueError("merge.mixer_rank must be >= 1")
+        if mg.mixer_hadamard_groups:
+            prod = 1
+            for g in mg.mixer_hadamard_groups:
+                if g < 1 or (g & (g - 1)):
+                    raise ValueError(
+                        f"merge.mixer_hadamard_groups entries must be powers of two, got {mg.mixer_hadamard_groups}"
+                    )
+                prod *= g
+            if prod != mg.n_experts:
+                raise ValueError(
+                    f"merge.mixer_hadamard_groups {mg.mixer_hadamard_groups} product {prod} != n_experts {mg.n_experts}"
+                )
 
 
 def describe(cfg: Config) -> str:

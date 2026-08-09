@@ -251,7 +251,11 @@ def main() -> int:
         path = init_from
         if not Path(path).exists():
             raise FileNotFoundError(f"--init-from: no checkpoint at {path}")
-        _, _ = load_model(path, model, str(device))
+        # Skip the cross-expert mixers (``mixers.*``): the target model's mixers
+        # may have a different geometry than the source (e.g. a fresh Hadamard
+        # mixer initialized from a SwiGLU-merged prior). The body/embed/head
+        # transfer; the mixers stay fresh so the Hadamard geometry is kept.
+        _, _ = load_model(path, model, str(device), skip_prefixes=("mixers.",))
         logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
     elif args.resume is not None:
         from hagi.train.checkpoint import latest_checkpoint, load_model, load_payload
