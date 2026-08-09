@@ -96,9 +96,28 @@ def make_expert_configs(expert_steps: int) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for domain, weights in DOMAINS.items():
         cfg = _load(EXPERT_BASE)
-        cfg["train"]["max_steps"] = expert_steps
+        # max_steps is a hard safety ceiling, NOT the training target. The
+        # model trains until it reaches a validation-CE plateau (saturation),
+        # which may take far more than ``expert_steps``. The corpus is an
+        # infinite stream (PackedStream wraps at EOF), so data never runs out;
+        # saturation is the only stop condition.
+        cfg["train"]["max_steps"] = max(expert_steps, 100000)
         cfg["train"]["batch_size"] = SAFE_BATCH
+        # Same-initialization: every expert must start from the same random
+        # weights (the method's core requirement). Pin the model init seed so
+        # all experts draw identical weights and the block-diagonal merge is a
+        # faithful concatenation of N subspaces grown from one shared prior.
+        cfg["model"]["init_seed"] = 1234
         cfg["train"]["data"]["weights"] = weights
+        # Train to saturation (validation-CE plateau), not a fixed step count.
+        # exact_ce is measured every 100 steps; stop once it has not improved
+        # by more than 0.01 over 20 samples (2000 steps). max_steps is a hard
+        # ceiling, not the target.
+        cfg["train"]["logging"]["exact_ce_interval"] = 100
+        cfg["train"]["logging"]["exact_ce_rows"] = 512
+        cfg["train"]["saturation_patience"] = 20
+        cfg["train"]["saturation_tol"] = 0.01
+        cfg["train"]["saturation_min_steps"] = 2000
         cfg["train"]["checkpoint_dir"] = f"checkpoints_experts/{domain.lower()}"
         cfg["train"]["checkpoint_interval"] = 1000
         cfg["train"]["checkpoint_keep_last"] = 2
@@ -112,12 +131,23 @@ def make_expert_configs(expert_steps: int) -> dict[str, Path]:
 
 
 def make_merged_config(expert_paths: dict[str, Path], joint_steps: int, expert_steps: int) -> Path:
-    """Write the merged config with expert checkpoints filled in."""
+    """Write the merged config with expert checkpoints filled in.
+
+    Experts train to a validation-CE plateau (not a fixed step count), so each
+    expert's checkpoint is its highest-numbered ``step-*.pt`` (the saturation
+    point), not ``step-{expert_steps}``. ``expert_steps`` is only the hard
+    ceiling.
+    """
+    from hagi.train.checkpoint import latest_checkpoint
+
     cfg = _load(MERGED_BASE)
-    cfg["merge"]["expert_checkpoints"] = [
-        str(EXPERTS.parent.parent / f"checkpoints_experts/{d.lower()}/step-{expert_steps:07d}.pt")
-        for d in DOMAINS
-    ]
+    ckpts = []
+    for d in DOMAINS:
+        latest = latest_checkpoint(ROOT / f"checkpoints_experts/{d.lower()}")
+        if latest is None:
+            latest = ROOT / f"checkpoints_experts/{d.lower()}/step-{expert_steps:07d}.pt"
+        ckpts.append(str(latest))
+    cfg["merge"]["expert_checkpoints"] = ckpts
     # The merge script writes step-0000000.pt; joint training resumes from it.
     cfg["train"]["max_steps"] = joint_steps
     cfg["train"]["batch_size"] = SAFE_BATCH

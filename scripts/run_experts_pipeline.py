@@ -37,6 +37,17 @@ def _run(cmd: list[str], dry: bool) -> None:
 
 
 def _expert_ckpt(domain: str, steps: int) -> Path:
+    """Path to the expert's saturation checkpoint.
+
+    Experts train to a validation-CE plateau (not a fixed step count), so the
+    final checkpoint is the highest-numbered ``step-*.pt`` in the expert's
+    directory, not ``step-{steps}``. ``steps`` is only the hard ceiling.
+    """
+    from hagi.train.checkpoint import latest_checkpoint
+
+    latest = latest_checkpoint(ROOT / f"checkpoints_experts/{domain.lower()}")
+    if latest is not None:
+        return latest
     return ROOT / f"checkpoints_experts/{domain.lower()}/step-{steps:07d}.pt"
 
 

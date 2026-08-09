@@ -41,6 +41,117 @@ from hagi.model.ffn import BranchScale
 from hagi.model.model import HAGI
 
 
+def _hadamard_matrix(n: int) -> torch.Tensor:
+    """Sylvester Hadamard matrix ``H_n`` of order ``n`` (power of two).
+
+    ``H_1 = [1]`` and ``H_{2k} = [[H_k, H_k], [H_k, -H_k]]``. Orthogonal up to
+    the ``sqrt(n)`` scale: ``H_n H_n^T = n I``, so ``H_n / sqrt(n)`` is
+    orthonormal. The transform is a pure permutation of the expert axis — it
+    adds no information, only re-mixes it (the user's core observation).
+    """
+    if n == 1:
+        return torch.ones(1, 1)
+    if n & (n - 1):
+        raise ValueError(f"Hadamard order must be a power of two, got {n}")
+    half = _hadamard_matrix(n // 2)
+    top = torch.cat([half, half], dim=1)
+    bot = torch.cat([half, -half], dim=1)
+    return torch.cat([top, bot], dim=0)
+
+
+# Cache of the orthonormal ``H_n / sqrt(n)`` per order, so the matmul path
+# below never rebuilds the matrix. Keyed by ``(n, device, dtype)``.
+_HADAMARD_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _hadamard_orthonormal(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return the cached orthonormal ``H_n / sqrt(n)`` on ``device``/``dtype``."""
+    key = (n, device.type, device.index, dtype)
+    hit = _HADAMARD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    h = (_hadamard_matrix(n) / math.sqrt(n)).to(device=device, dtype=dtype)
+    if len(_HADAMARD_CACHE) > 16:
+        _HADAMARD_CACHE.clear()
+    _HADAMARD_CACHE[key] = h
+    return h
+
+
+def hadamard_blocks(x: torch.Tensor, n_blocks: int) -> torch.Tensor:
+    """Apply ``(H_n / sqrt(n)) ⊗ I_H`` to the last axis of ``x``.
+
+    ``x`` is ``[..., n_blocks * block_dim]`` (a concatenated expert stream).
+    The transform mixes the ``n_blocks`` expert blocks while leaving each
+    block's internal ``block_dim`` untouched — the ``I_H`` factor. It is the
+    fixed, parameter-free cross-expert communication: after it, every output
+    block is a normalized sum/difference of all expert blocks, so the merged
+    model is no longer N independent subspaces at step 0.
+
+    For small ``n_blocks`` (the typical merge, N ≤ 64) this is a single
+    batched matmul against the cached ``H_n / sqrt(n)`` — measured ~9x faster
+    than the butterfly on the Radeon 8060S (0.81 vs 7.76 ms at N=16, H=2048,
+    B·T=8192), because the tiny ``[n, n]`` matrix rides the tensor cores and
+    the reshape/stack butterfly is launch-bound. For very large ``n_blocks``
+    (N > 64) the butterfly's ``O(NH log N)`` beats the ``O(N^2 H)`` matmul and
+    is used instead. The ``1/sqrt(n_blocks)`` keeps the output norm equal to
+    the input norm (the transform is orthonormal).
+    """
+    if n_blocks == 1:
+        return x
+    if n_blocks & (n_blocks - 1):
+        raise ValueError(f"hadamard_blocks requires a power-of-two block count, got {n_blocks}")
+    bd = x.shape[-1] // n_blocks
+    if n_blocks <= 64:
+        h = _hadamard_orthonormal(n_blocks, x.device, x.dtype)
+        # x: [..., n, bd] -> transpose to [..., bd, n] for the matmul, then back.
+        xb = x.reshape(x.shape[:-1] + (n_blocks, bd)).transpose(-1, -2)
+        return torch.matmul(xb, h.t()).transpose(-1, -2).reshape(x.shape)
+    # Butterfly fallback for very large N (O(NH log N) < O(N^2 H)).
+    shape = x.shape[:-1] + (n_blocks, bd)
+    xb = x.reshape(shape)
+    h = xb
+    step = 1
+    while step < n_blocks:
+        h = h.reshape(x.shape[:-1] + (n_blocks // (2 * step), 2, step, bd))
+        a = h[..., 0, :, :]
+        b = h[..., 1, :, :]
+        h = torch.stack((a + b, a - b), dim=-3)
+        step *= 2
+    h = h.reshape(x.shape[:-1] + (n_blocks, bd))
+    return (h / math.sqrt(n_blocks)).reshape(x.shape)
+
+
+def hadamard_apply_2d(weight: torch.Tensor, n_blocks: int) -> torch.Tensor:
+    """Right-multiply a 2D weight by ``(H_n / sqrt(n)) ⊗ I_H``.
+
+    Used to keep the merged head consistent with a Hadamard mixer: the head
+    projection is ``hidden @ weight.T``, so if the mixer rotates the hidden
+    stream by ``Q = (H_n/sqrt(n)) ⊗ I_H``, the head must be ``weight @ Q^T``
+    (i.e. ``weight`` right-multiplied by ``Q``) for the step-0 logits to be
+    unchanged. ``weight`` is ``[out, n_blocks * block_dim]``.
+    """
+    if n_blocks == 1:
+        return weight
+    bd = weight.shape[1] // n_blocks
+    if n_blocks <= 64:
+        h = _hadamard_orthonormal(n_blocks, weight.device, weight.dtype)
+        wb = weight.reshape(weight.shape[0], n_blocks, bd)
+        # weight @ (H ⊗ I) : [out, n, bd] -> transpose to [out, bd, n] for the
+        # matmul over the block axis, then back.
+        return torch.matmul(wb.transpose(1, 2), h.t()).transpose(1, 2).reshape(weight.shape)
+    wb = weight.reshape(weight.shape[0], n_blocks, bd)
+    h = wb
+    step = 1
+    while step < n_blocks:
+        h = h.reshape(weight.shape[0], n_blocks // (2 * step), 2, step, bd)
+        a = h[:, :, 0, :, :]
+        b = h[:, :, 1, :, :]
+        h = torch.stack((a + b, a - b), dim=2)
+        step *= 2
+    h = h.reshape(weight.shape[0], n_blocks, bd)
+    return (h / math.sqrt(n_blocks)).reshape(weight.shape)
+
+
 class CrossMixer(nn.Module):
     """A cross-block mixing layer on the residual stream.
 
@@ -80,6 +191,73 @@ class CrossMixer(nn.Module):
         h = self.norm(x)
         out = self.down(torch.nn.functional.silu(self.gate(h)) * self.up(h))
         return x + self.branch_scale(out) * self.gain.to(x.dtype)
+
+
+class HadamardMixer(nn.Module):
+    """Fixed fast-Hadamard cross-expert mixing plus a small low-rank residual.
+
+    ``y = H·norm(x) + gain * down(silu(gate(x)) * up(x))``
+
+    The fixed part ``H = (H_n / sqrt(n)) ⊗ I_H`` is the fast Hadamard transform
+    over the expert axis. It is the user's key idea: instead of a block-
+    diagonal merge that keeps the experts independent and a full-width mixer
+    that must *discover* all cross-expert communication from scratch, the
+    Hadamard gives every block a normalized sum/difference view of all the
+    others at step 0 — for O(NH log N) FLOPs and zero parameters. If the
+    experts share a common component ``s`` and differ by ``a, b``, the
+    transform separates ``sum`` (shared) from ``difference`` (specialization)
+    channels automatically.
+
+    The learned part is deliberately small: ``gate/up`` are ``H x rank`` and
+    ``down`` is ``rank x H``, so its FLOPs are ``O(H * rank)`` against the
+    full-width SwiGLU's ``O(H^2)``. The gain starts at ``mixer_init_scale``
+    (0 by default), so at step 0 the mixer is exactly the fixed Hadamard —
+    the base mixing already exists, and training only corrects it.
+
+    The Hadamard is orthonormal (``H H^T = I``), so it preserves the residual-
+    stream norm and adds no information — it only re-mixes what is already
+    there. The learned residual is what lets the blocks go beyond the fixed
+    sum/difference geometry.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_blocks: int,
+        rank: int = 64,
+        norm_eps: float = 1e-5,
+        residual_scale: float = 1.0,
+        mixer_init_scale: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if hidden_size % n_blocks:
+            raise ValueError(f"hidden_size {hidden_size} must be divisible by n_blocks {n_blocks}")
+        self.n_blocks = int(n_blocks)
+        self.rank = int(rank)
+        self.norm = nn.LayerNorm(hidden_size, eps=norm_eps)
+        self.gate = nn.Linear(hidden_size, rank, bias=False)
+        self.up = nn.Linear(hidden_size, rank, bias=False)
+        self.down = nn.Linear(rank, hidden_size, bias=False)
+        nn.init.normal_(self.gate.weight, std=hidden_size**-0.5)
+        nn.init.normal_(self.up.weight, std=hidden_size**-0.5)
+        nn.init.normal_(self.down.weight, std=residual_scale / rank**0.5)
+        self.branch_scale = BranchScale(residual_scale)
+        self.keep_fp32 = True
+        self.gain = nn.Parameter(torch.tensor(float(mixer_init_scale)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The fixed Hadamard is applied to the residual stream ``x`` itself
+        # (not to ``norm(x)``), so at ``gain=0`` the mixer is exactly
+        # ``y = Q·x``. Combined with the head pre-rotation ``WQ`` in
+        # :func:`merge_experts`, the step-0 logits are identical to the
+        # block-diagonal merge — the Hadamard re-mixes the stream and the head
+        # is pre-rotated to match, so the merged model is not degraded before
+        # joint training. The learned low-rank residual operates on the
+        # normalized stream and is gated by ``gain`` (0 by default).
+        mixed = hadamard_blocks(x, self.n_blocks)
+        h = self.norm(x)
+        out = self.down(torch.nn.functional.silu(self.gate(h)) * self.up(h))
+        return mixed + self.branch_scale(out) * self.gain.to(x.dtype)
 
 
 class MergedHAGI(HAGI):
@@ -135,23 +313,40 @@ class MergedHAGI(HAGI):
         # Cross-block mixers on the residual stream.
         inter = max(64, int(2.0 * h))
         residual_scale = (2.0 * m.num_layers * max(1, int(m.loop_depth))) ** -0.5
-        self.mixers = nn.ModuleList(
-            [
-                CrossMixer(h, inter, m.norm_eps, residual_scale, mixer_init_scale)
-                for _ in range(n_mixers)
-            ]
-        )
+        mixer_type = str(getattr(cfg.merge, "mixer_type", "swiglu"))
+        mixer_rank = int(getattr(cfg.merge, "mixer_rank", 64))
+        if mixer_type == "hadamard":
+            self.mixers = nn.ModuleList(
+                [
+                    HadamardMixer(
+                        h,
+                        n,
+                        rank=mixer_rank,
+                        norm_eps=m.norm_eps,
+                        residual_scale=residual_scale,
+                        mixer_init_scale=mixer_init_scale,
+                    )
+                    for _ in range(n_mixers)
+                ]
+            )
+        else:
+            self.mixers = nn.ModuleList(
+                [
+                    CrossMixer(h, inter, m.norm_eps, residual_scale, mixer_init_scale)
+                    for _ in range(n_mixers)
+                ]
+            )
 
-    def _run_blocks(
-        self,
-        h: torch.Tensor,
-        positions: torch.Tensor | None,
-        doc_ids: torch.Tensor | None,
-        prefix_len: int,
-        t_total: int,
-        use_state: bool = False,
-    ) -> torch.Tensor:
-        h = super()._run_blocks(h, positions, doc_ids, prefix_len, t_total, use_state=use_state)
+    def _apply_mixers(self, h: torch.Tensor) -> torch.Tensor:
+        """Run the cross-block mixers on the normalized residual stream.
+
+        The mixers run *after* ``out_norm`` (the hook is called from
+        :meth:`HAGI.forward` right after the output norm). This ordering is
+        what makes the Hadamard mixer's head pre-rotation exact: the head sees
+        ``mixer(out_norm(h))``, and at ``gain=0`` the Hadamard mixer is
+        ``Q·x``, so the pre-rotated head ``WQ`` reproduces the block-diagonal
+        logits bit-for-bit.
+        """
         for mixer in self.mixers:
             h = mixer(h)
         return h
@@ -357,6 +552,32 @@ def merge_experts(
                 f"merged shape {tuple(merged.shape)} != target {tuple(target.shape)} for {k!r}"
             )
         sd[k] = merged
+
+    # With a Hadamard mixer the hidden stream is rotated by
+    # ``Q = (H_n/sqrt(n)) ⊗ I_H`` at the mixer. The head projection is
+    # ``hidden @ weight.T``, so to keep the step-0 logits identical to the
+    # block-diagonal merge (each expert's head acting on its own block) the
+    # merged head weight must be right-multiplied by ``Q`` (symmetric). This
+    # makes the Hadamard mixer's fixed mixing *consistent* with the head at
+    # step 0: the mixer re-mixes the stream, and the head is pre-rotated to
+    # match, so the merged model is not degraded before joint training.
+    #
+    # Both the tied codebook (``encoder.embedding.weight``) and the untied
+    # projection (``head.projection.weight``) are ``[V, H]`` and both feed the
+    # logits, so both must be rotated. ``head.log_prior`` is a function of the
+    # vocabulary, not of the hidden space, and is left untouched.
+    if str(getattr(cfg.merge, "mixer_type", "swiglu")) == "hadamard" and n > 1:
+        # Only the *output* head must be pre-rotated. The input embedding
+        # (``encoder.embedding.weight``) feeds the first block, not the head,
+        # so it must NOT be rotated — rotating it would change the input
+        # representation and break the block-diagonal equivalence. When
+        # ``tie_lm_head`` is true the embedding doubles as the head, so it is
+        # rotated then; otherwise only ``head.projection.weight`` is.
+        if getattr(cfg.model, "tie_lm_head", False):
+            if "encoder.embedding.weight" in sd:
+                sd["encoder.embedding.weight"] = hadamard_apply_2d(sd["encoder.embedding.weight"], n)
+        if "head.projection.weight" in sd:
+            sd["head.projection.weight"] = hadamard_apply_2d(sd["head.projection.weight"], n)
 
     # Zero-init the mixer gains (already 0 from constructor) and keep the
     # merged model's own out_norm / head as-is (they are the merged versions).

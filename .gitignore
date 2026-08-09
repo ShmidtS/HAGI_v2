@@ -47,6 +47,7 @@ checkpoints/
 *.pth
 *.ckpt
 *.log
+consumed.json
 torch-compile.bat
 profile_*
 profiler_logs/

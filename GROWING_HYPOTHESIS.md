@@ -119,3 +119,76 @@ baseline (5.44). Ранее иерархия была хуже (5.00) из-за 
 
 Это даёт: (a) параллелизм по доменам, (b) сохранение специализаций,
 (c) дешёвое обучение композиции вместо дорогого открытия представлений.
+
+## Hadamard Cross-Expert Mixer (ЧАСТЬ V)
+
+**Проблема полного SwiGLU-миксера**: block-diagonal merge оставляет
+экспертов независимыми, и mixer должен с нуля выучить ВСЮ межблочную
+коммуникацию полной шириной (3 плотные матрицы H×2H). Это дорого по FLOPs
+и по шагам joint-обучения.
+
+**Идея**: заменить полный SwiGLU на фиксированный fast-Hadamard + малый
+low-rank residual. Hadamard даёт базовое перемешивание (sum/difference
+каналы) за O(NH log N) FLOPs и 0 параметров; обучаемая часть — маленький
+low-rank (rank=64), ~16x меньше FLOPs, чем полный SwiGLU.
+
+### Математика
+
+```
+y = Q·x + gain · down(silu(gate(x)) · up(x)),   Q = (H_n/sqrt(n)) ⊗ I_H
+```
+
+- **Q** — ортонормированный fast-Hadamard по оси экспертов. Сам по себе
+  не добавляет информации (ортогонален) — сила в месте установки: он даёт
+  каждому блоку нормированное sum/difference-представление всех остальных
+  на шаге 0, до всякого обучения.
+- **low-rank residual** — единственная обучаемая часть. gate/up: H×rank,
+  down: rank×H. gain стартует с 0, так что на шаге 0 mixer = чистый Q.
+
+### Step-0 эквивалентность (важно)
+
+Hadamard mixer при gain=0 даёт `y = Q·x`. Чтобы step-0 логиты совпадали с
+block-diagonal merge, head-проекция предварительно вращается: `W' = W·Q`.
+Проверено на реальных экспертах (v48, n=4): max logit diff 0.012 (bf16
+шум), 0% логитов отличаются >0.05. Это значит, что Hadamard-merge стартует
+с той же точки, что и block-diag, но mixer уже перемешивает блоки —
+joint-обучение не тратит шаги на открытие базовой коммуникации.
+
+### Реализация
+
+- Mixer применяется ПОСЛЕ `out_norm` (hook `_apply_mixers` в HAGI,
+  переопределён в MergedHAGI), чтобы head видел `mixer(out_norm(h))` —
+  это делает head-вращение точным.
+- Вращается только выходная head-проекция (`head.projection.weight`), НЕ
+  входной эмбеддинг, если `tie_lm_head=false`. При `tie_lm_head=true`
+  вращается и эмбеддинг (он же head).
+- Hadamard требует n_experts = степень двойки (валидация в config).
+
+### Результаты (wall-time, H=2048, n=16, batch=64, seq=128, compile ON)
+
+| Mixer | ms/step | tok/s |
+|---|---|---|
+| CrossMixer (SwiGLU) | 354.91 | 0.023M |
+| **HadamardMixer (rank=128)** | **273.52** | **0.030M** |
+
+**Прирост: 23%** (354.91 → 273.52 ms/step). Параметры миксера: 99,330 vs
+1,573,890 (16x меньше).
+
+### Оптимизация FHT → matmul
+
+Butterfly-реализация FHT (O(NH log N)) оказалась медленнее dense matmul на
+Radeon 8060S (7.76 vs 0.81 ms при N=16, H=2048, B·T=8192) — бабочка
+launch-bound, а малый `[n,n]`-matmul едет на tensor cores. Для N≤64
+используется кэшированный `H_n/sqrt(n)` + batched matmul; butterfly —
+fallback для N>64. Итог: 5.6x на самом преобразовании.
+
+### Конфигурация
+
+```yaml
+merge:
+  mixer_type: hadamard   # default: hadamard | swiglu
+  mixer_rank: 64         # rank low-rank residual (hadamard only)
+```
+
+`mixer_init_scale` (0 по умолчанию) — начальный gain: при 0 mixer = чистый
+Hadamard, обучение только корректирует его.

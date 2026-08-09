@@ -148,6 +148,22 @@ def main() -> int:
     parser.add_argument(
         "--resume", nargs="?", const="latest", default=None, help="path, or bare flag for the latest"
     )
+    parser.add_argument(
+        "--init-from",
+        default=None,
+        help="load weights as initialization (step 0, fresh optimizer) instead of resuming",
+    )
+    parser.add_argument(
+        "--no-optimizer-state",
+        action="store_true",
+        help="resume model weights but skip the optimizer state (e.g. Phase 1 mixer-only -> Phase 2 unfreeze, where the parameter-group count differs)",
+    )
+    parser.add_argument(
+        "--start-offset",
+        type=int,
+        default=0,
+        help="token offset into the corpus to begin reading from (recursive growth: the next expert continues where the previous one stopped)",
+    )
     parser.add_argument("--profile", type=int, default=0, help="profile the first N steps; 0 = off")
     args = parser.parse_args()
 
@@ -172,6 +188,13 @@ def main() -> int:
     for line in describe(cfg).splitlines():
         logger.info("  %s", line)
 
+    # Same-initialization for expert merge: every expert must start from the
+    # same random weights so the block-diagonal merge is a faithful
+    # concatenation of N subspaces grown from one shared prior. Seed the RNG
+    # immediately before constructing the model. init_seed=0 leaves the current
+    # RNG state untouched (no seeding).
+    if cfg.model.init_seed:
+        torch.manual_seed(cfg.model.init_seed)
     model = HAGI(cfg).to(device)
     if cfg.merge.enabled:
         from hagi.model.merge import MergedHAGI, merge_experts
@@ -215,14 +238,32 @@ def main() -> int:
 
     start_step = 0
     optimizer_state = None
-    if args.resume is not None:
+    # --init-from takes precedence; otherwise fall back to the config's
+    # train.init_from (the recursive-growth shared prior).
+    init_from = args.init_from or (cfg.train.init_from or None)
+    if init_from is not None:
+        # Load weights as an *initialization*, not a resume: completed_steps
+        # resets to 0 and the optimizer starts fresh. This is the recursive
+        # growth primitive — a level-N expert starts from the merged level-(N-1)
+        # model (the shared prior) and specializes on its own domain.
+        from hagi.train.checkpoint import load_model
+
+        path = init_from
+        if not Path(path).exists():
+            raise FileNotFoundError(f"--init-from: no checkpoint at {path}")
+        _, _ = load_model(path, model, str(device))
+        logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
+    elif args.resume is not None:
         from hagi.train.checkpoint import latest_checkpoint, load_model, load_payload
 
         path = args.resume if args.resume != "latest" else latest_checkpoint(cfg.train.checkpoint_dir)
         if path is None:
             raise FileNotFoundError(f"--resume: no step-*.pt in {cfg.train.checkpoint_dir}")
         start_step, _ = load_model(path, model, str(device))
-        optimizer_state = load_payload(path, str(device)).get("optimizer")
+        if args.no_optimizer_state:
+            optimizer_state = None
+        else:
+            optimizer_state = load_payload(path, str(device)).get("optimizer")
         logger.info(
             "resumed %s at step %d (optimizer state: %s)",
             path,
@@ -236,7 +277,7 @@ def main() -> int:
     from hagi.data.dataset import build_dataloader
     from hagi.train.loop import format_metrics, train
 
-    dataloader = build_dataloader(cfg, args.data_dir)
+    dataloader = build_dataloader(cfg, args.data_dir, start_offset=args.start_offset)
     tokens_per_step = cfg.train.batch_size * cfg.train.grad_accum_steps * cfg.train.data.seq_len
     logger.info(
         "training %d steps | %d tokens/step | %.2fB tokens total",
@@ -257,7 +298,7 @@ def main() -> int:
             on_trace_ready=lambda p: p.export_chrome_trace(trace),
         ) as prof:
             for index, metrics in enumerate(
-                train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state)
+                train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state, start_offset=args.start_offset)
             ):
                 logger.info(format_metrics(metrics))
                 prof.step()
@@ -266,7 +307,7 @@ def main() -> int:
         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
         return 0
 
-    for metrics in train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state):
+    for metrics in train(model, dataloader, cfg, start_step=start_step, optimizer_state=optimizer_state, start_offset=args.start_offset):
         logger.info(format_metrics(metrics))
     logger.info("training complete")
     return 0

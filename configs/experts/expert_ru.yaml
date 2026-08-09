@@ -46,8 +46,9 @@ model:
     grounding_weight: 0.1
     infonce_temperature: 0.07
     variance_gamma: 1.0
+  init_seed: 1234
 train:
-  max_steps: 20000
+  max_steps: 100000
   batch_size: 256
   grad_accum_steps: 1
   grad_checkpointing: false
@@ -92,6 +93,9 @@ train:
   checkpoint_interval: 1000
   checkpoint_keep_last: 2
   tokenizer: google/gemma-4-E2B-it
+  saturation_patience: 20
+  saturation_tol: 0.01
+  saturation_min_steps: 2000
 inference:
   temperature: 0.8
   top_k: 50
