@@ -208,6 +208,11 @@ def main() -> int:
                 states,
                 n_mixers=1,
                 mixer_init_scale=cfg.merge.mixer_init_scale,
+                # Hierarchical merge: the experts are themselves merged models
+                # with their own cross-block mixers, which must be dropped and
+                # replaced by a fresh level-N mixer. Harmless for plain experts
+                # (they have no ``mixers.*`` keys).
+                drop_expert_mixers=True,
             ).to(device)
         else:
             # No expert checkpoints configured: build the merged body from the
