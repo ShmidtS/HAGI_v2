@@ -1,12 +1,12 @@
 """Merge N expert checkpoints into one block-diagonal MergedHAGI.
 
 Usage:
-    python scripts/merge_experts.py --config configs/v47_merged.yaml \
+    python scripts/merge_experts.py --config configs/level1_merged.yaml \
         --experts ckptA.pt ckptB.pt ckptC.pt ckptD.pt \
-        --out checkpoints_v47_merged/step-0000000.pt
+        --out checkpoints_l1_merged/step-0000000.pt
 
 The merged model is written as a standard HAGI checkpoint (format 12) so it can
-be resumed with ``scripts/train.py --config configs/v47_merged.yaml --resume``.
+be resumed with ``scripts/train.py --config configs/level1_merged.yaml --resume``.
 
 When ``--experts`` is omitted, the current model's weights are replicated N
 times (machinery smoke test for the merge path).
@@ -31,7 +31,7 @@ from hagi.train.checkpoint import config_to_dict, load_payload  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Merge N expert checkpoints block-diagonally")
-    parser.add_argument("--config", default="configs/v47_merged.yaml")
+    parser.add_argument("--config", default="configs/level1_merged.yaml")
     parser.add_argument("--experts", nargs="+", default=None, help="N expert step-*.pt paths")
     parser.add_argument("--out", default=None, help="output checkpoint path")
     parser.add_argument("--n-mixers", type=int, default=1)
