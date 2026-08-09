@@ -25,7 +25,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from hagi.config import CHECKPOINT_FORMAT_VERSION, load_config  # noqa: E402
-from hagi.model.merge import MergedHAGI, merge_experts  # noqa: E402
+from hagi.model.merge import merge_experts  # noqa: E402
 from hagi.train.checkpoint import config_to_dict, load_payload  # noqa: E402
 
 
