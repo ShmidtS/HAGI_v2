@@ -8,15 +8,12 @@ specialized knowledge (per-domain ppl) and whether joint training recovers
 overall quality.
 
 Usage:
-    python scripts/eval_domains.py --config configs/v48_merged.yaml \
-        --resume checkpoints_v48_merged/step-0000020.pt \
+    python scripts/eval_domains.py --config configs/level1_merged.yaml \
+        --resume checkpoints_l1_merged/step-0000000.pt \
         --batches 20
 
-    python scripts/eval_domains.py --config configs/experts/expert_ru.yaml \
-        --resume checkpoints_experts/ru/step-0000050.pt --batches 20
-
 The domain mix is taken from the config's ``train.data.weights`` if present,
-else from the DOMAINS table below (the same mapping as make_expert_configs.py).
+else from the DOMAINS table below.
 """
 
 from __future__ import annotations
@@ -39,7 +36,7 @@ from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.checkpoint import load_model  # noqa: E402
 from hagi.train.loop import configure_runtime  # noqa: E402
 
-# domain -> {corpus: weight} (same mapping as make_expert_configs.py)
+# domain -> {corpus: weight}
 DOMAINS: dict[str, dict[str, float]] = {
     "RU": {"wikipedia_ru": 1.0, "oscar_ru": 1.0},
     "EN": {"edu": 1.0, "slimpajama": 1.0, "wikipedia_en": 1.0},
