@@ -49,6 +49,7 @@ model:
 merge:
   enabled: true
   n_experts: 18
+  mixer_type: hadamard
   expert_hidden: 128
   expert_checkpoints:
   - C:\HAGI_v2\checkpoints_corpus\edu\slice0\step-0010601.pt

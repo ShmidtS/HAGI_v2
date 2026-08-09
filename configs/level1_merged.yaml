@@ -1,13 +1,13 @@
 model:
   vocab_size: 32768
-  hidden_size: 2304
+  hidden_size: 9216
   num_layers: 3
   loop_depth: 1
   norm_eps: 1.0e-05
   init_orthogonal: true
   attention:
-    num_query_heads: 36
-    num_kv_heads: 18
+    num_query_heads: 144
+    num_kv_heads: 72
     head_dim: 64
     rope_theta: 10000.0
     max_seq_len: 4096
@@ -23,6 +23,7 @@ model:
   ffn:
     expansion: 0.5
     multiple_of: 64
+    intermediate_size: 4608
   ternary:
     enabled: true
     eps: 1.0e-05
@@ -48,40 +49,29 @@ model:
     variance_gamma: 1.0
 merge:
   enabled: true
-  n_experts: 18
-  mixer_type: hadamard
-  expert_hidden: 128
+  n_experts: 4
+  expert_hidden: 2304
   expert_checkpoints:
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice0\step-0010601.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice1\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice2\step-0009701.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice3\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice4\step-0004301.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice5\step-0002858.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice0\step-0008401.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice1\step-0004601.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice2\step-0005701.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice3\step-0006501.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_ru\slice0\step-0008001.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_ru\slice1\step-0004301.pt
-  - C:\HAGI_v2\checkpoints_corpus\oscar_ru\slice0\step-0008701.pt
-  - C:\HAGI_v2\checkpoints_corpus\openwebmath\slice0\step-0006110.pt
-  - C:\HAGI_v2\checkpoints_corpus\smoltalk\slice0\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\tinystories\slice0\step-0004396.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_en\slice0\step-0004228.pt
-  - C:\HAGI_v2\checkpoints_corpus\python_instruct\slice0\step-0000190.pt
+  - C:\HAGI_v2\checkpoints_l1\ru_general\step-0004601.pt
+  - C:\HAGI_v2\checkpoints_l1\en_general\step-0004000.pt
+  - C:\HAGI_v2\checkpoints_l1\math_code\step-0006300.pt
+  - C:\HAGI_v2\checkpoints_l1\instruct\step-0008301.pt
   freeze_experts: false
   mixer_init_scale: 0.0
+  mixer_type: hadamard
+  mixer_hadamard_groups:
+  - 2
+  - 2
 train:
-  max_steps: 100000
-  batch_size: 256
-  grad_accum_steps: 1
-  grad_checkpointing: false
+  max_steps: 4000
+  batch_size: 64
+  grad_accum_steps: 4
+  grad_checkpointing: true
   use_muon: false
   ternary_step_cache: true
   ce_keep_rate: 0.25
   ce_keep_mode: stride
-  learning_rate: 0.0001
+  learning_rate: 3.0e-05
   max_grad_norm: 1.0
   precision: bf16
   compile_model: true
@@ -91,7 +81,7 @@ train:
     beta2: 0.95
     weight_decay: 0.1
   schedule:
-    warmup_steps: 500
+    warmup_steps: 200
     decay_fraction: 0.2
     min_lr_ratio: 0.02
   data:
@@ -103,8 +93,15 @@ train:
     seed: 1234
     cross_doc_attention: true
     weights:
-      slimpajama: 0.9
-      wikipedia_en: 0.1
+      edu: 1.0
+      slimpajama: 1.0
+      wikipedia_ru: 1.0
+      oscar_ru: 1.0
+      openwebmath: 1.0
+      smoltalk: 1.0
+      tinystories: 1.0
+      wikipedia_en: 1.0
+      python_instruct: 1.0
   logging:
     log_interval: 100
     diag_interval: 100
@@ -112,14 +109,10 @@ train:
     exact_ce_interval: 100
     exact_ce_rows: 512
   z_loss_weight: 0.0001
-  checkpoint_dir: checkpoints_l1/en_general
-  checkpoint_interval: 1000
+  checkpoint_dir: C:\HAGI_v2\checkpoints_l1_merged
+  checkpoint_interval: 500
   checkpoint_keep_last: 2
   tokenizer: google/gemma-4-E2B-it
-  init_from: checkpoints_level0_merged/step-0004000.pt
-  saturation_patience: 20
-  saturation_tol: 0.01
-  saturation_min_steps: 2000
 inference:
   temperature: 0.8
   top_k: 50

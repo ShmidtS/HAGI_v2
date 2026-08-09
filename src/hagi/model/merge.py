@@ -65,19 +65,72 @@ _HADAMARD_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _hadamard_orthonormal(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return the cached orthonormal ``H_n / sqrt(n)`` on ``device``/``dtype``."""
+    """Return the cached orthonormal ``H_n / sqrt(n)`` on ``device``/``dtype``.
+
+    For ``n`` a power of two this is the exact Sylvester Hadamard transform
+    (orthonormal, ``H H^T = I``). For arbitrary ``n`` (e.g. 18 experts) it
+    pads to the next power of two ``m``, builds ``H_m``, takes the first ``n``
+    rows, and orthonormalizes them via QR — yielding an ``n x n`` orthogonal
+    matrix that reduces to the exact Hadamard whenever ``n`` is a power of
+    two. This lets the Hadamard mixer be used for any expert count.
+    """
     key = (n, device.type, device.index, dtype)
     hit = _HADAMARD_CACHE.get(key)
     if hit is not None:
         return hit
-    h = (_hadamard_matrix(n) / math.sqrt(n)).to(device=device, dtype=dtype)
+    if n & (n - 1):
+        # General n: pad to next power of two, take first n rows, orthonormalize.
+        # QR of the n x m matrix (n < m) yields an n x n orthogonal Q. QR is
+        # done in float32 (geqrf has no bf16 CUDA kernel), then cast to dtype.
+        m = 1
+        while m < n:
+            m <<= 1
+        h = _hadamard_matrix(m)[:n].to(device=device, dtype=torch.float32)
+        q, _ = torch.linalg.qr(h)
+        h = q.to(dtype=dtype)  # n x n orthogonal
+    else:
+        h = (_hadamard_matrix(n) / math.sqrt(n)).to(device=device, dtype=dtype)
     if len(_HADAMARD_CACHE) > 16:
         _HADAMARD_CACHE.clear()
     _HADAMARD_CACHE[key] = h
     return h
 
 
-def hadamard_blocks(x: torch.Tensor, n_blocks: int) -> torch.Tensor:
+# Cache of recursive (Kronecker) Hadamard matrices per group layout.
+_RECURSIVE_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _hadamard_recursive_matrix(
+    group_sizes: list[int], device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Build the recursive/local Hadamard as a Kronecker product of per-level
+    Hadamard matrices: ``H = H_{g_k} ⊗ ... ⊗ H_{g_1}`` where ``prod(g_i) = n``.
+
+    This is the recursive tree (16→4→1): at each level a local Hadamard mixes
+    the experts *within each group*, then the groups are grouped again. Each
+    factor is orthonormal, so the product is orthonormal. Because the Sylvester
+    Hadamard satisfies ``H_{ab} = H_a ⊗ H_b``, for uniform group sizes this
+    equals the global ``H_n`` up to a channel permutation — the difference is
+    the *ordering* of the sum/difference channels, which decides which
+    combinations read as "large-scale shared" vs "small-scale differences"
+    (the user's hierarchy idea). The mechanism is what matters: it is ready for
+    a 16→4→1 growth pipeline where each level carries its own local mixer.
+    """
+    key = (tuple(group_sizes), device.type, device.index, dtype)
+    hit = _RECURSIVE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    result = torch.ones(1, 1, device=device, dtype=dtype)
+    for g in group_sizes:
+        h = _hadamard_orthonormal(g, device, dtype)
+        result = torch.kron(result, h)
+    if len(_RECURSIVE_CACHE) > 16:
+        _RECURSIVE_CACHE.clear()
+    _RECURSIVE_CACHE[key] = result
+    return result
+
+
+def hadamard_blocks(x: torch.Tensor, n_blocks: int, group_sizes: list[int] | None = None) -> torch.Tensor:
     """Apply ``(H_n / sqrt(n)) ⊗ I_H`` to the last axis of ``x``.
 
     ``x`` is ``[..., n_blocks * block_dim]`` (a concatenated expert stream).
@@ -98,15 +151,23 @@ def hadamard_blocks(x: torch.Tensor, n_blocks: int) -> torch.Tensor:
     """
     if n_blocks == 1:
         return x
-    if n_blocks & (n_blocks - 1):
-        raise ValueError(f"hadamard_blocks requires a power-of-two block count, got {n_blocks}")
     bd = x.shape[-1] // n_blocks
+    if group_sizes is not None:
+        # Recursive/local Hadamard: Kronecker product of per-level Hadamards.
+        h = _hadamard_recursive_matrix(group_sizes, x.device, x.dtype)
+        xb = x.reshape(x.shape[:-1] + (n_blocks, bd)).transpose(-1, -2)
+        return torch.matmul(xb, h.t()).transpose(-1, -2).reshape(x.shape)
     if n_blocks <= 64:
         h = _hadamard_orthonormal(n_blocks, x.device, x.dtype)
         # x: [..., n, bd] -> transpose to [..., bd, n] for the matmul, then back.
         xb = x.reshape(x.shape[:-1] + (n_blocks, bd)).transpose(-1, -2)
         return torch.matmul(xb, h.t()).transpose(-1, -2).reshape(x.shape)
-    # Butterfly fallback for very large N (O(NH log N) < O(N^2 H)).
+    # Butterfly fallback for very large N (O(NH log N) < O(N^2 H)). Only valid
+    # for power-of-two N; for non-power-of-two N > 64 we still use the matmul.
+    if n_blocks & (n_blocks - 1):
+        h = _hadamard_orthonormal(n_blocks, x.device, x.dtype)
+        xb = x.reshape(x.shape[:-1] + (n_blocks, bd)).transpose(-1, -2)
+        return torch.matmul(xb, h.t()).transpose(-1, -2).reshape(x.shape)
     shape = x.shape[:-1] + (n_blocks, bd)
     xb = x.reshape(shape)
     h = xb
@@ -121,7 +182,9 @@ def hadamard_blocks(x: torch.Tensor, n_blocks: int) -> torch.Tensor:
     return (h / math.sqrt(n_blocks)).reshape(x.shape)
 
 
-def hadamard_apply_2d(weight: torch.Tensor, n_blocks: int) -> torch.Tensor:
+def hadamard_apply_2d(
+    weight: torch.Tensor, n_blocks: int, group_sizes: list[int] | None = None
+) -> torch.Tensor:
     """Right-multiply a 2D weight by ``(H_n / sqrt(n)) ⊗ I_H``.
 
     Used to keep the merged head consistent with a Hadamard mixer: the head
@@ -133,7 +196,11 @@ def hadamard_apply_2d(weight: torch.Tensor, n_blocks: int) -> torch.Tensor:
     if n_blocks == 1:
         return weight
     bd = weight.shape[1] // n_blocks
-    if n_blocks <= 64:
+    if group_sizes is not None:
+        h = _hadamard_recursive_matrix(group_sizes, weight.device, weight.dtype)
+        wb = weight.reshape(weight.shape[0], n_blocks, bd)
+        return torch.matmul(wb.transpose(1, 2), h.t()).transpose(1, 2).reshape(weight.shape)
+    if n_blocks <= 64 or (n_blocks & (n_blocks - 1)):
         h = _hadamard_orthonormal(n_blocks, weight.device, weight.dtype)
         wb = weight.reshape(weight.shape[0], n_blocks, bd)
         # weight @ (H ⊗ I) : [out, n, bd] -> transpose to [out, bd, n] for the
@@ -228,12 +295,24 @@ class HadamardMixer(nn.Module):
         norm_eps: float = 1e-5,
         residual_scale: float = 1.0,
         mixer_init_scale: float = 0.0,
+        group_sizes: list[int] | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % n_blocks:
             raise ValueError(f"hidden_size {hidden_size} must be divisible by n_blocks {n_blocks}")
         self.n_blocks = int(n_blocks)
         self.rank = int(rank)
+        self.group_sizes = list(group_sizes) if group_sizes else None
+        if self.group_sizes is not None:
+            prod = 1
+            for g in self.group_sizes:
+                if g < 1 or (g & (g - 1)):
+                    raise ValueError(f"group_sizes must be powers of two, got {self.group_sizes}")
+                prod *= g
+            if prod != self.n_blocks:
+                raise ValueError(
+                    f"group_sizes {self.group_sizes} product {prod} != n_blocks {self.n_blocks}"
+                )
         self.norm = nn.LayerNorm(hidden_size, eps=norm_eps)
         self.gate = nn.Linear(hidden_size, rank, bias=False)
         self.up = nn.Linear(hidden_size, rank, bias=False)
@@ -254,7 +333,7 @@ class HadamardMixer(nn.Module):
         # is pre-rotated to match, so the merged model is not degraded before
         # joint training. The learned low-rank residual operates on the
         # normalized stream and is gated by ``gain`` (0 by default).
-        mixed = hadamard_blocks(x, self.n_blocks)
+        mixed = hadamard_blocks(x, self.n_blocks, self.group_sizes)
         h = self.norm(x)
         out = self.down(torch.nn.functional.silu(self.gate(h)) * self.up(h))
         return mixed + self.branch_scale(out) * self.gain.to(x.dtype)
@@ -315,6 +394,9 @@ class MergedHAGI(HAGI):
         residual_scale = (2.0 * m.num_layers * max(1, int(m.loop_depth))) ** -0.5
         mixer_type = str(getattr(cfg.merge, "mixer_type", "swiglu"))
         mixer_rank = int(getattr(cfg.merge, "mixer_rank", 64))
+        group_sizes = getattr(cfg.merge, "mixer_hadamard_groups", None)
+        if group_sizes is not None:
+            group_sizes = [int(g) for g in group_sizes]
         if mixer_type == "hadamard":
             self.mixers = nn.ModuleList(
                 [
@@ -325,6 +407,7 @@ class MergedHAGI(HAGI):
                         norm_eps=m.norm_eps,
                         residual_scale=residual_scale,
                         mixer_init_scale=mixer_init_scale,
+                        group_sizes=group_sizes,
                     )
                     for _ in range(n_mixers)
                 ]
@@ -436,6 +519,12 @@ def merge_experts(
     # Group expert tensors by key. Each expert has the same key set.
     keys = list(expert_states[0].keys())
     for k in keys:
+        if drop_expert_mixers and k.startswith("mixers."):
+            # The experts' own mixers are dropped and replaced by a fresh
+            # level-2 mixer, so their geometry may differ across experts (e.g.
+            # a SwiGLU-trained expert vs a Hadamard-trained one). Skip the
+            # shape check for them.
+            continue
         for st in expert_states:
             if k not in st:
                 raise ValueError(f"expert state missing key {k!r}")
@@ -479,10 +568,12 @@ def merge_experts(
             # Block-wise RMSNorm gains: [n_blocks, block_dim]. Stack the
             # experts' [block_dim] gains along the block axis. For a
             # hierarchical merge the experts are themselves merged models with
-            # 2D block norms [n_blocks, block_dim]; concatenate those along
-            # the block_dim axis so each expert's blocks stay contiguous.
+            # 2D block norms [n_blocks, block_dim]; each expert's blocks must be
+            # flattened into a single contiguous block (its own hidden width)
+            # and stacked along the block axis, so the merged model's
+            # [n_experts, expert_hidden] norm applies per expert.
             if blocks[0].ndim == 2:
-                merged = torch.cat(blocks, dim=1)
+                merged = torch.stack([b.reshape(-1) for b in blocks], dim=0)
             else:
                 merged = torch.stack(blocks, dim=0)
         elif target.ndim == 2:
@@ -567,6 +658,9 @@ def merge_experts(
     # logits, so both must be rotated. ``head.log_prior`` is a function of the
     # vocabulary, not of the hidden space, and is left untouched.
     if str(getattr(cfg.merge, "mixer_type", "swiglu")) == "hadamard" and n > 1:
+        group_sizes = getattr(cfg.merge, "mixer_hadamard_groups", None)
+        if group_sizes is not None:
+            group_sizes = [int(g) for g in group_sizes]
         # Only the *output* head must be pre-rotated. The input embedding
         # (``encoder.embedding.weight``) feeds the first block, not the head,
         # so it must NOT be rotated — rotating it would change the input
@@ -575,9 +669,13 @@ def merge_experts(
         # rotated then; otherwise only ``head.projection.weight`` is.
         if getattr(cfg.model, "tie_lm_head", False):
             if "encoder.embedding.weight" in sd:
-                sd["encoder.embedding.weight"] = hadamard_apply_2d(sd["encoder.embedding.weight"], n)
+                sd["encoder.embedding.weight"] = hadamard_apply_2d(
+                    sd["encoder.embedding.weight"], n, group_sizes
+                )
         if "head.projection.weight" in sd:
-            sd["head.projection.weight"] = hadamard_apply_2d(sd["head.projection.weight"], n)
+            sd["head.projection.weight"] = hadamard_apply_2d(
+                sd["head.projection.weight"], n, group_sizes
+            )
 
     # Zero-init the mixer gains (already 0 from constructor) and keep the
     # merged model's own out_norm / head as-is (they are the merged versions).
