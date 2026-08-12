@@ -18,7 +18,7 @@ from tests.conftest import assert_finite
 
 
 def reference_allowed(
-    t_q: int, t_total: int, *, window: int, doc_ids: torch.Tensor | None, prefix_len: int
+    t_q: int, t_total: int, *, window: int, doc_ids: torch.Tensor | None, prefix_len: int, sink_len: int = 0
 ) -> torch.Tensor:
     """Nested-loop truth for the mask, one boolean per (query, key) pair."""
     batch = 1 if doc_ids is None else doc_ids.shape[0]
@@ -35,6 +35,11 @@ def reference_allowed(
                     ok = ok and int(doc_ids[b, q_pos]) == int(doc_ids[b, j])
                 if prefix_len > 0 and j < prefix_len:
                     ok = True
+                if sink_len > 0 and j < sink_len and j <= q_pos:
+                    # Sinks keep the leading keys visible inside a window, but
+                    # causality and document boundaries still apply.
+                    if doc_ids is None or int(doc_ids[b, q_pos]) == int(doc_ids[b, j]):
+                        ok = True
                 out[b, i, j] = ok
     return out
 
@@ -46,21 +51,21 @@ class TestMask:
         ), "an unconstrained causal mask must fall through to SDPA's fused kernel"
 
     @pytest.mark.parametrize(
-        "window,use_docs,prefix",
-        [(3, False, 0), (0, True, 0), (3, True, 0), (0, False, 2), (2, True, 2)],
-        ids=["window", "docs", "window_docs", "prefix", "all"],
+        "window,use_docs,prefix,sink",
+        [(3, False, 0, 0), (0, True, 0, 0), (3, True, 0, 0), (0, False, 2, 0), (2, True, 2, 0), (2, False, 0, 3), (4, True, 1, 2)],
+        ids=["window", "docs", "window_docs", "prefix", "all", "sink", "window_docs_prefix_sink"],
     )
-    def test_matches_reference(self, window, use_docs, prefix):
+    def test_matches_reference(self, window, use_docs, prefix, sink):
         t = 8
         doc_ids = None
         if use_docs:
             doc_ids = torch.tensor([[0, 0, 0, 1, 1, 2, 2, 2], [0, 1, 1, 1, 2, 2, 3, 3]])
         mask = build_attention_mask(
-            t, t, window=window, doc_ids=doc_ids, prefix_len=prefix,
+            t, t, window=window, doc_ids=doc_ids, prefix_len=prefix, sink_len=sink,
             device=torch.device("cpu"), dtype=torch.float32,
         )
         allowed = mask == 0.0
-        expected = reference_allowed(t, t, window=window, doc_ids=doc_ids, prefix_len=prefix)
+        expected = reference_allowed(t, t, window=window, doc_ids=doc_ids, prefix_len=prefix, sink_len=sink)
         assert torch.equal(allowed.squeeze(1), expected)
 
     def test_no_future_key_is_ever_allowed(self):
@@ -221,6 +226,46 @@ class TestAttention:
         assert grown_normed / base_normed < 1.5, (
             f"qk_norm let the logit range grow {grown_normed / base_normed:.1f}x"
         )
+
+    def test_sink_bias_affects_output_and_is_learnable(self):
+        """With sink_len>0 the module has a learnable bias and the output moves.
+
+        Lesson from DeepSeek-V4's ``attn_sink``: leading positions act as a
+        stable anchor every query can attend to. At init the bias is zero, so
+        output equals plain attention; after the bias moves, the output must
+        differ.
+        """
+        torch.manual_seed(0)
+        attn = self.make(sink_len=2).eval()
+        assert attn.sink_bias is not None
+        x = torch.randn(1, 6, 64)
+        with torch.no_grad():
+            base = attn(x)
+            attn.sink_bias.add_(1.5)
+            moved = attn(x)
+        assert not torch.allclose(base, moved, atol=1e-4), "sink bias had no effect"
+
+    def test_fp32_softmax_matches_sdpa(self):
+        """fp32 path is numerically equivalent to the fused SDPA path."""
+        x = torch.randn(1, 8, 64)
+        torch.manual_seed(0)
+        a_fast = self.make(fp32_softmax=False).eval()
+        torch.manual_seed(0)
+        a_fp32 = self.make(fp32_softmax=True).eval()
+        with torch.no_grad():
+            out_fast = a_fast(x)
+            out_fp32 = a_fp32(x)
+        assert torch.allclose(out_fast, out_fp32, atol=1e-5, rtol=1e-4)
+
+    def test_fp32_softmax_with_sinks_matches_reference(self):
+        """fp32 + sinks: causality lifted for leading keys, bias applied."""
+        torch.manual_seed(0)
+        attn = self.make(fp32_softmax=True, sink_len=2).eval()
+        x = torch.randn(1, 6, 64)
+        with torch.no_grad():
+            attn.sink_bias.fill_(0.7)
+            out = attn(x)
+        assert_finite(out, "fp32+sink output")
 
 
 class TestKVCacheDecode:

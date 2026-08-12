@@ -1,12 +1,12 @@
 """Merge N expert checkpoints into one block-diagonal MergedHAGI.
 
 Usage:
-    python scripts/merge_experts.py --config configs/level1_merged.yaml \
-        --experts ckptA.pt ckptB.pt ckptC.pt ckptD.pt \
-        --out checkpoints_l1_merged/step-0000000.pt
+    python scripts/merge_experts.py --config configs/level0_merged_3.yaml \
+        --experts ckptA.pt ckptB.pt ckptC.pt \
+        --out checkpoints_l0_merged/step-0000000.pt
 
 The merged model is written as a standard HAGI checkpoint (format 12) so it can
-be resumed with ``scripts/train.py --config configs/level1_merged.yaml --resume``.
+be resumed with ``scripts/train.py --config configs/level0_merged_3.yaml --resume``.
 
 When ``--experts`` is omitted, the current model's weights are replicated N
 times (machinery smoke test for the merge path).
