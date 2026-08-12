@@ -87,6 +87,8 @@ class HAGI(nn.Module):
                 sliding_window=windows[layer],
                 history_stride=m.sliding.history_stride,
                 per_head_qk=self._n_experts > 1,
+                fp32_softmax=m.attention.fp32_softmax,
+                sink_len=m.attention.sink_len,
             )
             mixer = FeedForward(
                 h,
@@ -177,14 +179,18 @@ class HAGI(nn.Module):
         t_q = h.shape[1]
         checkpointing = self.training and self.cfg.train.grad_checkpointing
         mask_by_window: dict[int, torch.Tensor | None] = {}
+        sink_len = self.cfg.model.attention.sink_len
 
         # Prefetch masks once; loops reuse them.
         # Pure window (no docs / no multimodal prefix): leave mask=None so the
         # layer runs correct O(T·W) local_window_attention instead of building
         # a dense T×T band and paying the math-SDPA full-score tax.
+        # Exception: when sinks are on, the mask is required so the leading
+        # keys stay visible inside the window (local_window_attention has no
+        # sink handling).
         for window in self._window_layers:
             if window not in mask_by_window:
-                if window > 0 and doc_ids is None and prefix_len <= 0:
+                if window > 0 and doc_ids is None and prefix_len <= 0 and sink_len == 0:
                     mask_by_window[window] = None
                 else:
                     mask_by_window[window] = build_attention_mask(
@@ -193,6 +199,7 @@ class HAGI(nn.Module):
                         window=window,
                         doc_ids=doc_ids,
                         prefix_len=prefix_len,
+                        sink_len=sink_len,
                         device=h.device,
                         dtype=h.dtype,
                     )

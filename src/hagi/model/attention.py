@@ -54,6 +54,8 @@ class AttentionConfig:
     sliding_window: int = 0  # 0 = full attention
     history_stride: int = 0
     per_head_qk: bool = False  # per-head QK gain (block-diagonal expert merge)
+    fp32_softmax: bool = True  # fp32 scores/softmax (DSV4 stability lesson)
+    sink_len: int = 0  # attention sinks: leading keys visible to every query
 
 
 
@@ -187,6 +189,8 @@ class Attention(nn.Module):
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.sliding_window = int(cfg.sliding_window or 0)
         self.history_stride = int(getattr(cfg, "history_stride", 0) or 0)
+        self.fp32_softmax = bool(getattr(cfg, "fp32_softmax", False))
+        self.sink_len = int(getattr(cfg, "sink_len", 0) or 0)
 
         def proj(out_features: int) -> nn.Module:
             return linear(hidden_size, out_features, use_ternary, init_orthogonal)
@@ -219,6 +223,13 @@ class Attention(nn.Module):
         )
         # Shared RoPE across layers (same head_dim/theta) — one table, one cache.
         self.rope = rope if rope is not None else RotaryEmbedding(cfg.head_dim, rope_theta=cfg.rope_theta)
+        # Attention sinks (DeepSeek-V4 attn_sink): learnable per-head bias on
+        # the leading ``sink_len`` key positions, which every query may attend
+        # to. Zero-initialized so enabling it starts as plain attention; the
+        # bias learns to hold a stable anchor for long-context decoding.
+        self.sink_bias: torch.nn.Parameter | None = None
+        if self.sink_len > 0:
+            self.sink_bias = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.sink_len))
         self.branch_scale = BranchScale(residual_scale)
         self._kv_cache: KVCache | None = None
 
@@ -228,6 +239,48 @@ class Attention(nn.Module):
 
     def detach_cache(self) -> None:
         self._kv_cache = None
+
+    def _sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        """Stable attention path.
+
+        With ``fp32_softmax`` (or active sinks) the scores are computed and
+        softmaxed in fp32 even when activations are bf16 — the stability lesson
+        from DeepSeek-V4's compressed attention (bf16 softmax can collapse
+        close logit pairs, especially at large window widths; the official code
+        runs ``softmax(dtype=torch.float32)`` there) and from the fp16-route
+        NaN we hit at low precision.
+
+        Sinks add a learnable per-head bias to the leading ``min(sink_len, T)``
+        key positions. They do **not** lift causality (a causal decoder cannot
+        attend to tokens that do not exist yet during incremental decode); the
+        mask's ``sink_len`` handling only brings those keys back inside a
+        sliding window. This keeps full forward and incremental decode exactly
+        consistent.
+        """
+        sl = self.sink_len
+        if not self.fp32_softmax and sl == 0:
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=is_causal)
+        q32, k32, v32 = q.float(), k.float(), v.float()
+        scores = torch.matmul(q32, k32.transpose(-2, -1)) * (self.head_dim**-0.5)
+        if is_causal:
+            t = scores.shape[-1]
+            causal = torch.triu(scores.new_ones(t, t), diagonal=1).bool()
+            scores = scores.masked_fill(causal, float("-inf"))
+        if mask is not None:
+            scores = scores + mask.float()
+        if sl > 0 and self.sink_bias is not None:
+            n = min(sl, scores.shape[-1])
+            if n > 0:
+                scores[..., :n] = scores[..., :n] + self.sink_bias[..., :n].to(scores.dtype)
+        probs = scores.softmax(dim=-1)
+        return torch.matmul(probs, v32).to(q.dtype)
 
     def forward(
         self,
@@ -281,7 +334,7 @@ class Attention(nn.Module):
         window = self.sliding_window
         if mask is not None:
             # Caller-built mask already encodes window / docs / prefix.
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            out = self._sdpa(q, k, v, mask=mask)
         elif (
             self.training
             and self.history_stride > 0
@@ -295,9 +348,9 @@ class Attention(nn.Module):
             out = local_window_attention(q, k, v, window)
         elif t == 1:
             # Single-token decode: one query against the whole cached prefix.
-            out = F.scaled_dot_product_attention(q, k, v)
+            out = self._sdpa(q, k, v)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = self._sdpa(q, k, v, is_causal=True)
 
         return self.branch_scale(
             self.out_proj(out.transpose(1, 2).reshape(b, t, self.hidden_size))
@@ -311,12 +364,13 @@ def build_attention_mask(
     window: int = 0,
     doc_ids: torch.Tensor | None = None,
     prefix_len: int = 0,
+    sink_len: int = 0,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
     """Build the additive attention mask, or None when plain causal suffices.
 
-    Composes three constraints:
+    Composes four constraints:
 
     * **Causal** — a query attends only to positions at or before it. This is the
       objective's definition; violating it makes next-token prediction trivial at
@@ -325,10 +379,14 @@ def build_attention_mask(
       independent documents. Attention across a boundary leaks one source into
       another, so ``doc_ids`` restricts each query to its own document.
     * **Window** — a query attends only to the last ``window`` positions.
+    * **Sinks** — the first ``sink_len`` key positions get a learnable bias and
+      are kept visible even inside a sliding window (attention sinks;
+      DeepSeek-V4 ``attn_sink``). Causality and document boundaries still
+      apply to them: they are an anchor the model can always lean on, not a
+      way to see the future or other documents.
 
-    A multimodal prefix (``prefix_len > 0``) is exempt from all three: prefix
-    tokens are mutually visible and visible to every text position, because the
-    prefix is side information available in full before decoding starts.
+    A multimodal prefix (``prefix_len > 0``) is exempt from all of the above:
+    prefix tokens are mutually visible and visible to every text position.
 
     Args:
         t_q: number of query positions.
@@ -337,6 +395,7 @@ def build_attention_mask(
         doc_ids: ``[B, t_total]`` document id per key position (queries take the
             last ``t_q``). None disables the boundary constraint.
         prefix_len: leading positions that bypass causality.
+        sink_len: leading key positions visible to every query.
         device, dtype: output device/dtype.
 
     Returns:
@@ -344,7 +403,7 @@ def build_attention_mask(
         None) additive mask with ``-inf`` at disallowed pairs, or None when the
         result is exactly plain causal.
     """
-    if window <= 0 and doc_ids is None and prefix_len <= 0:
+    if window <= 0 and doc_ids is None and prefix_len <= 0 and sink_len <= 0:
         return None
 
     q_pos = torch.arange(t_total - t_q, t_total, device=device).view(t_q, 1)
@@ -364,6 +423,16 @@ def build_attention_mask(
     if prefix_len > 0:
         is_prefix_key = (k_pos < prefix_len).view(1, 1, 1, t_total)
         allowed = allowed | is_prefix_key
+
+    if sink_len > 0:
+        # Sinks are a bias on the leading keys, not a causality exemption: a
+        # causal decoder cannot attend to tokens that are not generated yet, so
+        # the mask only brings the first ``sink_len`` keys back inside a sliding
+        # window (and still only within the query's own document).
+        is_sink = ((k_pos < sink_len) & (k_pos <= q_pos)).view(1, 1, t_q, t_total)
+        if doc_ids is not None:
+            is_sink = is_sink & same_doc
+        allowed = allowed | is_sink
 
     mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
     return mask.masked_fill(~allowed, float("-inf"))

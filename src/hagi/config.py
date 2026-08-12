@@ -65,6 +65,22 @@ class AttentionConfig:
     must divide ``num_query_heads``. GQA shrinks the KV-cache by
     ``num_query_heads / num_kv_heads`` at nearly no quality cost, which is what
     makes long-context decoding affordable.
+
+    Attributes:
+        fp32_softmax: compute attention scores and softmax in fp32 even when
+            the activations are bf16. Lesson from DeepSeek-V4's compressed-
+            attention path: in bf16/fp16 the softmax can collapse pairs that
+            differ by a small amount, especially at large window widths; the
+            official implementation explicitly runs ``softmax(dtype=fp32)``
+            there. On by default (training from scratch): the cost of the math
+            fallback is worth the guaranteed stability. Disable it only when
+            profiling shows it matters and the logit scale is well bounded.
+        sink_len: number of leading key positions that every query may attend
+            to (attention sinks, as in DeepSeek-V4's ``attn_sink``). A learnable
+            per-head bias is added to their scores and causality is lifted for
+            them. Default 4 (they must be trained from scratch — you cannot add
+            sinks to an already-trained model). 0 disables the mechanism
+            entirely (no extra parameters).
     """
 
     num_query_heads: int = 24
@@ -73,6 +89,8 @@ class AttentionConfig:
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
     qk_norm: bool = True
+    fp32_softmax: bool = True
+    sink_len: int = 4
 
 
 @dataclass
@@ -630,6 +648,8 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
     per_attn += (a.num_query_heads * a.head_dim) * h  # out
     if a.qk_norm:
         per_attn += 2 * a.head_dim
+    if a.sink_len > 0:
+        per_attn += a.num_query_heads * a.sink_len  # learnable sink bias
 
     per_dense_ffn = 3 * h * inter
     norms = n * 2 * h + h
@@ -810,6 +830,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("num_kv_heads must divide num_query_heads (GQA)")
     if a.head_dim % 2:
         raise ValueError("head_dim must be even (RoPE rotates dimension pairs)")
+    if a.sink_len < 0 or a.sink_len > a.max_seq_len:
+        raise ValueError(f"attention.sink_len must be in [0, max_seq_len], got {a.sink_len}")
     if t.data.seq_len > a.max_seq_len:
         raise ValueError(
             f"train.data.seq_len ({t.data.seq_len}) exceeds attention.max_seq_len ({a.max_seq_len})"
@@ -927,9 +949,19 @@ def validate_config(cfg: Config) -> None:
         if mg.mixer_hadamard_groups:
             prod = 1
             for g in mg.mixer_hadamard_groups:
-                if g < 1 or (g & (g - 1)):
+                # Powers of two use the fast Hadamard; powers of three use the
+                # complex DFT-3 (ternary orthonormal merge). Anything else is
+                # rejected.
+                is_pow2 = g >= 1 and not (g & (g - 1))
+                is_pow3 = g >= 1
+                if is_pow3:
+                    t = g
+                    while t % 3 == 0:
+                        t //= 3
+                    is_pow3 = t == 1
+                if not (is_pow2 or is_pow3):
                     raise ValueError(
-                        f"merge.mixer_hadamard_groups entries must be powers of two, got {mg.mixer_hadamard_groups}"
+                        f"merge.mixer_hadamard_groups entries must be powers of two or three, got {mg.mixer_hadamard_groups}"
                     )
                 prod *= g
             if prod != mg.n_experts:

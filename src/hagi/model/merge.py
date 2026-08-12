@@ -131,6 +131,83 @@ def _hadamard_recursive_matrix(
     return result
 
 
+def _dft3_pair(z: torch.Tensor, k: int) -> torch.Tensor:
+    """Rotate a complex pair ``(re, im)`` by ``omega**k`` (omega = e^{2pi i/3}).
+
+    ``z`` is ``[..., 2]`` (last dim = re, im). Multiplication by omega is a
+    rotation by 120 deg, by omega^2 a rotation by 240 deg. Pure real arithmetic
+    (the RoPE trick) — no complex tensors needed on ROCm.
+    """
+    a = z[..., 0]
+    b = z[..., 1]
+    s = math.sqrt(3) / 2.0
+    if k == 1:  # omega = cos120 + i sin120 = -1/2 + i sqrt(3)/2
+        return torch.stack((-0.5 * a - s * b, s * a - 0.5 * b), dim=-1)
+    # omega^2 = cos240 + i sin240 = -1/2 - i sqrt(3)/2
+    return torch.stack((-0.5 * a + s * b, -s * a - 0.5 * b), dim=-1)
+
+
+def _dft3_blocks3(x: torch.Tensor, bd: int) -> torch.Tensor:
+    """Apply the complex DFT-3 ``F_3 ⊗ I_{bd/2}`` to ``[..., 3*bd]``.
+
+    ``x`` is a concatenation of three expert blocks of width ``bd`` (must be
+    even). Each pair of coordinates inside a block is treated as one complex
+    number; the unitary ``F_3`` mixes the three experts on the complex axis and
+    the result is mapped back to real pairs. The real representation of a
+    unitary matrix is orthogonal, so this is an orthonormal transform — and
+    unlike any real 3x3 it mixes all three experts with equal weight (no blind
+    channel): every output pair sees every input pair with norm ``1/sqrt(3)``.
+    """
+    xb = x.reshape(x.shape[:-1] + (3, bd // 2, 2))
+    z0, z1, z2 = xb[..., 0, :, :], xb[..., 1, :, :], xb[..., 2, :, :]
+    s = 1.0 / math.sqrt(3)
+    y0 = s * (z0 + z1 + z2)
+    y1 = s * (z0 + _dft3_pair(z1, 1) + _dft3_pair(z2, 2))
+    y2 = s * (z0 + _dft3_pair(z1, 2) + _dft3_pair(z2, 1))
+    return torch.stack([y0, y1, y2], dim=-3).reshape(x.shape)
+
+
+def _is_ternary_group(g: int) -> bool:
+    """True if ``g`` is a power of three (3, 9, 27, ...)."""
+    if g < 1:
+        return False
+    while g % 3 == 0:
+        g //= 3
+    return g == 1
+
+
+def _dft3_apply(x: torch.Tensor, n_blocks: int, bd: int) -> torch.Tensor:
+    """Apply the ternary DFT to ``[..., n_blocks*bd]``, ``n_blocks = 3^k``.
+
+    Recursive Kronecker structure: ``F_{3^k} = F_3 ⊗ ... ⊗ F_3``, applied level
+    by level exactly like the Hadamard butterfly. At each level every local
+    triple of blocks (bd wide) is mixed by ``F_3``, then the triples are grouped
+    into triples again. The product is orthonormal; this is the ternary analogue
+    of ``H_{2^k}``.
+    """
+    if n_blocks == 1:
+        return x
+    if n_blocks == 3:
+        return _dft3_blocks3(x, bd)
+    # n_blocks = 9, 27, ...: first mix inside each local triple, then recurse
+    # on the ``n_blocks/3`` super-groups whose effective block width grew to
+    # ``3*bd`` (the Kronecker structure ``F_{3^k} = (F_3 ⊗ I) (I ⊗ F_3) ...``).
+    xb = x.reshape(x.shape[:-1] + (n_blocks // 3, 3, bd))
+    # Each local triple (3 blocks of width bd) becomes one contiguous row of
+    # width 3*bd; _dft3_blocks3 mixes those three blocks per group.
+    xc = xb.reshape(xb.shape[:-2] + (3 * bd,))
+    yc = _dft3_blocks3(xc, bd)
+    y2 = yc.reshape(x.shape)
+    return _dft3_apply(y2, n_blocks // 3, 3 * bd)
+
+
+def _dft3_apply_2d(weight: torch.Tensor, n_blocks: int, bd: int) -> torch.Tensor:
+    """Right-multiply a 2D weight by the ternary DFT (head pre-rotation)."""
+    if n_blocks == 1:
+        return weight
+    return _dft3_apply(weight, n_blocks, bd)
+
+
 def hadamard_blocks(x: torch.Tensor, n_blocks: int, group_sizes: list[int] | None = None) -> torch.Tensor:
     """Apply ``(H_n / sqrt(n)) ⊗ I_H`` to the last axis of ``x``.
 
@@ -154,10 +231,18 @@ def hadamard_blocks(x: torch.Tensor, n_blocks: int, group_sizes: list[int] | Non
         return x
     bd = x.shape[-1] // n_blocks
     if group_sizes is not None:
+        # Ternary groups (all powers of three): use the complex DFT-3, the
+        # orthonormal ternary analogue of the Hadamard. It mixes triples with
+        # equal weight (no blind channel) and is applied level by level.
+        if all(_is_ternary_group(g) for g in group_sizes) and bd % 2 == 0:
+            return _dft3_apply(x, n_blocks, bd)
         # Recursive/local Hadamard: Kronecker product of per-level Hadamards.
         h = _hadamard_recursive_matrix(group_sizes, x.device, x.dtype)
         xb = x.reshape(x.shape[:-1] + (n_blocks, bd)).transpose(-1, -2)
         return torch.matmul(xb, h.t()).transpose(-1, -2).reshape(x.shape)
+    if _is_ternary_group(n_blocks) and bd % 2 == 0:
+        # Flat ternary: F_3 (or F_9, ...) directly.
+        return _dft3_apply(x, n_blocks, bd)
     if n_blocks <= 64:
         h = _hadamard_orthonormal(n_blocks, x.device, x.dtype)
         # x: [..., n, bd] -> transpose to [..., bd, n] for the matmul, then back.
@@ -198,9 +283,13 @@ def hadamard_apply_2d(
         return weight
     bd = weight.shape[1] // n_blocks
     if group_sizes is not None:
+        if all(_is_ternary_group(g) for g in group_sizes) and bd % 2 == 0:
+            return _dft3_apply_2d(weight, n_blocks, bd)
         h = _hadamard_recursive_matrix(group_sizes, weight.device, weight.dtype)
         wb = weight.reshape(weight.shape[0], n_blocks, bd)
         return torch.matmul(wb.transpose(1, 2), h.t()).transpose(1, 2).reshape(weight.shape)
+    if _is_ternary_group(n_blocks) and bd % 2 == 0:
+        return _dft3_apply_2d(weight, n_blocks, bd)
     if n_blocks <= 64 or (n_blocks & (n_blocks - 1)):
         h = _hadamard_orthonormal(n_blocks, weight.device, weight.dtype)
         wb = weight.reshape(weight.shape[0], n_blocks, bd)
@@ -307,8 +396,13 @@ class HadamardMixer(nn.Module):
         if self.group_sizes is not None:
             prod = 1
             for g in self.group_sizes:
-                if g < 1 or (g & (g - 1)):
-                    raise ValueError(f"group_sizes must be powers of two, got {self.group_sizes}")
+                # Each level mixes a local group; the fixed orthonormal
+                # transform is the Hadamard for powers of two and the complex
+                # DFT-3 for powers of three (ternary merge).
+                if g < 1 or (not _is_ternary_group(g) and (g & (g - 1))):
+                    raise ValueError(
+                        f"group_sizes must be powers of two or powers of three, got {self.group_sizes}"
+                    )
                 prod *= g
             if prod != self.n_blocks:
                 raise ValueError(
@@ -545,7 +639,12 @@ def merge_experts(
         # the vocabulary, not of any single expert.
         if k.endswith("log_prior"):
             continue
-        if target.ndim == 2 and (k.endswith("q_norm.weight") or k.endswith("k_norm.weight")):
+        if target.ndim == 4 and k.endswith("sink_bias"):
+            # Learnable attention-sink bias is [1, n_heads, 1, sink_len]; each
+            # expert contributes its own heads, so concatenate along the head
+            # axis (dim=1). This mirrors the per-head QK gains handling below.
+            merged = torch.cat(blocks, dim=1)
+        elif target.ndim == 2 and (k.endswith("q_norm.weight") or k.endswith("k_norm.weight")):
             # Per-head QK gains: each expert's gain applies to its own heads.
             # The merged model has per_head_qk=True, so the target is
             # [n_heads, head_dim]. Each expert has q_per_exp (or kv_per_exp)
