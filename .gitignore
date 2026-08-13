@@ -47,6 +47,7 @@ checkpoints/
 *.pth
 *.ckpt
 *.log
+*.safetensors
 consumed.json
 torch-compile.bat
 profile_*
