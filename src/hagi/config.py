@@ -560,6 +560,29 @@ class MergeConfig:
             instead of the flat ``H_n`` — the same orthonormal mixing but with
             the sum/difference channels ordered by the hierarchy (ready for a
             16→4→1 growth pipeline). When None, the flat ``H_n`` is used.
+
+        The fixed Hadamard is information-neutral for ORTHOGONAL experts.
+        Measured on DeepSeek-V4 the routed experts are mutually orthogonal
+        (pairwise cos ~1/sqrt(N), flat spectrum): a rotation preserves the Gram
+        matrix, so no linear re-mixing (Hadamard / DFT-3 / Procrustes) can
+        recover a shared component — the "sum" channel is just another random
+        direction. The only way to merge orthogonal experts is DISTILLATION:
+        transfer their *outputs*, never their weights.
+
+        distill: enable distillation during joint training. The merged model
+            is trained to match a teacher's output (soft labels or hidden
+            states) in addition to its own CE. This is the merge mechanism for
+            orthogonal experts, where the fixed Hadamard re-mix cannot help.
+        distill_mode: ``"logit"`` (KL on logits, shared vocab), ``"feature"``
+            (MSE on hidden states, any vocab/dim via a learned projection), or
+            ``"both"``.
+        distill_temperature: KD temperature.
+        distill_alpha: blend weight of the distillation loss against CE
+            (``loss = (1-alpha)*ce + alpha*distill``).
+        distill_teacher: source of the teacher signal. ``"self"`` = the N
+            experts' own combined output (router-weighted sum, when the
+            experts carry a router); otherwise a path to an external teacher
+            (e.g. a DeepSeek MoE checkpoint assembled brick-by-brick).
     """
 
     enabled: bool = False
@@ -571,6 +594,11 @@ class MergeConfig:
     mixer_type: str = "hadamard"
     mixer_rank: int = 64
     mixer_hadamard_groups: list[int] = field(default_factory=list)
+    distill: bool = False
+    distill_mode: str = "feature"
+    distill_temperature: float = 1.0
+    distill_alpha: float = 0.5
+    distill_teacher: str = "self"
 
 
 @dataclass
