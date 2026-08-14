@@ -142,7 +142,7 @@ def main():
     ap.add_argument('layer', type=int)
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--end', type=int, default=256)
-    ap.add_argument('--steps', type=int, default=300)
+    ap.add_argument('--steps', type=int, default=150)
     ap.add_argument('--inter', type=int, default=4096)
     ap.add_argument('--group', type=int, default=32)
     ap.add_argument('--experts', type=int, default=0, help='if >0, only process this many (debug)')
@@ -164,16 +164,22 @@ def main():
             sys.exit(1)
     else:
         x = torch.load(xpath, map_location='cuda')
-    xc = x - x.mean(0, keepdim=True)
+    # Fix A: PCA on CENTERED x (stable), but teacher target on RAW x.
+    # The old code computed ffn(xc) — FFN(x-mu) differs from FFN(x) by 25-27%.
+    mu = x.mean(0, keepdim=True)
+    xc = x - mu
     print(f'layer {layer}: x {tuple(xc.shape)}')
 
     p_path = os.path.join(out_dir, 'P.pt')
+    mu_path = os.path.join(out_dir, 'mu.pt')
     if os.path.exists(p_path):
         P = torch.load(p_path, map_location='cuda')
+        mu = torch.load(mu_path, map_location='cuda') if os.path.exists(mu_path) else mu
     else:
         _, _, Vt = torch.linalg.svd(xc, full_matrices=False)
         P = Vt.T[:, :K].contiguous()
         torch.save(P.cpu(), p_path)
+        torch.save(mu.cpu(), mu_path)
     z = xc @ P
 
     fp = f'lossless_layers/layers_{layer}_ffn.safetensors'
@@ -203,7 +209,7 @@ def main():
         Qs = []
         for gk in group:
             w1, w2, w3 = load_expert(fp, layer, gk)
-            y = ffn(xc, w1, w2, w3)
+            y = ffn(x, w1, w2, w3)  # FFN(x) on RAW input (was xc -> 26% bug)
             _, _, Q = torch.svd_lowrank(y, q=Kp, niter=2)  # [4096, Kp]
             targets.append(y @ Q)
             Qs.append(Q)

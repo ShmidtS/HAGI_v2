@@ -60,6 +60,8 @@ def unpack_ternary(q: torch.Tensor) -> torch.Tensor:
 
 def load_reduced_layer(li: int) -> dict:
     P = torch.load(os.path.join(REDUCED, f'layer_{li}', 'P.pt'), map_location='cuda')
+    mu_path = os.path.join(REDUCED, f'layer_{li}', 'mu.pt')
+    mu = torch.load(mu_path, map_location='cuda') if os.path.exists(mu_path) else None
     experts = {}
     for k in range(256):
         e = torch.load(os.path.join(REDUCED, f'layer_{li}', f'expert_{k}.pt'), map_location='cuda')
@@ -69,7 +71,7 @@ def load_reduced_layer(li: int) -> dict:
             'w2': e['w2'], 'w2s': e['w2_scale'].to('cuda'),
             'Q': e['Q'].to('cuda'), 'Qs': e['Q_scale'].to('cuda'),
         }
-    return {'P': P, 'experts': experts}
+    return {'P': P, 'mu': mu, 'experts': experts}
 
 
 def reduced_ffn_z(z, e):
@@ -104,7 +106,11 @@ def make_reduced_hook(li: int, red_cache: dict, shared_cache: dict):
                * (flat @ sh['w3'].T).clamp(min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)) @ sh['w2'].T
 
         red = red_cache[li]
-        z = flat @ red['P']
+        # Fix A: center before projecting (mu stored at reduce time).
+        if red.get('mu') is not None:
+            z = (flat - red['mu']) @ red['P']
+        else:
+            z = flat @ red['P']
         for k in indices.unique().tolist():
             y = reduced_ffn_z(z, red['experts'][k])
             for kk in range(TOP_K):
