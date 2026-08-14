@@ -20,7 +20,7 @@
   ],
   "dtype": "bfloat16",
   "eos_token_id": 1,
-  "expert_dtype": null,
+  "expert_dtype": "fp4",
   "hc_eps": 1e-06,
   "hc_mult": 4,
   "hc_sinkhorn_iters": 20,
@@ -140,7 +140,6 @@
   "partial_rotary_factor": 0.125,
   "q_lora_rank": 1024,
   "qk_rope_head_dim": 64,
-  "quantization_config": null,
   "rms_norm_eps": 1e-06,
   "rope_parameters": {
     "compress": {

@@ -73,8 +73,8 @@ def install_kv_compression(cache, compressor: 'KVCompressor') -> None:
     cache.update = types.MethodType(patched_update, cache)
 
 
-def patch_yarn_factor(config, factor: int = 32) -> None:
-    """Extend the compressed-attention YaRN factor 16 -> 32 (1M -> 2M tokens).
+def patch_yarn_factor(config, factor: int = 8) -> None:
+    """Set the compressed-attention YaRN factor (16 -> 8 -> 512K context).
 
     Accepts either a model or a config. MUST be called BEFORE
     `from_pretrained` / module construction: the YaRN `inv_freq` buffers are
@@ -82,9 +82,9 @@ def patch_yarn_factor(config, factor: int = 32) -> None:
     mutation has no effect.
 
     The rope_parameters['compress'] block drives CSA/HCA positional encoding:
-    original_max_position_embeddings=65536 * factor = context length. This is
-    an inference-time extrapolation beyond the trained factor 16, so long-tail
-    quality may degrade — verify logits on long prompts before shipping.
+    original_max_position_embeddings=65536 * factor = context length. factor 8
+    = 524288 (512K) — within the trained factor 16, so positional quality is
+    safe; the KV cache is kept at full 512 dims (no KV-POD loss).
     """
     if hasattr(config, 'config'):
         config = config.config
