@@ -68,9 +68,26 @@ def _ternary_eff(W):
     return q.to(torch.bfloat16) * s.to(torch.bfloat16)
 
 
-def train_batch(pairs, inter, steps, err_thresh=1e-4, check_every=25):
+def zeropower(G, steps=5):
+    """Newton-Schulz orthogonalization of each [m,n] matrix (Muon core).
+    Orthogonalizes along the SMALLER dim to keep the intermediate small."""
+    a, m, n = G.shape
+    X = G.to(torch.bfloat16)
+    X = X / (X.norm(dim=(1, 2), keepdim=True).clamp_min(1e-7))
+    if m <= n:
+        for _ in range(steps):
+            X = 1.5 * X - 0.5 * (X @ X.transpose(1, 2)) @ X
+    else:
+        for _ in range(steps):
+            X = 1.5 * X - 0.5 * X @ (X.transpose(1, 2) @ X)
+    return X.float()
+
+
+def train_batch(pairs, inter, steps, err_thresh=5e-4, check_every=25):
     """pairs: list of (z_k [n_k,K], target_k [n_k,KP]) -> list of (w1q,w1s,w3q,w3s,w2q,w2s).
-    Freezes each expert IMMEDIATELY once its (EMA) sample residual < err_thresh."""
+    Residual is evaluated EVERY step from the training forward (free, since after
+    n_k cap 1024 the batch is always full). Freeze by threshold each step, plus
+    top-k re-balance on checkpoints so compute shifts to the worst experts."""
     G = len(pairs)
     Nmax = max(z.shape[0] for z, _ in pairs)
     Z = torch.zeros(G, Nmax, K, device='cuda', dtype=torch.bfloat16)
@@ -84,17 +101,21 @@ def train_batch(pairs, inter, steps, err_thresh=1e-4, check_every=25):
     W1 = torch.nn.Parameter(torch.randn(G, inter, K, device='cuda') * K**-0.5)
     W3 = torch.nn.Parameter(torch.randn(G, inter, K, device='cuda') * K**-0.5)
     W2 = torch.nn.Parameter(torch.randn(G, KP, inter, device='cuda') * inter**-0.5)
-    o = torch.optim.Adam([W1, W3, W2], lr=2e-3)
+    e1 = torch.zeros_like(W1); v1 = torch.zeros_like(W1)
+    e3 = torch.zeros_like(W3); v3 = torch.zeros_like(W3)
+    e2 = torch.zeros_like(W2); v2 = torch.zeros_like(W2)
+    MU = 0.95
+    B1, B2 = 0.9, 0.999
+    WARMUP = 75
     bs = min(Nmax, 2048)
     frozen = torch.zeros(G, dtype=torch.bool, device='cuda')
-    ema = torch.full((G,), 1.0, device='cuda')
+    prev_resid = None
+    stall = torch.zeros(G, dtype=torch.int, device='cuda')
     t0 = time.time()
     for st in range(steps):
         if frozen.all():
             break
-        lr = 2e-3 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
-        for g in o.param_groups:
-            g['lr'] = lr
+        lr = 0.05 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
         if Nmax > bs:
             idx = torch.randint(0, Nmax, (bs,), device='cuda')
             Zb, Tb, Mb = Z[:, idx], T[:, idx], M[:, idx]
@@ -105,23 +126,49 @@ def train_batch(pairs, inter, steps, err_thresh=1e-4, check_every=25):
             u = torch.bmm(Zb, qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
             h = F.silu(g) * u
             yp = torch.bmm(h, qste_bf16(W2).transpose(1, 2))
-        # per-expert sample residual (cheap, already computed) -> freeze immediately
+        # per-expert residual on the FULL set (free: batch is full after cap)
         num = (Mb * (yp.float() - Tb) ** 2).sum(dim=(1, 2))
         den = (Mb * Tb ** 2).sum(dim=(1, 2)).clamp_min(1e-12)
-        ema = 0.8 * ema + 0.2 * (num / den)
-        newly = (ema < err_thresh) & ~frozen
-        frozen |= newly
+        resid = num / den
+        # freeze immediately by threshold
+        frozen |= (resid < err_thresh)
         loss = num.sum() / (Mb.sum() * KP + 1e-12)
-        o.zero_grad()
+        W1.grad = None; W3.grad = None; W2.grad = None
         loss.backward()
         if frozen.any():
             W1.grad[frozen] = 0.0
             W3.grad[frozen] = 0.0
             W2.grad[frozen] = 0.0
-        o.step()
+            e1[frozen] = 0.0; v1[frozen] = 0.0
+            e3[frozen] = 0.0; v3[frozen] = 0.0
+            e2[frozen] = 0.0; v2[frozen] = 0.0
+        with torch.no_grad():
+            if st < WARMUP:
+                lr_a = 2e-3 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
+                for p, e, v in ((W1, e1, v1), (W3, e3, v3), (W2, e2, v2)):
+                    e.mul_(B1).add_(p.grad, alpha=1 - B1)
+                    v.mul_(B2).addcmul_(p.grad, p.grad, value=1 - B2)
+                    eh = e / (1 - B1 ** (st + 1))
+                    vh = v / (1 - B2 ** (st + 1))
+                    p.data -= lr_a * eh / (vh.sqrt() + 1e-8)
+            else:
+                e1.mul_(MU).add_(W1.grad, alpha=1 - MU)
+                e3.mul_(MU).add_(W3.grad, alpha=1 - MU)
+                e2.mul_(MU).add_(W2.grad, alpha=1 - MU)
+                W1.data -= lr * zeropower(e1)
+                W3.data -= lr * zeropower(e3)
+                W2.data -= lr * zeropower(e2)
         if (st + 1) % check_every == 0:
+            # freeze experts whose residual stopped improving for 2 checkpoints
+            if prev_resid is not None:
+                improvement = (prev_resid - resid) / prev_resid.clamp_min(1e-12)
+                stalled = improvement < 0.01
+                stall = torch.where(stalled, stall + 1, torch.zeros_like(stall))
+                frozen |= (stall >= 2)
+            prev_resid = resid.clone()
             print(f'    step {st+1}/{steps}  loss={loss.item():.6f}  '
                   f'frozen={int(frozen.sum())}/{G}  '
+                  f'resid med={resid.median().item()*100:.4f}%  '
                   f'ETA {(time.time()-t0)/(st+1)*(steps-st)/60:.1f} min', flush=True)
 
     w1q, w1s = ternarize(W1.detach())
@@ -168,6 +215,12 @@ def main():
                 x_k = x_k[idx]
                 y_k = y_k[idx]
             e = torch.load(ep, map_location='cpu', weights_only=False)
+            # resume: skip experts already refit below the target floor
+            rc = e.get('residual', float('inf'))
+            if isinstance(rc, (int, float)) and rc < 1e-4:
+                with open(args.done_log, 'a') as f:
+                    f.write(f'{key}\n')
+                continue
             Q = e['Q'].float().cuda() * e['Q_scale'].float().cuda()[None, :]
             z = (x_k.float().cuda() - mu) @ P
             target = y_k.float().cuda() @ Q
