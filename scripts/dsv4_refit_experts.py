@@ -182,7 +182,7 @@ def main():
     ap.add_argument('--start-layer', type=int, default=0)
     ap.add_argument('--end-layer', type=int, default=43)
     ap.add_argument('--group', type=int, default=512)
-    ap.add_argument('--steps', type=int, default=300)
+    ap.add_argument('--steps', type=int, default=600)
     ap.add_argument('--all', action='store_true', help='refit all experts, not only > 0.1%')
     ap.add_argument('--done-log', default='refit_done.txt')
     args = ap.parse_args()
