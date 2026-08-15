@@ -15,8 +15,8 @@ from dsv4_reduce_layer import qste, ternarize, pack_ternary
 from dsv4_generate_reduced import unpack_ternary
 
 K = 512
-INTER = 4096
-KP = 384
+INTER = 128
+KP = 8
 D = 4096
 POD = 'checkpoints_dsv4/pod_accurate'
 REDUCED = 'dsv4_reduced'
@@ -71,10 +71,8 @@ def zeropower(G, steps=3):
 
 
 def quantize_q(Q):
-    """Q [4096, KP] float -> (int8 [4096, KP], scale [KP])."""
-    scale = Q.abs().max(dim=0)[0].clamp_min(1e-9) / 127.0
-    q = (Q / scale[None, :]).round().clamp(-127, 127)
-    return q.to(torch.int8), scale
+    """Q [4096, KP] float -> bf16 (scale kept as ones for format compat)."""
+    return Q.to(torch.bfloat16), torch.ones(Q.shape[1], device=Q.device)
 
 
 def train_batch(pairs, inter, steps, check_every=25):
@@ -161,23 +159,28 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log):
         for k, (x_k, y_k) in acts.items():
             key = f'{L}_{k}'
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
-            if not os.path.exists(ep):
-                continue
             n_k = x_k.shape[0]
             if n_k > 1024:
                 idx = torch.randperm(n_k)[:1024]
                 x_k = x_k[idx]
                 y_k = y_k[idx]
-            e = torch.load(ep, map_location='cpu', weights_only=False)
-            rc = e.get('residual', float('inf'))
-            if isinstance(rc, (int, float)) and rc < 1.5e-4:
-                with open(done_log, 'a') as f:
-                    f.write(f'{key}\n')
-                continue
-            Q0 = e['Q'].float().cuda() * e['Q_scale'].float().cuda()[None, :]
+            e = None
+            if os.path.exists(ep):
+                e = torch.load(ep, map_location='cpu', weights_only=False)
+                rc = e.get('residual', float('inf'))
+                if (isinstance(rc, (int, float)) and rc < 1.5e-4
+                        and e.get('Q', torch.zeros(1, 1)).shape[1] == KP):
+                    with open(done_log, 'a') as f:
+                        f.write(f'{key}\n')
+                    continue
+                Q0 = (e['Q'].float().cuda() * e['Q_scale'].float().cuda()[None, :])[:, :KP]
+            else:
+                _, _, Q0 = torch.svd_lowrank(y_k.float().cuda(), q=KP, niter=2)
+                if Q0.shape[1] < KP:
+                    Q0 = torch.cat([Q0, torch.zeros(D, KP - Q0.shape[1], device='cuda')], dim=1)
             z = (x_k.float().cuda() - mu) @ P
             y_full = y_k.float().cuda()
-            if not all_flag:
+            if e is not None and not all_flag:
                 resid = current_resid(z, y_full, e)
                 if resid <= 1.5e-4:
                     with open(done_log, 'a') as f:
@@ -203,7 +206,10 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log):
             for (k, z, yf, Q0), (w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs) in zip(chunk, results):
                 resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
                 ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
-                e = torch.load(ep, map_location='cpu', weights_only=False)
+                if os.path.exists(ep):
+                    e = torch.load(ep, map_location='cpu', weights_only=False)
+                else:
+                    e = {}
                 e['w1'] = pack_ternary(w1q).cpu()
                 e['w1_scale'] = w1s.cpu()
                 e['w3'] = pack_ternary(w3q).cpu()

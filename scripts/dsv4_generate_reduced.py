@@ -40,8 +40,8 @@ SWIGLU_LIMIT = 10.0
 BOS_ID = 0
 EOS_ID = 1
 K = 512
-Kp = 384
-INTER = 4096
+Kp = 8
+INTER = 128
 
 CURRENT_IDS: torch.Tensor | None = None
 ROUTER_W: dict[int, torch.Tensor] = {}
