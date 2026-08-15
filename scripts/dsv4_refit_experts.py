@@ -187,10 +187,6 @@ def main():
     ap.add_argument('--done-log', default='refit_done.txt')
     args = ap.parse_args()
 
-    done = set()
-    if os.path.exists(args.done_log):
-        done = set(open(args.done_log).read().split())
-
     for L in range(args.start_layer, args.end_layer):
         p_path = os.path.join(REDUCED, f'layer_{L}', 'P.pt')
         if not os.path.exists(p_path):
@@ -203,8 +199,6 @@ def main():
         todo = []
         for k, (x_k, y_k) in acts.items():
             key = f'{L}_{k}'
-            if key in done:
-                continue
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
             if not os.path.exists(ep):
                 continue
