@@ -8,7 +8,7 @@ and yields ~5x lower residual at the same model size.
 Run multiple processes over disjoint layer ranges (--start-layer/--end-layer).
 Resumable via a per-process --done-log (skip by full-space residual threshold).
 """
-import torch, torch.nn.functional as F, os, sys, time, argparse
+import torch, torch.nn.functional as F, os, sys, time, argparse, subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dsv4_reduce_layer import qste, ternarize, pack_ternary
@@ -56,7 +56,7 @@ def qste_bf16(W):
     return Wb + (q - Wb).detach()
 
 
-def zeropower(G, steps=5):
+def zeropower(G, steps=3):
     """Newton-Schulz orthogonalization of each [m,n] matrix (Muon core)."""
     a, m, n = G.shape
     X = G.to(torch.bfloat16)
@@ -77,7 +77,7 @@ def quantize_q(Q):
     return q.to(torch.int8), scale
 
 
-def train_batch(pairs, inter, steps, err_thresh=1.5e-4, check_every=25):
+def train_batch(pairs, inter, steps, check_every=25):
     """pairs: list of (z_k [n_k,K], y_k [n_k,4096], Q0_k [4096,KP])
     -> list of (w1q,w1s,w3q,w3s,w2q,w2s,Qq,Qs).
     Jointly trains ternary core + learnable Q against full 4096-dim target."""
@@ -97,19 +97,14 @@ def train_batch(pairs, inter, steps, err_thresh=1.5e-4, check_every=25):
     W3 = torch.nn.Parameter(torch.randn(G, inter, K, device='cuda') * K**-0.5)
     W2 = torch.nn.Parameter(torch.randn(G, KP, inter, device='cuda') * inter**-0.5)
     Qp = torch.nn.Parameter(Q)
-    e1 = torch.zeros_like(W1); v1 = torch.zeros_like(W1)
-    e3 = torch.zeros_like(W3); v3 = torch.zeros_like(W3)
-    e2 = torch.zeros_like(W2); v2 = torch.zeros_like(W2)
-    eQ = torch.zeros_like(Qp); vQ = torch.zeros_like(Qp)
-    B1, B2 = 0.9, 0.999
+    e1 = torch.zeros_like(W1)
+    e3 = torch.zeros_like(W3)
+    e2 = torch.zeros_like(W2)
+    eQ = torch.zeros_like(Qp)
+    MU = 0.95
     bs = min(Nmax, 1024)
-    frozen = torch.zeros(G, dtype=torch.bool, device='cuda')
-    prev_resid = None
-    stall = torch.zeros(G, dtype=torch.int, device='cuda')
     t0 = time.time()
     for st in range(steps):
-        if frozen.all():
-            break
         if Nmax > bs:
             idx = torch.randint(0, Nmax, (bs,), device='cuda')
             Zb, Yb, Mb = Z[:, idx], Y[:, idx], M[:, idx]
@@ -124,32 +119,21 @@ def train_batch(pairs, inter, steps, err_thresh=1.5e-4, check_every=25):
         num = (Mb * (yp - Yb) ** 2).sum(dim=(1, 2)).float()
         den = (Mb * Yb ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
         resid = num / den
-        frozen |= (resid < err_thresh)
         loss = num.sum() / (Mb.sum() * D + 1e-12)
         W1.grad = None; W3.grad = None; W2.grad = None; Qp.grad = None
         loss.backward()
-        if frozen.any():
-            for p in (W1, W3, W2, Qp):
-                p.grad[frozen] = 0.0
-            for mm in (e1, v1, e3, v3, e2, v2, eQ, vQ):
-                mm[frozen] = 0.0
         with torch.no_grad():
-            lr_a = 2e-3 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
-            for p, e, v in ((W1, e1, v1), (W3, e3, v3), (W2, e2, v2), (Qp, eQ, vQ)):
-                e.mul_(B1).add_(p.grad, alpha=1 - B1)
-                v.mul_(B2).addcmul_(p.grad, p.grad, value=1 - B2)
-                eh = e / (1 - B1 ** (st + 1))
-                vh = v / (1 - B2 ** (st + 1))
-                p.data -= lr_a * eh / (vh.sqrt() + 1e-8)
+            lr_m = 0.05 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
+            e1.mul_(MU).add_(W1.grad, alpha=1 - MU)
+            e3.mul_(MU).add_(W3.grad, alpha=1 - MU)
+            e2.mul_(MU).add_(W2.grad, alpha=1 - MU)
+            eQ.mul_(MU).add_(Qp.grad, alpha=1 - MU)
+            W1.data -= lr_m * zeropower(e1)
+            W3.data -= lr_m * zeropower(e3)
+            W2.data -= lr_m * zeropower(e2)
+            Qp.data -= lr_m * zeropower(eQ)
         if (st + 1) % check_every == 0:
-            if prev_resid is not None:
-                improvement = (prev_resid - resid) / prev_resid.clamp_min(1e-12)
-                stalled = improvement < 0.01
-                stall = torch.where(stalled, stall + 1, torch.zeros_like(stall))
-                frozen |= (stall >= 2)
-            prev_resid = resid.clone()
             print(f'    step {st+1}/{steps}  loss={loss.item():.6f}  '
-                  f'frozen={int(frozen.sum())}/{G}  '
                   f'resid med={resid.median().item()*100:.4f}%  '
                   f'ETA {(time.time()-t0)/(st+1)*(steps-st)/60:.1f} min', flush=True)
 
@@ -163,17 +147,8 @@ def train_batch(pairs, inter, steps, err_thresh=1.5e-4, check_every=25):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--start-layer', type=int, default=0)
-    ap.add_argument('--end-layer', type=int, default=43)
-    ap.add_argument('--group', type=int, default=256)
-    ap.add_argument('--steps', type=int, default=600)
-    ap.add_argument('--all', action='store_true', help='refit all experts, not only > 0.1%')
-    ap.add_argument('--done-log', default='refit_done_q.txt')
-    args = ap.parse_args()
-
-    for L in range(args.start_layer, args.end_layer):
+def run_refit(start_layer, end_layer, group, steps, all_flag, done_log):
+    for L in range(start_layer, end_layer):
         p_path = os.path.join(REDUCED, f'layer_{L}', 'P.pt')
         if not os.path.exists(p_path):
             continue
@@ -196,16 +171,16 @@ def main():
             e = torch.load(ep, map_location='cpu', weights_only=False)
             rc = e.get('residual', float('inf'))
             if isinstance(rc, (int, float)) and rc < 1.5e-4:
-                with open(args.done_log, 'a') as f:
+                with open(done_log, 'a') as f:
                     f.write(f'{key}\n')
                 continue
             Q0 = e['Q'].float().cuda() * e['Q_scale'].float().cuda()[None, :]
             z = (x_k.float().cuda() - mu) @ P
             y_full = y_k.float().cuda()
-            if not args.all:
+            if not all_flag:
                 resid = current_resid(z, y_full, e)
                 if resid <= 1.5e-4:
-                    with open(args.done_log, 'a') as f:
+                    with open(done_log, 'a') as f:
                         f.write(f'{key}\n')
                     continue
             todo.append((k, z, y_full, Q0))
@@ -221,10 +196,10 @@ def main():
         todo.sort(key=lambda t: t[1].shape[0])
         t0 = time.time()
         n_fixed = 0
-        for i in range(0, len(todo), args.group):
-            chunk = todo[i:i + args.group]
+        for i in range(0, len(todo), group):
+            chunk = todo[i:i + group]
             pairs = [(z, yf, Q0) for _, z, yf, Q0 in chunk]
-            results = train_batch(pairs, INTER, args.steps)
+            results = train_batch(pairs, INTER, steps)
             for (k, z, yf, Q0), (w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs) in zip(chunk, results):
                 resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
                 ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
@@ -239,13 +214,53 @@ def main():
                 e['Q_scale'] = Qs.cpu()
                 e['residual'] = resid
                 torch.save(e, ep)
-                with open(args.done_log, 'a') as f:
+                with open(done_log, 'a') as f:
                     f.write(f'{L}_{k}\n')
                 n_fixed += 1
-            print(f'  layer {L} chunk {i // args.group}: {len(chunk)} experts '
+            print(f'  layer {L} chunk {i // group}: {len(chunk)} experts '
                   f'({time.time()-t0:.0f}s total)', flush=True)
             torch.cuda.empty_cache()
         print(f'layer {L}: refit {n_fixed} experts in {time.time()-t0:.0f}s', flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--start-layer', type=int, default=0)
+    ap.add_argument('--end-layer', type=int, default=43)
+    ap.add_argument('--group', type=int, default=64)
+    ap.add_argument('--steps', type=int, default=600)
+    ap.add_argument('--all', action='store_true', help='refit all experts, not only > 0.1%')
+    ap.add_argument('--done-log', default='refit_done_q.txt')
+    ap.add_argument('--n-procs', type=int, default=4,
+                    help='split layers across N parallel processes (0=auto=min(4,n_layers))')
+    args = ap.parse_args()
+
+    n_procs = max(1, args.n_procs if args.n_procs > 0 else min(4, args.end_layer - args.start_layer))
+
+    if n_procs == 1:
+        run_refit(args.start_layer, args.end_layer, args.group, args.steps, args.all, args.done_log)
+        return
+
+    per = (args.end_layer - args.start_layer + n_procs - 1) // n_procs
+    procs = []
+    for i in range(n_procs):
+        s = args.start_layer + i * per
+        e = min(args.start_layer + (i + 1) * per, args.end_layer)
+        if s >= e:
+            break
+        cmd = [sys.executable, '-u', os.path.abspath(__file__),
+               '--start-layer', str(s), '--end-layer', str(e),
+               '--group', str(args.group), '--steps', str(args.steps),
+               '--done-log', args.done_log, '--n-procs', '1']
+        if args.all:
+            cmd.append('--all')
+        with open(f'refit_q_p{i}.log', 'w') as f:
+            p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+        procs.append(p)
+        print(f'proc {i}: layers {s}-{e} -> refit_q_p{i}.log (pid {p.pid})', flush=True)
+    for p in procs:
+        p.wait()
+    print('all procs done', flush=True)
 
 
 if __name__ == '__main__':
