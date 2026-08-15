@@ -314,7 +314,15 @@ class Attention(nn.Module):
         # QK-norm before RoPE (Gemma-2 / Chameleon convention). RoPE is a
         # rotation and preserves norms, so the order only decides which tensor
         # the learnable gain scales.
+        #
+        # Fix A: center each head before RMS-norm. RMSNorm removes only the
+        # scale, not the mean, so a nonzero per-head mean injects a constant
+        # (DC) term into q@k^T that the QK gain cannot cancel. Centering is
+        # the attention-side analogue of the POD Fix A (SVD on centered
+        # activations): strip the DC direction before the isotropic step.
         if self.q_norm is not None:
+            q = q - q.mean(dim=-1, keepdim=True)
+            k = k - k.mean(dim=-1, keepdim=True)
             q = self.q_norm(q)
             k = self.k_norm(k)
 
