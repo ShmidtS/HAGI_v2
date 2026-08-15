@@ -30,16 +30,21 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 
-def svd_basis(x: torch.Tensor, rank: int | None, use_cuda: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (basis [D, rank], singular_values [min(N,D)]) for row-major X."""
+def svd_basis(x: torch.Tensor, rank: int | None, use_cuda: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (basis [D, rank], mean [D], singular_values [min(N,D)]) for row-major X.
+
+    SVD on CENTERED activations (Fix A): PCA on raw data is unstable and wastes
+    the top component on the mean; centering keeps the basis on real variance.
+    """
     if x.ndim == 3:  # Q: [N, heads, D] -> pool heads
         x = x.reshape(-1, x.shape[-1])
     dev = 'cuda' if (use_cuda and torch.cuda.is_available()) else 'cpu'
     xg = x.float().to(dev)
-    u, s, vh = torch.linalg.svd(xg, full_matrices=False)
+    mean = xg.mean(0)
+    u, s, vh = torch.linalg.svd(xg - mean, full_matrices=False)
     rank = rank or x.shape[1]
     rank = min(rank, x.shape[1], len(s))
-    return vh[:rank].T.cpu().contiguous(), s.cpu()
+    return vh[:rank].T.cpu().contiguous(), mean.cpu(), s.cpu()
 
 
 def variance_fractions(s: torch.Tensor) -> dict[int, float]:
@@ -74,36 +79,41 @@ def main():
 
     for li in layers:
         kv = torch.load(os.path.join(args.src, f'kv_L{li}.pt'))
-        pkv, skv = svd_basis(kv, args.kv_rank)
+        pkv, mkv, skv = svd_basis(kv, args.kv_rank)
         torch.save(pkv, os.path.join(args.out, f'P_kv_L{li}.pt'))
+        torch.save(mkv, os.path.join(args.out, f'mean_kv_L{li}.pt'))
         report.append(f'kv L{li}: ' + ' '.join(f'top-{k}={v:.3f}%' for k, v in variance_fractions(skv).items()))
 
         xin_path = os.path.join(args.src, f'x_L{li}.pt')
         if os.path.exists(xin_path):
             xin = torch.load(xin_path)
             pooled_x_in.append(xin)
-            pin, sin = svd_basis(xin, args.x_rank, use_cuda=not args.no_cuda)
+            pin, minx, sin = svd_basis(xin, args.x_rank, use_cuda=not args.no_cuda)
             torch.save(pin, os.path.join(args.out, f'P_x_in_L{li}.pt'))
+            torch.save(minx, os.path.join(args.out, f'mean_x_in_L{li}.pt'))
             report.append(f'x_in L{li}: ' + ' '.join(f'top-{k}={v:.3f}%' for k, v in variance_fractions(sin).items()))
 
         xout_path = os.path.join(args.src, f'xout_L{li}.pt')
         if os.path.exists(xout_path) and not args.skip_xout:
             xout = torch.load(xout_path)
-            pout, sout = svd_basis(xout, args.x_rank, use_cuda=not args.no_cuda)
+            pout, mout, sout = svd_basis(xout, args.x_rank, use_cuda=not args.no_cuda)
             torch.save(pout, os.path.join(args.out, f'P_x_out_L{li}.pt'))
+            torch.save(mout, os.path.join(args.out, f'mean_x_out_L{li}.pt'))
             report.append(f'x_out L{li}: ' + ' '.join(f'top-{k}={v:.3f}%' for k, v in variance_fractions(sout).items()))
 
         q_path = os.path.join(args.src, f'q_L{li}.pt')
         if os.path.exists(q_path):
             q = torch.load(q_path)
-            pq, sq = svd_basis(q, args.q_rank, use_cuda=not args.no_cuda)
+            pq, mq, sq = svd_basis(q, args.q_rank, use_cuda=not args.no_cuda)
             torch.save(pq, os.path.join(args.out, f'P_q_L{li}.pt'))
+            torch.save(mq, os.path.join(args.out, f'mean_q_L{li}.pt'))
             report.append(f'q L{li} (heads pooled): ' + ' '.join(f'top-{k}={v:.3f}%' for k, v in variance_fractions(sq).items()))
 
     if pooled_x_in:
         xall = torch.cat(pooled_x_in, dim=0)
-        pglobal, sglobal = svd_basis(xall, args.x_rank)
+        pglobal, mglobal, sglobal = svd_basis(xall, args.x_rank)
         torch.save(pglobal, os.path.join(args.out, 'P_x_global.pt'))
+        torch.save(mglobal, os.path.join(args.out, 'mean_x_global.pt'))
         report.append('x_in GLOBAL: ' + ' '.join(f'top-{k}={v:.3f}%' for k, v in variance_fractions(sglobal).items()))
 
     with open(os.path.join(args.out, 'rank_report.txt'), 'w', encoding='utf-8') as f:
