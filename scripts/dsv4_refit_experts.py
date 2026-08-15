@@ -217,7 +217,7 @@ def main():
             e = torch.load(ep, map_location='cpu', weights_only=False)
             # resume: skip experts already refit below the target floor
             rc = e.get('residual', float('inf'))
-            if isinstance(rc, (int, float)) and rc < 1e-4:
+            if isinstance(rc, (int, float)) and rc < 5e-4:
                 with open(args.done_log, 'a') as f:
                     f.write(f'{key}\n')
                 continue
