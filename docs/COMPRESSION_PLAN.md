@@ -1,8 +1,22 @@
 # Compression plan: attention + top layer (lm_head / embed / MTP)
 
-The FFN experts are already reduced (POD + ternary + int8, 2.77 MB/expert).
+The FFN experts are already reduced with the **channel-per-expert** method
+(POD input + ternary SwiGLU core + learnable int4 Q; covered experts ≤0.01%
+on real routed activations, uncovered 13% ~0.5–1.8% on a router-weight proxy).
 This plan covers the parts we have **not** touched yet: the attention
 projections, the output head, the embedding, and the MTP layers.
+
+## Core idea (in plain words)
+
+Each routed expert is a **separate communication channel** `x → y`. We do not
+compress it as part of a layer — we **measure its transfer function** by
+driving it with a universal test signal (unifold: bootstrap of the real POD
+manifold + 0.1σ jitter) and refit a compact block against the recorded `(x, y)`
+pairs, per expert. We probe only the **real input manifold** (where the router
+actually sends tokens) plus a small neighbourhood — not the full ±5σ volume,
+because the ternary kernel cannot express the expert there (25–36% residual).
+Experts the router never activated (13%) are refit on a proxy manifold from
+their nearest router-weight neighbours.
 
 ## Current uncompressed budget (bf16 unless noted)
 

@@ -72,9 +72,12 @@ DeepSeek-V4-Flash (256 routed experts/layer × 43 layers = 11008 experts).
 
 ### The idea in one sentence
 
-A trained MoE is a pile of **mutually orthogonal blocks**; you cannot merge or
-factor them, but you can **copy each block's function** instead of its weights —
-by storing only its low-rank I/O subspace plus a minimal ternary core.
+Each of the 11008 routed experts is a **separate communication channel**
+(`x → y`), an independent unitary unit. You cannot merge or factor them
+(weights are mutually orthogonal white noise), but you can **measure each
+channel's transfer function** by driving it with a universal test signal
+(unifold) and then **copy that function** with a compact block — per expert,
+individually, not per layer.
 
 ### Why the blocks cannot be merged
 
@@ -115,15 +118,32 @@ Q  = int8 [4096×384], per-column scale
 - **Q** [4096×384] int8 with per-column float32 scale: this costs only
   0.012% extra error versus fp8's 0.165% at the same 1.57 MB.
 
+### How the channel is measured (unifold + router split)
+
+We drive each expert with a **universal test signal (unifold)**: bootstrap of
+the layer's real POD manifold + 0.1σ jitter. This probes the honest working
+band — the manifold where the router actually sends tokens plus a small
+neighbourhood. We deliberately do NOT probe the full ±5σ volume: there the
+ternary kernel cannot express the expert's response (25–36% residual), so
+full-volume probing is waste.
+
+- **Covered experts (87%)** — the router activated them on the 774K-sample
+  collection; they refit on their **real routed activations** with an early
+  stop at **≤0.01%** honest residual.
+- **Uncovered experts (13%)** — no real samples. They refit on a **proxy
+  manifold from their nearest router-weight neighbours** (cosine similarity),
+  residual ~0.5–1.8% on the proxy (they are rare, so their weighted error is
+  small). Stall-based stop once the residual plateaus.
+
 ### Results
 
 | Metric | Value |
 |---|---|
-| Size per expert | **2.77 MB** (vs 12.6 MB FP4) = **−78%** |
-| Residual (in-sample, layer 0, true x₀) | 0.157% |
-| Residual (layers 1–42, x₀ fallback) | 0.22–0.26% |
-| int8 Q quantization error | 0.012% |
-| Rate-distortion floor (inter=4096) | ~0.156% |
+| Size per expert | **~1.3–2.4 MB** (adaptive inter/kp; vs 12.6 MB FP4) |
+| Covered residual (real routed activations) | **≤ 0.01%** (early stop) |
+| Uncovered residual (proxy manifold) | ~0.5–1.8% (13% of experts) |
+| Q format | int4 QAT, per-column scale max/28 |
+| Adaptive size | inter/kp by n_k: <200→(1024,512), 200–400→(2048,512), ≥400→(4096,768) |
 
 0.1% residual requires inter=6144 (3.28 MB — *larger*), so 4096 is the
 rate-distortion sweet spot: the smallest core that keeps the loss below the

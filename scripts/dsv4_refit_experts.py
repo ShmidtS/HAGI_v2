@@ -13,6 +13,8 @@ import torch, torch.nn.functional as F, os, sys, time, argparse, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dsv4_reduce_layer import qste, ternarize, pack_ternary
 from dsv4_generate_reduced import unpack_ternary
+from dsv4_collect_x_accurate import load_selected_experts, ffn as ffn_exact
+import dsv4_experts as de
 
 K = 512
 INTER = 1024
@@ -27,6 +29,59 @@ REFIT_CFGS = [
 D = 4096
 POD = 'checkpoints_dsv4/pod_accurate'
 REDUCED = 'dsv4_reduced'
+M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
+
+
+_ROUTER_W_CACHE = {}
+
+
+def load_router_weight(L):
+    """Load the router gate weight [256, 4096] for layer L (cached)."""
+    if L not in _ROUTER_W_CACHE:
+        snap = de.default_snapshot()
+        wm = de.load_index(snap)['weight_map']
+        p = f'layers.{L}.ffn.gate'
+        _ROUTER_W_CACHE[L] = de.read_tensor(snap, wm, f'{p}.weight', device='cuda').to(torch.float32)
+    return _ROUTER_W_CACHE[L]
+
+
+def universal_signal(z_real, M=M_SYNTH, seed=0, sigma_override=None, z_proxy=None):
+    """Comm-theory universal test signal in POD coordinates, confined to the real manifold.
+
+    Bootstrap + 10% jitter around real points (manifold coverage). Multi-tone axis
+    probes were dropped: they excite the expert on pure axes the ternary kernel
+    cannot match and inflated the mixed residual without improving real-data fit.
+    For experts with no real samples, bootstrap from z_proxy (other experts of the
+    layer, same input manifold); falls back to white noise when no proxy exists.
+    """
+    n, K = z_real.shape
+    g = torch.Generator(device=z_real.device).manual_seed(seed)
+    if sigma_override is not None:
+        sigma = sigma_override
+    elif n >= 8:
+        sigma = z_real.std(dim=0).clamp(0.3, 2.0)
+    else:
+        sigma = torch.ones(K, device=z_real.device)
+    if n == 0:
+        if z_proxy is not None and z_proxy.shape[0] > 0:
+            idx = torch.randint(0, z_proxy.shape[0], (M,), generator=g, device=z_real.device)
+            eps = torch.randn(M, K, generator=g, device=z_real.device) * (0.1 * sigma[None, :])
+            return z_proxy[idx] + eps
+        return torch.randn(M, K, generator=g, device=z_real.device) * sigma[None, :]
+    idx = torch.randint(0, n, (M,), generator=g, device=z_real.device)
+    z_base = z_real[idx]  # [M, K]
+    eps = torch.randn(M, K, generator=g, device=z_real.device) * (0.1 * sigma[None, :])
+    return z_base + eps
+
+
+def safe_svd_q(Y, q):
+    """Top-q right singular vectors [D, q] of Y, robust to ill-conditioned inputs."""
+    try:
+        _, _, V = torch.svd_lowrank(Y, q=q, niter=2)
+    except Exception:
+        _, _, V = torch.linalg.svd(Y.float(), full_matrices=False)
+        V = V[:, :q]
+    return V
 
 
 def pick_config(n_k):
@@ -44,21 +99,24 @@ def pick_config(n_k):
 
 
 def current_resid(z, y_full, e):
-    w1 = unpack_ternary(e['w1']).float().cuda() * e['w1_scale'].float().cuda()[:, None]
-    w3 = unpack_ternary(e['w3']).float().cuda() * e['w3_scale'].float().cuda()[:, None]
+    Kk = z.shape[1]
+    w1 = unpack_ternary(e['w1']).float().cuda()[:, :Kk] * e['w1_scale'].float().cuda()[:, None]
+    w3 = unpack_ternary(e['w3']).float().cuda()[:, :Kk] * e['w3_scale'].float().cuda()[:, None]
     w2 = unpack_ternary(e['w2']).float().cuda() * e['w2_scale'].float().cuda()[:, None]
     Q = unpack_int4(e['Q']).float().cuda() * e['Q_scale'].float().cuda()[None, :]
     with torch.autocast('cuda', dtype=torch.bfloat16):
         g = (z @ w1.T).clamp(max=10.0)
         u = (z @ w3.T).clamp(min=-10.0, max=10.0)
+        w2 = w2[:, :g.shape[1]]
         yp = ((F.silu(g) * u) @ w2.T) @ Q.T
     return (F.mse_loss(yp.float(), y_full) /
             F.mse_loss(y_full, torch.zeros_like(y_full))).item()
 
 
 def resid_weights_full(z, y_full, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s):
-    w1 = w1q * w1s[:, None]
-    w3 = w3q * w3s[:, None]
+    Kk = z.shape[1]
+    w1 = w1q[:, :Kk] * w1s[:, None]
+    w3 = w3q[:, :Kk] * w3s[:, None]
     w2 = w2q * w2s[:, None]
     Q = unpack_int4(Qq).float() * Qs[None, :]
     with torch.autocast('cuda', dtype=torch.bfloat16):
@@ -120,10 +178,12 @@ def quantize_q(Q):
     return pack_int4(q), scale
 
 
-def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_threshold=None):
+def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_threshold=None, n_real=0):
     """pairs: list of (z_k [n_k,K], y_k [n_k,4096], Q0_k [4096,kp])
     -> list of (w1q,w1s,w3q,w3s,w2q,w2s,Qq,Qs).
-    Jointly trains ternary core + learnable Q against full 4096-dim target."""
+    Jointly trains ternary core + learnable Q against full 4096-dim target.
+    n_real: first n_real rows of each pair are the REAL samples; when set, the
+    early-stop threshold is evaluated on those rows only (honest metric)."""
     G = len(pairs)
     Nmax = max(z.shape[0] for z, _, _ in pairs)
     Z = torch.zeros(G, Nmax, K, device='cuda', dtype=torch.bfloat16)
@@ -146,8 +206,9 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     eQ = torch.zeros_like(Qp)
     MU = 0.95
     bs = min(Nmax, 1024)
-    best = float('inf')
+    best = None
     stall = 0
+    ema = None
     t0 = time.time()
     for st in range(steps):
         if Nmax > bs:
@@ -179,10 +240,30 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
             W2.data -= lr_m * zeropower(e2)
             Qp.data -= lr_m * zeropower(eQ)
         resid_med = resid.median().item()
-        if resid_med < best - 1e-7:
-            best = resid_med
-        if stop_threshold is not None and resid_med <= stop_threshold:
-            print(f'    early stop at step {st+1}/{steps} (resid {resid_med*100:.4f}% <= {stop_threshold*100:.3f}%)', flush=True)
+        ema = resid_med if ema is None else 0.9 * ema + 0.1 * resid_med
+        if stop_threshold is None:
+            # Stall-based early stop (synthetic/uncovered experts only).
+            if best is None or ema < best - max(5e-4, best * 5e-2):
+                best = ema
+                stall = 0
+            else:
+                stall += 1
+            if stall >= patience:
+                print(f'    stalled at step {st+1}/{steps} (best resid {best*100:.4f}%)', flush=True)
+                break
+        # Honest early-stop metric: residual on the REAL samples only (first n_real rows),
+        # so the universal-signal rows drive learning but never inflate the stopping signal.
+        stop_resid = resid_med
+        if n_real > 0:
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                gr = torch.bmm(Z[:, :n_real], qste_bf16(W1).transpose(1, 2)).clamp(max=10.0)
+                ur = torch.bmm(Z[:, :n_real], qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
+                ypr = torch.bmm(torch.bmm(F.silu(gr) * ur, qste_bf16(W2).transpose(1, 2)), Quse.transpose(1, 2))
+            num_r = ((ypr - Y[:, :n_real]) ** 2).sum(dim=(1, 2)).float()
+            den_r = (Y[:, :n_real] ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
+            stop_resid = (num_r / den_r).median().item()
+        if stop_threshold is not None and stop_resid <= stop_threshold:
+            print(f'    early stop at step {st+1}/{steps} (real resid {stop_resid*100:.4f}% <= {stop_threshold*100:.3f}%)', flush=True)
             break
         if (st + 1) % check_every == 0:
             print(f'    step {st+1}/{steps}  loss={loss.item():.6f}  '
@@ -200,6 +281,9 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
 
 
 def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_threshold=2e-4):
+    """Router-based refit: covered experts learn on their REAL routed activations
+    (honest channel). Uncovered (noisy) experts learn on a proxy manifold built from
+    the nearest covered experts by router-weight cosine similarity."""
     for L in range(start_layer, end_layer):
         p_path = os.path.join(REDUCED, f'layer_{L}', 'P.pt')
         if not os.path.exists(p_path):
@@ -223,7 +307,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
                 e = torch.load(ep, map_location='cpu', weights_only=False)
                 rc = e.get('residual', float('inf'))
                 if (isinstance(rc, (int, float)) and rc < refit_threshold
-                        and e.get('Q_bits', 0) == Q_BITS):
+                        and e.get('Q_bits', 0) == Q_BITS and not all_flag):
                     with open(done_log, 'a') as f:
                         f.write(f'{key}\n')
                     continue
@@ -231,11 +315,11 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
                 if Qfull.shape[1] >= MAX_KP:
                     Q0 = Qfull[:, :MAX_KP].cuda()
                 else:
-                    _, _, Q0 = torch.svd_lowrank(y_k.float().cuda(), q=MAX_KP, niter=2)
+                    Q0 = safe_svd_q(y_k.float().cuda(), MAX_KP)
                     if Q0.shape[1] < MAX_KP:
                         Q0 = torch.cat([Q0, torch.zeros(D, MAX_KP - Q0.shape[1], device='cuda')], dim=1)
             else:
-                _, _, Q0 = torch.svd_lowrank(y_k.float().cuda(), q=MAX_KP, niter=2)
+                Q0 = safe_svd_q(y_k.float().cuda(), MAX_KP)
                 if Q0.shape[1] < MAX_KP:
                     Q0 = torch.cat([Q0, torch.zeros(D, MAX_KP - Q0.shape[1], device='cuda')], dim=1)
             z = (x_k.float().cuda() - mu) @ P
@@ -248,23 +332,73 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
                     continue
             todo.append((k, z, y_full, Q0))
 
+        covered = set(acts.keys())
+        for k in range(256):
+            sk = str(k)
+            if sk not in covered:
+                todo.append((sk, None, None, None))
+
         del acts
         torch.cuda.empty_cache()
-        print(f'layer {L}: collected {len(todo)} experts to refit', flush=True)
+        print(f'layer {L}: collected {len(todo)} experts to refit '
+              f'({len(covered)} real + {len(todo) - len(covered)} synthetic)', flush=True)
 
         if not todo:
             print(f'layer {L}: nothing to refit', flush=True)
             continue
 
-        todo.sort(key=lambda t: t[1].shape[0])
+        todo.sort(key=lambda t: 0 if t[1] is None else t[1].shape[0])
+        zs = [t[1] for t in todo if t[1] is not None]
+        z_by_key = {t[0]: t[1] for t in todo if t[1] is not None}
+        if zs:
+            global_sigma = torch.stack([zz.float().std(dim=0, unbiased=False) for zz in zs]).mean(dim=0).clamp(0.1, 2.0)
+        else:
+            global_sigma = torch.ones(K, device='cuda')
+        # Router weights for uncovered-expert proxy selection.
+        rw = load_router_weight(L)  # [256, 4096] float32 cuda
+        rw_n = rw / (rw.norm(dim=1, keepdim=True).clamp_min(1e-8))
+        covered_int = sorted(int(kk) for kk in covered)
+        covered_rw = rw_n[covered_int]  # [n_covered, 4096]
+
         t0 = time.time()
         n_fixed = 0
         for (k, z, yf, Q0) in todo:
-            inter, kp = pick_config(z.shape[0])
-            results = train_batch([(z, yf, Q0[:, :kp])], inter, steps, kp=kp,
-                                 stop_threshold=refit_threshold)
+            if z is None:
+                # Uncovered expert: proxy from nearest router-weight neighbours.
+                inter, kp = 2048, 512
+                steps_used, stop_used = steps, None
+                sim = covered_rw @ rw_n[int(k)]  # [n_covered]
+                top = sim.topk(min(8, sim.shape[0])).indices
+                z_proxy = torch.cat([z_by_key[str(covered_int[j])] for j in top.tolist()], dim=0)
+                z_synth = universal_signal(torch.zeros(0, K, device='cuda'),
+                                           sigma_override=global_sigma, z_proxy=z_proxy)
+                x_synth = (mu + z_synth @ P.T).float()
+                experts = load_selected_experts(L, [k])
+                w1, w2, w3 = experts[k]
+                y_synth = ffn_exact(x_synth, w1, w2, w3)
+                del experts, x_synth
+                Q0 = safe_svd_q(y_synth, kp)
+                if Q0.shape[1] < kp:
+                    Q0 = torch.cat([Q0, torch.zeros(D, kp - Q0.shape[1], device='cuda')], dim=1)
+                z_all, y_all, n_real = z_synth, y_synth, 0
+                z_eval, y_eval = z_all, y_all
+            else:
+                inter, kp = pick_config(z.shape[0])
+                steps_used, stop_used = steps, refit_threshold
+                z_synth = universal_signal(z)
+                x_synth = (mu + z_synth @ P.T).float()
+                experts = load_selected_experts(L, [k])
+                w1, w2, w3 = experts[k]
+                y_synth = ffn_exact(x_synth, w1, w2, w3)
+                del experts, x_synth
+                z_all = torch.cat([z, z_synth])
+                y_all = torch.cat([yf, y_synth])
+                n_real = z.shape[0]
+                z_eval, y_eval = z, yf
+            results = train_batch([(z_all, y_all, Q0[:, :kp])], inter, steps_used, kp=kp,
+                                 stop_threshold=stop_used, n_real=n_real)
             w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
-            resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
+            resid = resid_weights_full(z_eval, y_eval, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
             if os.path.exists(ep):
                 e = torch.load(ep, map_location='cpu', weights_only=False)
@@ -279,6 +413,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
             e['Q'] = Qq.cpu()
             e['Q_scale'] = Qs.cpu()
             e['Q_bits'] = Q_BITS
+            e['inter'] = inter
             e['residual'] = resid
             torch.save(e, ep)
             with open(done_log, 'a') as f:
@@ -295,11 +430,11 @@ def main():
     ap.add_argument('--start-layer', type=int, default=0)
     ap.add_argument('--end-layer', type=int, default=43)
     ap.add_argument('--group', type=int, default=64)
-    ap.add_argument('--steps', type=int, default=600)
+    ap.add_argument('--steps', type=int, default=10000)
     ap.add_argument('--all', action='store_true', help='refit all experts, not only > 0.1%')
     ap.add_argument('--done-log', default='refit_done_q.txt')
-    ap.add_argument('--refit-threshold', type=float, default=2e-4,
-                    help='accept an expert when its residual <= this (fraction, 0.02%% default)')
+    ap.add_argument('--refit-threshold', type=float, default=1e-4,
+                    help='accept an expert when its residual <= this (fraction, 0.01%% default)')
     ap.add_argument('--n-procs', type=int, default=4,
                     help='split layers across N parallel processes (0=auto=min(4,n_layers))')
     args = ap.parse_args()
