@@ -58,6 +58,13 @@ def unpack_ternary(q: torch.Tensor) -> torch.Tensor:
     return trits - 1
 
 
+def unpack_int4(p: torch.Tensor) -> torch.Tensor:
+    """uint8 [D, KP//2] -> int8 [D, KP] (-7..7)."""
+    even = (p & 0x0F).to(torch.int16) - 8
+    odd = ((p >> 4) & 0x0F).to(torch.int16) - 8
+    return torch.stack([even, odd], dim=2).reshape(p.shape[0], p.shape[1] * 2).to(torch.int8)
+
+
 def load_reduced_layer(li: int) -> dict:
     P = torch.load(os.path.join(REDUCED, f'layer_{li}', 'P.pt'), map_location='cuda')
     mu_path = os.path.join(REDUCED, f'layer_{li}', 'mu.pt')
@@ -76,10 +83,10 @@ def load_reduced_layer(li: int) -> dict:
 
 def reduced_ffn_z(z, e):
     zz = z.to(torch.bfloat16)
-    w1 = unpack_ternary(e['w1'])[:, :K].to(torch.bfloat16) * e['w1s'].to(torch.bfloat16)[:, None]
-    w3 = unpack_ternary(e['w3'])[:, :K].to(torch.bfloat16) * e['w3s'].to(torch.bfloat16)[:, None]
-    w2 = unpack_ternary(e['w2'])[:, :INTER].to(torch.bfloat16) * e['w2s'].to(torch.bfloat16)[:, None]
-    Q = e['Q'].to(torch.bfloat16) * e['Qs'].to(torch.bfloat16)[None, :]
+    w1 = unpack_ternary(e['w1']).to(torch.bfloat16) * e['w1s'].to(torch.bfloat16)[:, None]
+    w3 = unpack_ternary(e['w3']).to(torch.bfloat16) * e['w3s'].to(torch.bfloat16)[:, None]
+    w2 = unpack_ternary(e['w2']).to(torch.bfloat16) * e['w2s'].to(torch.bfloat16)[:, None]
+    Q = unpack_int4(e['Q']).to(torch.bfloat16) * e['Qs'].to(torch.bfloat16)[None, :]
     gate = (zz @ w1.T).clamp(max=SWIGLU_LIMIT)
     up = (zz @ w3.T).clamp(min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
     h = F.silu(gate) * up
