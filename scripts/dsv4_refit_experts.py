@@ -17,7 +17,7 @@ from dsv4_generate_reduced import unpack_ternary
 K = 512
 INTER = 1024
 KP = 512
-MAX_KP = 512
+MAX_KP = 768
 Q_BITS = 4
 Q_DIVISOR = 28
 Q_LEVELS = 7
@@ -29,10 +29,24 @@ POD = 'checkpoints_dsv4/pod_accurate'
 REDUCED = 'dsv4_reduced'
 
 
+def pick_config(n_k):
+    """Adaptive (inter, kp) by activation count.
+
+    Residual correlates with n_k (Pearson r=0.92 on layer 33): experts with
+    many activations have a higher-rank output that the fixed 1024/512 kernel
+    cannot express. Scale width (inter) and output rank (kp) with data volume.
+    """
+    if n_k < 200:
+        return 1024, 512
+    if n_k < 400:
+        return 2048, 512
+    return 4096, 768
+
+
 def current_resid(z, y_full, e):
-    w1 = unpack_ternary(e['w1'])[:, :K].float().cuda() * e['w1_scale'].float().cuda()[:, None]
-    w3 = unpack_ternary(e['w3'])[:, :K].float().cuda() * e['w3_scale'].float().cuda()[:, None]
-    w2 = unpack_ternary(e['w2'])[:, :INTER].float().cuda() * e['w2_scale'].float().cuda()[:, None]
+    w1 = unpack_ternary(e['w1']).float().cuda() * e['w1_scale'].float().cuda()[:, None]
+    w3 = unpack_ternary(e['w3']).float().cuda() * e['w3_scale'].float().cuda()[:, None]
+    w2 = unpack_ternary(e['w2']).float().cuda() * e['w2_scale'].float().cuda()[:, None]
     Q = unpack_int4(e['Q']).float().cuda() * e['Q_scale'].float().cuda()[None, :]
     with torch.autocast('cuda', dtype=torch.bfloat16):
         g = (z @ w1.T).clamp(max=10.0)
@@ -246,7 +260,8 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
         t0 = time.time()
         n_fixed = 0
         for (k, z, yf, Q0) in todo:
-            results = train_batch([(z, yf, Q0[:, :KP])], INTER, steps, kp=KP,
+            inter, kp = pick_config(z.shape[0])
+            results = train_batch([(z, yf, Q0[:, :kp])], inter, steps, kp=kp,
                                  stop_threshold=refit_threshold)
             w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
             resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
