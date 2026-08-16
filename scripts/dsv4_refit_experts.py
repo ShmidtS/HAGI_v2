@@ -185,6 +185,10 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     n_real: first n_real rows of each pair are the REAL samples; when set, the
     early-stop threshold is evaluated on those rows only (honest metric)."""
     G = len(pairs)
+    if isinstance(n_real, (list, tuple)):
+        n_real = [int(v) for v in n_real]
+    else:
+        n_real = [int(n_real)] * G
     Nmax = max(z.shape[0] for z, _, _ in pairs)
     Z = torch.zeros(G, Nmax, K, device='cuda', dtype=torch.bfloat16)
     Y = torch.zeros(G, Nmax, D, device='cuda', dtype=torch.bfloat16)
@@ -210,7 +214,9 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     stall = 0
     ema = None
     best_state = None
-    best_stop = float('inf')
+    best_stop = torch.full((G,), float('inf'), device='cuda')
+    n_real_t = torch.tensor(n_real, device='cuda')
+    done_mask = torch.zeros(G, dtype=torch.bool, device='cuda')
     t0 = time.time()
     for st in range(steps):
         if Nmax > bs:
@@ -228,9 +234,18 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
         num = (Mb * (yp - Yb) ** 2).sum(dim=(1, 2)).float()
         den = (Mb * Yb ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
         resid = num / den
-        loss = num.sum() / (Mb.sum() * D + 1e-12)
+        active = (~done_mask).float()
+        if active.sum() == 0:
+            break
+        loss = (num * active).sum() / ((Mb.sum(dim=(1, 2)) * active).sum() * D + 1e-12)
         W1.grad = None; W3.grad = None; W2.grad = None; Qp.grad = None
         loss.backward()
+        if done_mask.any():
+            with torch.no_grad():
+                W1.grad[done_mask] = 0
+                W3.grad[done_mask] = 0
+                W2.grad[done_mask] = 0
+                Qp.grad[done_mask] = 0
         with torch.no_grad():
             lr_m = 0.05 * 0.5 * (1 + torch.cos(torch.tensor(3.14159 * st / steps)).item())
             e1.mul_(MU).add_(W1.grad, alpha=1 - MU)
@@ -253,25 +268,39 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
             if stall >= patience:
                 print(f'    stalled at step {st+1}/{steps} (best resid {best*100:.4f}%)', flush=True)
                 break
-        # Honest early-stop metric: residual on the REAL samples only (first n_real rows),
-        # so the universal-signal rows drive learning but never inflate the stopping signal.
-        stop_resid = resid_med
-        if n_real > 0:
+        # Honest early-stop metric: per-expert residual on the REAL rows only.
+        # Computed every check_every steps (not every step) to roughly halve the
+        # forward cost; best-state tracks the per-expert minimum on that grid.
+        honest = (n_real_t.sum() == 0) or (st == steps - 1) or ((st + 1) % check_every == 0)
+        stop_resid = resid  # [G] synthetic residual (fallback when not honest)
+        if n_real_t.sum() > 0 and honest:
+            nrm = int(n_real_t.max().item())
+            Zc, Yc = Z[:, :nrm], Y[:, :nrm]
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                gr = torch.bmm(Z[:, :n_real], qste_bf16(W1).transpose(1, 2)).clamp(max=10.0)
-                ur = torch.bmm(Z[:, :n_real], qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
+                gr = torch.bmm(Zc, qste_bf16(W1).transpose(1, 2)).clamp(max=10.0)
+                ur = torch.bmm(Zc, qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
                 ypr = torch.bmm(torch.bmm(F.silu(gr) * ur, qste_bf16(W2).transpose(1, 2)), Quse.transpose(1, 2))
-            num_r = ((ypr - Y[:, :n_real]) ** 2).sum(dim=(1, 2)).float()
-            den_r = (Y[:, :n_real] ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
-            stop_resid = (num_r / den_r).median().item()
-        # Keep the best state (min honest stop_resid), not the final one.
-        if stop_resid < best_stop:
-            best_stop = stop_resid
-            best_state = (W1.detach().clone(), W3.detach().clone(),
-                          W2.detach().clone(), Qp.detach().clone())
-        if stop_threshold is not None and stop_resid <= stop_threshold:
-            print(f'    early stop at step {st+1}/{steps} (real resid {stop_resid*100:.4f}% <= {stop_threshold*100:.3f}%)', flush=True)
-            break
+            real_mask = torch.arange(nrm, device='cuda')[None, :] < n_real_t[:, None]  # [G, nrm]
+            num_r = (real_mask[:, :, None] * (ypr - Yc) ** 2).sum(dim=(1, 2)).float()
+            den_r = (real_mask[:, :, None] * Yc ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
+            stop_resid = num_r / den_r  # [G]
+        # Per-expert best-state (min honest stop_resid), not the final one.
+        if honest:
+            better = stop_resid < best_stop  # [G]
+            if better.any():
+                best_stop = torch.where(better, stop_resid, best_stop)
+                W1d, W3d, W2d, Qpd = W1.detach(), W3.detach(), W2.detach(), Qp.detach()
+                if best_state is None:
+                    best_state = (W1d.clone(), W3d.clone(), W2d.clone(), Qpd.clone())
+                best_state[0][better] = W1d[better]
+                best_state[1][better] = W3d[better]
+                best_state[2][better] = W2d[better]
+                best_state[3][better] = Qpd[better]
+        if stop_threshold is not None and honest:
+            done_mask |= (stop_resid <= stop_threshold)
+            if done_mask.all():
+                print(f'    early stop at step {st+1}/{steps} (all {G} experts <= {stop_threshold*100:.3f}%)', flush=True)
+                break
         if (st + 1) % check_every == 0:
             print(f'    step {st+1}/{steps}  loss={loss.item():.6f}  '
                   f'resid med={resid.median().item()*100:.4f}%  '
@@ -375,48 +404,10 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
 
         t0 = time.time()
         n_fixed = 0
-        for (k, z, yf, Q0) in todo:
-            if z is None:
-                # Uncovered expert: proxy from nearest router-weight neighbours.
-                inter, kp = 2048, 512
-                steps_used, stop_used = steps, None
-                sim = covered_rw @ rw_n[int(k)]  # [n_covered]
-                top = sim.topk(min(8, sim.shape[0])).indices
-                z_proxy = torch.cat([z_by_key[str(covered_int[j])] for j in top.tolist()], dim=0)
-                z_synth = universal_signal(torch.zeros(0, K, device='cuda'),
-                                           sigma_override=global_sigma, z_proxy=z_proxy)
-                x_synth = (mu + z_synth @ P.T).float()
-                experts = load_selected_experts(L, [k])
-                w1, w2, w3 = experts[k]
-                y_synth = ffn_exact(x_synth, w1, w2, w3)
-                del experts, x_synth
-                Q0 = safe_svd_q(y_synth, kp)
-                if Q0.shape[1] < kp:
-                    Q0 = torch.cat([Q0, torch.zeros(D, kp - Q0.shape[1], device='cuda')], dim=1)
-                z_all, y_all, n_real = z_synth, y_synth, 0
-                z_eval, y_eval = z_all, y_all
-            else:
-                inter, kp = pick_config(z.shape[0])
-                steps_used, stop_used = steps, refit_threshold
-                z_synth = universal_signal(z)
-                x_synth = (mu + z_synth @ P.T).float()
-                experts = load_selected_experts(L, [k])
-                w1, w2, w3 = experts[k]
-                y_synth = ffn_exact(x_synth, w1, w2, w3)
-                del experts, x_synth
-                z_all = torch.cat([z, z_synth])
-                y_all = torch.cat([yf, y_synth])
-                n_real = z.shape[0]
-                z_eval, y_eval = z, yf
-            results = train_batch([(z_all, y_all, Q0[:, :kp])], inter, steps_used, kp=kp,
-                                 stop_threshold=stop_used, n_real=n_real)
-            w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
-            resid = resid_weights_full(z_eval, y_eval, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
+
+        def save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter):
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
-            if os.path.exists(ep):
-                e = torch.load(ep, map_location='cpu', weights_only=False)
-            else:
-                e = {}
+            e = torch.load(ep, map_location='cpu', weights_only=False) if os.path.exists(ep) else {}
             e['w1'] = pack_ternary(w1q).cpu()
             e['w1_scale'] = w1s.cpu()
             e['w3'] = pack_ternary(w3q).cpu()
@@ -431,6 +422,52 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
             torch.save(e, ep)
             with open(done_log, 'a') as f:
                 f.write(f'{L}_{k}\n')
+
+        covered_todo = [t for t in todo if t[1] is not None]
+        missing_todo = [t for t in todo if t[1] is None]
+
+        # --- Covered: one expert at a time (memory-bound iGPU: G=1 beats batching) ---
+        for (k, z, yf, Q0) in covered_todo:
+            inter, kp = pick_config(z.shape[0])
+            z_synth = universal_signal(z)
+            x_synth = (mu + z_synth @ P.T).float()
+            experts = load_selected_experts(L, [int(k)])
+            w1, w2, w3 = experts[int(k)]
+            y_synth = ffn_exact(x_synth, w1, w2, w3)
+            del experts, x_synth
+            z_all = torch.cat([z, z_synth])
+            y_all = torch.cat([yf, y_synth])
+            results = train_batch([(z_all, y_all, Q0[:, :kp])], inter, steps, kp=kp,
+                                  stop_threshold=refit_threshold, n_real=z.shape[0])
+            w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
+            resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
+            save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter)
+            n_fixed += 1
+            print(f'  layer {L} expert {k}: resid={resid*100:.4f}%  '
+                  f'({n_fixed} total, {time.time()-t0:.0f}s)', flush=True)
+            torch.cuda.empty_cache()
+
+        # --- Missing: proxy + synthetic, one expert at a time (13%) ---
+        for (k, z, yf, Q0) in missing_todo:
+            inter, kp = 2048, 512
+            sim = covered_rw @ rw_n[int(k)]  # [n_covered]
+            top = sim.topk(min(8, sim.shape[0])).indices
+            z_proxy = torch.cat([z_by_key[str(covered_int[j])] for j in top.tolist()], dim=0)
+            z_synth = universal_signal(torch.zeros(0, K, device='cuda'),
+                                       sigma_override=global_sigma, z_proxy=z_proxy)
+            x_synth = (mu + z_synth @ P.T).float()
+            experts = load_selected_experts(L, [int(k)])
+            w1, w2, w3 = experts[int(k)]
+            y_synth = ffn_exact(x_synth, w1, w2, w3)
+            del experts, x_synth
+            Q0m = safe_svd_q(y_synth, kp)
+            if Q0m.shape[1] < kp:
+                Q0m = torch.cat([Q0m, torch.zeros(D, kp - Q0m.shape[1], device='cuda')], dim=1)
+            results = train_batch([(z_synth, y_synth, Q0m[:, :kp])], inter, steps, kp=kp,
+                                  stop_threshold=None, n_real=0)
+            w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
+            resid = resid_weights_full(z_synth, y_synth, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
+            save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter)
             n_fixed += 1
             print(f'  layer {L} expert {k}: resid={resid*100:.4f}%  '
                   f'({n_fixed} total, {time.time()-t0:.0f}s)', flush=True)
