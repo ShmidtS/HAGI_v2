@@ -209,6 +209,8 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     best = None
     stall = 0
     ema = None
+    best_state = None
+    best_stop = float('inf')
     t0 = time.time()
     for st in range(steps):
         if Nmax > bs:
@@ -262,6 +264,11 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
             num_r = ((ypr - Y[:, :n_real]) ** 2).sum(dim=(1, 2)).float()
             den_r = (Y[:, :n_real] ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
             stop_resid = (num_r / den_r).median().item()
+        # Keep the best state (min honest stop_resid), not the final one.
+        if stop_resid < best_stop:
+            best_stop = stop_resid
+            best_state = (W1.detach().clone(), W3.detach().clone(),
+                          W2.detach().clone(), Qp.detach().clone())
         if stop_threshold is not None and stop_resid <= stop_threshold:
             print(f'    early stop at step {st+1}/{steps} (real resid {stop_resid*100:.4f}% <= {stop_threshold*100:.3f}%)', flush=True)
             break
@@ -270,6 +277,12 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
                   f'resid med={resid.median().item()*100:.4f}%  '
                   f'ETA {(time.time()-t0)/(st+1)*(steps-st)/60:.1f} min', flush=True)
 
+    # Restore the best state (min honest residual) instead of the final one.
+    if best_state is not None:
+        W1.data.copy_(best_state[0])
+        W3.data.copy_(best_state[1])
+        W2.data.copy_(best_state[2])
+        Qp.data.copy_(best_state[3])
     w1q, w1s = ternarize(W1.detach())
     w3q, w3s = ternarize(W3.detach())
     w2q, w2s = ternarize(W2.detach())
