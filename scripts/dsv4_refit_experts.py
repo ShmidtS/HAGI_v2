@@ -136,7 +136,9 @@ def qste_bf16(W):
 
 
 def zeropower(G, steps=3):
-    """Newton-Schulz orthogonalization of each [m,n] matrix (Muon core)."""
+    """Newton-Schulz orthogonalization of each [m,n] matrix (Muon core).
+    steps=3: measured identical live throughput to steps=2 in the 4-process
+    refit (~46-47 steps/s each), so keep the tighter orthogonalization."""
     a, m, n = G.shape
     X = G.to(torch.bfloat16)
     X = X / (X.norm(dim=(1, 2), keepdim=True).clamp_min(1e-7))
@@ -178,7 +180,21 @@ def quantize_q(Q):
     return pack_int4(q), scale
 
 
-def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_threshold=None, n_real=0):
+def train_batch_fwd(Zb, W1, W3, W2, Qp):
+    """Module-level (dynamo in this torch build cannot trace closures):
+    explicit bf16 casts — numerically identical to the autocast version
+    (autocast casts bmm inputs to bf16 anyway)."""
+    g = torch.bmm(Zb, qste_bf16(W1).transpose(1, 2)).clamp(max=10.0)
+    u = torch.bmm(Zb, qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
+    h = F.silu(g) * u
+    yp_r = torch.bmm(h, qste_bf16(W2).transpose(1, 2))  # [G,bs,KP]
+    Quse = qat_q(Qp, Q_DIVISOR)
+    yp = torch.bmm(yp_r, Quse.to(torch.bfloat16).transpose(1, 2))  # [G,bs,4096]
+    return yp, Quse
+
+
+def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_threshold=None, n_real=0, use_compile=False,
+                 init=None, stall_checks=200, stall_tol=0.02):
     """pairs: list of (z_k [n_k,K], y_k [n_k,4096], Q0_k [4096,kp])
     -> list of (w1q,w1s,w3q,w3s,w2q,w2s,Qq,Qs).
     Jointly trains ternary core + learnable Q against full 4096-dim target.
@@ -203,6 +219,17 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     W1 = torch.nn.Parameter(torch.randn(G, inter, K, device='cuda') * K**-0.5)
     W3 = torch.nn.Parameter(torch.randn(G, inter, K, device='cuda') * K**-0.5)
     W2 = torch.nn.Parameter(torch.randn(G, kp, inter, device='cuda') * inter**-0.5)
+    if init is not None:
+        # Warm-start the ternary core from a previous pass (packed ternary unpacked
+        # to float). Shapes must match: (G,inter,K)/(G,inter,K)/(G,kp,inter).
+        iW1, iW3, iW2 = init
+        if iW1.shape == W1.shape and iW3.shape == W3.shape and iW2.shape == W2.shape:
+            W1.data.copy_(iW1)
+            W3.data.copy_(iW3)
+            W2.data.copy_(iW2)
+            print('    [warm] ternary core initialized from previous pass', flush=True)
+        else:
+            print(f'    [warm] shape mismatch ({tuple(iW1.shape)} vs {tuple(W1.shape)}) — random init', flush=True)
     Qp = torch.nn.Parameter(Q)
     e1 = torch.zeros_like(W1)
     e3 = torch.zeros_like(W3)
@@ -215,31 +242,74 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     ema = None
     best_state = None
     best_stop = torch.full((G,), float('inf'), device='cuda')
+    # Honest-EMA stall tracking (covered experts that plateau above the threshold):
+    # stop after stall_checks honest checks without >stall_tol relative improvement.
+    ema_h = None
+    ref_h = None
+    stall_ct = torch.zeros(G, device='cuda')
     n_real_t = torch.tensor(n_real, device='cuda')
     done_mask = torch.zeros(G, dtype=torch.bool, device='cuda')
+
+    def update_best(metric, valid=None):
+        nonlocal best_state, best_stop
+        if valid is None:
+            valid = torch.ones(G, dtype=torch.bool, device='cuda')
+        if valid.any():
+            cand = torch.where(valid, metric, torch.full_like(best_stop, float('inf')))
+            better = cand < best_stop
+            if better.any():
+                best_stop = torch.where(better, cand, best_stop)
+                W1d, W3d, W2d, Qpd = W1.detach(), W3.detach(), W2.detach(), Qp.detach()
+                if best_state is None:
+                    best_state = (W1d.clone(), W3d.clone(), W2d.clone(), Qpd.clone())
+                best_state[0][better] = W1d[better]
+                best_state[1][better] = W3d[better]
+                best_state[2][better] = W2d[better]
+                best_state[3][better] = Qpd[better]
+
+    if use_compile:
+        fwd = torch.compile(train_batch_fwd)
+        print('    [compile] torch.compile enabled (first steps compile the graph)', flush=True)
+    else:
+        fwd = train_batch_fwd
+
     t0 = time.time()
     for st in range(steps):
         if Nmax > bs:
             idx = torch.randint(0, Nmax, (bs,), device='cuda')
             Zb, Yb, Mb = Z[:, idx], Y[:, idx], M[:, idx]
         else:
+            idx = torch.arange(Nmax, device='cuda')
             Zb, Yb, Mb = Z, Y, M
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            g = torch.bmm(Zb, qste_bf16(W1).transpose(1, 2)).clamp(max=10.0)
-            u = torch.bmm(Zb, qste_bf16(W3).transpose(1, 2)).clamp(min=-10.0, max=10.0)
-            h = F.silu(g) * u
-            yp_r = torch.bmm(h, qste_bf16(W2).transpose(1, 2))  # [G,bs,KP]
-            Quse = qat_q(Qp, Q_DIVISOR)
-            yp = torch.bmm(yp_r, Quse.transpose(1, 2))           # [G,bs,4096]
-        num = (Mb * (yp - Yb) ** 2).sum(dim=(1, 2)).float()
-        den = (Mb * Yb ** 2).sum(dim=(1, 2)).float().clamp_min(1e-12)
+        yp, Quse = fwd(Zb, W1, W3, W2, Qp)
+        diff2 = (yp - Yb) ** 2
+        yb2 = Yb ** 2
+        num = (Mb * diff2).sum(dim=(1, 2)).float()
+        den = (Mb * yb2).sum(dim=(1, 2)).float().clamp_min(1e-12)
         resid = num / den
         active = (~done_mask).float()
         if active.sum() == 0:
             break
         loss = (num * active).sum() / ((Mb.sum(dim=(1, 2)) * active).sum() * D + 1e-12)
+        # Free stochastic real-residual from the training batch (no extra forward):
+        # reuse the already-computed diff2/yb2; real rows in batch are idx < n_real.
+        if n_real_t.sum() > 0:
+            real_b = (idx[None, :] < n_real_t[:, None]).float()  # [G, bs]
+            has_real = real_b.sum(dim=1) > 0  # [G]
+            if has_real.any():
+                num_rb = (real_b[..., None] * diff2).sum(dim=(1, 2)).float()
+                den_rb = (real_b[..., None] * yb2).sum(dim=(1, 2)).float().clamp_min(1e-12)
+                update_best(num_rb / den_rb, has_real)
         W1.grad = None; W3.grad = None; W2.grad = None; Qp.grad = None
         loss.backward()
+        if use_compile and ((st + 1) % check_every == 0 or st == 0):
+            # ROCm torch.compile bug guard: non-finite grads would silently skip
+            # updates (see BENCHMARKS compile+batch>=320). Fail loudly instead.
+            if not (torch.isfinite(W1.grad).all() and torch.isfinite(W3.grad).all()
+                    and torch.isfinite(W2.grad).all() and torch.isfinite(Qp.grad).all()):
+                raise RuntimeError(
+                    f'non-finite grads at step {st+1} under torch.compile '
+                    '(known ROCm buffer-reuse bug) — rerun without --compile')
         if done_mask.any():
             with torch.no_grad():
                 W1.grad[done_mask] = 0
@@ -286,21 +356,31 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
             stop_resid = num_r / den_r  # [G]
         # Per-expert best-state (min honest stop_resid), not the final one.
         if honest:
-            better = stop_resid < best_stop  # [G]
-            if better.any():
-                best_stop = torch.where(better, stop_resid, best_stop)
-                W1d, W3d, W2d, Qpd = W1.detach(), W3.detach(), W2.detach(), Qp.detach()
-                if best_state is None:
-                    best_state = (W1d.clone(), W3d.clone(), W2d.clone(), Qpd.clone())
-                best_state[0][better] = W1d[better]
-                best_state[1][better] = W3d[better]
-                best_state[2][better] = W2d[better]
-                best_state[3][better] = Qpd[better]
+            update_best(stop_resid)
         if stop_threshold is not None and honest:
             done_mask |= (stop_resid <= stop_threshold)
             if done_mask.all():
                 print(f'    early stop at step {st+1}/{steps} (all {G} experts <= {stop_threshold*100:.3f}%)', flush=True)
                 break
+            # Stall-stop: covered experts stuck on a plateau above the threshold
+            # burn the whole budget otherwise. EMA of the honest residual must
+            # improve by >stall_tol (relative) within stall_checks honest checks.
+            with torch.no_grad():
+                if ema_h is None:
+                    ema_h = stop_resid.clone()
+                    ref_h = stop_resid.clone()
+                else:
+                    ema_h = 0.9 * ema_h + 0.1 * stop_resid
+                    improved = ema_h < ref_h * (1.0 - stall_tol)
+                    ref_h = torch.minimum(ref_h, ema_h)
+                    stall_ct = torch.where(improved & (~done_mask), torch.zeros_like(stall_ct), stall_ct + 1.0)
+                    newly = (~done_mask) & (stall_ct >= stall_checks) & (best_stop > stop_threshold)
+                    if newly.any():
+                        done_mask |= newly
+                        print(f'    stall-stop {int(newly.sum())} expert(s) at step {st+1} '
+                              f'(plateau best {best_stop[newly].min().item()*100:.4f}%)', flush=True)
+                        if done_mask.all():
+                            break
         if (st + 1) % check_every == 0:
             print(f'    step {st+1}/{steps}  loss={loss.item():.6f}  '
                   f'resid med={resid.median().item()*100:.4f}%  '
@@ -322,7 +402,23 @@ def train_batch(pairs, inter, steps, kp=KP, check_every=25, patience=1000, stop_
     return out
 
 
-def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_threshold=2e-4):
+def warm_init_from(e, inter, kp):
+    """Unpack a saved expert's ternary core into float init tensors for train_batch.
+    Returns None if shapes/keys are unusable."""
+    try:
+        if 'w1' not in e or 'w3' not in e or 'w2' not in e or e.get('inter') != inter:
+            return None
+        w1 = unpack_ternary(e['w1']).float() * e['w1_scale'].float()[:, None]   # [inter,K]
+        w3 = unpack_ternary(e['w3']).float() * e['w3_scale'].float()[:, None]   # [inter,K]
+        w2 = unpack_ternary(e['w2']).float() * e['w2_scale'].float()[:, None]   # [rows,KP']
+        if w2.shape[0] != kp:
+            return None
+        return (w1[None], w3[None], w2[None])
+    except Exception:
+        return None
+
+
+def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_threshold=2e-4, use_compile=False, warm=False, seed=0):
     """Router-based refit: covered experts learn on their REAL routed activations
     (honest channel). Uncovered (noisy) experts learn on a proxy manifold built from
     the nearest covered experts by router-weight cosine similarity."""
@@ -336,6 +432,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
         print(f'layer {L}: loading {len(acts)} experts...', flush=True)
 
         todo = []
+        skipped_z = {}  # z of experts skipped by resume — missing-branch proxy needs them
         for k, (x_k, y_k) in acts.items():
             key = f'{L}_{k}'
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
@@ -352,6 +449,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
                         and e.get('Q_bits', 0) == Q_BITS and not all_flag):
                     with open(done_log, 'a') as f:
                         f.write(f'{key}\n')
+                    skipped_z[k] = (x_k.float().cuda() - mu) @ P
                     continue
                 Qfull = unpack_int4(e['Q']).float() * e['Q_scale'].float()[None, :]
                 if Qfull.shape[1] >= MAX_KP:
@@ -371,14 +469,15 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
                 if resid <= refit_threshold:
                     with open(done_log, 'a') as f:
                         f.write(f'{key}\n')
+                    skipped_z[k] = z
                     continue
-            todo.append((k, z, y_full, Q0))
+            todo.append((k, z, y_full, Q0, e))
 
         covered = set(acts.keys())
         for k in range(256):
             sk = str(k)
             if sk not in covered:
-                todo.append((sk, None, None, None))
+                todo.append((sk, None, None, None, None))
 
         del acts
         torch.cuda.empty_cache()
@@ -392,6 +491,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
         todo.sort(key=lambda t: 0 if t[1] is None else t[1].shape[0])
         zs = [t[1] for t in todo if t[1] is not None]
         z_by_key = {t[0]: t[1] for t in todo if t[1] is not None}
+        z_by_key.update(skipped_z)
         if zs:
             global_sigma = torch.stack([zz.float().std(dim=0, unbiased=False) for zz in zs]).mean(dim=0).clamp(0.1, 2.0)
         else:
@@ -405,7 +505,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
         t0 = time.time()
         n_fixed = 0
 
-        def save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter):
+        def save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter, n_real=None):
             ep = os.path.join(REDUCED, f'layer_{L}', f'expert_{k}.pt')
             e = torch.load(ep, map_location='cpu', weights_only=False) if os.path.exists(ep) else {}
             e['w1'] = pack_ternary(w1q).cpu()
@@ -419,6 +519,8 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
             e['Q_bits'] = Q_BITS
             e['inter'] = inter
             e['residual'] = resid
+            if n_real is not None:
+                e['n_real'] = int(n_real)
             torch.save(e, ep)
             with open(done_log, 'a') as f:
                 f.write(f'{L}_{k}\n')
@@ -427,9 +529,17 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
         missing_todo = [t for t in todo if t[1] is None]
 
         # --- Covered: one expert at a time (memory-bound iGPU: G=1 beats batching) ---
-        for (k, z, yf, Q0) in covered_todo:
-            inter, kp = pick_config(z.shape[0])
-            z_synth = universal_signal(z)
+        for (k, z, yf, Q0, e_prev) in covered_todo:
+            n_k = z.shape[0]
+            inter, kp = pick_config(n_k)
+            # n_k tiers: honest residual is only meaningful with enough real rows.
+            if n_k >= 128:
+                tier_thr, tier_steps, tier = refit_threshold, steps, 'A'
+            elif n_k >= 8:
+                tier_thr, tier_steps, tier = max(refit_threshold, 1e-3), steps, 'B'
+            else:
+                tier_thr, tier_steps, tier = None, min(steps, 1000), 'C'
+            z_synth = universal_signal(z, seed=seed + int(k))
             x_synth = (mu + z_synth @ P.T).float()
             experts = load_selected_experts(L, [int(k)])
             w1, w2, w3 = experts[int(k)]
@@ -437,24 +547,26 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
             del experts, x_synth
             z_all = torch.cat([z, z_synth])
             y_all = torch.cat([yf, y_synth])
-            results = train_batch([(z_all, y_all, Q0[:, :kp])], inter, steps, kp=kp,
-                                  stop_threshold=refit_threshold, n_real=z.shape[0])
+            init = warm_init_from(e_prev, inter, kp) if (warm and e_prev is not None) else None
+            results = train_batch([(z_all, y_all, Q0[:, :kp])], inter, tier_steps, kp=kp,
+                                  stop_threshold=tier_thr, n_real=z.shape[0], use_compile=use_compile,
+                                  init=init)
             w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
             resid = resid_weights_full(z, yf, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
-            save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter)
+            save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter, n_real=n_k)
             n_fixed += 1
-            print(f'  layer {L} expert {k}: resid={resid*100:.4f}%  '
+            print(f'  layer {L} expert {k} [tier {tier}, n={n_k}]: resid={resid*100:.4f}%  '
                   f'({n_fixed} total, {time.time()-t0:.0f}s)', flush=True)
             torch.cuda.empty_cache()
 
         # --- Missing: proxy + synthetic, one expert at a time (13%) ---
-        for (k, z, yf, Q0) in missing_todo:
+        for (k, z, yf, Q0, _e_prev) in missing_todo:
             inter, kp = 2048, 512
             sim = covered_rw @ rw_n[int(k)]  # [n_covered]
             top = sim.topk(min(8, sim.shape[0])).indices
             z_proxy = torch.cat([z_by_key[str(covered_int[j])] for j in top.tolist()], dim=0)
             z_synth = universal_signal(torch.zeros(0, K, device='cuda'),
-                                       sigma_override=global_sigma, z_proxy=z_proxy)
+                                       sigma_override=global_sigma, z_proxy=z_proxy, seed=seed + int(k))
             x_synth = (mu + z_synth @ P.T).float()
             experts = load_selected_experts(L, [int(k)])
             w1, w2, w3 = experts[int(k)]
@@ -464,7 +576,7 @@ def run_refit(start_layer, end_layer, group, steps, all_flag, done_log, refit_th
             if Q0m.shape[1] < kp:
                 Q0m = torch.cat([Q0m, torch.zeros(D, kp - Q0m.shape[1], device='cuda')], dim=1)
             results = train_batch([(z_synth, y_synth, Q0m[:, :kp])], inter, steps, kp=kp,
-                                  stop_threshold=None, n_real=0)
+                                  stop_threshold=None, n_real=0, use_compile=use_compile)
             w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs = results[0]
             resid = resid_weights_full(z_synth, y_synth, Qq, Qs, w1q, w1s, w3q, w3s, w2q, w2s)
             save_expert(k, resid, w1q, w1s, w3q, w3s, w2q, w2s, Qq, Qs, inter)
@@ -487,13 +599,20 @@ def main():
                     help='accept an expert when its residual <= this (fraction, 0.01%% default)')
     ap.add_argument('--n-procs', type=int, default=4,
                     help='split layers across N parallel processes (0=auto=min(4,n_layers))')
+    ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
+                    help='torch.compile the training forward step (default: on; --no-compile to disable. '
+                         'Guard raises on non-finite grads)')
+    ap.add_argument('--warm', action='store_true',
+                    help='warm-start the ternary core from the saved expert file (iterative refinement passes)')
+    ap.add_argument('--seed', type=int, default=0,
+                    help='unifold signal seed offset (vary per refinement pass for data diversity)')
     args = ap.parse_args()
 
     n_procs = max(1, args.n_procs if args.n_procs > 0 else min(4, args.end_layer - args.start_layer))
 
     if n_procs == 1:
         run_refit(args.start_layer, args.end_layer, args.group, args.steps, args.all,
-                  args.done_log, args.refit_threshold)
+                  args.done_log, args.refit_threshold, use_compile=args.compile, warm=args.warm, seed=args.seed)
         return
 
     per = (args.end_layer - args.start_layer + n_procs - 1) // n_procs
@@ -510,6 +629,11 @@ def main():
                '--refit-threshold', str(args.refit_threshold)]
         if args.all:
             cmd.append('--all')
+        if args.compile:
+            cmd.append('--compile')
+        if args.warm:
+            cmd.append('--warm')
+        cmd.extend(['--seed', str(args.seed)])
         with open(f'refit_q_p{i}.log', 'w') as f:
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         procs.append(p)
