@@ -27,7 +27,7 @@ REFIT_CFGS = [
     (1024, 512),
 ]
 D = 4096
-POD = 'checkpoints_dsv4/pod_accurate'
+POD = 'checkpoints_dsv4/pod_all_tokens'
 REDUCED = 'dsv4_reduced'
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
 

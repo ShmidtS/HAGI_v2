@@ -41,7 +41,7 @@ def main():
 
     import dsv4_collect_attention as ca
     tok = gigatoken.Tokenizer.from_json(open(TOKENIZER, 'rb').read())
-    ids = [0] + list(tok.encode(ca.TEXT))
+    ids = [0] + torch.randperm(ca.VOCAB, dtype=torch.long).tolist()
     ids = ids[: args.max_tokens]
     n_tok = len(ids)
     print(f'tokens: {n_tok}', flush=True)
