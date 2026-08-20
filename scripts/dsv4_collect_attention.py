@@ -33,9 +33,11 @@ sys.path.insert(0, os.path.join(_ROOT, 'src'))
 import stub_import_tf  # noqa: F401
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 import gigatoken
+import dsv4_experts as de
 
 TOKENIZER = r'C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json'
 OUT_DIR = 'checkpoints_dsv4/attention'
+VOCAB = 129280
 
 TEXT = (
     'The transformer architecture processes a sequence of tokens through stacked layers. Each layer applies multi-head attention followed by a feed-forward network. '
@@ -59,20 +61,21 @@ def parse_q_layers(spec: str, n_layers: int) -> list[int]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--model', default='C:/HAGI_v2/dsv4_shared_only')
+    ap.add_argument('--model', default=None, help='model dir (default: original DeepSeek-V4-Flash snapshot)')
     ap.add_argument('--out', default=OUT_DIR)
     ap.add_argument('--max-tokens', type=int, default=3000)
     ap.add_argument('--q-layers', default='0', help="comma list, 'all', or 'none'")
     args = ap.parse_args()
 
+    model_dir = args.model or de.default_snapshot()
     tok = gigatoken.Tokenizer.from_json(open(TOKENIZER, 'rb').read())
-    ids = [0] + list(tok.encode(TEXT))
+    ids = [0] + torch.randperm(VOCAB, dtype=torch.long).tolist()
     ids = ids[: args.max_tokens]
     n_tok = len(ids)
-    print(f'tokens: {n_tok}', flush=True)
+    print(f'tokens: {n_tok} (shuffled vocab)', flush=True)
 
     torch.set_default_device('cuda')
-    model = DeepseekV4ForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
+    model = DeepseekV4ForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32)
     torch.set_default_device('cpu')
     model.eval()
     model = model.to(torch.bfloat16)

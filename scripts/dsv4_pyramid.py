@@ -55,7 +55,7 @@ import dsv4_experts as de
 
 K = 512
 D = 4096
-POD_ACTS = 'checkpoints_dsv4/pod_accurate'
+POD_ACTS = 'checkpoints_dsv4/pod_all_tokens'
 
 
 # --------------------------------------------------------------------------

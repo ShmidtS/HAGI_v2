@@ -133,7 +133,8 @@ def main():
 
     stream = []
     if not args.no_vocab:
-        stream.append(torch.arange(VOCAB, dtype=torch.long))
+        # uniformly shuffled vocab (all manifolds mixed) — matches POD coverage goal
+        stream.append(torch.randperm(VOCAB, dtype=torch.long))
     n_rand = max(0, args.max_tokens - sum(int(s.numel()) for s in stream))
     if n_rand > 0:
         stream.append(torch.randint(0, VOCAB, (n_rand,), dtype=torch.long))
