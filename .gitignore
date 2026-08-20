@@ -52,3 +52,6 @@ consumed.json
 torch-compile.bat
 profile_*
 profiler_logs/
+
+# refit runtime done-logs (append-only state)
+refit_*.txt

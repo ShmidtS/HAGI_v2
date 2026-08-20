@@ -83,14 +83,16 @@ def load_reduced_layer(li: int) -> dict:
 
 def reduced_ffn_z(z, e):
     zz = z.to(torch.bfloat16)
-    w1 = unpack_ternary(e['w1']).to(torch.bfloat16) * e['w1s'].to(torch.bfloat16)[:, None]
-    w3 = unpack_ternary(e['w3']).to(torch.bfloat16) * e['w3s'].to(torch.bfloat16)[:, None]
+    K = zz.shape[1]
+    # trim base-3 packing pads (5 trits/byte -> cols rounded up to *5)
+    w1 = unpack_ternary(e['w1']).to(torch.bfloat16)[:, :K] * e['w1s'].to(torch.bfloat16)[:, None]
+    w3 = unpack_ternary(e['w3']).to(torch.bfloat16)[:, :K] * e['w3s'].to(torch.bfloat16)[:, None]
     w2 = unpack_ternary(e['w2']).to(torch.bfloat16) * e['w2s'].to(torch.bfloat16)[:, None]
     Q = unpack_int4(e['Q']).to(torch.bfloat16) * e['Qs'].to(torch.bfloat16)[None, :]
     gate = (zz @ w1.T).clamp(max=SWIGLU_LIMIT)
     up = (zz @ w3.T).clamp(min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
     h = F.silu(gate) * up
-    yc = h @ w2.T
+    yc = h @ w2[:, :h.shape[1]].T
     return (yc @ Q.T).float()
 
 
