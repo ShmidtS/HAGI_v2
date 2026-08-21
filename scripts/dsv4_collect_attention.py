@@ -74,11 +74,9 @@ def main():
     n_tok = len(ids)
     print(f'tokens: {n_tok} (shuffled vocab)', flush=True)
 
-    torch.set_default_device('cuda')
-    model = DeepseekV4ForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32)
-    torch.set_default_device('cpu')
+    model = DeepseekV4ForCausalLM.from_pretrained(model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
     model.eval()
-    model = model.to(torch.bfloat16)
+    model = model.to('cuda')
     model.config._experts_implementation = 'eager'
     model.config.gradient_checkpointing = False
     n_layers = len(model.model.layers)
