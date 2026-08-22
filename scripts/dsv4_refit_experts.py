@@ -20,10 +20,15 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dsv4_experts as de
-from dsv4_collect_x_accurate import ffn as ffn_exact
-from dsv4_collect_x_accurate import load_selected_experts
-from dsv4_generate_reduced import unpack_ternary
-from dsv4_reduce_layer import pack_ternary, ternarize
+from dsv4_experts import (
+    ffn as ffn_exact,
+)
+from dsv4_experts import (
+    load_selected_experts,
+    pack_ternary,
+    ternarize,
+    unpack_ternary,
+)
 
 K = 4096
 INTER = 1024

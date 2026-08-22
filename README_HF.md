@@ -11,9 +11,8 @@ tags:
   - moe
   - compression
   - ternary
-  - pod
-  - int4
-  - qat
+  - int8
+  - kv-cache
   - long-context
   - 2m-context
 pipeline_tag: text-generation
@@ -27,9 +26,13 @@ A **lossy-compressed** derivative of
 [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
 (256 MoE experts/layer × 43 layers) with an **extended 2M-token context**.
 
+> ⚠️ **Status: in progress / experimental.** The compression is not yet
+> published and the reduced model is not yet fully assembled. The description
+> below reflects the current design, not a released artifact.
+
 Every routed FFN expert is replaced by a compact
-**POD + ternary SwiGLU + int4-QAT** block, and the KV cache is stored in a
-256-dim POD subspace with a **distance-dependent (pyramid) rank**, so the
+**full-rank two-stage ternary SwiGLU** block, and the KV cache is stored in
+**int8** with a **distance-dependent (pyramid) sliding window**, so the
 context grows to 2M tokens **without raising the YaRN factor**.
 
 ## Core idea: each expert is a communication channel
@@ -39,102 +42,86 @@ parts of a layer. Each expert is a channel `x → y`: we measure its transfer
 function by driving it with a **universal test signal (unifold)** and refit a
 compact block against the recorded `(x, y)` pairs — per expert, individually.
 
-The signal covers the **real input manifold** (where the router actually sends
-tokens) plus a small 0.1σ jitter around it. We deliberately do NOT probe the
-full ±5σ volume: on empty regions the ternary kernel cannot express the expert
-response (25–36% residual), so full-volume coverage is a waste — the manifold
-+ neighbourhood is the honest working band.
-
-Experts the router never activated on the 774K-sample collection (13%) have no
-real manifold. They are refit on a **proxy manifold from their nearest
-router-weight neighbours** (cosine similarity), bootstrap + 0.1σ jitter, with a
-stall-based stop once the residual plateaus.
-
-> ⚠️ This is a compressed approximation, not the original model. It trades a
-> small per-expert residual (~0.012% median) for a ~3× size reduction of the
-> MoE. Generation is coherent but degraded relative to the base model.
+**Key finding — the weights are noise, and so (almost) are the activations.**
+Expert weights are pairwise orthogonal white noise (cannot be merged or
+factored). The activations are *almost* full-rank: an earlier "top-512 =
+99.93%" claim was an overfit artifact of a 3000-token sample; the honest
+spectrum (259072 tokens) gives ~59% energy at K=512 (≈41% out-of-sample) and
+~95% only at K=3072. So the compression keeps the **full 4096-dim rank** and
+instead uses a **two-stage ternary** kernel for the size win.
 
 ## What's inside
 
-| Component | Format | Size |
-|-----------|--------|------|
+| Component | Format | Notes |
+| ----------- | -------- | ------- |
 | Skeleton (non-expert weights) | `model.safetensors` + `config.json` | 16.69 GB |
-| Routed experts (43 × 256) | `reduced/layer_{L}/expert_{k}.pt` | ~14.5 GB |
-| KV POD bases + means | `pod_reduced/P_kv_L{L}.pt`, `mean_kv_L{L}.pt` | ~22 MB |
-| **Total** | | **~31 GB** |
+| Routed experts (43 × 256) | `dsv4_reduced/layer_{L}/expert_{k}.pt` | two-stage ternary |
+| Per-layer rotation + mean | `P.pt` [4096,4096], `mu.pt` [1,4096] | fp32, per layer |
+| int8 KV scales | `kv_int8_scales.pt` (43 × 512) | per-channel, RoPE-safe |
 
-### Expert format (per expert, ~1.32 MB)
+### Expert format (per expert)
 
 ```
-P        [4096, 512]  fp32   input POD projection (per layer)
-mu       [4096]       fp32   input mean (subtract before projecting)
-w1, w3   [1024, 103]  uint8  ternary gate/up, packed 5 trits/byte (inter=1024)
-w1_scale, w3_scale [1024] fp32
-w2       [512, 205]   uint8  ternary down, packed (inter=1024 → ceil(1024/5)=205)
-w2_scale [512]        fp32
-Q        [4096, 256]  uint8  int4 output basis, packed 2 nibbles/byte (kp=512)
-Q_scale  [512]        fp32   per-column scale (max/28)
-Q_bits   scalar       int64  4 (format marker)
+P              [4096, 4096]  fp32    per-layer orthogonal rotation (whitening)
+mu             [1, 4096]     fp32    per-layer input mean
+w1, w3         [2048, 820]   uint8   ternary gate/up, packed 5 trits/byte (inter=2048)
+w1_q2, w3_q2   [2048, 820]   uint8   second ternary stage (residual refinement)
+w2             [4096, 410]   uint8   ternary down, packed (inter=2048)
+w2_q2          [4096, 410]   uint8   second ternary stage
+scales         [...]         fp32    per-row scale for each stage
 ```
 
 Forward per routed expert:
 
 ```
-z   = (x - mu) @ P                  # 4096 → 512
-g   = silu(z @ W1) * (z @ W3)       # ternary SwiGLU, inter=1024
-y   = (g @ W2) @ Q.T                # 512 → 4096 (int4 Q, dequant on read)
+z = (x - mu) @ P                 # 4096 → 4096 (rotation only)
+g = silu(z @ W1) * (z @ W3)      # two-stage ternary SwiGLU, inter = 2048
+y = g @ W2                       # 4096 → 4096 (identity output)
 ```
+
+Each ternary weight `W` is a **sum of two ternary matrices**
+`W = W_q · s + W_q2 · s2`, which roughly halves the residual versus a single
+ternary matrix at the same bit cost.
 
 ## Compression method
 
-The core idea: **compress the FFN on real activations, not on weights**.
-Routed-expert weights are white noise (weight-rank reduction is useless), but
-the activations are low-rank. Each expert is replaced by a spectral (POD)
-factorization + a ternary kernel + a quantized output basis:
+1. **Full-rank rotation** — per-layer orthogonal `P [4096,4096]` + mean
+   `mu` whiten the FFN inputs; no dimensionality reduction (POD was rejected).
+2. **Two-stage ternary SwiGLU kernel** — `z → silu(z·W1)·(z·W3)·W2` with
+   `W1,W3,W2 ∈ {−1,0,1}` (packed 5 trits/byte), `inter = 2048`, each weight a
+   sum of two ternary stages. Trained with straight-through estimator + Muon
+   (zeropower) optimizer, bf16 autocast.
+3. **Identity output** — `kp = 4096`, no output basis. The int4-QAT output
+   basis Q was abandoned once the model ran at full rank.
 
-1. **Input POD** — `P [4096, 512]` from SVD of the layer's FFN-input
-   activations; `z = (x − μ) P` projects onto the 512-dim signal subspace.
-2. **Ternary SwiGLU kernel** — `z → silu(z·W1)·(z·W3)·W2` with
-   `W1,W3,W2 ∈ {−1,0,1}` (packed 5 trits/byte), `inter = 1024`. Trained with
-   straight-through estimator + Muon (zeropower) optimizer, bf16 autocast.
-3. **int4 QAT output basis** — `Q [4096, 512]` is quantization-aware trained
-   to int4 (2 nibbles/byte, `scale = max/28`, levels −7..7) against the full
-   4096-dim target. Per-column scale stored as fp32.
+**Per-expert quality (full 4096-dim, weighted MSE(y_pred,y)/MSE(y,0)):**
+~0.6–0.9% residual (measured on the current refit). Earlier "≤0.01%" figures
+were a reduced 384-dim output-space loss and are not comparable.
 
-**Per-expert quality (router-based):**
+## Attention: int8 KV-cache + pyramid for 2M context
 
-- **Covered experts (87%)** — early-stop on the honest residual over their
-  **real routed activations** at **≤ 0.01%** (full 4096-dim loss).
-- **Uncovered experts (13%)** — no real samples; residual on the proxy
-  manifold ~0.5–1.8% (they are rare, so their weighted contribution is small).
-- **Adaptive size** — `inter/kp` chosen by activation count `n_k`:
-  `<200→(1024,512)`, `200–400→(2048,512)`, `≥400→(4096,768)`. Different
-  experts may end up different sizes; packing and inference are per-expert, so
-  this is fine.
+The context is extended **without YaRN extrapolation**:
 
-## Attention: KV-POD + pyramid for 2M context
-
-The context is extended **without YaRN extrapolation** (factor stays 8, inside
-the trained factor-16 range):
-
-- **KV-cache POD** — K/V are stored in a 256-dim POD subspace
-  (`P_kv [512, 256]` + `mean_kv [512]` per layer), halving KV memory.
-- **Pyramid rank** — tokens within `window=4096` of the query read back at
-  full rank 256; older tokens read back at `r(d) = clamp(256 >> ⌊log2(d/4096+1)⌋, 16, 256)`.
-  Far tokens cost less, so the sliding window grows to 2M at the same memory
-  budget (≈5.7 GB KV cache at 2M tokens, bf16).
+- **int8 KV-cache** — K/V stored per-channel int8 (static scale, RoPE-safe:
+  K is stored post-RoPE), ~2× KV memory with ~0.005% reconstruction error
+  (worst 0.0125% across 43 layers). Replaces an earlier low-rank KV-POD.
+- **Pyramid sliding window** — nearby tokens keep full 512 channels; older
+  tokens are channel-truncated per
+  `r(d) = clamp(512 >> ⌊log2(d/1024 + 1)⌋, 32, 512)` (base 512, window 1024,
+  min 32). Far tokens cost less, so the window grows to 2M at the same budget.
 
 ## Usage
 
 ```python
-# The reduced experts + POD bases are loaded by the pipeline in
-# github.com/ShmidtS/HAGI_v2 (scripts/dsv4_generate_reduced.py).
-# The skeleton is a standard transformers checkpoint.
+# Utilities: scripts/dsv4_experts.py (decode / load / ternary pack-unpack),
+# and the refit in scripts/dsv4_refit_experts.py. Generation currently runs
+# the EXACT model from lossless_layers via scripts/dsv4_generate_fast.py /
+# dsv4_generate_real.py. Reduced-model generation is not yet wired up.
 ```
 
 ## Limitations
 
-- Lossy: per-expert residual ~0.012% (median); hard experts can be higher.
-- Generation quality is degraded relative to the base model.
-- Custom ternary/int4 dequant on read — not a drop-in GGUF; load via the
-  HAGI_v2 pipeline or the bundled safetensors (`dsv4_reduced.safetensors`).
+- Lossy: per-expert residual ~0.6–0.9% (full 4096-dim).
+- Refit is in progress (239 / 11008 experts across 3 layers); the reduced
+  model is not yet assembled or generating.
+- Custom ternary dequant on read — not a drop-in GGUF.
