@@ -65,186 +65,114 @@ pip install -e .
 python scripts/train.py --config configs/level0_merged_3.yaml --resume checkpoints_l0_merged/step-0000000.pt
 ```
 
-## DeepSeek-V4 MoE compression: copy minimal orthogonal blocks
+## DeepSeek-V4 MoE compression (status: in progress)
 
-This is the loss-minimising compression scheme discovered while shrinking
-DeepSeek-V4-Flash (256 routed experts/layer × 43 layers = 11008 experts).
+This is an ongoing experiment to shrink DeepSeek-V4-Flash
+(256 routed experts/layer × 43 layers = 11008 experts) with minimal quality
+loss. Findings below are current as of the latest measurements.
 
-### The idea in one sentence
-
-Each of the 11008 routed experts is a **separate communication channel**
-(`x → y`), an independent unitary unit. You cannot merge or factor them
-(weights are mutually orthogonal white noise), but you can **measure each
-channel's transfer function** by driving it with a universal test signal
-(unifold) and then **copy that function** with a compact block — per expert,
-individually, not per layer.
-
-### Why the blocks cannot be merged
+### What holds: the weights are white noise
 
 Measured on the real checkpoint, the routed experts are pairwise orthogonal
-(cos ≈ 1/√N, flat singular spectrum): each weight matrix is white noise.
-Consequently any linear re-mixing — Hadamard, DFT-3, Procrustes — is
-information-neutral: a rotation preserves the Gram matrix, so the "sum"
-channel is just another random direction. There is **no shared component** to
-recover. The only way to combine orthogonal experts is distillation (copy
-their outputs), never their weights.
+(cos ≈ 1/√N, flat singular spectrum): each weight matrix is white noise. Any
+linear re-mixing — Hadamard, DFT-3, Procrustes — is information-neutral: a
+rotation preserves the Gram matrix, so the "sum" channel is just another
+random direction. There is **no shared component** to recover; the only way to
+combine experts is distillation (copy their outputs), never weight factoring.
+SVD on the weights is dead: full rank, flat spectrum.
 
-### The trick: the weights are noise, but the activations are low-rank
+### What was wrong (corrected): the activations are *not* low-rank
 
-SVD on the expert weights is dead (rank ≈ full, flat spectrum). But the
-**activations** flowing through the FFN live in a tiny subspace — the top
-K=512 input directions explain ≈ 99.93% of the variance, the top Kp=384
-output directions ≈ 99.9%. So the signal is compressible even though the
-weights are not: project the I/O onto those subspaces and only the *residual
-mapping between them* needs to be stored.
+An earlier claim — "top-512 input directions explain 99.93% of variance" —
+was an overfit artifact: it was measured on only N=3000 tokens. The honest
+spectrum (full 259072-token sample, layer 10) is almost full-rank:
 
-### One expert, copied minimally
+| K (kept directions) | energy, in-sample | out-of-sample |
+| --- | --- | --- |
+| 512 | 59.1% | ~41% |
+| 1024 | 71.8% | — |
+| 2048 | 86.2% | — |
+| 3072 | 94.9% | — |
+| 4096 | 100% | — |
 
-Each 4096→4096 expert FFN is replaced by:
+So compressing the residual stream to K=512 loses ~40% of the energy, and
+low-rank POD compression of activations was **rejected**. The refit now works
+at full rank (K=4096).
+
+### Current compression (per expert)
+
+Each 4096→4096 routed expert is replaced by a full-rank, two-stage ternary
+SwiGLU block — no POD bottleneck, no output basis:
 
 ```
-y ≈ Q · tern(z) · P
-z  = x @ P          # input POD:  4096 → 512
-h  = silu(z·w1ᵀ)·(z·w3ᵀ)   # ternary SwiGLU core, inter = 4096
-yc = h @ w2ᵀ        # 4096 → 384
-Q  = int8 [4096×384], per-column scale
+z = (x - mu) @ P            # per-layer mean-centring + orthogonal rotation
+g = silu(z @ W1) * (z @ W3) # two-stage ternary SwiGLU, inter = 2048
+y = g @ W2                  # identity output (4096 → 4096, no Q)
 ```
 
-- **P** [4096×512] fp32 — top-512 right singular vectors of the real FFN
-  inputs (POD, computed once per layer).
-- **w1, w3** [4096×512], **w2** [384×4096] — ternary {-1, 0, +1}, packed
-  5 trits/byte. Trained 300 steps (lr 2e-3 cosine, batch 2048, G=32) to
-  minimise `MSE(y_pred, y) / MSE(y, 0)` — the *residual %*.
-- **Q** [4096×384] int8 with per-column float32 scale: this costs only
-  0.012% extra error versus fp8's 0.165% at the same 1.57 MB.
+- **P** [4096×4096] fp32 — per-layer orthogonal rotation (whitening only, no
+  dimensionality reduction); **mu** [1×4096] per-layer input mean.
+- **W1, W3, W2** are ternary {−1, 0, +1}, each stored as a **sum of two
+  ternary matrices** (`W` + `W_q2·scale2`) for finer precision, packed
+  5 trits/byte, `inter = 2048`.
+- The output is **identity** (kp = 4096 = D): the int4-QAT output basis Q was
+  abandoned once the model ran at full rank — it added a bottleneck with no
+  benefit there.
 
-### How the channel is measured (unifold + router split)
+**Honest residual (full 4096-dim, weighted MSE(y_pred,y)/MSE(y,0))**: ~0.6–0.9%
+per expert (measured on the current refit). The earlier "≤0.01%" figure was a
+reduced 384-dim output-space loss and is not comparable.
 
-We drive each expert with a **universal test signal (unifold)**: bootstrap of
-the layer's real POD manifold + 0.1σ jitter. This probes the honest working
-band — the manifold where the router actually sends tokens plus a small
-neighbourhood. We deliberately do NOT probe the full ±5σ volume: there the
-ternary kernel cannot express the expert's response (25–36% residual), so
-full-volume probing is waste.
+### The actual VRAM lever: int8 quantization
 
-- **Covered experts (87%)** — the router activated them on the 774K-sample
-  collection; they refit on their **real routed activations** with an early
-  stop at **≤0.01%** honest residual.
-- **Uncovered experts (13%)** — no real samples. They refit on a **proxy
-  manifold from their nearest router-weight neighbours** (cosine similarity),
-  residual ~0.5–1.8% on the proxy (they are rare, so their weighted error is
-  small). Stall-based stop once the residual plateaus.
+Since the activations are full-rank, the memory win comes from quantization,
+not low-rank:
 
-### Results
+- **int8 activations (residual stream)** — per-channel, ~2× with ~0.01%
+  reconstruction error (per-tensor ~0.08%).
+- **int8 KV-cache** — per-channel static scale, RoPE-safe (K is stored
+  post-RoPE), ~2× with ~0.005% error (worst 0.0125% across 43 layers). This
+  replaces the earlier low-rank KV-POD (512→256), which was rejected.
 
-| Metric | Value |
-|---|---|
-| Size per expert | **~1.3–2.4 MB** (adaptive inter/kp; vs 12.6 MB FP4) |
-| Covered residual (real routed activations) | **≤ 0.01%** (early stop) |
-| Uncovered residual (proxy manifold) | ~0.5–1.8% (13% of experts) |
-| Q format | int4 QAT, per-column scale max/28 |
-| Adaptive size | inter/kp by n_k: <200→(1024,512), 200–400→(2048,512), ≥400→(4096,768) |
+A distance-dependent **pyramid sliding window** (ported from the old KV-POD
+idea) sits on top of the int8 cache: nearby tokens keep full 512 channels,
+older tokens are channel-truncated per
+`r(d) = clamp(512 >> ⌊log2(d/1024 + 1)⌋, 32, 512)` (base 512, window 1024,
+min 32).
 
-0.1% residual requires inter=6144 (3.28 MB — *larger*), so 4096 is the
-rate-distortion sweet spot: the smallest core that keeps the loss below the
-round-trip budget.
-
-### What actually reduces the error
-
-The residual is dominated by a handful of decisions; everything else is noise.
-
-1. **POD on activations, never on weights.** SVD of the expert weights is
-dead — full rank, flat spectrum (white noise): no low-rank weight factor
-exists. But POD on the *real FFN inputs/outputs* is sharp: top-512 input
-directions explain ≈ 99.93% of variance (K=512 → 0.002% reconstruction
-error), top-384 output ≈ 99.9% (Kp=384 → 0.004%). The signal is
-low-rank even though the weights are not — this is the single biggest
-error lever.
-
-2. **int8 Q with per-column scale, not fp8.** The output basis Q is
-quantised to int8 with one float32 scale *per column* (not per-tensor).
-This costs **0.012%** extra error versus fp8's **0.165%** at the same
-1.57 MB — a ~13× error cut for free.
-
-3. **Accurate per-layer activations (no contamination).** Collecting x_L
-through the *already-reduced* forward compounds error across layers — the
-residual climbs 0.19% → 0.54% → 0.83% as depth grows, because each layer's
-error leaks into the next layer's "input signal". Collecting x_L from the
-*original* model (or a clean x₀) holds the residual at 0.157–0.26% across
-all 43 layers.
-
-4. **Train the ternary core, don't round it.** w1/w3/w2 are fitted by
-300 steps of gradient descent (lr 2e-3 cosine, batch 2048, G=32) directly
-against `MSE(y_pred, y)/MSE(y, 0)` — not by rounding a dense matrix. The
-swiglu clamp (±10) matches the original model's own gate/up clamp, so the
-teacher target is exact.
-
-### Tried and rejected (they do NOT lower the error)
+### Tried and rejected
 
 - **SVD / low-rank on weights** — flat spectrum, nothing to keep.
-- **Linear re-mixing (Hadamard / DFT-3 / Procrustes)** — orthogonal experts
-  stay orthogonal; the rotation is information-neutral.
-- **bf16 Q** — output basis in bf16 loses too much precision.
-- **warm-init** (start the ternary from a rounded dense fit) — 0.301% vs
-  0.161% for random init; worse.
-- **fp8 Q** — 0.165% vs int8's 0.012% at identical size.
+- **Low-rank POD on activations (K=512)** — ~40% energy loss out-of-sample.
+- **int4-QAT output basis Q** — bottleneck with no benefit at full rank.
+- **KV-cache low-rank POD (512→256)** — replaced by int8 (both 2×, int8 loses less).
+- **Linear re-mixing (Hadamard / DFT-3 / Procrustes)** — orthogonal experts stay orthogonal.
+- **bf16 output basis** — loses too much precision vs int8.
+- **warm-init ternary** — worse than random init.
+- **fp8 output basis** — 0.165% vs int8's 0.012% at identical size.
 
-### Error reduction levers (how to push it lower)
+### Status
 
-The residual is not at a hard wall yet — these knobs still move it.
-
-1. **Measure more activations for the POD basis (N↑).** P and Q are
-esimated from N=3000 tokens; a larger activation corpus (10k–100k tokens,
-sampled across real prompts) makes the principal-subspace estimate converge
-to the true one. Both the POD reconstruction error and the ternary fit
-improve, because the fit sees a wider slice of the input distribution.
-
-2. **Run more activations through the compressed layer (out-of-sample
-residual).** The reported 0.157–0.26% is *in-sample* (the same 3000 tokens
-used to fit). The honest metric is the residual on a held-out activation
-set the ternary never saw — this reveals overfitting to x₀ and is the real
-number the 43-layer round-trip will pay.
-
-3. **Per-layer accurate activations (x_L, not the x₀ fallback).** Using the
-true layer input x_L instead of x₀ holds the residual at ~0.157%; the x₀
-fallback costs 0.22–0.26% per layer. Across 43 stacked layers this gap
-compounds, so accurate per-layer x_L is the cheapest ~0.1%/layer win (the
-cost is only the collection pass).
-
-4. **More training steps (300 → 600+).** The ternary core is still
-descending at step 300; more steps push it toward the inter=4096 floor.
-Watch the out-of-sample residual — once it stops falling while in-sample
-keeps falling, the fit is overfitting and more steps stop helping.
-
-5. **Wider ternary core (inter 4096 → 6144).** The rate-distortion floor
-moves ~0.156% → ~0.1%, at +0.5 MB/expert. Only worth it if the round-trip
-budget requires it.
-
-6. **Wider POD (K 512 → 768, Kp 384 → 512).** Lower POD reconstruction
-error, at the cost of larger P/Q and a bigger ternary input/output space.
-
-7. **Better Q basis (svd_lowrank niter 2 → 10+).** More iterations give a
-tighter output basis Q and directly lower the residual for the same Kp.
-
-8. **Measure the full 43-layer round-trip.** The per-expert residual is a
-proxy; the true error is `reduced_model(x) vs original_model(x)` over the
-whole stack (or generation quality). Only that number decides whether the
-remaining levers are worth their size.
+The refit is **in progress**: 239 / 11008 experts across 3 layers are done so
+far. Reduced-model generation is not yet wired up (the old
+`dsv4_generate_reduced.py` was removed); generation currently runs the exact
+model from `lossless_layers`.
 
 ### Pipeline
 
 ```
-lossless_layers/{layer}_ffn.safetensors   (FP4 experts, per layer)
-        │  dequant_fp4 (dsv4_experts.py)
+lossless_layers/{layer}_ffn.safetensors   (FP4 routed experts)
+        │  dsv4_experts.py (dequant_fp4, load_selected_experts)
         ▼
-dsv4_reduce_layer.py <L>  ── teacher y=ffn(x₀,w) → POD P,Q → ternary fit
+dsv4_refit_experts.py <L>   ── exact x/y → two-stage ternary fit (full 4096-dim)
         ▼
-dsv4_reduced/layer_<L>/expert_<k>.pt   (2.77 MB each, int8 Q)
-        ▼
-dsv4_generate_reduced.py   ── skeleton + hooks → full reduced model → decode
+dsv4_reduced/layer_<L>/P.pt, mu.pt, expert_<k>.pt
 ```
 
-Key scripts: `scripts/dsv4_reduce_layer.py` (per-expert fit),
-`scripts/dsv4_reduce_all.py` / `scripts/dsv4_reduce_parallel.py` (loop),
-`scripts/dsv4_collect_x0.py` (activation basis), `scripts/dsv4_generate_reduced.py`
-(assembly + generation).
+Key scripts:
+
+- `scripts/dsv4_experts.py` — shared decode / load / ternary pack-unpack utilities.
+- `scripts/dsv4_refit_experts.py` — per-expert full-rank two-stage ternary refit.
+- `scripts/dsv4_collect_all_tokens.py` / `dsv4_collect_attention.py` — activation / KV collection.
+- `scripts/dsv4_kvcache_int8.py` — int8 KV-cache (+ pyramid sliding window).
+- `scripts/dsv4_generate_fast.py` / `dsv4_generate_real.py` — exact-model generation.
