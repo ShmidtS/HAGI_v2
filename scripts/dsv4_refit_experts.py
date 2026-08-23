@@ -42,6 +42,9 @@ MODE_MARKER = "int4x"  # binary W13 + int4 W2, single sub (post-hoc binary S=4+W
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 LR_BASE = 0.02  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
+JITTER_BANK = 8  # precomputed (idx, Zj, Yb) minibatches: kills the per-step teacher
+# forward (3 bmm); bank is regenerated every JITTER_REGEN steps for row coverage
+JITTER_REGEN = 200
 AM_WEIGHT = 0.0  # activation-matching (g/u/h) loss weight vs the output loss
 DECORR_ALPHA = 0.25  # W2 replica init decorrelation noise (0 = identical copies)
 S2_EVERY = 25  # exact per-channel s2 refit cadence: convex at fixed signs, churn-free,
@@ -401,24 +404,36 @@ def train_batch(
     else:
         fwd = train_batch_fwd
 
+    # jittered-target bank: JITTER_BANK precomputed minibatches (Zj, teacher Yb),
+    # regenerated every JITTER_REGEN steps; saves the per-step teacher forward
+    jbank: list = []
+
+    def _rebuild_jbank():
+        jbank.clear()
+        with torch.no_grad():
+            for _ in range(JITTER_BANK):
+                idx_b = torch.randint(0, Nmax, (bs,), device="cuda")
+                Zj = Z[:, idx_b] + jitter * z_std * torch.randn_like(Z[:, idx_b])
+                g_o = soft_lim(torch.bmm(Zj, oW1.transpose(1, 2)) + t_b1)
+                u_o = soft_lim(torch.bmm(Zj, oW3.transpose(1, 2)) + t_b3)
+                Yb_b = torch.bmm(F.silu(g_o) * u_o, oW2.transpose(1, 2))
+                jbank.append((idx_b, Zj, Yb_b))
+
     t0 = time.time()
     for st in range(steps):
-        if Nmax > bs:
-            idx = torch.randint(0, Nmax, (bs,), device="cuda")
-            Zb, Mb = Z[:, idx], M[:, idx]
-        else:
-            idx = torch.arange(Nmax, device="cuda")
-            Zb, Mb = Z, M
         g_o = u_o = h_o = None
         if t_b1 is not None and t_b3 is not None:
-            Zj = Zb + jitter * z_std * torch.randn_like(Zb)
-            g_o = soft_lim(torch.bmm(Zj, oW1.transpose(1, 2)) + t_b1)
-            u_o = soft_lim(torch.bmm(Zj, oW3.transpose(1, 2)) + t_b3)
-            h_o = F.silu(g_o) * u_o
-            Yb = torch.bmm(h_o, oW2.transpose(1, 2))
-            Zb = Zj
-            Mb = torch.ones_like(Mb)
+            if not jbank or st % JITTER_REGEN == 0:
+                _rebuild_jbank()
+            idx, Zb, Yb = jbank[st % len(jbank)]
+            Mb = torch.ones_like(M[:, idx])
         else:
+            if Nmax > bs:
+                idx = torch.randint(0, Nmax, (bs,), device="cuda")
+                Zb, Mb = Z[:, idx], M[:, idx]
+            else:
+                idx = torch.arange(Nmax, device="cuda")
+            Zb, Mb = Z, M
             Yb = Y[:, idx]
         yp, g_bin, u_bin, h_bin = fwd(Zb, weights, scales, biases, bounds, want_guh=AM_WEIGHT > 0)
         diff2 = (yp - Yb) ** 2
