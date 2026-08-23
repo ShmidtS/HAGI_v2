@@ -42,10 +42,11 @@ CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 AM_WEIGHT = 0.0  # activation-matching (g/u/h) loss weight vs the output loss
 DECORR_ALPHA = 0.25  # W2 replica init decorrelation noise (0 = identical copies)
-LS_EVERY = 10  # ALS cadence sweet spot: refresh (~0.3-0.5s) ~= 4-6 Muon steps (85ms each);
-# below ~5 the solve repeats itself (features unchanged), above ~25 features drift with stale W2
-ALS_W2 = True  # W2 subproblem is CONVEX given features: replace Muon on W2 with exact
-# least-squares solve + re-binarize + per-channel s2 (every LS_EVERY steps, guarded monotone).
+S2_EVERY = 25  # exact per-channel s2 refit cadence: convex at fixed signs, churn-free,
+# cheap (~0.2s) - can run often without disturbing feature co-adaptation
+SIGN_EVERY = 250  # W2 sign refresh cadence (dual-ridge Theta + binarize, guarded). RARE on
+# purpose: each accepted flip changes the gradient path for features - frequent refresh
+# keeps Muon momentum (0.95, ~20-step memory) perpetually stale (measured: every-10 worse)
 
 
 SOFT_LIM = 10.0  # soft saturation: replaces hard clamp (normalization, no dead gradients)
@@ -260,8 +261,7 @@ def train_batch(
         p1 = torch.nn.Parameter(torch.randn(G, inter, w_in, device="cuda") * w_in**-0.5)
         p3 = torch.nn.Parameter(torch.randn(G, inter, u_in, device="cuda") * u_in**-0.5)
         p2 = torch.nn.Parameter(torch.randn(G, D, inter, device="cuda") * inter**-0.5)
-        if ALS_W2:
-            p2.requires_grad_(False)  # convex subproblem: solved exactly by LS refresh, not Muon
+        p2.requires_grad_(False)  # convex subproblem: solved exactly by LS refresh, not Muon
         weights.extend([p1, p3, p2])
     if init is not None:
         iW1, iW3, iW2 = init
@@ -479,7 +479,9 @@ def train_batch(
                         ep.mul_(MU).add_(p.grad, alpha=1 - MU)
                         p.data -= lr_s * ep
         # --- periodic exact LS refresh (ALS): scales/biases are convex subproblems ---
-        if LS_EVERY and ((st + 1) % LS_EVERY == 0 or st == steps - 1) and not done_mask.any():
+        do_s2 = S2_EVERY and ((st + 1) % S2_EVERY == 0 or st == steps - 1)
+        do_signs = SIGN_EVERY and ((st + 1) % SIGN_EVERY == 0 or st == steps - 1)
+        if (do_s2 or do_signs) and not done_mask.any():
             with torch.no_grad():
 
                 def _resid_now(sc):
@@ -491,8 +493,7 @@ def train_batch(
 
                 r0 = _resid_now(scales)
                 Mfl = M.float()
-                # W2 block: s2 always optimal (convex at fixed signs), signs guarded
-                if ALS_W2:
+                if do_s2 or do_signs:
                     hs = []
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         for s_ in range(NSUB):
@@ -540,32 +541,36 @@ def train_batch(
                     # (b0) s2-only: optimal at current signs - apply unconditionally
                     _solve_s2()
                     r1 = _resid_now(scales)  # <= r0 by construction
-                    snap1 = [t.detach().clone() for t in weights + scales + biases]
-                    # (b1) sign refresh from dual-ridge Theta (guarded)
-                    H = torch.cat(hs, dim=2).float() * Mfl  # [G,n,S*inter]
-                    # DUAL ridge solve: F = S*inter = 8192 features > n samples -> primal
-                    # normal equations are rank-deficient (measured: garbage signs, resid 99.7%).
-                    # Minimum-norm solution via the sample-space system [n,n].
-                    Ym = Y.float() * Mfl  # [G,n,D]
-                    Kk = torch.bmm(H, H.transpose(1, 2))  # [G,n,n]
-                    regk = Kk.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-6) * 1e-4
-                    Kk = Kk + regk[:, None, None] * torch.eye(Kk.shape[1], device="cuda")[None]
-                    alpha = torch.linalg.solve(Kk, Ym)  # [G,n,D]
-                    Theta = torch.bmm(H.transpose(1, 2), alpha)  # [G,F,D]
-                    for s_ in range(NSUB):
-                        blk = Theta[:, s_ * inter : (s_ + 1) * inter, :]
-                        weights[3 * s_ + 2].data = torch.sign(blk).transpose(1, 2).contiguous()
-                    _solve_s2()
-                    r2_raw = _resid_now(scales)
-                    if (r2_raw >= r1).any():
-                        for t, sv in zip(weights + scales + biases, snap1):
-                            t.data.copy_(sv)
-                    else:
-                        r1 = r2_raw
+                    if do_signs:
+                        snap1 = [t.detach().clone() for t in weights + scales + biases]
+                        # (b1) sign refresh from dual-ridge Theta (guarded)
+                        H = torch.cat(hs, dim=2).float() * Mfl  # [G,n,S*inter]
+                        # DUAL ridge solve: F = S*inter = 8192 features > n samples -> primal
+                        # normal equations are rank-deficient (measured: garbage signs, resid 99.7%).
+                        # Minimum-norm solution via the sample-space system [n,n].
+                        Ym = Y.float() * Mfl  # [G,n,D]
+                        Kk = torch.bmm(H, H.transpose(1, 2))  # [G,n,n]
+                        regk = Kk.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-6) * 1e-4
+                        Kk = Kk + regk[:, None, None] * torch.eye(Kk.shape[1], device="cuda")[None]
+                        alpha = torch.linalg.solve(Kk, Ym)  # [G,n,D]
+                        Theta = torch.bmm(H.transpose(1, 2), alpha)  # [G,F,D]
+                        for s_ in range(NSUB):
+                            blk = Theta[:, s_ * inter : (s_ + 1) * inter, :]
+                            weights[3 * s_ + 2].data = torch.sign(blk).transpose(1, 2).contiguous()
+                        _solve_s2()
+                        r2_raw = _resid_now(scales)
+                        if (r2_raw >= r1).any():
+                            for t, sv in zip(weights + scales + biases, snap1):
+                                t.data.copy_(sv)
+                        else:
+                            r1 = r2_raw
                 if (r1 < r0).any():
                     for t in es + ebs:
                         t.zero_()  # scales/biases optimal: kill stale momentum
-                    print(f"    [als] step {st + 1}: {r0.mean() * 100:.3f}% -> {r1.mean() * 100:.3f}%", flush=True)
+                    # sign refreshes are rare: always log; s2-only steps log big gains only
+                    if do_signs or (r0 - r1).mean() > r0.mean() * 0.005:
+                        tag = "als+signs" if do_signs else "als-s2"
+                        print(f"    [{tag}] step {st + 1}: {r0.mean() * 100:.3f}% -> {r1.mean() * 100:.3f}%", flush=True)
         if stop_threshold is None:
             cur_best = best_stop.min().item()
             if not (cur_best < float("inf")):
