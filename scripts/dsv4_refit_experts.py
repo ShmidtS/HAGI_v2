@@ -48,7 +48,8 @@ P2_SNAP = False  # measured DEAD on real data: 4.05% -> 10.3% (per-channel +/-2^
 RND_W13 = False  # measured DEAD on real data: random projections don't correlate with the
 # expert function (resid stuck at 98.5% vs ~40% champion at the same steps). W1/W3 structure
 # is irreplaceable; the memory budget cannot be shifted to W2 replicas.
-LS_EVERY = 250  # periodic in-training LS refresh of scales/biases (0 = off)
+LS_EVERY = 25  # ALS cadence: exact LS refresh costs ~1-2s vs 85ms/step; frequent refresh
+# converges like true block-coordinate descent (250 was arbitrary and slow)
 ALS_W2 = True  # W2 subproblem is CONVEX given features: replace Muon on W2 with exact
 # least-squares solve + re-binarize + per-channel s2 (every LS_EVERY steps, guarded monotone).
 LS_S13 = False  # g-level per-channel (s1,b1) LS vs original pre-activations: measured HARMFUL
@@ -567,7 +568,7 @@ def train_batch(
                 else:
                     r1 = r1_raw
                 snap1 = [t.detach().clone() for t in weights + scales + biases]
-                # (b) W2 by exact joint LS over concatenated features, re-binarized
+                # (b) W2 block: s2 always optimal (convex at fixed signs), signs guarded
                 if ALS_W2:
                     hs = []
                     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -586,6 +587,38 @@ def train_batch(
                                 uu = uu + b3v.to(torch.bfloat16)
                             uu = soft_lim(uu)
                             hs.append(F.silu(gg) * uu)
+
+                    def _solve_s2():
+                        """Per-channel joint (4x4) s2 for the CURRENT W2 signs. Convex:
+                        cannot be worse than the incumbent scales."""
+                        A2 = []
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            for s_ in range(NSUB):
+                                A2.append(
+                                    torch.bmm(hs[s_], torch.sign(weights[3 * s_ + 2]).to(torch.bfloat16).transpose(1, 2)).float()
+                                )
+                        Mf2 = M.float()[:, :, 0]
+                        Gm = A2[0].new_zeros(G, D, NSUB, NSUB)
+                        for i in range(NSUB):
+                            for j in range(i, NSUB):
+                                v = (Mf2[:, :, None] * A2[i] * A2[j]).sum(dim=1)
+                                Gm[:, :, i, j] = v
+                                Gm[:, :, j, i] = v
+                        rhs2 = A2[0].new_zeros(G, D, NSUB)
+                        for i in range(NSUB):
+                            rhs2[:, :, i] = (Mf2[:, :, None] * A2[i] * Y.float()).sum(dim=1)
+                        reg2 = Gm.diagonal(dim1=2, dim2=3).mean(dim=(1, 2)).clamp_min(1e-6) * 1e-6
+                        Gm = Gm + reg2[:, None, None, None] * torch.eye(NSUB, device="cuda")[None, None]
+                        x2 = torch.linalg.solve(Gm.view(G * D, NSUB, NSUB), rhs2.view(G * D, NSUB)).view(G, D, NSUB)
+                        for s_ in range(NSUB):
+                            v = x2[:, :, s_]
+                            scales[3 * s_ + 2].data = (v.sign() * v.abs().clamp_min(1e-5)).unsqueeze(2)
+
+                    # (b0) s2-only: optimal at current signs - apply unconditionally
+                    _solve_s2()
+                    r1 = _resid_now(scales)  # <= r0 by construction
+                    snap1 = [t.detach().clone() for t in weights + scales + biases]
+                    # (b1) sign refresh from dual-ridge Theta (guarded)
                     H = torch.cat(hs, dim=2).float() * Mfl  # [G,n,S*inter]
                     # DUAL ridge solve: F = S*inter = 8192 features > n samples -> primal
                     # normal equations are rank-deficient (measured: garbage signs, resid 99.7%).
@@ -599,34 +632,11 @@ def train_batch(
                     for s_ in range(NSUB):
                         blk = Theta[:, s_ * inter : (s_ + 1) * inter, :]
                         weights[3 * s_ + 2].data = torch.sign(blk).transpose(1, 2).contiguous()
-                    # per-channel joint s2 (4x4) for the new signs
-                    A2 = []
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        for s_ in range(NSUB):
-                            A2.append(
-                                torch.bmm(hs[s_], torch.sign(weights[3 * s_ + 2]).to(torch.bfloat16).transpose(1, 2)).float()
-                            )
-                    Mf2 = M.float()[:, :, 0]
-                    Gm = A2[0].new_zeros(G, D, NSUB, NSUB)
-                    for i in range(NSUB):
-                        for j in range(i, NSUB):
-                            v = (Mf2[:, :, None] * A2[i] * A2[j]).sum(dim=1)
-                            Gm[:, :, i, j] = v
-                            Gm[:, :, j, i] = v
-                    rhs2 = A2[0].new_zeros(G, D, NSUB)
-                    for i in range(NSUB):
-                        rhs2[:, :, i] = (Mf2[:, :, None] * A2[i] * Y.float()).sum(dim=1)
-                    reg2 = Gm.diagonal(dim1=2, dim2=3).mean(dim=(1, 2)).clamp_min(1e-6) * 1e-6
-                    Gm = Gm + reg2[:, None, None, None] * torch.eye(NSUB, device="cuda")[None, None]
-                    x2 = torch.linalg.solve(Gm.view(G * D, NSUB, NSUB), rhs2.view(G * D, NSUB)).view(G, D, NSUB)
-                    for s_ in range(NSUB):
-                        v = x2[:, :, s_]
-                        scales[3 * s_ + 2].data = (v.sign() * v.abs().clamp_min(1e-5)).unsqueeze(2)
+                    _solve_s2()
                     r2_raw = _resid_now(scales)
                     if (r2_raw >= r1).any():
                         for t, sv in zip(weights + scales + biases, snap1):
                             t.data.copy_(sv)
-                        r2 = r1
                     else:
                         r1 = r2_raw
                 if (r1 < r0).any():
