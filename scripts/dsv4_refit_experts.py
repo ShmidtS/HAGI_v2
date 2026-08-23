@@ -37,14 +37,17 @@ POD = "checkpoints_dsv4/pod_all_tokens"
 REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
-MODE_MARKER = "binary4q"  # binary4x + power-of-two scales/biases (shift-only logits at inference)
+MODE_MARKER = "binary4x"  # horizontal 4-way, CROSSED pairing: u-branch of sub s reads slice (s+1) % NSUB
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 BOOST = False  # tried True (sequential residual stages): 18.97% vs 4.08% joint - joint co-adaptation wins
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 AM_WEIGHT = 0.0  # activation-matching (g/u/h) loss weight vs the output loss
 DECORR_ALPHA = 0.25  # W2 replica init decorrelation noise (0 = identical copies)
-W2_EVERY = 2  # Muon on W2 every k-th step (momentum accumulates each step; zeropower = 2/3 of step FLOPs)
-P2_SNAP = True  # export scales/biases snapped to +/-2^k: logits = integer +/- sums, multiply = exponent shift
+W2_EVERY = 1  # Muon on W2 every k-th step (k=2 measured: -14% time but +0.34pp resid — not worth it)
+P2_SNAP = False  # measured DEAD on real data: 4.05% -> 10.3% (per-channel +/-2^k error up to 41%)
+RND_W13 = False  # measured DEAD on real data: random projections don't correlate with the
+# expert function (resid stuck at 98.5% vs ~40% champion at the same steps). W1/W3 structure
+# is irreplaceable; the memory budget cannot be shifted to W2 replicas.
 
 
 def snap_pow2(t):
@@ -259,15 +262,23 @@ def train_batch(
     for s in range(NSUB):
         w_in = widths[s]
         u_in = widths[u_slice(s)]  # crossed pairing: W3_s acts on the u-slice
-        weights.append(torch.nn.Parameter(torch.randn(G, inter, w_in, device="cuda") * w_in**-0.5))  # W1_s
-        weights.append(torch.nn.Parameter(torch.randn(G, inter, u_in, device="cuda") * u_in**-0.5))  # W3_s
-        weights.append(torch.nn.Parameter(torch.randn(G, D, inter, device="cuda") * inter**-0.5))  # W2_s
+        p1 = torch.nn.Parameter(torch.randn(G, inter, w_in, device="cuda") * w_in**-0.5)
+        p3 = torch.nn.Parameter(torch.randn(G, inter, u_in, device="cuda") * u_in**-0.5)
+        p2 = torch.nn.Parameter(torch.randn(G, D, inter, device="cuda") * inter**-0.5)
+        if RND_W13:
+            with torch.no_grad():
+                p1.copy_(torch.sign(torch.randn_like(p1)))
+                p3.copy_(torch.sign(torch.randn_like(p3)))
+            p1.requires_grad_(False)
+            p3.requires_grad_(False)  # frozen random features: no grads, no Muon, no storage
+        weights.extend([p1, p3, p2])
     if init is not None:
         iW1, iW3, iW2 = init
         if iW1.shape[-1] == K and iW3.shape[-1] == K and iW2.shape == (G, D, inter):
             for s in range(NSUB):
-                weights[3 * s].data.copy_(iW1[..., bounds[s] : bounds[s + 1]])
-                weights[3 * s + 1].data.copy_(iW3[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]])
+                if not RND_W13:
+                    weights[3 * s].data.copy_(iW1[..., bounds[s] : bounds[s + 1]])
+                    weights[3 * s + 1].data.copy_(iW3[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]])
                 if s == 0 or DECORR_ALPHA <= 0.0:
                     weights[3 * s + 2].data.copy_(iW2)
                 else:
@@ -297,11 +308,19 @@ def train_batch(
             W2d = weights[3 * s + 2].detach().to(torch.bfloat16)
             Zs = Z[..., bounds[s] : bounds[s + 1]]
             Zu = Z[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]]
-            gA = torch.bmm(Zs, W1d.transpose(1, 2))
             gB = torch.bmm(Zs, W1d.sign().transpose(1, 2))
-            scale_vals.append(_ls(gA, gB))
-            uA = torch.bmm(Zu, W3d.transpose(1, 2))
             uB = torch.bmm(Zu, W3d.sign().transpose(1, 2))
+            if RND_W13 and init is not None:
+                # random features: match the ORIGINAL expert's response amplitude
+                # (per-channel LS of random projection vs original projection)
+                oW1s = init[0][..., bounds[s] : bounds[s + 1]].to(torch.bfloat16)
+                oW3s = init[1][..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]].to(torch.bfloat16)
+                gA = torch.bmm(Zs, oW1s.transpose(1, 2))
+                uA = torch.bmm(Zu, oW3s.transpose(1, 2))
+            else:
+                gA = torch.bmm(Zs, W1d.transpose(1, 2))
+                uA = torch.bmm(Zu, W3d.transpose(1, 2))
+            scale_vals.append(_ls(gA, gB))
             scale_vals.append(_ls(uA, uB))
             h_o = F.silu(soft_lim(gA)) * soft_lim(uA)
             yA = torch.bmm(h_o, W2d.transpose(1, 2))
