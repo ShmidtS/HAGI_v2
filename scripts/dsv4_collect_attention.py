@@ -77,7 +77,9 @@ def main():
     print(f"tokens: {n_tok} (shuffled vocab)", flush=True)
 
     torch.set_default_device("cuda")
-    model = DeepseekV4ForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+    model: DeepseekV4ForCausalLM = DeepseekV4ForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.float32, low_cpu_mem_usage=True
+    )
     torch.set_default_device("cpu")
     model.eval()
     model = model.to(torch.bfloat16)

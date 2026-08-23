@@ -24,12 +24,12 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import stub_import_tf  # noqa: F401
-
-from safetensors import safe_open
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 import dsv4_experts as de
 import gigatoken
+from safetensors import safe_open
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+import stub_import_tf  # noqa: F401
 
 MODEL_DIR = "C:/HAGI_v2/dsv4_shared_only"
 TOKENIZER = r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json"
@@ -50,7 +50,7 @@ ROUTER_BIAS: dict[int, torch.Tensor] = {}
 ROUTER_TID: dict[int, torch.Tensor] = {}
 
 FILE_HANDLES: dict[str, object] = {}
-PACKED_CACHE: "collections.OrderedDict[tuple, dict]" = collections.OrderedDict()
+PACKED_CACHE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
 CACHE_BYTES = 0
 SHARED_DEQUANT: dict[int, dict] = {}
 HIT = 0
@@ -169,6 +169,7 @@ def make_hook(li):
         correct = out.to(x.dtype).reshape(B, S, D)
         del out, flat, scores, logits, indices, weights
         return correct
+
     return hook
 
 
@@ -189,17 +190,18 @@ def main():
     print("loading model skeleton...", flush=True)
     t0 = time.time()
     torch.set_default_device("cuda")
-    model = DeepseekV4ForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
+    model: DeepseekV4ForCausalLM = DeepseekV4ForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
     torch.set_default_device("cpu")
     model.eval()
     model = model.to(torch.bfloat16)
     model.config._experts_implementation = "eager"
     model.config.gradient_checkpointing = False
     free, total = torch.cuda.mem_get_info()
-    print(f"model loaded in {time.time()-t0:.1f}s, GPU free={free/1e9:.1f}/{total/1e9:.1f} GB", flush=True)
+    print(f"model loaded in {time.time() - t0:.1f}s, GPU free={free / 1e9:.1f}/{total / 1e9:.1f} GB", flush=True)
 
-    handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li), with_kwargs=True)
-               for li in range(N_LAYERS)]
+    handles = [
+        model.model.layers[li].mlp.register_forward_hook(make_hook(li), with_kwargs=True) for li in range(N_LAYERS)
+    ]
 
     input_ids = torch.tensor([ids], device="cuda", dtype=torch.long)
     global CURRENT_IDS
@@ -229,9 +231,12 @@ def main():
             times.append(time.time() - t_dec)
             t_dec = time.time()
             if (len(times) + 1) % 5 == 0:
-                print(f"  {len(times)+1} tokens, last5={sum(times[-5:])/5:.2f}s/tok "
-                      f"(cache {HIT}H/{MISS}M, {PACKED_CACHE.__len__()} experts, "
-                      f"{CACHE_BYTES/1e9:.1f}GB)", flush=True)
+                print(
+                    f"  {len(times) + 1} tokens, last5={sum(times[-5:]) / 5:.2f}s/tok "
+                    f"(cache {HIT}H/{MISS}M, {PACKED_CACHE.__len__()} experts, "
+                    f"{CACHE_BYTES / 1e9:.1f}GB)",
+                    flush=True,
+                )
 
     for h in handles:
         h.remove()
@@ -239,9 +244,12 @@ def main():
     if times:
         cold = sum(times[:5]) / min(5, len(times))
         warm = sum(times[5:]) / max(1, len(times) - 5)
-        print(f"\ncold (first 5): {cold:.2f}s/tok = {1/cold:.2f} tok/s", flush=True)
-        print(f"warm (after 5): {warm:.2f}s/tok = {1/warm:.2f} tok/s", flush=True)
-    print(f"cache: {HIT} hits / {MISS} misses, {len(PACKED_CACHE)} experts resident ({CACHE_BYTES/1e9:.1f}GB)", flush=True)
+        print(f"\ncold (first 5): {cold:.2f}s/tok = {1 / cold:.2f} tok/s", flush=True)
+        print(f"warm (after 5): {warm:.2f}s/tok = {1 / warm:.2f} tok/s", flush=True)
+    print(
+        f"cache: {HIT} hits / {MISS} misses, {len(PACKED_CACHE)} experts resident ({CACHE_BYTES / 1e9:.1f}GB)",
+        flush=True,
+    )
 
     text = tok.decode(generated)
     if isinstance(text, bytes):
