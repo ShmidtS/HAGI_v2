@@ -48,8 +48,8 @@ P2_SNAP = False  # measured DEAD on real data: 4.05% -> 10.3% (per-channel +/-2^
 RND_W13 = False  # measured DEAD on real data: random projections don't correlate with the
 # expert function (resid stuck at 98.5% vs ~40% champion at the same steps). W1/W3 structure
 # is irreplaceable; the memory budget cannot be shifted to W2 replicas.
-LS_EVERY = 25  # ALS cadence: exact LS refresh costs ~1-2s vs 85ms/step; frequent refresh
-# converges like true block-coordinate descent (250 was arbitrary and slow)
+LS_EVERY = 10  # ALS cadence sweet spot: refresh (~0.3-0.5s) ~= 4-6 Muon steps (85ms each);
+# below ~5 the solve repeats itself (features unchanged), above ~25 features drift with stale W2
 ALS_W2 = True  # W2 subproblem is CONVEX given features: replace Muon on W2 with exact
 # least-squares solve + re-binarize + per-channel s2 (every LS_EVERY steps, guarded monotone).
 LS_S13 = False  # g-level per-channel (s1,b1) LS vs original pre-activations: measured HARMFUL
