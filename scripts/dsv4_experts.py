@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -190,19 +191,30 @@ def iter_expert_ids(weight_map: dict, layer_prefix: str) -> list[int]:
     for name in weight_map:
         if name.startswith(f"{layer_prefix}.experts."):
             rest = name[len(f"{layer_prefix}.experts.") :]
-            ids.add(int(rest.split(".")[0]))
+            try:
+                ids.add(int(rest.split(".")[0]))
+            except ValueError:
+                continue
     return sorted(ids)
 
 
 def load_index(snapshot_dir: str) -> dict:
-    with open(os.path.join(snapshot_dir, "model.safetensors.index.json")) as fh:
-        return json.load(fh)
+    index_path = Path(snapshot_dir, "model.safetensors.index.json").resolve()
+    try:
+        return json.loads(index_path.read_text())
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Missing model index: {index_path}") from exc
 
 
 def default_snapshot() -> str:
     cache = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots")
-    snap = sorted(os.listdir(cache))[0]
-    return os.path.join(cache, snap)
+    try:
+        snaps = sorted(os.listdir(cache))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Snapshot cache not found: {cache}") from exc
+    if not snaps:
+        raise FileNotFoundError(f"No snapshots under: {cache}")
+    return os.path.join(cache, snaps[0])
 
 
 # --- Router / MoE geometry + forward helpers (shared across collect/refit) ---
@@ -300,3 +312,27 @@ def unpack_ternary(q: torch.Tensor) -> torch.Tensor:
     for i in range(5):
         trits[:, i::5] = (t // (3**i)) % 3
     return trits - 1
+
+
+def pack_binary(q: torch.Tensor) -> torch.Tensor:
+    """Pack binary int8 {-1,+1} [out, in] -> uint8 [out, ceil(in/8)] (1 bit/weight).
+    sign>0 -> bit 1, else bit 0."""
+    b = (q > 0).to(torch.uint8)  # {0,1}
+    out, in_ = b.shape
+    n = (in_ + 7) // 8
+    padded = torch.zeros(out, n * 8, dtype=torch.uint8, device=b.device)
+    padded[:, :in_] = b
+    packed = torch.zeros(out, n, dtype=torch.uint8, device=b.device)
+    for i in range(8):
+        packed |= padded[:, i::8] << i
+    return packed
+
+
+def unpack_binary(p: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 [out, ceil(in/8)] -> int8 [out, in] binary {-1,+1}."""
+    t = p.to(torch.int64)
+    out, n = t.shape
+    bits = torch.zeros(out, n * 8, dtype=torch.int8, device=t.device)
+    for i in range(8):
+        bits[:, i::8] = ((t >> i) & 1).to(torch.int8)
+    return bits * 2 - 1
