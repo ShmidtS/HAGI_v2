@@ -336,3 +336,27 @@ def unpack_binary(p: torch.Tensor) -> torch.Tensor:
     for i in range(8):
         bits[:, i::8] = ((t >> i) & 1).to(torch.int8)
     return bits * 2 - 1
+
+
+def pack_int4(q: torch.Tensor) -> torch.Tensor:
+    """Pack int4 {-7..7} [out, in] -> uint8 [out, ceil(in/2)] (4 bits/weight).
+    Two nibbles per byte: even-index weights low, odd-index high; offset +8."""
+    v = (q.round().clamp(-7, 7).to(torch.int64) + 8).clamp(0, 15)  # 0..15
+    out, in_ = v.shape
+    if in_ % 2:
+        v = torch.cat([v, torch.zeros(out, 1, dtype=v.dtype, device=v.device)], dim=1)
+        in_ += 1
+    packed = (v[:, 0::2] | (v[:, 1::2] << 4)).to(torch.uint8)
+    assert packed.shape == (out, in_ // 2)
+    return packed
+
+
+def unpack_int4(p: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 [out, ceil(in/2)] -> int [-7..7] [out, in] (offset binary)."""
+    t = p.to(torch.int64)
+    lo = (t & 15) - 8
+    hi = (t >> 4) - 8
+    out = torch.empty(t.shape[0], t.shape[1] * 2, dtype=torch.int64, device=t.device)
+    out[:, 0::2] = lo
+    out[:, 1::2] = hi
+    return out
