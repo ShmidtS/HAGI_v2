@@ -27,24 +27,26 @@ from dsv4_experts import (
 from dsv4_experts import (
     load_selected_experts,
     pack_binary,
+    pack_int4,
 )
 
 K = 4096
 INTER = 2048
 D = 4096
-NSUB = 4  # horizontal sub-experts: pyramidal EQUAL-ENERGY input slices (POD quantiles), full width
+NSUB = 1  # int4x: single full-K sub; W13 binary (1 bit), W2 int4 (4 bits) - 6.3 MB/expert
 POD = "checkpoints_dsv4/pod_all_tokens"
 REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
-MODE_MARKER = "binary4x"  # horizontal 4-way, CROSSED pairing: u-branch of sub s reads slice (s+1) % NSUB
+MODE_MARKER = "int4x"  # binary W13 + int4 W2, single sub (post-hoc binary S=4+W2-1b was 21.1% vs this 9.9% pre-train)
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
+LR_BASE = 0.02  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
 AM_WEIGHT = 0.0  # activation-matching (g/u/h) loss weight vs the output loss
 DECORR_ALPHA = 0.25  # W2 replica init decorrelation noise (0 = identical copies)
 S2_EVERY = 25  # exact per-channel s2 refit cadence: convex at fixed signs, churn-free,
 # cheap (~0.2s) - can run often without disturbing feature co-adaptation
-SIGN_EVERY = 250  # W2 sign refresh cadence (dual-ridge Theta + binarize, guarded). RARE on
+SIGN_EVERY = 25  # W2 pattern refresh cadence (dual-ridge Theta + binarize, guarded). RARE on
 # purpose: each accepted flip changes the gradient path for features - frequent refresh
 # keeps Muon momentum (0.95, ~20-step memory) perpetually stale (measured: every-10 worse)
 
@@ -107,6 +109,21 @@ def qste_bin(W, s):
     q = torch.sign(Wb)
     q_ste = q.detach() + Wb - Wb.detach()  # value = sign(Wb), grad(dW) = identity
     return q_ste * sb
+
+
+def qste_int4(W, s):
+    """4-bit {-7..7} STE with learnable per-output-channel scale (W2 readout).
+    forward = round(W).clamp(-7,7) * s, dW = identity (STE). Returns bf16."""
+    Wb = W.to(torch.bfloat16)
+    sb = s.to(torch.bfloat16)
+    q = Wb.round().clamp(-7.0, 7.0)
+    q_ste = q.detach() + Wb - Wb.detach()
+    return q_ste * sb
+
+
+def qint4_fixed(W):
+    """int4 snap without STE (refresh/solve/export paths; W2 params are grid units)."""
+    return W.round().clamp(-7.0, 7.0)
 
 
 def binarize_fixed(W, s):
@@ -193,7 +210,7 @@ def train_batch_fwd(Zb, weights, scales, biases, bounds, max_sub=None, want_guh=
             u = u + b3.to(torch.bfloat16)
         u = soft_lim(u)
         h = F.silu(g) * u
-        ys = torch.bmm(h, qste_bin(W2, s2).transpose(1, 2))  # [G,bs,D]
+        ys = torch.bmm(h, qste_int4(W2, s2).transpose(1, 2))  # [G,bs,D]
         yp = ys if yp is None else yp + ys
         gs.append(g)
         us.append(u)
@@ -281,6 +298,15 @@ def train_batch(
             )
         else:
             print(f"    [warm] shape mismatch ({tuple(iW1.shape)}) - random init", flush=True)
+    # W2 params live in int4 GRID units (round->{-7..7}); normalize so amax per
+    # output channel lands on the grid edge (random init values would all round to 0)
+    w2_grid_scale = []
+    with torch.no_grad():
+        for s in range(NSUB):
+            p2 = weights[3 * s + 2]
+            sg = p2.data.abs().amax(dim=2, keepdim=True).clamp_min(1e-9) / 7.0
+            p2.data.div_(sg)
+            w2_grid_scale.append(sg.detach())  # [G, D, 1] original amplitude per channel
     # Jacobian-aligned scale init per sub: per-channel LS matching the original's
     # response (Z@W^T vs Z@sign(W)^T) on each sub's OWN input quarter. No range clamp.
     with torch.no_grad():
@@ -305,8 +331,8 @@ def train_batch(
             uB = torch.bmm(Zu, W3d.sign().transpose(1, 2))
             scale_vals.append(_ls(uA, uB))
             h_o = F.silu(soft_lim(gA)) * soft_lim(uA)
-            yA = torch.bmm(h_o, W2d.transpose(1, 2))
-            yB = torch.bmm(h_o, W2d.sign().transpose(1, 2))
+            yA = torch.bmm(h_o, (W2d * w2_grid_scale[s]).to(torch.bfloat16).transpose(1, 2))
+            yB = torch.bmm(h_o, qint4_fixed(W2d).to(torch.bfloat16).transpose(1, 2))
             scale_vals.append(_ls(yA, yB))
     scales = [torch.nn.Parameter(v.float()) for v in scale_vals]
     # Original (rotated, FULL-K) FP4 weights for on-the-fly target generation.
@@ -462,7 +488,7 @@ def train_batch(
                     if p.grad is not None:
                         p.grad[done_mask] = 0
         with torch.no_grad():
-            lr_m = 0.02 * 0.5 * (1 + math.cos(math.pi * st / steps))  # CPU scalar, no GPU sync
+            lr_m = LR_BASE * 0.5 * (1 + math.cos(math.pi * st / steps))  # CPU scalar, no GPU sync
             lr_s = lr_m * SCALE_LR_FACTOR
             for j in range(NSUB):
                 for wi, (w, ew, g) in enumerate(zip(weights[3 * j : 3 * j + 3], ews[3 * j : 3 * j + 3], grads[3 * j : 3 * j + 3])):
@@ -470,14 +496,15 @@ def train_batch(
                         continue
                     ew.mul_(MU).add_(g, alpha=1 - MU)
                     w.data -= lr_m * zeropower(ew)
-                for p, ep in zip(scales[3 * j : 3 * j + 3], es[3 * j : 3 * j + 3]):
+                for si, (p, ep) in enumerate(zip(scales[3 * j : 3 * j + 3], es[3 * j : 3 * j + 3])):
+                    if si == 2:
+                        continue  # s2: exact-LS only (S2_EVERY); gradient drift destabilizes (measured)
                     if p.grad is not None:
-                        ep.mul_(MU).add_(p.grad, alpha=1 - MU)
-                        p.data -= lr_s * ep
+                        p.data -= lr_s * p.grad  # plain SGD: momentum on scales amplifies the
+                        # post-refresh amplitude kick (measured: 1.5M% buffer spikes)
                 for p, ep in zip(biases[2 * j : 2 * j + 2], ebs[2 * j : 2 * j + 2]):
                     if p.grad is not None:
-                        ep.mul_(MU).add_(p.grad, alpha=1 - MU)
-                        p.data -= lr_s * ep
+                        p.data -= lr_s * p.grad  # plain SGD, same reason
         # --- periodic exact LS refresh (ALS): scales/biases are convex subproblems ---
         do_s2 = S2_EVERY and ((st + 1) % S2_EVERY == 0 or st == steps - 1)
         do_signs = SIGN_EVERY and ((st + 1) % SIGN_EVERY == 0 or st == steps - 1)
@@ -519,7 +546,7 @@ def train_batch(
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             for s_ in range(NSUB):
                                 A2.append(
-                                    torch.bmm(hs[s_], torch.sign(weights[3 * s_ + 2]).to(torch.bfloat16).transpose(1, 2)).float()
+                                    torch.bmm(hs[s_], qint4_fixed(weights[3 * s_ + 2]).to(torch.bfloat16).transpose(1, 2)).float()
                                 )
                         Mf2 = M.float()[:, :, 0]
                         Gm = A2[0].new_zeros(G, D, NSUB, NSUB)
@@ -550,16 +577,17 @@ def train_batch(
                         # Minimum-norm solution via the sample-space system [n,n].
                         Ym = Y.float() * Mfl  # [G,n,D]
                         Kk = torch.bmm(H, H.transpose(1, 2))  # [G,n,n]
-                        regk = Kk.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-6) * 1e-4
+                        regk = Kk.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-6) * 1e-2  # F==n square in int4x: needs a real ridge
                         Kk = Kk + regk[:, None, None] * torch.eye(Kk.shape[1], device="cuda")[None]
                         alpha = torch.linalg.solve(Kk, Ym)  # [G,n,D]
                         Theta = torch.bmm(H.transpose(1, 2), alpha)  # [G,F,D]
                         for s_ in range(NSUB):
-                            blk = Theta[:, s_ * inter : (s_ + 1) * inter, :]
-                            weights[3 * s_ + 2].data = torch.sign(blk).transpose(1, 2).contiguous()
+                            blk = Theta[:, s_ * inter : (s_ + 1) * inter, :]  # [G,inter,D]
+                            sg = blk.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0  # [G,1,D]
+                            weights[3 * s_ + 2].data = ((blk / sg).round().clamp(-7.0, 7.0)).transpose(1, 2).contiguous()
                         _solve_s2()
                         r2_raw = _resid_now(scales)
-                        if (r2_raw >= r1).any():
+                        if os.environ.get("NO_GUARD") is None and (r2_raw >= r1).any():
                             for t, sv in zip(weights + scales + biases, snap1):
                                 t.data.copy_(sv)
                         else:
@@ -685,7 +713,7 @@ def train_batch(
                 u = soft_lim(u)
                 h = F.silu(g) * u
                 # scale-free output basis: sign(W2) columns, s2 folded out
-                A.append(torch.bmm(h, torch.sign(W2d).to(torch.bfloat16).transpose(1, 2)).float())  # [G,N,D]
+                A.append(torch.bmm(h, qint4_fixed(W2d).to(torch.bfloat16).transpose(1, 2)).float())  # [G,N,D]
         Mf = M.float()[:, :, 0]  # [G,N]
         # Per-channel normal equations: Gram must aggregate over n ONLY (not over d),
         # matching rhs — a scalar Gram was silently off by ~D in scale and the old
@@ -717,7 +745,12 @@ def train_batch(
                 flush=True,
             )
 
-    fixed = [binarize_fixed(w.detach(), s.detach()) for w, s in zip(weights, scales)]
+    fixed = []
+    for j, (w, sc) in enumerate(zip(weights, scales)):
+        if j % 3 == 2:  # W2: int4 grid
+            fixed.append((qint4_fixed(w.detach()), sc.detach().squeeze(2)))
+        else:  # W13: binary
+            fixed.append(binarize_fixed(w.detach(), sc.detach()))
     bf = [p.detach().squeeze(1) for p in biases]  # each [G, inter]
     out = []
     for i in range(G):
@@ -805,8 +838,9 @@ def run_refit(
         def save_expert(k, resid, res, inter, n_real=None):
             ep = os.path.join(REDUCED, f"layer_{L}", f"expert_{k}.pt")
             e = {}
-            for j, nm in enumerate(W_NAMES):  # res: 12 (q, scale) pairs, interleaved
-                e[nm] = pack_binary(res[2 * j]).cpu()
+            for j, nm in enumerate(W_NAMES):  # res: (q, scale) pairs, interleaved
+                q = res[2 * j]
+                e[nm] = (pack_int4(q) if nm.startswith("w2") else pack_binary(q)).cpu()
                 e[f"{nm}_scale"] = res[2 * j + 1].cpu()
             for j, nm in enumerate(B_NAMES):  # then 8 biases (b1, b3 per sub)
                 e[nm] = res[6 * NSUB + j].cpu()
