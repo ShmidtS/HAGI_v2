@@ -61,7 +61,7 @@ instead uses a **two-stage ternary** kernel for the size win.
 
 ### Expert format (per expert)
 
-```
+```text
 P              [4096, 4096]  fp32    per-layer orthogonal rotation (whitening)
 mu             [1, 4096]     fp32    per-layer input mean
 w1, w3         [2048, 820]   uint8   ternary gate/up, packed 5 trits/byte (inter=2048)
@@ -73,7 +73,7 @@ scales         [...]         fp32    per-row scale for each stage
 
 Forward per routed expert:
 
-```
+```text
 z = (x - mu) @ P                 # 4096 → 4096 (rotation only)
 g = silu(z @ W1) * (z @ W3)      # two-stage ternary SwiGLU, inter = 2048
 y = g @ W2                       # 4096 → 4096 (identity output)

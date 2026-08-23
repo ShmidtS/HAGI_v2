@@ -15,17 +15,18 @@ from __future__ import annotations
 import os
 import sys
 import time
+from typing import cast
 
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import stub_import_tf  # noqa: F401
-
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 import dsv4_experts as de
 import gigatoken
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+import stub_import_tf  # noqa: F401
 
 MODEL_DIR = "C:/HAGI_v2/dsv4_shared_only"
 TOKENIZER = r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json"
@@ -120,16 +121,17 @@ def main() -> None:
     print("loading model skeleton...", flush=True)
     t0 = time.time()
     torch.set_default_device("cuda")
-    model = DeepseekV4ForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
+    model: DeepseekV4ForCausalLM = DeepseekV4ForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
     torch.set_default_device("cpu")
     model.eval()
-    model = model.to(torch.bfloat16)
+    model = cast(DeepseekV4ForCausalLM, cast(torch.nn.Module, model).to(torch.bfloat16))
     model.config._experts_implementation = "eager"
     model.config.gradient_checkpointing = False
-    print(f"model loaded in {time.time()-t0:.1f}s", flush=True)
+    print(f"model loaded in {time.time() - t0:.1f}s", flush=True)
 
-    handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li), with_kwargs=True)
-               for li in range(N_LAYERS)]
+    handles = [
+        model.model.layers[li].mlp.register_forward_hook(make_hook(li), with_kwargs=True) for li in range(N_LAYERS)
+    ]
 
     input_ids = torch.tensor([ids], device="cuda", dtype=torch.long)
     global CURRENT_IDS
@@ -161,13 +163,13 @@ def main() -> None:
             generated.append(nxt)
             n_dec += 1
             if (n_dec + 1) % 5 == 0:
-                print(f"  {n_dec+1} tokens, {time.time()-t_dec:.1f}s", flush=True)
+                print(f"  {n_dec + 1} tokens, {time.time() - t_dec:.1f}s", flush=True)
         t_dec = time.time() - t_dec
 
     for h in handles:
         h.remove()
 
-    print(f"decoded {n_dec} tokens in {t_dec:.1f}s = {n_dec/t_dec:.2f} tok/s", flush=True)
+    print(f"decoded {n_dec} tokens in {t_dec:.1f}s = {n_dec / t_dec:.2f} tok/s", flush=True)
     text = tok.decode(generated)
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
