@@ -39,26 +39,15 @@ DEAD_LOG = "refit_bin_dead.txt"
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
 MODE_MARKER = "binary4x"  # horizontal 4-way, CROSSED pairing: u-branch of sub s reads slice (s+1) % NSUB
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
-BOOST = False  # tried True (sequential residual stages): 18.97% vs 4.08% joint - joint co-adaptation wins
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 AM_WEIGHT = 0.0  # activation-matching (g/u/h) loss weight vs the output loss
 DECORR_ALPHA = 0.25  # W2 replica init decorrelation noise (0 = identical copies)
-W2_EVERY = 1  # Muon on W2 every k-th step (k=2 measured: -14% time but +0.34pp resid — not worth it)
-P2_SNAP = False  # measured DEAD on real data: 4.05% -> 10.3% (per-channel +/-2^k error up to 41%)
-RND_W13 = False  # measured DEAD on real data: random projections don't correlate with the
-# expert function (resid stuck at 98.5% vs ~40% champion at the same steps). W1/W3 structure
-# is irreplaceable; the memory budget cannot be shifted to W2 replicas.
 LS_EVERY = 10  # ALS cadence sweet spot: refresh (~0.3-0.5s) ~= 4-6 Muon steps (85ms each);
 # below ~5 the solve repeats itself (features unchanged), above ~25 features drift with stale W2
 ALS_W2 = True  # W2 subproblem is CONVEX given features: replace Muon on W2 with exact
 # least-squares solve + re-binarize + per-channel s2 (every LS_EVERY steps, guarded monotone).
-LS_S13 = False  # g-level per-channel (s1,b1) LS vs original pre-activations: measured HARMFUL
-# on synthetic (breaks y-level co-adaptation, 68% -> 74%); keep Muon gradients for s1/s3.
 
 
-def snap_pow2(t):
-    """Snap to +/-2^k (nearest in log space): sign(t) * 2^round(log2|t|)."""
-    return torch.sign(t) * torch.exp2(torch.round(torch.log2(t.abs().clamp_min(1e-30))))
 SOFT_LIM = 10.0  # soft saturation: replaces hard clamp (normalization, no dead gradients)
 SOFT_KNEE = 0.75  # exact identity below knee*lim, smooth tanh rolloff to lim above
 
@@ -273,20 +262,13 @@ def train_batch(
         p2 = torch.nn.Parameter(torch.randn(G, D, inter, device="cuda") * inter**-0.5)
         if ALS_W2:
             p2.requires_grad_(False)  # convex subproblem: solved exactly by LS refresh, not Muon
-        if RND_W13:
-            with torch.no_grad():
-                p1.copy_(torch.sign(torch.randn_like(p1)))
-                p3.copy_(torch.sign(torch.randn_like(p3)))
-            p1.requires_grad_(False)
-            p3.requires_grad_(False)  # frozen random features: no grads, no Muon, no storage
         weights.extend([p1, p3, p2])
     if init is not None:
         iW1, iW3, iW2 = init
         if iW1.shape[-1] == K and iW3.shape[-1] == K and iW2.shape == (G, D, inter):
             for s in range(NSUB):
-                if not RND_W13:
-                    weights[3 * s].data.copy_(iW1[..., bounds[s] : bounds[s + 1]])
-                    weights[3 * s + 1].data.copy_(iW3[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]])
+                weights[3 * s].data.copy_(iW1[..., bounds[s] : bounds[s + 1]])
+                weights[3 * s + 1].data.copy_(iW3[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]])
                 if s == 0 or DECORR_ALPHA <= 0.0:
                     weights[3 * s + 2].data.copy_(iW2)
                 else:
@@ -316,19 +298,11 @@ def train_batch(
             W2d = weights[3 * s + 2].detach().to(torch.bfloat16)
             Zs = Z[..., bounds[s] : bounds[s + 1]]
             Zu = Z[..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]]
+            gA = torch.bmm(Zs, W1d.transpose(1, 2))
             gB = torch.bmm(Zs, W1d.sign().transpose(1, 2))
-            uB = torch.bmm(Zu, W3d.sign().transpose(1, 2))
-            if RND_W13 and init is not None:
-                # random features: match the ORIGINAL expert's response amplitude
-                # (per-channel LS of random projection vs original projection)
-                oW1s = init[0][..., bounds[s] : bounds[s + 1]].to(torch.bfloat16)
-                oW3s = init[1][..., bounds[u_slice(s)] : bounds[u_slice(s) + 1]].to(torch.bfloat16)
-                gA = torch.bmm(Zs, oW1s.transpose(1, 2))
-                uA = torch.bmm(Zu, oW3s.transpose(1, 2))
-            else:
-                gA = torch.bmm(Zs, W1d.transpose(1, 2))
-                uA = torch.bmm(Zu, W3d.transpose(1, 2))
             scale_vals.append(_ls(gA, gB))
+            uA = torch.bmm(Zu, W3d.transpose(1, 2))
+            uB = torch.bmm(Zu, W3d.sign().transpose(1, 2))
             scale_vals.append(_ls(uA, uB))
             h_o = F.silu(soft_lim(gA)) * soft_lim(uA)
             yA = torch.bmm(h_o, W2d.transpose(1, 2))
@@ -377,8 +351,6 @@ def train_batch(
     n_real_t = torch.tensor(n_real, device="cuda")
     done_mask = torch.zeros(G, dtype=torch.bool, device="cuda")
     nonlocal_guard_ct = [0]  # non-finite-loss guard hits (boxed for closure mutability)
-    stage_len = max(1, steps // (NSUB + 1))  # NSUB boost stages + joint finale
-    prev_stage = [-1]
 
     def update_best(metric, valid=None):
         nonlocal best_state, best_stop
@@ -422,16 +394,7 @@ def train_batch(
             Mb = torch.ones_like(Mb)
         else:
             Yb = Y[:, idx]
-        # Boosting schedule (disabled: joint co-adaptation wins, see BOOST note).
-        use_max = None
-        if BOOST:
-            stage = min(st // stage_len, NSUB)
-            if stage != prev_stage[0]:
-                label = "joint" if stage >= NSUB else f"sub {stage}"
-                print(f"    [boost] stage -> {label} at step {st + 1}", flush=True)
-                prev_stage[0] = stage
-            use_max = stage if stage < NSUB else None
-        yp, g_bin, u_bin, h_bin = fwd(Zb, weights, scales, biases, bounds, use_max, want_guh=AM_WEIGHT > 0)
+        yp, g_bin, u_bin, h_bin = fwd(Zb, weights, scales, biases, bounds, want_guh=AM_WEIGHT > 0)
         diff2 = (yp - Yb) ** 2
         yb2 = Yb**2
         num = (Mb * diff2).sum(dim=(1, 2)).float()
@@ -502,14 +465,10 @@ def train_batch(
             lr_m = 0.02 * 0.5 * (1 + math.cos(math.pi * st / steps))  # CPU scalar, no GPU sync
             lr_s = lr_m * SCALE_LR_FACTOR
             for j in range(NSUB):
-                if BOOST and stage < NSUB and j != stage:
-                    continue  # frozen during stage `stage`
                 for wi, (w, ew, g) in enumerate(zip(weights[3 * j : 3 * j + 3], ews[3 * j : 3 * j + 3], grads[3 * j : 3 * j + 3])):
                     if g is None:
                         continue
                     ew.mul_(MU).add_(g, alpha=1 - MU)
-                    if wi == 2 and W2_EVERY > 1 and (st % W2_EVERY != 0):
-                        continue  # W2: orthogonalize less often (momentum keeps accumulating)
                     w.data -= lr_m * zeropower(ew)
                 for p, ep in zip(scales[3 * j : 3 * j + 3], es[3 * j : 3 * j + 3]):
                     if p.grad is not None:
@@ -530,45 +489,9 @@ def train_batch(
                     y2 = (M * Y.float() ** 2).sum(dim=(1, 2)).clamp_min(1e-12)
                     return d2 / y2
 
-                snap0 = [t.detach().clone() for t in weights + scales + biases]
                 r0 = _resid_now(scales)
                 Mfl = M.float()
-                # (a) per-channel (s, b) LS for g/u branches vs ORIGINAL pre-activations
-                if LS_S13:
-                    for s_ in range(NSUB):
-                        for br in ("g", "u"):
-                            wi_ = 0 if br == "g" else 1
-                            sl0 = bounds[s_] if br == "g" else bounds[u_slice(s_)]
-                            sl1 = bounds[s_ + 1] if br == "g" else bounds[u_slice(s_) + 1]
-                            Zs = Z[..., sl0:sl1]
-                            ow = oW1 if br == "g" else oW3
-                            tA = torch.bmm(Zs, ow[..., sl0:sl1].to(torch.bfloat16).transpose(1, 2)).float()
-                            if biases:
-                                if br == "g" and tb1 is not None:
-                                    tA = tA + tb1
-                                if br == "u" and tb3 is not None:
-                                    tA = tA + tb3
-                            gB = torch.bmm(Zs, torch.sign(weights[3 * s_ + wi_]).to(torch.bfloat16).transpose(1, 2)).float()
-                            aa = (Mfl * gB * gB).sum(dim=1)
-                            ab = (Mfl * gB).sum(dim=1)
-                            bb = Mfl.sum(dim=1).expand_as(aa)
-                            at = (Mfl * gB * tA).sum(dim=1)
-                            bt = (Mfl * tA).sum(dim=1)
-                            det = (aa * bb - ab * ab).clamp_min(1e-9)
-                            s_new = ((at * bb - ab * bt) / det).clamp_min(1e-5)
-                            b_new = (aa * bt - ab * at) / det
-                            scales[3 * s_ + wi_].data = s_new.unsqueeze(2)
-                            if biases:
-                                biases[2 * s_ + wi_].data = b_new.unsqueeze(1).float()
-                r1_raw = _resid_now(scales)
-                if (r1_raw >= r0).any():
-                    for t, sv in zip(weights + scales + biases, snap0):
-                        t.data.copy_(sv)
-                    r1 = r0
-                else:
-                    r1 = r1_raw
-                snap1 = [t.detach().clone() for t in weights + scales + biases]
-                # (b) W2 block: s2 always optimal (convex at fixed signs), signs guarded
+                # W2 block: s2 always optimal (convex at fixed signs), signs guarded
                 if ALS_W2:
                     hs = []
                     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -643,8 +566,6 @@ def train_batch(
                     for t in es + ebs:
                         t.zero_()  # scales/biases optimal: kill stale momentum
                     print(f"    [als] step {st + 1}: {r0.mean() * 100:.3f}% -> {r1.mean() * 100:.3f}%", flush=True)
-                else:
-                    pass  # refresh rejected by monotone guard: keep Muon trajectory
         if stop_threshold is None:
             cur_best = best_stop.min().item()
             if not (cur_best < float("inf")):
@@ -740,15 +661,6 @@ def train_batch(
             return d2 / y2
 
         r_before = _buf_resid(scales)
-        if P2_SNAP:
-            # lower levels first: s1/s3 and biases -> +/-2^k; s2 is then LS-solved
-            # ON TOP of the snapped lower levels (partial compensation), then snapped too.
-            for i, p in enumerate(scales):
-                if i % 3 == 2:
-                    continue  # s2 handled after the LS solve
-                p.data = snap_pow2(p.data)
-            for p in biases:
-                p.data = snap_pow2(p.data)
         A = []
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for s in range(NSUB):
@@ -786,31 +698,19 @@ def train_batch(
         Gm = Gm + reg[:, None, None, None] * torch.eye(NSUB, device=Gm.device)[None, None]
         x = torch.linalg.solve(Gm.view(G * D, NSUB, NSUB), rhs.view(G * D, NSUB)).view(G, D, NSUB)
         new_s2 = [(v.sign() * v.abs().clamp_min(1e-5)).unsqueeze(2) for v in (x[:, :, s] for s in range(NSUB))]
-        if P2_SNAP:
-            new_s2 = [snap_pow2(v) for v in new_s2]
         cand_scales = list(scales)
         for s in range(NSUB):
             cand_scales[3 * s + 2] = new_s2[s]
         r_after = _buf_resid(cand_scales)
-        if P2_SNAP:
-            # export requirement: apply unconditionally, report the degradation
+        better = r_after < r_before
+        if better.any():
             for s in range(NSUB):
-                scales[3 * s + 2].data = new_s2[s]
+                scales[3 * s + 2].data = torch.where(better[:, None, None], new_s2[s], scales[3 * s + 2].data)
             print(
-                f"    [p2] snapped scales/biases to +/-2^k: buffer resid "
-                f"{r_before.mean() * 100:.3f}% -> {r_after.mean() * 100:.3f}%",
+                f"    [ls] W2 scale refit: buffer resid {r_before[better].mean() * 100:.3f}% "
+                f"-> {r_after[better].mean() * 100:.3f}% ({int(better.sum())}/{G} experts)",
                 flush=True,
             )
-        else:
-            better = r_after < r_before
-            if better.any():
-                for s in range(NSUB):
-                    scales[3 * s + 2].data = torch.where(better[:, None, None], new_s2[s], scales[3 * s + 2].data)
-                print(
-                    f"    [ls] W2 scale refit: buffer resid {r_before[better].mean() * 100:.3f}% "
-                    f"-> {r_after[better].mean() * 100:.3f}% ({int(better.sum())}/{G} experts)",
-                    flush=True,
-                )
 
     fixed = [binarize_fixed(w.detach(), s.detach()) for w, s in zip(weights, scales)]
     bf = [p.detach().squeeze(1) for p in biases]  # each [G, inter]
@@ -847,8 +747,8 @@ def run_refit(
             continue
         P = torch.load(p_path, map_location="cuda").float()
         mu = torch.load(os.path.join(REDUCED, f"layer_{L}", "mu.pt"), map_location="cuda").float()
-        acts = torch.load(os.path.join(POD, f"acts_layer{L}.pt"), map_location="cuda", weights_only=False)
-        print(f"layer {L}: loading {len(acts)} experts...", flush=True)
+        acts = torch.load(os.path.join(POD, f"acts_layer{L}.pt"), map_location="cpu", weights_only=False)
+        print(f"layer {L}: indexed {len(acts)} experts (activations stay on CPU, moved per expert)", flush=True)
 
         todo = []
         for k, (x_k, y_k) in acts.items():
@@ -856,7 +756,7 @@ def run_refit(
             ep = os.path.join(REDUCED, f"layer_{L}", f"expert_{k}.pt")
             e = None
             if os.path.exists(ep):
-                e = torch.load(ep, map_location="cuda", weights_only=False)
+                e = torch.load(ep, map_location="cpu", weights_only=False)
                 rc = e.get("residual", float("inf"))
                 # Resume only when the file is already a BINARY refit and good
                 # enough. Old ternary files (no MODE_MARKER) are always refit.
@@ -869,9 +769,7 @@ def run_refit(
                     with open(done_log, "a") as f:
                         f.write(f"{key}\n")
                     continue
-            z = (x_k.float().cuda() - mu) @ P
-            y_full = y_k.float().cuda()
-            todo.append((k, z, y_full, e))
+            todo.append((k, x_k, y_k, e))
 
         covered = set(acts.keys())
         for k in range(256):
@@ -880,7 +778,6 @@ def run_refit(
                 todo.append((sk, None, None, None))
 
         del acts
-        torch.cuda.empty_cache()
         print(
             f"layer {L}: collected {len(todo)} experts to refit "
             f"({len(covered)} real + {len(todo) - len(covered)} synthetic)",
@@ -922,7 +819,9 @@ def run_refit(
         missing_todo = [t for t in todo if t[1] is None]
 
         def _prep_covered(t):
-            (k, z, yf, e_prev) = t
+            (k, x_k, y_k, e_prev) = t
+            z = (x_k.float().cuda() - mu) @ P
+            yf = y_k.float().cuda()
             n_k = z.shape[0]
             if n_k >= 128:
                 tier_thr, tier_steps, tier = refit_threshold, steps, "A"
@@ -944,7 +843,8 @@ def run_refit(
             bias3 = mu.reshape(-1) @ w3.T
             fp4_init = (w1_rot[None].contiguous(), w3_rot[None].contiguous(), w2[None].contiguous())
             del experts
-            z_all_rows = z.shape[0]  # tier B rows grow later when z_synth is appended
+            z_all_rows = z.shape[0]
+            todo_data[k] = (z, yf)
             init = tuple(t.to(torch.bfloat16).cpu() for t in fp4_init)
             bias1_cpu = bias1.cpu()
             bias3_cpu = bias3.cpu()
@@ -964,7 +864,7 @@ def run_refit(
                 bias3=bias3_cpu,
             )
 
-        BATCH_G = int(os.environ.get("REFIT_BATCH_G", "8"))
+        todo_data = {}
         prepped_A = []
         prepped_B = []
         for t in covered_todo:
@@ -973,46 +873,40 @@ def run_refit(
                 continue
             (prepped_B if p["tier"] == "B" else prepped_A).append(p)
 
-        def _run_group(group, todo_data):
+        def _run_expert(p):
+            """Train ONE expert (no batching): G=1 tensors in, single result out."""
             nonlocal n_fixed
-            if not group:
-                return
-            for i in range(0, len(group), BATCH_G):
-                chunk = group[i : i + BATCH_G]
-                pairs = []
-                for p in chunk:
-                    z_all_gpu, y_all_gpu = todo_data[p["k"]]
-                    n_rows = p["z_all_rows"]
-                    pairs.append((z_all_gpu[:n_rows], y_all_gpu[:n_rows]))
-                init_gpu = tuple(torch.cat([p["init"][j] for p in chunk]).cuda().float() for j in range(3))
-                bias1_gpu = torch.stack([p["bias1"] for p in chunk]).cuda().float()  # [G, inter]
-                bias3_gpu = torch.stack([p["bias3"] for p in chunk]).cuda().float()  # [G, inter]
-                results = train_batch(
-                    pairs,
-                    INTER,
-                    chunk[0]["tier_steps"],
-                    stop_threshold=chunk[0]["tier_thr"],
-                    n_real=[p["n_k"] for p in chunk],
-                    use_compile=use_compile,
-                    init=init_gpu,
-                    real_weight=chunk[0]["rw_eff"],
-                    bias1=bias1_gpu,
-                    bias3=bias3_gpu,
-                )
-                for p, res in zip(chunk, results):
-                    z_h, yf_h = todo_data[p["k"]]
-                    resid = resid_weights_full(z_h, yf_h, res)
-                    save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
-                    n_fixed += 1
-                    print(
-                        f"  layer {L} expert {p['k']} [tier {p['tier']}, n={p['n_k']}]: "
-                        f"resid={resid * 100:.4f}%  ({n_fixed} total, {time.time() - t0:.0f}s)",
-                        flush=True,
-                    )
-                torch.cuda.empty_cache()
+            z_all_gpu, y_all_gpu = todo_data[p["k"]]
+            n_rows = p["z_all_rows"]
+            init_gpu = tuple(t.cuda().float() for t in p["init"])
+            bias1_gpu = p["bias1"].cuda().float().unsqueeze(0)  # [1, inter]
+            bias3_gpu = p["bias3"].cuda().float().unsqueeze(0)
+            res = train_batch(
+                [(z_all_gpu[:n_rows], y_all_gpu[:n_rows])],
+                INTER,
+                p["tier_steps"],
+                stop_threshold=p["tier_thr"],
+                n_real=[p["n_k"]],
+                use_compile=use_compile,
+                init=init_gpu,
+                real_weight=p["rw_eff"],
+                bias1=bias1_gpu,
+                bias3=bias3_gpu,
+            )[0]
+            z_h, yf_h = todo_data[p["k"]]
+            resid = resid_weights_full(z_h, yf_h, res)
+            save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
+            n_fixed += 1
+            print(
+                f"  layer {L} expert {p['k']} [tier {p['tier']}, n={p['n_k']}]: "
+                f"resid={resid * 100:.4f}%  ({n_fixed} total, {time.time() - t0:.0f}s)",
+                flush=True,
+            )
+            todo_data.pop(p["k"], None)  # stream: free GPU activations
+            torch.cuda.empty_cache()
 
-        todo_data = {t[0]: (t[1], t[2]) for t in covered_todo}
-        _run_group(prepped_A, todo_data)
+        for p in prepped_A:
+            _run_expert(p)
         for p in prepped_B:
             z, yf = todo_data[p["k"]]
             z_synth = universal_signal(z, seed=seed + int(p["k"]), jitter=jitter)
@@ -1023,7 +917,7 @@ def run_refit(
             del experts, x_synth
             todo_data[p["k"]] = (torch.cat([z, z_synth]), torch.cat([yf, y_synth]))
             p["z_all_rows"] = todo_data[p["k"]][0].shape[0]
-            _run_group([p], todo_data)
+            _run_expert(p)
 
         for k, z, yf, _e_prev in missing_todo:
             with open(DEAD_LOG, "a") as f:
