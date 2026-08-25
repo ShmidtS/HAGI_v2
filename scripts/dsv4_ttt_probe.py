@@ -26,15 +26,21 @@ REFIT = 64
 ATOMS = int(os.environ.get("TTT_ATOMS", "128"))
 
 
+_LAYER_CACHE = {}
+
+
 def load_expert(L, k):
     red = os.path.join(RED, f"layer_{L}")
     if not os.path.exists(os.path.join(red, f"expert_{k}.pt")):
         return None
-    P = torch.load(os.path.join(red, "P.pt"), map_location=DEV).float()
-    mu = torch.load(os.path.join(red, "mu.pt"), map_location=DEV).float()
-    acts = torch.load(os.path.join(POD, f"acts_layer{L}.pt"), map_location="cpu", weights_only=False)
+    if L not in _LAYER_CACHE:
+        _LAYER_CACHE[L] = (
+            torch.load(os.path.join(red, "P.pt"), map_location=DEV).float(),
+            torch.load(os.path.join(red, "mu.pt"), map_location=DEV).float(),
+            torch.load(os.path.join(POD, f"acts_layer{L}.pt"), map_location="cpu", weights_only=False),
+        )
+    P, mu, acts = _LAYER_CACHE[L]
     x, y = acts[str(k)]
-    del acts
     z = (x.float().to(DEV) - mu) @ P
     e = torch.load(os.path.join(red, f"expert_{k}.pt"), map_location="cpu", weights_only=False)
     if e.get("mode") != "int4x":
@@ -73,6 +79,10 @@ def run_expert(L, k, lam, alpha_mult):
     if r is None:
         return None
     h, y, w2_int4 = r
+    if os.environ.get("TTT_SHUFFLE"):
+        g = torch.Generator().manual_seed(7)
+        perm = torch.randperm(h.shape[0], generator=g)
+        h, y = h[perm], y[perm]  # control: destroys temporal order, keeps distribution
     n = h.shape[0]
     Fd = h.shape[1]
     hs, hh = h[:N_STREAM], y[:N_STREAM]
