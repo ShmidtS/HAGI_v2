@@ -61,6 +61,10 @@ TTT_HOLDOUT = 0.2  # tail fraction of the buffer used for save decision
 TTT_MIN_GAIN = 0.02  # save only if holdout resid improves by >= 2% relative
 TTT_MAX_EXPERTS = 16  # live RLS states (G/C ~48MB each) - LRU
 TTT_ROWS_MAX = 2048  # max rows kept per expert for holdout eval
+# --- attention TTT: o_b_proj readout (grouped ctx [.,8192] -> hidden 4096) ---
+TTT_ATTN_LAYERS = [int(v) for v in os.environ.get("TTT_ATTN_LAYERS", "0,1,2,3").split(",") if v != ""]
+TTT_ATTN_MAX = 8  # live attention RLS states (G 8192^2 + C 8192x4096 fp32 ~ 384MB each)
+TTT_ATTN_ALPHA = 1000.0  # anchor weight (token units) toward the current o_b weights
 
 CURRENT_IDS: torch.Tensor | None = None
 ROUTER_W: dict[int, torch.Tensor] = {}
@@ -75,6 +79,10 @@ MISS = 0
 
 INT4X: dict[tuple, dict] = {}  # (L,k) -> dequant-int4x expert (frozen parts)
 TTT_STATE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
+# attention: adapted o_b weights per layer + RLS states
+ATTN_ADAPT: dict[int, dict] = {}  # L -> {"w": [4096,8192] adapted, "w0": [4096,8192] teacher}
+ATTN_STATE: collections.OrderedDict[int, dict] = collections.OrderedDict()
+ATTN_SAVE_LOG: list[str] = []
 TTT_ROWS = 0  # global update counter for TTT_SAMPLE
 SAVE_LOG: list[str] = []
 
@@ -263,6 +271,18 @@ def _resid(w2, h, y):
     return (((yh - y) ** 2).sum() / (y**2).sum().clamp_min(1e-12)).item()
 
 
+def snap_int8(w):
+    """int8 {-127..127} + per-channel LS scale; measured: holds the adaptation
+    gain where int4 collapses (attn o_b: 0.50% vs 3.10%)."""
+    sg = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 127.0
+    q = (w / sg).round().clamp(-127, 127)
+    num = (q * w).sum(dim=1)
+    den = (q * q).sum(dim=1).clamp_min(1e-9)
+    a = num / den
+    a = a.sign() * a.abs().clamp_min(1e-9)
+    return q, a
+
+
 def snap_int4(w2):
     sg = w2.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0
     q = (w2 / sg).round().clamp(-7, 7)
@@ -321,6 +341,138 @@ def consolidate_and_save(li, k, enabled=True):
     os.replace(tmp, fp)
     SAVE_LOG.append(f"L{li}_{k}: {r_static*100:.3f}% -> {r_cons*100:.3f}%")
     print(f"  [ttt] SAVED {fp}", flush=True)
+
+
+def attn_ob_path(li):
+    return os.path.join(REDUCED, f"layer_{li}", "attn_ob.pt")
+
+
+def attn_init(li, module):
+    """Load/start the adapted o_b weights (checkpoint if present, else original)."""
+    w0 = module.weight.detach().float().cuda()  # teacher + default init
+    w = w0.clone()
+    fp = attn_ob_path(li)
+    if os.path.exists(fp):
+        e = torch.load(fp, map_location="cpu", weights_only=False)
+        q = e["ob"].float().cuda()  # int8 stored raw (1 byte/weight)
+        w = q * e["ob_scale"].float().cuda()[:, None]
+        print(f"  [attn-ttt] L{li}: loaded adapted o_b (resid {e.get('residual', float('nan'))*100:.3f}%)", flush=True)
+    ATTN_ADAPT[li] = {"w": w, "w0": w0}
+
+
+def attn_touch(li, h_rows):
+    if li not in ATTN_STATE:
+        if len(ATTN_STATE) >= TTT_ATTN_MAX:
+            ATTN_STATE.popitem(last=False)  # coldest state dropped; adapted w persists
+        Fin = h_rows.shape[1]
+        alpha = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ATTN_ALPHA
+        ATTN_STATE[li] = {
+            "G": torch.eye(Fin, device="cuda") * alpha,
+            "C": alpha * ATTN_ADAPT[li]["w"].T.clone(),
+            "Fin": Fin,
+            "H": [],  # train rows (fed into G/C; refit guard)
+            "Y": [],
+            "Hva": [],  # validation rows (NEVER fed into G/C; save decision)
+            "Yva": [],
+            "rows": 0,
+            "since": 0,
+            "refits": 0,
+        }
+    ATTN_STATE.move_to_end(li)
+    return ATTN_STATE[li]
+
+
+def attn_ttt_update(li, h_rows, y_rows):
+    st = attn_touch(li, h_rows)
+    G, C = st["G"], st["C"]
+    n = h_rows.shape[0]
+    n_va = n // 5 if n >= 5 else (1 if n > 1 else 0)  # honest validation split
+    tr_h, tr_y = h_rows[: n - n_va], y_rows[: n - n_va]
+    va_h, va_y = h_rows[n - n_va :], y_rows[n - n_va :]
+    nt = tr_h.shape[0]
+    G.mul_(TTT_LAM**nt).add_(tr_h.T @ tr_h)
+    C.mul_(TTT_LAM**nt).add_(tr_h.T @ tr_y)
+    st["rows"] += n
+    st["since"] += nt
+    st["H"].append(tr_h.detach())
+    st["Y"].append(tr_y.detach())
+    if va_h.shape[0]:
+        st["Hva"].append(va_h.detach())
+        st["Yva"].append(va_y.detach())
+        if sum(t.shape[0] for t in st["Hva"]) > TTT_ROWS_MAX // 2:
+            st["Hva"].pop(0)
+            st["Yva"].pop(0)
+    if sum(t.shape[0] for t in st["H"]) > TTT_ROWS_MAX:
+        st["H"].pop(0)
+        st["Y"].pop(0)
+    if st["since"] >= TTT_REFIT:
+        st["since"] = 0
+        st["refits"] += 1
+        Hb, Yb = torch.cat(st["H"]), torch.cat(st["Y"])
+        w = ATTN_ADAPT[li]["w"]
+        r_before = _resid(w, Hb, Yb)
+        reg = G.diagonal().mean() * 1e-3
+        w_new = torch.linalg.solve(G + reg * torch.eye(st["Fin"], device="cuda"), C).T.contiguous()
+        r_after = _resid(w_new, Hb, Yb)
+        if r_after < r_before:
+            ATTN_ADAPT[li]["w"].copy_(w_new)
+        del w_new
+
+
+def attn_consolidate_and_save(li, enabled=True):
+    """End of run: snap adapted o_b to int4, save when holdout improves vs teacher-init."""
+    if li not in ATTN_STATE:
+        return
+    st = ATTN_STATE.pop(li)
+    if not st["Hva"]:  # no honest validation rows -> refuse to decide
+        return
+    Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])  # NEVER seen by G/C
+    w = ATTN_ADAPT[li]["w"]
+    w0 = ATTN_ADAPT[li]["w0"]
+    r_static = _resid(w0, Hh, Yh)
+    r_cont = _resid(w, Hh, Yh)
+    q, a = snap_int8(w)  # int8: int4 grid collapses the adaptation gain (measured)
+    r_cons = _resid(q * a[:, None], Hh, Yh)
+    if r_cons > r_static:
+        r_cons = r_static
+        q, a = snap_int8(w0)
+    improved = (r_static - r_cons) / max(r_static, 1e-12)
+    print(
+        f"  [attn-ttt] L{li}: rows={st['rows']} refits={st['refits']} holdout "
+        f"teacher={r_static*100:.4f}% cont={r_cont*100:.4f}% cons={r_cons*100:.4f}% "
+        f"(gain {improved*100:+.1f}%)",
+        flush=True,
+    )
+    if not enabled or improved < TTT_MIN_GAIN:
+        return
+    fp = attn_ob_path(li)
+    e = {"ob": q.to(torch.int8).cpu(), "ob_scale": a.cpu(), "residual": r_cons,
+         "ttt": {"rows": st["rows"], "refits": st["refits"], "static": r_static, "cons": r_cons}}
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    tmp = fp + ".tmp"
+    torch.save(e, tmp)
+    os.replace(tmp, fp)
+    ATTN_SAVE_LOG.append(f"L{li}: {r_static*100:.4f}% -> {r_cons*100:.4f}%")
+    print(f"  [attn-ttt] SAVED {fp}", flush=True)
+
+
+def make_attn_hook(li, ttt_on):
+    """Replace o_b_proj output with the adapted readout + TTT updates."""
+    def hook(module, args, kwargs, output):
+        grouped = args[0]  # [B, S, o_groups*o_lora_rank]
+        ad = ATTN_ADAPT[li]
+        g = grouped.reshape(-1, grouped.shape[-1]).float()
+        out = (g @ ad["w"].T).to(output.dtype).reshape(output.shape)
+        if ttt_on:
+            global TTT_ROWS
+            TTT_ROWS += 1
+            if TTT_ROWS % TTT_SAMPLE == 0:
+                y_t = g @ ad["w0"].T
+                attn_ttt_update(li, g, y_t)
+                del y_t
+        return out
+
+    return hook
 
 
 def make_hook(li, ttt_on):
@@ -413,6 +565,17 @@ def main():
     print(f"int4x checkpoints available: {n_int4x} experts; ttt={'on' if ttt_on else 'off'} save={'on' if save_on else 'off'}", flush=True)
 
     handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li, ttt_on), with_kwargs=True) for li in range(N_LAYERS)]
+    attn_on = "--no-attn" not in sys.argv
+    attn_handles = []
+    if attn_on:
+        for li in TTT_ATTN_LAYERS:
+            if li >= N_LAYERS:
+                continue
+            attn_init(li, model.model.layers[li].self_attn.o_b_proj)
+            attn_handles.append(
+                model.model.layers[li].self_attn.o_b_proj.register_forward_hook(make_attn_hook(li, ttt_on), with_kwargs=True)
+            )
+        print(f"attention TTT on layers {TTT_ATTN_LAYERS} (o_b_proj readout)", flush=True)
 
     input_ids = torch.tensor([ids], device="cuda", dtype=torch.long)
     global CURRENT_IDS
@@ -435,6 +598,8 @@ def main():
 
     for h in handles:
         h.remove()
+    for h in attn_handles:
+        h.remove()
 
     dt = time.time() - t0
     n_tok = len(generated) - len(ids)
@@ -443,6 +608,10 @@ def main():
     print("consolidating TTT experts...", flush=True)
     for (li, k) in list(TTT_STATE.keys()):
         consolidate_and_save(li, k, enabled=save_on)
+    for li in list(ATTN_STATE.keys()):
+        attn_consolidate_and_save(li, enabled=save_on)
+    if ATTN_SAVE_LOG:
+        print(f"attention saved {len(ATTN_SAVE_LOG)} layer(s): " + "; ".join(ATTN_SAVE_LOG), flush=True)
     if SAVE_LOG:
         print(f"saved {len(SAVE_LOG)} expert(s): " + "; ".join(SAVE_LOG), flush=True)
     else:
