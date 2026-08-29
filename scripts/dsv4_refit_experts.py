@@ -993,7 +993,14 @@ def run_refit(
                 break
             z_parts.append(z_kk.cpu())
             n_have += z_kk.shape[0]
-        z_pool = torch.cat(z_parts) if z_parts else torch.zeros(1, INTER)
+        if z_parts:
+            z_pool = torch.cat(z_parts)
+        else:
+            # no covered rows survived skipping (layer fully done): white-noise
+            # pool in POD coords - universal_signal's documented fallback
+            g0 = torch.Generator().manual_seed(4321 + L)
+            z_pool = torch.randn(4096, P.shape[1], generator=g0)
+            print(f"layer {L}: pool EMPTY (all experts pre-done) - white-noise fallback", flush=True)
         del z_parts
         print(f"layer {L}: activation pool for tier-B/dead: {z_pool.shape[0]} rows", flush=True)
 
