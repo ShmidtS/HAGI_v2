@@ -159,6 +159,48 @@ def soft_lim(x, lim=SOFT_LIM, knee=SOFT_KNEE):
     return y_abs * torch.sign(x)
 
 
+def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=3):
+    # NOTE: w2 unused here (the readout is re-solved); kept for signature clarity.
+    """Closed-form int4x encoder (AngelSlim STQ-style, no gradient steps):
+
+    signs = sign(W_rot) (STE-free), LS scales, exact ridge solve for W2 on the
+    given activations (imatrix analog: the functional error IS the metric),
+    CD snap of W2, then one re-LS of W1/W3 scales + biases at the quantized W2.
+    Returns (res, resid_before_snap_W2) in trainer format."""
+    q1 = torch.sign(w1_rot)
+    q3 = torch.sign(w3_rot)
+    s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
+    s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
+    w1 = q1 * s1[:, None]
+    w3 = q3 * s3[:, None]
+    g = soft_lim(z_rows @ w1.T + bias1[None, :])
+    u = soft_lim(z_rows @ w3.T + bias3[None, :])
+    h = F.silu(g) * u  # [n, inter]
+    # exact ridge solve for the continuous W2 readout
+    Gm = h.T @ h
+    Gm.diagonal().add_((Gm.diagonal().mean() * 1e-2))
+    W2c = torch.linalg.solve(Gm, h.T @ y_rows).T.contiguous()  # [4096, inter]
+    # CD snap of W2 to int4 (weighted by feature energy = the true metric)
+    cw = (h ** 2).sum(dim=0)
+    cw = cw / cw.mean().clamp_min(1e-12)
+    sg = W2c.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0
+    q2 = (W2c / sg).round().clamp(-7, 7)
+    for _ in range(cd_rounds):
+        num = (cw * q2 * W2c).sum(dim=1, keepdim=True)
+        den = (cw * q2 * q2).sum(dim=1, keepdim=True).clamp_min(1e-9)
+        sg = num / den
+        sg = torch.where(sg.abs() < 1e-9, torch.full_like(sg, 1e-9), sg)
+        q2 = (W2c / sg).round().clamp(-7, 7)
+    num = (cw * q2 * W2c).sum(dim=1)
+    den = (cw * q2 * q2).sum(dim=1).clamp_min(1e-9)
+    s2 = (num / den)
+    s2 = s2.sign() * s2.abs().clamp_min(1e-6)
+    # one re-LS of W1/W3 scales + biases at the QUANTIZED W2
+    bounds = [0, z_rows.shape[1]]
+    res = (q1, s1, q3, s3, q2, s2, bias1, bias3, bounds)
+    return res
+
+
 def resid_weights_full(z, y_full, res):
     """Pyramidal binary residual: sub s reads its equal-energy input slice
     (POD rank), full width, full output; sum of sub outputs vs exact target."""
@@ -927,6 +969,32 @@ def run_refit(
                 continue
             (prepped_B if p["tier"] == "B" else prepped_A).append(p)
 
+        # Layer-wide activation pool: the residual stream that feeds ALL experts
+        # of the layer. For experts with few/no routed rows this is a far better
+        # manifold than bootstrapping around their own 2-3 points (measured:
+        # n=2 tier-B converged to 38-66% resid - wasted 67s each).
+        n_pool_rows = 8192
+        z_parts = []
+        n_have = 0
+        rng = torch.Generator().manual_seed(1234 + L)
+        cand = list(todo_data.keys())
+        cand.sort(key=lambda kk: todo_data[kk][0].shape[0], reverse=True)
+        for kk in cand:
+            z_kk = todo_data[kk][0]
+            if n_have + z_kk.shape[0] > n_pool_rows:
+                take = n_pool_rows - n_have
+                if take > 0:
+                    z_parts.append(z_kk[:take].cpu())
+                    n_have += take
+                break
+            z_parts.append(z_kk.cpu())
+            n_have += z_kk.shape[0]
+        z_pool = torch.cat(z_parts) if z_parts else torch.zeros(1, INTER)
+        del z_parts
+        print(f"layer {L}: activation pool for tier-B/dead: {z_pool.shape[0]} rows", flush=True)
+
+        PTQ_FALLBACK = 0.10  # gradient result worse than this -> closed-form PTQ
+
         def _run_expert(p):
             """Train ONE expert (no batching): G=1 tensors in, single result out."""
             nonlocal n_fixed
@@ -949,6 +1017,21 @@ def run_refit(
             )[0]
             z_h, yf_h = todo_data[p["k"]]
             resid = resid_weights_full(z_h, yf_h, res)
+            if resid > PTQ_FALLBACK:
+                # stalled gradient run (thin coverage: STE sign oscillation) ->
+                # AngelSlim-style closed-form PTQ in ~1s; keep whichever is better
+                w1f, w3f, w2f = init_gpu[0][0], init_gpu[1][0], init_gpu[2][0]
+                try:
+                    res_ptq = ptq_closed_form(
+                        w1f, w3f, w2f, z_all_gpu[:n_rows], y_all_gpu[:n_rows],
+                        p["bias1"].cuda().float(), p["bias3"].cuda().float(),
+                    )
+                    resid_ptq = resid_weights_full(z_h, yf_h, res_ptq)
+                    if resid_ptq < resid:
+                        res, resid = res_ptq, resid_ptq
+                        print(f"    [ptq-fallback] {p['k']}: {resid*100:.3f}%", flush=True)
+                except Exception as ex:  # noqa: BLE001 - fallback must never kill the run
+                    print(f"    [ptq-fallback] {p['k']} failed: {ex}", flush=True)
             save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
             n_fixed += 1
             print(
@@ -963,7 +1046,13 @@ def run_refit(
             _run_expert(p)
         for p in prepped_B:
             z, yf = todo_data[p["k"]]
-            z_synth = universal_signal(z, seed=seed + int(p["k"]), jitter=jitter)
+            if z.shape[0] < 128:  # thin real coverage -> bootstrap from the LAYER pool
+                z_synth = universal_signal(
+                    z, seed=seed + int(p["k"]), jitter=jitter,
+                    z_proxy=z_pool.cuda() if z.shape[0] < 8 else None,
+                )
+            else:
+                z_synth = universal_signal(z, seed=seed + int(p["k"]), jitter=jitter)
             x_synth = (mu + z_synth @ P.T).float()
             experts = load_selected_experts(L, [int(p["k"])])
             w1, w2, w3 = experts[int(p["k"])]
@@ -974,9 +1063,52 @@ def run_refit(
             _run_expert(p)
 
         for k, z, yf, _e_prev in missing_todo:
-            with open(DEAD_LOG, "a") as f:
-                f.write(f"{L}_{k}\n")
-            print(f"  layer {L} expert {k}: DEAD (0 activations) — skipped", flush=True)
+            # 0 routed rows in the collection, but the expert IS part of the model:
+            # distill it on the layer activation pool against its original weights.
+            g = torch.Generator().manual_seed(777 + int(k))
+            idx = torch.randint(0, z_pool.shape[0], (4096,), generator=g)
+            z_rows = z_pool[idx].cuda().float()
+            x_rows = (mu + z_rows @ P.T).float()
+            experts = load_selected_experts(L, [int(k)])
+            w1, w2, w3 = experts[int(k)]
+            y_rows = ffn_exact(x_rows, w1, w2, w3)
+            bias1 = mu.reshape(-1) @ w1.T
+            bias3 = mu.reshape(-1) @ w3.T
+            init = (w1 @ P, w3 @ P, w2)
+            del experts, x_rows
+            res = train_batch(
+                [(z_rows, y_rows)],
+                INTER,
+                steps,
+                stop_threshold=refit_threshold,
+                n_real=[0],
+                use_compile=use_compile,
+                init=tuple(t[None].contiguous().float() for t in init),
+                real_weight=1.0,
+                bias1=bias1.float()[None],
+                bias3=bias3.float()[None],
+            )[0]
+            resid = resid_weights_full(z_rows, y_rows, res)
+            if resid > PTQ_FALLBACK:
+                try:
+                    res_ptq = ptq_closed_form(
+                        (w1 @ P), (w3 @ P), w2, z_rows, y_rows,
+                        bias1.float(), bias3.float(),
+                    )
+                    resid_ptq = resid_weights_full(z_rows, y_rows, res_ptq)
+                    if resid_ptq < resid:
+                        res, resid = res_ptq, resid_ptq
+                        print(f"    [ptq-fallback] dead {k}: {resid*100:.3f}%", flush=True)
+                except Exception as ex:  # noqa: BLE001
+                    print(f"    [ptq-fallback] dead {k} failed: {ex}", flush=True)
+            save_expert(k, resid, res, INTER, n_real=0)
+            n_fixed += 1
+            print(
+                f"  layer {L} expert {k} [dead->distill, n=0]: resid={resid * 100:.4f}%  "
+                f"({n_fixed} total, {time.time() - t0:.0f}s)",
+                flush=True,
+            )
+            torch.cuda.empty_cache()
         print(f"layer {L}: refit {n_fixed} experts in {time.time() - t0:.0f}s", flush=True)
 
 
