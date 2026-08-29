@@ -91,13 +91,23 @@ REP_PEN = 1.5  # repetition penalty divisor for tokens seen in the last REP_WIN
 REP_WIN = 128
 MIN_NEW_TOKENS = 8  # do not allow EOS before this many tokens in a turn
 
+N_STREAMS = int(os.environ.get("EVOL_STREAMS", "4"))  # parallel thought streams (batched decode)
+# routing-aware expert pinning: hash layers route by token id (EXACT sets from
+# the stream), topk layers have stable usage -> pin the hot set in VRAM
+PIN_BUDGET = int(os.environ.get("PIN_BUDGET", "30")) * 2**30
+PINNED: set = set()
+PINNED_BYTES = 0
+COLLECT_USAGE = False
+USAGE_T: dict[int, torch.Tensor] = {}  # li -> [256] pick counts
+FLUSH_EVERY = 2  # teacher/RLS flush every N turns (amortizes expert materialization)
+NGRAM = 3  # no-repeat n-gram blocking size (kills degenerate loops)
 SAVE_ENABLED = True  # set from --no-save; gates persistence on eviction too
-INT4X_MAX = int(os.environ.get("INT4X_MAX", "448"))  # live int4x experts (~128MB each); LRU
-DEQUANT_MAX = int(os.environ.get("DEQUANT_MAX", "320"))  # cached original experts (bf16 ~50MB each)
+INT4X_MAX = int(os.environ.get("INT4X_MAX", "256"))  # hot tier + pins; cold = ~1.8ms bf16 unpack  # live int4x experts (~128MB each); LRU
+DEQUANT_MAX = int(os.environ.get("DEQUANT_MAX", "128"))  # cached original experts (bf16 ~50MB each)
 ATTN_ROWS_CAP = 256  # max student rows per attention RLS update (strided subsample)
 
 MODE = "student"  # "teacher" during the shadow pass (hooks branch on this)
-SHADOW: dict[int, torch.Tensor | None] = {}  # li -> teacher grouped-ctx rows for current prefill
+SHADOW: dict[int, list] = {}  # li -> list of teacher grouped-ctx chunks (aligned by feed order)
 
 CURRENT_IDS: torch.Tensor | None = None
 ROUTER_W: dict[int, torch.Tensor] = {}
@@ -105,13 +115,19 @@ ROUTER_BIAS: dict[int, torch.Tensor] = {}
 ROUTER_TID: dict[int, torch.Tensor] = {}
 
 PACKED_CACHE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
-PACKED_MAX = int(os.environ.get("PACKED_MAX", "64"))
+PACKED_MAX = int(os.environ.get("PACKED_MAX", "256"))  # backs dequant misses (no disk thrash)
 CACHE_BYTES = 0
 SHARED_DEQUANT: dict[int, dict] = {}
 HIT = 0
 MISS = 0
 
 INT4X: dict[tuple, dict] = {}  # (L,k) -> dequant-int4x expert (frozen parts + adaptive w2)
+I4X_PACKED: collections.OrderedDict[tuple, dict] = collections.OrderedDict()  # (L,k) -> packed ckpt ON GPU (~6MB)
+I4X_PACKED_MAX = int(os.environ.get("I4X_PACKED_MAX", "1600"))
+# decode-time TTT collections (per turn): attention ctx rows + FFN (x,h) per expert
+COLLECT_ATTN: dict[int, list] = {}
+COLLECT_FFN: dict[tuple, dict] = {}
+COLLECT_CAP = 192  # max rows per expert per turn
 TTT_STATE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
 ATTN_ADAPT: dict[int, dict] = {}  # L -> {"w": [4096,8192] fp32 adapted, "w0": bf16 ref to module weight}
 ATTN_STATE: collections.OrderedDict[int, dict] = collections.OrderedDict()
@@ -200,7 +216,10 @@ def get_dequant(li, k):
     DEQUANT_BYTES += w1.numel() * 2 + w2.numel() * 2 + w3.numel() * 2
     free, _ = torch.cuda.mem_get_info()
     while (len(DEQUANT_CACHE) > DEQUANT_MAX or DEQUANT_BYTES > free - GPU_HEADROOM) and len(DEQUANT_CACHE) > 1:
-        _, ev = DEQUANT_CACHE.popitem(last=False)
+        evk = next((kk for kk in DEQUANT_CACHE if kk not in PINNED), None)
+        if evk is None:
+            break
+        ev = DEQUANT_CACHE.pop(evk)
         DEQUANT_BYTES -= ev[0].numel() * 2 + ev[1].numel() * 2 + ev[2].numel() * 2
         del ev
     return DEQUANT_CACHE[key]
@@ -224,6 +243,27 @@ def get_w2_fp32(li, k):
     return d["w2"]
 
 
+def unpack_binary_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """uint8 [out, in/8] (cuda) -> bf16 [out, in] {-1,+1} x per-row scale. ~1ms."""
+    O, N = p.shape
+    t = p.to(torch.uint8)
+    bits = (t.unsqueeze(-1) >> torch.arange(8, device=p.device, dtype=torch.uint8)) & 1
+    w = bits.reshape(O, N * 8).to(torch.bfloat16)
+    w = w * 2 - 1
+    return w * scale.to(torch.bfloat16)[:, None]
+
+
+def unpack_int4_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """uint8 [out, in/2] (cuda) -> bf16 [out, in] {-7..7} x per-row scale. ~0.5ms."""
+    t = p.to(torch.int16)
+    lo = ((t & 15) - 8).to(torch.bfloat16)
+    hi = ((t >> 4) - 8).to(torch.bfloat16)
+    out = torch.empty(t.shape[0], t.shape[1] * 2, dtype=torch.bfloat16, device=p.device)
+    out[:, 0::2] = lo
+    out[:, 1::2] = hi
+    return out * scale.to(torch.bfloat16)[:, None]
+
+
 def load_pod(li):
     if li in POD_CACHE:
         return POD_CACHE[li]
@@ -242,41 +282,42 @@ def get_int4x(li, k):
         I4X_HIT += 1
         return INT4X[key]
     I4X_MISS += 1
-    fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
-    if not os.path.exists(fp):
-        return None
-    e = torch.load(fp, map_location="cpu", weights_only=False)
-    if e.get("mode") != "int4x":
-        return None
+    key_p = (li, k)
+    if key_p in I4X_PACKED:
+        e = I4X_PACKED[key_p]
+        I4X_PACKED.move_to_end(key_p)
+    else:
+        fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
+        if not os.path.exists(fp):
+            return None
+        e = torch.load(fp, map_location="cpu", weights_only=False)
+        if e.get("mode") != "int4x":
+            return None
+        e = {kk: (v.cuda() if torch.is_tensor(v) else v) for kk, v in e.items()}
+        I4X_PACKED[key_p] = e
+        I4X_PACKED.move_to_end(key_p)
+        while len(I4X_PACKED) > I4X_PACKED_MAX:
+            I4X_PACKED.popitem(last=False)
     P, mu = load_pod(li)
     dev = "cuda"
-    # unpack ON GPU (CPU unpack was the decode bottleneck on cache misses)
-    q1 = unpack_binary(e["w1a"].to(dev))
-    q3 = unpack_binary(e["w3a"].to(dev))
-    q2 = unpack_int4(e["w2a"].to(dev)).float()
-    s1 = e["w1a_scale"].float().to(dev)
-    s3 = e["w3a_scale"].float().to(dev)
-    s2 = e["w2a_scale"].float().to(dev)
+    e_gpu = I4X_PACKED[key_p]  # already on cuda
     d = {
-        # P/mu are SHARED per layer (pod tensors are big: no per-expert copies)
-        "P": _pod_bf16(li),
-        "mu": mu,
-        "w1": (q1.float() * s1[:, None]).to(torch.bfloat16),
-        "w3": (q3.float() * s3[:, None]).to(torch.bfloat16),
-        "b1": e["bias1a"].float().to(dev),
-        "b3": e["bias3a"].float().to(dev),
-        # w2 fp32 kept LAZILY (only experts selected for TTT need it);
-        # forward uses the bf16 mirror
-        "w2": None,
-        "w2b": (q2 * s2[:, None]).to(torch.bfloat16),
+        "P": _pod_bf16(li),  # shared per layer
+        "mu": mu.to(torch.bfloat16),
+        "w1": unpack_binary_bf16(e_gpu["w1a"], e_gpu["w1a_scale"]),
+        "w3": unpack_binary_bf16(e_gpu["w3a"], e_gpu["w3a_scale"]),
+        "b1": e_gpu["bias1a"].to(torch.bfloat16),
+        "b3": e_gpu["bias3a"].to(torch.bfloat16),
+        "w2": None,  # fp32 materialized lazily for TTT only
+        "w2b": unpack_int4_bf16(e_gpu["w2a"], e_gpu["w2a_scale"]),
         "residual": e.get("residual", float("inf")),
         "adapted": False,
     }
     INT4X[key] = d
     while len(INT4X) > INT4X_MAX:
-        ev = next((kk for kk in INT4X if kk not in TTT_STATE), None)
+        ev = next((kk for kk in INT4X if kk not in TTT_STATE and kk not in PINNED), None)
         if ev is None:
-            break  # everything pinned by live states (states are LRU-capped anyway)
+            break  # pinned/states protect the rest
         INT4X.pop(ev)  # adapted entries are consolidated on STATE eviction, never lost
     return d
 
@@ -284,9 +325,9 @@ def get_int4x(li, k):
 def int4x_forward(d, x_rows):
     """x_rows [n, 4096] raw fp32 -> h [n, 2048] fp32 (bf16 GEMMs inside)."""
     xb = x_rows.to(torch.bfloat16)
-    z = (xb - d["mu"].to(torch.bfloat16)) @ d["P"]
-    g = soft_lim(z @ d["w1"].T + d["b1"].to(torch.bfloat16))
-    u = soft_lim(z @ d["w3"].T + d["b3"].to(torch.bfloat16))
+    z = (xb - d["mu"]) @ d["P"]
+    g = soft_lim(z @ d["w1"].T + d["b1"])
+    u = soft_lim(z @ d["w3"].T + d["b3"])
     return (torch.nn.functional.silu(g) * u).float()
 
 
@@ -541,24 +582,27 @@ def make_attn_hook(li, ttt_on):
     def hook(module, args, kwargs, output):
         if MODE == "teacher":
             g = args[0]
-            SHADOW[li] = g.reshape(-1, g.shape[-1]).detach()
+            SHADOW.setdefault(li, []).append(g.reshape(-1, g.shape[-1]).detach())
             return None  # original module forward (original o_b weights)
         grouped = args[0]
         ad = ATTN_ADAPT[li]
         g = grouped.reshape(-1, grouped.shape[-1]).float()
         out = (g @ ad["w"].T).to(output.dtype).reshape(output.shape)
-        if ttt_on and SHADOW.get(li) is not None:
-            g_t = SHADOW[li]
-            n = min(g.shape[0], g_t.shape[0])
-            if n > 1:
-                if n > ATTN_ROWS_CAP:  # strided subsample, same rows in student/teacher
-                    sel = torch.arange(0, n, n // ATTN_ROWS_CAP, device=g.device)
-                else:
-                    sel = slice(None)
-                y_t = (g_t[sel].to(ad["w0"].dtype) @ ad["w0"].T).float()
-                attn_ttt_update(li, g[sel], y_t)
-                del y_t
-            SHADOW[li] = None  # consumed; decode steps carry no shadow rows
+        if grouped.shape[1] > 1:  # prefill: consume the teacher chunks directly
+            chunks = SHADOW.pop(li, None)
+            if ttt_on and chunks:
+                g_t = torch.cat(chunks)
+                n = min(g.shape[0], g_t.shape[0])
+                if n > 1:
+                    if n > ATTN_ROWS_CAP:
+                        sel = torch.arange(0, n, n // ATTN_ROWS_CAP, device=g.device)
+                    else:
+                        sel = slice(None)
+                    y_t = (g_t[sel].to(ad["w0"].dtype) @ ad["w0"].T).float()
+                    attn_ttt_update(li, g[sel], y_t)
+                    del y_t
+        elif ttt_on:  # decode step: collect student rows for the turn-end flush
+            COLLECT_ATTN.setdefault(li, []).append(g.detach())
         return out
 
     return hook
@@ -590,6 +634,8 @@ def make_hook(li, ttt_on):
         out = ffn(flatb, sw["w1"], sw["w2"], sw["w3"]).float()
 
         teacher = MODE == "teacher"
+        if COLLECT_USAGE and not teacher:
+            USAGE_T[li] += torch.bincount(indices.reshape(-1), minlength=256)
         prefill = (not teacher) and S > 1 and ttt_on
         cands = []  # (rows, k) TTT candidates at prefill
         for k in indices.unique().tolist():
@@ -605,6 +651,15 @@ def make_hook(li, ttt_on):
                         out[m] += weights[m, kk, None] * out_k[pos[m]]
                 if prefill:
                     cands.append((int(m_any.sum()), k))
+                elif ttt_on:  # decode step: collect rows for the turn-end flush
+                    ekey = (li, k)
+                    ent = COLLECT_FFN.get(ekey)
+                    if ent is None:
+                        ent = COLLECT_FFN[ekey] = {"x": [], "h": [], "n": 0}
+                    if ent["n"] < COLLECT_CAP:
+                        ent["x"].append(flat[m_any].detach())
+                        ent["h"].append(h.detach())
+                        ent["n"] += int(m_any.sum())
                 del h, out_k, m_any, pos
             else:
                 w1, w2, w3 = get_dequant(li, k)
@@ -653,15 +708,16 @@ def setup_model():
     return model
 
 
-def shadow_prefill(model, input_ids):
-    """One forward through the ORIGINAL model (teacher) to fill SHADOW rows."""
+def shadow_prefill(model, input_ids, past=None, keep_past=False):
+    """Forward through the ORIGINAL model (teacher); returns its past if kept."""
     global MODE, CURRENT_IDS
     MODE = "teacher"
     CURRENT_IDS = input_ids
     try:
-        model(input_ids=input_ids, use_cache=False)
+        out = model(input_ids=input_ids, use_cache=True, past_key_values=past)
     finally:
         MODE = "student"
+    return out.past_key_values if keep_past else None
 
 
 # ------------------------------------------------------------------- evolve ---
@@ -739,10 +795,163 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
     return generated
 
 
+def _block_ngram(probs, hist, n=NGRAM):
+    """Zero out tokens that would complete an already-seen n-gram."""
+    if len(hist) >= n - 1:
+        tail = hist[-(n - 1):]
+        banned = {hist[i + n - 1] for i in range(len(hist) - n + 1) if hist[i:i + n - 1] == tail}
+        if banned:
+            probs[torch.tensor(sorted(banned), device=probs.device, dtype=torch.long)] = 0.0
+    return probs
+
+
 def _attn_window(session_idx, width):
     """Rotating coverage: session s covers layers [s*width % 43, +width)."""
     start = (session_idx * width) % N_LAYERS
     return sorted((start + i) % N_LAYERS for i in range(width))
+
+
+def build_pins(prefix_ids):
+    """Routing-aware residency: hash layers pin EXACT expert sets for the known
+    token stream; topk layers pin by measured prefill usage. Budget-capped."""
+    global PINNED, PINNED_BYTES, COLLECT_USAGE
+    COLLECT_USAGE = False
+    PINNED = set()
+    PINNED_BYTES = 0
+    cands = []  # (priority, li, k)
+    ids_t = torch.tensor(prefix_ids, device="cuda", dtype=torch.long)
+    for li in HASH_LAYERS:  # deterministic token-id routing: exact needs
+        flat_eids = ROUTER_TID[li][ids_t].reshape(-1).tolist()
+        for k in set(flat_eids):
+            cands.append((float("inf"), li, k))
+    for li in range(N_LAYERS):  # stable topk routing: measured usage
+        for k, c in enumerate(USAGE_T[li].tolist()):
+            if c > 0:
+                cands.append((c, li, k))
+    cands.sort(key=lambda t: (0 if t[0] == float("inf") else 1, -t[0]))
+    n_pin = 0
+    for _, li, k in cands:
+        if (li, k) in PINNED:
+            continue
+        if PINNED_BYTES + 50 * 2**20 > PIN_BUDGET:
+            break
+        # protect BEFORE materializing: LRU eviction skips pinned keys, but the
+        # entry must survive the tight INT4X/DEQUANT caps during the pin sweep
+        ckpt = os.path.exists(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"))
+        PINNED.add((li, k))
+        if ckpt:
+            if get_int4x(li, k) is None:
+                PINNED.discard((li, k))
+                continue
+            if (li, k) not in INT4X:  # checkpoint exists but not int4x mode
+                PINNED.discard((li, k))
+                continue
+        else:
+            get_dequant(li, k)
+            if (li, k) not in DEQUANT_CACHE:
+                PINNED.discard((li, k))
+                continue
+        PINNED_BYTES += 50 * 2**20
+        n_pin += 1
+    print(f"pinned {n_pin} experts ({PINNED_BYTES / 2**30:.1f} GB budget {PIN_BUDGET / 2**30:.0f})", flush=True)
+
+
+@torch.no_grad()
+def gen_turn_b(model, state, n_new, temp):
+    """One decode turn for B parallel streams, single KV: feed [B,1] per step,
+    per-stream sampling (top-p + rep penalty + n-gram block)."""
+    B = state["B"]
+    gen = [[] for _ in range(B)]
+    fed = []
+    t0 = time.time()
+    global CURRENT_IDS, I4X_HIT, I4X_MISS
+    for step in range(n_new):
+        nxt_list = [EOS_ID] * B
+        for b in range(B):
+            if state["finished"][b]:
+                continue
+            probs = _top_p_filter(state["logits"][b] / temp)
+            hist = state["all"][b]
+            recent = hist[-REP_WIN:]
+            if recent:
+                idx = torch.tensor(sorted(set(recent)), device="cuda", dtype=torch.long)
+                probs[idx] /= REP_PEN
+            probs = _block_ngram(probs, hist)
+            if len(gen[b]) < MIN_NEW_TOKENS:
+                probs[EOS_ID] = 0.0
+            probs = probs / probs.sum().clamp_min(1e-12)
+            nxt = int(torch.multinomial(probs, 1).item())
+            if nxt == EOS_ID:
+                state["finished"][b] = True
+            else:
+                nxt_list[b] = nxt
+                gen[b].append(nxt)
+                hist.append(nxt)
+        ids = torch.tensor(nxt_list, device="cuda", dtype=torch.long).unsqueeze(1)  # [B, 1]
+        CURRENT_IDS = ids
+        out = model(input_ids=ids, use_cache=True, past_key_values=state["past"])
+        state["past"] = out.past_key_values
+        state["logits"] = out.logits[:, -1].float()
+        fed.append(nxt_list)
+        if (step + 1) % 10 == 0:
+            dt = time.time() - t0
+            print(
+                f"    ...{(step + 1) * B} tok ({dt / ((step + 1) * B):.2f} s/tok, "
+                f"i4x h/m={I4X_HIT}/{I4X_MISS})",
+                flush=True,
+            )
+            I4X_HIT = I4X_MISS = 0
+    return gen, fed
+
+
+@torch.no_grad()
+def ttt_flush(model, tstate, fed_steps):
+    """Teacher prefill (stepwise, feed-aligned) over the turn tokens, then
+    fire the RLS updates from the collected student rows."""
+    if not fed_steps:
+        return
+    global CURRENT_IDS, MODE
+    ids = torch.tensor(fed_steps, device="cuda", dtype=torch.long).t()  # [B, n] ONE batched prefill
+    CURRENT_IDS = ids
+    MODE = "teacher"
+    try:
+        out = model(input_ids=ids, use_cache=True, past_key_values=tstate.get("past"))
+        tstate["past"] = out.past_key_values
+    finally:
+        MODE = "student"
+    # attention: collected student rows vs teacher chunks (both step-major)
+    n_steps = len(fed_steps)
+    for li in list(ATTN_ADAPT.keys()):
+        chunks = SHADOW.pop(li, None)
+        rows = COLLECT_ATTN.pop(li, None)
+        if chunks and rows:
+            g_t = torch.cat(chunks)  # [B*n, Fin] stream-major (batched prefill flatten)
+            g_s = torch.cat(rows)    # [n*B, Fin] step-major -> reorder to stream-major
+            g_s = g_s.view(n_steps, -1, g_s.shape[-1]).transpose(0, 1).reshape(-1, g_s.shape[-1])
+            n = min(g_t.shape[0], g_s.shape[0])
+            if n > 1:
+                if n > ATTN_ROWS_CAP:
+                    sel = torch.arange(0, n, n // ATTN_ROWS_CAP, device=g_s.device)
+                else:
+                    sel = slice(None)
+                y_t = (g_t[sel].to(ATTN_ADAPT[li]["w0"].dtype) @ ATTN_ADAPT[li]["w0"].T).float()
+                attn_ttt_update(li, g_s[sel], y_t)
+                del y_t
+    # FFN: top experts by collected rows -> teacher pass -> RLS
+    per_layer: dict[int, list] = {}
+    for (li, k), v in COLLECT_FFN.items():
+        if v["x"]:
+            per_layer.setdefault(li, []).append((v["n"], k))
+    for li, lst in per_layer.items():
+        lst.sort(reverse=True)
+        for n, k in lst[:TTT_PER_LAYER]:
+            v = COLLECT_FFN[(li, k)]
+            x = torch.cat(v["x"])
+            h = torch.cat(v["h"])
+            y_t = _teacher_y(li, k, x)
+            ttt_update(li, k, h, y_t)
+            del y_t
+    COLLECT_FFN.clear()
 
 
 def run_evolve(model, tok, ttt_on, save_on, sessions_limit, session_sec, turns, gen_tokens, attn_window_w):
@@ -780,19 +989,48 @@ def run_evolve(model, tok, ttt_on, save_on, sessions_limit, session_sec, turns, 
                     )
                 )
 
-            # self-talk: the model continues its own thought stream
+            # session start: B streams continue the lineage thought (same prefix,
+            # diverging via sampling); teacher mirrors the prefix in its own KV
+            prefix = [BOS_ID] + ctx[-(EVOL_CTX - 1):]
+            ids0 = torch.tensor([prefix] * N_STREAMS, device="cuda", dtype=torch.long)
+            tstate: dict = {"past": None}
+            if ttt_on and len(prefix) > 1:
+                tstate["past"] = shadow_prefill(model, ids0, keep_past=True)
+            state = {"B": N_STREAMS, "past": None, "logits": None, "finished": [False] * N_STREAMS,
+                     "all": [list(prefix) for _ in range(N_STREAMS)]}
+            global CURRENT_IDS, COLLECT_USAGE, USAGE_T
+            for li in range(N_LAYERS):
+                USAGE_T[li] = torch.zeros(256, dtype=torch.long, device="cuda")
+            COLLECT_USAGE = True
+            CURRENT_IDS = ids0
+            out = model(input_ids=ids0, use_cache=True, past_key_values=None)
+            COLLECT_USAGE = False
+            state["past"] = out.past_key_values
+            state["logits"] = out.logits[:, -1].float()
+            del out
+            build_pins(prefix)  # routing-aware residency for this session's stream
+
+            fed_all = []
             for turn in range(turns):
                 temp = CURIOSITY_TEMP if turn % 2 == 1 else NORMAL_TEMP
-                new = gen_sample(model, ([BOS_ID] + ctx)[-EVOL_CTX:], gen_tokens, temp, shadow=ttt_on)
-                if not new:
-                    break
-                ctx = (ctx + new)[-EVOL_CTX:]
-                text = tok.decode(new[-60:])
+                gen, fed = gen_turn_b(model, state, gen_tokens, temp)
+                fed_all.extend(fed)
+                if ttt_on and ((turn + 1) % FLUSH_EVERY == 0 or turn == turns - 1):
+                    ttt_flush(model, tstate, fed_all)
+                    fed_all = []
+                text = tok.decode(gen[0][-60:]) if gen[0] else ""
                 if isinstance(text, bytes):
                     text = text.decode("utf-8", errors="replace")
                 snippet = " ".join(text.split())
-                print(f"  [turn {turn} T={temp}] ...{snippet}", flush=True)
+                alive = sum(1 for f in state["finished"] if not f)
+                print(f"  [turn {turn} T={temp} streams={alive}] ...{snippet}", flush=True)
+                if alive == 0:
+                    break
 
+            ctx = state["all"][0][-EVOL_CTX_KEEP:]  # stream 0 carries the lineage
+            global PINNED_BYTES
+            PINNED.clear()
+            PINNED_BYTES = 0
             n_exp = len(TTT_STATE)
             for (li, k) in list(TTT_STATE.keys()):
                 consolidate_and_save(li, k, enabled=save_on)
@@ -859,7 +1097,7 @@ def main():
             sessions_limit=_arg("--sessions", 0),
             session_sec=_arg("--session-sec", 60),
             turns=_arg("--turns", 6),
-            gen_tokens=_arg("--gen-tokens", 60),
+            gen_tokens=_arg("--gen-tokens", 16),
             attn_window_w=_arg("--attn-window", 8),
         )
         return
