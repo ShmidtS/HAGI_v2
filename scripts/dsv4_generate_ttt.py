@@ -64,15 +64,17 @@ ROUTED_SCALE = 1.5
 SWIGLU_LIMIT = 10.0
 BOS_ID = 0
 EOS_ID = 1
-GPU_HEADROOM = 8 * 1024**3
+GPU_HEADROOM = 12 * 1024**3
 
 # --- TTT knobs ---
-TTT_SAMPLE = 4  # FFN: update stats on every Nth expert call (teacher dequant cost)
+TTT_PER_LAYER = int(os.environ.get("TTT_PER_LAYER", "2"))  # experts TTT-updated per layer per prefill
 TTT_REFIT = 64  # exact solve after this many accumulated train rows
 TTT_ALPHA = 1000.0  # anchor weight (in "token" units) toward the current readout
 TTT_LAM = 0.9995  # forgetting factor
 TTT_MIN_GAIN = 0.02  # save only if honest-validation resid improves by >= 2% relative
-TTT_MAX_EXPERTS = 16  # live FFN RLS states (G/C ~48MB each) - LRU
+TTT_MAX_EXPERTS = int(os.environ.get("TTT_MAX_EXPERTS", "64"))  # live FFN RLS states (G/C ~48MB each) - LRU
+I4X_HIT = 0  # instrumentation
+I4X_MISS = 0
 TTT_ROWS_MAX = 2048  # max train rows kept per expert
 # --- attention TTT: o_b_proj readout (grouped ctx [.,8192] -> hidden 4096) ---
 TTT_ATTN_LAYERS = [int(v) for v in os.environ.get("TTT_ATTN_LAYERS", "0,1,2,3").split(",") if v != ""]
@@ -90,7 +92,9 @@ REP_WIN = 128
 MIN_NEW_TOKENS = 8  # do not allow EOS before this many tokens in a turn
 
 SAVE_ENABLED = True  # set from --no-save; gates persistence on eviction too
-INT4X_MAX = int(os.environ.get("INT4X_MAX", "32"))  # live int4x experts (~130MB each); LRU
+INT4X_MAX = int(os.environ.get("INT4X_MAX", "448"))  # live int4x experts (~128MB each); LRU
+DEQUANT_MAX = int(os.environ.get("DEQUANT_MAX", "320"))  # cached original experts (bf16 ~50MB each)
+ATTN_ROWS_CAP = 256  # max student rows per attention RLS update (strided subsample)
 
 MODE = "student"  # "teacher" during the shadow pass (hooks branch on this)
 SHADOW: dict[int, torch.Tensor | None] = {}  # li -> teacher grouped-ctx rows for current prefill
@@ -101,6 +105,7 @@ ROUTER_BIAS: dict[int, torch.Tensor] = {}
 ROUTER_TID: dict[int, torch.Tensor] = {}
 
 PACKED_CACHE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
+PACKED_MAX = int(os.environ.get("PACKED_MAX", "64"))
 CACHE_BYTES = 0
 SHARED_DEQUANT: dict[int, dict] = {}
 HIT = 0
@@ -111,7 +116,6 @@ TTT_STATE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
 ATTN_ADAPT: dict[int, dict] = {}  # L -> {"w": [4096,8192] fp32 adapted, "w0": bf16 ref to module weight}
 ATTN_STATE: collections.OrderedDict[int, dict] = collections.OrderedDict()
 ATTN_SAVE_LOG: list[str] = []
-TTT_ROWS = 0  # global counter for TTT_SAMPLE
 SAVE_LOG: list[str] = []
 
 
@@ -151,7 +155,7 @@ def get_expert_packed(li, k):
     CACHE_BYTES += sum(t.numel() * t.element_size() for t in d.values())
     free, _ = torch.cuda.mem_get_info()
     lim = max(0, free - GPU_HEADROOM)
-    while CACHE_BYTES > lim and len(PACKED_CACHE) > 1:
+    while (CACHE_BYTES > lim or len(PACKED_CACHE) > PACKED_MAX) and len(PACKED_CACHE) > 1:
         _, ev = PACKED_CACHE.popitem(last=False)
         CACHE_BYTES -= sum(t.numel() * t.element_size() for t in ev.values())
         del ev
@@ -159,6 +163,7 @@ def get_expert_packed(li, k):
 
 
 def get_shared_dequant(li):
+    """bf16 shared experts (halves per-token bandwidth vs fp32 decode)."""
     if li in SHARED_DEQUANT:
         return SHARED_DEQUANT[li]
     fp = os.path.join(LOSSLESS, f"layers_{li}_ffn.safetensors")
@@ -168,23 +173,75 @@ def get_shared_dequant(li):
         for proj in ("w1", "w2", "w3"):
             w = f.get_tensor(f"{base}.{proj}.weight")
             s = f.get_tensor(f"{base}.{proj}.scale")
-            d[proj] = de._decode(base, w, s)
+            d[proj] = de._decode(base, w, s).to(torch.bfloat16)
     SHARED_DEQUANT[li] = d
     return d
 
 
+DEQUANT_CACHE: collections.OrderedDict[tuple, tuple] = collections.OrderedDict()
+DEQUANT_BYTES = 0
+
+
+def get_dequant(li, k):
+    """Cached bf16 dequantized ORIGINAL expert (decode speed: per-token dequant
+    of FP4 experts was the bottleneck; bf16 halves bandwidth and doubles GEMM
+    throughput - teacher targets get ~0.4% bf16 rounding, acceptable)."""
+    global DEQUANT_BYTES
+    key = (li, k)
+    if key in DEQUANT_CACHE:
+        DEQUANT_CACHE.move_to_end(key)
+        return DEQUANT_CACHE[key]
+    p = get_expert_packed(li, k)
+    w1 = de.dequant_fp4(p["w1.weight"], p["w1.scale"]).to(torch.bfloat16)
+    w2 = de.dequant_fp4(p["w2.weight"], p["w2.scale"]).to(torch.bfloat16)
+    w3 = de.dequant_fp4(p["w3.weight"], p["w3.scale"]).to(torch.bfloat16)
+    DEQUANT_CACHE[key] = (w1, w2, w3)
+    DEQUANT_CACHE.move_to_end(key)
+    DEQUANT_BYTES += w1.numel() * 2 + w2.numel() * 2 + w3.numel() * 2
+    free, _ = torch.cuda.mem_get_info()
+    while (len(DEQUANT_CACHE) > DEQUANT_MAX or DEQUANT_BYTES > free - GPU_HEADROOM) and len(DEQUANT_CACHE) > 1:
+        _, ev = DEQUANT_CACHE.popitem(last=False)
+        DEQUANT_BYTES -= ev[0].numel() * 2 + ev[1].numel() * 2 + ev[2].numel() * 2
+        del ev
+    return DEQUANT_CACHE[key]
+
+
+POD_CACHE: dict[int, tuple] = {}
+POD_BF16: dict[int, torch.Tensor] = {}
+
+
+def _pod_bf16(li):
+    if li not in POD_BF16:
+        POD_BF16[li] = load_pod(li)[0].to(torch.bfloat16)
+    return POD_BF16[li]
+
+
+def get_w2_fp32(li, k):
+    """Materialize the fp32 adaptive readout (TTT-only path; decode never calls)."""
+    d = get_int4x(li, k)
+    if d["w2"] is None:
+        d["w2"] = d["w2b"].float()
+    return d["w2"]
+
+
 def load_pod(li):
+    if li in POD_CACHE:
+        return POD_CACHE[li]
     red = os.path.join(REDUCED, f"layer_{li}")
     P = torch.load(os.path.join(red, "P.pt"), map_location="cuda").float()
     mu = torch.load(os.path.join(red, "mu.pt"), map_location="cuda").float()
+    POD_CACHE[li] = (P, mu)
     return P, mu
 
 
 def get_int4x(li, k):
     """Dequantized int4x expert: frozen parts + current (possibly adapted) W2."""
+    global I4X_HIT, I4X_MISS
     key = (li, k)
     if key in INT4X:
+        I4X_HIT += 1
         return INT4X[key]
+    I4X_MISS += 1
     fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
     if not os.path.exists(fp):
         return None
@@ -193,21 +250,25 @@ def get_int4x(li, k):
         return None
     P, mu = load_pod(li)
     dev = "cuda"
-    q1 = unpack_binary(e["w1a"]).float().to(dev)
-    q3 = unpack_binary(e["w3a"]).float().to(dev)
-    q2 = unpack_int4(e["w2a"]).float().to(dev)
+    # unpack ON GPU (CPU unpack was the decode bottleneck on cache misses)
+    q1 = unpack_binary(e["w1a"].to(dev))
+    q3 = unpack_binary(e["w3a"].to(dev))
+    q2 = unpack_int4(e["w2a"].to(dev)).float()
     s1 = e["w1a_scale"].float().to(dev)
     s3 = e["w3a_scale"].float().to(dev)
     s2 = e["w2a_scale"].float().to(dev)
-    w2 = q2 * s2[:, None]  # continuous readout (adapted in place by TTT)
     d = {
-        "P": P,
+        # P/mu are SHARED per layer (pod tensors are big: no per-expert copies)
+        "P": _pod_bf16(li),
         "mu": mu,
-        "w1": q1 * s1[:, None],
-        "w3": q3 * s3[:, None],
+        "w1": (q1.float() * s1[:, None]).to(torch.bfloat16),
+        "w3": (q3.float() * s3[:, None]).to(torch.bfloat16),
         "b1": e["bias1a"].float().to(dev),
         "b3": e["bias3a"].float().to(dev),
-        "w2": w2,
+        # w2 fp32 kept LAZILY (only experts selected for TTT need it);
+        # forward uses the bf16 mirror
+        "w2": None,
+        "w2b": (q2 * s2[:, None]).to(torch.bfloat16),
         "residual": e.get("residual", float("inf")),
         "adapted": False,
     }
@@ -221,21 +282,17 @@ def get_int4x(li, k):
 
 
 def int4x_forward(d, x_rows):
-    """x_rows [n, 4096] raw -> h [n, 2048] via POD rotation + int4x expert."""
-    z = (x_rows - d["mu"]) @ d["P"]
-    g = soft_lim(z @ d["w1"].T + d["b1"])
-    u = soft_lim(z @ d["w3"].T + d["b3"])
-    return torch.nn.functional.silu(g) * u
+    """x_rows [n, 4096] raw fp32 -> h [n, 2048] fp32 (bf16 GEMMs inside)."""
+    xb = x_rows.to(torch.bfloat16)
+    z = (xb - d["mu"].to(torch.bfloat16)) @ d["P"]
+    g = soft_lim(z @ d["w1"].T + d["b1"].to(torch.bfloat16))
+    u = soft_lim(z @ d["w3"].T + d["b3"].to(torch.bfloat16))
+    return (torch.nn.functional.silu(g) * u).float()
 
 
 def _teacher_y(li, k, x_rows):
-    p = get_expert_packed(li, k)
-    w1 = de.dequant_fp4(p["w1.weight"], p["w1.scale"])
-    w2 = de.dequant_fp4(p["w2.weight"], p["w2.scale"])
-    w3 = de.dequant_fp4(p["w3.weight"], p["w3.scale"])
-    y = ffn(x_rows, w1, w2, w3)
-    del w1, w2, w3
-    return y
+    w1, w2, w3 = get_dequant(li, k)
+    return ffn(x_rows.to(torch.bfloat16), w1, w2, w3).float()
 
 
 def _new_state(w_anchor_T, Fin, alpha):
@@ -308,7 +365,7 @@ def ttt_touch(li, k):
         st = {
             "G": None,  # lazy: needs h energy scale from the first rows
             "C": None,
-            "Fin": INT4X[key]["w2"].shape[1],
+            "Fin": INT4X[key]["w2b"].shape[1],
             "H": [], "Y": [], "Hva": [], "Yva": [],
             "rows": 0, "since": 0, "refits": 0,
         }
@@ -320,7 +377,7 @@ def ttt_touch(li, k):
 def ttt_update(li, k, h_rows, y_rows):
     """FFN: anchored RLS against the original FP4 expert outputs."""
     st = ttt_touch(li, k)
-    w2 = INT4X[(li, k)]["w2"]
+    w2 = get_w2_fp32(li, k)
     if st["G"] is None:
         alpha = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ALPHA
         fresh = _new_state(w2.T, st["Fin"], alpha)
@@ -328,6 +385,7 @@ def ttt_update(li, k, h_rows, y_rows):
     ret = _rls_step(st, h_rows, y_rows, w2, w2)
     if ret is not None:
         INT4X[(li, k)]["adapted"] = True
+        INT4X[(li, k)]["w2b"].copy_(w2.to(torch.bfloat16))
     return ret
 
 
@@ -370,7 +428,7 @@ def consolidate_and_save(li, k, enabled=True):
     if not st["Hva"]:  # no honest validation rows -> refuse to decide
         return
     Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])
-    w2 = INT4X[key]["w2"]
+    w2 = get_w2_fp32(li, k)
     e = torch.load(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"), map_location="cpu", weights_only=False)
     q2_0 = unpack_int4(e["w2a"]).float().cuda()
     w2_static = q2_0 * e["w2a_scale"].float().cuda()[:, None]
@@ -493,8 +551,12 @@ def make_attn_hook(li, ttt_on):
             g_t = SHADOW[li]
             n = min(g.shape[0], g_t.shape[0])
             if n > 1:
-                y_t = (g_t[:n].to(ad["w0"].dtype) @ ad["w0"].T).float()
-                attn_ttt_update(li, g[:n], y_t)
+                if n > ATTN_ROWS_CAP:  # strided subsample, same rows in student/teacher
+                    sel = torch.arange(0, n, n // ATTN_ROWS_CAP, device=g.device)
+                else:
+                    sel = slice(None)
+                y_t = (g_t[sel].to(ad["w0"].dtype) @ ad["w0"].T).float()
+                attn_ttt_update(li, g[sel], y_t)
                 del y_t
             SHADOW[li] = None  # consumed; decode steps carry no shadow rows
         return out
@@ -503,9 +565,12 @@ def make_attn_hook(li, ttt_on):
 
 
 def make_hook(li, ttt_on):
-    """MoE routing hook. Teacher mode (shadow pass): original FP4 experts only,
-    no TTT - this IS the original model. Student mode: int4x experts where
-    checkpoints exist (with TTT), original FP4 elsewhere."""
+    """MoE routing hook. Teacher mode (shadow pass): original experts only, no
+    TTT - this IS the original model. Student mode: int4x experts where
+    checkpoints exist, original FP4 (cached bf16 dequant) elsewhere.
+    TTT runs ONLY at prefill (S>1), on the top TTT_PER_LAYER experts by routed
+    row count - decode steps carry zero TTT overhead (rows are recovered by the
+    next turn's prefill anyway)."""
     def hook(module, args, kwargs, output):
         x = args[0]
         B, S, D = x.shape
@@ -521,43 +586,44 @@ def make_hook(li, ttt_on):
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * ROUTED_SCALE
 
         sw = get_shared_dequant(li)
-        out = ffn(flat, sw["w1"], sw["w2"], sw["w3"])
+        flatb = flat.to(torch.bfloat16)
+        out = ffn(flatb, sw["w1"], sw["w2"], sw["w3"]).float()
 
         teacher = MODE == "teacher"
-        global TTT_ROWS
+        prefill = (not teacher) and S > 1 and ttt_on
+        cands = []  # (rows, k) TTT candidates at prefill
         for k in indices.unique().tolist():
             d = None if teacher else get_int4x(li, k)
             if d is not None:
-                h = None
-                out_k = None
+                m_any = (indices == k).any(dim=1)
+                h = int4x_forward(d, flat[m_any])
+                out_k = (h.to(torch.bfloat16) @ d["w2b"].T).float()  # [rows_any, D]
+                pos = torch.cumsum(m_any.long(), 0) - 1  # row -> position in xm
                 for kk in range(TOP_K):
                     m = indices[:, kk] == k
-                    if not m.any():
-                        continue
-                    xm = flat[m]
-                    if h is None:
-                        h = int4x_forward(d, xm)
-                        out_k = h @ d["w2"].T
-                    out[m] += weights[m, kk, None] * out_k
-                    if ttt_on:
-                        TTT_ROWS += 1
-                        if TTT_ROWS % TTT_SAMPLE == 0:
-                            y_t = _teacher_y(li, k, xm)
-                            ttt_update(li, k, h.float(), y_t.float())
-                            del y_t
-                del h, out_k
+                    if m.any():
+                        out[m] += weights[m, kk, None] * out_k[pos[m]]
+                if prefill:
+                    cands.append((int(m_any.sum()), k))
+                del h, out_k, m_any, pos
             else:
-                p = get_expert_packed(li, k)
-                w1 = de.dequant_fp4(p["w1.weight"], p["w1.scale"])
-                w2 = de.dequant_fp4(p["w2.weight"], p["w2.scale"])
-                w3 = de.dequant_fp4(p["w3.weight"], p["w3.scale"])
-                ek = ffn(flat, w1, w2, w3)
-                del w1, w2, w3
+                w1, w2, w3 = get_dequant(li, k)
+                ek = ffn(flat.to(torch.bfloat16), w1, w2, w3).float()
                 for kk in range(TOP_K):
                     m = indices[:, kk] == k
                     if m.any():
                         out[m] += weights[m, kk, None] * ek[m]
                 del ek
+
+        if cands:  # prefill TTT: hottest experts only, teacher = original FP4
+            cands.sort(reverse=True)
+            for rows, k in cands[:TTT_PER_LAYER]:
+                d = get_int4x(li, k)
+                m_any = (indices == k).any(dim=1)
+                h = int4x_forward(d, flat[m_any])
+                y_t = _teacher_y(li, k, flat[m_any])
+                ttt_update(li, k, h, y_t)
+                del h, y_t, m_any
 
         correct = out.to(x.dtype).reshape(B, S, D)
         del out, flat, scores, logits, indices, weights
@@ -633,7 +699,7 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
     """Autoregressive top-p sampling with repetition penalty; optional shadow
     teacher prefill (honest attention targets) before the student pass."""
     input_ids = torch.tensor([ids], device="cuda", dtype=torch.long)
-    if shadow:
+    if shadow and len(ids) > 1:
         shadow_prefill(model, input_ids)
     global CURRENT_IDS
     CURRENT_IDS = input_ids
@@ -641,6 +707,7 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
     past = out.past_key_values
     logits = out.logits[0, -1].float()
     generated: list[int] = []
+    _t0 = time.time()
     for _ in range(max_new):
         probs = _top_p_filter(logits / temp)
         recent = generated[-REP_WIN:]
@@ -655,6 +722,15 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
         if nxt == EOS_ID:
             break
         generated.append(nxt)
+        if len(generated) % 10 == 0:
+            global I4X_HIT, I4X_MISS
+            dt = time.time() - _t0
+            print(
+                f"    ...{len(generated)} tok ({dt/len(generated):.2f} s/tok, "
+                f"i4x h/m={I4X_HIT}/{I4X_MISS}, deq={len(DEQUANT_CACHE)}, packed={len(PACKED_CACHE)})",
+                flush=True,
+            )
+            I4X_HIT = I4X_MISS = 0
         CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
         out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
         past = out.past_key_values
@@ -751,6 +827,10 @@ def run_evolve(model, tok, ttt_on, save_on, sessions_limit, session_sec, turns, 
 
 
 def main():
+    try:  # generated text can contain any unicode; console/log pipe is cp1251
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     prompt = sys.argv[1] if len(sys.argv) > 1 else "Hello"
     max_new = int(sys.argv[2]) if len(sys.argv) > 2 else 24
     ttt_on = "--no-ttt" not in sys.argv
@@ -779,7 +859,7 @@ def main():
             sessions_limit=_arg("--sessions", 0),
             session_sec=_arg("--session-sec", 60),
             turns=_arg("--turns", 6),
-            gen_tokens=_arg("--gen-tokens", 200),
+            gen_tokens=_arg("--gen-tokens", 60),
             attn_window_w=_arg("--attn-window", 8),
         )
         return
