@@ -198,7 +198,7 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
     # one re-LS of W1/W3 scales + biases at the QUANTIZED W2
     bounds = [0, z_rows.shape[1]]
     res = (q1, s1, q3, s3, q2, s2, bias1, bias3, bounds)
-    return res
+    return res, W2c
 
 
 def resid_weights_full(z, y_full, res):
@@ -937,7 +937,11 @@ def run_refit(
             w3_rot = w3 @ P
             bias1 = mu.reshape(-1) @ w1.T  # [inter] (mu is [1,K] -> flatten)
             bias3 = mu.reshape(-1) @ w3.T
-            fp4_init = (w1_rot[None].contiguous(), w3_rot[None].contiguous(), w2[None].contiguous())
+            # PTQ FIRST, gradient on top: replace the FP4 W2 with the exact
+            # ridge-solved readout on this expert's own rows (~1s), then let the
+            # gradient pass refine signs/scales/W2 from a fitted starting point.
+            _res0, w2c = ptq_closed_form(w1_rot, w3_rot, w2, z, yf, bias1, bias3)
+            fp4_init = (w1_rot[None].contiguous(), w3_rot[None].contiguous(), w2c[None].contiguous())
             del experts
             z_all_rows = z.shape[0]
             todo_data[k] = (z, yf)
@@ -1022,7 +1026,7 @@ def run_refit(
                 # AngelSlim-style closed-form PTQ in ~1s; keep whichever is better
                 w1f, w3f, w2f = init_gpu[0][0], init_gpu[1][0], init_gpu[2][0]
                 try:
-                    res_ptq = ptq_closed_form(
+                    res_ptq, _w2c = ptq_closed_form(
                         w1f, w3f, w2f, z_all_gpu[:n_rows], y_all_gpu[:n_rows],
                         p["bias1"].cuda().float(), p["bias3"].cuda().float(),
                     )
@@ -1060,6 +1064,19 @@ def run_refit(
             del experts, x_synth
             todo_data[p["k"]] = (torch.cat([z, z_synth]), torch.cat([yf, y_synth]))
             p["z_all_rows"] = todo_data[p["k"]][0].shape[0]
+            # PTQ warm-init on the FULL (real+synthetic) rows: the continuous W2
+            # starts exact-fitted instead of the raw FP4 readout
+            try:
+                b1g = p["bias1"].cuda().float()
+                b3g = p["bias3"].cuda().float()
+                z_all, y_all = todo_data[p["k"]]
+                _r0, w2c = ptq_closed_form(w1 @ P, w3 @ P, w2, z_all, y_all, b1g, b3g)
+                init_l = list(p["init"])
+                init_l[2] = w2c[None].to(torch.bfloat16).cpu()
+                p["init"] = tuple(init_l)
+                del w2c
+            except Exception as ex:  # noqa: BLE001 - init stays FP4 on failure
+                print(f"    [ptq-init] {p['k']} failed: {ex}", flush=True)
             _run_expert(p)
 
         for k, z, yf, _e_prev in missing_todo:
@@ -1074,7 +1091,8 @@ def run_refit(
             y_rows = ffn_exact(x_rows, w1, w2, w3)
             bias1 = mu.reshape(-1) @ w1.T
             bias3 = mu.reshape(-1) @ w3.T
-            init = (w1 @ P, w3 @ P, w2)
+            _r0, w2c0 = ptq_closed_form(w1 @ P, w3 @ P, w2, z_rows, y_rows, bias1.float(), bias3.float())
+            init = (w1 @ P, w3 @ P, w2c0)
             del experts, x_rows
             res = train_batch(
                 [(z_rows, y_rows)],
@@ -1091,7 +1109,7 @@ def run_refit(
             resid = resid_weights_full(z_rows, y_rows, res)
             if resid > PTQ_FALLBACK:
                 try:
-                    res_ptq = ptq_closed_form(
+                    res_ptq, _w2c = ptq_closed_form(
                         (w1 @ P), (w3 @ P), w2, z_rows, y_rows,
                         bias1.float(), bias3.float(),
                     )
