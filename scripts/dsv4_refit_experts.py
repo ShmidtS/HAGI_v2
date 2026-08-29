@@ -212,9 +212,21 @@ def _gptq_groups(W, H, s_groups, gs=128, block=128, jit=1e-3):
     Wp = W[:, perm].clone()
     Hp = H[perm][:, perm]
     eye = torch.eye(in_, device=W.device)
-    Hi = torch.linalg.cholesky(Hp + jit * Hp.diag().mean() * eye)
-    Hi = torch.cholesky_inverse(Hi)
-    Hi = torch.linalg.cholesky(Hi + jit * Hi.diag().mean() * eye, upper=True)
+    # adaptive jitter: thin experts (n < in_) give rank-deficient h-Hessians;
+    # escalate damping x100 until PD
+    dmean = Hp.diag().mean().clamp_min(1e-12)
+    jit_i = jit
+    for _ in range(5):
+        try:
+            Hi = torch.linalg.cholesky(Hp + jit_i * dmean * eye)
+            Hi = torch.cholesky_inverse(Hi)
+            Hi = torch.linalg.cholesky(Hi + jit_i * Hi.diag().mean().clamp_min(1e-12) * eye, upper=True)
+            break
+        except Exception:
+            jit_i *= 100.0
+            torch.cuda.empty_cache()
+    else:
+        raise RuntimeError(f"_gptq_groups: Hessian not PD even at jit={jit_i}")
     Q = torch.zeros_like(Wp)
     for c0 in range(0, in_, block):
         c1 = min(c0 + block, in_)

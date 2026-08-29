@@ -101,27 +101,40 @@ at full rank (K=4096).
 
 ### Current compression (per expert)
 
-Each 4096→4096 routed expert is replaced by a full-rank, two-stage ternary
-SwiGLU block — no POD bottleneck, no output basis:
+Each 4096→4096 routed expert is replaced by a mixed-precision full-rank
+block — no POD bottleneck, no output basis:
 
 ```
-z = (x - mu) @ P            # per-layer mean-centring + orthogonal rotation
-g = silu(z @ W1) * (z @ W3) # two-stage ternary SwiGLU, inter = 2048
-y = g @ W2                  # identity output (4096 → 4096, no Q)
+z = (x - mu) @ P                        # per-layer mean-centring + orthogonal rotation
+g = soft_lim(z @ W1ᵀ + b1)              # W1: BINARY ±1, per-row scale (mean|w|)
+u = soft_lim(z @ W3ᵀ + b3)              # W3: BINARY ±1, per-row scale
+y = (silu(g) * u) @ W2ᵀ                 # W2: int4 grid ±7, per-(row,g128) scales, GPTQ
 ```
 
-- **P** [4096×4096] fp32 — per-layer orthogonal rotation (whitening only, no
-  dimensionality reduction); **mu** [1×4096] per-layer input mean.
-- **W1, W3, W2** are ternary {−1, 0, +1}, each stored as a **sum of two
-  ternary matrices** (`W` + `W_q2·scale2`) for finer precision, packed
-  5 trits/byte, `inter = 2048`.
-- The output is **identity** (kp = 4096 = D): the int4-QAT output basis Q was
-  abandoned once the model ran at full rank — it added a bottleneck with no
-  benefit there.
+- **P** [4096×4096] fp32 — per-layer orthogonal rotation (whitening only);
+  **mu** [1×4096] folded into the biases b1/b3.
+- **W1, W3** (gate/up): **binary ±1**, 1 bit/weight, per-row fp32 scale
+  (mean|w| — the LS-optimal scale). Signs are taken from exact FP32 rotated
+  weights with a tie-break (FP4 weights contain exact 0s; `sign(0)=0` is
+  unstorable and previously corrupted saved files silently).
+- **W2** (down): **int4 grid ±7**, 4 bits/weight, per-(row, group-of-128)
+  LS-refined scales [4096×16] fp32, quantized with **GPTQ/LDLQ error
+  feedback** over the activation Hessian `H = hᵀh / n` (h computed with the
+  already-quantized W13). GPTQ minimizes the *functional* output error, not
+  the weight error — this removed W2 as the dominant error source.
+- Adaptive Cholesky jitter for thin experts (n < 2048 rows → rank-deficient
+  Hessian); mode marker `i1i4` stored in each file.
 
-**Honest residual (full 4096-dim, weighted MSE(y_pred,y)/MSE(y,0))**: ~0.6–0.9%
-per expert (measured on the current refit). The earlier "≤0.01%" figure was a
-reduced 384-dim output-space loss and is not comparable.
+**Size**: 6.6 MB/expert vs 12.6 MB FP4 = **1.91× compression** of the routed
+expert mass (97%+ of model parameters).
+
+**Honest quality** (norm error ‖y_pred−y‖/‖y‖ per expert, measured on real
+activations): median ~13–16%; thin/dead experts better. Note the refit logs
+report *squared* MSE-ratio (≈0.1–2.7%), take sqrt for norm error. The floor
+of this scheme is the binary W13 contribution (12.4%); the W2 int4
+contribution was 13.6% with naive CD quantization and is now ~0 thanks to
+GPTQ. An eps-injection benchmark (noise added to FP4 expert outputs) showed
+5–10% → clean text, 15% → still coherent, 20%+ → degradation.
 
 ### The actual VRAM lever: int8 quantization
 
@@ -140,39 +153,64 @@ older tokens are channel-truncated per
 `r(d) = clamp(512 >> ⌊log2(d/1024 + 1)⌋, 32, 512)` (base 512, window 1024,
 min 32).
 
-### Tried and rejected
+### Tried and rejected (quantization search)
+
+The scheme above is the measured Pareto optimum at ~2× on scalar grids;
+alternatives were prototyped and rejected by measurement:
 
 - **SVD / low-rank on weights** — flat spectrum, nothing to keep.
 - **Low-rank POD on activations (K=512)** — ~40% energy loss out-of-sample.
 - **int4-QAT output basis Q** — bottleneck with no benefit at full rank.
 - **KV-cache low-rank POD (512→256)** — replaced by int8 (both 2×, int8 loses less).
 - **Linear re-mixing (Hadamard / DFT-3 / Procrustes)** — orthogonal experts stay orthogonal.
-- **bf16 output basis** — loses too much precision vs int8.
-- **warm-init ternary** — worse than random init.
-- **fp8 output basis** — 0.165% vs int8's 0.012% at identical size.
+- **E8-lattice quantization (GLQ/QuIP#-style)** — 36.8% norm error, worse than int4.
+- **Spherical VQ @ 2.25 bpw** — 39.2% (rate-distortion limit: 2.25 bits ≠ 4 bits).
+- **2-stage VQ @ ~4.25 bpw** — 15.3% but needs per-group fp16 scales → int8-size
+  footprint, an accounting illusion.
+- **2/3-bit W13 grids** — no gain over binary (12–13% vs 12.4% floor).
+- **Per-column / finer W13 scales** — helped in an unstorable format only;
+  honest group scales on W13 ≈ +0.1%.
+- **Low-rank correction of the W2 quantization delta** — diffuse spectrum, dead end.
+- **Naive (CD/RTN) int4 W2** — 13.6% contribution from W2 alone; replaced by GPTQ.
+- **Gradient-trained signs (2-stage ternary era)** — better W13 (7.4% vs 12.4%)
+  at the same size; kept as the next quality step on top of GPTQ-W2.
+- **bf16 output basis**, **warm-init ternary**, **fp8 output basis** — as before.
+
+Cross-validated against industry recipes: the Tencent/AngelSlim Hy4 GGUF
+(ternary 3:4-sparse gate/up ~1.3–2 bpw, down-projection deliberately ~2 levels
+higher "because it writes straight into the residual stream", LS scales
+instead of amax = 90% of their PTQ win, per-layer sensitivity split) matches
+our mixed-precision layout and our LS-scale choices.
 
 ### Status
 
-The refit is **in progress**: 239 / 11008 experts across 3 layers are done so
-far. Reduced-model generation is not yet wired up (the old
-`dsv4_generate_reduced.py` was removed); generation currently runs the exact
-model from `lossless_layers`.
+Full refit of all 43 layers in the `i1i4` format (bin W13 + int4 GPTQ W2) is
+**in progress** (v19b; ~20/43 layers done, ~270 s/layer). Generation runs
+from the compressed expert files via `scripts/dsv4_generate_ttt.py`
+(`INT4X_OFF=1` switches to the FP4 baseline for A/B checks). The e2e text
+quality gate on the compressed model is the next milestone; the eps-injection
+benchmark predicts coherence at the measured per-expert error levels. On top
+of the persisted files, the same pipeline supports **TTT (anchored RLS
+"eternal thinking")** updates and `--evolve` self-talk sessions.
 
 ### Pipeline
 
 ```
 lossless_layers/{layer}_ffn.safetensors   (FP4 routed experts)
-        │  dsv4_experts.py (dequant_fp4, load_selected_experts)
+        │  dsv4_experts.py (dequant_fp4, load_selected_experts, pack/unpack intN/binary)
         ▼
-dsv4_refit_experts.py <L>   ── exact x/y → two-stage ternary fit (full 4096-dim)
+dsv4_refit_experts.py <L>   ── exact x/y → bin W13 + GPTQ int4 W2 (mode i1i4, 6.6 MB/expert)
         ▼
 dsv4_reduced/layer_<L>/P.pt, mu.pt, expert_<k>.pt
+        ▼
+dsv4_generate_ttt.py        ── decode from packed files on the fly (+ TTT/evolve)
 ```
 
 Key scripts:
 
-- `scripts/dsv4_experts.py` — shared decode / load / ternary pack-unpack utilities.
-- `scripts/dsv4_refit_experts.py` — per-expert full-rank two-stage ternary refit.
-- `scripts/dsv4_collect_all_tokens.py` / `dsv4_collect_attention.py` — activation / KV collection.
-- `scripts/dsv4_kvcache_int8.py` — int8 KV-cache (+ pyramid sliding window).
-- `scripts/dsv4_generate_fast.py` / `dsv4_generate_real.py` — exact-model generation.
+- `scripts/dsv4_experts.py` — shared decode / load / bit-pack utilities
+  (binary, int4, n-bit, int6).
+- `scripts/dsv4_refit_experts.py` — per-expert PTQ refit: binary W13,
+  GPTQ W2 over the activation Hessian (`W13_BITS`/`W2_BITS`/`W2_GPTQ` env).
+- `scripts/dsv4_generate_ttt.py` — generation from compressed files
+  (`INT4X_OFF=1` → FP4 baseline; `EXPERT_NOISE=ε` → noise benchmark).

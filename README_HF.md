@@ -10,7 +10,9 @@ tags:
   - deepseek-v4
   - moe
   - compression
-  - ternary
+  - quantization
+  - gptq
+  - int4
   - int8
   - kv-cache
   - long-context
@@ -30,10 +32,11 @@ A **lossy-compressed** derivative of
 > published and the reduced model is not yet fully assembled. The description
 > below reflects the current design, not a released artifact.
 
-Every routed FFN expert is replaced by a compact
-**full-rank two-stage ternary SwiGLU** block, and the KV cache is stored in
-**int8** with a **distance-dependent (pyramid) sliding window**, so the
-context grows to 2M tokens **without raising the YaRN factor**.
+Every routed FFN expert is replaced by a compact **mixed-precision
+full-rank SwiGLU** block (binary gate/up + GPTQ int4 down, ~1.9× smaller than
+the FP4 original), and the KV cache is stored in **int8** with a
+**distance-dependent (pyramid) sliding window**, so the context grows to 2M
+tokens **without raising the YaRN factor**.
 
 ## Core idea: each expert is a communication channel
 
@@ -48,55 +51,61 @@ factored). The activations are *almost* full-rank: an earlier "top-512 =
 99.93%" claim was an overfit artifact of a 3000-token sample; the honest
 spectrum (259072 tokens) gives ~59% energy at K=512 (≈41% out-of-sample) and
 ~95% only at K=3072. So the compression keeps the **full 4096-dim rank** and
-instead uses a **two-stage ternary** kernel for the size win.
+wins the size via **mixed-precision quantization**: binary gate/up + int4
+down with GPTQ error feedback.
 
 ## What's inside
 
 | Component | Format | Notes |
 | ----------- | -------- | ------- |
 | Skeleton (non-expert weights) | `model.safetensors` + `config.json` | 16.69 GB |
-| Routed experts (43 × 256) | `dsv4_reduced/layer_{L}/expert_{k}.pt` | two-stage ternary |
+| Routed experts (43 × 256) | `dsv4_reduced/layer_{L}/expert_{k}.pt` | bin W13 + int4 W2, mode `i1i4` |
 | Per-layer rotation + mean | `P.pt` [4096,4096], `mu.pt` [1,4096] | fp32, per layer |
 | int8 KV scales | `kv_int8_scales.pt` (43 × 512) | per-channel, RoPE-safe |
 
-### Expert format (per expert)
+### Expert format (per expert, 6.6 MB vs 12.6 MB FP4 = 1.91×)
 
 ```text
-P              [4096, 4096]  fp32    per-layer orthogonal rotation (whitening)
-mu             [1, 4096]     fp32    per-layer input mean
-w1, w3         [2048, 820]   uint8   ternary gate/up, packed 5 trits/byte (inter=2048)
-w1_q2, w3_q2   [2048, 820]   uint8   second ternary stage (residual refinement)
-w2             [4096, 410]   uint8   ternary down, packed (inter=2048)
-w2_q2          [4096, 410]   uint8   second ternary stage
-scales         [...]         fp32    per-row scale for each stage
+w1a, w3a   [2048, 512]  uint8   binary ±1 gate/up, 1 bit/weight (4096 in)
+w1a_scale, w3a_scale [2048] fp32  per-row LS scale (mean|w|)
+w2a        [4096, 1024] uint8   int4 grid ±7 down, 4 bits/weight (2048 in)
+w2a_scale  [4096, 16]   fp32   per-(row, group-of-128) LS scales
+bias1a, bias3a [2048]   fp32   mu folded in
+bounds, inter, mode     —       full-rank split, mode marker "i1i4"
 ```
 
 Forward per routed expert:
 
 ```text
 z = (x - mu) @ P                 # 4096 → 4096 (rotation only)
-g = silu(z @ W1) * (z @ W3)      # two-stage ternary SwiGLU, inter = 2048
-y = g @ W2                       # 4096 → 4096 (identity output)
+g = soft_lim(z @ W1ᵀ + b1)       # binary gate, per-row scale
+u = soft_lim(z @ W3ᵀ + b3)       # binary up, per-row scale
+y = (silu(g) * u) @ W2ᵀ          # int4 down (decoded from packed on the fly)
 ```
-
-Each ternary weight `W` is a **sum of two ternary matrices**
-`W = W_q · s + W_q2 · s2`, which roughly halves the residual versus a single
-ternary matrix at the same bit cost.
 
 ## Compression method
 
 1. **Full-rank rotation** — per-layer orthogonal `P [4096,4096]` + mean
    `mu` whiten the FFN inputs; no dimensionality reduction (POD was rejected).
-2. **Two-stage ternary SwiGLU kernel** — `z → silu(z·W1)·(z·W3)·W2` with
-   `W1,W3,W2 ∈ {−1,0,1}` (packed 5 trits/byte), `inter = 2048`, each weight a
-   sum of two ternary stages. Trained with straight-through estimator + Muon
-   (zeropower) optimizer, bf16 autocast.
-3. **Identity output** — `kp = 4096`, no output basis. The int4-QAT output
-   basis Q was abandoned once the model ran at full rank.
+   `mu` is folded into the gate/up biases.
+2. **Binary gate/up (W1, W3)** — ±1 with per-row fp32 scale (the LS-optimal
+   `mean|w|`); signs from exact FP32 rotated weights with a tie-break
+   (FP4 zeros must not become a silent `-1`).
+3. **GPTQ int4 down (W2)** — int4 grid ±7 with per-(row, group-128) LS
+   scales, quantized with **LDLQ sequential error feedback** over the
+   activation Hessian `hᵀh` from real text (h computed with the quantized
+   W13 already in place). GPTQ minimizes the *functional* expert output
+   error — with naive rounding W2 alone contributed 13.6% norm error;
+   GPTQ removes essentially all of it.
+4. **Identity output** — `kp = 4096`, no output basis (the int4-QAT basis Q
+   was abandoned once the model ran at full rank).
 
-**Per-expert quality (full 4096-dim, weighted MSE(y_pred,y)/MSE(y,0)):**
-~0.6–0.9% residual (measured on the current refit). Earlier "≤0.01%" figures
-were a reduced 384-dim output-space loss and are not comparable.
+**Per-expert quality** (norm error ‖y_pred−y‖/‖y‖ on real activations):
+median ~13–16%, dominated by the binary-W13 floor (~12.4%). A noise-injection
+benchmark on the FP4 model (ε added to expert outputs) showed 5–10% → clean
+text, 15% → still coherent, 20%+ → degradation; the measured levels sit
+inside the coherent band. E2E text quality gate on the compressed model is
+the current milestone.
 
 ## Attention: int8 KV-cache + pyramid for 2M context
 
@@ -113,15 +122,19 @@ The context is extended **without YaRN extrapolation**:
 ## Usage
 
 ```python
-# Utilities: scripts/dsv4_experts.py (decode / load / ternary pack-unpack),
-# and the refit in scripts/dsv4_refit_experts.py. Generation currently runs
-# the EXACT model from lossless_layers via scripts/dsv4_generate_fast.py /
-# dsv4_generate_real.py. Reduced-model generation is not yet wired up.
+# Utilities: scripts/dsv4_experts.py (decode / load / bit-pack: binary,
+# int4, n-bit, int6), refit in scripts/dsv4_refit_experts.py
+# (env: W13_BITS=1 W2_BITS=4 W2_GPTQ=1). Generation from compressed files:
+# scripts/dsv4_generate_ttt.py  (INT4X_OFF=1 -> FP4 baseline A/B,
+#                                EXPERT_NOISE=eps -> noise benchmark)
+# TTT (anchored RLS "eternal thinking") and --evolve self-talk run on top
+# of the same persisted expert files.
 ```
 
 ## Limitations
 
-- Lossy: per-expert residual ~0.6–0.9% (full 4096-dim).
-- Refit is in progress (239 / 11008 experts across 3 layers); the reduced
-  model is not yet assembled or generating.
-- Custom ternary dequant on read — not a drop-in GGUF.
+- Lossy: per-expert norm error ~13–16% (median, real activations); the
+  e2e text-quality gate on the compressed model is still pending.
+- Refit is in progress (v19b, ~20/43 layers done in the `i1i4` format).
+- Custom packed format (mode marker per file) — not a drop-in GGUF; decode
+  from packed tensors on the fly.
