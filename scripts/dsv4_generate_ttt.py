@@ -72,6 +72,7 @@ TTT_REFIT = 64  # exact solve after this many accumulated train rows
 TTT_ALPHA = 1000.0  # anchor weight (in "token" units) toward the current readout
 TTT_LAM = 0.9995  # forgetting factor
 TTT_MIN_GAIN = 0.02  # save only if honest-validation resid improves by >= 2% relative
+TTT_DELTA_RANK = int(os.environ.get("TTT_DELTA_RANK", "128"))  # low-rank persist of the W2 adaptation
 TTT_MAX_EXPERTS = int(os.environ.get("TTT_MAX_EXPERTS", "64"))  # live FFN RLS states (G/C ~48MB each) - LRU
 I4X_HIT = 0  # instrumentation
 I4X_MISS = 0
@@ -313,6 +314,11 @@ def get_int4x(li, k):
         "residual": e.get("residual", float("inf")),
         "adapted": False,
     }
+    d["adapted"] = False
+    if e.get("ttt_A") is not None:  # persisted low-rank TTT delta (previous sessions)
+        dA = e["ttt_A"].float()
+        dB = e["ttt_B"].float()
+        d["w2b"] = (d["w2b"].float() + dA @ dB.T).to(torch.bfloat16)
     INT4X[key] = d
     while len(INT4X) > INT4X_MAX:
         ev = next((kk for kk in INT4X if kk not in TTT_STATE and kk not in PINNED), None)
@@ -469,36 +475,44 @@ def consolidate_and_save(li, k, enabled=True):
     if not st["Hva"]:  # no honest validation rows -> refuse to decide
         return
     Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])
-    w2 = get_w2_fp32(li, k)
+    w2 = get_w2_fp32(li, k)  # adapted continuous readout
     e = torch.load(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"), map_location="cpu", weights_only=False)
     q2_0 = unpack_int4(e["w2a"]).float().cuda()
-    w2_static = q2_0 * e["w2a_scale"].float().cuda()[:, None]
+    w2_base = q2_0 * e["w2a_scale"].float().cuda()[:, None]
     del q2_0
-    r_static = _resid(w2_static, Hh, Yh)
+    # baseline = current file state (int4 + any previously persisted delta)
+    dA0, dB0 = e.get("ttt_A"), e.get("ttt_B")
+    old_delta = dA0.float().cuda() @ dB0.float().cuda().T if dA0 is not None else 0.0
+    w2_cur = w2_base + old_delta
+    r_cur = _resid(w2_cur, Hh, Yh)
     r_cont = _resid(w2, Hh, Yh)
-    q, a = snap_int4(w2)
-    r_cons = _resid(q * a[:, None], Hh, Yh)
-    if r_cons > r_static:  # snap worse than current file -> keep the file
-        r_cons = r_static
-        q, a = snap_int4(w2_static)
-    improved = (r_static - r_cons) / r_static
+    # full delta vs the int4 base (fold the previous delta in: cumulative lineage)
+    total = (w2 - w2_cur) + old_delta
+    r = min(TTT_DELTA_RANK, total.shape[1] - 1)
+    U, S, V = torch.svd_lowrank(total, q=min(r + 8, total.shape[1] - 1), niter=4)
+    A = (U[:, :r] * S[:r])   # [4096, r]
+    B = V[:, :r]             # [2048, r]
+    w2_new = w2_base + A @ B.T
+    r_new = _resid(w2_new, Hh, Yh)
+    improved = (r_cur - r_new) / max(r_cur, 1e-12)
     print(
         f"  [ttt] L{li} k{k}: rows={st['rows']} refits={st['refits']} val "
-        f"static={r_static*100:.3f}% cont={r_cont*100:.3f}% cons={r_cons*100:.3f}% "
+        f"cur={r_cur*100:.3f}% cont={r_cont*100:.3f}% lowrank(r={r})={r_new*100:.3f}% "
         f"(gain {improved*100:+.1f}%)",
         flush=True,
     )
     if not enabled or improved < TTT_MIN_GAIN:
         return
     fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
-    e["w2a"] = de.pack_int4(q.cpu())
-    e["w2a_scale"] = a.cpu()
-    e["residual"] = r_cons
-    e["ttt"] = {"rows": st["rows"], "refits": st["refits"], "static": r_static, "cons": r_cons}
+    e["ttt_A"] = A.half().cpu()
+    e["ttt_B"] = B.half().cpu()
+    e["residual"] = r_new
+    e["ttt"] = {"rows": st["rows"], "refits": st["refits"], "cur": r_cur, "new": r_new, "rank": r}
     tmp = fp + ".tmp"
     torch.save(e, tmp)
     os.replace(tmp, fp)
-    SAVE_LOG.append(f"L{li}_{k}: {r_static*100:.3f}% -> {r_cons*100:.3f}%")
+    I4X_PACKED.pop((li, k), None)  # drop stale packed entry (it has no delta)
+    SAVE_LOG.append(f"L{li}_{k}: {r_cur*100:.3f}% -> {r_new*100:.3f}%")
     print(f"  [ttt] SAVED {fp}", flush=True)
 
 
