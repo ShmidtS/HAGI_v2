@@ -34,6 +34,7 @@ K = 4096
 INTER = 2048
 D = 4096
 NSUB = 1  # int4x: single full-K sub; W13 binary (1 bit), W2 int4 (4 bits) - 6.3 MB/expert
+DIRECT_PTQ_MAX = int(os.environ.get("DIRECT_PTQ_MAX", "64"))  # n_real below this -> closed-form PTQ only, no gradient
 POD = "checkpoints_dsv4/pod_all_tokens"
 REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
@@ -1101,19 +1102,30 @@ def run_refit(
             del experts, x_synth
             todo_data[p["k"]] = (torch.cat([z, z_synth]), torch.cat([yf, y_synth]))
             p["z_all_rows"] = todo_data[p["k"]][0].shape[0]
-            # PTQ warm-init on the FULL (real+synthetic) rows: the continuous W2
-            # starts exact-fitted instead of the raw FP4 readout
-            try:
-                b1g = p["bias1"].cuda().float()
-                b3g = p["bias3"].cuda().float()
-                z_all, y_all = todo_data[p["k"]]
-                _r0, w2c = ptq_closed_form(w1 @ P, w3 @ P, w2, z_all, y_all, b1g, b3g)
-                init_l = list(p["init"])
-                init_l[2] = w2c[None].to(torch.bfloat16).cpu()
-                p["init"] = tuple(init_l)
-                del w2c
-            except Exception as ex:  # noqa: BLE001 - init stays FP4 on failure
-                print(f"    [ptq-init] {p['k']} failed: {ex}", flush=True)
+            # PTQ on the FULL (real+synthetic) rows
+            b1g = p["bias1"].cuda().float()
+            b3g = p["bias3"].cuda().float()
+            z_all, y_all = todo_data[p["k"]]
+            _r0, w2c = ptq_closed_form(w1 @ P, w3 @ P, w2, z_all, y_all, b1g, b3g)
+            if p["n_k"] < DIRECT_PTQ_MAX:
+                # thin coverage: the gradient pass never beats the closed form
+                # here (measured: PTQ 4.7-5.8% vs gradient stuck 40-68%) - save
+                # it directly, zero training steps
+                resid = resid_weights_full(z_all, y_all, _r0)
+                save_expert(p["k"], resid, _r0, INTER, n_real=p["n_k"])
+                n_fixed += 1
+                print(
+                    f"  layer {L} expert {p['k']} [direct-ptq, n={p['n_k']}]: "
+                    f"resid={resid * 100:.4f}%  ({n_fixed} total, {time.time() - t0:.0f}s)",
+                    flush=True,
+                )
+                todo_data.pop(p["k"], None)
+                torch.cuda.empty_cache()
+                continue
+            init_l = list(p["init"])
+            init_l[2] = w2c[None].to(torch.bfloat16).cpu()
+            p["init"] = tuple(init_l)
+            del w2c
             _run_expert(p)
 
         for k, z, yf, _e_prev in missing_todo:
@@ -1128,34 +1140,11 @@ def run_refit(
             y_rows = ffn_exact(x_rows, w1, w2, w3)
             bias1 = mu.reshape(-1) @ w1.T
             bias3 = mu.reshape(-1) @ w3.T
-            _r0, w2c0 = ptq_closed_form(w1 @ P, w3 @ P, w2, z_rows, y_rows, bias1.float(), bias3.float())
-            init = (w1 @ P, w3 @ P, w2c0)
+            _r0, _w2c0 = ptq_closed_form(w1 @ P, w3 @ P, w2, z_rows, y_rows, bias1.float(), bias3.float())
             del experts, x_rows
-            res = train_batch(
-                [(z_rows, y_rows)],
-                INTER,
-                steps,
-                stop_threshold=refit_threshold,
-                n_real=[0],
-                use_compile=use_compile,
-                init=tuple(t[None].contiguous().float() for t in init),
-                real_weight=1.0,
-                bias1=bias1.float()[None],
-                bias3=bias3.float()[None],
-            )[0]
+            # dead experts: closed-form PTQ directly, zero training steps
+            res = _r0
             resid = resid_weights_full(z_rows, y_rows, res)
-            if resid > PTQ_FALLBACK:
-                try:
-                    res_ptq, _w2c = ptq_closed_form(
-                        (w1 @ P), (w3 @ P), w2, z_rows, y_rows,
-                        bias1.float(), bias3.float(),
-                    )
-                    resid_ptq = resid_weights_full(z_rows, y_rows, res_ptq)
-                    if resid_ptq < resid:
-                        res, resid = res_ptq, resid_ptq
-                        print(f"    [ptq-fallback] dead {k}: {resid*100:.3f}%", flush=True)
-                except Exception as ex:  # noqa: BLE001
-                    print(f"    [ptq-fallback] dead {k} failed: {ex}", flush=True)
             save_expert(k, resid, res, INTER, n_real=0)
             n_fixed += 1
             print(
