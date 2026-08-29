@@ -28,6 +28,9 @@ from dsv4_experts import (
     load_selected_experts,
     pack_binary,
     pack_int4,
+    pack_nbit,
+    pack_int6,
+    LEVELS,
 )
 
 K = 4096
@@ -40,7 +43,9 @@ POD = "checkpoints_dsv4/pod_all_tokens"
 REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
-MODE_MARKER = "int4x"  # binary W13 + int4 W2, single sub (post-hoc binary S=4+W2-1b was 21.1% vs this 9.9% pre-train)
+W13_BITS = int(os.environ.get("W13_BITS", "2"))  # 1=binary, 2={-3,-1,1,3}, 3={-3..3}, 4=int4
+W2_BITS = int(os.environ.get("W2_BITS", "4"))
+MODE_MARKER = f"i{W13_BITS}i{W2_BITS}"  # e.g. "i2i4" = 2-bit W13 + int4 W2
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 LR_BASE = 0.02  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
@@ -161,6 +166,140 @@ def soft_lim(x, lim=SOFT_LIM, knee=SOFT_KNEE):
     return y_abs * torch.sign(x)
 
 
+def _quant_cd(w, bits, cd_rounds=3):
+    """Per-row quantization with LS scale. bits>=4: symmetric intN {-nlev..nlev};
+    bits<4: explicit level grids via LEVELS. Returns (q, s)."""
+    if bits >= 4:
+        nlev = 2 ** (bits - 1) - 1
+        sg = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / nlev
+        q = (w / sg).round().clamp(-nlev, nlev)
+        for _ in range(cd_rounds):
+            num = (q * w).sum(dim=1, keepdim=True)
+            den = (q * q).sum(dim=1, keepdim=True).clamp_min(1e-9)
+            sg = num / den
+            sg = torch.where(sg.abs() < 1e-9, torch.full_like(sg, 1e-9), sg)
+            q = (w / sg).round().clamp(-nlev, nlev)
+        num = (q * w).sum(dim=1)
+        den = (q * q).sum(dim=1).clamp_min(1e-9)
+        s = num / den
+        return q, s.sign() * s.abs().clamp_min(1e-6)
+    lv = torch.tensor(LEVELS[bits], device=w.device)
+    sg = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / max(abs(v) for v in LEVELS[bits])
+    for _ in range(cd_rounds + 1):
+        wn = w / sg
+        idx = torch.argmin((wn.unsqueeze(-1) - lv).abs(), dim=-1)
+        q = lv[idx]
+        num = (q * w).sum(dim=1, keepdim=True)
+        den = (q * q).sum(dim=1, keepdim=True).clamp_min(1e-9)
+        sg = (num / den).sign().abs().clamp_min(1e-9)
+    wn = w / sg
+    idx = torch.argmin((wn.unsqueeze(-1) - lv).abs(), dim=-1)
+    q = lv[idx]
+    num = (q * w).sum(dim=1)
+    den = (q * q).sum(dim=1).clamp_min(1e-9)
+    s = num / den
+    return q, s.sign() * s.abs().clamp_min(1e-6)
+
+
+def _gptq_groups(W, H, s_groups, gs=128, block=128, jit=1e-3):
+    """Honest GPTQ with FROZEN per-(row,group) scales (storable format).
+    s_groups [out, in//gs]. Columns quantize to the fixed grid q=round(w/s);
+    LDLQ feedback compensates in the Hessian-weighted output space.
+    Measured L5 k7: CD g128 21.1% -> GPTQ g128 14.9% (bin W13 floor 12.4%)."""
+    out_, in_ = W.shape
+    H = H.float()
+    perm = torch.argsort(H.diag(), descending=True)
+    Wp = W[:, perm].clone()
+    Hp = H[perm][:, perm]
+    eye = torch.eye(in_, device=W.device)
+    Hi = torch.linalg.cholesky(Hp + jit * Hp.diag().mean() * eye)
+    Hi = torch.cholesky_inverse(Hi)
+    Hi = torch.linalg.cholesky(Hi + jit * Hi.diag().mean() * eye, upper=True)
+    Q = torch.zeros_like(Wp)
+    for c0 in range(0, in_, block):
+        c1 = min(c0 + block, in_)
+        Wb = Wp[:, c0:c1].clone()
+        Qb = torch.zeros_like(Wb)
+        Err = torch.zeros_like(Wb)
+        Hb = Hi[c0:c1, c0:c1]
+        for j in range(c1 - c0):
+            col = perm[c0 + j]
+            sc = s_groups[:, col // gs]
+            w = Wb[:, j]
+            qcol = (w / sc).round().clamp(-7, 7)
+            Qb[:, j] = qcol
+            Err[:, j] = (w - qcol * sc) / Hb[j, j]
+            if j + 1 < c1 - c0:
+                Wb[:, j + 1:] -= torch.outer(Err[:, j], Hb[j, j + 1:])
+        Q[:, c0:c1] = Qb
+        if c1 < in_:
+            Wp[:, c1:] -= Err @ Hi[c0:c1, c1:]
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(in_, device=W.device)
+    return Q[:, inv]  # grid values; reconstruction = Q * s_exp
+
+
+def _gptq(W, H, quant_col, block=128, act_order=True, jit=1e-3):
+    """GPTQ/LDLQ sequential error feedback over columns of W given activation
+    Hessian H (h^T h / n): minimizes ||h @ (W-Wq)^T||, not weight error.
+    Measured on L5 k7: W2 int4 CD 24.5% -> GPTQ 12.36% (binary-W13 floor).
+    quant_col(column) must return (q, s): grid values and per-row scale, so the
+    result stays exactly on the storage grid (q*s reconstructs losslessly)."""
+    out_, in_ = W.shape
+    W = W.clone()
+    if act_order:
+        perm = torch.argsort(H.diag(), descending=True)
+        W = W[:, perm]
+        H = H[perm][:, perm]
+    Hf = H.float()
+    eye = torch.eye(in_, device=W.device)
+    Hi = torch.linalg.cholesky(Hf + jit * Hf.diag().mean() * eye)
+    Hi = torch.cholesky_inverse(Hi)
+    Hi = torch.linalg.cholesky(Hi + jit * Hi.diag().mean() * eye, upper=True)
+    Q = torch.zeros_like(W)
+    S = torch.zeros(out_, device=W.device)
+    for c0 in range(0, in_, block):
+        c1 = min(c0 + block, in_)
+        Wb = W[:, c0:c1].clone()
+        Qb = torch.zeros_like(Wb)
+        Sb = torch.zeros(out_, device=W.device)
+        Err = torch.zeros_like(Wb)
+        Hb = Hi[c0:c1, c0:c1]
+        for j in range(c1 - c0):
+            w = Wb[:, j]
+            q, sj = quant_col(w)
+            Qb[:, j] = q
+            Sb = sj
+            Err[:, j] = (w - q * sj) / Hb[j, j]
+            if j + 1 < c1 - c0:
+                Wb[:, j + 1:] -= torch.outer(Err[:, j], Hb[j, j + 1:])
+        Q[:, c0:c1] = Qb
+        S[:] = Sb  # per-row scale is taken from the LAST block (rows are consistent)
+        if c1 < in_:
+            W[:, c1:] -= Err @ Hi[c0:c1, c1:]
+    if act_order:
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(in_, device=W.device)
+        Q = Q[:, inv]
+    return Q, S
+
+
+def _int4_col(w, rounds=2):
+    """int4 quantize one column with per-row LS scale (GPTQ cell quantizer).
+    Returns (q, s): grid values {-7..7} and the per-row scale."""
+    sg = w.abs().amax().clamp_min(1e-9) / 7.0
+    q = (w / sg).round().clamp(-7, 7)
+    for _ in range(rounds):
+        num = (q * w).sum()
+        den = (q * q).sum().clamp_min(1e-9)
+        sg = (num / den).clamp_min(1e-9)
+        q = (w / sg).round().clamp(-7, 7)
+    num = (q * w).sum()
+    den = (q * q).sum().clamp_min(1e-9)
+    s = (num / den).sign() * (num / den).abs().clamp_min(1e-6)
+    return q, s
+
+
 def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=3):
     # NOTE: w2 unused here (the readout is re-solved); kept for signature clarity.
     """Closed-form int4x encoder (AngelSlim STQ-style, no gradient steps):
@@ -169,10 +308,16 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
     given activations (imatrix analog: the functional error IS the metric),
     CD snap of W2, then one re-LS of W1/W3 scales + biases at the quantized W2.
     Returns (res, resid_before_snap_W2) in trainer format."""
-    q1 = torch.sign(w1_rot)
-    q3 = torch.sign(w3_rot)
-    s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
-    s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
+    if W13_BITS == 1:
+        # no zeros: FP4 weights contain exact 0s and the binary format cannot
+        # store them (pack_binary maps 0 -> -1 silently, corrupting the file)
+        q1 = torch.where(w1_rot >= 0, 1.0, -1.0)
+        q3 = torch.where(w3_rot >= 0, 1.0, -1.0)
+        s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
+        s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
+    else:
+        q1, s1 = _quant_cd(w1_rot, W13_BITS)
+        q3, s3 = _quant_cd(w3_rot, W13_BITS)
     w1 = q1 * s1[:, None]
     w3 = q3 * s3[:, None]
     g = soft_lim(z_rows @ w1.T + bias1[None, :])
@@ -185,18 +330,55 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
     # CD snap of W2 to int4 (weighted by feature energy = the true metric)
     cw = (h ** 2).sum(dim=0)
     cw = cw / cw.mean().clamp_min(1e-12)
-    sg = W2c.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0
-    q2 = (W2c / sg).round().clamp(-7, 7)
-    for _ in range(cd_rounds):
-        num = (cw * q2 * W2c).sum(dim=1, keepdim=True)
-        den = (cw * q2 * q2).sum(dim=1, keepdim=True).clamp_min(1e-9)
-        sg = num / den
-        sg = torch.where(sg.abs() < 1e-9, torch.full_like(sg, 1e-9), sg)
-        q2 = (W2c / sg).round().clamp(-7, 7)
-    num = (cw * q2 * W2c).sum(dim=1)
-    den = (cw * q2 * q2).sum(dim=1).clamp_min(1e-9)
-    s2 = (num / den)
-    s2 = s2.sign() * s2.abs().clamp_min(1e-6)
+    if W2_BITS == 4 and os.environ.get("W2_GPTQ", "1") == "1":
+        # GPTQ over the h-Hessian with FROZEN per-(row,group) scales (g128):
+        # minimizes the functional error, format-storable. +0.13 MB per expert.
+        GS = 128
+        ng = W2c.shape[1] // GS
+        Wg = W2c.view(W2c.shape[0], ng, GS)
+        sg_ = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / 7.0
+        qg = (Wg / sg_).round().clamp(-7, 7)
+        for _ in range(3):
+            num = (qg * Wg).sum(-1, keepdim=True)
+            den = (qg * qg).sum(-1, keepdim=True).clamp_min(1e-9)
+            sg_ = (num / den).clamp_min(1e-9)
+            qg = (Wg / sg_).round().clamp(-7, 7)
+        s2g = sg_.squeeze(-1)  # [out, ng] storable group scales
+        Hh = (h.T @ h) / h.shape[0]
+        q2 = _gptq_groups(W2c, Hh, s2g, gs=GS)
+        s2 = s2g  # 2D [out, ng]; resid_weights_full/save handle the broadcast
+    elif W2_BITS >= 4:
+        nlev = 2 ** (W2_BITS - 1) - 1
+        sg = W2c.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / nlev
+        q2 = (W2c / sg).round().clamp(-nlev, nlev)
+        for _ in range(cd_rounds):
+            num = (cw * q2 * W2c).sum(dim=1, keepdim=True)
+            den = (cw * q2 * q2).sum(dim=1, keepdim=True).clamp_min(1e-9)
+            sg = num / den
+            sg = torch.where(sg.abs() < 1e-9, torch.full_like(sg, 1e-9), sg)
+            q2 = (W2c / sg).round().clamp(-nlev, nlev)
+        num = (cw * q2 * W2c).sum(dim=1)
+        den = (cw * q2 * q2).sum(dim=1).clamp_min(1e-9)
+        s2 = (num / den)
+        s2 = s2.sign() * s2.abs().clamp_min(1e-6)
+    else:
+        lv = torch.tensor(LEVELS[W2_BITS], device=W2c.device)
+        wcw = cw  # energy weights over input dim (h columns)
+        sg = W2c.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 3.0
+        for _ in range(cd_rounds + 1):
+            wn = W2c / sg
+            idx = torch.argmin((wn.unsqueeze(-1) - lv).abs(), dim=-1)
+            q2 = lv[idx]
+            num = (wcw * q2 * W2c).sum(dim=1, keepdim=True)
+            den = (wcw * q2 * q2).sum(dim=1, keepdim=True).clamp_min(1e-9)
+            sg = (num / den).sign().abs().clamp_min(1e-9)
+        wn = W2c / sg
+        idx = torch.argmin((wn.unsqueeze(-1) - lv).abs(), dim=-1)
+        q2 = lv[idx]
+        num = (wcw * q2 * W2c).sum(dim=1)
+        den = (wcw * q2 * q2).sum(dim=1).clamp_min(1e-9)
+        s2 = num / den
+        s2 = s2.sign() * s2.abs().clamp_min(1e-6)
     # one re-LS of W1/W3 scales + biases at the QUANTIZED W2
     bounds = [0, z_rows.shape[1]]
     res = (q1, s1, q3, s3, q2, s2, bias1, bias3, bounds)
@@ -221,7 +403,11 @@ def resid_weights_full(z, y_full, res):
             us = z[:, bounds[u_slice(s)] : bounds[u_slice(s) + 1]]  # crossed pairing
             w1 = w1q * w1s[:, None]
             w3 = w3q * w3s[:, None]
-            w2 = w2q * w2s[:, None]
+            if w2s.dim() == 2:  # group scales [out, ng] -> expand to [out, in]
+                gs = w2q.shape[1] // w2s.shape[1]
+                w2 = (w2q.view(w2q.shape[0], w2s.shape[1], gs) * w2s.unsqueeze(-1)).view_as(w2q)
+            else:
+                w2 = w2q * w2s[:, None]
             g = soft_lim(zs @ w1.T + b1)
             u = soft_lim(us @ w3.T + b3)
             ys = (F.silu(g) * u) @ w2.T
@@ -946,7 +1132,19 @@ def run_refit(
             e = {}
             for j, nm in enumerate(W_NAMES):  # res: (q, scale) pairs, interleaved
                 q = res[2 * j]
-                e[nm] = (pack_int4(q) if nm.startswith("w2") else pack_binary(q)).cpu()
+                if nm.startswith("w2"):
+                    if W2_BITS == 4:
+                        e[nm] = pack_int4(q).cpu()
+                    elif W2_BITS == 6:
+                        e[nm] = pack_int6(q).cpu()
+                    else:
+                        e[nm] = pack_nbit(q, W2_BITS).cpu()
+                elif W13_BITS == 1:
+                    e[nm] = pack_binary(q).cpu()
+                elif W13_BITS == 4:
+                    e[nm] = pack_int4(q).cpu()
+                else:
+                    e[nm] = pack_nbit(q, W13_BITS).cpu()
                 e[f"{nm}_scale"] = res[2 * j + 1].cpu()
             for j, nm in enumerate(B_NAMES):  # then 8 biases (b1, b3 per sub)
                 e[nm] = res[6 * NSUB + j].cpu()
@@ -991,6 +1189,16 @@ def run_refit(
             # gradient pass refine signs/scales/W2 from a fitted starting point.
             _res0, w2c = ptq_closed_form(w1_rot, w3_rot, w2, z, yf, bias1, bias3)
             fp4_init = (w1_rot[None].contiguous(), w3_rot[None].contiguous(), w2c[None].contiguous())
+            # keep the exact FP32 signs compactly: q tensors as int8 (~14MB/expert),
+            # scales/biases fp32. bf16 rounding of w1_rot flips ~13% of near-zero
+            # signs - the PTQ-only save path must NOT re-derive signs from bf16.
+            q1c, s1c, q3c, s3c, q2c, s2c, b1c, b3c, bnd = _res0
+            res0_cpu = (
+                q1c.to(torch.int8).cpu(), s1c.float().cpu(),
+                q3c.to(torch.int8).cpu(), s3c.float().cpu(),
+                q2c.to(torch.int8).cpu(), s2c.float().cpu(),
+                b1c.float().cpu(), b3c.float().cpu(), bnd,
+            )
             del experts
             z_all_rows = z.shape[0]
             todo_data[k] = (z, yf)
@@ -1011,6 +1219,7 @@ def run_refit(
                 init=init,
                 bias1=bias1_cpu,
                 bias3=bias3_cpu,
+                res0=res0_cpu,
             )
 
         todo_data = {}
@@ -1086,12 +1295,8 @@ def run_refit(
         for p in prepped_A:
             if PTQ_ONLY:
                 z_all, y_all = todo_data[p["k"]]
-                iW1, iW3, iW2 = p["init"]
-                res, _ = ptq_closed_form(
-                    iW1[0].cuda().float(), iW3[0].cuda().float(), iW2[0].cuda().float(),
-                    z_all, y_all,
-                    p["bias1"].cuda().float(), p["bias3"].cuda().float(),
-                )
+                # exact FP32 signs from prep time (NOT the bf16 init)
+                res = tuple(t.cuda().float() if torch.is_tensor(t) else t for t in p["res0"])
                 resid = resid_weights_full(z_all, y_all, res)
                 save_expert(p["k"], resid, res, INTER, n_real=p["n_k"])
                 n_fixed += 1
@@ -1101,6 +1306,7 @@ def run_refit(
                     flush=True,
                 )
                 todo_data.pop(p["k"], None)
+                p["res0"] = None
                 torch.cuda.empty_cache()
                 continue
             _run_expert(p)

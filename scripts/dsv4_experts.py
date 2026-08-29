@@ -351,6 +351,114 @@ def pack_int4(q: torch.Tensor) -> torch.Tensor:
     return packed
 
 
+def pack_2bit(q: torch.Tensor) -> torch.Tensor:
+    """Pack 4-level int2 {-3,-1,1,3} [out, in] -> uint8 [out, ceil(in/4)].
+    Values map to 2-bit codes: -3->0, -1->1, 1->2, 3->3; 4 values per byte."""
+    lvl = torch.tensor([-3.0, -1.0, 1.0, 3.0], device=q.device)
+    idx = torch.argmin((q.unsqueeze(-1) - lvl).abs(), dim=-1).to(torch.int64)  # [out, in]
+    out, in_ = idx.shape
+    n = (in_ + 3) // 4
+    padded = torch.zeros(out, n * 4, dtype=torch.int64, device=q.device)
+    padded[:, :in_] = idx
+    packed = torch.zeros(out, n, dtype=torch.uint8, device=q.device)
+    for i in range(4):
+        packed |= (padded[:, i::4] << (2 * i)).to(torch.uint8)
+    return packed
+
+
+def unpack_2bit(p: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 [out, ceil(in/4)] -> int2 {-3,-1,1,3} [out, in]."""
+    lvl = torch.tensor([-3.0, -1.0, 1.0, 3.0], device=p.device)
+    t = p.to(torch.int64)
+    out = torch.empty(t.shape[0], t.shape[1] * 4, dtype=torch.float32, device=p.device)
+    for i in range(4):
+        out[:, i::4] = lvl[(t >> (2 * i)) & 3]
+    return out
+
+
+LEVELS = {
+    2: [-3.0, -1.0, 1.0, 3.0],
+    3: [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+}
+
+
+def pack_nbit(q: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack small-grid values (LEVELS[bits]) [out, in] -> uint8 bitstream.
+    bits=2: 4 values/byte; bits=3: 8 values per 3 bytes (24-bit groups)."""
+    lv = torch.tensor(LEVELS[bits], device=q.device)
+    idx = torch.argmin((q.unsqueeze(-1) - lv).abs(), dim=-1).to(torch.int64)
+    out_, in_ = idx.shape
+    if bits == 2:
+        n = (in_ + 3) // 4
+        padded = torch.zeros(out_, n * 4, dtype=torch.int64, device=q.device)
+        padded[:, :in_] = idx
+        packed = torch.zeros(out_, n, dtype=torch.uint8, device=q.device)
+        for i in range(4):
+            packed |= (padded[:, i::4] << (2 * i)).to(torch.uint8)
+        return packed
+    # bits == 3: 8 values -> 24 bits -> 3 bytes
+    n = (in_ + 7) // 8
+    padded = torch.zeros(out_, n * 8, dtype=torch.int64, device=q.device)
+    padded[:, :in_] = idx
+    g = padded.view(out_, n, 8)
+    v = torch.zeros(out_, n, dtype=torch.int64, device=q.device)
+    for k in range(8):
+        v |= g[:, :, k] << (3 * k)
+    b0 = (v & 255).to(torch.uint8)
+    b1 = ((v >> 8) & 255).to(torch.uint8)
+    b2 = ((v >> 16) & 255).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=-1).view(out_, n * 3)
+
+
+def unpack_nbit(p: torch.Tensor, bits: int) -> torch.Tensor:
+    """Inverse of pack_nbit: uint8 bitstream -> value grid LEVELS[bits]."""
+    lv = torch.tensor(LEVELS[bits], device=p.device)
+    out_, nb = p.shape
+    t = p.to(torch.int64)
+    if bits == 2:
+        res = torch.empty(out_, nb * 4, dtype=torch.float32, device=p.device)
+        for i in range(4):
+            res[:, i::4] = lv[(t >> (2 * i)) & 3]
+        return res
+    n = nb // 3
+    b0 = t[:, 0::3]
+    b1 = t[:, 1::3]
+    b2 = t[:, 2::3]
+    v = b0 | (b1 << 8) | (b2 << 16)  # [out, n]
+    res = torch.empty(out_, n * 8, dtype=torch.float32, device=p.device)
+    for k in range(8):
+        res[:, k::8] = lv[(v >> (3 * k)) & 7]
+    return res
+
+
+def pack_int6(q: torch.Tensor) -> torch.Tensor:
+    """Pack int6 {-31..31} [out, in] -> uint8 [out, ceil(in/4)*3] (6 bits/weight, 4 values per 3 bytes)."""
+    v = q.round().clamp(-31, 31).to(torch.int64) + 31  # 0..62
+    out_, in_ = v.shape
+    n4 = (in_ + 3) // 4
+    if in_ % 4:
+        v = torch.cat([v, torch.zeros(out_, n4 * 4 - in_, dtype=v.dtype, device=v.device)], dim=1)
+        in_ = n4 * 4
+    g = v.view(out_, n4, 4)
+    w24 = g[:, :, 0] | (g[:, :, 1] << 6) | (g[:, :, 2] << 12) | (g[:, :, 3] << 18)  # [out, n4] 24-bit
+    b0 = (w24 & 255).to(torch.uint8)
+    b1 = ((w24 >> 8) & 255).to(torch.uint8)
+    b2 = ((w24 >> 16) & 255).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=-1).view(out_, n4 * 3)
+
+
+def unpack_int6(p: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 [out, n4*3] -> int6 {-31..31} [out, n4*4]."""
+    t = p.to(torch.int64)
+    out_, nb = t.shape
+    n4 = nb // 3
+    w24 = t[:, 0::3] | (t[:, 1::3] << 8) | (t[:, 2::3] << 16)
+    res = torch.empty(out_, n4 * 4, dtype=torch.int64, device=p.device)
+    for i in range(4):
+        res[:, i::4] = ((w24 >> (6 * i)) & 63) - 31
+    return res
+
+
 def unpack_int4(p: torch.Tensor) -> torch.Tensor:
     """Unpack uint8 [out, ceil(in/2)] -> int [-7..7] [out, in] (offset binary)."""
     t = p.to(torch.int64)

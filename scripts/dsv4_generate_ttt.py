@@ -105,6 +105,7 @@ NGRAM = 3  # no-repeat n-gram blocking size (kills degenerate loops)
 SAVE_ENABLED = True  # set from --no-save; gates persistence on eviction too
 INT4X_MAX = int(os.environ.get("INT4X_MAX", "256"))  # hot tier + pins; cold = ~1.8ms bf16 unpack  # live int4x experts (~128MB each); LRU
 DEQUANT_MAX = int(os.environ.get("DEQUANT_MAX", "128"))  # cached original experts (bf16 ~50MB each)
+EXPERT_NOISE = float(os.environ.get("EXPERT_NOISE", "0"))  # inject eps relative noise into ORIGINAL expert outputs (quality-tolerance probe)
 ATTN_ROWS_CAP = 256  # max student rows per attention RLS update (strided subsample)
 
 MODE = "student"  # "teacher" during the shadow pass (hooks branch on this)
@@ -254,15 +255,40 @@ def unpack_binary_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return w * scale.to(torch.bfloat16)[:, None]
 
 
+def unpack_nbit_bf16(p: torch.Tensor, scale: torch.Tensor, bits: int) -> torch.Tensor:
+    """uint8 bitstream [out, bytes] (cuda) -> bf16 [out, in] LEVELS[bits] x per-row scale."""
+    import dsv4_experts as _de
+
+    lv = torch.tensor(_de.LEVELS[bits], device=p.device)
+    t = p.to(torch.int64)
+    out_, nb = t.shape
+    if bits == 2:
+        res = torch.empty(out_, nb * 4, dtype=torch.float32, device=p.device)
+        for i in range(4):
+            res[:, i::4] = lv[(t >> (2 * i)) & 3]
+    else:  # bits == 3
+        n = nb // 3
+        v = t[:, 0::3] | (t[:, 1::3] << 8) | (t[:, 2::3] << 16)
+        res = torch.empty(out_, n * 8, dtype=torch.float32, device=p.device)
+        for k in range(8):
+            res[:, k::8] = lv[(v >> (3 * k)) & 7]
+    return (res * scale.to(torch.float32)[:, None]).to(torch.bfloat16)
+
+
 def unpack_int4_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """uint8 [out, in/2] (cuda) -> bf16 [out, in] {-7..7} x per-row scale. ~0.5ms."""
+    """uint8 [out, in/2] (cuda) -> bf16 [out, in] {-7..7} x scale.
+    scale: [out] per-row OR [out, ng] group scales (expanded). ~0.5ms."""
     t = p.to(torch.int16)
     lo = ((t & 15) - 8).to(torch.bfloat16)
     hi = ((t >> 4) - 8).to(torch.bfloat16)
     out = torch.empty(t.shape[0], t.shape[1] * 2, dtype=torch.bfloat16, device=p.device)
     out[:, 0::2] = lo
     out[:, 1::2] = hi
-    return out * scale.to(torch.bfloat16)[:, None]
+    sc = scale
+    if sc.dim() == 2:  # group scales [out, ng]
+        gs = out.shape[1] // sc.shape[1]
+        sc = sc.repeat_interleave(gs, dim=1)
+    return out * sc.to(torch.bfloat16)[:, None]
 
 
 def load_pod(li):
@@ -278,6 +304,8 @@ def load_pod(li):
 def get_int4x(li, k):
     """Dequantized int4x expert: frozen parts + current (possibly adapted) W2."""
     global I4X_HIT, I4X_MISS
+    if os.environ.get("INT4X_OFF"):
+        return None  # baseline: original FP4 experts everywhere
     key = (li, k)
     if key in INT4X:
         I4X_HIT += 1
@@ -292,7 +320,13 @@ def get_int4x(li, k):
         if not os.path.exists(fp):
             return None
         e = torch.load(fp, map_location="cpu", weights_only=False)
-        if e.get("mode") != "int4x":
+        mode = e.get("mode", "")
+        _b13 = _b2 = None
+        if mode == "int4x":
+            _b13, _b2 = 1, 4
+        elif len(mode) == 4 and mode[0] == "i" and mode[2] == "i" and mode[1].isdigit() and mode[3].isdigit():
+            _b13, _b2 = int(mode[1]), int(mode[3])
+        if _b13 is None:
             return None
         e = {kk: (v.cuda() if torch.is_tensor(v) else v) for kk, v in e.items()}
         I4X_PACKED[key_p] = e
@@ -302,15 +336,34 @@ def get_int4x(li, k):
     P, mu = load_pod(li)
     dev = "cuda"
     e_gpu = I4X_PACKED[key_p]  # already on cuda
+    if _b13 == 1:
+        _u13 = unpack_binary_bf16
+    elif _b13 == 4:
+        _u13 = unpack_int4_bf16
+    else:
+        _u13 = lambda p_, s_: unpack_nbit_bf16(p_, s_, _b13)
+    if _b2 == 4:
+        _u2 = unpack_int4_bf16
+    elif _b2 == 6:
+        def _u2(p_, s_):
+            t = p_.to(torch.int64)
+            n4 = t.shape[1] // 3
+            w24 = t[:, 0::3] | (t[:, 1::3] << 8) | (t[:, 2::3] << 16)
+            res = torch.empty(t.shape[0], n4 * 4, dtype=torch.float32, device=p_.device)
+            for i in range(4):
+                res[:, i::4] = ((w24 >> (6 * i)) & 63).float() - 31.0
+            return (res * s_.to(torch.float32)[:, None]).to(torch.bfloat16)
+    else:
+        _u2 = lambda p_, s_: unpack_nbit_bf16(p_, s_, _b2)
     d = {
         "P": _pod_bf16(li),  # shared per layer
         "mu": mu.to(torch.bfloat16),
-        "w1": unpack_binary_bf16(e_gpu["w1a"], e_gpu["w1a_scale"]),
-        "w3": unpack_binary_bf16(e_gpu["w3a"], e_gpu["w3a_scale"]),
+        "w1": _u13(e_gpu["w1a"], e_gpu["w1a_scale"]),
+        "w3": _u13(e_gpu["w3a"], e_gpu["w3a_scale"]),
         "b1": e_gpu["bias1a"].to(torch.bfloat16),
         "b3": e_gpu["bias3a"].to(torch.bfloat16),
         "w2": None,  # fp32 materialized lazily for TTT only
-        "w2b": unpack_int4_bf16(e_gpu["w2a"], e_gpu["w2a_scale"]),
+        "w2b": _u2(e_gpu["w2a"], e_gpu["w2a_scale"]),
         "residual": e.get("residual", float("inf")),
         "adapted": False,
     }
@@ -678,6 +731,9 @@ def make_hook(li, ttt_on):
             else:
                 w1, w2, w3 = get_dequant(li, k)
                 ek = ffn(flat.to(torch.bfloat16), w1, w2, w3).float()
+                if EXPERT_NOISE > 0.0:
+                    rms = ek.pow(2).mean(dim=1, keepdim=True).sqrt()
+                    ek = ek + rms * EXPERT_NOISE * torch.randn_like(ek)
                 for kk in range(TOP_K):
                     m = indices[:, kk] == k
                     if m.any():
