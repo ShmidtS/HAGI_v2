@@ -35,6 +35,7 @@ INTER = 2048
 D = 4096
 NSUB = 1  # int4x: single full-K sub; W13 binary (1 bit), W2 int4 (4 bits) - 6.3 MB/expert
 DIRECT_PTQ_MAX = int(os.environ.get("DIRECT_PTQ_MAX", "64"))  # n_real below this -> closed-form PTQ only, no gradient
+PTQ_ONLY = os.environ.get("PTQ_ONLY", "1") == "1"  # 1 (default): closed-form PTQ for ALL experts, zero gradient steps
 POD = "checkpoints_dsv4/pod_all_tokens"
 REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
@@ -893,6 +894,33 @@ def run_refit(
             if sk not in covered:
                 todo.append((sk, None, None, None))
 
+        # Layer-wide activation pool from the ACTS FILE itself (not todo_data):
+        # when every covered expert is already done and skipped, todo_data is
+        # empty and the old pool degenerated to white noise (measured: dead
+        # distill 13% on noise vs 3% on the real layer distribution).
+        n_pool_rows = 8192
+        rng0 = torch.Generator().manual_seed(1234 + L)
+        xs_parts = []
+        n_have = 0
+        keys = sorted(acts.keys(), key=lambda kk: acts[kk][0].shape[0], reverse=True)
+        for kk in keys:
+            x_kk = acts[kk][0]
+            if n_have >= n_pool_rows:
+                break
+            take = min(x_kk.shape[0], n_pool_rows - n_have)
+            sel = torch.randperm(x_kk.shape[0], generator=rng0)[:take]
+            xs_parts.append(x_kk[torch.sort(sel).values])
+            n_have += take
+        if xs_parts:
+            xs = torch.cat(xs_parts).float().cuda()
+            z_pool = ((xs - mu) @ P).cpu()
+            del xs
+        else:
+            z_pool = torch.randn(4096, P.shape[1], generator=rng0)
+            print(f"layer {L}: pool EMPTY (no activations at all) - white-noise fallback", flush=True)
+        del xs_parts
+        print(f"layer {L}: activation pool: {z_pool.shape[0]} rows from acts", flush=True)
+
         del acts
         print(
             f"layer {L}: collected {len(todo)} experts to refit "
@@ -994,36 +1022,7 @@ def run_refit(
                 continue
             (prepped_B if p["tier"] == "B" else prepped_A).append(p)
 
-        # Layer-wide activation pool: the residual stream that feeds ALL experts
-        # of the layer. For experts with few/no routed rows this is a far better
-        # manifold than bootstrapping around their own 2-3 points (measured:
-        # n=2 tier-B converged to 38-66% resid - wasted 67s each).
-        n_pool_rows = 8192
-        z_parts = []
-        n_have = 0
-        rng = torch.Generator().manual_seed(1234 + L)
-        cand = list(todo_data.keys())
-        cand.sort(key=lambda kk: todo_data[kk][0].shape[0], reverse=True)
-        for kk in cand:
-            z_kk = todo_data[kk][0]
-            if n_have + z_kk.shape[0] > n_pool_rows:
-                take = n_pool_rows - n_have
-                if take > 0:
-                    z_parts.append(z_kk[:take].cpu())
-                    n_have += take
-                break
-            z_parts.append(z_kk.cpu())
-            n_have += z_kk.shape[0]
-        if z_parts:
-            z_pool = torch.cat(z_parts)
-        else:
-            # no covered rows survived skipping (layer fully done): white-noise
-            # pool in POD coords - universal_signal's documented fallback
-            g0 = torch.Generator().manual_seed(4321 + L)
-            z_pool = torch.randn(4096, P.shape[1], generator=g0)
-            print(f"layer {L}: pool EMPTY (all experts pre-done) - white-noise fallback", flush=True)
-        del z_parts
-        print(f"layer {L}: activation pool for tier-B/dead: {z_pool.shape[0]} rows", flush=True)
+
 
         PTQ_FALLBACK = 0.10  # gradient result worse than this -> closed-form PTQ
 
@@ -1085,6 +1084,25 @@ def run_refit(
             torch.cuda.empty_cache()
 
         for p in prepped_A:
+            if PTQ_ONLY:
+                z_all, y_all = todo_data[p["k"]]
+                iW1, iW3, iW2 = p["init"]
+                res, _ = ptq_closed_form(
+                    iW1[0].cuda().float(), iW3[0].cuda().float(), iW2[0].cuda().float(),
+                    z_all, y_all,
+                    p["bias1"].cuda().float(), p["bias3"].cuda().float(),
+                )
+                resid = resid_weights_full(z_all, y_all, res)
+                save_expert(p["k"], resid, res, INTER, n_real=p["n_k"])
+                n_fixed += 1
+                print(
+                    f"  layer {L} expert {p['k']} [ptq, n={p['n_k']}]: "
+                    f"resid={resid * 100:.4f}%  ({n_fixed} total, {time.time() - t0:.0f}s)",
+                    flush=True,
+                )
+                todo_data.pop(p["k"], None)
+                torch.cuda.empty_cache()
+                continue
             _run_expert(p)
         for p in prepped_B:
             z, yf = todo_data[p["k"]]
@@ -1107,7 +1125,7 @@ def run_refit(
             b3g = p["bias3"].cuda().float()
             z_all, y_all = todo_data[p["k"]]
             _r0, w2c = ptq_closed_form(w1 @ P, w3 @ P, w2, z_all, y_all, b1g, b3g)
-            if p["n_k"] < DIRECT_PTQ_MAX:
+            if PTQ_ONLY or p["n_k"] < DIRECT_PTQ_MAX:
                 # thin coverage: the gradient pass never beats the closed form
                 # here (measured: PTQ 4.7-5.8% vs gradient stuck 40-68%) - save
                 # it directly, zero training steps
