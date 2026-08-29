@@ -1,26 +1,40 @@
-"""Generation with int4x-compressed experts + TTT (online RLS) and weight save-on-improvement.
+"""Generation with int4x-compressed experts + TTT (test-time training) + self-evolution.
 
-Builds on dsv4_generate_fast.py (custom MoE routing hook). Differences:
+Builds on dsv4_generate_fast.py (custom MoE routing hook). Mechanisms:
   - experts with an int4x checkpoint (dsv4_reduced/layer_L/expert_k.pt) run COMPRESSED:
-    z = (x - mu) @ P, y = (silu(soft_lim(z@W1q^T+b1)) * soft_lim(z@W3q^T+b3)) @ (int4W2*s2)^T
-  - TTT engine (default ON for checkpointed layers): during generation each active
-    expert accumulates anchored-RLS statistics G/C against the ORIGINAL FP4 expert
-    (teacher pass on the same routed activations, subsampled 1/TTT_SAMPLE tokens);
-    exact refit every TTT_REFIT accumulated rows, guarded on the buffered residual.
-  - save-on-improvement: at the end of the run (after the chain of thought) each
-    adapted expert is consolidated (snap to int4) and, if its HOLDOUT residual
-    (last 20% of the accumulated buffer, never refit against... accumulated after
-    the last refit) improved by >= TTT_MIN_GAIN vs the static int4 readout, the
-    updated W2 is written back into the expert file ATOMICALLY (tmp + os.replace),
-    with a `ttt` metadata block (tokens seen, residuals, timestamp).
+    z = (x - mu) @ P, h = silu(soft_lim(z@W1q^T+b1)) * soft_lim(z@W3q^T+b3),
+    y = h @ (int4W2*s2)^T  (W2 is the ADAPTIVE readout, refit online by RLS)
+  - FFN TTT: anchored RLS against the ORIGINAL FP4 expert applied to the same
+    routed activations (local proximal teacher; measured 2.51% -> 1.66% resid).
+  - Attention TTT (o_b_proj readout, [.,8192] -> 4096): SHADOW TEACHER pass -
+    before each student prefill the same tokens run through the ORIGINAL model
+    (all-FP4 experts, original o_b); the teacher's grouped context is regressed
+    against by the student's features: min ||g_student @ w^T - y_orig||^2.
+    This compensates upstream compression error (a self-referential teacher
+    would converge to a no-op: the target must exist independently of the
+    student's own weights).
+  - honest validation: every 5th row NEVER enters G/C (Hva/Yva buffers);
+    save decisions are computed ONLY on those rows.
+  - save-on-improvement: snap adapted readout (int4 for experts, int8 for o_b -
+    measured: the int4 grid collapses the attention adaptation gain) and write
+    back ATOMICALLY (tmp + os.replace) when the honest validation improves by
+    >= TTT_MIN_GAIN.
+  - self-evolution (--evolve): endless self-talk sessions; the model continues
+    ITS OWN stream of thought (context tail persisted in evolve_state.json -
+    no fixed prompts); curiosity turns at temperature 1.25, repetition penalty;
+    attention adapts in a rotating window (all 43 layers over sessions); FFN
+    adapts on every checkpointed expert that fires; live adaptations are
+    consolidated before any LRU eviction and on Ctrl+C.
 
 Usage:
-    python scripts/dsv4_generate_ttt.py "<prompt>" [max_new_tokens] [--no-ttt] [--no-save]
+    python scripts/dsv4_generate_ttt.py "<prompt>" [max_new] [--no-ttt] [--no-save] [--no-attn]
+    python scripts/dsv4_generate_ttt.py "" 0 --evolve [--sessions 0] [--turns 6]
+        [--gen-tokens 200] [--attn-window 8] [--no-save]
 """
-
 from __future__ import annotations
 
 import collections
+import json
 import os
 import sys
 import time
@@ -53,18 +67,33 @@ EOS_ID = 1
 GPU_HEADROOM = 8 * 1024**3
 
 # --- TTT knobs ---
-TTT_SAMPLE = 4  # update stats on every Nth activation row (token budget guard)
-TTT_REFIT = 64  # exact solve after this many accumulated rows per expert
-TTT_ALPHA = 1000.0  # anchor weight (in "token" units) toward the int4 init
+TTT_SAMPLE = 4  # FFN: update stats on every Nth expert call (teacher dequant cost)
+TTT_REFIT = 64  # exact solve after this many accumulated train rows
+TTT_ALPHA = 1000.0  # anchor weight (in "token" units) toward the current readout
 TTT_LAM = 0.9995  # forgetting factor
-TTT_HOLDOUT = 0.2  # tail fraction of the buffer used for save decision
-TTT_MIN_GAIN = 0.02  # save only if holdout resid improves by >= 2% relative
-TTT_MAX_EXPERTS = 16  # live RLS states (G/C ~48MB each) - LRU
-TTT_ROWS_MAX = 2048  # max rows kept per expert for holdout eval
+TTT_MIN_GAIN = 0.02  # save only if honest-validation resid improves by >= 2% relative
+TTT_MAX_EXPERTS = 16  # live FFN RLS states (G/C ~48MB each) - LRU
+TTT_ROWS_MAX = 2048  # max train rows kept per expert
 # --- attention TTT: o_b_proj readout (grouped ctx [.,8192] -> hidden 4096) ---
 TTT_ATTN_LAYERS = [int(v) for v in os.environ.get("TTT_ATTN_LAYERS", "0,1,2,3").split(",") if v != ""]
 TTT_ATTN_MAX = 8  # live attention RLS states (G 8192^2 + C 8192x4096 fp32 ~ 384MB each)
-TTT_ATTN_ALPHA = 1000.0  # anchor weight (token units) toward the current o_b weights
+TTT_ATTN_ALPHA = 1000.0
+# --- self-evolution session loop (--evolve) ---
+EVOL_STATE = os.path.join(REDUCED, "evolve_state.json")
+CURIOSITY_TEMP = 1.25  # odd turns: high-temp exploration
+NORMAL_TEMP = 0.9
+EVOL_TOP_P = 0.98
+EVOL_CTX = 1024
+EVOL_CTX_KEEP = 256  # thought-tail persisted between sessions (the model thinks itself)
+REP_PEN = 1.5  # repetition penalty divisor for tokens seen in the last REP_WIN
+REP_WIN = 128
+MIN_NEW_TOKENS = 8  # do not allow EOS before this many tokens in a turn
+
+SAVE_ENABLED = True  # set from --no-save; gates persistence on eviction too
+INT4X_MAX = int(os.environ.get("INT4X_MAX", "32"))  # live int4x experts (~130MB each); LRU
+
+MODE = "student"  # "teacher" during the shadow pass (hooks branch on this)
+SHADOW: dict[int, torch.Tensor | None] = {}  # li -> teacher grouped-ctx rows for current prefill
 
 CURRENT_IDS: torch.Tensor | None = None
 ROUTER_W: dict[int, torch.Tensor] = {}
@@ -77,13 +106,12 @@ SHARED_DEQUANT: dict[int, dict] = {}
 HIT = 0
 MISS = 0
 
-INT4X: dict[tuple, dict] = {}  # (L,k) -> dequant-int4x expert (frozen parts)
+INT4X: dict[tuple, dict] = {}  # (L,k) -> dequant-int4x expert (frozen parts + adaptive w2)
 TTT_STATE: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
-# attention: adapted o_b weights per layer + RLS states
-ATTN_ADAPT: dict[int, dict] = {}  # L -> {"w": [4096,8192] adapted, "w0": [4096,8192] teacher}
+ATTN_ADAPT: dict[int, dict] = {}  # L -> {"w": [4096,8192] fp32 adapted, "w0": bf16 ref to module weight}
 ATTN_STATE: collections.OrderedDict[int, dict] = collections.OrderedDict()
 ATTN_SAVE_LOG: list[str] = []
-TTT_ROWS = 0  # global update counter for TTT_SAMPLE
+TTT_ROWS = 0  # global counter for TTT_SAMPLE
 SAVE_LOG: list[str] = []
 
 
@@ -153,7 +181,7 @@ def load_pod(li):
 
 
 def get_int4x(li, k):
-    """Dequantized int4x expert: returns frozen parts + current (possibly adapted) W2."""
+    """Dequantized int4x expert: frozen parts + current (possibly adapted) W2."""
     key = (li, k)
     if key in INT4X:
         return INT4X[key]
@@ -181,17 +209,23 @@ def get_int4x(li, k):
         "b3": e["bias3a"].float().to(dev),
         "w2": w2,
         "residual": e.get("residual", float("inf")),
+        "adapted": False,
     }
     INT4X[key] = d
+    while len(INT4X) > INT4X_MAX:
+        ev = next((kk for kk in INT4X if kk not in TTT_STATE), None)
+        if ev is None:
+            break  # everything pinned by live states (states are LRU-capped anyway)
+        INT4X.pop(ev)  # adapted entries are consolidated on STATE eviction, never lost
     return d
 
 
 def int4x_forward(d, x_rows):
-    """x_rows [n, 4096] raw -> y [n, 4096] via POD rotation + int4x expert."""
+    """x_rows [n, 4096] raw -> h [n, 2048] via POD rotation + int4x expert."""
     z = (x_rows - d["mu"]) @ d["P"]
     g = soft_lim(z @ d["w1"].T + d["b1"])
     u = soft_lim(z @ d["w3"].T + d["b3"])
-    return torch.nn.functional.silu(g) * u  # h
+    return torch.nn.functional.silu(g) * u
 
 
 def _teacher_y(li, k, x_rows):
@@ -204,189 +238,27 @@ def _teacher_y(li, k, x_rows):
     return y
 
 
-def ttt_touch(li, k):
-    key = (li, k)
-    if key not in TTT_STATE:
-        if len(TTT_STATE) >= TTT_MAX_EXPERTS:
-            TTT_STATE.popitem(last=False)  # drop coldest state (weights stay adapted)
-        Fd = INT4X[key]["w2"].shape[1]
-        Dm = INT4X[key]["w2"].shape[0]
-        alpha = None  # set on first row (needs h energy scale)
-        TTT_STATE[key] = {
-            "G": None,
-            "C": None,
-            "alpha": alpha,
-            "Fd": Fd,
-            "D": Dm,
-            "H": [],
-            "Y": [],
-            "rows": 0,
-            "since_refit": 0,
-            "refits": 0,
-        }
-    TTT_STATE.move_to_end(key)
-    return TTT_STATE[key]
+def _new_state(w_anchor_T, Fin, alpha):
+    return {
+        "G": torch.eye(Fin, device="cuda") * alpha,
+        "C": alpha * w_anchor_T.clone(),
+        "Fin": Fin,
+        "H": [],  # train rows (fed into G/C; refit guard)
+        "Y": [],
+        "Hva": [],  # validation rows (NEVER fed into G/C; save decision)
+        "Yva": [],
+        "rows": 0,
+        "since": 0,
+        "refits": 0,
+    }
 
 
-def ttt_update(li, k, h_rows, y_rows):
-    """Accumulate anchored RLS stats; exact refit every TTT_REFIT rows (guarded)."""
-    st = ttt_touch(li, k)
-    w2 = INT4X[(li, k)]["w2"]
-    if st["G"] is None:
-        Fd = st["Fd"]
-        st["alpha"] = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ALPHA
-        st["G"] = torch.eye(Fd, device="cuda") * st["alpha"]
-        st["C"] = st["alpha"] * w2.T.clone()
+def _rls_step(st, h_rows, y_rows, anchor_w, apply_to):
+    """Shared anchored-RLS step: 4/5 rows -> G/C, 1/5 -> honest validation;
+    guarded exact refit every TTT_REFIT train rows; apply_to updated in place."""
     G, C = st["G"], st["C"]
     n = h_rows.shape[0]
-    # pre-update residual on these rows (prequential)
-    G.mul_(TTT_LAM**n).add_(h_rows.T @ h_rows)
-    C.mul_(TTT_LAM**n).add_(h_rows.T @ y_rows)
-    st["rows"] += n
-    st["since_refit"] += n
-    st["H"].append(h_rows.detach())
-    st["Y"].append(y_rows.detach())
-    if sum(t.shape[0] for t in st["H"]) > TTT_ROWS_MAX:
-        st["H"].pop(0)
-        st["Y"].pop(0)
-    if st["since_refit"] >= TTT_REFIT:
-        st["since_refit"] = 0
-        st["refits"] += 1
-        Hb = torch.cat(st["H"])
-        Yb = torch.cat(st["Y"])
-        r_before = _resid(w2, Hb, Yb)
-        reg = G.diagonal().mean() * 1e-3
-        w2_new = torch.linalg.solve(G + reg * torch.eye(st["Fd"], device="cuda"), C).T.contiguous()
-        r_after = _resid(w2_new, Hb, Yb)
-        if r_after < r_before:
-            INT4X[(li, k)]["w2"].copy_(w2_new)
-            del w2_new
-            return r_before, r_after
-        del w2_new
-    return None
-
-
-def _resid(w2, h, y):
-    yh = h @ w2.T
-    return (((yh - y) ** 2).sum() / (y**2).sum().clamp_min(1e-12)).item()
-
-
-def snap_int8(w):
-    """int8 {-127..127} + per-channel LS scale; measured: holds the adaptation
-    gain where int4 collapses (attn o_b: 0.50% vs 3.10%)."""
-    sg = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 127.0
-    q = (w / sg).round().clamp(-127, 127)
-    num = (q * w).sum(dim=1)
-    den = (q * q).sum(dim=1).clamp_min(1e-9)
-    a = num / den
-    a = a.sign() * a.abs().clamp_min(1e-9)
-    return q, a
-
-
-def snap_int4(w2):
-    sg = w2.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0
-    q = (w2 / sg).round().clamp(-7, 7)
-    num = (q * w2).sum(dim=1)
-    den = (q * q).sum(dim=1).clamp_min(1e-9)
-    a = num / den
-    a = a.sign() * a.abs().clamp_min(1e-6)
-    return q, a
-
-
-def consolidate_and_save(li, k, enabled=True):
-    """End-of-run: snap adapted W2 to int4; save if holdout improves vs static."""
-    key = (li, k)
-    if key not in TTT_STATE:
-        return
-    st = TTT_STATE.pop(key)
-    if not st["H"]:
-        return
-    Hb = torch.cat(st["H"])
-    Yb = torch.cat(st["Y"])
-    w2 = INT4X[key]["w2"]
-    # static reference: the ORIGINAL checkpoint readout (rebuild from file pattern)
-    e = torch.load(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"), map_location="cpu", weights_only=False)
-    q2_0 = unpack_int4(e["w2a"]).float().cuda()
-    w2_static = q2_0 * e["w2a_scale"].float().cuda()[:, None]
-    del q2_0
-    # holdout = tail of the accumulated buffer
-    n_hold = max(64, int(Hb.shape[0] * TTT_HOLDOUT))
-    Hh, Yh = Hb[-n_hold:], Yb[-n_hold:]
-    r_static = _resid(w2_static, Hh, Yh)
-    r_cont = _resid(w2, Hh, Yh)
-    q, a = snap_int4(w2)
-    r_cons = _resid(q * a[:, None], Hh, Yh)
-    best_w2 = w2.contiguous()
-    if r_cons > r_static:
-        q, a = snap_int4(w2_static)
-        r_cons = r_static
-        best_w2 = w2_static
-    improved = (r_static - r_cons) / r_static
-    print(
-        f"  [ttt] L{li} k{k}: tokens={st['rows']} refits={st['refits']} "
-        f"holdout static={r_static*100:.3f}% cont={r_cont*100:.3f}% cons={r_cons*100:.3f}% "
-        f"(gain {improved*100:+.1f}%)",
-        flush=True,
-    )
-    if not enabled or improved < TTT_MIN_GAIN:
-        return
-    # atomic save: pattern + scale back into the expert file
-    fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
-    e["w2a"] = de.pack_int4(q.cpu())
-    e["w2a_scale"] = a.cpu()
-    e["residual"] = r_cons
-    e["ttt"] = {"tokens": st["rows"], "refits": st["refits"], "static": r_static, "cons": r_cons}
-    tmp = fp + ".tmp"
-    torch.save(e, tmp)
-    os.replace(tmp, fp)
-    SAVE_LOG.append(f"L{li}_{k}: {r_static*100:.3f}% -> {r_cons*100:.3f}%")
-    print(f"  [ttt] SAVED {fp}", flush=True)
-
-
-def attn_ob_path(li):
-    return os.path.join(REDUCED, f"layer_{li}", "attn_ob.pt")
-
-
-def attn_init(li, module):
-    """Load/start the adapted o_b weights (checkpoint if present, else original)."""
-    w0 = module.weight.detach().float().cuda()  # teacher + default init
-    w = w0.clone()
-    fp = attn_ob_path(li)
-    if os.path.exists(fp):
-        e = torch.load(fp, map_location="cpu", weights_only=False)
-        q = e["ob"].float().cuda()  # int8 stored raw (1 byte/weight)
-        w = q * e["ob_scale"].float().cuda()[:, None]
-        print(f"  [attn-ttt] L{li}: loaded adapted o_b (resid {e.get('residual', float('nan'))*100:.3f}%)", flush=True)
-    ATTN_ADAPT[li] = {"w": w, "w0": w0}
-
-
-def attn_touch(li, h_rows):
-    if li not in ATTN_STATE:
-        if len(ATTN_STATE) >= TTT_ATTN_MAX:
-            ATTN_STATE.popitem(last=False)  # coldest state dropped; adapted w persists
-        Fin = h_rows.shape[1]
-        alpha = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ATTN_ALPHA
-        ATTN_STATE[li] = {
-            "G": torch.eye(Fin, device="cuda") * alpha,
-            "C": alpha * ATTN_ADAPT[li]["w"].T.clone(),
-            "Fin": Fin,
-            "H": [],  # train rows (fed into G/C; refit guard)
-            "Y": [],
-            "Hva": [],  # validation rows (NEVER fed into G/C; save decision)
-            "Yva": [],
-            "rows": 0,
-            "since": 0,
-            "refits": 0,
-        }
-    ATTN_STATE.move_to_end(li)
-    return ATTN_STATE[li]
-
-
-def attn_ttt_update(li, h_rows, y_rows):
-    st = attn_touch(li, h_rows)
-    G, C = st["G"], st["C"]
-    n = h_rows.shape[0]
-    n_va = n // 5 if n >= 5 else (1 if n > 1 else 0)  # honest validation split
+    n_va = n // 5 if n >= 5 else (1 if n > 1 else 0)
     tr_h, tr_y = h_rows[: n - n_va], y_rows[: n - n_va]
     va_h, va_y = h_rows[n - n_va :], y_rows[n - n_va :]
     nt = tr_h.shape[0]
@@ -409,37 +281,185 @@ def attn_ttt_update(li, h_rows, y_rows):
         st["since"] = 0
         st["refits"] += 1
         Hb, Yb = torch.cat(st["H"]), torch.cat(st["Y"])
-        w = ATTN_ADAPT[li]["w"]
-        r_before = _resid(w, Hb, Yb)
+        r_before = _resid(anchor_w, Hb, Yb)
         reg = G.diagonal().mean() * 1e-3
         w_new = torch.linalg.solve(G + reg * torch.eye(st["Fin"], device="cuda"), C).T.contiguous()
         r_after = _resid(w_new, Hb, Yb)
         if r_after < r_before:
-            ATTN_ADAPT[li]["w"].copy_(w_new)
-        del w_new
+            apply_to.copy_(w_new)
+            ret = (r_before, r_after)
+        else:
+            ret = None
+        del w_new, Hb, Yb
+        return ret
+    return None
+
+
+def ttt_touch(li, k):
+    key = (li, k)
+    if key not in TTT_STATE:
+        while len(TTT_STATE) >= TTT_MAX_EXPERTS:
+            ev_key = next(iter(TTT_STATE))
+            d_ev = INT4X.get(ev_key)
+            if d_ev is not None and d_ev.get("adapted"):
+                consolidate_and_save(ev_key[0], ev_key[1], enabled=SAVE_ENABLED)  # pops state
+            else:
+                TTT_STATE.pop(ev_key, None)
+        st = {
+            "G": None,  # lazy: needs h energy scale from the first rows
+            "C": None,
+            "Fin": INT4X[key]["w2"].shape[1],
+            "H": [], "Y": [], "Hva": [], "Yva": [],
+            "rows": 0, "since": 0, "refits": 0,
+        }
+        TTT_STATE[key] = st
+    TTT_STATE.move_to_end(key)
+    return TTT_STATE[key]
+
+
+def ttt_update(li, k, h_rows, y_rows):
+    """FFN: anchored RLS against the original FP4 expert outputs."""
+    st = ttt_touch(li, k)
+    w2 = INT4X[(li, k)]["w2"]
+    if st["G"] is None:
+        alpha = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ALPHA
+        fresh = _new_state(w2.T, st["Fin"], alpha)
+        st["G"], st["C"] = fresh["G"], fresh["C"]
+    ret = _rls_step(st, h_rows, y_rows, w2, w2)
+    if ret is not None:
+        INT4X[(li, k)]["adapted"] = True
+    return ret
+
+
+def _resid(w2, h, y):
+    yh = h @ w2.T
+    return (((yh - y) ** 2).sum() / (y**2).sum().clamp_min(1e-12)).item()
+
+
+def snap_int8(w):
+    """int8 {-127..127} + per-channel LS scale; measured: holds the adaptation
+    gain where int4 collapses (attn o_b: 0.50% vs 3.10%)."""
+    sg = w.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 127.0
+    q = (w.float() / sg).round().clamp(-127, 127)
+    num = (q * w.float()).sum(dim=1)
+    den = (q * q).sum(dim=1).clamp_min(1e-9)
+    a = num / den
+    a = a.sign() * a.abs().clamp_min(1e-9)
+    return q, a
+
+
+def snap_int4(w2):
+    sg = w2.abs().amax(dim=1, keepdim=True).clamp_min(1e-9) / 7.0
+    q = (w2 / sg).round().clamp(-7, 7)
+    num = (q * w2).sum(dim=1)
+    den = (q * q).sum(dim=1).clamp_min(1e-9)
+    a = num / den
+    a = a.sign() * a.abs().clamp_min(1e-6)
+    return q, a
+
+
+def consolidate_and_save(li, k, enabled=True):
+    """Snap adapted W2 to int4; save ONLY if the honest validation (rows never
+    fed into G/C) improves over the current checkpoint readout."""
+    key = (li, k)
+    if key not in TTT_STATE:
+        return
+    st = TTT_STATE.pop(key)
+    if key in INT4X:
+        INT4X[key]["adapted"] = False
+    if not st["Hva"]:  # no honest validation rows -> refuse to decide
+        return
+    Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])
+    w2 = INT4X[key]["w2"]
+    e = torch.load(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"), map_location="cpu", weights_only=False)
+    q2_0 = unpack_int4(e["w2a"]).float().cuda()
+    w2_static = q2_0 * e["w2a_scale"].float().cuda()[:, None]
+    del q2_0
+    r_static = _resid(w2_static, Hh, Yh)
+    r_cont = _resid(w2, Hh, Yh)
+    q, a = snap_int4(w2)
+    r_cons = _resid(q * a[:, None], Hh, Yh)
+    if r_cons > r_static:  # snap worse than current file -> keep the file
+        r_cons = r_static
+        q, a = snap_int4(w2_static)
+    improved = (r_static - r_cons) / r_static
+    print(
+        f"  [ttt] L{li} k{k}: rows={st['rows']} refits={st['refits']} val "
+        f"static={r_static*100:.3f}% cont={r_cont*100:.3f}% cons={r_cons*100:.3f}% "
+        f"(gain {improved*100:+.1f}%)",
+        flush=True,
+    )
+    if not enabled or improved < TTT_MIN_GAIN:
+        return
+    fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
+    e["w2a"] = de.pack_int4(q.cpu())
+    e["w2a_scale"] = a.cpu()
+    e["residual"] = r_cons
+    e["ttt"] = {"rows": st["rows"], "refits": st["refits"], "static": r_static, "cons": r_cons}
+    tmp = fp + ".tmp"
+    torch.save(e, tmp)
+    os.replace(tmp, fp)
+    SAVE_LOG.append(f"L{li}_{k}: {r_static*100:.3f}% -> {r_cons*100:.3f}%")
+    print(f"  [ttt] SAVED {fp}", flush=True)
+
+
+# ---------------------------------------------------------------- attention ---
+
+def attn_ob_path(li):
+    return os.path.join(REDUCED, f"layer_{li}", "attn_ob.pt")
+
+
+def attn_init(li, module):
+    """w0 = reference to the module's original bf16 weight (no fp32 copy);
+    w starts from the saved int8 adaptation if present, else from w0."""
+    w0 = module.weight.detach()  # bf16, on cuda (teacher reference)
+    w = w0.float().clone()
+    fp = attn_ob_path(li)
+    if os.path.exists(fp):
+        e = torch.load(fp, map_location="cpu", weights_only=False)
+        q = e["ob"].float().cuda()
+        w = q * e["ob_scale"].float().cuda()[:, None]
+        print(f"  [attn-ttt] L{li}: loaded adapted o_b (resid {e.get('residual', float('nan'))*100:.3f}%)", flush=True)
+    ATTN_ADAPT[li] = {"w": w, "w0": w0}
+
+
+def attn_touch(li, h_rows):
+    if li not in ATTN_STATE:
+        if len(ATTN_STATE) >= TTT_ATTN_MAX:
+            ATTN_STATE.popitem(last=False)  # coldest state dropped; adapted w persists
+        alpha = (h_rows.T @ h_rows).diagonal().mean().item() / max(1, h_rows.shape[0]) * TTT_ATTN_ALPHA
+        ATTN_STATE[li] = _new_state(ATTN_ADAPT[li]["w"].T, h_rows.shape[1], alpha)
+    ATTN_STATE.move_to_end(li)
+    return ATTN_STATE[li]
+
+
+def attn_ttt_update(li, h_rows, y_rows):
+    st = attn_touch(li, h_rows)
+    w = ATTN_ADAPT[li]["w"]
+    _rls_step(st, h_rows, y_rows, w, w)
 
 
 def attn_consolidate_and_save(li, enabled=True):
-    """End of run: snap adapted o_b to int4, save when holdout improves vs teacher-init."""
+    """Snap adapted o_b to int8; save when honest validation improves vs original."""
     if li not in ATTN_STATE:
         return
     st = ATTN_STATE.pop(li)
-    if not st["Hva"]:  # no honest validation rows -> refuse to decide
+    if not st["Hva"]:
         return
-    Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])  # NEVER seen by G/C
+    Hh, Yh = torch.cat(st["Hva"]), torch.cat(st["Yva"])
     w = ATTN_ADAPT[li]["w"]
-    w0 = ATTN_ADAPT[li]["w0"]
+    w0 = ATTN_ADAPT[li]["w0"].float()
     r_static = _resid(w0, Hh, Yh)
     r_cont = _resid(w, Hh, Yh)
-    q, a = snap_int8(w)  # int8: int4 grid collapses the adaptation gain (measured)
+    q, a = snap_int8(w)
     r_cons = _resid(q * a[:, None], Hh, Yh)
     if r_cons > r_static:
         r_cons = r_static
         q, a = snap_int8(w0)
     improved = (r_static - r_cons) / max(r_static, 1e-12)
     print(
-        f"  [attn-ttt] L{li}: rows={st['rows']} refits={st['refits']} holdout "
-        f"teacher={r_static*100:.4f}% cont={r_cont*100:.4f}% cons={r_cons*100:.4f}% "
+        f"  [attn-ttt] L{li}: rows={st['rows']} refits={st['refits']} val "
+        f"orig={r_static*100:.4f}% cont={r_cont*100:.4f}% cons={r_cons*100:.4f}% "
         f"(gain {improved*100:+.1f}%)",
         flush=True,
     )
@@ -457,25 +477,35 @@ def attn_consolidate_and_save(li, enabled=True):
 
 
 def make_attn_hook(li, ttt_on):
-    """Replace o_b_proj output with the adapted readout + TTT updates."""
+    """Teacher mode: record the original model's grouped context (shadow).
+    Student mode: output = grouped @ w_adapted.T; on prefill, regress against
+    the shadow teacher outputs (y_orig = g_teacher @ w0.T)."""
     def hook(module, args, kwargs, output):
-        grouped = args[0]  # [B, S, o_groups*o_lora_rank]
+        if MODE == "teacher":
+            g = args[0]
+            SHADOW[li] = g.reshape(-1, g.shape[-1]).detach()
+            return None  # original module forward (original o_b weights)
+        grouped = args[0]
         ad = ATTN_ADAPT[li]
         g = grouped.reshape(-1, grouped.shape[-1]).float()
         out = (g @ ad["w"].T).to(output.dtype).reshape(output.shape)
-        if ttt_on:
-            global TTT_ROWS
-            TTT_ROWS += 1
-            if TTT_ROWS % TTT_SAMPLE == 0:
-                y_t = g @ ad["w0"].T
-                attn_ttt_update(li, g, y_t)
+        if ttt_on and SHADOW.get(li) is not None:
+            g_t = SHADOW[li]
+            n = min(g.shape[0], g_t.shape[0])
+            if n > 1:
+                y_t = (g_t[:n].to(ad["w0"].dtype) @ ad["w0"].T).float()
+                attn_ttt_update(li, g[:n], y_t)
                 del y_t
+            SHADOW[li] = None  # consumed; decode steps carry no shadow rows
         return out
 
     return hook
 
 
 def make_hook(li, ttt_on):
+    """MoE routing hook. Teacher mode (shadow pass): original FP4 experts only,
+    no TTT - this IS the original model. Student mode: int4x experts where
+    checkpoints exist (with TTT), original FP4 elsewhere."""
     def hook(module, args, kwargs, output):
         x = args[0]
         B, S, D = x.shape
@@ -493,9 +523,10 @@ def make_hook(li, ttt_on):
         sw = get_shared_dequant(li)
         out = ffn(flat, sw["w1"], sw["w2"], sw["w3"])
 
+        teacher = MODE == "teacher"
         global TTT_ROWS
         for k in indices.unique().tolist():
-            d = get_int4x(li, k) if ttt_on or True else None
+            d = None if teacher else get_int4x(li, k)
             if d is not None:
                 h = None
                 out_k = None
@@ -535,16 +566,8 @@ def make_hook(li, ttt_on):
     return hook
 
 
-def main():
-    prompt = sys.argv[1] if len(sys.argv) > 1 else "Hello"
-    max_new = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-    ttt_on = "--no-ttt" not in sys.argv
-    save_on = "--no-save" not in sys.argv
-
-    print("loading tokenizer...", flush=True)
-    tok = gigatoken.Tokenizer.from_json(open(TOKENIZER, "rb").read())
-    ids = [BOS_ID] + list(tok.encode(prompt))
-
+def setup_model():
+    """Load router + bf16 skeleton; shared by the one-shot generator and evolve loop."""
     print("loading router...", flush=True)
     snap = de.default_snapshot()
     wm = de.load_index(snap)["weight_map"]
@@ -561,6 +584,205 @@ def main():
     model.config.gradient_checkpointing = False
     free, total = torch.cuda.mem_get_info()
     print(f"model loaded in {time.time() - t0:.1f}s, GPU free={free / 1e9:.1f}/{total / 1e9:.1f} GB", flush=True)
+    return model
+
+
+def shadow_prefill(model, input_ids):
+    """One forward through the ORIGINAL model (teacher) to fill SHADOW rows."""
+    global MODE, CURRENT_IDS
+    MODE = "teacher"
+    CURRENT_IDS = input_ids
+    try:
+        model(input_ids=input_ids, use_cache=False)
+    finally:
+        MODE = "student"
+
+
+# ------------------------------------------------------------------- evolve ---
+
+def load_lineage():
+    if os.path.exists(EVOL_STATE):
+        try:
+            with open(EVOL_STATE, encoding="utf-8") as f:
+                st = json.load(f)
+            return (int(st.get("cycle", 0)), int(st.get("saves", 0)),
+                    int(st.get("sessions", 0)), list(st.get("ctx", [])))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return 0, 0, 0, []
+
+
+def save_lineage(cycle, saves, sessions, ctx):
+    tmp = EVOL_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"cycle": cycle, "saves": saves, "sessions": sessions, "ctx": ctx}, f)
+    os.replace(tmp, EVOL_STATE)
+
+
+def _top_p_filter(logits, top_p=EVOL_TOP_P):
+    probs = logits.softmax(-1)
+    sp, si = torch.sort(probs, descending=True)
+    cum = sp.cumsum(0)
+    sp[cum - sp > top_p] = 0.0
+    out = torch.zeros_like(probs).scatter(0, si, sp)
+    return out / out.sum().clamp_min(1e-12)
+
+
+@torch.no_grad()
+def gen_sample(model, ids, max_new, temp, shadow=False):
+    """Autoregressive top-p sampling with repetition penalty; optional shadow
+    teacher prefill (honest attention targets) before the student pass."""
+    input_ids = torch.tensor([ids], device="cuda", dtype=torch.long)
+    if shadow:
+        shadow_prefill(model, input_ids)
+    global CURRENT_IDS
+    CURRENT_IDS = input_ids
+    out = model(input_ids=input_ids, use_cache=True, past_key_values=None)
+    past = out.past_key_values
+    logits = out.logits[0, -1].float()
+    generated: list[int] = []
+    for _ in range(max_new):
+        probs = _top_p_filter(logits / temp)
+        recent = generated[-REP_WIN:]
+        if recent:
+            idx = torch.tensor(list(set(recent)), device="cuda", dtype=torch.long)
+            probs[idx] /= REP_PEN
+            probs = probs / probs.sum().clamp_min(1e-12)
+        if len(generated) < MIN_NEW_TOKENS:
+            probs[EOS_ID] = 0.0
+            probs = probs / probs.sum().clamp_min(1e-12)
+        nxt = int(torch.multinomial(probs, 1).item())
+        if nxt == EOS_ID:
+            break
+        generated.append(nxt)
+        CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
+        out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
+        past = out.past_key_values
+        logits = out.logits[0, -1].float()
+    del past, out
+    return generated
+
+
+def _attn_window(session_idx, width):
+    """Rotating coverage: session s covers layers [s*width % 43, +width)."""
+    start = (session_idx * width) % N_LAYERS
+    return sorted((start + i) % N_LAYERS for i in range(width))
+
+
+def run_evolve(model, tok, ttt_on, save_on, sessions_limit, session_sec, turns, gen_tokens, attn_window_w):
+    """Background self-evolution: endless self-talk. The model continues ITS OWN
+    stream of thought (context tail persisted in the lineage state - no fixed
+    prompts); weights evolve live; lineage consolidates after every session."""
+    cycle, saves, sessions, ctx = load_lineage()
+    print(f"lineage: cycle={cycle} sessions={sessions} saves={saves} ctx={len(ctx)} tok", flush=True)
+
+    handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li, ttt_on), with_kwargs=True) for li in range(N_LAYERS)]
+    attn_handles: list = []
+    print(f"FFN TTT hooks on all {N_LAYERS} layers (experts adapt where int4x checkpoints exist)", flush=True)
+
+    session = 0
+    prev_layers: set[int] = set()
+    try:
+        while sessions_limit == 0 or session < sessions_limit:
+            session += 1
+            t0 = time.time()
+            layers = _attn_window(session, attn_window_w)
+            # rotate the attention window: drop adapters of layers that left it
+            for h in attn_handles:
+                h.remove()
+            attn_handles = []
+            for li in prev_layers - set(layers):
+                ATTN_ADAPT.pop(li, None)  # ~128MB fp32 + bf16 ref per layer
+                SHADOW.pop(li, None)
+                ATTN_STATE.pop(li, None)  # consolidated at the previous session end
+            prev_layers = set(layers)
+            for li in layers:
+                attn_init(li, model.model.layers[li].self_attn.o_b_proj)
+                attn_handles.append(
+                    model.model.layers[li].self_attn.o_b_proj.register_forward_hook(
+                        make_attn_hook(li, ttt_on), with_kwargs=True
+                    )
+                )
+
+            # self-talk: the model continues its own thought stream
+            for turn in range(turns):
+                temp = CURIOSITY_TEMP if turn % 2 == 1 else NORMAL_TEMP
+                new = gen_sample(model, ([BOS_ID] + ctx)[-EVOL_CTX:], gen_tokens, temp, shadow=ttt_on)
+                if not new:
+                    break
+                ctx = (ctx + new)[-EVOL_CTX:]
+                text = tok.decode(new[-60:])
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="replace")
+                snippet = " ".join(text.split())
+                print(f"  [turn {turn} T={temp}] ...{snippet}", flush=True)
+
+            n_exp = len(TTT_STATE)
+            for (li, k) in list(TTT_STATE.keys()):
+                consolidate_and_save(li, k, enabled=save_on)
+            for li in list(ATTN_STATE.keys()):
+                attn_consolidate_and_save(li, enabled=save_on)
+            nsaved = len(SAVE_LOG) + len(ATTN_SAVE_LOG)
+
+            cycle += 1
+            sessions += 1
+            saves += 1 if nsaved else 0
+            save_lineage(cycle, saves, sessions, ctx[-EVOL_CTX_KEEP:])
+            SAVE_LOG.clear()
+            ATTN_SAVE_LOG.clear()
+            dt = time.time() - t0
+            print(
+                f"[session {session}] {turns} turns, experts-touched={n_exp} "
+                f"attn-layers={layers} -> saved {nsaved} | lineage cycle {cycle}, saves={saves} ({dt:.0f}s)",
+                flush=True,
+            )
+            time.sleep(max(1, session_sec - int(dt)))
+    finally:
+        for h in handles:
+            h.remove()
+        for h in attn_handles:
+            h.remove()
+        # do not lose live adaptations on Ctrl+C
+        for (li, k) in list(TTT_STATE.keys()):
+            consolidate_and_save(li, k, enabled=save_on)
+        for li in list(ATTN_STATE.keys()):
+            attn_consolidate_and_save(li, enabled=save_on)
+        print("evolve loop stopped; live states consolidated", flush=True)
+
+
+def main():
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "Hello"
+    max_new = int(sys.argv[2]) if len(sys.argv) > 2 else 24
+    ttt_on = "--no-ttt" not in sys.argv
+    save_on = "--no-save" not in sys.argv
+    evolve_on = "--evolve" in sys.argv
+    global SAVE_ENABLED
+    SAVE_ENABLED = save_on
+
+    print("loading tokenizer...", flush=True)
+    tok = gigatoken.Tokenizer.from_json(open(TOKENIZER, "rb").read())
+    ids = [BOS_ID] + list(tok.encode(prompt))
+
+    model = setup_model()
+
+    if evolve_on:
+        def _arg(name, default, cast=int):
+            if name in sys.argv:
+                i = sys.argv.index(name)
+                if i + 1 < len(sys.argv):
+                    return cast(sys.argv[i + 1])
+            return default
+
+        run_evolve(
+            model, tok,
+            ttt_on=ttt_on, save_on=save_on,
+            sessions_limit=_arg("--sessions", 0),
+            session_sec=_arg("--session-sec", 60),
+            turns=_arg("--turns", 6),
+            gen_tokens=_arg("--gen-tokens", 200),
+            attn_window_w=_arg("--attn-window", 8),
+        )
+        return
     n_int4x = sum(1 for li in range(N_LAYERS) for k in range(256) if os.path.exists(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")))
     print(f"int4x checkpoints available: {n_int4x} experts; ttt={'on' if ttt_on else 'off'} save={'on' if save_on else 'off'}", flush=True)
 
@@ -582,6 +804,8 @@ def main():
     generated = list(ids)
     t0 = time.time()
     with torch.no_grad():
+        if attn_handles and ttt_on:
+            shadow_prefill(model, input_ids)  # honest attention targets for the prompt
         CURRENT_IDS = input_ids
         out = model(input_ids=input_ids, use_cache=True, past_key_values=None)
         past = out.past_key_values
