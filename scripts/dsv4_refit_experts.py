@@ -282,6 +282,8 @@ def train_batch(
     bias1=None,
     bias3=None,
     jitter=0.05,
+    abort_above=None,  # early exit when the run is hopeless vs this resid floor
+    abort_after=250,   # ... after this many steps of no progress toward it
 ):
     """pairs: list of (z_k [n_k,K], y_k [n_k,4096]) -> list of (w1q,w1s,w3q,w3s,w2q,w2s).
     Trains the binary core against the full 4096-dim target. n_real: first n_real
@@ -349,7 +351,16 @@ def train_batch(
     with torch.no_grad():
         for s in range(NSUB):
             p2 = weights[3 * s + 2]
-            sg = p2.data.abs().amax(dim=2, keepdim=True).clamp_min(1e-9) / 7.0
+            w = p2.data
+            sg = w.abs().amax(dim=2, keepdim=True).clamp_min(1e-9) / 7.0
+            if init is not None:
+                # warm init: refit the per-channel scale by LS against the
+                # quantized pattern instead of amax (amax pins the scale to the
+                # row's max outlier - AngelSlim measured -89.7% weighted SSD)
+                q = (w / sg).round().clamp(-7, 7)
+                num = (w * q).sum(dim=2, keepdim=True)
+                den = (q * q).sum(dim=2, keepdim=True).clamp_min(1e-9)
+                sg = (num / den).abs().clamp_min(1e-9)
             p2.data.div_(sg)
             w2_grid_scale.append(sg.detach())  # [G, D, 1] original amplitude per channel
     # Jacobian-aligned scale init per sub: per-channel LS matching the original's
@@ -733,6 +744,15 @@ def train_batch(
                 f"ETA {(time.time() - t0) / (st + 1) * (steps - st) / 60:.1f} min",
                 flush=True,
             )
+            if abort_above is not None and st + 1 >= abort_after:
+                med = resid.median().item()
+                if med > abort_above:
+                    print(
+                        f"    [abort] step {st + 1}: resid med {med * 100:.2f}% hopeless "
+                        f"vs floor {abort_above * 100:.2f}% -> stop, caller falls back",
+                        flush=True,
+                    )
+                    break
 
     if best_state is not None:
         for p, saved in zip(weights + scales + biases, best_state):
@@ -1014,6 +1034,15 @@ def run_refit(
             init_gpu = tuple(t.cuda().float() for t in p["init"])
             bias1_gpu = p["bias1"].cuda().float().unsqueeze(0)  # [1, inter]
             bias3_gpu = p["bias3"].cuda().float().unsqueeze(0)
+            # PTQ floor: the closed-form result this init came from; if the
+            # gradient pass is not within 1.5x of it after 250 steps it is
+            # hopeless - abort and let the post-hoc fallback take the PTQ
+            _r_ptq, _w2c_ptq = ptq_closed_form(
+                init_gpu[0][0], init_gpu[1][0], init_gpu[2][0],
+                z_all_gpu[:n_rows], y_all_gpu[:n_rows],
+                p["bias1"].cuda().float(), p["bias3"].cuda().float(),
+            )
+            floor = resid_weights_full(z_all_gpu[:n_rows], y_all_gpu[:n_rows], _r_ptq)
             res = train_batch(
                 [(z_all_gpu[:n_rows], y_all_gpu[:n_rows])],
                 INTER,
@@ -1025,6 +1054,7 @@ def run_refit(
                 real_weight=p["rw_eff"],
                 bias1=bias1_gpu,
                 bias3=bias3_gpu,
+                abort_above=floor * 1.5 if floor < PTQ_FALLBACK else None,
             )[0]
             z_h, yf_h = todo_data[p["k"]]
             resid = resid_weights_full(z_h, yf_h, res)
