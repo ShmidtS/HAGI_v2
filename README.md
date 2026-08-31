@@ -144,14 +144,35 @@ not low-rank:
 - **int8 activations (residual stream)** — per-channel, ~2× with ~0.01%
   reconstruction error (per-tensor ~0.08%).
 - **int8 KV-cache** — per-channel static scale, RoPE-safe (K is stored
-  post-RoPE), ~2× with ~0.005% error (worst 0.0125% across 43 layers). This
-  replaces the earlier low-rank KV-POD (512→256), which was rejected.
+  post-RoPE; scale bound uses the rotation-safe max over each RoPE pair,
+  position-independent, verified flat to 500K positions), ~2× with ~0.005%
+  error (worst 0.0125% across 43 layers). This replaces the earlier
+  low-rank KV-POD (512→256), which was rejected: measured KV spectra are
+  near full-rank, so the low-rank assumption was wrong from the start —
+  same lesson as whitening/rotations in the expert track: measure the
+  spectrum first, then choose the method.
 
-A distance-dependent **pyramid sliding window** (ported from the old KV-POD
-idea) sits on top of the int8 cache: nearby tokens keep full 512 channels,
-older tokens are channel-truncated per
-`r(d) = clamp(512 >> ⌊log2(d/1024 + 1)⌋, 32, 512)` (base 512, window 1024,
-min 32).
+**Target KV design — precision pyramid** (the old pyramid idea survives,
+on the right carrier). The original KV-POD pyramid (2531698) halved the
+read *rank* per distance doubling; the rank carrier died with POD. What
+survives is the principle: nearby tokens matter more, distant tokens get
+small softmax weights, so their error enters the output damped. Budget
+error by contribution, not uniformly — the same telescopic principle as
+the expert refit:
+
+- sliding window (~4K) — full precision (bf16 or int8);
+- mid distances — int8 (0.003–0.005% per channel, negligible next to the
+  9.5% per-expert compression error);
+- far history (≥64K) — int4 (halving effective bits per distance
+  doubling, the same law as the old `r(d)`, applied to bit depth);
+- a few sink tokens — full precision.
+
+At 2M context this is ~3–4× smaller than bf16 cache with no perceptible
+degradation (dominant share of tokens is far history). Wiring plan:
+enable plain int8 KV in the TTT generator after the ternary e2e gate
+(one-line install); the two-tier int8/int4 pyramid is a small patch to
+`Int8KVStore` (tokens evicted from the window re-pack to int4), needed
+only for >128K contexts.
 
 ### Tried and rejected (quantization search)
 
