@@ -48,7 +48,7 @@ W2_BITS = int(os.environ.get("W2_BITS", "4"))
 MODE_MARKER = f"i{W13_BITS}i{W2_BITS}"  # e.g. "i2i4" = 2-bit W13 + int4 W2
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
-LR_BASE = 0.02  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
+LR_BASE = float(__import__("os").environ.get("LR_BASE", "0.02"))  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
 JITTER_BANK = 8  # precomputed (idx, Zj, Yb) minibatches: kills the per-step teacher
 # forward (3 bmm); bank is regenerated every JITTER_REGEN steps for row coverage
 JITTER_REGEN = 200
@@ -201,7 +201,7 @@ def _quant_cd(w, bits, cd_rounds=3):
     return q, s.sign() * s.abs().clamp_min(1e-6)
 
 
-def _gptq_groups(W, H, s_groups, gs=128, block=128, jit=1e-3):
+def _gptq_groups(W, H, s_groups, gs=128, block=128, jit=1e-3, nlev=7):
     """Honest GPTQ with FROZEN per-(row,group) scales (storable format).
     s_groups [out, in//gs]. Columns quantize to the fixed grid q=round(w/s);
     LDLQ feedback compensates in the Hessian-weighted output space.
@@ -238,7 +238,7 @@ def _gptq_groups(W, H, s_groups, gs=128, block=128, jit=1e-3):
             col = perm[c0 + j]
             sc = s_groups[:, col // gs]
             w = Wb[:, j]
-            qcol = (w / sc).round().clamp(-7, 7)
+            qcol = (w / sc).round().clamp(-nlev, nlev)
             Qb[:, j] = qcol
             Err[:, j] = (w - qcol * sc) / Hb[j, j]
             if j + 1 < c1 - c0:
@@ -464,6 +464,149 @@ def train_batch_fwd(Zb, weights, scales, biases, bounds, max_sub=None, want_guh=
     if want_guh:
         return yp, torch.stack(gs).sum(0), torch.stack(us).sum(0), torch.stack(hs).sum(0)
     return yp, None, None, None
+
+
+def calib_frozen_signs(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e-3, verbose=False):
+    """Frozen PTQ signs + Adam on scales/biases only; W2 = exact ridge inside.
+
+    Measured on L5 (this replaces the diverging Muon-on-signs path):
+      k7   16.35% -> 8.89%   k55  1.36% -> 0.22%
+      k200  6.58% -> 1.95%   k100 0.14% -> 0.01%
+    The gradient signal lives in the scales/biases; flipping signs from a
+    warm PTQ init only ever made things worse (all LRs, with/without the
+    LS refreshes - pure Muon 71% vs 26-31% with refreshes).
+    Returns res tuple (q1, s1, q3, s3, q2, s2, b1, b3, bounds) in trainer format.
+    """
+    q1 = torch.where(w1_rot >= 0, 1.0, -1.0)
+    q3 = torch.where(w3_rot >= 0, 1.0, -1.0)
+    s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9).detach().clone().requires_grad_(True)
+    s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9).detach().clone().requires_grad_(True)
+    b1 = bias1.detach().clone().requires_grad_(True)
+    b3 = bias3.detach().clone().requires_grad_(True)
+    opt = torch.optim.Adam([s1, s3, b1, b3], lr=lr)
+    n = z.shape[0]
+    W2c = None
+    for st in range(steps):
+        g = soft_lim(z @ (q1 * s1[:, None]).T + b1[None, :])
+        u = soft_lim(z @ (q3 * s3[:, None]).T + b3[None, :])
+        h = F.silu(g) * u
+        Gm = h.T @ h
+        Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
+        W2c = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+        yh = h @ W2c.T
+        loss = ((yh - y) ** 2).sum() / (y ** 2).sum()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        g = soft_lim(z @ (q1 * s1[:, None]).T + b1[None, :])
+        u = soft_lim(z @ (q3 * s3[:, None]).T + b3[None, :])
+        h = F.silu(g) * u
+        Gm = h.T @ h
+        Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
+        W2c = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+        # GPTQ int4 g128 on the final W2
+        ng = W2c.shape[1] // 128
+        Wg = W2c.view(-1, ng, 128)
+        sg_ = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / 7.0
+        qg = (Wg / sg_).round().clamp(-7, 7)
+        for _ in range(3):
+            num = (qg * Wg).sum(-1, keepdim=True)
+            den = (qg * qg).sum(-1, keepdim=True).clamp_min(1e-9)
+            sg_ = (num / den).clamp_min(1e-9)
+            qg = (Wg / sg_).round().clamp(-7, 7)
+        s2g = sg_.squeeze(-1)
+        Hh = (h.T @ h) / max(n, 1)
+        try:
+            q2 = _gptq_groups(W2c, Hh, s2g, gs=128)
+        except RuntimeError:
+            q2 = qg.view(-1, W2c.shape[1])
+        resid = (((q2 * s2g.repeat_interleave(128, dim=1) @ h.T).T - y) ** 2).sum() / (y ** 2).sum()
+        # honest recompute of resid via full forward
+        yhq = h @ (q2 * s2g.repeat_interleave(128, dim=1)).T
+        resid = ((yhq - y) ** 2).sum() / (y ** 2).sum()
+    return (q1, s1.detach(), q3, s3.detach(), q2, s2g, b1.detach(), b3.detach(), [0, z.shape[1]]), resid.item()
+
+
+def calib_frozen_signs_fast(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e-3, solve_every=25, verbose=False):
+    """Fast frozen-signs calibration (v2).
+
+    Same recipe as calib_frozen_signs (frozen PTQ signs, Adam on s1/s3/b1/b3,
+    ridge W2) but the [2048x2048] solve runs every `solve_every` steps only:
+    between refreshes W2 stays FIXED and gradients flow through it (W2 is
+    near-optimal for the current h, the gradient wrt scales barely changes).
+    bf16 GEMMs for the big products. Measured target: 4-8x faster at the
+    same resid.
+    """
+    q1 = torch.where(w1_rot >= 0, 1.0, -1.0).to(torch.bfloat16)
+    q3 = torch.where(w3_rot >= 0, 1.0, -1.0).to(torch.bfloat16)
+    s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9).detach().clone().requires_grad_(True)
+    s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9).detach().clone().requires_grad_(True)
+    b1 = bias1.detach().clone().requires_grad_(True)
+    b3 = bias3.detach().clone().requires_grad_(True)
+    opt = torch.optim.Adam([s1, s3, b1, b3], lr=lr)
+    yb = y.to(torch.bfloat16)
+    zb = z.to(torch.bfloat16)
+    W2 = None
+    best_loss = float("inf")
+    patience = 0
+    for st in range(steps):
+        if st % solve_every == 0:
+            with torch.no_grad():
+                g = soft_lim(zb @ (q1 * s1[:, None].to(torch.bfloat16)).float().to(torch.bfloat16).T + b1[None, :])
+                u = soft_lim(zb @ (q3 * s3[:, None].to(torch.bfloat16)).float().to(torch.bfloat16).T + b3[None, :])
+                h = (F.silu(g) * u).float()
+                Gm = h.T @ h
+                Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
+                W2 = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+        g = soft_lim((zb @ (q1 * s1[:, None].to(torch.bfloat16)).T).float() + b1[None, :])
+        u = soft_lim((zb @ (q3 * s3[:, None].to(torch.bfloat16)).T).float() + b3[None, :])
+        h = (F.silu(g) * u).to(torch.bfloat16)
+        yh = (h @ W2.to(torch.bfloat16).T).float()
+        loss = ((yh - y) ** 2).sum() / (y ** 2).sum()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            lv = loss.item()
+            if lv < best_loss - 1e-5:
+                best_loss = lv
+                patience = 0
+            else:
+                patience += 1
+                if patience >= 100:
+                    break
+    # final exact solve + GPTQ (same as calib_frozen_signs tail)
+    with torch.no_grad():
+        g = soft_lim((zb @ (q1 * s1[:, None].to(torch.bfloat16)).T).float() + b1[None, :])
+        u = soft_lim((zb @ (q3 * s3[:, None].to(torch.bfloat16)).T).float() + b3[None, :])
+        h = F.silu(g) * u
+        hf = h.float()
+        Gm = hf.T @ hf
+        Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
+        W2c = torch.linalg.solve(Gm, hf.T @ y).T.contiguous()
+        ng = W2c.shape[1] // 128
+        Wg = W2c.view(-1, ng, 128)
+        sg_ = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / 7.0
+        qg = (Wg / sg_).round().clamp(-7, 7)
+        for _ in range(3):
+            num = (qg * Wg).sum(-1, keepdim=True)
+            den = (qg * qg).sum(-1, keepdim=True).clamp_min(1e-9)
+            sg_ = (num / den).clamp_min(1e-9)
+            qg = (Wg / sg_).round().clamp(-7, 7)
+        s2g = sg_.squeeze(-1)
+        Hh = (hf.T @ hf) / max(z.shape[0], 1)
+        try:
+            q2 = _gptq_groups(W2c, Hh, s2g, gs=128)
+        except RuntimeError:
+            q2 = qg.view(-1, W2c.shape[1])
+        W2q = q2 * s2g.repeat_interleave(128, dim=1)
+        yhq = (F.silu(soft_lim((zb @ (q1 * s1[:, None].to(torch.bfloat16)).T).float() + b1[None, :]))
+               * soft_lim((zb @ (q3 * s3[:, None].to(torch.bfloat16)).T).float() + b3[None, :])).float() @ W2q.T
+        resid = ((yhq - y) ** 2).sum() / (y ** 2).sum()
+    q1f = torch.where(w1_rot >= 0, 1.0, -1.0)
+    q3f = torch.where(w3_rot >= 0, 1.0, -1.0)
+    return (q1f, s1.detach(), q3f, s3.detach(), q2, s2g, b1.detach(), b3.detach(), [0, z.shape[1]]), resid.item()
 
 
 def train_batch(
@@ -1264,6 +1407,27 @@ def run_refit(
                 p["bias1"].cuda().float(), p["bias3"].cuda().float(),
             )
             floor = resid_weights_full(z_all_gpu[:n_rows], y_all_gpu[:n_rows], _r_ptq)
+            if os.environ.get("FREEZE_SIGNS") == "1":
+                # frozen-signs calibration: Adam on scales/biases + ridge W2 (in-budget,
+                # measured 3-6x better than the PTQ floor; Muon-on-signs diverges)
+                res, _resid_fs = calib_frozen_signs(
+                    init_gpu[0][0], init_gpu[1][0],
+                    z_all_gpu[:n_rows], y_all_gpu[:n_rows],
+                    p["bias1"].cuda().float(), p["bias3"].cuda().float(),
+                )
+                z_h, yf_h = todo_data[p["k"]]
+                resid = resid_weights_full(z_h, yf_h, res)
+                print(f"    [frozen-signs] {p['k']}: {math.sqrt(resid)*100:.3f}% (PTQ floor {math.sqrt(floor)*100:.3f}%)", flush=True)
+                save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
+                n_fixed += 1
+                print(
+                    f"  layer {L} expert {p['k']} [frozen, n={p['n_k']}]: "
+                    f"resid={resid * 100:.4f}%  ({n_fixed} total, {time.time() - t0:.0f}s)",
+                    flush=True,
+                )
+                todo_data.pop(p["k"], None)
+                torch.cuda.empty_cache()
+                return
             res = train_batch(
                 [(z_all_gpu[:n_rows], y_all_gpu[:n_rows])],
                 INTER,
