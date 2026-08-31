@@ -29,6 +29,7 @@ from dsv4_experts import (
     pack_binary,
     pack_int4,
     pack_nbit,
+    pack_ternary,
     pack_int6,
     LEVELS,
 )
@@ -44,8 +45,9 @@ REDUCED = "dsv4_reduced"
 DEAD_LOG = "refit_bin_dead.txt"
 M_SYNTH = 2048  # universal test-signal samples per expert (multi-tone + white noise)
 W13_BITS = int(os.environ.get("W13_BITS", "2"))  # 1=binary, 2={-3,-1,1,3}, 3={-3..3}, 4=int4
+W13_TERN = os.environ.get("W13_MODE", "") == "tern"  # ternary {-1,0,1} grid, 5 trits/byte
 W2_BITS = int(os.environ.get("W2_BITS", "4"))
-MODE_MARKER = f"i{W13_BITS}i{W2_BITS}"  # e.g. "i2i4" = 2-bit W13 + int4 W2
+MODE_MARKER = "terni4" if W13_TERN else f"i{W13_BITS}i{W2_BITS}"  # e.g. "i2i4", "terni4"
 CROSSED = True  # crossed pairing: approximates off-diagonal cross terms at zero extra bits
 SCALE_LR_FACTOR = 0.5  # LSQ scales: lower LR than Muon weights (raw grad, ~INTERx more sensitive)
 LR_BASE = float(__import__("os").environ.get("LR_BASE", "0.02"))  # Muon base LR (cosined); 0.04 measured worse on synthetic (35% vs 23% @300)
@@ -327,11 +329,12 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         q3 = torch.where(w3_rot >= 0, 1.0, -1.0)
         s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
         s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
-    elif W13_BITS >= 3 and os.environ.get("W13_GPTQ", "1") == "1":
+    elif (W13_BITS >= 3 or W13_TERN) and os.environ.get("W13_GPTQ", "1") == "1":
         # group-GPTQ over the z-Hessian: frozen per-(row,group) LS scales
         # (W13_GS), LDLQ feedback. Measured on L5 k7 (int3 g128): 8.10 -> 6.34.
+        # tern mode: nlev=1 -> grid {-1,0,1} (zero allowed), packed 5 trits/byte.
         GS13 = int(os.environ.get("W13_GS", "128"))
-        nlev13 = 2 ** (W13_BITS - 1) - 1
+        nlev13 = 1 if W13_TERN else 2 ** (W13_BITS - 1) - 1
         Hzz = (z_rows.T @ z_rows) / z_rows.shape[0]
 
         def _gptq_w13(W):
@@ -1331,6 +1334,8 @@ def run_refit(
                         e[nm] = pack_nbit(q, W2_BITS).cpu()
                 elif W13_BITS == 1:
                     e[nm] = pack_binary(q).cpu()
+                elif W13_TERN:
+                    e[nm] = pack_ternary(q).cpu()
                 elif W13_BITS == 4:
                     e[nm] = pack_int4(q).cpu()
                 else:
