@@ -184,24 +184,50 @@ our mixed-precision layout and our LS-scale choices.
 
 ### Status
 
-Full refit of all 43 layers in the `i1i4` format (bin W13 + int4 GPTQ W2) is
-**in progress** (v19b; ~20/43 layers done, ~270 s/layer). Generation runs
-from the compressed expert files via `scripts/dsv4_generate_ttt.py`
-(`INT4X_OFF=1` switches to the FP4 baseline for A/B checks). The e2e text
-quality gate on the compressed model is the next milestone; the eps-injection
-benchmark predicts coherence at the measured per-expert error levels. On top
-of the persisted files, the same pipeline supports **TTT (anchored RLS
+The winning recipe is **`terni4`**: ternary W13 ({−1,0,1} grid, GPTQ,
+group scales g128, 5 trits/byte) + int4 GPTQ W2 (g32) — **1.51× smaller**
+than the FP4 original, e2e coherence gate on layers 0–3 passed.
+Measured per-expert RMS error ~9.5 % (hot expert, honest ‖Δy‖/‖y‖);
+binary W13 everywhere is ruled out (~14.3 %/expert → e_N ≈ 39 % with
+compounding). Next round: adaptive tern-hot / bin-cold experts (~1.6–1.9×).
+
+Full 43-layer pass runs **sequentially with telescopic correction**
+(BRECQ-style): each layer is fitted on activations collected through the
+already-compressed prefix, so per-layer errors add up (Σ) instead of
+multiplying (Π). A/B measured on layer 1: drift-fit **0.73 %** vs
+clean-fit **13.46 %** — 18× in favour; error propagation α = 0.87–0.99
+per layer. `seq_full_pass.sh` orchestrates the pass in blocks of 3
+(collect 3 layers in one model pass → refit → free acts, ~14 h total).
+
+Note on metrics: refit logs print `resid` as an **MSE fraction** (squared
+relative error); the honest RMS error is `sqrt(resid)` — e.g. logged
+0.0082 ≈ 9.1 % RMS. Do not read logged residuals as percentages.
+
+Generation runs from the compressed expert files via
+`scripts/dsv4_generate_ttt.py` (`INT4X_OFF=1` → FP4 baseline for A/B).
+On top of the persisted files the pipeline supports **TTT (anchored RLS
 "eternal thinking")** updates and `--evolve` self-talk sessions.
+
+Rejected by measurement (do not retry): whitening, frozen scales,
+h/y rotations (QuIP#), sign branches, k-means codebooks, channel
+rescaling of W3↔W2 (provably invariant), KL-Root-Kron, act_order.
+Local group scales + ternary grid beat all of them.
 
 ### Pipeline
 
 ```
 lossless_layers/{layer}_ffn.safetensors   (FP4 routed experts)
-        │  dsv4_experts.py (dequant_fp4, load_selected_experts, pack/unpack intN/binary)
+        │  dsv4_experts.py (dequant_fp4, pack/unpack intN/binary/ternary)
         ▼
-dsv4_refit_experts.py <L>   ── exact x/y → bin W13 + GPTQ int4 W2 (mode i1i4, 6.6 MB/expert)
+dsv4_collect_seq.py    ── collect drifted x/y for layers L..L+2 through
+        │                 the compressed prefix (SEQ_LAYERS, I4X_LAYERS,
+        │                 SEQ_CH chunk; 8 K random tokens + unifold seeds)
         ▼
-dsv4_reduced/layer_<L>/P.pt, mu.pt, expert_<k>.pt
+dsv4_refit_experts.py <L>   ── PTQ: tern W13 + GPTQ int4 W2 on drifted
+        │                     acts (W13_MODE=tern W13_BITS=2 W13_GS=128
+        │                     W2_GPTQ=1 PTQ_ONLY=1), real+unifold rows
+        ▼
+dsv4_reduced/layer_<L>/P.pt, mu.pt, expert_<k>.pt   (mode "terni4")
         ▼
 dsv4_generate_ttt.py        ── decode from packed files on the fly (+ TTT/evolve)
 ```
@@ -209,8 +235,17 @@ dsv4_generate_ttt.py        ── decode from packed files on the fly (+ TTT/ev
 Key scripts:
 
 - `scripts/dsv4_experts.py` — shared decode / load / bit-pack utilities
-  (binary, int4, n-bit, int6).
-- `scripts/dsv4_refit_experts.py` — per-expert PTQ refit: binary W13,
-  GPTQ W2 over the activation Hessian (`W13_BITS`/`W2_BITS`/`W2_GPTQ` env).
+  (binary, ternary, int4, n-bit, int6).
+- `scripts/dsv4_refit_experts.py` — per-expert PTQ refit (tern/binary W13,
+  GPTQ W2 over the activation Hessian; `W13_MODE`/`W2_GPTQ` env).
+- `scripts/dsv4_collect_seq.py` — sequential drift collector (multi-layer
+  capture in one model pass, chunked to keep HIP stable).
+- `scripts/probe_alpha.py` — measures per-layer error propagation α.
+- `scripts/probe_binary_check.py` — honest per-format error on a real
+  expert (binary vs ternary vs two-level).
+- `scripts/eval_ab_layer1.py` — A/B eval of a refit variant on held-out
+  rows (`drift` vs `clean` fits).
+- `seq_full_pass.sh` — full 43-layer sequential ternary pass (block-3,
+  disk hygiene, single-instance lock).
 - `scripts/dsv4_generate_ttt.py` — generation from compressed files
   (`INT4X_OFF=1` → FP4 baseline; `EXPERT_NOISE=ε` → noise benchmark).
