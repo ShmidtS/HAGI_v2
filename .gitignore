@@ -43,6 +43,7 @@ dist/
 
 # checkpoints and model weights
 checkpoints/
+checkpoints_dsv4/
 *.pt
 *.pth
 *.ckpt
@@ -57,3 +58,9 @@ profiler_logs/
 refit_*.txt
 dsv4_shared_only/
 research_refs/
+seq_full.lock
+seq_full_pass.log
+seq_full_done.txt
+collect_full.log
+refit_full.log
+checkpoints_dsv4/seq_full/
