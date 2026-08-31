@@ -52,10 +52,26 @@ from dsv4_refit_experts import soft_lim
 from safetensors import safe_open
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
-MODEL_DIR = "C:/HAGI_v2/dsv4_shared_only"
-TOKENIZER = r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json"
-LOSSLESS = "C:/HAGI_v2/lossless_layers"
+import os as _os
+if _os.name != "nt" and _os.path.exists("/mnt/c/HAGI_v2"):
+    # WSL: transparently remap the hardcoded Windows paths
+    def _w2l(p):
+        return p.replace("C:/", "/mnt/c/") if p.startswith("C:/") else p
+else:
+    def _w2l(p):
+        return p
+
+MODEL_DIR = _w2l("C:/HAGI_v2/dsv4_shared_only")
+TOKENIZER = _w2l(r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json")
+LOSSLESS = _w2l("C:/HAGI_v2/lossless_layers")
 REDUCED = "dsv4_reduced"
+# WSL ext4 copy (drvfs torch.load is ~5x slower): set HAGI_DATA=/root/hagi
+# to read the big dirs from the native FS instead of /mnt/c.
+_data = os.environ.get("HAGI_DATA")
+if _data:
+    MODEL_DIR = os.path.join(_data, "dsv4_shared_only")
+    LOSSLESS = os.path.join(_data, "lossless_layers")
+    REDUCED = os.path.join(_data, "dsv4_reduced")
 
 N_LAYERS = 43
 HASH_LAYERS = {0, 1, 2}
@@ -75,6 +91,8 @@ TTT_MIN_GAIN = 0.02  # save only if honest-validation resid improves by >= 2% re
 TTT_DELTA_RANK = int(os.environ.get("TTT_DELTA_RANK", "128"))  # low-rank persist of the W2 adaptation
 TTT_MAX_EXPERTS = int(os.environ.get("TTT_MAX_EXPERTS", "64"))  # live FFN RLS states (G/C ~48MB each) - LRU
 I4X_HIT = 0  # instrumentation
+PROF_DECODE = bool(os.environ.get("PROF_DECODE"))
+PROF_T = {"shared": 0.0, "route": 0.0, "get": 0.0, "fwd": 0.0, "outk": 0.0, "scatter": 0.0}
 I4X_MISS = 0
 TTT_ROWS_MAX = 2048  # max train rows kept per expert
 # --- attention TTT: o_b_proj readout (grouped ctx [.,8192] -> hidden 4096) ---
@@ -285,9 +303,10 @@ def unpack_int4_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     out[:, 0::2] = lo
     out[:, 1::2] = hi
     sc = scale
-    if sc.dim() == 2:  # group scales [out, ng]
+    if sc.dim() == 2:  # group scales [out, ng] -> [out, in], elementwise
         gs = out.shape[1] // sc.shape[1]
         sc = sc.repeat_interleave(gs, dim=1)
+        return out * sc.to(torch.bfloat16)
     return out * sc.to(torch.bfloat16)[:, None]
 
 
@@ -301,11 +320,64 @@ def load_pod(li):
     return P, mu
 
 
+def prewarm_packed(n_threads=8, verbose=True):
+    """One sequential sweep over all expert files into the GPU packed cache.
+    Turns per-token random small-file IO (drvfs/9P per-file overhead is
+    ~40ms on WSL) into a one-time parallel prefetch. With I4X_PACKED_MAX
+    >= 11008 the whole routed mass (~72GB) stays resident (unified memory)
+    and generation then does ZERO file IO."""
+    import concurrent.futures as cf
+    t0 = time.time()
+    paths = []
+    for li in range(N_LAYERS):
+        for k in range(256):
+            fp = os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")
+            if os.path.exists(fp):
+                paths.append((li, k, fp))
+    if verbose:
+        print(f"prewarm: {len(paths)} expert files, {n_threads} threads", flush=True)
+
+    def _load(item):
+        li, k, fp = item
+        return li, k, torch.load(fp, map_location="cpu", weights_only=False)
+
+    n = 0
+    with cf.ThreadPoolExecutor(n_threads) as ex:
+        for li, k, e in ex.map(_load, paths):
+            key_p = (li, k)
+            if key_p in I4X_PACKED:
+                continue
+            e = {kk: (v.cuda() if torch.is_tensor(v) else v) for kk, v in e.items()}
+            I4X_PACKED[key_p] = e
+            I4X_PACKED.move_to_end(key_p)
+            n += 1
+            if verbose and n % 1024 == 0:
+                print(f"  prewarm {n}/{len(paths)} ({time.time() - t0:.0f}s)", flush=True)
+    while len(I4X_PACKED) > I4X_PACKED_MAX:
+        I4X_PACKED.popitem(last=False)
+    if verbose:
+        print(f"prewarm done: {n} experts resident in {time.time() - t0:.0f}s", flush=True)
+
+
+_I4X_LAYERS = None  # bisect: None = all compressed; else a set of layers
+
+
+def _i4x_layers():
+    global _I4X_LAYERS
+    if _I4X_LAYERS is None:
+        v = os.environ.get("I4X_LAYERS")
+        _I4X_LAYERS = set(int(x) for x in v.split(",")) if v else None
+    return _I4X_LAYERS
+
+
 def get_int4x(li, k):
     """Dequantized int4x expert: frozen parts + current (possibly adapted) W2."""
     global I4X_HIT, I4X_MISS
     if os.environ.get("INT4X_OFF"):
         return None  # baseline: original FP4 experts everywhere
+    _ll = _i4x_layers()
+    if _ll is not None and li not in _ll:
+        return None  # bisect: this layer runs the original FP4 expert
     key = (li, k)
     if key in INT4X:
         I4X_HIT += 1
@@ -320,19 +392,19 @@ def get_int4x(li, k):
         if not os.path.exists(fp):
             return None
         e = torch.load(fp, map_location="cpu", weights_only=False)
-        mode = e.get("mode", "")
-        _b13 = _b2 = None
-        if mode == "int4x":
-            _b13, _b2 = 1, 4
-        elif len(mode) == 4 and mode[0] == "i" and mode[2] == "i" and mode[1].isdigit() and mode[3].isdigit():
-            _b13, _b2 = int(mode[1]), int(mode[3])
-        if _b13 is None:
-            return None
         e = {kk: (v.cuda() if torch.is_tensor(v) else v) for kk, v in e.items()}
         I4X_PACKED[key_p] = e
         I4X_PACKED.move_to_end(key_p)
         while len(I4X_PACKED) > I4X_PACKED_MAX:
             I4X_PACKED.popitem(last=False)
+    mode = e.get("mode", "")
+    _b13 = _b2 = None
+    if mode == "int4x":
+        _b13, _b2 = 1, 4
+    elif len(mode) == 4 and mode[0] == "i" and mode[2] == "i" and mode[1].isdigit() and mode[3].isdigit():
+        _b13, _b2 = int(mode[1]), int(mode[3])
+    if _b13 is None:
+        return None
     P, mu = load_pod(li)
     dev = "cuda"
     e_gpu = I4X_PACKED[key_p]  # already on cuda
@@ -385,6 +457,15 @@ def int4x_forward(d, x_rows):
     """x_rows [n, 4096] raw fp32 -> h [n, 2048] fp32 (bf16 GEMMs inside)."""
     xb = x_rows.to(torch.bfloat16)
     z = (xb - d["mu"]) @ d["P"]
+    g = soft_lim(z @ d["w1"].T + d["b1"])
+    u = soft_lim(z @ d["w3"].T + d["b3"])
+    return (torch.nn.functional.silu(g) * u).float()
+
+
+def int4x_forward_z(d, z):
+    """Pre-rotated variant: z [n, 4096] (already (x-mu)@P, bf16-friendly fp32)
+    -> h [n, 2048]. The (x-mu)@P GEMM reads the 32MB P once per LAYER, not
+    once per expert (8x less traffic; FreeToken-style hoisting)."""
     g = soft_lim(z @ d["w1"].T + d["b1"])
     u = soft_lim(z @ d["w3"].T + d["b3"])
     return (torch.nn.functional.silu(g) * u).float()
@@ -696,49 +777,100 @@ def make_hook(li, ttt_on):
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * ROUTED_SCALE
 
+        _pr = PROF_DECODE
+        _t0 = _pr and time.perf_counter()
         sw = get_shared_dequant(li)
         flatb = flat.to(torch.bfloat16)
         out = ffn(flatb, sw["w1"], sw["w2"], sw["w3"]).float()
+        if _pr:
+            PROF_T["shared"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
         teacher = MODE == "teacher"
         if COLLECT_USAGE and not teacher:
             USAGE_T[li] += torch.bincount(indices.reshape(-1), minlength=256)
         prefill = (not teacher) and S > 1 and ttt_on
         cands = []  # (rows, k) TTT candidates at prefill
-        for k in indices.unique().tolist():
-            d = None if teacher else get_int4x(li, k)
-            if d is not None:
-                m_any = (indices == k).any(dim=1)
-                h = int4x_forward(d, flat[m_any])
-                out_k = (h.to(torch.bfloat16) @ d["w2b"].T).float()  # [rows_any, D]
-                pos = torch.cumsum(m_any.long(), 0) - 1  # row -> position in xm
-                for kk in range(TOP_K):
-                    m = indices[:, kk] == k
-                    if m.any():
-                        out[m] += weights[m, kk, None] * out_k[pos[m]]
-                if prefill:
-                    cands.append((int(m_any.sum()), k))
-                elif ttt_on:  # decode step: collect rows for the turn-end flush
-                    ekey = (li, k)
-                    ent = COLLECT_FFN.get(ekey)
-                    if ent is None:
-                        ent = COLLECT_FFN[ekey] = {"x": [], "h": [], "n": 0}
-                    if ent["n"] < COLLECT_CAP:
-                        ent["x"].append(flat[m_any].detach())
-                        ent["h"].append(h.detach())
-                        ent["n"] += int(m_any.sum())
-                del h, out_k, m_any, pos
-            else:
-                w1, w2, w3 = get_dequant(li, k)
-                ek = ffn(flat.to(torch.bfloat16), w1, w2, w3).float()
-                if EXPERT_NOISE > 0.0:
-                    rms = ek.pow(2).mean(dim=1, keepdim=True).sqrt()
-                    ek = ek + rms * EXPERT_NOISE * torch.randn_like(ek)
-                for kk in range(TOP_K):
-                    m = indices[:, kk] == k
-                    if m.any():
-                        out[m] += weights[m, kk, None] * ek[m]
-                del ek
+        if _pr:
+            PROF_T["route"] += time.perf_counter() - _t0  # includes unique().tolist() sync
+        if flat.shape[0] == 1:
+            # decode fast path: single row, no scatter machinery, two syncs total;
+            # z = (x-mu)@P hoisted per layer (shared by all routed experts)
+            _w_list = weights[0].tolist()
+            _d0 = get_int4x(li, indices[0, 0].item()) if not teacher else None
+            _z_layer = None
+            for j, k in enumerate(indices[0].tolist()):
+                _tk = _pr and time.perf_counter()
+                d = None if teacher else get_int4x(li, k)
+                if _pr:
+                    PROF_T["get"] += time.perf_counter() - _tk
+                if d is None:
+                    # baseline/bisect: this expert runs the ORIGINAL FP4 weights
+                    w1, w2, w3 = get_dequant(li, k)
+                    ek = ffn(flatb, w1, w2, w3).float()
+                    out[0] += _w_list[j] * ek[0]
+                    continue
+                if _z_layer is None:
+                    _z_layer = (flat.to(torch.bfloat16) - d["mu"]) @ d["P"]
+                if _pr:
+                    _tk = time.perf_counter()
+                h = int4x_forward_z(d, _z_layer)
+                out[0] += _w_list[j] * (h.to(torch.bfloat16) @ d["w2b"].T).float()[0]
+                if _pr:
+                    PROF_T["fwd"] += time.perf_counter() - _tk
+            del _d0, _z_layer
+            if _pr:
+                _t0 = time.perf_counter()
+            for kk in range(0):  # keep later accumulators coherent
+                pass
+        else:
+            for k in indices.unique().tolist():
+                _tk = _pr and time.perf_counter()
+                d = None if teacher else get_int4x(li, k)
+                if _pr:
+                    PROF_T["get"] += time.perf_counter() - _tk
+                if d is not None:
+                    if _pr:
+                        _tk = time.perf_counter()
+                    m_any = (indices == k).any(dim=1)
+                    h = int4x_forward(d, flat[m_any])
+                    if _pr:
+                        PROF_T["fwd"] += time.perf_counter() - _tk
+                        _tk = time.perf_counter()
+                    out_k = (h.to(torch.bfloat16) @ d["w2b"].T).float()  # [rows_any, D]
+                    if _pr:
+                        PROF_T["outk"] += time.perf_counter() - _tk
+                        _tk = time.perf_counter()
+                    pos = torch.cumsum(m_any.long(), 0) - 1  # row -> position in xm
+                    for kk in range(TOP_K):
+                        m = indices[:, kk] == k
+                        if m.any():
+                            out[m] += weights[m, kk, None] * out_k[pos[m]]
+                    if _pr:
+                        PROF_T["scatter"] += time.perf_counter() - _tk
+                    if prefill:
+                        cands.append((int(m_any.sum()), k))
+                    elif ttt_on:  # decode step: collect rows for the turn-end flush
+                        ekey = (li, k)
+                        ent = COLLECT_FFN.get(ekey)
+                        if ent is None:
+                            ent = COLLECT_FFN[ekey] = {"x": [], "h": [], "n": 0}
+                        if ent["n"] < COLLECT_CAP:
+                            ent["x"].append(flat[m_any].detach())
+                            ent["h"].append(h.detach())
+                            ent["n"] += int(m_any.sum())
+                    del h, out_k, m_any, pos
+                else:
+                    w1, w2, w3 = get_dequant(li, k)
+                    ek = ffn(flat.to(torch.bfloat16), w1, w2, w3).float()
+                    if EXPERT_NOISE > 0.0:
+                        rms = ek.pow(2).mean(dim=1, keepdim=True).sqrt()
+                        ek = ek + rms * EXPERT_NOISE * torch.randn_like(ek)
+                    for kk in range(TOP_K):
+                        m = indices[:, kk] == k
+                        if m.any():
+                            out[m] += weights[m, kk, None] * ek[m]
+                    del ek
 
         if cands:  # prefill TTT: hottest experts only, teacher = original FP4
             cands.sort(reverse=True)
@@ -1173,6 +1305,8 @@ def main():
         return
     n_int4x = sum(1 for li in range(N_LAYERS) for k in range(256) if os.path.exists(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")))
     print(f"int4x checkpoints available: {n_int4x} experts; ttt={'on' if ttt_on else 'off'} save={'on' if save_on else 'off'}", flush=True)
+    if os.environ.get("I4X_PREWARM") and not evolve_on:
+        prewarm_packed(n_threads=int(os.environ.get("I4X_PREWARM_THREADS", "8")))
 
     handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li, ttt_on), with_kwargs=True) for li in range(N_LAYERS)]
     attn_on = "--no-attn" not in sys.argv
@@ -1216,6 +1350,10 @@ def main():
     dt = time.time() - t0
     n_tok = len(generated) - len(ids)
     print(f"generated {n_tok} tokens in {dt:.1f}s ({n_tok / max(dt, 1e-9):.2f} tok/s)", flush=True)
+    print(f"i4x hit/miss: {I4X_HIT}/{I4X_MISS} (miss-rate {I4X_MISS / max(I4X_HIT + I4X_MISS, 1) * 100:.0f}%)", flush=True)
+    if PROF_DECODE:
+        tot = sum(PROF_T.values())
+        print("hook profile: " + "  ".join(f"{k}={v:.2f}s" for k, v in PROF_T.items()) + f"  total={tot:.2f}s", flush=True)
 
     print("consolidating TTT experts...", flush=True)
     for (li, k) in list(TTT_STATE.keys()):

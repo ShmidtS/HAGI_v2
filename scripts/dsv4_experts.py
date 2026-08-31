@@ -207,7 +207,10 @@ def load_index(snapshot_dir: str) -> dict:
 
 
 def default_snapshot() -> str:
-    cache = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots")
+    hf = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    cache = os.path.join(hf, "hub", "models--deepseek-ai--DeepSeek-V4-Flash-0731", "snapshots")
+    if not os.path.isdir(cache) and cache.startswith("/root"):
+        cache = "/mnt/c/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots"  # WSL fallback
     try:
         snaps = sorted(os.listdir(cache))
     except FileNotFoundError as exc:
