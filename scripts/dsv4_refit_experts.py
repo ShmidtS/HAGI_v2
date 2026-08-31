@@ -327,11 +327,39 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         q3 = torch.where(w3_rot >= 0, 1.0, -1.0)
         s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
         s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
+    elif W13_BITS >= 3 and os.environ.get("W13_GPTQ", "1") == "1":
+        # group-GPTQ over the z-Hessian: frozen per-(row,group) LS scales
+        # (W13_GS), LDLQ feedback. Measured on L5 k7 (int3 g128): 8.10 -> 6.34.
+        GS13 = int(os.environ.get("W13_GS", "128"))
+        nlev13 = 2 ** (W13_BITS - 1) - 1
+        Hzz = (z_rows.T @ z_rows) / z_rows.shape[0]
+
+        def _gptq_w13(W):
+            out_, in_ = W.shape
+            ng13 = in_ // GS13
+            Wg = W.view(out_, ng13, GS13)
+            sg13 = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / nlev13
+            for _ in range(4):
+                qg13 = (Wg / sg13).round().clamp(-nlev13, nlev13)
+                num = (qg13 * Wg).sum(-1, keepdim=True)
+                den = (qg13 * qg13).sum(-1, keepdim=True).clamp_min(1e-9)
+                sg13 = (num / den).clamp_min(1e-9)
+            sg13_2d = sg13.squeeze(-1)  # [out, ng] storable
+            q13 = _gptq_groups(W, Hzz, sg13_2d, gs=GS13, nlev=nlev13)
+            return q13, sg13_2d
+
+        q1, s1 = _gptq_w13(w1_rot)
+        q3, s3 = _gptq_w13(w3_rot)
     else:
         q1, s1 = _quant_cd(w1_rot, W13_BITS)
         q3, s3 = _quant_cd(w3_rot, W13_BITS)
-    w1 = q1 * s1[:, None]
-    w3 = q3 * s3[:, None]
+    if s1.dim() == 2:
+        gs1e = q1.shape[1] // s1.shape[1]
+        w1 = (q1.view(q1.shape[0], s1.shape[1], gs1e) * s1.unsqueeze(-1)).view_as(q1)
+        w3 = (q3.view(q3.shape[0], s3.shape[1], gs1e) * s3.unsqueeze(-1)).view_as(q3)
+    else:
+        w1 = q1 * s1[:, None]
+        w3 = q3 * s3[:, None]
     g = soft_lim(z_rows @ w1.T + bias1[None, :])
     u = soft_lim(z_rows @ w3.T + bias3[None, :])
     h = F.silu(g) * u  # [n, inter]
@@ -391,7 +419,6 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         den = (wcw * q2 * q2).sum(dim=1).clamp_min(1e-9)
         s2 = num / den
         s2 = s2.sign() * s2.abs().clamp_min(1e-6)
-    # one re-LS of W1/W3 scales + biases at the QUANTIZED W2
     bounds = [0, z_rows.shape[1]]
     res = (q1, s1, q3, s3, q2, s2, bias1, bias3, bounds)
     return res, W2c
@@ -413,8 +440,16 @@ def resid_weights_full(z, y_full, res):
             b3 = bss[2 * s + 1].to(torch.bfloat16)
             zs = z[:, bounds[s] : bounds[s + 1]]
             us = z[:, bounds[u_slice(s)] : bounds[u_slice(s) + 1]]  # crossed pairing
-            w1 = w1q * w1s[:, None]
-            w3 = w3q * w3s[:, None]
+            if w1s.dim() == 2:  # group scales [out, ng] -> expand
+                gs1 = w1q.shape[1] // w1s.shape[1]
+                w1 = (w1q.view(w1q.shape[0], w1s.shape[1], gs1) * w1s.unsqueeze(-1)).view_as(w1q)
+            else:
+                w1 = w1q * w1s[:, None]
+            if w3s.dim() == 2:
+                gs3 = w3q.shape[1] // w3s.shape[1]
+                w3 = (w3q.view(w3q.shape[0], w3s.shape[1], gs3) * w3s.unsqueeze(-1)).view_as(w3q)
+            else:
+                w3 = w3q * w3s[:, None]
             if w2s.dim() == 2:  # group scales [out, ng] -> expand to [out, in]
                 gs = w2q.shape[1] // w2s.shape[1]
                 w2 = (w2q.view(w2q.shape[0], w2s.shape[1], gs) * w2s.unsqueeze(-1)).view_as(w2q)

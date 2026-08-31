@@ -290,7 +290,12 @@ def unpack_nbit_bf16(p: torch.Tensor, scale: torch.Tensor, bits: int) -> torch.T
         res = torch.empty(out_, n * 8, dtype=torch.float32, device=p.device)
         for k in range(8):
             res[:, k::8] = lv[(v >> (3 * k)) & 7]
-    return (res * scale.to(torch.float32)[:, None]).to(torch.bfloat16)
+    sc = scale
+    if sc.dim() == 2:  # group scales [out, ng] -> [out, in], elementwise
+        gs = res.shape[1] // sc.shape[1]
+        sc = sc.repeat_interleave(gs, dim=1)
+        return (res * sc.to(torch.float32)).to(torch.bfloat16)
+    return (res * sc.to(torch.float32)[:, None]).to(torch.bfloat16)
 
 
 def unpack_int4_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
