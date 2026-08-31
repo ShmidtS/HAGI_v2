@@ -298,6 +298,21 @@ def unpack_nbit_bf16(p: torch.Tensor, scale: torch.Tensor, bits: int) -> torch.T
     return (res * sc.to(torch.float32)[:, None]).to(torch.bfloat16)
 
 
+def unpack_ternary_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """uint8 [out, ceil(in/5)] (cuda) -> bf16 [out, in] {-1,0,1} x scale.
+    scale: [out] per-row OR [out, ng] group scales."""
+    from dsv4_experts import unpack_ternary
+
+    t = unpack_ternary(p).to(torch.float32)
+    if scale.dim() == 2:  # group scales [out, ng], gs=128 fixed by refit
+        in_ = scale.shape[1] * 128
+        t = t[:, :in_]
+        sc = scale.repeat_interleave(128, dim=1)
+        return (t * sc.to(torch.float32)).to(torch.bfloat16)
+    sc = scale
+    return (t * sc.to(torch.float32)[:, None]).to(torch.bfloat16)
+
+
 def unpack_int4_bf16(p: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """uint8 [out, in/2] (cuda) -> bf16 [out, in] {-7..7} x scale.
     scale: [out] per-row OR [out, ng] group scales (expanded). ~0.5ms."""
@@ -406,6 +421,8 @@ def get_int4x(li, k):
     _b13 = _b2 = None
     if mode == "int4x":
         _b13, _b2 = 1, 4
+    elif mode == "terni4":
+        _b13, _b2 = "tern", 4
     elif len(mode) == 4 and mode[0] == "i" and mode[2] == "i" and mode[1].isdigit() and mode[3].isdigit():
         _b13, _b2 = int(mode[1]), int(mode[3])
     if _b13 is None:
@@ -415,6 +432,8 @@ def get_int4x(li, k):
     e_gpu = I4X_PACKED[key_p]  # already on cuda
     if _b13 == 1:
         _u13 = unpack_binary_bf16
+    elif _b13 == "tern":
+        _u13 = unpack_ternary_bf16
     elif _b13 == 4:
         _u13 = unpack_int4_bf16
     else:
