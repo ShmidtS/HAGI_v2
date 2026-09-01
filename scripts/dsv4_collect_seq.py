@@ -51,7 +51,14 @@ SEQ_LAYERS = set(int(x) for x in os.environ.get("SEQ_LAYERS", "").split(",") if 
 if not SEQ_LAYERS:
     SEQ_LAYERS = {int(os.environ["SEQ_LAYER"])}
 COMP = set(int(x) for x in os.environ.get("I4X_LAYERS", "").split(",") if x != "")
-assert all(c < min(SEQ_LAYERS) for c in COMP), "compressed prefix must be BELOW the target layers"
+if os.environ.get("BACKFILL_ANY_PREFIX") == "1":
+    # backfill mode: capture ALL layers in one pass through the fully
+    # compressed prefix. Layer L's input only depends on layers < L, so a
+    # compressed layer >= L does not corrupt its capture (the y-teacher is
+    # always computed from the original weights).
+    pass
+else:
+    assert all(c < min(SEQ_LAYERS) for c in COMP), "compressed prefix must be BELOW the target layers"
 
 MODEL_DIR = "C:/HAGI_v2/dsv4_shared_only"
 TOKENIZER = r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json"
