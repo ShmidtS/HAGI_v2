@@ -128,6 +128,20 @@ def main():
                         m = indices[:, kk] == k
                         if m.any():
                             out[m] += weights[m, kk, None] * out_k[pos[m]]
+                    if collect:
+                        # backfill capture on a COMPRESSED layer: inputs are drifted
+                        # (what we want), but the teacher MUST be the original
+                        # weights - materialize them for the captured rows only.
+                        key = str(k)
+                        if COUNTS.setdefault(li, {}).get(key, 0) < args.cap:
+                            x_k = flat[m_any]
+                            w1, w2, w3 = get_dequant(li, k)
+                            y_cap = ffn(x_k.to(torch.bfloat16), w1, w2, w3).float()
+                            take = min(args.cap - COUNTS[li].get(key, 0), x_k.shape[0])
+                            ent = ACC.setdefault(li, {}).setdefault(key, ([], []))
+                            ent[0].append(x_k[:take].detach().cpu().to(torch.bfloat16))
+                            ent[1].append(y_cap[:take].detach().cpu().to(torch.bfloat16))
+                            COUNTS[li][key] = COUNTS[li].get(key, 0) + take
             else:
                 for k in indices.unique().tolist():
                     w1, w2, w3 = get_dequant(li, k)
@@ -142,7 +156,7 @@ def main():
                     if collect:
                         key = str(k)
                         if COUNTS.setdefault(li, {}).get(key, 0) < args.cap:
-                            take = min(args.cap - COUNTS.get(key, 0), x_k.shape[0])
+                            take = min(args.cap - COUNTS[li].get(key, 0), x_k.shape[0])
                             ent = ACC.setdefault(li, {}).setdefault(key, ([], []))
                             ent[0].append(x_k[:take].detach().cpu().to(torch.bfloat16))
                             ent[1].append(y_k[:take].detach().cpu().to(torch.bfloat16))
