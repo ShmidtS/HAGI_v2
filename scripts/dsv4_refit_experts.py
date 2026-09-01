@@ -331,11 +331,14 @@ def ridge_solve_guarded(Gm, rhs, y_rows=None, h_rows=None, tag=""):
         sol = torch.linalg.lstsq(Gm, rhs).solution
     if y_rows is not None and h_rows is not None:
         w = sol.T.contiguous()
-        r2 = 1 - ((h_rows @ w.T - y_rows) ** 2).sum() / ((y_rows - y_rows.mean(0)) ** 2).sum().clamp_min(1e-30)
-        if r2 < 0:
-            print(f"    [quaSAR] {tag}: R^2={r2.item():.3f} < 0 (fit worse than mean) - check this expert", flush=True)
+        # uncentered R^2 (1 - SSE/||y||^2) == our resid metric; the centered
+        # variance denominator degenerates to ~0 on thin-expert synthetic
+        # clouds (near-constant y) and produces fake -1e22 alarms.
+        r2 = 1 - ((h_rows @ w.T - y_rows) ** 2).sum() / y_rows.pow(2).sum().clamp_min(1e-30)
+        if r2 < -0.05:
+            print(f"    [quaSAR] {tag}: resid={(1 - r2).item() * 100:.2f}% of ||y|| (fit exploded) - check this expert", flush=True)
         nw = w.norm() / y_rows.norm().clamp_min(1e-30)
-        if h_rows.shape[1] and nw > 1e3:
+        if nw > 1e3:
             print(f"    [quaSAR] {tag}: readout norm ratio {nw.item():.1f} - possible collapse", flush=True)
     return sol
 
