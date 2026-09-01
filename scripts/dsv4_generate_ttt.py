@@ -85,6 +85,8 @@ GPU_HEADROOM = 12 * 1024**3
 # --- TTT knobs ---
 TTT_PER_LAYER = int(os.environ.get("TTT_PER_LAYER", "2"))  # experts TTT-updated per layer per prefill
 TTT_REFIT = 64  # exact solve after this many accumulated train rows
+TTT_PRECOND = os.environ.get("TTT_PRECOND", "1") == "1"  # delta-mem style: per-feature
+# scale normalization when accumulating G/C (anti-drift preconditioning)
 TTT_ALPHA = 1000.0  # anchor weight (in "token" units) toward the current readout
 TTT_LAM = 0.9995  # forgetting factor
 TTT_MIN_GAIN = 0.02  # save only if honest-validation resid improves by >= 2% relative
@@ -524,6 +526,16 @@ def _rls_step(st, h_rows, y_rows, anchor_w, apply_to):
     tr_h, tr_y = h_rows[: n - n_va], y_rows[: n - n_va]
     va_h, va_y = h_rows[n - n_va :], y_rows[n - n_va :]
     nt = tr_h.shape[0]
+    if TTT_PRECOND:
+        # delta-mem stabilization: normalize feature columns (RMS) so the
+        # Gram stays O(1) despite the 1e12 eigenvalue spread of h; the solve
+        # is a mere reparameterization, W2 is recovered by un-scaling.
+        sc = st.setdefault("fsc", None)
+        if sc is None:
+            sc = tr_h.pow(2).mean(0).sqrt().clamp_min(1e-6)
+            st["fsc"] = sc
+        tr_h = tr_h / sc
+        tr_y = tr_y  # targets unchanged; the solved readout acts on scaled h
     G.mul_(TTT_LAM**nt).add_(tr_h.T @ tr_h)
     C.mul_(TTT_LAM**nt).add_(tr_h.T @ tr_y)
     st["rows"] += n
@@ -546,6 +558,8 @@ def _rls_step(st, h_rows, y_rows, anchor_w, apply_to):
         r_before = _resid(anchor_w, Hb, Yb)
         reg = G.diagonal().mean() * 1e-3
         w_new = torch.linalg.solve(G + reg * torch.eye(st["Fin"], device="cuda"), C).T.contiguous()
+        if TTT_PRECOND and st.get("fsc") is not None:
+            w_new = w_new / st["fsc"]  # un-scale: readout acts on raw h again
         r_after = _resid(w_new, Hb, Yb)
         if r_after < r_before:
             apply_to.copy_(w_new)

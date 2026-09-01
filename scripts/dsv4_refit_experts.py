@@ -314,6 +314,31 @@ def _int4_col(w, rounds=2):
     return q, s
 
 
+
+def ridge_solve_guarded(Gm, rhs, y_rows=None, h_rows=None, tag=""):
+    """QuaSAR-style guarded ridge solve: solve, then pinv fallback on collapse.
+
+    Alarms (printed, non-fatal): negative R^2 of the fit (worse than the
+    mean predictor) and readout norm explosion vs the data scale. On a
+    singular/ill-conditioned Gram matrix falls back to lstsq (pinv with
+    rcond cutoff), which zeroes only the collapsed directions instead of
+    shrinking all of them.
+    """
+    try:
+        sol = torch.linalg.solve(Gm, rhs)
+    except Exception:
+        print(f"    [quaSAR] {tag}: singular Gram -> pinv fallback", flush=True)
+        sol = torch.linalg.lstsq(Gm, rhs).solution
+    if y_rows is not None and h_rows is not None:
+        w = sol.T.contiguous()
+        r2 = 1 - ((h_rows @ w.T - y_rows) ** 2).sum() / ((y_rows - y_rows.mean(0)) ** 2).sum().clamp_min(1e-30)
+        if r2 < 0:
+            print(f"    [quaSAR] {tag}: R^2={r2.item():.3f} < 0 (fit worse than mean) - check this expert", flush=True)
+        nw = w.norm() / y_rows.norm().clamp_min(1e-30)
+        if h_rows.shape[1] and nw > 1e3:
+            print(f"    [quaSAR] {tag}: readout norm ratio {nw.item():.1f} - possible collapse", flush=True)
+    return sol
+
 def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=3):
     # NOTE: w2 unused here (the readout is re-solved); kept for signature clarity.
     """Closed-form int4x encoder (AngelSlim STQ-style, no gradient steps):
@@ -369,7 +394,7 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
     # exact ridge solve for the continuous W2 readout
     Gm = h.T @ h
     Gm.diagonal().add_((Gm.diagonal().mean() * 1e-2))
-    W2c = torch.linalg.solve(Gm, h.T @ y_rows).T.contiguous()  # [4096, inter]
+    W2c = ridge_solve_guarded(Gm, h.T @ y_rows, y_rows=y_rows, h_rows=h, tag='W2').T.contiguous()  # [4096, inter]
     # CD snap of W2 to int4 (weighted by feature energy = the true metric)
     cw = (h ** 2).sum(dim=0)
     cw = cw / cw.mean().clamp_min(1e-12)
@@ -530,7 +555,7 @@ def calib_frozen_signs(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e-3, v
         h = F.silu(g) * u
         Gm = h.T @ h
         Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
-        W2c = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+        W2c = ridge_solve_guarded(Gm, h.T @ y, y_rows=y, h_rows=h, tag='W2').T.contiguous()
         yh = h @ W2c.T
         loss = ((yh - y) ** 2).sum() / (y ** 2).sum()
         opt.zero_grad()
@@ -542,7 +567,7 @@ def calib_frozen_signs(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e-3, v
         h = F.silu(g) * u
         Gm = h.T @ h
         Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
-        W2c = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+        W2c = ridge_solve_guarded(Gm, h.T @ y, y_rows=y, h_rows=h, tag='W2').T.contiguous()
         # GPTQ int4 g128 on the final W2
         ng = W2c.shape[1] // 128
         Wg = W2c.view(-1, ng, 128)
@@ -596,7 +621,7 @@ def calib_frozen_signs_fast(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e
                 h = (F.silu(g) * u).float()
                 Gm = h.T @ h
                 Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
-                W2 = torch.linalg.solve(Gm, h.T @ y).T.contiguous()
+                W2 = ridge_solve_guarded(Gm, h.T @ y, y_rows=y, h_rows=h, tag='W2g').T.contiguous()
         g = soft_lim((zb @ (q1 * s1[:, None].to(torch.bfloat16)).T).float() + b1[None, :])
         u = soft_lim((zb @ (q3 * s3[:, None].to(torch.bfloat16)).T).float() + b3[None, :])
         h = (F.silu(g) * u).to(torch.bfloat16)
@@ -622,7 +647,7 @@ def calib_frozen_signs_fast(w1_rot, w3_rot, z, y, bias1, bias3, steps=400, lr=3e
         hf = h.float()
         Gm = hf.T @ hf
         Gm.diagonal().add_(Gm.diagonal().mean() * 1e-2)
-        W2c = torch.linalg.solve(Gm, hf.T @ y).T.contiguous()
+        W2c = ridge_solve_guarded(Gm, hf.T @ y, y_rows=y, h_rows=hf, tag='W2f').T.contiguous()
         ng = W2c.shape[1] // 128
         Wg = W2c.view(-1, ng, 128)
         sg_ = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / 7.0
