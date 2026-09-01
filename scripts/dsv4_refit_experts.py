@@ -1296,10 +1296,21 @@ def run_refit(
             todo.append((k, x_k, y_k, e))
 
         covered = set(acts.keys())
-        for k in range(256):
-            sk = str(k)
-            if sk not in covered:
-                todo.append((sk, None, None, None))
+        # PARTIAL_ACTS=1 (backfill mode): the acts file intentionally holds only
+        # a SUBSET of experts. Experts absent from it are NOT dead - they keep
+        # their existing checkpoints. Without this guard a partial file would
+        # send every other expert of the layer to dead->distill on a tiny pool
+        # and overwrite good checkpoints (layer-3 incident, 2026-09-01).
+        partial = os.environ.get("PARTIAL_ACTS", "0") == "1"
+        if not partial:
+            for k in range(256):
+                sk = str(k)
+                if sk not in covered:
+                    todo.append((sk, None, None, None))
+        else:
+            n_part = len(covered)
+            print(f"  [partial-acts] {n_part} experts in acts file; "
+                  f"the other {256 - n_part} keep their checkpoints", flush=True)
 
         # Layer-wide activation pool from the ACTS FILE itself (not todo_data):
         # when every covered expert is already done and skipped, todo_data is

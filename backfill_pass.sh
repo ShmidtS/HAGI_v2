@@ -28,7 +28,7 @@ SEQ_CH=4096 BACKFILL_ANY_PREFIX=1 SEQ_LAYERS=$LAYERS I4X_LAYERS=$LAYERS \
 for L in $(seq 1 42); do
   SEQ_BACKFILL=checkpoints_dsv4/seq_backfill $PY scripts/filter_backfill_acts.py $L >> $LOG 2>&1
   if [ -f checkpoints_dsv4/pod_all_tokens/acts_layer$L.pt ]; then
-    W13_MODE=tern W13_BITS=2 W13_GS=128 W2_GPTQ=1 PTQ_ONLY=1 \
+    W13_MODE=tern W13_BITS=2 W13_GS=128 W2_GPTQ=1 PTQ_ONLY=1 PARTIAL_ACTS=1 \
       $PY scripts/dsv4_refit_experts.py --start-layer $L --end-layer $((L + 1)) \
       --n-procs 1 --done-log $DONE >> refit_backfill.log 2>&1 \
       || { echo "REFIT FAILED layer $L" >> $LOG; exit 3; }
