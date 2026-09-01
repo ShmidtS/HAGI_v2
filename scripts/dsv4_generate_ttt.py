@@ -650,7 +650,12 @@ def consolidate_and_save(li, k, enabled=True):
     w2 = get_w2_fp32(li, k)  # adapted continuous readout
     e = torch.load(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt"), map_location="cpu", weights_only=False)
     q2_0 = unpack_int4(e["w2a"]).float().cuda()
-    w2_base = q2_0 * e["w2a_scale"].float().cuda()[:, None]
+    s2 = e["w2a_scale"].float().cuda()
+    if s2.dim() == 2:  # group scales [out, ng] (W2_GPTQ g128): expand
+        gs = q2_0.shape[1] // s2.shape[1]
+        w2_base = q2_0 * s2.repeat_interleave(gs, dim=1)
+    else:
+        w2_base = q2_0 * s2[:, None]
     del q2_0
     # baseline = current file state (int4 + any previously persisted delta)
     dA0, dB0 = e.get("ttt_A"), e.get("ttt_B")
