@@ -47,6 +47,11 @@ from dsv4_experts import (
 import dsv4_generate_ttt as gen  # compressed-expert machinery
 from dsv4_generate_ttt import get_dequant, get_int4x, int4x_forward, int4x_forward_z
 
+# Keep ALL experts of the active layer resident (256 x ~50MB bf16 ~ 13GB):
+# generation's default 128 thrashes the LRU cache every chunk (each chunk
+# touches most of the 256 experts).
+gen.DEQUANT_MAX = int(os.environ.get("COLLECT_DEQUANT_MAX", "256"))
+
 SEQ_LAYERS = set(int(x) for x in os.environ.get("SEQ_LAYERS", "").split(",") if x != "")
 if not SEQ_LAYERS:
     SEQ_LAYERS = {int(os.environ["SEQ_LAYER"])}
@@ -72,7 +77,9 @@ CUR_IDS = None
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-tokens", type=int, default=258560)
-    ap.add_argument("--cap", type=int, default=2048)
+    ap.add_argument("--cap", type=int, default=8192)  # n >= 4x W2 features (2048)
+                                                    # else ridge W2 interpolates
+                                                    # (2026-09-02 measurement)
     ap.add_argument("--out-dir", default=OUT_DEFAULT)
     ap.add_argument("--no-vocab", action="store_true")
     args = ap.parse_args()
@@ -92,9 +99,18 @@ def main():
     model.config.gradient_checkpointing = False
     global CUR_IDS
 
+    # CPU-RAM budget (32GB box): captured rows cost 16KB/row (x+y bf16).
+    # 1.1M rows/layer ~ 17.6GB. Stops mid-tier accumulation once hit; hot
+    # experts are long capped by the per-expert --cap by then anyway.
+    MAX_LAYER_ROWS = int(os.environ.get("MAX_LAYER_ROWS", "1100000"))
+    LAYER_TOT = {}
+
     def make_hook(li):
-        def hook(module, args_, kwargs, output):
-            x = args_[0]
+        # Direct forward patch (torch 2.10 pre-hooks cannot bypass a module's
+        # forward - verified 2026-09-02). Patching skips the eager routed-MoE
+        # forward (original weights) that the old post-hook design paid on top
+        # of the recompute - i.e. v1 collected at ~2x the necessary MoE cost.
+        def mlp_forward(x, *a, **kw):
             B, S, D = x.shape
             flat = x.reshape(-1, D).float()
 
@@ -133,7 +149,7 @@ def main():
                         # (what we want), but the teacher MUST be the original
                         # weights - materialize them for the captured rows only.
                         key = str(k)
-                        if COUNTS.setdefault(li, {}).get(key, 0) < args.cap:
+                        if COUNTS.setdefault(li, {}).get(key, 0) < args.cap and LAYER_TOT.get(li, 0) < MAX_LAYER_ROWS:
                             x_k = flat[m_any]
                             w1, w2, w3 = get_dequant(li, k)
                             y_cap = ffn(x_k.to(torch.bfloat16), w1, w2, w3).float()
@@ -142,6 +158,7 @@ def main():
                             ent[0].append(x_k[:take].detach().cpu().to(torch.bfloat16))
                             ent[1].append(y_cap[:take].detach().cpu().to(torch.bfloat16))
                             COUNTS[li][key] = COUNTS[li].get(key, 0) + take
+                            LAYER_TOT[li] = LAYER_TOT.get(li, 0) + take
             else:
                 for k in indices.unique().tolist():
                     w1, w2, w3 = get_dequant(li, k)
@@ -155,27 +172,66 @@ def main():
                             out[m] += weights[m, kk, None] * y_k[pos[m]]
                     if collect:
                         key = str(k)
-                        if COUNTS.setdefault(li, {}).get(key, 0) < args.cap:
+                        if COUNTS.setdefault(li, {}).get(key, 0) < args.cap and LAYER_TOT.get(li, 0) < MAX_LAYER_ROWS:
                             take = min(args.cap - COUNTS[li].get(key, 0), x_k.shape[0])
                             ent = ACC.setdefault(li, {}).setdefault(key, ([], []))
                             ent[0].append(x_k[:take].detach().cpu().to(torch.bfloat16))
                             ent[1].append(y_k[:take].detach().cpu().to(torch.bfloat16))
                             COUNTS[li][key] = COUNTS[li].get(key, 0) + take
+                            LAYER_TOT[li] = LAYER_TOT.get(li, 0) + take
             return out.to(x.dtype).reshape(B, S, D)
 
-        return hook
+        return mlp_forward
 
     for li in range(N_LAYERS):
-        model.model.layers[li].mlp.register_forward_hook(make_hook(li), with_kwargs=True)
+        model.model.layers[li].mlp.forward = make_hook(li)
+
+    # Tail truncation (2026-09-02): captures depend only on layers <= max(SEQ_LAYERS)
+    # (teacher y is computed locally from x at each layer input). Decoder layers
+    # above that are dead weight -> identity forward skips attention+MoE entirely.
+    # Mathematically identical for every captured row; ~50% avg pass-time saved.
+    _hi = max(SEQ_LAYERS)
+    if _hi < N_LAYERS - 1:
+        for li in range(_hi + 1, N_LAYERS):
+            model.model.layers[li].forward = lambda h, *a, **kw: h
+        print(f"tail truncation: layers >{_hi} skipped (identity)", flush=True)
 
     vocab = 129280
     streams = []
     if not args.no_vocab:
         streams.append(("vocab", torch.arange(vocab).unsqueeze(0)))
-    n_rand = max(0, args.max_tokens - (0 if args.no_vocab else vocab))
+    text_file = os.environ.get("COLLECT_TEXT_FILE", "")
+    n_text = 0
+    if text_file and os.path.exists(text_file):
+        # real-text stream: fixes the manifold mismatch (2026-09-02 probe:
+        # random-token fits transfer to text 2-3x worse than to fresh random)
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(gen.TOKENIZER_PATH if hasattr(gen, "TOKENIZER_PATH") else
+            r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062")
+        n_text = int(os.environ.get("COLLECT_TEXT_TOKENS", "131072"))
+        with open(text_file, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read(8 * n_text)  # ~4 chars/token headroom
+        ids_text = tok(txt, return_tensors="pt").input_ids[:, :n_text]
+        streams.append(("text", ids_text))
+        print(f"text stream: {ids_text.shape[1]} tokens from {text_file}", flush=True)
+    n_rand = max(0, args.max_tokens - (0 if args.no_vocab else vocab) - n_text)
     if n_rand > 0:
         torch.manual_seed(1234)
         streams.append(("rand", torch.randint(0, vocab, (1, n_rand))))
+    # per-expert row saturation early-stop (2026-09-02): random/text streams
+    # mostly re-hit already-capped hot experts; stop when STOP_SAT of the
+    # FIRED experts are at cap (vocab sweep always runs to completion).
+    STOP_SAT = float(os.environ.get("STOP_SAT", "0.95"))
+    def _saturated():
+        for SL in SEQ_LAYERS:
+            cnt = COUNTS.get(SL, {})
+            if not cnt:
+                return False
+            capped = sum(1 for v in cnt.values() if v >= args.cap)
+            if capped < STOP_SAT * len(cnt):
+                return False
+        return True
+
     t0 = time.time()
     with torch.no_grad():
         for nm, ids in streams:
@@ -184,6 +240,12 @@ def main():
                 chunk = ids[:, c0 : c0 + CH]
                 CUR_IDS = chunk.reshape(-1)
                 model(chunk.cuda())
+                if STOP_SAT > 0 and nm != "vocab" and _saturated():
+                    print(f"early stop: >= {STOP_SAT:.0%} of fired experts at cap in {nm} stream @{c0 + chunk.shape[1]} tok", flush=True)
+                    break
+            else:
+                continue
+            break
     for SL in sorted(SEQ_LAYERS):
         merged = {}
         for k, (xs, ys) in ACC.get(SL, {}).items():
