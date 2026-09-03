@@ -64,3 +64,22 @@ seq_full_done.txt
 collect_full.log
 refit_full.log
 checkpoints_dsv4/seq_full/
+
+# v2 pass runtime artifacts (2026-09-03)
+*.lock
+*.out
+refit_v2_*.log
+collect_v2.log
+seq_full_pass_v2.log
+seq_full_done_v2.txt
+canary_done.txt
+checkpoints_dsv4/seq_v2/
+checkpoints_dsv4/pod_all_tokens/
+
+# one-shot diagnostics (results live in logs; kept on disk, not in git)
+canary_345.sh
+canary_345_phase2.sh
+l5_resume.sh
+scripts/repro_l5_crash.py
+scripts/scan_acts_finite.py
+scripts/scan_acts_order.py

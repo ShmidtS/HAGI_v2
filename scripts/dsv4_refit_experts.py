@@ -357,26 +357,41 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         q3 = torch.where(w3_rot >= 0, 1.0, -1.0)
         s1 = w1_rot.abs().mean(dim=1).clamp_min(1e-9)
         s3 = w3_rot.abs().mean(dim=1).clamp_min(1e-9)
-    elif (W13_BITS >= 3 or W13_TERN) and os.environ.get("W13_GPTQ", "1") == "1":
+    elif (W13_BITS >= 3 or W13_TERN):
         # group-GPTQ over the z-Hessian: frozen per-(row,group) LS scales
         # (W13_GS), LDLQ feedback. Measured on L5 k7 (int3 g128): 8.10 -> 6.34.
         # tern mode: nlev=1 -> grid {-1,0,1} (zero allowed), packed 5 trits/byte.
         GS13 = int(os.environ.get("W13_GS", "128"))
         nlev13 = 1 if W13_TERN else 2 ** (W13_BITS - 1) - 1
         Hzz = (z_rows.T @ z_rows) / z_rows.shape[0]
+        # WLS (Sherry/imatrix-style): weights = per-column z energy. Measured
+        # out-of-sample on L4 k8 @11K rows: 22.0% -> 14.9% vs plain LS.
+        W13_WLS = os.environ.get("W13_WLS", "1") == "1"
+        # GPTQ LDLQ feedback vs pure RTN on the wLS scales: canary-test which
+        # wins on the HELD-OUT residual (2026-09-02; GPTQ was tuned in-sample)
+        W13_GPTQ = os.environ.get("W13_GPTQ", "1") == "1"
 
         def _gptq_w13(W):
             out_, in_ = W.shape
             ng13 = in_ // GS13
             Wg = W.view(out_, ng13, GS13)
             sg13 = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / nlev13
+            if W13_WLS:
+                imp = Hzz.diagonal().clamp_min(1e-12).view(1, ng13, GS13)
             for _ in range(4):
                 qg13 = (Wg / sg13).round().clamp(-nlev13, nlev13)
-                num = (qg13 * Wg).sum(-1, keepdim=True)
-                den = (qg13 * qg13).sum(-1, keepdim=True).clamp_min(1e-9)
+                if W13_WLS:
+                    num = (qg13 * Wg * imp).sum(-1, keepdim=True)
+                    den = (qg13 * qg13 * imp).sum(-1, keepdim=True).clamp_min(1e-9)
+                else:
+                    num = (qg13 * Wg).sum(-1, keepdim=True)
+                    den = (qg13 * qg13).sum(-1, keepdim=True).clamp_min(1e-9)
                 sg13 = (num / den).clamp_min(1e-9)
             sg13_2d = sg13.squeeze(-1)  # [out, ng] storable
-            q13 = _gptq_groups(W, Hzz, sg13_2d, gs=GS13, nlev=nlev13)
+            if W13_GPTQ:
+                q13 = _gptq_groups(W, Hzz, sg13_2d, gs=GS13, nlev=nlev13)
+            else:  # RTN on the (w)LS scales - ~4x faster, no LDLQ pass
+                q13 = qg13.reshape_as(W).contiguous()
             return q13, sg13_2d
 
         q1, s1 = _gptq_w13(w1_rot)
@@ -409,9 +424,15 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         Wg = W2c.view(W2c.shape[0], ng, GS)
         sg_ = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / 7.0
         qg = (Wg / sg_).round().clamp(-7, 7)
+        cwg = cw.view(1, ng, GS)  # h-column energy as WLS importance
+        W2_WLS = os.environ.get("W2_WLS", "1") == "1"
         for _ in range(3):
-            num = (qg * Wg).sum(-1, keepdim=True)
-            den = (qg * qg).sum(-1, keepdim=True).clamp_min(1e-9)
+            if W2_WLS:
+                num = (qg * Wg * cwg).sum(-1, keepdim=True)
+                den = (qg * qg * cwg).sum(-1, keepdim=True).clamp_min(1e-9)
+            else:
+                num = (qg * Wg).sum(-1, keepdim=True)
+                den = (qg * qg).sum(-1, keepdim=True).clamp_min(1e-9)
             sg_ = (num / den).clamp_min(1e-9)
             qg = (Wg / sg_).round().clamp(-7, 7)
         s2g = sg_.squeeze(-1)  # [out, ng] storable group scales
@@ -1359,7 +1380,7 @@ def run_refit(
         W_NAMES = [f"w{m}{c}" for c in SUB_IDS for m in ("1", "3", "2")]
         B_NAMES = [f"bias{m}{c}" for c in SUB_IDS for m in ("1", "3")]
 
-        def save_expert(k, resid, res, inter, n_real=None):
+        def save_expert(k, resid, res, inter, n_real=None, resid_fit=None):
             ep = os.path.join(REDUCED, f"layer_{L}", f"expert_{k}.pt")
             e = {}
             for j, nm in enumerate(W_NAMES):  # res: (q, scale) pairs, interleaved
@@ -1385,6 +1406,9 @@ def run_refit(
             e["bounds"] = list(res[-1])  # pyramidal input-slice boundaries
             e["inter"] = inter
             e["residual"] = resid
+            if resid_fit is not None:
+                e["residual_fit"] = resid_fit
+            e["n_val"] = int(val_data[k][0].shape[0]) if k in val_data else 0
             e["mode"] = MODE_MARKER
             if n_real is not None:
                 e["n_real"] = int(n_real)
@@ -1392,13 +1416,37 @@ def run_refit(
             with open(done_log, "a") as f:
                 f.write(f"{L}_{k}\n")
 
+        def _eval_res(k, res, fit_rows):
+            """Honest metric: held-out resid when available, else in-sample.
+            Returns (resid_to_store, resid_fit, tag)."""
+            zf, yff = fit_rows
+            r_fit = resid_weights_full(zf, yff, res)
+            if k in val_data:
+                zv, yv = val_data[k]
+                r_val = resid_weights_full(zv, yv, res)
+                return r_val, r_fit, "val"
+            return r_fit, r_fit, "fit"
+
         covered_todo = [t for t in todo if t[1] is not None]
         missing_todo = [t for t in todo if t[1] is None]
+
+        # Held-out validation (Goodhart fix, 2026-09-02): in-sample resid on
+        # ridge-fit rows was ~50x over-optimistic (0.26% vs 32-50% out-sample).
+        # Fit on VAL_FRAC-holdout, checkpoint residual = the held-out number.
+        VAL_FRAC = float(os.environ.get("VAL_FRAC", "0.2"))
+        val_data = {}
 
         def _prep_covered(t):
             (k, x_k, y_k, e_prev) = t
             z = (x_k.float().cuda() - mu) @ P
             yf = y_k.float().cuda()
+            if VAL_FRAC > 0 and z.shape[0] >= 256:
+                g = torch.Generator(device="cuda").manual_seed(1234 + L * 1000 + int(k))
+                perm = torch.randperm(z.shape[0], device="cuda", generator=g)
+                nv = max(32, int(z.shape[0] * VAL_FRAC))
+                val_data[k] = (z[perm[:nv]].contiguous(), yf[perm[:nv]].contiguous())
+                z = z[perm[nv:]].contiguous()
+                yf = yf[perm[nv:]].contiguous()
             n_k = z.shape[0]
             if n_k >= 128:
                 tier_thr, tier_steps, tier = refit_threshold, steps, "A"
@@ -1459,12 +1507,62 @@ def run_refit(
         todo_data = {}
         prepped_A = []
         prepped_B = []
-        for t in covered_todo:
-            p = _prep_covered(t)
-            if p is None:
-                continue
-            (prepped_B if p["tier"] == "B" else prepped_A).append(p)
+        # PTQ_ONLY uses the streaming loop below (one expert in GPU memory at
+        # a time); the bulk prep would hold all 256 experts' rows simultaneously
+        # (~85GB float32 at cap 8192) - skip it entirely in that mode.
+        if not PTQ_ONLY:
+            for t in covered_todo:
+                p = _prep_covered(t)
+                if p is None:
+                    continue
+                (prepped_B if p["tier"] == "B" else prepped_A).append(p)
 
+        if PTQ_ONLY:
+            # STREAMING PTQ (2026-09-02): cap-8192 acts for 256 experts do not
+            # fit GPU (float32 ~85GB) nor CPU RAM (bf16 ~43GB > 32GB). Prep one
+            # expert -> save -> free. Semantics identical to the old bulk
+            # PTQ_ONLY paths (tier A: res0 as-is; tier B: synth-augment + ptq).
+            for t in covered_todo:
+                p = _prep_covered(t)
+                if p is None:
+                    continue
+                k = p["k"]
+                z_r, y_r = todo_data.pop(k)
+                if p["tier"] == "B":
+                    # thin real coverage -> bootstrap from the LAYER pool
+                    if z_r.shape[0] < 8:
+                        z_synth = universal_signal(
+                            z_r, seed=seed + int(k), jitter=jitter,
+                            z_proxy=z_pool.cuda() if z_r.shape[0] < 8 else None,
+                        )
+                    else:
+                        z_synth = universal_signal(z_r, seed=seed + int(k), jitter=jitter)
+                    x_synth = (mu + z_synth @ P.T).float()
+                    experts = load_selected_experts(L, [int(k)])
+                    w1, w2, w3 = experts[int(k)]
+                    y_synth = ffn_exact(x_synth, w1, w2, w3)
+                    del experts, x_synth
+                    z_r = torch.cat([z_r, z_synth])
+                    y_r = torch.cat([y_r, y_synth])
+                    b1g = p["bias1"].cuda().float()
+                    b3g = p["bias3"].cuda().float()
+                    res, _w2c = ptq_closed_form(
+                        w1 @ P, w3 @ P, w2, z_r, y_r, b1g, b3g)
+                    del w1, w2, w3
+                else:
+                    res = tuple(tt.cuda().float() if torch.is_tensor(tt) else tt for tt in p["res0"])
+                resid, resid_fit, _tag = _eval_res(k, res, (z_r, y_r))
+                save_expert(k, resid, res, INTER, n_real=p["n_k"], resid_fit=resid_fit)
+                n_fixed += 1
+                print(
+                    f"  layer {L} expert {k} [ptq-stream, n={p['n_k']}, {_tag}]: "
+                    f"resid={resid * 100:.4f}% fit={resid_fit * 100:.4f}%  "
+                    f"({n_fixed} total, {time.time() - t0:.0f}s)",
+                    flush=True,
+                )
+                val_data.pop(k, None)
+                del z_r, y_r, res
+                torch.cuda.empty_cache()
 
 
         PTQ_FALLBACK = 0.10  # gradient result worse than this -> closed-form PTQ
@@ -1495,9 +1593,9 @@ def run_refit(
                     p["bias1"].cuda().float(), p["bias3"].cuda().float(),
                 )
                 z_h, yf_h = todo_data[p["k"]]
-                resid = resid_weights_full(z_h, yf_h, res)
-                print(f"    [frozen-signs] {p['k']}: {math.sqrt(resid)*100:.3f}% (PTQ floor {math.sqrt(floor)*100:.3f}%)", flush=True)
-                save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
+                resid, resid_fit, _tag = _eval_res(p["k"], res, (z_h, yf_h))
+                print(f"    [frozen-signs] {p['k']}: {math.sqrt(resid)*100:.3f}%{_tag} (PTQ floor {math.sqrt(floor)*100:.3f}%)", flush=True)
+                save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"], resid_fit=resid_fit)
                 n_fixed += 1
                 print(
                     f"  layer {L} expert {p['k']} [frozen, n={p['n_k']}]: "
@@ -1521,7 +1619,7 @@ def run_refit(
                 abort_above=floor * 1.5 if floor < PTQ_FALLBACK else None,
             )[0]
             z_h, yf_h = todo_data[p["k"]]
-            resid = resid_weights_full(z_h, yf_h, res)
+            resid, resid_fit, _tag = _eval_res(p["k"], res, (z_h, yf_h))
             if resid > PTQ_FALLBACK:
                 # stalled gradient run (thin coverage: STE sign oscillation) ->
                 # AngelSlim-style closed-form PTQ in ~1s; keep whichever is better
@@ -1531,13 +1629,14 @@ def run_refit(
                         w1f, w3f, w2f, z_all_gpu[:n_rows], y_all_gpu[:n_rows],
                         p["bias1"].cuda().float(), p["bias3"].cuda().float(),
                     )
-                    resid_ptq = resid_weights_full(z_h, yf_h, res_ptq)
+                    resid_ptq, _rf_ptq, _ = _eval_res(p["k"], res_ptq, (z_h, yf_h))
                     if resid_ptq < resid:
                         res, resid = res_ptq, resid_ptq
+                        resid_fit = _rf_ptq
                         print(f"    [ptq-fallback] {p['k']}: {resid*100:.3f}%", flush=True)
                 except Exception as ex:  # noqa: BLE001 - fallback must never kill the run
                     print(f"    [ptq-fallback] {p['k']} failed: {ex}", flush=True)
-            save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"])
+            save_expert(p["k"], resid, res, p["inter"], n_real=p["n_k"], resid_fit=resid_fit)
             n_fixed += 1
             print(
                 f"  layer {L} expert {p['k']} [tier {p['tier']}, n={p['n_k']}]: "
@@ -1552,8 +1651,8 @@ def run_refit(
                 z_all, y_all = todo_data[p["k"]]
                 # exact FP32 signs from prep time (NOT the bf16 init)
                 res = tuple(t.cuda().float() if torch.is_tensor(t) else t for t in p["res0"])
-                resid = resid_weights_full(z_all, y_all, res)
-                save_expert(p["k"], resid, res, INTER, n_real=p["n_k"])
+                resid, resid_fit, _tag = _eval_res(p["k"], res, (z_all, y_all))
+                save_expert(p["k"], resid, res, INTER, n_real=p["n_k"], resid_fit=resid_fit)
                 n_fixed += 1
                 print(
                     f"  layer {L} expert {p['k']} [ptq, n={p['n_k']}]: "
@@ -1590,8 +1689,8 @@ def run_refit(
                 # thin coverage: the gradient pass never beats the closed form
                 # here (measured: PTQ 4.7-5.8% vs gradient stuck 40-68%) - save
                 # it directly, zero training steps
-                resid = resid_weights_full(z_all, y_all, _r0)
-                save_expert(p["k"], resid, _r0, INTER, n_real=p["n_k"])
+                resid, resid_fit, _tag = _eval_res(p["k"], _r0, (z_all, y_all))
+                save_expert(p["k"], resid, _r0, INTER, n_real=p["n_k"], resid_fit=resid_fit)
                 n_fixed += 1
                 print(
                     f"  layer {L} expert {p['k']} [direct-ptq, n={p['n_k']}]: "
