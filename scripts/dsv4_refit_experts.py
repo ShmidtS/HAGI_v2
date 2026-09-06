@@ -1707,14 +1707,33 @@ def run_refit(
             _run_expert(p)
 
         for k, z, yf, _e_prev in missing_todo:
-            # 0 routed rows in the collection, but the expert IS part of the model:
-            # distill it on the layer activation pool against its original weights.
+            # 0 routed rows in the collection, but the expert IS part of the model.
+            # 2026-09-05 fix: "dead" is a property of the RANDOM-TOKEN calibration
+            # stream; real text may route here (dead-expert spike L16-18 coincides
+            # with the e2e damage zone). Pool distillation fits the expert to
+            # FOREIGN inputs; instead synthesize rows from the expert's OWN weight
+            # geometry (top right-singular subspaces of W1/W3) mixed with pool
+            # rows, and fit on ORIGINAL outputs there (function preserved in its
+            # own responsive subspace + the layer manifold).
             g = torch.Generator().manual_seed(777 + int(k))
-            idx = torch.randint(0, z_pool.shape[0], (4096,), generator=g)
-            z_rows = z_pool[idx].cuda().float()
-            x_rows = (mu + z_rows @ P.T).float()
+            n_pool = 2048
+            idx = torch.randint(0, z_pool.shape[0], (n_pool,), generator=g)
+            z_pool_rows = z_pool[idx].cuda().float()
             experts = load_selected_experts(L, [int(k)])
             w1, w2, w3 = experts[int(k)]
+            # self-synth: top right-singular vectors of w1 (input directions the
+            # expert responds to), random coords in that subspace, pool-scaled
+            try:
+                _, _, Vh = torch.linalg.svd(w1.float(), full_matrices=False)
+                V = Vh[: min(512, Vh.shape[0])].T  # [K, r] orthonormal subspace
+                sc = z_pool_rows.std(dim=0, keepdim=True).mean().clamp_min(1e-6)
+                gdev = torch.Generator(device="cuda").manual_seed(31 + int(k))
+                z_self = (torch.randn(2048, V.shape[1], device="cuda", generator=gdev)
+                          * sc) @ V.T
+            except Exception:
+                z_self = None
+            z_rows = torch.cat([z_pool_rows, z_self]) if z_self is not None else z_pool_rows
+            x_rows = (mu + z_rows @ P.T).float()
             y_rows = ffn_exact(x_rows, w1, w2, w3)
             bias1 = mu.reshape(-1) @ w1.T
             bias3 = mu.reshape(-1) @ w3.T

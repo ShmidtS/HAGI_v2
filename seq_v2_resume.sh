@@ -19,6 +19,11 @@ trap 'rm -f seq_v2r.lock' EXIT
 
 echo "=== v2 resume pass started $(date) from layer $START ===" >> $LOG
 
+# 2026-09-05: kernel serialization is the ONLY empirically stable mode on
+# this box (L26 completed 256/256 under it; async HIP failures otherwise
+# escalate to machine-level wedges / Kernel-Power 41 reboots under load)
+export AMD_SERIALIZE_KERNEL=3
+
 for L in $(seq $START 42); do
   prefix=$(seq -s, 0 $((L - 1)))
   # skip layer only when ALL 256 checkpoints are v2-era (n_val marker);
