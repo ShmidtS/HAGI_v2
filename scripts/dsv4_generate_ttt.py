@@ -867,6 +867,9 @@ def make_hook(li, ttt_on):
             for kk in range(0):  # keep later accumulators coherent
                 pass
         else:
+            _z_layer = None  # hoisted per-layer z (2026-09-05: one (x-mu)@P
+            # per LAYER instead of per expert — P is [4096,4096] fp32; at
+            # top-6 routing this cuts the dominant P-read traffic 6x)
             for k in indices.unique().tolist():
                 _tk = _pr and time.perf_counter()
                 d = None if teacher else get_int4x(li, k)
@@ -876,7 +879,12 @@ def make_hook(li, ttt_on):
                     if _pr:
                         _tk = time.perf_counter()
                     m_any = (indices == k).any(dim=1)
-                    h = int4x_forward(d, flat[m_any])
+                    if _z_layer is None:
+                        _z_layer = (flat.to(torch.bfloat16) - d["mu"]) @ d["P"]
+                    zm = _z_layer[m_any]
+                    g = soft_lim(zm @ d["w1"].T + d["b1"])
+                    u = soft_lim(zm @ d["w3"].T + d["b3"])
+                    h = (torch.nn.functional.silu(g) * u).float()
                     if _pr:
                         PROF_T["fwd"] += time.perf_counter() - _tk
                         _tk = time.perf_counter()
@@ -995,6 +1003,42 @@ def _top_p_filter(logits, top_p=EVOL_TOP_P):
     return out / out.sum().clamp_min(1e-12)
 
 
+GATE_FILE = os.environ.get("GATE_FILE", "")   # latent feedback gate checkpoint
+GATE = None
+
+
+def _gate_rmsnorm(x, eps=1e-6):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+
+def load_gate():
+    """Load the latent feedback gate (train: scripts/dsv4_train_gate.py).
+    fused = e + rmsnorm(h_prev @ W_U) * sigmoid(e @ W_G + b_G)
+    h_prev = final-norm'd top hidden state of the PREVIOUS position."""
+    global GATE
+    if not GATE_FILE:
+        GATE = None
+        return None
+    ck = torch.load(GATE_FILE, map_location="cuda")
+    GATE = {k: ck[k].float().cuda() for k in ("W_U", "W_G", "b_G")}
+    # hash routers (layers 0-2) index by token id; with inputs_embeds passes
+    # they get input_ids=None -> route by the global CURRENT_IDS (same patch
+    # as training).
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HashRouter as _HR
+    if getattr(_HR.forward, "_gate_patched", False) is False:
+        _orig = _HR.forward
+
+        def _fwd(self, hidden_states, input_ids=None, *a, **kw):
+            if input_ids is None and CURRENT_IDS is not None:
+                input_ids = CURRENT_IDS.reshape(-1)[: hidden_states.reshape(-1, self.hidden_dim).shape[0]]
+            return _orig(self, hidden_states, input_ids, *a, **kw)
+
+        _fwd._gate_patched = True
+        _HR.forward = _fwd
+    print(f"[gate] loaded {GATE_FILE} (chunk {ck.get('chunk', '?')})", flush=True)
+    return GATE
+
+
 @torch.no_grad()
 def gen_sample(model, ids, max_new, temp, shadow=False):
     """Autoregressive top-p sampling with repetition penalty; optional shadow
@@ -1004,9 +1048,15 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
         shadow_prefill(model, input_ids)
     global CURRENT_IDS
     CURRENT_IDS = input_ids
-    out = model(input_ids=input_ids, use_cache=True, past_key_values=None)
+    load_gate()
+    use_gate = GATE is not None
+    out = model(input_ids=input_ids, use_cache=True, past_key_values=None,
+                output_hidden_states=use_gate)
     past = out.past_key_values
     logits = out.logits[0, -1].float()
+    h_prev = None
+    if use_gate:
+        h_prev = model.model.norm(out.hidden_states[-1][0, -1]).float()
     generated: list[int] = []
     _t0 = time.time()
     for _ in range(max_new):
@@ -1033,9 +1083,19 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
             )
             I4X_HIT = I4X_MISS = 0
         CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
-        out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
+        if use_gate:
+            e = model.model.embed_tokens(CURRENT_IDS)[0, 0].float()
+            gate = torch.sigmoid(e @ GATE["W_G"] + GATE["b_G"])
+            val = _gate_rmsnorm(h_prev @ GATE["W_U"])
+            fused = (e + val * gate).to(torch.bfloat16)[None, None]
+            out = model(inputs_embeds=fused, use_cache=True, past_key_values=past,
+                        output_hidden_states=True)
+        else:
+            out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
         past = out.past_key_values
         logits = out.logits[0, -1].float()
+        if use_gate:
+            h_prev = model.model.norm(out.hidden_states[-1][0, -1]).float()
     del past, out
     return generated
 

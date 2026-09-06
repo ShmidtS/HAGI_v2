@@ -126,7 +126,10 @@ y = (silu(g) * u) @ W2ᵀ                 # W2: int4 grid ±7, per-(row,g128) sc
   Hessian); mode marker `i1i4` stored in each file.
 
 **Size**: 6.6 MB/expert vs 12.6 MB FP4 = **1.91× compression** of the routed
-expert mass (97%+ of model parameters).
+expert mass (97%+ of model parameters). Note: the per-layer orthogonal
+`P` (4096² fp32, 64 MiB/layer ≈ 2.75 GiB over 43 layers — ~3% of the
+reduced model) is a compression *transform*, not compression; it belongs
+on the Pareto ledger. Candidate: fp16/int8 P storage or Hadamard-free fold.
 
 **Honest quality** (norm error ‖y_pred−y‖/‖y‖ per expert, measured on real
 activations): median ~13–16%; thin/dead experts better. Note the refit logs
@@ -206,7 +209,9 @@ our mixed-precision layout and our LS-scale choices.
 ### Status
 
 The winning recipe is **`terni4`**: ternary W13 ({−1,0,1} grid, GPTQ,
-group scales g128, 5 trits/byte) + int4 GPTQ W2 (g32) — **1.51× smaller**
+group scales g128, 5 trits/byte — 1.6 bpw stored, not the 1.585
+theoretical log₂3; whole-expert average is **~2.4 bpw** weight codes:
+(2×1.6 + 4)/3 with W13:W2 = 2:1) + int4 GPTQ W2 (g32) — **1.51× smaller**
 than the FP4 original, e2e coherence gate on layers 0–3 passed.
 Measured per-expert RMS error ~9.5 % (hot expert, honest ‖Δy‖/‖y‖);
 binary W13 everywhere is ruled out (~14.3 %/expert → e_N ≈ 39 % with
@@ -214,8 +219,10 @@ compounding). Next round: adaptive tern-hot / bin-cold experts (~1.6–1.9×).
 
 Full 43-layer pass runs **sequentially with telescopic correction**
 (BRECQ-style): each layer is fitted on activations collected through the
-already-compressed prefix, so per-layer errors add up (Σ) instead of
-multiplying (Π). A/B measured on layer 1: drift-fit **0.73 %** vs
+already-compressed prefix. First-order error dynamics δ_{l+1} = J_l δ_l +
+r_l give Σ-accumulation of *expected* error (a stochastic-independence
+model, not a worst-case bound — the bound is r/(1-α)); drift calibration
+compensates the systematic part of r_l. A/B measured on layer 1: drift-fit **0.73 %** vs
 clean-fit **13.46 %** — 18× in favour; error propagation α = 0.87–0.99
 per layer. `seq_full_pass.sh` orchestrates the pass in blocks of 3
 (collect 3 layers in one model pass → refit → free acts, ~14 h total).
