@@ -110,6 +110,21 @@ def main():
         # forward - verified 2026-09-02). Patching skips the eager routed-MoE
         # forward (original weights) that the old post-hook design paid on top
         # of the recompute - i.e. v1 collected at ~2x the necessary MoE cost.
+        def _sorted_assign(indices, weights):
+            """2026-09-07 sync-free routing scatter: one torch.sort over the
+            n*K assignments; per-expert work uses contiguous slices +
+            index_select + index_add_. Exactly 2 device syncs (uq.tolist,
+            counts.tolist) vs ~10 boolean-mask syncs per expert under the
+            old loop (each sync drains the serialized pipeline). Same math,
+            same capture; per-entry weights come from the sorted permutation
+            so duplicate expert slots (hash layers) stay exact."""
+            n, K = indices.shape
+            se, perm = torch.sort(indices.reshape(-1))
+            row_pos = perm // K
+            w_sorted = weights.reshape(-1)[perm]
+            uq, counts = torch.unique_consecutive(se, return_counts=True)
+            return uq.tolist(), counts.tolist(), row_pos, w_sorted
+
         def mlp_forward(x, *a, **kw):
             B, S, D = x.shape
             flat = x.reshape(-1, D).float()
@@ -129,29 +144,29 @@ def main():
 
             collect = li in SEQ_LAYERS
             if li in COMP:
-                # compressed expert path (z hoisted per layer; rows indexed by m_any!)
+                # compressed expert path (z hoisted per layer; sort-scatter)
                 _z = None
-                for k in indices.unique().tolist():
+                uq, cnt, row_pos, w_sorted = _sorted_assign(indices, weights)
+                o = 0
+                for k, c in zip(uq, cnt):
+                    rpos = row_pos[o:o + c]
+                    wsel = w_sorted[o:o + c]
+                    o += c
                     d = get_int4x(li, k)
-                    m_any = (indices == k).any(dim=1)
                     if _z is None:
-                        d0 = d
-                        _z = (flatb - d0["mu"]) @ d0["P"]
-                    h = int4x_forward_z(d, _z[m_any])
-                    out_k = (h.to(torch.bfloat16) @ d["w2b"].T).float()
-                    pos = torch.cumsum(m_any.long(), 0) - 1
-                    for kk in range(TOP_K):
-                        m = indices[:, kk] == k
-                        if m.any():
-                            out[m] += weights[m, kk, None] * out_k[pos[m]]
+                        _z = (flatb - d["mu"]) @ d["P"]
+                    zg = _z.index_select(0, rpos)
+                    h = int4x_forward_z(d, zg)
+                    yk = (h.to(torch.bfloat16) @ d["w2b"].T).float()
+                    out.index_add_(0, rpos, wsel[:, None] * yk)
                     if collect:
-                        # backfill capture on a COMPRESSED layer: inputs are drifted
-                        # (what we want), but the teacher MUST be the original
-                        # weights - materialize them for the captured rows only.
+                        # backfill capture on a COMPRESSED layer: inputs are
+                        # drifted (what we want), teacher = original weights
+                        # for the captured rows only.
                         key = str(k)
                         if COUNTS.setdefault(li, {}).get(key, 0) < args.cap and LAYER_TOT.get(li, 0) < MAX_LAYER_ROWS:
-                            x_k = flat[m_any]
                             w1, w2, w3 = get_dequant(li, k)
+                            x_k = flat.index_select(0, rpos)
                             y_cap = ffn(x_k.to(torch.bfloat16), w1, w2, w3).float()
                             take = min(args.cap - COUNTS[li].get(key, 0), x_k.shape[0])
                             ent = ACC.setdefault(li, {}).setdefault(key, ([], []))
@@ -160,16 +175,16 @@ def main():
                             COUNTS[li][key] = COUNTS[li].get(key, 0) + take
                             LAYER_TOT[li] = LAYER_TOT.get(li, 0) + take
             else:
-                for k in indices.unique().tolist():
+                uq, cnt, row_pos, w_sorted = _sorted_assign(indices, weights)
+                o = 0
+                for k, c in zip(uq, cnt):
+                    rpos = row_pos[o:o + c]
+                    wsel = w_sorted[o:o + c]
+                    o += c
                     w1, w2, w3 = get_dequant(li, k)
-                    m_any = (indices == k).any(dim=1)
-                    x_k = flat[m_any]
+                    x_k = flat.index_select(0, rpos)
                     y_k = ffn(x_k.to(torch.bfloat16), w1, w2, w3).float()
-                    pos = torch.cumsum(m_any.long(), 0) - 1
-                    for kk in range(TOP_K):
-                        m = indices[:, kk] == k
-                        if m.any():
-                            out[m] += weights[m, kk, None] * y_k[pos[m]]
+                    out.index_add_(0, rpos, wsel[:, None] * y_k)
                     if collect:
                         key = str(k)
                         if COUNTS.setdefault(li, {}).get(key, 0) < args.cap and LAYER_TOT.get(li, 0) < MAX_LAYER_ROWS:

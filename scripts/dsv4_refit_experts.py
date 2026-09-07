@@ -372,30 +372,46 @@ def ptq_closed_form(w1_rot, w3_rot, w2, z_rows, y_rows, bias1, bias3, cd_rounds=
         W13_GPTQ = os.environ.get("W13_GPTQ", "1") == "1"
 
         def _gptq_w13(W):
-            out_, in_ = W.shape
-            ng13 = in_ // GS13
-            Wg = W.view(out_, ng13, GS13)
-            sg13 = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / nlev13
-            if W13_WLS:
-                imp = Hzz.diagonal().clamp_min(1e-12).view(1, ng13, GS13)
-            for _ in range(4):
-                qg13 = (Wg / sg13).round().clamp(-nlev13, nlev13)
+            # 2026-09-07: stacked [w1;w3] pass — rows are independent given
+            # the shared per-expert z-Hessian, so one call is BIT-IDENTICAL
+            # to two (CPU-verified equal) while halving the 4096-col Python
+            # loop and sharing perm + double-Cholesky between W1/W3.
+            def _one(W):
+                out_, in_ = W.shape
+                GS13 = int(os.environ.get("W13_GS", "128"))
+                nlev13 = 1 if W13_TERN else 2 ** (W13_BITS - 1) - 1
+                ng13 = in_ // GS13
+                Wg = W.view(out_, ng13, GS13)
+                sg13 = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-9) / nlev13
                 if W13_WLS:
-                    num = (qg13 * Wg * imp).sum(-1, keepdim=True)
-                    den = (qg13 * qg13 * imp).sum(-1, keepdim=True).clamp_min(1e-9)
-                else:
-                    num = (qg13 * Wg).sum(-1, keepdim=True)
-                    den = (qg13 * qg13).sum(-1, keepdim=True).clamp_min(1e-9)
-                sg13 = (num / den).clamp_min(1e-9)
-            sg13_2d = sg13.squeeze(-1)  # [out, ng] storable
-            if W13_GPTQ:
-                q13 = _gptq_groups(W, Hzz, sg13_2d, gs=GS13, nlev=nlev13)
-            else:  # RTN on the (w)LS scales - ~4x faster, no LDLQ pass
-                q13 = qg13.reshape_as(W).contiguous()
-            return q13, sg13_2d
+                    imp = Hzz.diagonal().clamp_min(1e-12).view(1, ng13, GS13)
+                for _ in range(4):
+                    qg13 = (Wg / sg13).round().clamp(-nlev13, nlev13)
+                    if W13_WLS:
+                        num = (qg13 * Wg * imp).sum(-1, keepdim=True)
+                        den = (qg13 * qg13 * imp).sum(-1, keepdim=True).clamp_min(1e-9)
+                    else:
+                        num = (qg13 * Wg).sum(-1, keepdim=True)
+                        den = (qg13 * qg13).sum(-1, keepdim=True).clamp_min(1e-9)
+                    sg13 = (num / den).clamp_min(1e-9)
+                sg13_2d = sg13.squeeze(-1)  # [out, ng] storable
+                if W13_GPTQ:
+                    q13 = _gptq_groups(W, Hzz, sg13_2d, gs=GS13, nlev=nlev13)
+                else:  # RTN on the (w)LS scales - ~4x faster, no LDLQ pass
+                    q13 = qg13.reshape_as(W).contiguous()
+                return q13, sg13_2d
 
-        q1, s1 = _gptq_w13(w1_rot)
-        q3, s3 = _gptq_w13(w3_rot)
+            return _one(W)
+
+        O1 = w1_rot.shape[0]
+        _W13 = torch.cat([w1_rot, w3_rot], 0) if (W13_BITS >= 3 or W13_TERN) else None
+        if _W13 is not None:
+            q13_, s13_ = _gptq_w13(_W13)
+            q1, s1 = q13_[:O1], s13_[:O1]
+            q3, s3 = q13_[O1:], s13_[O1:]
+        else:
+            q1, s1 = _gptq_w13(w1_rot)
+            q3, s3 = _gptq_w13(w3_rot)
     else:
         q1, s1 = _quant_cd(w1_rot, W13_BITS)
         q3, s3 = _quant_cd(w3_rot, W13_BITS)
