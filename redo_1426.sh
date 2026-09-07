@@ -7,6 +7,11 @@ PY=.venv/Scripts/python.exe
 POD=checkpoints_dsv4/pod_all_tokens
 LOG=redo_1426.log
 export AMD_SERIALIZE_KERNEL=3
+# 2026-09-06 OOM fix (L23 collect, 3 fails): eager attention on an 8192-
+# token chunk transiently needs ~10 GiB (S^2 * heads) and without
+# expandable_segments the allocator fragments (29 GiB reserved-unallocated
+# at death). Chunk 4096 = 4x less transient; retries drop to 2048.
+export PYTORCH_HIP_ALLOC_CONFIG=expandable_segments:True
 
 if [ -f redo_1426.lock ]; then echo "already running"; exit 1; fi
 touch redo_1426.lock
@@ -17,12 +22,20 @@ echo "=== redo 14..26 (dead-fix) started $(date) ===" >> $LOG
 for L in $(seq 14 26); do
   [ "$L" -eq 16 ] && continue   # already validated & refit with the fix
 
+  # resume-safety: skip layers already redone (log line persists)
+  if rg -q "layer $L complete" $LOG 2>/dev/null; then
+    echo "skip layer $L (already redone) $(date)" >> $LOG
+    continue
+  fi
+
   # collect through the (progressively fixed) compressed prefix
-  for TRY in 1 2 3; do
-    SEQ_LAYERS=$L I4X_LAYERS=$(seq -s, 0 $((L - 1))) TOKENS=262144 \
+  for TRY in 1 2 3 4 5 6; do
+    SEQ_CH=4096
+    [ $TRY -gt 2 ] && SEQ_CH=2048
+    SEQ_LAYERS=$L I4X_LAYERS=$(seq -s, 0 $((L - 1))) TOKENS=262144 SEQ_CH=$SEQ_CH \
       $PY scripts/dsv4_collect_seq.py >> collect_redo_L$L.log 2>&1
     [ -f checkpoints_dsv4/seq/acts_layer$L.pt ] && break
-    echo "collect layer $L try $TRY failed, cooling 120s" >> $LOG
+    echo "collect layer $L try $TRY (CH=$SEQ_CH) failed, cooling 120s" >> $LOG
     sleep 120
   done
   [ -f checkpoints_dsv4/seq/acts_layer$L.pt ] || { echo "COLLECT FAILED layer $L" >> $LOG; exit 2; }

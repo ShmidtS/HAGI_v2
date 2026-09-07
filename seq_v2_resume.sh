@@ -23,6 +23,9 @@ echo "=== v2 resume pass started $(date) from layer $START ===" >> $LOG
 # this box (L26 completed 256/256 under it; async HIP failures otherwise
 # escalate to machine-level wedges / Kernel-Power 41 reboots under load)
 export AMD_SERIALIZE_KERNEL=3
+# 2026-09-06: collect needs expandable_segments too (L23 redo died with
+# 29 GiB reserved-unallocated fragmentation; refit already had it).
+export PYTORCH_HIP_ALLOC_CONFIG=expandable_segments:True
 
 for L in $(seq $START 42); do
   prefix=$(seq -s, 0 $((L - 1)))
