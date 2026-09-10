@@ -83,3 +83,6 @@ l5_resume.sh
 scripts/repro_l5_crash.py
 scripts/scan_acts_finite.py
 scripts/scan_acts_order.py
+
+dsv4_release/
+dsv4_bank/

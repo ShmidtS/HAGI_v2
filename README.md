@@ -65,7 +65,7 @@ pip install -e .
 python scripts/train.py --config configs/level0_merged_3.yaml --resume checkpoints_l0_merged/step-0000000.pt
 ```
 
-## DeepSeek-V4 MoE compression (status: in progress)
+## DeepSeek-V4 MoE compression (status: pass complete, e2e validated; gate training)
 
 This is an ongoing experiment to shrink DeepSeek-V4-Flash
 (256 routed experts/layer × 43 layers = 11008 experts) with minimal quality
@@ -215,36 +215,48 @@ higher "because it writes straight into the residual stream", LS scales
 instead of amax = 90% of their PTQ win, per-layer sensitivity split) matches
 our mixed-precision layout and our LS-scale choices.
 
-### Status (2026-09-06)
+### Status (2026-09-10)
 
-- **terni4 v2 pass**: layers 0..26 compressed (256/256 checkpoints each,
-  honest val residual in every file). Sequential **telescopic** fitting:
-  layer L is fitted on activations collected through the
-  already-compressed prefix — drift-fit measured **0.73%** vs clean-fit
-  **13.46%** on layer 1 (18×). Error propagation α = 0.87–0.99 per layer;
-  δ_{l+1} = J_l δ_l + r_l gives Σ-accumulation of *expected* error
-  (stochastic-independence model, not a worst-case bound).
-- **e2e bisection** localized the damage: prefix 0..13 generates coherent
-  text, 0..20 degenerates → damage in layers 14..20, exactly where the
-  dead-expert count spikes (L16–L18: 59–71 experts with zero routed rows
-  on the random-token calibration).
-- **Dead-expert fix (validated 2026-09-05)**: dead experts were
-  pool-distilled on *foreign* inputs — a silent function replacement.
-  Now they are fitted on rows synthesized from their **own top
-  right-singular subspaces of W1** (2048 self-synth + 2048 pool rows,
-  pool-scaled) against original-weight outputs. Validation: L16 redone
-  (59 dead) → generation with prefix 0..16 went from garbage to fully
-  coherent text. Live experts keep their real routed rows — they strictly
-  dominate synthetic ones (true manifold + telescopic drift + honest val),
-  and their own-subspace adaptation already happens via the per-expert
-  GPTQ Hessian.
-- **In progress**: redo of layers 14..26 with the fix (`redo_1426.sh`;
-  14, 15, 17, 18 done, 16 validated), then the 27..42 pass
-  (`seq_v2_resume.sh` — reboot-resilient: n_val purge, threshold 1.0 on
-  retries, AMD_SERIALIZE_KERNEL=3 pinned).
-- **Next**: latent feedback gate (below) → full-model e2e gate →
-  round 2 (adaptive tern-hot / bin-cold experts, ~1.6–1.9×) → speed
-  track (triton + banks) → int8-KV → GLM-5.3 through the same pipeline.
+- **The v2 pass is COMPLETE: all 43 layers (0..42) compressed —
+  11,008 terni4 experts** (256/256 per layer, honest val residual in
+  every checkpoint; ~89 GB total vs 169 GB FP4 original). Two
+  incidents survived on the way (L23 OOM → expandable_segments +
+  4096-token collect chunks; a Windows-Update reboot at L37 → stale
+  lock removal, resume from 37).
+- **Dead-expert fix (history, validated 2026-09-05)**: dead experts
+  (zero routed rows) used to be pool-distilled on foreign inputs — a
+  silent function replacement; now they are SVD-self-synthesized from
+  their own W1 top singular subspaces. Layers 14..26 were redone with
+  the fix; the 27..42 pass hit only 1–2 dead experts per layer
+  (resid 0.2–1.5%).
+- **E2E validation of the full stack (the milestone)**: generation on
+  all 43 compressed layers produces coherent, factually correct text.
+  "The capital of France is Paris..." → Rome, Madrid, Amsterdam,
+  Brussels, Warsaw, Stockholm, Bern, Oslo, Bratislava, Vienna, Sofia,
+  Budapest, Ankara, Nicosia — the whole chain correct; the Russian
+  variant (Москва, Пекин, Токио, Вашингтон, Лондон...) equally clean.
+- **Honest val-resid grows with depth** (medians: L18 0.78% → L26
+  12.4% → L32 16.9% → L36 23.7%) yet e2e holds — the residual stream
+  and routing absorb per-expert error. The trend motivates the gate
+  (below) and the round-2 depth-waterfilling.
+- **Bit-identical speedups (CPU-proven, measured)**: stacked W1+W3
+  into ONE GPTQ call (shared per-expert Hzz; refit 44 → 22–28
+  min/layer, −42% over 5 layers); sort-scatter collect routing (2
+  device syncs/layer instead of ~10/expert).
+- **Expert banks**: `dsv4_bank/layer{L}.safetensors`, 2.0 GB/layer
+  (87 GB total); one file loads a layer in 4 s, the whole 92 GB stack
+  goes resident in 137 s; bitwise-verified against the source
+  expert_*.pt files.
+- **int8 KV-cache validated**: 2× KV memory with text quality
+  identical to bf16 (divergence only in continuation choice after
+  ~15 tokens); scales collected ON the compressed stack
+  (`KV_COLLECT=2048`, then `KV_MODE=int8`).
+- **In progress**: latent-gate training on the full stack (781
+  chunks × 512 tokens, ~45 h; 60 GB bank budget + LRU eviction +
+  serialize; chunk 0: loss 13.29, p1=200 s, p2+bwd=5.7 s, reuse 43/43).
+- **Next**: gate A/B generation → round 2 (per-layer bit budget from
+  Σw_L·ρ_L², escape codes, Hadamard-vs-SVD A/B) → speed track
+  (triton bank kernels) → GLM-5.3 through the same pipeline.
 
 Generation runs from the compressed expert files via
 `scripts/dsv4_generate_ttt.py` (`INT4X_OFF=1` → FP4 baseline for A/B).
@@ -256,7 +268,7 @@ h/y rotations (QuIP#), sign branches, k-means codebooks, channel
 rescaling of W3↔W2 (provably invariant), KL-Root-Kron, act_order.
 Local group scales + ternary grid beat all of them.
 
-### Latent feedback gate (in progress)
+### Latent feedback gate (training in progress)
 
 Residual damage after the dead-fix is repaired by an adaptation of the
 full-bandwidth transformer idea: the model's top state feeds back to the
@@ -281,13 +293,39 @@ fused = e + RMSNorm(W_U · h_prev) ⊙ σ(W_G · e + b_G)
   forward). MoE blocks are detached wrt gradient: the signal flows through
   the residual stream + attention (also sidesteps a ROCm
   autograd-through-unpack crash).
-- Fast training path (`scripts/gate_moe_fast.py`): resident packed terni4
-  banks on GPU, FP4 tail streamed from mmap safetensors, LUT ternary
-  unpack (3× faster than divmod), z hoisted once per layer, sync-free
-  sort-scatter (2 device syncs/layer vs ~50). Measured 350 s → ~100 s
-  per chunk even with the FP4 tail still present.
+- Fast training path (`scripts/gate_moe_fast.py`): terni4 banks loaded
+  from `dsv4_bank` as ONE safetensors read per layer (per-expert
+  entries are zero-copy views), LUT ternary unpack (3× faster than
+  divmod), z hoisted once per layer, sync-free sort-scatter (2 device
+  syncs/layer vs ~50), block-grouped W13 batching (GATE_W13_BLOCK=32,
+  W1/W3 built and freed interleaved — ~3 GB unpack peak instead of
+  8.4), and an LRU bank budget (`GATE_BANK_BUDGET`; 60 GB → ~72 GB
+  total, stable where 95 GB triggered HIP launch failures). The batch
+  path is verified against a per-expert reference (rel 5e-03, dense
+  and sparse routing — the sparse test caught a real position-vs-id
+  slicing bug).
 - Decode integration: `GATE_FILE=<ckpt>` in `dsv4_generate_ttt.py` — each
   step feeds `inputs_embeds=fused` (hash-router patched for embed passes).
+
+### Memory & speed tooling (2026-09-10)
+
+- **terni4 banks** (`scripts/build_bank.py` → `dsv4_bank/`, 2.0
+  GB/layer, atomic writes): w13t u8 [256,4096,820] (ternary W1|W3,
+  5 trits/byte), s13 f32 g128, b13, w2a int4, s2. Consumer:
+  `gate_moe_fast.load_bank` (fast path) with fallback to expert_*.pt.
+- **int8 KV** (`dsv4_generate_ttt.py`: `KV_COLLECT=<N>` collects
+  per-channel scales on the compressed stack via kv_norm hooks;
+  `KV_MODE=int8` patches the DynamicCache after prefill AND
+  retrofits the already-written bf16 prefill — without the retrofit,
+  cat(bf16, int8) promotes raw int8 into bf16 and the text collapses).
+- **Blockwise eager attention** (`gate_moe_fast.install_blockwise_attention`,
+  active for S>1024): S² → S×256; row-wise math identical (rel
+  4.2e-05 at S=2048); kills the 10 GiB combined_logits spike on long
+  prefills (the L23 incident). Auto-installed in train_gate and ttt.
+- **VM-pressure rule**: at ~95 GB occupied (of the 107.87 GB APU)
+  attention kernels start dying with "unspecified launch failure" —
+  a pressure symptom, not an attention bug; fix = lower bank budget
+  (60 GB → ~72 total) + serialize.
 
 ### Machine stability (this box)
 
