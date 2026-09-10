@@ -36,6 +36,8 @@ import dsv4_generate_ttt as gen
 REDUCED = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dsv4_reduced")
 
 BANKS: dict[int, dict[int, dict]] = {}   # li -> k -> packed tensors (GPU)
+BANK_BYTES: dict[int, int] = {}          # li -> bytes held by BANKS[li]
+BANK_BUDGET = int(os.environ.get("GATE_BANK_BUDGET", str(84_000_000_000)))
 POD: dict[int, dict] = {}                # li -> {"P", "mu"} bf16
 GPUBYTES = 0
 HOT: "OrderedDict[tuple, tuple]" = OrderedDict()   # (li,k) -> (w1,w3,w2) bf16
@@ -52,29 +54,120 @@ REUSE_ON = os.environ.get("GATE_REUSE_MLP", "1") == "1"
 STATS = {"reuse": 0, "compute": 0, "hot_hit": 0, "hot_miss": 0}
 
 
+def install_blockwise_attention(model, block: int = 256):
+    """Memory-frugal eager attention (our chunking method applied to the S^2
+    transient): process query rows in blocks so attn_weights never exceeds
+    [B, H, block, S+1] instead of [B, H, S, S+1]. At S=8192 that is the known
+    10 GiB combined_logits spike (L23 incident); at S<=1024 the original
+    allocates <1 GiB and we delegate unchanged. Row-wise math is identical:
+    softmax runs over the FULL key row (S+1 incl. sink) per query block;
+    returns weights=None (the caller only uses them for output_attentions,
+    which we never request). Applied via monkey-patch on the module global
+    that the runtime dispatcher resolves at every forward."""
+    import torch.nn.functional as F
+    from transformers.models.deepseek_v4 import modeling_deepseek_v4 as _M
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import repeat_kv as _repeat_kv
+
+    if getattr(_M.eager_attention_forward, "_blockwise", False):
+        return  # already installed
+    _orig = _M.eager_attention_forward
+
+    def blockwise(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
+        S = query.shape[-2]
+        if S <= 1024 or query.requires_grad:
+            return _orig(module, query, key, value, attention_mask, scaling,
+                         dropout=dropout, **kw)
+        key_states = _repeat_kv(key, module.num_key_value_groups)
+        value_states = _repeat_kv(value, module.num_key_value_groups)
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(
+            query.shape[0], -1, query.shape[-2], -1)
+        out = torch.empty_like(query)
+        for q0 in range(0, S, block):
+            q1 = min(q0 + block, S)
+            qb = query[..., q0:q1, :]
+            aw = torch.matmul(qb, key_states.transpose(2, 3)) * scaling
+            if attention_mask is not None:
+                aw = aw + attention_mask[..., q0:q1, :]
+            cl = torch.cat([aw, sinks[..., q0:q1, :]], dim=-1)
+            cl = cl - cl.max(dim=-1, keepdim=True).values
+            probs = F.softmax(cl, dim=-1, dtype=cl.dtype)
+            out[..., q0:q1, :] = torch.matmul(probs[..., :-1], value_states).to(query.dtype)
+        return out, None
+
+    blockwise._blockwise = True
+    _M.eager_attention_forward = blockwise
+
+
+def _evict_banks(keep_li: int | None = None):
+    """Enforce GATE_BANK_BUDGET: drop the oldest loaded layer banks (dict
+    insertion order = load order; a sequential layer sweep evicts the layer
+    just finished - reload cost ~2 GB read, no correctness impact). Never
+    evicts the layer currently being computed."""
+    global GPUBYTES
+    while GPUBYTES > BANK_BUDGET and len(BANKS) > 1:
+        oldest = next(iter(BANKS))
+        if oldest == keep_li and len(BANKS) > 1:
+            items = list(BANKS.keys())
+            if len(items) < 2:
+                break
+            oldest = items[1]
+        b = BANKS.pop(oldest)
+        nby = BANK_BYTES.pop(oldest, 0)
+        GPUBYTES -= nby
+        del b
+
+
 def load_bank(li: int, verbose: bool = False) -> int:
     global GPUBYTES
     if li in BANKS:
         return 0
-    bank = {}
-    for fp in sorted(glob.glob(os.path.join(REDUCED, f"layer_{li}", "expert_*.pt"))):
-        k = int(fp.split("expert_")[1].split(".")[0])
-        e = torch.load(fp, map_location="cpu", weights_only=False)
-        if e.get("mode") != "terni4":
-            continue
-        bank[k] = {
-            "w1a": e["w1a"].cuda(non_blocking=True),
-            "w1s": e["w1a_scale"].cuda(non_blocking=True),
-            "w3a": e["w3a"].cuda(non_blocking=True),
-            "w3s": e["w3a_scale"].cuda(non_blocking=True),
-            "w2a": e["w2a"].cuda(non_blocking=True),
-            "w2s": e["w2a_scale"].cuda(non_blocking=True),
-            "b1": e["bias1a"].cuda(non_blocking=True),
-            "b3": e["bias3a"].cuda(non_blocking=True),
-        }
-        GPUBYTES += sum(t.numel() * t.element_size() for t in bank[k].values())
-        del e
+    bank_fp = os.path.join("dsv4_bank", f"layer{li}.safetensors")
+    if os.path.exists(bank_fp):
+        # packed bank (scripts/build_bank.py): ONE sequential read per layer
+        # instead of 256 scattered expert_*.pt; per-expert entries are views
+        # into the big [256, ...] tensors (zero-copy until cat in the hooks).
+        from safetensors.torch import load_file
+        t = load_file(bank_fp, device="cpu")
+        w13t = t["w13t"].cuda(non_blocking=True)
+        s13 = t["s13"].cuda(non_blocking=True)
+        b13 = t["b13"].cuda(non_blocking=True)
+        w2a = t["w2a"].cuda(non_blocking=True)
+        s2 = t["s2"].cuda(non_blocking=True)
+        GPUBYTES += sum(x.numel() * x.element_size() for x in (w13t, s13, b13, w2a, s2))
+        BANK_BYTES[li] = sum(x.numel() * x.element_size() for x in (w13t, s13, b13, w2a, s2))
+        bank = {}
+        for k in range(w13t.shape[0]):
+            bank[k] = {
+                "w1a": w13t[k, :2048], "w3a": w13t[k, 2048:],
+                "w1s": s13[k, :2048], "w3s": s13[k, 2048:],
+                "b1": b13[k, :2048], "b3": b13[k, 2048:],
+                "w2a": w2a[k], "w2s": s2[k],
+            }
+        del t
+    else:
+        bank = {}
+        _lbytes = 0
+        for fp in sorted(glob.glob(os.path.join(REDUCED, f"layer_{li}", "expert_*.pt"))):
+            k = int(fp.split("expert_")[1].split(".")[0])
+            e = torch.load(fp, map_location="cpu", weights_only=False)
+            if e.get("mode") != "terni4":
+                continue
+            bank[k] = {
+                "w1a": e["w1a"].cuda(non_blocking=True),
+                "w1s": e["w1a_scale"].cuda(non_blocking=True),
+                "w3a": e["w3a"].cuda(non_blocking=True),
+                "w3s": e["w3a_scale"].cuda(non_blocking=True),
+                "w2a": e["w2a"].cuda(non_blocking=True),
+                "w2s": e["w2a_scale"].cuda(non_blocking=True),
+                "b1": e["bias1a"].cuda(non_blocking=True),
+                "b3": e["bias3a"].cuda(non_blocking=True),
+            }
+            _lbytes += sum(t.numel() * t.element_size() for t in bank[k].values())
+            del e
+        GPUBYTES += _lbytes
+        BANK_BYTES[li] = _lbytes
     BANKS[li] = bank
+    _evict_banks(keep_li=li)
     if verbose:
         free, _ = torch.cuda.mem_get_info()
         print(f"bank L{li}: {len(bank)} experts, banks {GPUBYTES/1e9:.1f}GB, "
@@ -198,29 +291,38 @@ def _batched_experts(li, fired, z, row_pos, w_sorted, cnt, uq):
         if k in bank:
             offs[k] = (o, o + c)
         o += c
-    # --- batched W13: cat packed rows, unpack once ---
-    w1a = torch.cat([bank[k]["w1a"] for k in fired])          # [F*I, n/5]
-    w1s = torch.cat([bank[k]["w1s"] for k in fired])
-    w3a = torch.cat([bank[k]["w3a"] for k in fired])
-    w3s = torch.cat([bank[k]["w3s"] for k in fired])
-    b1 = torch.cat([bank[k]["b1"] for k in fired])            # [F*I] fp32
-    b3 = torch.cat([bank[k]["b3"] for k in fired])
-    W1 = _tern_w(w1a, w1s)                                    # [F*I, D] bf16
-    W3 = _tern_w(w3a, w3s)
-    del w1a, w3a
-    G = soft_lim(z @ W1.T + b1.to(torch.bfloat16)[None, :])   # [n, F*I]
-    U = soft_lim(z @ W3.T + b3.to(torch.bfloat16)[None, :])
-    del W1, W3
-    H = (F.silu(G.float()) * U.float()).to(torch.bfloat16)   # [n, F*I]
-    del G, U
+    # --- batched W13 in BLOCK-sized groups: the LUT unpack materializes
+    # [rows, 820, 5] f32 (~4 GiB per 64-expert block at BLOCK=32... ~8.4 GiB
+    # for 128); with banks resident that spike must fit the free headroom,
+    # so process the stacked W13 in groups and keep the per-group H blocks.
+    # W1/W3 are built/freed INTERLEAVED (G from W1, del W1, U from W3) -
+    # halves the peak vs holding both unpacked at once.
+    BLOCK = int(os.environ.get("GATE_W13_BLOCK", "32"))
+    I_ = bank[fired[0]]["w1a"].shape[0]
+    H = torch.empty(n, len(fired) * I_, dtype=torch.bfloat16, device=z.device)
+    for g0 in range(0, len(fired), BLOCK):
+        grp = fired[g0:g0 + BLOCK]
+        b1 = torch.cat([bank[k]["b1"] for k in grp])            # [B*I] fp32
+        b3 = torch.cat([bank[k]["b3"] for k in grp])
+        W1 = _tern_w(torch.cat([bank[k]["w1a"] for k in grp]),
+                     torch.cat([bank[k]["w1s"] for k in grp]))  # [B*I, D] bf16
+        G = soft_lim(z @ W1.T + b1.to(torch.bfloat16)[None, :])
+        del W1
+        W3 = _tern_w(torch.cat([bank[k]["w3a"] for k in grp]),
+                     torch.cat([bank[k]["w3s"] for k in grp]))
+        U = soft_lim(z @ W3.T + b3.to(torch.bfloat16)[None, :])
+        del W3
+        hblk = (F.silu(G.float()) * U.float()).to(torch.bfloat16)
+        del G, U
+        H[:, g0 * I_:(g0 + len(grp)) * I_] = hblk
+        del hblk
     # --- per-expert W2 GEMM + scatter ---
     acc = torch.zeros(n, z.shape[1], dtype=torch.float32, device=z.device)
-    I_ = bank[fired[0]]["w1a"].shape[0]
-    for k in fired:
-        o0, o1 = offs[k]
-        rpos = row_pos[o0:o1]
-        wsel = w_sorted[o0:o1]
-        h_k = H[:, k * I_:(k + 1) * I_]                        # [n, I] bf16
+    for j, k in enumerate(fired):          # j = POSITION in fired: the H
+        o0, o1 = offs[k]                   # blocks above are stacked by
+        rpos = row_pos[o0:o1]              # position, NOT by expert id —
+        wsel = w_sorted[o0:o1]             # slicing H by k*I_ would read the
+        h_k = H[:, j * I_:(j + 1) * I_]    # wrong expert (or past the end)
         # only the rows routed to this expert
         h_sel = h_k.index_select(0, rpos)
         w2 = _int4_w(bank[k]["w2a"], bank[k]["w2s"])

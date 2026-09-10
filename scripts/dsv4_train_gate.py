@@ -33,7 +33,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import dsv4_generate_ttt as gen
 import dsv4_refit_experts  # noqa: F401  (env plumbing for gen loading)
-from gate_moe_fast import install_hooks
+import gate_moe_fast as fast
+from gate_moe_fast import install_hooks, install_blockwise_attention
 from transformers import AutoTokenizer
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
@@ -130,6 +131,7 @@ def main():
         compressed = None  # all layers that have banks (load lazily)
     DETACH_MLP = os.environ.get("GATE_DETACH_MLP", "1") == "1"
     handles = install_hooks(model, compressed or set(range(N_LAYERS)), detach=DETACH_MLP)
+    install_blockwise_attention(model)   # S^2 -> S*256 eager-attention transient
     print(f"model loaded, i4x layers: {str(gen._i4x_layers())[:60]}", flush=True)
 
     # gate params (fp32 on GPU)
@@ -148,10 +150,25 @@ def main():
     n_chunks = stream.shape[0] // CHUNK
     print(f"stream {stream.shape[0]} tokens -> {n_chunks} chunks of {CHUNK}", flush=True)
 
+    # resume from the last periodic checkpoint (params + AdamW state);
+    # the stream is deterministic (seed 1234), so skipping processed
+    # chunks is exact. Without this, a reboot before chunk 399 used to
+    # lose the whole run.
+    start_ci = 0
+    if os.path.exists(GATE_OUT + ".tmp"):
+        ck = torch.load(GATE_OUT + ".tmp", map_location="cpu", weights_only=False)
+        with torch.no_grad():
+            W_U.copy_(ck["W_U"]); W_G.copy_(ck["W_G"]); b_G.copy_(ck["b_G"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        start_ci = int(ck.get("chunk", -1)) + 1
+        print(f"resumed from {GATE_OUT}.tmp at chunk {start_ci} "
+              f"(loss history reset; optimizer state restored)", flush=True)
+
     t0 = time.time()
     losses = []
-    import gate_moe_fast as fast
-    for ci in range(n_chunks):
+
+    for ci in range(start_ci, n_chunks):
         ids = stream[ci * CHUNK:(ci + 1) * CHUNK + 1].unsqueeze(0).cuda()
         inp = ids[:, :-1]
         tgt = ids[0, 1:]
@@ -200,9 +217,10 @@ def main():
                   f"reuse={st['reuse']} compute={st['compute']} hot={st['hot_hit']}/{st['hot_hit']+st['hot_miss']}", flush=True)
             for k_ in gen.PROF_T:
                 gen.PROF_T[k_] = 0.0
-        if ci % 400 == 399:
+        if ci % 100 == 99:
             torch.save({"W_U": W_U.detach().cpu(), "W_G": W_G.detach().cpu(),
-                        "b_G": b_G.detach().cpu(), "chunk": ci}, GATE_OUT + ".tmp")
+                        "b_G": b_G.detach().cpu(), "chunk": ci,
+                        "opt": opt.state_dict()}, GATE_OUT + ".tmp")
     for h_ in handles:
         h_.remove()
     torch.save({"W_U": W_U.detach().cpu(), "W_G": W_G.detach().cpu(),

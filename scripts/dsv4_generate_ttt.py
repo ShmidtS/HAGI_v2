@@ -1006,6 +1006,86 @@ def _top_p_filter(logits, top_p=EVOL_TOP_P):
 GATE_FILE = os.environ.get("GATE_FILE", "")   # latent feedback gate checkpoint
 GATE = None
 
+# --- int8 KV-cache (dsv4_kvcache_int8) ------------------------------------
+KV_MODE = os.environ.get("KV_MODE", "")          # "int8": compress KV cache
+KV_SCALES = os.environ.get("KV_SCALES", "checkpoints_dsv4/kv_int8_scales.pt")
+_KV_STORE = None
+
+
+def install_int8_kv(past):
+    """KV_MODE=int8: patch the DynamicCache after prefill - write int8,
+    dequantize to bf16 on read (2x KV memory). Idempotent per cache object."""
+    global _KV_STORE
+    if KV_MODE != "int8" or past is None or getattr(past, "_int8_kv", False):
+        return
+    import dsv4_kvcache_int8 as ki
+    if _KV_STORE is None:
+        scales = torch.load(KV_SCALES, map_location="cpu", weights_only=True)
+        _KV_STORE = ki.Int8KVStore(scales)
+    ki.install_int8_compression(past, _KV_STORE)
+    past._int8_kv = True
+    # retrofit: the prefill already wrote bf16 K/V; cat(bf16, int8) would
+    # PROMOTE raw int8 values into bf16 (-127..127) and the shared decompress
+    # would then scale the prefill down ~100x (measured: text collapses
+    # after a few coherent tokens). Quantize the existing entries in place so
+    # the whole cache is int8 from the first decode step.
+    kb = 0
+    for li, layer in enumerate(past.layers):
+        if not getattr(layer, "is_initialized", False):
+            continue
+        if layer.keys is not None and layer.keys.numel() and layer.keys.dtype != torch.int8 and li in _KV_STORE.scales:
+            layer.keys = _KV_STORE.compress(layer.keys, li)
+        if layer.values is not None and layer.values.numel() and layer.values.dtype != torch.int8 and li in _KV_STORE.scales:
+            layer.values = _KV_STORE.compress(layer.values, li)
+        for t in (layer.keys, layer.values):
+            if t is not None and t.numel():
+                kb += t.numel() * t.element_size()
+    if kb:
+        print(f"[kv] int8 cache active (retrofit prefill): dtype={past.layers[0].keys.dtype}, "
+              f"KV={kb / 2**20:.1f} MiB (bf16 would be {kb * 2 / 2**20:.1f} MiB)", flush=True)
+
+
+def kv_collect_run(model, n_tokens):
+    """Collect per-layer pre-RoPE KV channel absmax ON THE COMPRESSED STACK
+    (shared kv_norm: K==V pre-RoPE), then compute rotation-safe pair-bound
+    int8 scales - same math as dsv4_kvcache_int8.compute_scales - and save."""
+    from dsv4_collect_attention import TEXT
+    tok = gigatoken.Tokenizer.from_json(open(TOKENIZER, "rb").read())
+    ids = torch.tensor([list(tok.encode(TEXT))], device="cuda", dtype=torch.long)[0]
+    if ids.numel() == 0:
+        raise RuntimeError("empty KV collection stream")
+    reps = (n_tokens // ids.numel()) + 1
+    ids = ids.repeat(reps)[:n_tokens]
+    amax: dict[int, torch.Tensor] = {}
+
+    def mk(li):
+        def h(mod, args, out):
+            a = out.detach().float().reshape(-1, out.shape[-1]).abs().amax(0)
+            if li in amax:
+                torch.maximum(amax[li], a, out=amax[li])
+            else:
+                amax[li] = a
+        return h
+
+    hs = [layer.self_attn.kv_norm.register_forward_hook(mk(li))
+          for li, layer in enumerate(model.model.layers)]
+    global CURRENT_IDS
+    with torch.no_grad():
+        for c0 in range(0, ids.numel(), 1024):
+            chunk = ids[None, c0:c0 + 1024]
+            CURRENT_IDS = chunk
+            model(input_ids=chunk, use_cache=False)
+    for h in hs:
+        h.remove()
+    scales = {}
+    for li, a in amax.items():
+        mx = a.view(-1, 2)
+        bound = torch.sqrt(mx[:, 0] ** 2 + mx[:, 1] ** 2).repeat_interleave(2)
+        scales[li] = (bound / 127).clamp(min=1e-6)
+    torch.save(scales, KV_SCALES)
+    print(f"[kv] collected int8 scales for {len(scales)} layers ({n_tokens} tok) "
+          f"-> {KV_SCALES}", flush=True)
+
 
 def _gate_rmsnorm(x, eps=1e-6):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -1053,6 +1133,7 @@ def gen_sample(model, ids, max_new, temp, shadow=False):
     out = model(input_ids=input_ids, use_cache=True, past_key_values=None,
                 output_hidden_states=use_gate)
     past = out.past_key_values
+    install_int8_kv(past)
     logits = out.logits[0, -1].float()
     h_prev = None
     if use_gate:
@@ -1408,10 +1489,18 @@ def main():
         return
     n_int4x = sum(1 for li in range(N_LAYERS) for k in range(256) if os.path.exists(os.path.join(REDUCED, f"layer_{li}", f"expert_{k}.pt")))
     print(f"int4x checkpoints available: {n_int4x} experts; ttt={'on' if ttt_on else 'off'} save={'on' if save_on else 'off'}", flush=True)
+    try:  # memory-frugal eager attention for long prefills (S^2 -> S*256)
+        import gate_moe_fast as _fast
+        _fast.install_blockwise_attention(model)
+        print("[attn] blockwise eager attention installed (S>1024)", flush=True)
+    except Exception as e:
+        print(f"[attn] blockwise not installed: {e}", flush=True)
     if os.environ.get("I4X_PREWARM") and not evolve_on:
         prewarm_packed(n_threads=int(os.environ.get("I4X_PREWARM_THREADS", "8")))
 
     handles = [model.model.layers[li].mlp.register_forward_hook(make_hook(li, ttt_on), with_kwargs=True) for li in range(N_LAYERS)]
+    if os.environ.get("KV_COLLECT"):
+        kv_collect_run(model, int(os.environ["KV_COLLECT"]))
     attn_on = "--no-attn" not in sys.argv
     attn_handles = []
     if attn_on:
@@ -1434,6 +1523,7 @@ def main():
         CURRENT_IDS = input_ids
         out = model(input_ids=input_ids, use_cache=True, past_key_values=None)
         past = out.past_key_values
+        install_int8_kv(past)
         nxt = int(out.logits[0, -1].argmax().item())
         generated.append(nxt)
         for _ in range(max_new - 1):
