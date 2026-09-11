@@ -106,7 +106,7 @@ def build_routers() -> None:
 
 
 def copy_static() -> None:
-    """Skeleton, tokenizer, original LICENSE."""
+    """Skeleton, tokenizer, original LICENSE, release generation wrapper."""
     sk_dst = os.path.join(RELEASE, "skeleton")
     if not os.path.exists(sk_dst):
         shutil.copytree("dsv4_shared_only", sk_dst)
@@ -123,6 +123,13 @@ def copy_static() -> None:
         if os.path.isdir(enc_src):
             shutil.copytree(enc_src, os.path.join(tok_dst, "encoding"))
         print("tokenizer copied", flush=True)
+    # release generation wrapper (delegates to the validated ttt generator;
+    # must be committed alongside, see scripts/release_gen.py)
+    wrapper_src = os.path.join(os.path.dirname(__file__), "release_gen.py")
+    wrapper_dst = os.path.join(RELEASE, "release_gen.py")
+    if os.path.exists(wrapper_src) and not os.path.exists(wrapper_dst):
+        shutil.copy2(wrapper_src, wrapper_dst)
+        print("release_gen.py copied", flush=True)
 
 
 def main():

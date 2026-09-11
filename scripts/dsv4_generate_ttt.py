@@ -63,14 +63,14 @@ else:
 
 MODEL_DIR = _w2l("C:/HAGI_v2/dsv4_shared_only")
 TOKENIZER = _w2l(r"C:/Users/shmid/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json")
-LOSSLESS = _w2l("C:/HAGI_v2/lossless_layers")
+# LOSSLESS (original FP4 store) deleted 2026-09-11; model runs on compressed experts only
 REDUCED = "dsv4_reduced"
 # WSL ext4 copy (drvfs torch.load is ~5x slower): set HAGI_DATA=/root/hagi
 # to read the big dirs from the native FS instead of /mnt/c.
 _data = os.environ.get("HAGI_DATA")
 if _data:
     MODEL_DIR = os.path.join(_data, "dsv4_shared_only")
-    LOSSLESS = os.path.join(_data, "lossless_layers")
+    pass  # LOSSLESS removed
     REDUCED = os.path.join(_data, "dsv4_reduced")
 
 N_LAYERS = 43
@@ -174,44 +174,49 @@ def load_router(snap, wm):
 
 
 def get_expert_packed(li, k):
-    global CACHE_BYTES, HIT, MISS
-    key = (li, k)
-    if key in PACKED_CACHE:
-        PACKED_CACHE.move_to_end(key)
-        HIT += 1
-        return PACKED_CACHE[key]
-    MISS += 1
-    fp = os.path.join(LOSSLESS, f"layers_{li}_ffn.safetensors")
-    base = f"layers.{li}.ffn.experts.{k}"
-    with safe_open(fp, framework="pt", device="cuda") as f:
-        d = {}
-        for proj in ("w1", "w2", "w3"):
-            d[f"{proj}.weight"] = f.get_tensor(f"{base}.{proj}.weight")
-            d[f"{proj}.scale"] = f.get_tensor(f"{base}.{proj}.scale")
-    PACKED_CACHE[key] = d
-    PACKED_CACHE.move_to_end(key)
-    CACHE_BYTES += sum(t.numel() * t.element_size() for t in d.values())
-    free, _ = torch.cuda.mem_get_info()
-    lim = max(0, free - GPU_HEADROOM)
-    while (CACHE_BYTES > lim or len(PACKED_CACHE) > PACKED_MAX) and len(PACKED_CACHE) > 1:
-        _, ev = PACKED_CACHE.popitem(last=False)
-        CACHE_BYTES -= sum(t.numel() * t.element_size() for t in ev.values())
-        del ev
-    return d
+    """REMOVED: the original-FP4 lossless_layers store is deleted; the model
+    now runs and learns exclusively on its own COMPRESSED experts. Kept as
+    an explicit error so stale callers fail loudly instead of silently
+    reading nonexistent files."""
+    raise RuntimeError(
+        "get_expert_packed (original FP4 experts) is gone: lossless_layers "
+        "was deleted. The model runs on compressed experts only.")
+
+
+def _frozen_expert_fn(li, k):
+    """The model's OWN frozen compressed expert (pre-adaptation state):
+    unpacks w1/w2/w3 straight from the packed codes, bypassing any live
+    TTT adaptation. This is the learning anchor - the model learns on its
+    own thoughts, regressing toward its frozen self."""
+    key_p = (li, k)
+    e_gpu = I4X_PACKED.get(key_p)
+    if e_gpu is None:
+        return None
+    if e_gpu.get("w1a") is not None and "tern" in str(e_gpu.get("mode", "")):
+        w1 = unpack_ternary_bf16(e_gpu["w1a"], e_gpu["w1a_scale"])
+        w3 = unpack_ternary_bf16(e_gpu["w3a"], e_gpu["w3a_scale"])
+    else:
+        return None
+    w2 = unpack_int4_bf16(e_gpu["w2a"], e_gpu["w2a_scale"])
+    return w1, w2, w3
 
 
 def get_shared_dequant(li):
-    """bf16 shared experts (halves per-token bandwidth vs fp32 decode)."""
+    """bf16 shared experts, read from the skeleton (MODEL_DIR). The skeleton
+    ships the shared experts pre-decoded to bf16 - bitwise identical to the
+    old lossless_layers fp8 decode (verified 2026-09-11)."""
     if li in SHARED_DEQUANT:
         return SHARED_DEQUANT[li]
-    fp = os.path.join(LOSSLESS, f"layers_{li}_ffn.safetensors")
+    import json
+    from safetensors import safe_open
+    idx = json.load(open(os.path.join(MODEL_DIR, "model.safetensors.index.json")))
+    wm = idx["weight_map"]
     base = f"layers.{li}.ffn.shared_experts"
     d = {}
-    with safe_open(fp, framework="pt", device="cuda") as f:
-        for proj in ("w1", "w2", "w3"):
-            w = f.get_tensor(f"{base}.{proj}.weight")
-            s = f.get_tensor(f"{base}.{proj}.scale")
-            d[proj] = de._decode(base, w, s).to(torch.bfloat16)
+    for proj in ("w1", "w2", "w3"):
+        with safe_open(os.path.join(MODEL_DIR, wm[f"{base}.{proj}.weight"]),
+                       framework="pt") as f:
+            d[proj] = f.get_tensor(f"{base}.{proj}.weight").cuda()
     SHARED_DEQUANT[li] = d
     return d
 
@@ -221,30 +226,11 @@ DEQUANT_BYTES = 0
 
 
 def get_dequant(li, k):
-    """Cached bf16 dequantized ORIGINAL expert (decode speed: per-token dequant
-    of FP4 experts was the bottleneck; bf16 halves bandwidth and doubles GEMM
-    throughput - teacher targets get ~0.4% bf16 rounding, acceptable)."""
-    global DEQUANT_BYTES
-    key = (li, k)
-    if key in DEQUANT_CACHE:
-        DEQUANT_CACHE.move_to_end(key)
-        return DEQUANT_CACHE[key]
-    p = get_expert_packed(li, k)
-    w1 = de.dequant_fp4(p["w1.weight"], p["w1.scale"]).to(torch.bfloat16)
-    w2 = de.dequant_fp4(p["w2.weight"], p["w2.scale"]).to(torch.bfloat16)
-    w3 = de.dequant_fp4(p["w3.weight"], p["w3.scale"]).to(torch.bfloat16)
-    DEQUANT_CACHE[key] = (w1, w2, w3)
-    DEQUANT_CACHE.move_to_end(key)
-    DEQUANT_BYTES += w1.numel() * 2 + w2.numel() * 2 + w3.numel() * 2
-    free, _ = torch.cuda.mem_get_info()
-    while (len(DEQUANT_CACHE) > DEQUANT_MAX or DEQUANT_BYTES > free - GPU_HEADROOM) and len(DEQUANT_CACHE) > 1:
-        evk = next((kk for kk in DEQUANT_CACHE if kk not in PINNED), None)
-        if evk is None:
-            break
-        ev = DEQUANT_CACHE.pop(evk)
-        DEQUANT_BYTES -= ev[0].numel() * 2 + ev[1].numel() * 2 + ev[2].numel() * 2
-        del ev
-    return DEQUANT_CACHE[key]
+    """REMOVED together with the original-FP4 store (lossless_layers deleted).
+    The model runs on its own compressed experts only."""
+    raise RuntimeError(
+        "get_dequant (original FP4 experts) is gone: the model learns on its "
+        "own frozen compressed experts (see _frozen_expert_fn).")
 
 
 POD_CACHE: dict[int, tuple] = {}
@@ -498,7 +484,15 @@ def int4x_forward_z(d, z):
 
 
 def _teacher_y(li, k, x_rows):
-    w1, w2, w3 = get_dequant(li, k)
+    """Learning anchor = the model's OWN frozen compressed expert
+    (pre-adaptation state, unpacked straight from the packed codes).
+    The model learns on its own thoughts: adapted W2 regresses toward
+    reproducing its frozen self on live activations."""
+    w = _frozen_expert_fn(li, k)
+    if w is None:
+        d = get_int4x(li, k)
+        return int4x_forward(d, x_rows) @ d["w2b"].float().T
+    w1, w2, w3 = w
     return ffn(x_rows.to(torch.bfloat16), w1, w2, w3).float()
 
 
@@ -840,19 +834,15 @@ def make_hook(li, ttt_on):
             # decode fast path: single row, no scatter machinery, two syncs total;
             # z = (x-mu)@P hoisted per layer (shared by all routed experts)
             _w_list = weights[0].tolist()
-            _d0 = get_int4x(li, indices[0, 0].item()) if not teacher else None
+            _d0 = get_int4x(li, indices[0, 0].item())
             _z_layer = None
             for j, k in enumerate(indices[0].tolist()):
                 _tk = _pr and time.perf_counter()
-                d = None if teacher else get_int4x(li, k)
+                d = get_int4x(li, k)
                 if _pr:
                     PROF_T["get"] += time.perf_counter() - _tk
                 if d is None:
-                    # baseline/bisect: this expert runs the ORIGINAL FP4 weights
-                    w1, w2, w3 = get_dequant(li, k)
-                    ek = ffn(flatb, w1, w2, w3).float()
-                    out[0] += _w_list[j] * ek[0]
-                    continue
+                    raise RuntimeError(f"missing compressed expert L{li}E{k}")
                 if _z_layer is None:
                     _z_layer = (flat.to(torch.bfloat16) - d["mu"]) @ d["P"]
                 if _pr:
@@ -872,10 +862,12 @@ def make_hook(li, ttt_on):
             # top-6 routing this cuts the dominant P-read traffic 6x)
             for k in indices.unique().tolist():
                 _tk = _pr and time.perf_counter()
-                d = None if teacher else get_int4x(li, k)
+                d = get_int4x(li, k)
                 if _pr:
                     PROF_T["get"] += time.perf_counter() - _tk
-                if d is not None:
+                if d is None:
+                    raise RuntimeError(f"missing compressed expert L{li}E{k}")
+                if True:
                     if _pr:
                         _tk = time.perf_counter()
                     m_any = (indices == k).any(dim=1)
@@ -911,19 +903,8 @@ def make_hook(li, ttt_on):
                             ent["h"].append(h.detach())
                             ent["n"] += int(m_any.sum())
                     del h, out_k, m_any, pos
-                else:
-                    w1, w2, w3 = get_dequant(li, k)
-                    ek = ffn(flat.to(torch.bfloat16), w1, w2, w3).float()
-                    if EXPERT_NOISE > 0.0:
-                        rms = ek.pow(2).mean(dim=1, keepdim=True).sqrt()
-                        ek = ek + rms * EXPERT_NOISE * torch.randn_like(ek)
-                    for kk in range(TOP_K):
-                        m = indices[:, kk] == k
-                        if m.any():
-                            out[m] += weights[m, kk, None] * ek[m]
-                    del ek
 
-        if cands:  # prefill TTT: hottest experts only, teacher = original FP4
+        if cands:  # prefill TTT: hottest experts; anchor = own frozen expert
             cands.sort(reverse=True)
             for rows, k in cands[:TTT_PER_LAYER]:
                 d = get_int4x(li, k)
@@ -1233,10 +1214,9 @@ def build_pins(prefix_ids):
                 PINNED.discard((li, k))
                 continue
         else:
-            get_dequant(li, k)
-            if (li, k) not in DEQUANT_CACHE:
-                PINNED.discard((li, k))
-                continue
+            # no original-FP4 store anymore: only compressed experts can pin
+            PINNED.discard((li, k))
+            continue
         PINNED_BYTES += 50 * 2**20
         n_pin += 1
     print(f"pinned {n_pin} experts ({PINNED_BYTES / 2**30:.1f} GB budget {PIN_BUDGET / 2**30:.0f})", flush=True)
