@@ -147,12 +147,20 @@ def _patch():
             import torch.nn.functional as F
             sw = T.get_shared_dequant(li)
             D, I, GS = 4096, 2048, 128
+            D, I, GS = 4096, 2048, 128  # noqa: F811 (kept for clarity)
             state = {}
+            T_K = T.TOP_K
 
             def _ensure():
                 if not state:
                     state["Pbf"] = _load_pod(li)[0].to(torch.bfloat16)
                     state["mubf"] = _load_pod(li)[1].to(torch.bfloat16).reshape(1, -1)
+                    state["muP"] = (state["mubf"] @ state["Pbf"]).reshape(1, -1)
+                    # persistent scratch buffers (decode n==1 path)
+                    state["hbuf"] = torch.empty(T_K, I, device="cuda")
+                    state["ybuf"] = torch.empty(T_K, D, device="cuda")
+                    state["acc"] = torch.zeros(D, device="cuda")
+                    state["ids_rel"] = torch.arange(T_K, dtype=torch.int32, device="cuda")
                 return state
 
             def hook(module, args, kwargs, output):
@@ -174,6 +182,26 @@ def _patch():
                 g = (flatb @ sw["w1"].T).clamp(max=10.0)
                 u = (flatb @ sw["w3"].T).clamp(min=-10.0, max=10.0)
                 out = (F.silu(g) * u @ sw["w2"].T).float()
+                if n == 1:
+                    # fast decode path: muP-folded z, persistent scratch
+                    hbuf, ybuf, acc = state["hbuf"], state["ybuf"], state["acc"]
+                    ids_rel = state["ids_rel"]
+                    zvec = (flatb[0].unsqueeze(0) @ Pbf - state["muP"])[0].contiguous()
+                    ws = [_slices(li, int(indices[0, j].item())) for j in range(T_K)]
+                    w13c = torch.stack([d["w13"] for d in ws])
+                    s13c = torch.stack([d["s13"] for d in ws])
+                    b13c = torch.stack([d["b13"] for d in ws])
+                    w2c = torch.stack([d["w2a"] for d in ws])
+                    s2c = torch.stack([d["s2"] for d in ws])
+                    acc.zero_()
+                    k_h13t[(T_K, I // 64)](zvec, ids_rel, w13c, s13c, b13c, lut, hbuf,
+                                           D=D, I=I, GS=GS, BI=64, num_warps=2)
+                    tbk.k_yb[(T_K, Dd // 512)](hbuf, ids_rel, weights[0].contiguous(),
+                                               w2c, s2c, ybuf, acc, D=D, I=I, GS=GS,
+                                               BD=512, BK=128, num_warps=8)
+                    res = (out + acc).to(x.dtype).reshape(B, S, Dd)
+                    del output
+                    return res
                 routed = torch.zeros(n, Dd, device=x.device)
                 for r in range(n):
                     ws = [_slices(li, int(indices[r, j].item())) for j in range(T.TOP_K)]
@@ -200,7 +228,34 @@ def _patch():
             return hook
 
         T.make_hook = _fast_hook
-        print(f"[fast-moe] expert-LRU({PACK_MAX}) + triton kernels", flush=True)
+
+        # --- fused mHC (hc_fused): the hc forward is ~45 tiny torch launches
+        # (sinkhorn loop); one fused path cuts 5.2ms -> 0.33ms per site.
+        # Decode only (S==1); prefill uses the reference module.
+        from hc_fused import HCFused
+
+        _orig_setup = T.setup_model
+
+        def setup_model_with_hc():
+            model = _orig_setup()
+            n = 0
+            for li in range(T.N_LAYERS):
+                for site in ("attn_hc", "ffn_hc"):
+                    mod = getattr(model.model.layers[li], site)
+                    fused = HCFused(mod)
+                    ref_fwd = mod.forward
+
+                    def shim(hidden_streams, _f=fused, _ref=ref_fwd):
+                        if hidden_streams.shape[1] == 1:
+                            return _f.forward(hidden_streams)
+                        return _ref(hidden_streams)
+
+                    mod.forward = shim
+                    n += 1
+            print(f"[fast-moe] fused mHC on {n} hc sites (decode)", flush=True)
+            return model
+
+        T.setup_model = setup_model_with_hc
 
 
 _patch()
