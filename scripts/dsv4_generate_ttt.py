@@ -1506,20 +1506,69 @@ def main():
         install_int8_kv(past)
         nxt = int(out.logits[0, -1].argmax().item())
         generated.append(nxt)
+        _lg_prev = out.logits[0, -1].float()
         for _ in range(max_new - 1):
             if nxt == EOS_ID:
                 break
-            CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
-            out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
-            past = out.past_key_values
-            _lg = out.logits[0, -1].float()
+            # --- HAGI_LOOK lookahead speculation (greedy only) ---
+            _K = int(os.environ.get("HAGI_LOOK", "6"))
             _temp = float(os.environ.get("HAGI_TEMP", "0"))
-            if _temp > 0:
-                _p = torch.softmax(_lg / _temp, dim=-1)
-                nxt = int(torch.multinomial(_p, 1).item())
+            drafted = None
+            if _K > 1 and _temp <= 0 and len(generated) >= _K + 2:
+                _NG = 3
+                _pool = {}
+                for _i in range(len(generated) - _NG):
+                    _pool.setdefault(tuple(generated[_i:_i + _NG]), []).append(generated[_i + _NG])
+                key = tuple(generated[-_NG:])
+                cands = _pool.get(key, [])
+                if cands:
+                    nxt1 = int(_lg_prev.argmax().item()) if _lg_prev is not None else None
+                    drafted = [cands[0]]
+                    # extend draft via repeated lookup
+                    seq = generated + drafted
+                    for _ in range(_K - 2):
+                        k2 = tuple(seq[-_NG:])
+                        c2 = _pool.get(k2, [])
+                        if not c2:
+                            break
+                        drafted.append(c2[0])
+                        seq.append(c2[0])
+                    if nxt1 is not None and (not drafted or drafted[0] != nxt1):
+                        drafted.insert(0, nxt1)
+            if drafted and len(drafted) > 1:
+                # verify: feed all drafted tokens at once; logits[i-1] must
+                # predict drafted[i]; accept longest matching prefix; bonus
+                # token from the last accepted position.
+                draft_t = torch.tensor([drafted], device="cuda", dtype=torch.long)
+                CURRENT_IDS = draft_t
+                out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
+                lg = out.logits[0]                     # [k, vocab] (pos i predicts draft[i])
+                accepted = 0
+                for i in range(len(drafted)):
+                    if int(lg[i].argmax().item()) != drafted[i]:
+                        break
+                    accepted += 1
+                # bonus token from last accepted position (or from position 0 if none)
+                src = min(accepted, len(drafted) - 1)
+                nxt = int(lg[src].argmax().item())
+                if accepted == len(drafted):
+                    nxt = int(lg[-1].argmax().item())
+                keep = len(generated) + accepted
+                past.crop(keep)
+                generated.extend(drafted[:accepted])
+                generated.append(nxt)
             else:
-                nxt = int(_lg.argmax().item())
-            generated.append(nxt)
+                CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
+                out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
+                past = out.past_key_values
+                _lg = out.logits[0, -1].float()
+                if _temp > 0:
+                    _p = torch.softmax(_lg / _temp, dim=-1)
+                    nxt = int(torch.multinomial(_p, 1).item())
+                else:
+                    nxt = int(_lg.argmax().item())
+                generated.append(nxt)
+            _lg_prev = out.logits[0, -1].float()
 
     for h in handles:
         h.remove()
