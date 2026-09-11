@@ -144,3 +144,37 @@ def k_yb6(
         acc += tl.sum(hb[None, :] * wqb, axis=1)
     tl.store(y_ptr + t * D + offs_o, acc)
     tl.atomic_add(out_ptr + offs_o, acc * wscalar)
+
+
+@triton.jit
+def k_yb_multi(
+    h_ptr,        # [T, I] fp32
+    ids_ptr,      # [T] int32 (0..255 expert ids)
+    w_ptr,        # [T] fp32 router weights
+    w2_ptr,       # u8 [T, D, I/2] stacked per-token w2
+    s2_ptr,       # f16 [T, D, I/GS]
+    y_ptr,        # [T, D] fp32 scratch (ALWAYS written)
+    out_ptr,      # [n, D] fp32 accumulator: out[t // ZPJ] += w[t]*y[t]
+    D: tl.constexpr, I: tl.constexpr, GS: tl.constexpr,
+    BD: tl.constexpr, BK: tl.constexpr, ZPJ: tl.constexpr,
+):
+    t = tl.program_id(0)
+    ob = tl.program_id(1)
+    zr = t // ZPJ
+    wscalar = tl.load(w_ptr + t).to(tl.float32)
+    offs_o = ob * BD + tl.arange(0, BD)
+    acc = tl.zeros((BD,), dtype=tl.float32)
+    cols = tl.arange(0, BK // 2)[None, :]
+    for k0 in range(0, I, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        hv = tl.load(h_ptr + t * I + offs_k).to(tl.float32)
+        raw = tl.load(w2_ptr + t * (D * (I // 2)) + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16)
+        lo = (raw & 15).to(tl.float32) - 8.0
+        hi = (raw >> 4).to(tl.float32) - 8.0
+        wq = tl.join(lo, hi).reshape(BD, BK)
+        sg = tl.load(s2_ptr + t * (D * (I // GS)) + offs_o * (I // GS) + (k0 // GS)).to(tl.float32)
+        wqb = (wq * sg[:, None]).to(tl.bfloat16).to(tl.float32)
+        hb = hv.to(tl.bfloat16).to(tl.float32)
+        acc += tl.sum(hb[None, :] * wqb, axis=1)
+    tl.store(y_ptr + t * D + offs_o, acc)
+    tl.atomic_add(out_ptr + zr * D + offs_o, acc * wscalar)

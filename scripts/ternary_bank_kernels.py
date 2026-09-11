@@ -29,7 +29,7 @@ def _soft_lim(x, LIM: tl.constexpr, KNEE: tl.constexpr):
 
 @triton.jit
 def k_h13t(
-    z_ptr,        # [D] f32 pre-rotated token
+    z_ptr,        # [n, D] f32 pre-rotated tokens (n = len(ids) // ZPJ)
     ids_ptr,      # [T] int32 expert ids (GPU)
     w13_ptr,      # u8 [256, 2I, T3] ternary 5 trits/byte base-3
     s13_ptr,      # f32 [256, 2I, D/GS]
@@ -37,10 +37,12 @@ def k_h13t(
     lut_ptr,      # i8 [256, 5] trit LUT
     h_ptr,        # [T, I] f32 out
     D: tl.constexpr, I: tl.constexpr, GS: tl.constexpr, BI: tl.constexpr,
+    ZPJ: tl.constexpr,  # z rows per token-group (TOP_K); z row = t // ZPJ
 ):
     t = tl.program_id(0)
     ib = tl.program_id(1)
     e = tl.load(ids_ptr + t)
+    zr = t // ZPJ
     T3: tl.constexpr = (D + 4) // 5
     NG: tl.constexpr = D // GS
     offs_i = tl.arange(0, BI) + ib * BI
@@ -52,7 +54,7 @@ def k_h13t(
         kb = g * GS + ks
         byte = kb // 5
         sloti = (kb % 5).to(tl.int32)
-        zf = tl.load(z_ptr + kb)
+        zf = tl.load(z_ptr + zr * D + kb)
         b1 = tl.load(w13_ptr + base13 + offs_i[:, None] * T3 + byte[None, :]).to(tl.int32)
         b3 = tl.load(w13_ptr + base13 + (I + offs_i[:, None]) * T3 + byte[None, :]).to(tl.int32)
         t1 = tl.load(lut_ptr + b1 * 5 + sloti[None, :]).to(tl.float32)
@@ -110,7 +112,7 @@ def k_h13t6(
         kb = g * GS + ks
         byte = kb // 5
         sloti = (kb % 5).to(tl.int32)
-        zf = tl.load(z_ptr + kb)
+        zf = tl.load(z_ptr + zr * D + kb)
         # select pointers (compile-time branch on runtime value is not allowed;
         # instead compute offsets relative to each tensor and use tl.where on
         # a per-program basis via scalar checks)
