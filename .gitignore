@@ -87,3 +87,4 @@ scripts/scan_acts_order.py
 dsv4_release/
 dsv4_bank/
 dsv4_latent_gate.pt*
+_v41/report.txt
