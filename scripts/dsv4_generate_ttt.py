@@ -1512,7 +1512,13 @@ def main():
             CURRENT_IDS = torch.tensor([[nxt]], device="cuda", dtype=torch.long)
             out = model(input_ids=CURRENT_IDS, use_cache=True, past_key_values=past)
             past = out.past_key_values
-            nxt = int(out.logits[0, -1].argmax().item())
+            _lg = out.logits[0, -1].float()
+            _temp = float(os.environ.get("HAGI_TEMP", "0"))
+            if _temp > 0:
+                _p = torch.softmax(_lg / _temp, dim=-1)
+                nxt = int(torch.multinomial(_p, 1).item())
+            else:
+                nxt = int(_lg.argmax().item())
             generated.append(nxt)
 
     for h in handles:

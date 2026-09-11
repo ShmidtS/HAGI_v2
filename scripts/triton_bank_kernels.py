@@ -93,6 +93,54 @@ def k_yb(
         hi = (raw >> 4).to(tl.float32) - 8.0
         wq = tl.join(lo, hi).reshape(BD, BK)
         sg = tl.load(s2_ptr + e * (D * (I // GS)) + offs_o * (I // GS) + (k0 // GS)).to(tl.float32)
-        acc += tl.sum(hv[None, :] * (wq * sg[:, None]), axis=1)
+        wqb = (wq * sg[:, None]).to(tl.bfloat16).to(tl.float32)
+        hb = hv.to(tl.bfloat16).to(tl.float32)
+        acc += tl.sum(hb[None, :] * wqb, axis=1)
+    tl.store(y_ptr + t * D + offs_o, acc)
+    tl.atomic_add(out_ptr + offs_o, acc * wscalar)
+
+
+@triton.jit
+def k_yb6(
+    h_ptr,        # [T, I] fp32
+    ids_ptr,      # [T] int32 (values 0..5, select among the 6 passed experts)
+    w_ptr,        # [T] fp32 router weights
+    w2_0, w2_1, w2_2, w2_3, w2_4, w2_5,
+    s2_0, s2_1, s2_2, s2_3, s2_4, s2_5,
+    y_ptr,        # [T, D] fp32 scratch (ALWAYS written)
+    out_ptr,      # [D] fp32 accumulator: out += w[t] * y[t]
+    D: tl.constexpr, I: tl.constexpr, GS: tl.constexpr,
+    BD: tl.constexpr, BK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    ob = tl.program_id(1)
+    e = tl.load(ids_ptr + t)
+    wscalar = tl.load(w_ptr + t).to(tl.float32)
+    offs_o = ob * BD + tl.arange(0, BD)
+    acc = tl.zeros((BD,), dtype=tl.float32)
+    sel = (e == 0).to(tl.int32) + 2 * (e == 1).to(tl.int32) + 3 * (e == 2).to(tl.int32) \
+        + 4 * (e == 3).to(tl.int32) + 5 * (e == 4).to(tl.int32)
+    cols = tl.arange(0, BK // 2)[None, :]
+    for k0 in range(0, I, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        hv = tl.load(h_ptr + t * I + offs_k).to(tl.float32)
+        raw = tl.load(w2_0 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16)
+        raw = tl.where(sel == 1, tl.load(w2_1 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16), raw)
+        raw = tl.where(sel == 2, tl.load(w2_2 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16), raw)
+        raw = tl.where(sel == 3, tl.load(w2_3 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16), raw)
+        raw = tl.where(sel == 4, tl.load(w2_4 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16), raw)
+        raw = tl.where(sel == 5, tl.load(w2_5 + offs_o[:, None] * (I // 2) + (k0 // 2) + cols).to(tl.uint16), raw)
+        lo = (raw & 15).to(tl.float32) - 8.0
+        hi = (raw >> 4).to(tl.float32) - 8.0
+        wq = tl.join(lo, hi).reshape(BD, BK)
+        sg = tl.load(s2_0 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32)
+        sg = tl.where(sel == 1, tl.load(s2_1 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32), sg)
+        sg = tl.where(sel == 2, tl.load(s2_2 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32), sg)
+        sg = tl.where(sel == 3, tl.load(s2_3 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32), sg)
+        sg = tl.where(sel == 4, tl.load(s2_4 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32), sg)
+        sg = tl.where(sel == 5, tl.load(s2_5 + offs_o * (I // GS) + (k0 // GS)).to(tl.float32), sg)
+        wqb = (wq * sg[:, None]).to(tl.bfloat16).to(tl.float32)
+        hb = hv.to(tl.bfloat16).to(tl.float32)
+        acc += tl.sum(hb[None, :] * wqb, axis=1)
     tl.store(y_ptr + t * D + offs_o, acc)
     tl.atomic_add(out_ptr + offs_o, acc * wscalar)
