@@ -119,6 +119,89 @@ def _patch():
 
     T.load_pod = _load_pod
 
+    # --- fast MoE decode path (HAGI_FAST_MOE=1, default on): expert-level
+    # LRU over dsv4_release/experts (12MB per expert) + route-indirect
+    # Triton kernels on stacked [T,*] scratch. No full-bank residency.
+    if os.environ.get("HAGI_FAST_MOE", "1") == "1":
+        import collections
+        import triton_bank_kernels as tbk
+        from ternary_bank_kernels import k_h13t, trit_lut
+
+        lut = trit_lut()
+        PACK_MAX = int(os.environ.get("HAGI_PACK_MAX", "1600"))
+        pack = collections.OrderedDict()   # (li,k) -> expert tensors (cuda)
+
+        def _slices(li, k):
+            key = (li, k)
+            if key in pack:
+                pack.move_to_end(key)
+                return pack[key]
+            fp = os.path.join(RELEASE, "experts", f"L{li}", f"E{k}.safetensors")
+            d = load_file(fp, device="cuda")
+            pack[key] = d
+            while len(pack) > PACK_MAX:
+                pack.popitem(last=False)
+            return d
+
+        def _fast_hook(li, ttt_on):
+            import torch.nn.functional as F
+            sw = T.get_shared_dequant(li)
+            D, I, GS = 4096, 2048, 128
+            state = {}
+
+            def _ensure():
+                if not state:
+                    state["Pbf"] = _load_pod(li)[0].to(torch.bfloat16)
+                    state["mubf"] = _load_pod(li)[1].to(torch.bfloat16).reshape(1, -1)
+                return state
+
+            def hook(module, args, kwargs, output):
+                st = _ensure()
+                Pbf, mubf = st["Pbf"], st["mubf"]
+                x = args[0]
+                B, S, Dd = x.shape
+                n = B * S
+                flat = x.reshape(n, Dd).float()
+                logits = flat @ T.ROUTER_W[li].T
+                scores = torch.nn.functional.softplus(logits).sqrt()
+                if li in T.HASH_LAYERS:
+                    indices = T.ROUTER_TID[li][T.CURRENT_IDS.reshape(-1)]
+                else:
+                    indices = torch.topk(scores + T.ROUTER_BIAS[li], T.TOP_K, dim=-1).indices
+                weights = scores.gather(1, indices)
+                weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * T.ROUTED_SCALE
+                flatb = flat.to(torch.bfloat16)
+                g = (flatb @ sw["w1"].T).clamp(max=10.0)
+                u = (flatb @ sw["w3"].T).clamp(min=-10.0, max=10.0)
+                out = (F.silu(g) * u @ sw["w2"].T).float()
+                routed = torch.zeros(n, Dd, device=x.device)
+                for r in range(n):
+                    ws = [_slices(li, int(indices[r, j].item())) for j in range(T.TOP_K)]
+                    w13c = torch.stack([d["w13"] for d in ws])
+                    s13c = torch.stack([d["s13"] for d in ws])
+                    b13c = torch.stack([d["b13"] for d in ws])
+                    w2c = torch.stack([d["w2a"] for d in ws])
+                    s2c = torch.stack([d["s2"] for d in ws])
+                    zvec = ((flat[r:r + 1].to(torch.bfloat16) - mubf) @ Pbf)[0].contiguous()
+                    hbuf = torch.empty(T.TOP_K, I, device=x.device)
+                    ybuf = torch.empty(T.TOP_K, Dd, device=x.device)
+                    acc = torch.zeros(Dd, device=x.device)
+                    ids_rel = torch.arange(T.TOP_K, dtype=torch.int32, device=x.device)
+                    k_h13t[(T.TOP_K, I // 64)](zvec, ids_rel, w13c, s13c, b13c, lut, hbuf,
+                                               D=D, I=I, GS=GS, BI=64, num_warps=2)
+                    tbk.k_yb[(T.TOP_K, Dd // 512)](hbuf, ids_rel, weights[r].contiguous(),
+                                                   w2c, s2c, ybuf, acc, D=D, I=I, GS=GS,
+                                                   BD=512, BK=128, num_warps=8)
+                    routed[r] = acc
+                res = (out + routed).to(x.dtype).reshape(B, S, Dd)
+                del output
+                return res
+
+            return hook
+
+        T.make_hook = _fast_hook
+        print(f"[fast-moe] expert-LRU({PACK_MAX}) + triton kernels", flush=True)
+
 
 _patch()
 
