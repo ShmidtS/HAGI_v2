@@ -122,7 +122,9 @@ def _patch():
     # --- fast MoE decode path (HAGI_FAST_MOE=1, default on): expert-level
     # LRU over dsv4_release/experts (12MB per expert) + route-indirect
     # Triton kernels on stacked [T,*] scratch. No full-bank residency.
-    if os.environ.get("HAGI_FAST_MOE", "1") == "1":
+    fast_enabled = (os.environ.get("HAGI_FAST_MOE", "1") == "1"
+                    and "--evolve" not in sys.argv)
+    if fast_enabled:
         import collections
         import triton_bank_kernels as tbk
         from ternary_bank_kernels import k_h13t, trit_lut
@@ -182,45 +184,29 @@ def _patch():
                 g = (flatb @ sw["w1"].T).clamp(max=10.0)
                 u = (flatb @ sw["w3"].T).clamp(min=-10.0, max=10.0)
                 out = (F.silu(g) * u @ sw["w2"].T).float()
-                if n == 1:
-                    # fast decode path: muP-folded z, persistent scratch
-                    hbuf, ybuf, acc = state["hbuf"], state["ybuf"], state["acc"]
-                    ids_rel = state["ids_rel"]
-                    zvec = (flatb[0].unsqueeze(0) @ Pbf - state["muP"])[0].contiguous()
-                    ws = [_slices(li, int(indices[0, j].item())) for j in range(T_K)]
-                    w13c = torch.stack([d["w13"] for d in ws])
-                    s13c = torch.stack([d["s13"] for d in ws])
-                    b13c = torch.stack([d["b13"] for d in ws])
-                    w2c = torch.stack([d["w2a"] for d in ws])
-                    s2c = torch.stack([d["s2"] for d in ws])
-                    acc.zero_()
-                    k_h13t[(T_K, I // 64)](zvec, ids_rel, w13c, s13c, b13c, lut, hbuf,
-                                           D=D, I=I, GS=GS, BI=64, num_warps=2)
-                    tbk.k_yb[(T_K, Dd // 512)](hbuf, ids_rel, weights[0].contiguous(),
-                                               w2c, s2c, ybuf, acc, D=D, I=I, GS=GS,
-                                               BD=512, BK=128, num_warps=8)
-                    res = (out + acc).to(x.dtype).reshape(B, S, Dd)
-                    del output
-                    return res
-                routed = torch.zeros(n, Dd, device=x.device)
-                for r in range(n):
-                    ws = [_slices(li, int(indices[r, j].item())) for j in range(T.TOP_K)]
-                    w13c = torch.stack([d["w13"] for d in ws])
-                    s13c = torch.stack([d["s13"] for d in ws])
-                    b13c = torch.stack([d["b13"] for d in ws])
-                    w2c = torch.stack([d["w2a"] for d in ws])
-                    s2c = torch.stack([d["s2"] for d in ws])
-                    zvec = ((flat[r:r + 1].to(torch.bfloat16) - mubf) @ Pbf)[0].contiguous()
-                    hbuf = torch.empty(T.TOP_K, I, device=x.device)
-                    ybuf = torch.empty(T.TOP_K, Dd, device=x.device)
-                    acc = torch.zeros(Dd, device=x.device)
-                    ids_rel = torch.arange(T.TOP_K, dtype=torch.int32, device=x.device)
-                    k_h13t[(T.TOP_K, I // 64)](zvec, ids_rel, w13c, s13c, b13c, lut, hbuf,
-                                               D=D, I=I, GS=GS, BI=64, num_warps=2)
-                    tbk.k_yb[(T.TOP_K, Dd // 512)](hbuf, ids_rel, weights[r].contiguous(),
-                                                   w2c, s2c, ybuf, acc, D=D, I=I, GS=GS,
-                                                   BD=512, BK=128, num_warps=8)
-                    routed[r] = acc
+                # batched: LRU slices; single launch pair per layer
+                NT = n * T.TOP_K
+                flat_idx = indices.reshape(-1).tolist()
+                ws = [_slices(li, int(kk)) for kk in flat_idx]
+                w13c = torch.stack([d["w13"] for d in ws])
+                s13c = torch.stack([d["s13"] for d in ws])
+                b13c = torch.stack([d["b13"] for d in ws])
+                w2c = torch.stack([d["w2a"] for d in ws])
+                s2c = torch.stack([d["s2"] for d in ws])
+                zb = ((flatb - mubf) @ Pbf).contiguous()          # [n, D]
+                hbuf = torch.empty(NT, I, device=x.device)
+                ybuf = torch.empty(NT, Dd, device=x.device)
+                acc = torch.zeros(n, Dd, device=x.device)
+                ids_all = torch.arange(NT, dtype=torch.int32, device=x.device)
+                wts = weights.reshape(-1).contiguous()
+                k_h13t[(NT, I // 64)](zb, ids_all, w13c, s13c, b13c, lut, hbuf,
+                                      D=D, I=I, GS=GS, BI=64, num_warps=2, ZPJ=T.TOP_K)
+                tbk.k_yb_multi[(NT, Dd // 512)](hbuf, ids_all, wts, w2c, s2c, ybuf, acc,
+                                                D=D, I=I, GS=GS, BD=512, BK=128,
+                                                num_warps=8, ZPJ=T.TOP_K)
+                res = (out + acc).to(x.dtype).reshape(B, S, Dd)
+                del output
+                return res
                 res = (out + routed).to(x.dtype).reshape(B, S, Dd)
                 del output
                 return res
@@ -256,6 +242,8 @@ def _patch():
             return model
 
         T.setup_model = setup_model_with_hc
+    else:
+        print("[fast-moe] disabled (--evolve or HAGI_FAST_MOE=0): full TTT active", flush=True)
 
 
 _patch()
