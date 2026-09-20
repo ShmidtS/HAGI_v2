@@ -103,6 +103,8 @@ def main() -> int:
     if args.adaptive_lora_path:
         main_lora = HeadLoRA.load(args.adaptive_lora_path, cfg.model.hidden_size, cfg.model.vocab_size, device)
         main_model.head.attach_lora(main_lora)
+        if args.adaptive_self_train:
+            lora_trainer = HeadLoRATrainer()
     elif args.adaptive_lora_rank > 0:
         lora_trainer = HeadLoRATrainer()
         main_lora = lora_trainer.attach(main_model, rank=args.adaptive_lora_rank)
@@ -128,14 +130,18 @@ def main() -> int:
     route_map = ParameterMap(candidates)
 
     def execute(req, candidate):
-        model = pool.get(candidate.target_id or "main")
+        model_key = candidate.target_id or "main"
+        model = pool.get(model_key)
+        model_cfg = pool.config(model_key)
         prompt_ids = req["input_ids"]
+        if model_cfg.model.vocab_size != cfg.model.vocab_size:
+            raise ValueError(f"route {model_key!r} has incompatible vocab size")
         out = generate(
             model,
             prompt_ids,
             max_new_tokens=args.max_tokens,
-            eos_token_id=cfg.train.data.eos_token_id,
-            pad_token_id=cfg.train.data.pad_token_id,
+            eos_token_id=model_cfg.train.data.eos_token_id,
+            pad_token_id=model_cfg.train.data.pad_token_id,
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
@@ -203,7 +209,7 @@ def main() -> int:
                 max_train = min(len(seq) - 1, 64)
                 train_seq = torch.tensor([seq[-(max_train + 1):]], dtype=torch.long, device=device)
                 loss = lora_trainer.step(main_model, train_seq[:, :-1], train_seq[:, 1:])
-                path = lora_trainer.save_version(main_lora, args.adaptive_lora_save_dir, int(time.time()))
+                path = lora_trainer.save_version(main_lora, args.adaptive_lora_save_dir, int(time.time() * 1000))
                 if args.adaptive_log:
                     print(f"[adaptive-lora] pseudo_loss={loss:.4f} saved={path}")
         if args.adaptive_log:
