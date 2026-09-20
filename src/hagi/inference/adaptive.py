@@ -46,6 +46,7 @@ class RouteCandidate:
     estimated_latency_ms: float
     max_risk: float = 1.0
     adapter_ids: tuple[str, ...] = ()
+    target_id: str = ""
 
     def __post_init__(self) -> None:
         if self.estimated_latency_ms < 0:
