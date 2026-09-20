@@ -93,7 +93,7 @@ class ParameterMap:
     def get_candidates(self, domain: str) -> tuple[RouteCandidate, ...]:
         exact = tuple(c for c in self._candidates if c.domain == domain)
         generic = tuple(c for c in self._candidates if c.domain == "*")
-        return exact or generic
+        return exact + generic
 
 
 class BudgetPolicy:
