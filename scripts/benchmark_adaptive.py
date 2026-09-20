@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
+import gigatoken as gt
 
 from hagi.inference import (
     AdaptiveInferenceController, InferenceResult, ParameterMap, Route,
@@ -108,10 +109,19 @@ def main() -> int:
     )
 
     prompts = read_prompts(args.prompts_file, args.prompt)
-    prompt_ids_cache = {
-        p: torch.tensor([list(p.encode("utf-8"))], dtype=torch.long, device=device)
-        for p in prompts
-    }
+    tokenizer = gt.Tokenizer(main_cfg.train.tokenizer)
+    vocab_map = None
+    map_path = Path(main_cfg.train.data.data_dir) / "vocab_map.npz"
+    if map_path.exists() and main_cfg.model.vocab_size < 262144:
+        from hagi.data.vocab_map import VocabMap
+        vocab_map = VocabMap(map_path)
+    prompt_ids_cache = {}
+    for p in prompts:
+        raw = tokenizer.encode(p)
+        ids = list(raw) if not isinstance(raw, list) else raw
+        if vocab_map is not None:
+            ids = vocab_map.to_compact(ids).tolist()
+        prompt_ids_cache[p] = torch.tensor([ids], dtype=torch.long, device=device)
 
     # Router-only measurement.
     route_samples = []
