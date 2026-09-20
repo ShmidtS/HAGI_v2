@@ -78,11 +78,11 @@ class HeuristicRouter:
                 scores[domain] = 0.5
                 continue
             hits = sum(1 for kw in profile.keywords if kw.lower() in tokens or kw.lower() in text)
-            scores[domain] = 0.15 * hits
+            scores[domain] = 2.5 * hits
 
         # Length/complexity acts as a weak prior toward the main model.
         complexity = min(1.0, len(tokens) / 160.0)
-        scores["GENERAL"] += 0.25 + 0.35 * complexity
+        scores["GENERAL"] += 1.0 + 0.25 * complexity
 
         domains = tuple(scores)
         logits = [scores[d] / self.temperature for d in domains]
@@ -110,5 +110,7 @@ class HeuristicRouter:
             domain=domain,
             confidence=confidence,
             risk=risk,
+            domain_probs=probs,
+            labels=(domain.lower(), reason, "high_confidence" if confidence >= self.specialist_threshold else "uncertain"),
             reason=reason,
         )
