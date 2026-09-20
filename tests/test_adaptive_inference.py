@@ -91,3 +91,19 @@ class AdaptiveInferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_domain_router_produces_probability_map(self):
+        from hagi.inference.router import HeuristicRouter
+        decision = HeuristicRouter().predict("write a python function to parse JSON")
+        self.assertGreaterEqual(sum(decision.domain_probs.values()), 0.999)
+        self.assertLessEqual(sum(decision.domain_probs.values()), 1.001)
+        self.assertTrue(decision.labels)
+
+    def test_parameter_map_keeps_generic_fallback(self):
+        pm = ParameterMap((
+            RouteCandidate(Route.SPECIALIST, "CODE", 1.0, 0.5, target_id="code"),
+            RouteCandidate(Route.MAIN, "*", 10.0, 1.0, target_id="main"),
+        ))
+        routes = pm.get_candidates("CODE")
+        self.assertEqual({r.target_id for r in routes}, {"code", "main"})
