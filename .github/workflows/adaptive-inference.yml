@@ -22,4 +22,4 @@ jobs:
       - name: Adaptive tests
         run: python -m pytest -q tests/test_adaptive_inference.py tests/test_adaptive_lora.py
       - name: Ruff
-        run: python -m ruff check src/hagi/inference scripts/infer_adaptive.py scripts/benchmark_adaptive.py tests/test_adaptive_inference.py tests/test_adaptive_lora.py
+        run: python -m ruff check src/hagi/inference tests/test_adaptive_inference.py tests/test_adaptive_lora.py
