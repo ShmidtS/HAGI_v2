@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,6 +29,7 @@ from hagi.inference.generate import generate
 from hagi.inference.model_pool import CheckpointModelPool
 from hagi.inference.router import HeuristicRouter
 from hagi.inference.verifier import GenerationVerifier
+from hagi.inference.lora import HeadLoRA, HeadLoRATrainer
 from hagi.model.model import HAGI
 from hagi.train.checkpoint import config_from_dict, load_payload
 from hagi.train.loop import cast_model
@@ -73,6 +75,10 @@ def main() -> int:
     ap.add_argument("--adaptive_max_resident", type=int, default=2)
     ap.add_argument("--adaptive_budget_ms", type=float, default=float("inf"))
     ap.add_argument("--adaptive_log", action="store_true")
+    ap.add_argument("--adaptive_lora_rank", type=int, default=0)
+    ap.add_argument("--adaptive_lora_path")
+    ap.add_argument("--adaptive_lora_save_dir", default="adaptive_lora")
+    ap.add_argument("--adaptive_self_train", action="store_true", help="opt-in pseudo-label head-LoRA update after each turn")
     args = ap.parse_args()
 
     device = torch.device(
@@ -91,6 +97,15 @@ def main() -> int:
 
     pool = CheckpointModelPool(device, max_resident=args.adaptive_max_resident)
     pool.register_loaded("main", main_model, cfg)
+
+    lora_trainer = None
+    main_lora = None
+    if args.adaptive_lora_path:
+        main_lora = HeadLoRA.load(args.adaptive_lora_path, cfg.model.hidden_size, cfg.model.vocab_size, device)
+        main_model.head.attach_lora(main_lora)
+    elif args.adaptive_lora_rank > 0:
+        lora_trainer = HeadLoRATrainer()
+        main_lora = lora_trainer.attach(main_model, rank=args.adaptive_lora_rank)
 
     candidates = [
         RouteCandidate(Route.MAIN, "*", float("inf"), 1.0, target_id="main"),
@@ -180,6 +195,17 @@ def main() -> int:
             break
         output, trace = turn(prompt)
         print(decode_text(tokenizer, output, vocab_map))
+        if args.adaptive_self_train:
+            if lora_trainer is None or main_lora is None:
+                raise RuntimeError("--adaptive_self_train requires --adaptive_lora_rank > 0 or --adaptive_lora_path")
+            seq = encode(prompt) + output
+            if len(seq) >= 2:
+                max_train = min(len(seq) - 1, 64)
+                train_seq = torch.tensor([seq[-(max_train + 1):]], dtype=torch.long, device=device)
+                loss = lora_trainer.step(main_model, train_seq[:, :-1], train_seq[:, 1:])
+                path = lora_trainer.save_version(main_lora, args.adaptive_lora_save_dir, int(time.time()))
+                if args.adaptive_log:
+                    print(f"[adaptive-lora] pseudo_loss={loss:.4f} saved={path}")
         if args.adaptive_log:
             d = trace.decision
             print(
