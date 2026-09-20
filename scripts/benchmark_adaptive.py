@@ -1,11 +1,12 @@
-"""Benchmark adaptive inference components and optional HAGI generation.
+"""End-to-end adaptive inference benchmark for native HAGI checkpoints.
 
-Usage examples:
-  python scripts/benchmark_adaptive.py --router-only --repeats 1000
-  python scripts/benchmark_adaptive.py --checkpoint ... --prompts-file prompts.txt
+The benchmark uses the same prompts and generation settings for:
+  B0 baseline      : main checkpoint directly
+  B1 router-only   : lightweight route decision only
+  B2 adaptive      : router + route registry + verifier + fallback
 
-The model benchmark compares the same generation workload with adaptive mode
-disabled/enabled. A secondary checkpoint can be supplied for specialist routing.
+A specialist checkpoint can be supplied with --specialist_code/--specialist_math/...
+No speed or quality claim is made unless this script is run on the target hardware.
 """
 from __future__ import annotations
 
@@ -15,67 +16,185 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hagi.inference.adaptive import (
-    AdaptiveInferenceController, InferenceResult, ParameterMap, RouteCandidate, Route,
+import torch
+
+from hagi.inference import (
+    AdaptiveInferenceController, InferenceResult, ParameterMap, Route,
+    RouteCandidate,
 )
+from hagi.inference.generate import generate
+from hagi.inference.model_pool import CheckpointModelPool
 from hagi.inference.router import HeuristicRouter
 from hagi.inference.verifier import GenerationVerifier
+from infer_adaptive import load_main
 
 
-def bench_router(repeats: int) -> None:
-    router = HeuristicRouter()
-    prompts = [
-        "write a python function that parses JSON",
+def percentile(values: list[float], p: float) -> float:
+    values = sorted(values)
+    return values[min(len(values) - 1, int(p * len(values)))]
+
+
+def read_prompts(path: str | None, inline: list[str] | None) -> list[str]:
+    if inline:
+        return inline
+    if path:
+        lines = [x.strip() for x in Path(path).read_text(encoding="utf-8").splitlines()]
+        return [x for x in lines if x]
+    return [
+        "write a python function that parses JSON safely",
         "prove the derivative of x^2",
-        "переведи этот текст на английский",
-        "объясни работу алгоритма",
+        "объясни принцип работы attention",
+        "напиши SQL запрос с группировкой",
     ]
-    samples = []
-    for i in range(repeats):
-        t0 = time.perf_counter()
-        router.predict(prompts[i % len(prompts)])
-        samples.append((time.perf_counter() - t0) * 1e6)
-    samples.sort()
-    p50 = statistics.median(samples)
-    p95 = samples[min(len(samples) - 1, int(0.95 * len(samples)))]
-    print(f"router_us_p50={p50:.2f} router_us_p95={p95:.2f} repeats={repeats}")
-
-
-def bench_controller(repeats: int) -> None:
-    router = HeuristicRouter()
-    candidates = ParameterMap((
-        RouteCandidate(Route.SPECIALIST, "CODE", 1.0, 0.25),
-        RouteCandidate(Route.MAIN, "*", 10.0, 1.0),
-    ))
-    verifier = GenerationVerifier()
-
-    def execute(req, candidate):
-        return InferenceResult("ok", candidate.route)
-
-    controller = AdaptiveInferenceController(router, candidates, execute, verifier)
-    samples = []
-    for i in range(repeats):
-        t0 = time.perf_counter()
-        controller.generate("python function for parsing JSON")
-        samples.append((time.perf_counter() - t0) * 1e6)
-    p95 = sorted(samples)[min(len(samples) - 1, int(0.95 * len(samples)))]
-    print(
-        f"controller_us_median={statistics.median(samples):.2f} "
-        f"controller_us_p95={p95:.2f}"
-    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--router-only", action="store_true")
-    ap.add_argument("--repeats", type=int, default=1000)
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--prompts_file")
+    ap.add_argument("--prompt", action="append")
+    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--max_tokens", type=int, default=32)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top_k", type=int, default=0)
+    ap.add_argument("--top_p", type=float, default=1.0)
+    ap.add_argument("--repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--specialist_code")
+    ap.add_argument("--specialist_math")
+    ap.add_argument("--specialist_ru")
+    ap.add_argument("--specialist_en")
     args = ap.parse_args()
-    bench_router(args.repeats)
-    if not args.router_only:
-        bench_controller(max(100, args.repeats // 10))
+
+    device = torch.device(
+        args.device if args.device != "auto"
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    main_model, main_cfg = load_main(Path(args.checkpoint), device)
+    pool = CheckpointModelPool(device, max_resident=2)
+    pool.register_loaded("main", main_model, main_cfg)
+
+    candidates = [RouteCandidate(Route.MAIN, "*", float("inf"), 1.0, target_id="main")]
+    for domain, path in (
+        ("CODE", args.specialist_code),
+        ("MATH", args.specialist_math),
+        ("RU", args.specialist_ru),
+        ("EN", args.specialist_en),
+    ):
+        if path:
+            key = domain.lower()
+            pool.register(key, path)
+            candidates.insert(0, RouteCandidate(
+                Route.SPECIALIST, domain, float("inf"), 0.75, target_id=key,
+            ))
+
+    router = HeuristicRouter()
+    verifier = GenerationVerifier()
+    controller = AdaptiveInferenceController(
+        router,
+        ParameterMap(candidates),
+        lambda req, cand: generate_result(req, cand, pool, main_cfg, args),
+        verifier,
+        fallback=lambda req, prev: generate_result(
+            req,
+            RouteCandidate(Route.MAIN, "*", float("inf"), 1.0, target_id="main"),
+            pool,
+            main_cfg,
+            args,
+        ),
+    )
+
+    prompts = read_prompts(args.prompts_file, args.prompt)
+    prompt_ids_cache = {
+        p: torch.tensor([list(p.encode("utf-8"))], dtype=torch.long, device=device)
+        for p in prompts
+    }
+
+    # Router-only measurement.
+    route_samples = []
+    for _ in range(max(1, args.repeats) * len(prompts)):
+        for p in prompts:
+            t0 = time.perf_counter()
+            router.predict(p)
+            route_samples.append((time.perf_counter() - t0) * 1e6)
+    print(f"B1 router_us_p50={statistics.median(route_samples):.2f} router_us_p95={percentile(route_samples, .95):.2f}")
+
+    def run_baseline() -> list[tuple[float, int]]:
+        rows = []
+        for _ in range(max(1, args.repeats)):
+            for p in prompts:
+                t0 = time.perf_counter()
+                out = generate(
+                    main_model,
+                    prompt_ids_cache[p],
+                    max_new_tokens=args.max_tokens,
+                    eos_token_id=main_cfg.train.data.eos_token_id,
+                    pad_token_id=main_cfg.train.data.pad_token_id,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    repetition_penalty=args.repetition_penalty,
+                )
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                rows.append((elapsed, int(out.lengths[0])))
+        return rows
+
+    def run_adaptive() -> list[tuple[float, int, str]]:
+        rows = []
+        for _ in range(max(1, args.repeats)):
+            for p in prompts:
+                result, trace = controller.generate(
+                    {"prompt": p, "input_ids": prompt_ids_cache[p]},
+                )
+                rows.append((trace.elapsed_ms, len(result.output), trace.selected_route.value))
+        return rows
+
+    baseline = run_baseline()
+    adaptive = run_adaptive()
+    b_times = [x[0] for x in baseline]
+    a_times = [x[0] for x in adaptive]
+    b_tok = sum(x[1] for x in baseline) / max(sum(x[0] for x in baseline) / 1000.0, 1e-9)
+    a_tok = sum(x[1] for x in adaptive) / max(sum(x[0] for x in adaptive) / 1000.0, 1e-9)
+    routes = {}
+    for _, _, route in adaptive:
+        routes[route] = routes.get(route, 0) + 1
+
+    print(
+        f"B0 baseline_ms_p50={statistics.median(b_times):.2f} "
+        f"baseline_ms_p95={percentile(b_times, .95):.2f} "
+        f"baseline_gen_tok_s={b_tok:.2f}"
+    )
+    print(
+        f"B2 adaptive_ms_p50={statistics.median(a_times):.2f} "
+        f"adaptive_ms_p95={percentile(a_times, .95):.2f} "
+        f"adaptive_gen_tok_s={a_tok:.2f} routes={routes}"
+    )
+    print("Note: this benchmark measures latency/throughput, not semantic quality. Pair it with eval_domains.py/golden tests.")
     return 0
+
+
+def generate_result(req, candidate, pool, fallback_cfg, args):
+    key = candidate.target_id or "main"
+    model = pool.get(key)
+    cfg = pool.config(key)
+    if cfg.model.vocab_size != fallback_cfg.model.vocab_size:
+        raise ValueError(f"route {key!r} has incompatible vocab size")
+    out = generate(
+        model,
+        req["input_ids"],
+        max_new_tokens=args.max_tokens,
+        eos_token_id=cfg.train.data.eos_token_id,
+        pad_token_id=cfg.train.data.pad_token_id,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+    )
+    generated = out.token_ids[0, req["input_ids"].shape[1]:].tolist()
+    return InferenceResult(generated, candidate.route, metadata={"route_target": key})
 
 
 if __name__ == "__main__":
