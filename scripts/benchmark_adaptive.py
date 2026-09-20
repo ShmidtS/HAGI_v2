@@ -62,9 +62,10 @@ def bench_controller(repeats: int) -> None:
         t0 = time.perf_counter()
         controller.generate("python function for parsing JSON")
         samples.append((time.perf_counter() - t0) * 1e6)
+    p95 = sorted(samples)[min(len(samples) - 1, int(0.95 * len(samples)))]
     print(
         f"controller_us_median={statistics.median(samples):.2f} "
-        f"controller_us_p95={sorted(samples)[min(len(samples)-1, int(.95*len(samples)))]):.2f}"
+        f"controller_us_p95={p95:.2f}"
     )
 
 
