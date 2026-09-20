@@ -6,9 +6,9 @@ trade-off explicit.
 """
 from __future__ import annotations
 
+import gc
 from collections import OrderedDict
 from pathlib import Path
-import gc
 
 import torch
 
