@@ -114,9 +114,10 @@ class BudgetPolicy:
             and decision.risk <= c.max_risk
         ]
         if not feasible:
-            # Fail safe: choose the least-risk candidate, then let executor enforce
-            # its own hard budget/timeout. Never silently claim budget compliance.
-            feasible = list(candidates)
+            # Relax latency first while preserving route-risk compatibility.
+            feasible = [c for c in candidates if decision.risk <= c.max_risk]
+            if not feasible:
+                feasible = list(candidates)
         if not feasible:
             raise RuntimeError(f"no execution route available for domain={decision.domain!r}")
         preferred = [c for c in feasible if c.route == decision.route]
