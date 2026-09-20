@@ -26,6 +26,8 @@ class RouteDecision:
     confidence: float
     risk: float = 1.0
     adapter_ids: tuple[str, ...] = ()
+    domain_probs: Mapping[str, float] = field(default_factory=dict)
+    labels: tuple[str, ...] = ()
     reason: str = "router"
 
     def __post_init__(self) -> None:
@@ -116,7 +118,9 @@ class BudgetPolicy:
             feasible = list(candidates)
         if not feasible:
             raise RuntimeError(f"no execution route available for domain={decision.domain!r}")
-        return min(feasible, key=lambda c: (c.estimated_latency_ms, c.max_risk))
+        preferred = [c for c in feasible if c.route == decision.route]
+        pool = preferred or feasible
+        return min(pool, key=lambda c: (c.estimated_latency_ms, c.max_risk))
 
 
 class AdaptiveInferenceController:
