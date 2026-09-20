@@ -17,8 +17,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import torch
-
 from hagi.inference.adaptive import (
     AdaptiveInferenceController, InferenceResult, ParameterMap, RouteCandidate, Route,
 )
