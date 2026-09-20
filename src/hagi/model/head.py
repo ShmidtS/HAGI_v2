@@ -258,6 +258,9 @@ class LMHead(nn.Module):
             self.projection = nn.Linear(hidden_size, vocab_size, bias=False)
             nn.init.normal_(self.projection.weight, std=hidden_size**-0.5)
 
+        # Optional inference-time fast-memory adapter. Unset by default.
+        self.adaptive_lora: nn.Module | None = None
+
         # One learnable receiver gain. See the module docstring: without it a tied
         # codebook starts with a ``H * init_std`` self-correlation outlier, which
         # at H=2048 is a +41 logit and discards the unigram prior entirely.
@@ -284,12 +287,20 @@ class LMHead(nn.Module):
         """The effective ``[V, H]`` output projection."""
         return self._tied_ref[0] if self._tied_ref else self.projection.weight
 
-    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Full logits for ``[..., H]`` — for generation and diagnostics only.
+    def attach_lora(self, adapter: nn.Module) -> None:
+        self.adaptive_lora = adapter
 
-        Training must use :meth:`loss`, which never materializes ``[N, V]``.
-        """
-        out = F.linear(hidden * self.logit_scale.to(hidden.dtype), self.weight)
+    def detach_lora(self) -> nn.Module | None:
+        adapter = self.adaptive_lora
+        self.adaptive_lora = None
+        return adapter
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Full logits for generation/diagnostics."""
+        scaled_hidden = hidden * self.logit_scale.to(hidden.dtype)
+        out = F.linear(scaled_hidden, self.weight)
+        if self.adaptive_lora is not None:
+            out = out + self.adaptive_lora(hidden).to(out.dtype)
         if self.log_prior is not None:
             out = out + self.log_prior.to(out.dtype)
         return out
