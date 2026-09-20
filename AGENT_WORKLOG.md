@@ -105,3 +105,12 @@
 - Иерархия теперь сравнялась с flat (4.83) — ранее была хуже (5.00)
 - Вывод: разрыв flat vs hier был артефактом неверного logit_scale, не свойством иерархии
 - Обновлены BENCHMARKS.md и GROWING_HYPOTHESIS.md
+
+
+### Adaptive Inference MVP — 2026-09-20
+- Added typed adaptive inference controller with route registry, risk/latency policy, verifier/fallback and trace metadata.
+- Added lightweight bootstrap domain router; designed as a replaceable interface for a calibrated Jev-like classifier.
+- Added lazy native HAGI checkpoint pool for specialist routes.
+- Added safe replay queue and native receiver/head LoRA fast-memory adapter; base model weights remain unchanged.
+- Added adaptive interactive entry point, benchmark runner, targeted unit tests and CI workflow.
+- No measured speedup claim yet: target hardware benchmark still required. Local execution could not be performed because the current environment cannot resolve github.com.
