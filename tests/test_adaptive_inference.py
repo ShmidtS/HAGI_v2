@@ -53,7 +53,10 @@ class AdaptiveInferenceTests(unittest.TestCase):
 
     def test_verifier_failure_uses_fallback(self):
         def execute(request, candidate):
-            return InferenceResult("first", candidate.route, metadata={"trusted_supervision": True})
+            return InferenceResult(
+                "first", candidate.route,
+                metadata={"trusted_supervision": True},
+            )
 
         def fallback(request, previous):
             return InferenceResult("verified fallback", Route.FALLBACK)
@@ -67,11 +70,14 @@ class AdaptiveInferenceTests(unittest.TestCase):
         self.assertTrue(trace.fallback_used)
         self.assertTrue(trace.verifier_accepted)
 
-    def test_learner_only_receives_verified_result(self):
+    def test_learner_receives_only_trusted_example(self):
         learner = FakeLearner()
         controller = AdaptiveInferenceController(
             FakeRouter(self.decision), ParameterMap(self.candidates),
-            lambda request, candidate: InferenceResult("ok", candidate.route, metadata={"trusted_supervision": True}),
+            lambda request, candidate: InferenceResult(
+                "ok", candidate.route,
+                metadata={"trusted_supervision": True},
+            ),
             FakeVerifier([True]), learner=learner,
         )
         _, trace = controller.generate("task", latency_budget_ms=10)
@@ -82,16 +88,13 @@ class AdaptiveInferenceTests(unittest.TestCase):
         seen = []
         controller = AdaptiveInferenceController(
             FakeRouter(self.decision), ParameterMap(self.candidates),
-            lambda request, candidate: (seen.append(candidate.route) or InferenceResult("ok", candidate.route)),
+            lambda request, candidate: (
+                seen.append(candidate.route) or InferenceResult("ok", candidate.route)
+            ),
             FakeVerifier([True]), shadow=True,
         )
         controller.generate("task", latency_budget_ms=10)
         self.assertEqual(seen, [Route.MAIN])
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
     def test_domain_router_produces_probability_map(self):
         from hagi.inference.router import HeuristicRouter
@@ -107,3 +110,7 @@ if __name__ == "__main__":
         ))
         routes = pm.get_candidates("CODE")
         self.assertEqual({r.target_id for r in routes}, {"code", "main"})
+
+
+if __name__ == "__main__":
+    unittest.main()
