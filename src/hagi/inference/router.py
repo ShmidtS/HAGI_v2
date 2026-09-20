@@ -6,9 +6,9 @@ a trained/quantized Jev-like classifier can implement the same Router protocol.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from hagi.inference.adaptive import Route, RouteDecision
