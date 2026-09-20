@@ -79,9 +79,11 @@ class HeadLoRATrainer:
         neg = self._sample_negatives(targets, head.vocab_size)
 
         z = F.linear(hidden, adapter.A)
-        target_base = (hidden * head.logit_scale.to(hidden.dtype)) @ weight.index_select(0, targets).t()
-        target_base = target_base.diagonal()
-        target_delta = F.linear(z, adapter.B.index_select(0, targets)) * adapter.scale
+        scaled_hidden = hidden * head.logit_scale.to(hidden.dtype)
+        target_weight = weight.index_select(0, targets)
+        target_base = (scaled_hidden * target_weight).sum(dim=-1)
+        target_B = adapter.B.index_select(0, targets)
+        target_delta = (z * target_B).sum(dim=-1) * adapter.scale
         target_logits = target_base + target_delta.to(target_base.dtype)
 
         neg_weight = weight.index_select(0, neg)
