@@ -53,7 +53,7 @@ class AdaptiveInferenceTests(unittest.TestCase):
 
     def test_verifier_failure_uses_fallback(self):
         def execute(request, candidate):
-            return InferenceResult("first", candidate.route)
+            return InferenceResult("first", candidate.route, metadata={"trusted_supervision": True})
 
         def fallback(request, previous):
             return InferenceResult("verified fallback", Route.FALLBACK)
@@ -71,7 +71,7 @@ class AdaptiveInferenceTests(unittest.TestCase):
         learner = FakeLearner()
         controller = AdaptiveInferenceController(
             FakeRouter(self.decision), ParameterMap(self.candidates),
-            lambda request, candidate: InferenceResult("ok", candidate.route),
+            lambda request, candidate: InferenceResult("ok", candidate.route, metadata={"trusted_supervision": True}),
             FakeVerifier([True]), learner=learner,
         )
         _, trace = controller.generate("task", latency_budget_ms=10)
