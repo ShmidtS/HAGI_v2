@@ -107,6 +107,10 @@ class TestHyperparameterValidation:
         {"max_delta_rms_frac": float("nan")},
         {"rows_max": 0},
         {"prior": float("nan")},
+        {"prior": 0.0},
+        {"prior": -1.0},
+        {"reg": 0.0},
+        {"reg": -1.0},
     ])
     def test_bad_hyperparams_raise(self, kw):
         with pytest.raises(ValueError):
@@ -114,6 +118,18 @@ class TestHyperparameterValidation:
 
 
 class TestFrozenBaseInvariant:
+    def test_rls_step_rejects_row_count_mismatch(self):
+        """The reference checks this; without it a mismatch broadcasts or fits
+        the wrong rows silently."""
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        fitter = _fitter(model)
+        lora = fitter._lora[0]
+        phi = torch.randn(12, lora.r)
+        y = torch.randn(11, lora.hidden_size)
+        with pytest.raises(ValueError, match="row count mismatch"):
+            fitter.rls_step(0, phi, y, holdout=False)
+
     def test_base_params_unchanged(self):
         cfg = _lora_cfg()
         model = _model(cfg)
