@@ -146,11 +146,14 @@ def load_model(
 
 
 def latest_checkpoint(directory: str | Path) -> Path | None:
-    """Highest-numbered ``step-*.pt`` in ``directory``, or None."""
-    found = sorted(
-        Path(directory).glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-"))
-    )
-    return found[-1] if found else None
+    """Highest-numbered regular ``step-*.pt`` checkpoint in ``directory``."""
+    candidates = []
+    for path in Path(directory).glob("step-*.pt"):
+        suffix = path.stem.removeprefix("step-")
+        if path.is_symlink() or not suffix.isdigit():
+            continue
+        candidates.append((int(suffix), path))
+    return max(candidates, default=(0, None))[1]
 
 
 def save_checkpoint(
