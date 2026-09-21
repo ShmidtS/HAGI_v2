@@ -105,13 +105,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", type=int, nargs="+", default=[8])
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--modes", nargs="+", default=["gradient", "rls"],
+                    help="subset of contours; rls-only isolates the layer-count "
+                         "limit from the contour comparison")
     args = ap.parse_args()
     print(f"device free: {torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB")
     print(f"real dims: {REAL}\n")
     for layers in args.layers:
         agg = {}
         for seed in range(args.seeds):
-            for mode in ("gradient", "rls"):
+            for mode in args.modes:
                 r = run(mode, layers, seed)
                 a = agg.setdefault(mode, {"iters": 0, "fw": 0.0, "ms": 0.0})
                 a["iters"] += r["iters"]
@@ -123,11 +126,14 @@ def main() -> int:
         hdr = f"{'mode':>9} {'iters':>6} {'fwd/iter':>9} {'ms/iter':>10}"
         print(hdr)
         print("-" * len(hdr))
-        for mode in ("gradient", "rls"):
+        for mode in args.modes:
             a = agg[mode]
             print(f"{mode:>9} {a['iters']:>6} {a['fw'] / a['iters']:>9.2f} "
                   f"{a['ms'] / a['iters']:>10.0f}")
-        g, r = agg["gradient"], agg["rls"]
+        if len(args.modes) != 2:
+            print()
+            continue
+        g, r = agg[args.modes[0]], agg[args.modes[1]]
         fw_ratio = (g["fw"] / g["iters"]) / (r["fw"] / r["iters"])
         ms_ratio = (g["ms"] / g["iters"]) / (r["ms"] / r["iters"])
         print(f"\n  forwards ratio: {fw_ratio:.2f}x   wallclock ratio: "
