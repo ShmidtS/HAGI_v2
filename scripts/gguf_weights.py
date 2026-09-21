@@ -158,6 +158,22 @@ _GGUF_TO_HF_TAIL = {
 _MTP_BLOCK = 64          # blk.64 is the draft head; the HF text stack stops at 63
 
 
+def general_architecture(path: Path = GGUF_PATH) -> str:
+    """The ``general.architecture`` string of the base GGUF.
+
+    An adapter file must declare the same value: ``llama-adapter.cpp:210-215`` resolves
+    the string through ``llm_arch_from_string`` and throws ``"model arch and LoRA arch
+    mismatch"`` unless it equals the loaded model's arch. Reading it beats hardcoding
+    ``"qwen35"`` — the string is a property of the file, not of this repo.
+    """
+    field = _reader(Path(path)).fields["general.architecture"]
+    # parts layout (gguf-py reader): [key_len, key, value_type, str_len, str_bytes].
+    raw = field.parts[-1]
+    if raw.dtype != np.uint8:
+        raise ValueError(f"general.architecture is not a string field in {path.name}")
+    return bytes(raw.tobytes()).decode("utf-8")
+
+
 def gguf_to_hf_name(name: str) -> str | None:
     """The HF parameter ``name`` addresses, or None for the MTP block.
 
