@@ -575,6 +575,46 @@ def test_probe_grep_pattern_is_not_a_path():
     assert not out.startswith(("DENIED", "ERROR")), out
 
 
+def test_probe_glob_and_tilde_forms_denied():
+    """Runtime-expansion forms are refused: the validator must see every byte
+    the binary will receive.
+
+    The probe binaries are MSYS builds and their C runtime expands globs and ~
+    in argv after CreateProcess, so shell=False does not help. Measured before
+    this rule existed, with a PROBE_ROOT holding one file: ``cat *`` read every
+    non-dot file in the root, ``cat models/*`` read a 3 MiB file whose literal
+    name the size cap denies, and ``ls ~`` listed 93 entries of the user's home
+    directory -- a containment break, not a policy wrinkle.
+    """
+    for argv in (["cat", "*"], ["cat", "*/*"], ["cat", "models/*"], ["cat", "?.txt"],
+                 ["cat", "a{b,c}.txt"], ["cat", "**"], ["cat", "~/x"], ["ls", "~"],
+                 ["wc", "-c", "*/*"], ["grep", "-e", "x", "[a-z]*"],
+                 ["head", "-n", "5", "*"]):
+        assert daemon._validate_probe(list(argv)) is not None, argv
+        out = daemon.run_probe_argv(list(argv))
+        assert out.startswith("DENIED"), (argv, out)
+
+
+def test_probe_glob_cannot_defeat_the_size_cap(tmp_path, monkeypatch):
+    """An oversized file stays refused when named through a wildcard."""
+    root = tmp_path.resolve()
+    monkeypatch.setattr(daemon, "PROBE_ROOT", root)
+    (root / "models").mkdir()
+    (root / "models" / "big.gguf").write_bytes(b"Z" * (daemon.PROBE_MAX_BYTES + 1))
+    assert daemon.run_probe_argv(["cat", "models/big.gguf"]).startswith("DENIED")
+    out = daemon.run_probe_argv(["cat", "models/*"])
+    assert out.startswith("DENIED"), out
+    assert "Z" not in out
+
+
+def test_probe_regex_quantifiers_stay_usable_in_patterns():
+    """The glob refusal binds paths only; grep patterns are regex, where ``*?[]``
+    are ordinary characters. Pinning this is what keeps the fix from silently
+    costing the model its search syntax."""
+    for pat in ("ab*c", "[a-z]+", "^OK$", "O?K", "x{1,2}"):
+        assert daemon._validate_probe(["grep", "-e", pat, "README.md"]) is None, pat
+
+
 def test_probe_head_tail_count_forms_allowed():
     """POSIX count forms stay legal: `-3`, `-n 3`, `-n3`, `-c100`."""
     for argv in (

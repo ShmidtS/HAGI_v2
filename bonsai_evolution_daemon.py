@@ -120,6 +120,16 @@ _NEEDS_PATH = frozenset({"cat", "head", "tail", "wc", "grep"})
 # on paths only so grep patterns such as 'a|b' stay usable.
 _PATH_META = frozenset(";|&$><`()\n\r\\'\"")
 
+# The MSYS C runtime expands these in argv itself, after CreateProcess and
+# independently of shell=False, so the token the validator sees is not the token
+# the binary receives. Measured on this host with a one-file PROBE_ROOT:
+# ``cat *`` read every non-dot file in the root, ``cat models/*`` read a 3 MiB
+# file whose literal name the size cap denies (the cap is defeated -- and the
+# real models/ holds a 7.6 GiB GGUF), and ``ls ~`` listed 93 entries of the
+# user's home directory. Refused on paths only: in a grep pattern ``*`` and
+# ``[]`` are regex, not glob.
+_GLOB_META = frozenset("*?[]{}~")
+
 # A confined read of models/*.gguf (7.6 GiB) used to buffer the whole file
 # before trimming to 2000 chars, so the model could crash the daemon by naming
 # a path it already knows from README. Output is trimmed anyway.
@@ -158,7 +168,8 @@ SYSTEM_PROMPT = (
     "агент. Ты вызываешь read-only утилиты через tool 'system_probe': поле "
     "binary (одно из date/uname/wc/ls/cat/head/tail/grep) и поле args (массив "
     "флагов и путей, относительных к рабочему каталогу; grep — только через "
-    "-e PATTERN). Точки, абсолютные пути, .. и рекурсия запрещены. Ты коротко "
+    "-e PATTERN). Точки, абсолютные пути, .., рекурсия, маски (* ? [ ] { }) и "
+    "~ запрещены: называй файл целиком. Ты коротко "
     "отвечаешь на русском, критикуешь свои ответы и улучшаешь их. Ты знаешь, "
     "что inference-only: не меняешь веса, а корректируешь поведение через "
     "confidence/branch/rollback. Всегда называй сегодняшнюю дату через "
@@ -171,7 +182,9 @@ SYSTEM_PROBE_TOOL = {
         "name": "system_probe",
         "description": (
             "Read-only local probe, confined to the workspace root. Dotfiles, "
-            "absolute paths, '..' traversal and recursion are refused."
+            "absolute paths, '..' traversal, recursion, shell wildcards "
+            "(* ? [ ] { }) and '~' are refused: name a file in full. A path "
+            "that expands is not the path that is checked."
         ),
         "parameters": {
             "type": "object",
@@ -181,16 +194,17 @@ SYSTEM_PROBE_TOOL = {
                     "enum": sorted(ALLOWED_PROBES),
                     "description": "The only executables available.",
                 },
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "maxItems": PROBE_MAX_ARGS,
-                        "description": (
-                            "Flags and workspace-relative paths. cat/head/tail/wc/grep "
-                            "need at least one path; grep's pattern must be bound with "
-                            "-e PATTERN, every other element is a path."
-                        ),
-                    },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": PROBE_MAX_ARGS,
+                    "description": (
+                        "Flags and workspace-relative paths. cat/head/tail/wc/grep "
+                        "need at least one path; grep's pattern must be bound with "
+                        "-e PATTERN, every other element is a path. Paths take no "
+                        "wildcards or ~."
+                    ),
+                },
             },
             "required": ["binary"],
         },
@@ -426,6 +440,8 @@ def _confined_path(arg: str) -> Path | None:
     if not arg or ":" in arg or "\\" in arg:
         return None
     if _PATH_META.intersection(arg):
+        return None
+    if _GLOB_META.intersection(arg):
         return None
     p = PurePosixPath(arg)
     if p.is_absolute() or not p.parts:
