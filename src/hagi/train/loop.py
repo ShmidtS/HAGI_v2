@@ -29,6 +29,7 @@ import torch
 from torch import nn
 
 from hagi.config import Config
+from hagi.model.adapters import BlockAdapter
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
@@ -156,10 +157,26 @@ def clip_gradients_by_group(
     that compare and convert like scalars.
     """
     body = _muon_parameters(model)
-    rest = [p for p in model.parameters() if p not in set(body)]
+    rest = [p for p in model.parameters() if p.requires_grad and p not in set(body)]
     body_norm = torch.nn.utils.clip_grad_norm_(body, max_norm) if body else float("nan")
     rest_norm = torch.nn.utils.clip_grad_norm_(rest, max_norm) if rest else float("nan")
     return body_norm, rest_norm
+
+
+def _freeze_base_for_adapters(model: nn.Module) -> None:
+    """Freeze all parameters except the parameters owned by block adapters."""
+    adapter_params = {
+        id(param)
+        for module in model.modules()
+        if isinstance(module, BlockAdapter)
+        for param in module.parameters()
+    }
+    if not adapter_params:
+        raise RuntimeError(
+            "train.adapt.freeze_base=True requires at least one attached BlockAdapter"
+        )
+    for param in model.parameters():
+        param.requires_grad_(id(param) in adapter_params)
 
 
 class Trainer:
@@ -176,6 +193,13 @@ class Trainer:
         self.cfg = cfg
         self.step = start_step
         cast_model(model, cfg.train.precision)
+        if cfg.model.adapters.enabled and cfg.train.adapt.freeze_base:
+            _freeze_base_for_adapters(model)
+        elif cfg.train.adapt.freeze_base:
+            raise ValueError(
+                "train.adapt.freeze_base=True requires model.adapters.enabled=True "
+                "(no adapter parameters exist to optimize when adapters are disabled)"
+            )
         if getattr(cfg.train, "compile_model", False):
             # ROCm flash-attention backward breaks torch.compile (a fake/meta
             # kernel stride assertion in _scaled_dot_product_flash_attention_backward).
@@ -212,6 +236,7 @@ class Trainer:
         model.train()
         device = next(model.parameters()).device
         self.optimizer.zero_grad(set_to_none=True)
+        adapter_only = cfg.model.adapters.enabled and cfg.train.adapt.freeze_base
 
         # OFDM coherence interval: the ternary map Q*s is constant across the
         # microbatches of one optimizer step (the master W only changes on
@@ -219,8 +244,10 @@ class Trainer:
         # step recomputes against the updated master. Always on: the cached
         # path is also the host-bound fix (zero per-forward copies), so it is
         # a win even at grad_accum=1.
-        use_ternary_cache = cfg.model.ternary.enabled and getattr(
-            cfg.train, "ternary_step_cache", True
+        use_ternary_cache = (
+            cfg.model.ternary.enabled
+            and not adapter_only
+            and getattr(cfg.train, "ternary_step_cache", True)
         )
         if use_ternary_cache:
             cache_ternary_weights(model)
@@ -362,7 +389,7 @@ class Trainer:
         if use_ternary_cache:
             clear_ternary_weights(model)
 
-        if hasattr(model, "commit_controller_updates"):
+        if not adapter_only and hasattr(model, "commit_controller_updates"):
             model.commit_controller_updates()
 
         # Metrics cross the device boundary once, after all scheduled GPU work.
