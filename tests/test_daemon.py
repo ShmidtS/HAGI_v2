@@ -184,7 +184,7 @@ def test_candidate_score_ranking():
 
 def test_handle_tool_calls_detail_accounting():
     tc = {"tool_calls": [{"type": "function", "function": {
-        "name": "system_probe", "arguments": {"command": "date"}
+        "name": "system_probe", "arguments": {"binary": "date"}
     }}]}
     text, st_ = daemon.handle_tool_calls_detail(tc)
     assert st_["present"] == 1
@@ -202,6 +202,117 @@ def test_handle_tool_calls_detail_accounting():
     text3, st3 = daemon.handle_tool_calls_detail({"tool_calls": None})
     assert text3 is None
     assert st3["present"] == 0
+
+
+def test_probe_denies_secret_exfiltration():
+    """Read-only is not safe: ``cat`` happily reads ``.env``.
+
+    The repo root really does contain a gitignored ``.env``, so this is the
+    live attack shape rather than a hypothetical one.
+    """
+    for argv in (
+        ["cat", ".env"],
+        ["grep", "TOKEN", ".env"],
+        ["head", "-1", ".env"],
+        ["cat", ".git/config"],
+        ["cat", "data/../.env"],
+        ["cat", "/etc/passwd"],
+        ["cat", "C:/Windows/win.ini"],
+        ["cat", "..\\..\\.env"],
+    ):
+        out = daemon.run_probe_argv(argv)
+        assert out.startswith("DENIED"), f"{argv} was not denied: {out[:60]!r}"
+
+
+def test_probe_denies_recursion_and_dotfile_enumeration():
+    """Recursion descends into dotdirs, defeating per-argument confinement."""
+    for argv in (
+        ["grep", "-r", "TOKEN", "docs"],
+        ["grep", "--recursive", "TOKEN", "docs"],
+        ["ls", "-la"],
+        ["ls", "--all"],
+        ["wc", "-rw", "README.md"],
+    ):
+        out = daemon.run_probe_argv(argv)
+        assert out.startswith("DENIED"), f"{argv} was not denied: {out[:60]!r}"
+
+
+def test_probe_denies_stdin_hangers():
+    """No path means read stdin, which would block the daemon forever."""
+    for argv in (["cat"], ["head"], ["tail"], ["wc"], ["grep", "x"]):
+        out = daemon.run_probe_argv(argv)
+        assert out.startswith("DENIED"), f"{argv} was not denied: {out[:60]!r}"
+
+
+def test_probe_allows_confined_workspace_reads():
+    """The capability the probe exists for must still work."""
+    for argv in (
+        ["date"],
+        ["uname", "-a"],
+        ["ls"],
+        ["wc", "-l", "README.md"],
+        ["cat", "README.md"],
+        ["head", "-3", "README.md"],
+        ["grep", "daemon", "README.md"],
+    ):
+        out = daemon.run_probe_argv(argv)
+        assert not out.startswith(("DENIED", "ERROR")), f"{argv}: {out[:60]!r}"
+
+
+def test_probe_positive_authorization_refuses_unnamed_binaries():
+    """Allow-by-exception: anything not on the list is refused."""
+    for argv in (["rg", "x"], ["echo", "hi"], ["rm", "-rf", "/"], ["bash", "-c", "date"]):
+        assert daemon.run_probe_argv(argv).startswith("DENIED")
+
+
+def test_probe_schema_enum_matches_allowlist():
+    """Decode-time enforcement: the enum *is* the allowlist.
+
+    llama.cpp's grammar was measured to honour an enum under adversarial
+    prompting at temperature 1.0 (0 violations in 10 tries), so the schema and
+    the executor must not be allowed to drift apart.
+    """
+    enum = daemon.SYSTEM_PROBE_TOOL["function"]["parameters"]["properties"]["binary"]["enum"]
+    assert set(enum) == daemon.ALLOWED_PROBES
+    props = daemon.SYSTEM_PROBE_TOOL["function"]["parameters"]["properties"]
+    assert "command" not in props, "free-form command string is the exfil vector"
+
+
+def test_probe_argv_drops_malformed_entries():
+    """Non-string entries are dropped, never coerced via str()."""
+    assert daemon._probe_argv({"binary": "cat", "args": [{"x": 1}, "README.md"]}) == [
+        "cat",
+        "README.md",
+    ]
+    assert daemon._probe_argv({"binary": "cat", "args": "README.md"}) == ["cat"]
+    assert daemon._probe_argv({"command": "date"}) == []
+    assert daemon._probe_argv(None) == []
+
+
+def test_probe_old_schema_fails_closed():
+    """A stale ``{"command": ...}`` call must be denied, not shlex-parsed."""
+    out = daemon.handle_tool_calls_detail(
+        {"tool_calls": [{"type": "function", "function": {
+            "name": "system_probe", "arguments": {"command": "date"}
+        }}]}
+    )
+    assert out[1]["denied"] == 1
+
+
+def test_probe_root_monkeypatch_confines_reads(tmp_path, monkeypatch):
+    """Confinement follows PROBE_ROOT, and symlink escape is refused."""
+    (tmp_path / "ok.txt").write_text("public\n", encoding="utf-8")
+    secret = tmp_path.parent / f"{tmp_path.name}_outside.txt"
+    secret.write_text("outside\n", encoding="utf-8")
+    link = tmp_path / "escape.txt"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink creation needs privileges on this host")
+    monkeypatch.setattr(daemon, "PROBE_ROOT", tmp_path.resolve())
+    assert not daemon.run_probe_argv(["cat", "ok.txt"]).startswith("DENIED")
+    assert daemon.run_probe_argv(["cat", "escape.txt"]).startswith("DENIED")
+    secret.unlink()
 
 
 def test_main_max_turns_halt(tmp_path, monkeypatch):

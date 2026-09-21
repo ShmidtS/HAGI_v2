@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SERVER = os.environ.get("HAGI_SERVER", "http://127.0.0.1:8090")
@@ -35,7 +36,14 @@ STATE_DIR = os.environ.get("HAGI_STATE_DIR",
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "daemon.log")
 
-MAX_TOKENS = max(1, int(os.environ.get("HAGI_DAEMON_TOK", "96")))
+# 512, not 96: with --reasoning on, the model spends the budget on reasoning
+# before it can emit a call, so a small budget silently disables tool access.
+# Measured tool-call rate over 8 prompts (greedy) at this server config:
+# 96t -> 25%, 256t -> 50%, 512t -> 100% (62.5% at the sampling default 0.7).
+# The previous 96 default was mistaken for a draft-mtp runtime limitation.
+# Tradeoff: ~5x the tokens per turn, so a fixed HAGI_DAEMON_HORIZON buys fewer
+# turns, not more work.
+MAX_TOKENS = max(1, int(os.environ.get("HAGI_DAEMON_TOK", "512")))
 TEMPERATURE = float(os.environ.get("HAGI_DAEMON_TEMP", "0.7"))
 TOP_P = float(os.environ.get("HAGI_DAEMON_TOP_P", "0.95"))
 TOP_K = int(os.environ.get("HAGI_DAEMON_TOP_K", "20"))
@@ -55,12 +63,34 @@ TRIGRAM_LIMIT = float(os.environ.get("HAGI_TRIGRAM_LIMIT", "0.55"))
 ALLOWED_PROBES = {"date", "uname", "wc", "ls", "cat", "head", "tail",
                   "grep"}
 
+# Read-only is not the same as safe: ``cat``/``grep`` happily read ``.env``.
+# The probe surface is therefore *positively* authorized -- every argument has
+# to be accounted for by the rules below, and anything unnamed is refused, so
+# a new flag cannot silently widen the surface.
+PROBE_ROOT = Path(os.environ.get("HAGI_PROBE_ROOT") or os.getcwd()).resolve()
+
+# Recursion turns a confined read into a workspace-wide sweep and descends into
+# dot-directories that per-argument confinement would never name. The dotfile
+# flags enumerate names the path rule hides.
+_BANNED_LONG_FLAGS = frozenset({"--recursive", "--all", "--almost-all",
+                                "--directory"})
+_BANNED_SHORT_CHARS = {"ls": set("rRaA"), "grep": set("rR"), "wc": set("rR")}
+
+# These read stdin when given no path, which would block the daemon.
+_NEEDS_PATH = frozenset({"cat", "head", "tail", "wc", "grep"})
+
+# Inert under shell=False, but in a *path* they mark a chained command. Checked
+# on paths only so grep patterns such as 'a|b' stay usable.
+_PATH_META = frozenset(";|&$><`()\n\r\\'\"")
+
 SYSTEM_PROMPT = (
     "Ты — русскоязычная языковая модель-самоэволюционирующий системный "
-    "агент. Ты можешь вызывать локальные read-only утилиты (date, uname, wc, "
-    "ls, cat, head, tail, grep) через tool 'system_probe'. Ты коротко отвечаешь на "
-    "русском, критикуешь свои ответы и улучшаешь их. Ты знаешь, что inference-"
-    "only: не меняешь веса, а корректируешь поведение через confidence/branch/"
+    "агент. Ты вызываешь read-only утилиты через tool 'system_probe': поле "
+    "binary (одно из date/uname/wc/ls/cat/head/tail/grep) и поле args (массив "
+    "флагов и путей, относительных к рабочему каталогу). Точки, абсолютные "
+    "пути, .. и рекурсия запрещены. Ты коротко отвечаешь на русском, "
+    "критикуешь свои ответы и улучшаешь их. Ты знаешь, что inference-only: "
+    "не меняешь веса, а корректируешь поведение через confidence/branch/"
     "rollback. Всегда называй сегодняшнюю дату через system_probe."
 )
 
@@ -68,16 +98,30 @@ SYSTEM_PROBE_TOOL = {
     "type": "function",
     "function": {
         "name": "system_probe",
-        "description": "Read-only local probe: date/uname/wc/ls/cat/head/tail/grep only.",
+        "description": (
+            "Read-only local probe, confined to the workspace root. Dotfiles, "
+            "absolute paths, '..' traversal and recursion are refused."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {
+                "binary": {
                     "type": "string",
-                    "description": "One safe read-only shell command.",
+                    "enum": sorted(ALLOWED_PROBES),
+                    "description": "The only executables available.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 4,
+                    "description": (
+                        "Flags and workspace-relative paths. cat/head/tail/wc/grep "
+                        "need at least one path; for grep the first non-flag "
+                        "element is the pattern."
+                    ),
                 },
             },
-            "required": ["command"],
+            "required": ["binary"],
         },
     },
 }
@@ -218,7 +262,7 @@ def completion(messages: list[dict], *, max_tokens: int = MAX_TOKENS,
     return post("/v1/chat/completions", payload)
 
 
-__all__ = ["main", "run_probe", "completion"]
+__all__ = ["main", "run_probe", "run_probe_argv", "completion"]
 
 
 def mean_entropy(probs: list[float]) -> float:
@@ -288,19 +332,140 @@ def candidate_score(content: str, confidence: float, rep: float) -> tuple[bool, 
     return bool(content.strip()), -float(rep), float(confidence)
 
 
-def run_probe(command: str) -> str:
-    parts = shlex.split(command)
-    if not parts or parts[0] not in ALLOWED_PROBES:
-        return f"DENIED: '{parts[0] if parts else ''}' not allowed"
+def _confined(arg: str) -> bool:
+    """True when ``arg`` names a location inside :data:`PROBE_ROOT`.
+
+    Refuses absolute paths, drive letters, backslashes, ``..`` and any
+    dot-prefixed component -- the last rule is what keeps ``.env``, ``.git``
+    and ``.ssh`` out of reach while ``cat``/``grep`` stay allowlisted.
+    Containment is tested on the *resolved* path, so a symlink planted inside
+    the workspace cannot point outside it.
+    """
+    if not arg or ":" in arg or "\\" in arg:
+        return False
+    if _PATH_META.intersection(arg):
+        return False
+    p = PurePosixPath(arg)
+    if p.is_absolute() or not p.parts:
+        return False                      # '' and '.' name the root itself
+    if any(part == ".." or part.startswith(".") for part in p.parts):
+        return False
     try:
-        r = subprocess.run(parts, capture_output=True, text=True,
-                           timeout=25, check=False, shell=False)
+        resolved = (PROBE_ROOT / Path(*p.parts)).resolve()
+    except OSError:
+        return False
+    return resolved == PROBE_ROOT or resolved.is_relative_to(PROBE_ROOT)
+
+
+def _flag_denial(binary: str, arg: str) -> str | None:
+    """Denial reason for a flag, or None when it is acceptable."""
+    if arg.startswith("--"):
+        return f"{arg} is denied" if arg in _BANNED_LONG_FLAGS else None
+    if arg.startswith("-") and len(arg) > 1:
+        banned = _BANNED_SHORT_CHARS.get(binary, set())
+        for ch in arg[1:]:                # bundled short flags: -rn, -la
+            if ch in banned:
+                return f"-{ch} (in {arg!r}) is denied"
+    return None
+
+
+def _validate_probe(argv: list[str]) -> str | None:
+    """Return a denial reason for ``argv``, or None when the probe is allowed.
+
+    Positive authorization: each binary has a named argument shape and an
+    argument fitting no rule is refused rather than passed through.
+    """
+    if not argv:
+        return "'' not allowed"
+    binary = argv[0]
+    if binary not in ALLOWED_PROBES:
+        return f"'{binary}' not allowed"
+    rest = argv[1:]
+
+    if binary == "date":
+        for a in rest:
+            if not a.startswith("+"):
+                return f"date accepts only +FORMAT, got {a!r}"
+        return None
+    if binary == "uname":
+        for a in rest:
+            if not a.startswith("-"):
+                return f"uname accepts only flags, got {a!r}"
+        return None
+
+    paths = 0
+    pattern_seen = False
+    for a in rest:
+        if a.startswith("-"):
+            denial = _flag_denial(binary, a)
+            if denial:
+                return denial
+            continue
+        if binary == "grep" and not pattern_seen:
+            pattern_seen = True            # first operand is the pattern
+            continue
+        if not _confined(a):
+            return f"unsafe path {a!r}"
+        paths += 1
+    if binary == "grep" and not pattern_seen:
+        return "grep needs a PATTERN"
+    if binary in _NEEDS_PATH and paths == 0:
+        return f"{binary} needs a confined path"
+    return None
+
+
+def run_probe_argv(argv: list[str]) -> str:
+    """Run a validated read-only probe. ``argv`` comes from JSON, unparsed.
+
+    Going from the decoded array straight to ``subprocess`` removes the
+    command-string class of bugs entirely: with no shlex in the path, a
+    metacharacter can never rejoin a token into a second command.
+    """
+    denial = _validate_probe(list(argv))
+    if denial:
+        return f"DENIED: {denial}"
+    try:
+        r = subprocess.run(list(argv), capture_output=True, text=True,
+                           timeout=25, check=False, shell=False,
+                           cwd=str(PROBE_ROOT))
         out = (r.stdout or "")[:2000]
         if r.stderr:
             out += "\n[stderr] " + (r.stderr or "")[:500]
         return out.strip()
     except Exception as e:
         return f"ERROR: {e}"
+
+
+def run_probe(command: str) -> str:
+    """Legacy string form: shlex-split, then hand over to the hardened core.
+
+    Kept because it is the published contract (``__all__``, and callers such as
+    tests pass a command line). The tool path uses :func:`run_probe_argv`
+    instead, so model-supplied arguments never reach a shell splitter.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return "DENIED: unbalanced quoting"
+    return run_probe_argv(argv)
+
+
+def _probe_argv(args: Any) -> list[str]:
+    """Assemble argv from decoded tool arguments, dropping anything malformed.
+
+    Non-string entries are dropped rather than coerced: a dict or list inside
+    ``args`` means a malformed call, and ``str()``-ing it would smuggle
+    characters back into argv the validator has already cleared.
+    """
+    if not isinstance(args, dict):
+        return []
+    binary = args.get("binary")
+    if not isinstance(binary, str):
+        return []
+    raw = args.get("args") or []
+    if not isinstance(raw, list):
+        return [binary]
+    return [binary, *[a for a in raw if isinstance(a, str)]]
 
 
 def handle_tool_calls_detail(msg: dict) -> tuple[str | None, dict[str, int]]:
@@ -329,8 +494,7 @@ def handle_tool_calls_detail(msg: dict) -> tuple[str | None, dict[str, int]]:
             status["denied"] += 1
             results.append(f"<error tool={name} denied</error>")
             continue
-        cmd = (args or {}).get("command", "") if isinstance(args, dict) else ""
-        output = run_probe(cmd)
+        output = run_probe_argv(_probe_argv(args))
         if output.startswith("DENIED:"):
             status["denied"] += 1
         elif output.startswith("ERROR:"):
