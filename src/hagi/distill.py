@@ -1,8 +1,10 @@
 """Distillation for orthogonal-expert merging.
 
-The measured fact (DeepSeek-V4, see scripts/dsv4_spectrum_gap.py and
-scripts/dsv4_full_activation_analysis.py): the 256 routed experts per layer are
-mutually ORTHOGONAL — pairwise output cosine ~1/sqrt(257), flat SVD spectrum,
+The measured fact (DeepSeek-V4; the two one-off analysis scripts that produced
+it — `dsv4_spectrum_gap.py` and `dsv4_full_activation_analysis.py` — were never
+committed, so README.md § "What holds: the weights are white noise" is the only
+surviving record): the 256 routed experts per layer are mutually ORTHOGONAL —
+pairwise output cosine ~1/sqrt(257), flat SVD spectrum,
 white-noise 2D spectrum, cross-layer cosine ~0.0006. Orthogonal weights cannot
 be merged by any linear re-mixing: a rotation (Hadamard / DFT-3 / Procrustes)
 preserves the Gram matrix, so a Hadamard "sum channel" carries exactly as much
