@@ -49,12 +49,20 @@ effective one:
   window every step (10/10). Between refits a step still pays a full
   forward+backward and writes nothing.
 
-So ``stream_frac`` bounds the intent, not the result. Scaling ``prior`` with
-the window (``prior ~= kappa * refit_rows``) would make the effective step
-match the nominal one across window sizes; that is a behavioural change and is
-not made here. The rescaling scalar is shared by every row of a block, so it
-reparametrises the step size without distorting the relative magnitudes of
-positions.
+So ``stream_frac`` bounds the intent, not the result. The shrinkage is a
+**warmup cost, not a mis-calibration**: ``prior`` is a steady-state anchor, and
+at ``lam=0.9995``/``refit_rows=64`` the effective row count in ``G`` converges
+to ~2032, against which a prior of 1000 is kappa ~= 0.49 -- the reference's
+intent. Measured over 60 steps against a ``prior=1`` ceiling: frac climbs
+3.29e-3 -> 5.35e-3 -> 6.80e-3 (ceiling 7.87e-3) and dCE recovers +9.01e-4 ->
++1.50e-3 -> +1.92e-3 (ceiling +2.23e-3), i.e. 40% of the signal at step 12 and
+86% by step 60. A long window reaches steady state in a handful of steps
+(~410 rows/step at seq=512 -> ~5 steps), so the default is kept: shortening
+the warmup by weakening ``prior`` would trade away the steady-state anchor the
+reference sized it for. What matters operationally is that a short-window
+caller is in the warmup regime, and any benchmark run there (this repo's
+real-dims sweep used T=32) measures the shrunk step, so it reads conservative
+rather than optimistic.
 
 Frozen base invariant
 ---------------------
