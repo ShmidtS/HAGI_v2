@@ -511,6 +511,24 @@ def handle_tool_calls(msg: dict) -> str | None:
     return text
 
 
+def _render_calls(tool_calls: list) -> str:
+    """Render the model's own tool calls as visible history text.
+
+    The chat template accepts only system/user/assistant, so a call cannot be
+    replayed as a structured message here. Naming the call in content keeps the
+    decision in context: without it the model sees a tool result it never
+    asked for.
+    """
+    parts = []
+    for c in tool_calls or []:
+        fn = (c or {}).get("function", {}) if isinstance(c, dict) else {}
+        args = fn.get("arguments", "")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        parts.append(f"[called {fn.get('name', '?')} {args}]")
+    return " ".join(parts)
+
+
 def critique(messages: list[dict], answer: str) -> str:
     """JEV discriminator: model critiques its own answer.
 
@@ -613,8 +631,16 @@ def active_messages(st: DaemonState, window: int = 32) -> list[dict]:
     if st.summary:
         msgs.append({"role": "user",
                      "content": "Контекст из rolling summary: " + st.summary})
+    # Rejected and empty assistant turns are dropped: they are the model's own
+    # discarded output, and feeding them back as if valid teaches the next
+    # attempt to reproduce failures. A missing `accepted` key means "keep" --
+    # only an explicit False is a rejection.
     recent = [t for t in st.transcript
-              if t.get("role") != "system"][-window:]
+              if t.get("role") != "system"
+              and t.get("accepted") is not False
+              and not (t.get("role") == "assistant"
+                       and not (t.get("content") or "").strip())
+              ][-window:]
     have_user = bool(st.summary)
     for t in recent:
         role = role_map.get(t.get("role", ""), t.get("role", ""))
@@ -638,11 +664,17 @@ def active_messages(st: DaemonState, window: int = 32) -> list[dict]:
 
 def commit(st: DaemonState, idx: int, role: str, content: str,
            entropy: float, confidence: float, rep: float, ntok: int,
-           accepted: bool, ts: float, branch: str = "main") -> None:
+           accepted: bool, ts: float, branch: str = "main",
+           tool_calls: list | None = None) -> None:
     rec = {"idx": idx, "role": role, "content": content,
            "entropy": round(entropy, 4), "confidence": round(confidence, 4),
            "rep": round(rep, 4), "ntok": ntok, "ts": round(ts, 3),
            "branch": branch, "accepted": accepted}
+    if tool_calls:
+        # Persisted so the model's decision to call is auditable and can
+        # re-enter its own context; without it history holds a tool result
+        # nothing asked for.
+        rec["tool_calls"] = tool_calls
     st.transcript.append(rec)
     if role == "assistant":
         if accepted:
@@ -846,6 +878,23 @@ def main() -> int:
                 {"tool_calls": result["tool_calls"]}
             )
             tool_in_turn = True
+            # Commit the CALL before the RESULT. The follow-up below
+            # overwrites `result`, so without this the call's tokens never
+            # reach total_generated and the horizon undercounts real spend.
+            commit(
+                st,
+                turn_idx,
+                "assistant",
+                _render_calls(result["tool_calls"]),
+                result["entropy"],
+                result["confidence"],
+                result["rep"],
+                result["ntok"],
+                True,
+                time.time(),
+                "tool_call",
+                tool_calls=result["tool_calls"],
+            )
             commit(
                 st,
                 turn_idx,

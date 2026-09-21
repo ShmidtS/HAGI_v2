@@ -75,6 +75,49 @@ def test_active_messages_normalizes_roles():
     assert not (len(roles) >= 2 and roles[-1] == "assistant" and roles[-2] == "assistant")
 
 
+def test_active_messages_drops_rejected_and_empty_assistant():
+    """The model must not see its own discarded output as valid history.
+
+    Rejected turns are failures; replaying them teaches the next attempt to
+    reproduce the failure. Absence of ``accepted`` is *not* a rejection.
+    """
+    st = daemon.DaemonState()
+    st.transcript.append({"idx": 1, "role": "assistant", "content": "good",
+                          "accepted": True})
+    st.transcript.append({"idx": 2, "role": "assistant", "content": "bad",
+                          "accepted": False})
+    st.transcript.append({"idx": 3, "role": "assistant", "content": "   "})
+    st.transcript.append({"idx": 4, "role": "assistant", "content": "no-key-kept"})
+    msgs = daemon.active_messages(st)
+    bodies = [m["content"] for m in msgs]
+    assert "good" in bodies
+    assert "no-key-kept" in bodies
+    assert "bad" not in bodies, "rejected turn leaked into LLM context"
+    assert "" not in [b.strip() for b in bodies if b], "empty turn leaked"
+
+
+def test_commit_persists_tool_calls():
+    """Without the call, history is a tool result the model never asked for."""
+    daemon.STATE_DIR = "/tmp"
+    daemon.STATE_FILE = "/tmp/_nocap_state.json"
+    daemon.LOG_FILE = "/tmp/_nocap.log"
+    st = daemon.DaemonState()
+    calls = [{"id": "c1", "type": "function", "function":
+              {"name": "system_probe", "arguments": '{"binary":"date"}'}}]
+    daemon.commit(st, 1, "assistant", "[called]", 0.1, 0.9, 0.0, 118, True,
+                  1.0, "tool_call", tool_calls=calls)
+    assert st.transcript[-1]["tool_calls"] == calls
+    assert st.total_generated == 118, "tool-call tokens must count"
+
+
+def test_render_calls_marks_the_decision():
+    calls = [{"type": "function", "function":
+              {"name": "system_probe", "arguments": {"binary": "ls"}}}]
+    out = daemon._render_calls(calls)
+    assert "system_probe" in out and "binary" in out
+    assert daemon._render_calls([]) == ""
+
+
 def test_state_save_resume_roundtrip(tmp_path):
     sf = tmp_path / "state.json"
     daemon.STATE_DIR = str(tmp_path)
@@ -448,8 +491,12 @@ def test_consecutive_errors_reset_after_tool_followup(tmp_path, monkeypatch):
     # With MAX_CONSECUTIVE_ERRORS=3 and two error paths (main then followup
     # then a second failure), the daemon must NOT halt prematurely — the
     # success after the followup must have reset consecutive_errors to 0.
-    # Force a tight horizon so it halts on tokens, not errors.
-    monkeypatch.setattr(daemon, "HORIZON_TOKENS", 1)
+    # Tight horizon so the halt is on tokens, not errors. 7, not 1: the
+    # tool-call turn's 5 tokens now count against the horizon (they used to
+    # vanish because the follow-up overwrote `result` before any commit), so a
+    # budget of 1 would exit before the post-error success that resets
+    # consecutive_errors -- which is the thing this test is about.
+    monkeypatch.setattr(daemon, "HORIZON_TOKENS", 7)
     rc = daemon.main()
     assert rc == 0, f"expected graceful halt (rc=0), got rc={rc}"
     with open(daemon.STATE_FILE, encoding="utf-8") as f:
