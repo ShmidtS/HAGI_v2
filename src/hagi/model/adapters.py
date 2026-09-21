@@ -54,14 +54,40 @@ def _qr_orthonormal(
     For the adapter contract ``rows >= cols``. The rows-orthonormal branch is
     retained as a defensive fallback for direct helper use, but adapter
     construction rejects ``rank > hidden_size`` before reaching it.
+
+    The draw and the factorisation are pinned to CPU fp32 and the result is
+    moved to the ambient device afterwards. Two reasons, both measured:
+
+    * a CPU ``torch.Generator`` cannot feed a cuda ``torch.randn`` (it raises
+      "Expected a 'cuda' device type for generator but found 'cpu'"), and
+      callers pass one in for reproducibility;
+    * ``torch.linalg.qr`` is not implemented for bf16 on CPU ("geqrf_cpu not
+      implemented for 'BFloat16'"), so the ambient dtype has to be overridden
+      for the factorisation, not just the device.
+
+    The tensor is [rows, cols] -- 40K elements at real dimensions -- so the
+    round trip costs nothing, while it is what lets a 27B model be constructed
+    *directly on the GPU*. That is not a convenience: this host has 31.6 GiB of
+    RAM, and building 22.4B params on the host needs 83.5 GiB fp32 (41.8 bf16),
+    which pages into a crash. Precision is not lost: ``lora_A`` is a buffer,
+    so the production ``cast_model`` already narrows it to bf16 anyway.
     """
     if rows <= 0 or cols <= 0:
         raise ValueError(f"QR dimensions must be positive, got {rows}x{cols}")
-    if rows >= cols:
-        q, _ = torch.linalg.qr(torch.randn(rows, cols, generator=generator))
-        return q
-    q, _ = torch.linalg.qr(torch.randn(rows, cols, generator=generator).T)
-    return q.T
+    # Capture the ambient target BEFORE pinning to cpu: inside that context the
+    # ambient device is cpu again, so reading it after would silently leave the
+    # basis on the host (measured: "cuda ctx: cpu").
+    device = torch.get_default_device()
+    dtype = torch.get_default_dtype()
+    with torch.device("cpu"):
+        if rows >= cols:
+            q, _ = torch.linalg.qr(
+                torch.randn(rows, cols, generator=generator, dtype=torch.float32))
+        else:
+            q, _ = torch.linalg.qr(
+                torch.randn(rows, cols, generator=generator, dtype=torch.float32).T)
+            q = q.T
+    return q.to(device=device, dtype=dtype)
 
 
 class PyramidAdapter(nn.Module):

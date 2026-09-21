@@ -36,6 +36,7 @@ from hagi.train.ttt import TttRls
 REAL = dict(hidden=5120, vocab=248320, inter=17408, q_heads=20,
             kv_heads=4, head_dim=256, rank=8)
 N_NEW = 16
+LOOP_DEPTH = 2   # overridden by --loop-depth; the real 27B ships 1
 ITERS = 6
 
 
@@ -54,7 +55,7 @@ def cfg_for(layers: int) -> Config:
     m.adapters.pyramid.enabled = False
     m.adapters.ttt_lora.enabled = True
     m.adapters.ttt_lora.rank = REAL["rank"]
-    c.model.loop_depth = 2         # matches the tiny-model baseline harness;
+    c.model.loop_depth = LOOP_DEPTH  # matches the tiny-model baseline harness;
                                    # self_improve's gradient contour needs >1
                                    # (repeated adapter input); params stay at
                                    # num_layers while effective depth doubles
@@ -70,11 +71,47 @@ def cfg_for(layers: int) -> Config:
     return c
 
 
+def _build_on_gpu(cfg: Config) -> HAGI:
+    """Construct the model directly on the gpu in bf16, and refuse to oversubscribe.
+
+    Not an optimization -- on this host it is the only order that works. RAM is
+    31.6 GiB, and the previous ``HAGI(cfg).to("cuda", bf16)`` held the whole
+    fp32 build on the host first: 44.1 GiB at 32 layers, 83.5 GiB at 64, either
+    of which pages into a crash before the gpu sees a weight. The 64-layer run
+    that killed a machine did exactly this.
+
+    Building under a ``cuda`` + bf16 ambient needs ``_qr_orthonormal`` to be
+    device-aware (it pins its draw to cpu fp32 and moves the basis after),
+    which is why ``adapters.py`` reads the ambient device before pinning.
+    """
+    free, _ = torch.cuda.mem_get_info()
+    gib = 2**30
+    # Params dominate; estimate from the config instead of building twice.
+    h = cfg.model.hidden_size
+    per_layer = (
+        4 * h * h                                  # q/k/v/o at these dims
+        + 3 * cfg.model.ffn.intermediate_size * h  # gate/up/down
+    )
+    proj = (per_layer * cfg.model.num_layers + 2 * cfg.model.vocab_size * h) * 2 / gib
+    if proj > free * 0.75:
+        raise SystemExit(
+            f"refusing to build: projected bf16 footprint {proj:.1f} GiB exceeds "
+            f"75% of {free / gib:.1f} GiB free gpu memory"
+        )
+    prev = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("cuda"):
+            return HAGI(cfg)
+    finally:
+        torch.set_default_dtype(prev)
+
+
 def run(mode: str, layers: int, seed: int) -> dict:
     cfg = cfg_for(layers)
     torch.manual_seed(seed)
     t_build = time.perf_counter()
-    model = HAGI(cfg).to(device="cuda", dtype=torch.bfloat16)
+    model = _build_on_gpu(cfg)
     build = time.perf_counter() - t_build
     calls = {"n": 0}
 
@@ -108,7 +145,15 @@ def main() -> int:
     ap.add_argument("--modes", nargs="+", default=["gradient", "rls"],
                     help="subset of contours; rls-only isolates the layer-count "
                          "limit from the contour comparison")
+    ap.add_argument("--loop-depth", type=int, default=2,
+                    help="model.loop_depth. The harness baseline is 2; the real "
+                         "27B ships 1 (64 distinct layers, no weight-tied "
+                         "repeats). Full depth only fits at 1: at 2 the harvest "
+                         "graph covers 128 block passes and OOMs at ~136 GiB "
+                         "against the 86.2 GiB measured at 1.")
     args = ap.parse_args()
+    global LOOP_DEPTH
+    LOOP_DEPTH = args.loop_depth
     print(f"device free: {torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB")
     print(f"real dims: {REAL}\n")
     for layers in args.layers:
