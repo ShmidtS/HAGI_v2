@@ -75,6 +75,28 @@ class TestChunkedCrossEntropy:
         assert float((head.projection.weight.grad - w2.grad).abs().max()) < 1e-12
         assert float((head.logit_scale.grad - s2.grad).abs()) < 1e-12
 
+    def test_frozen_projection_skips_weight_gradient(self):
+        """``freeze_base`` must not pay for a ``[V, H]`` accumulator it never
+        reads -- but ``grad_hidden`` still has to be *exact*, since that is the
+        only gradient the adapter-only contours consume.
+        """
+        head = make_head(chunk=7).double()
+        head.projection.weight.requires_grad_(False)
+        h = torch.randn(23, 16, dtype=torch.float64, requires_grad=True)
+        t = torch.randint(0, 64, (23,))
+        ce, z = head.loss(h, t)
+        (ce + 1e-3 * z).backward()
+
+        h2 = h.detach().clone().requires_grad_(True)
+        w2 = head.projection.weight.detach().clone()
+        s2 = head.logit_scale.detach().clone().requires_grad_(True)
+        ce2, z2 = dense_reference(h2, w2, t, s2, None)
+        (ce2 + 1e-3 * z2).backward()
+
+        assert float((h.grad - h2.grad).abs().max()) < 1e-12
+        assert head.projection.weight.grad is None
+        assert head.logit_scale.grad is not None
+
     def test_gradient_reaches_the_gain(self):
         head = make_head()
         h = torch.randn(8, 16, requires_grad=True)
