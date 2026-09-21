@@ -206,19 +206,27 @@ Joint:   короткое обучение, учит блоки взаимоде
 | `scripts/count_unigram.py` | подсчёт unigram-частот |
 | `scripts/preprocess_gemma.py` | raw .jsonl -> .bin |
 | `scripts/rebuild_compact2.py` | пересборка .compact2.bin |
-| `scripts/bench_train_step.py` | wall-time бенчмарк шага |
-| `scripts/bench_sampled_head.py` | A/B бенчмарк receiver |
-| `scripts/breakdown.py` | разбивка времени шага по фазам |
-| `scripts/prof_step.py` | профилирование шага |
-| `scripts/smoke_real.py` | smoke-тест реального пайплайна |
+
+> Одноразовые bench/profile/smoke скрипты (`bench_train_step.py`,
+> `bench_sampled_head.py`, `breakdown.py`, `prof_step.py`, `smoke_real.py`)
+> были удалены в `0b5ef7f` как one-off: их выводы зафиксированы в
+> BENCHMARKS.md, воспроизводить их нечем и незачем.
 
 ### 4.2 Конфиги
 
-- `configs/level0_merged.yaml` — level-0 merged (H=2304, 18 экспертов).
+- `configs/level0_merged_3.yaml` — level-0 merged.
+- `configs/level0_ab/*.yaml` — A/B срезы (ru_baseline, ru_sink).
+- `configs/level0_experts/expert_*.yaml` — level-0 эксперты по доменам.
 - `configs/level1/expert_*.yaml` — 4 level-1 эксперта (ru/en/math/instruct).
-- `configs/level1_merged.yaml` — merged H=9216 (Hadamard `[2,2]`).
+
+> `configs/level0_merged.yaml` (H=2304, 18 экспертов) и
+> `configs/level1_merged.yaml` (H=9216) удалены в `8e32498` вместе с мёртвыми
+> конфигами v41–v45; merged-архитектура описана в разделе 3, а не файлом.
 
 ### 4.3 Чекпоинты
+
+Каталоги чекпоинтов — выход тренировок, в git не входят (`checkpoints*/` в
+`.gitignore`) и на диске отсутствуют, пока не запущена тренировка:
 
 - `checkpoints_corpus/` — level-0 эксперты (по корпусам/срезам).
 - `checkpoints_level0_merged/` — level-0 merged.

@@ -1,10 +1,19 @@
 # Compression plan: attention + top layer (lm_head / embed / MTP)
 
+> **STATUS (2026-09-21): low-rank premise superseded; kept as a record.**
+> The POD spectrum below was measured on N=3000 tokens and was an overfit
+> artifact. On a 259 072-token sample the activations are near full-rank
+> (K=512 keeps ~59% in-sample, ~41% out-of-sample), so low-rank POD of
+> activations **and** of the KV-cache was rejected and its scripts deleted in
+> `d3c7c6e` ("drop rejected POD paths, adopt int8 KV-cache"). Current ground
+> truth: `README.md` § "The actual VRAM lever: int8 quantization". The text
+> below is the history of *why*, not an actionable TODO.
+
 The FFN experts are already reduced with the **channel-per-expert** method
-(POD input + ternary SwiGLU core + learnable int4 Q; covered experts ≤0.01%
-on real routed activations, uncovered 13% ~0.5–1.8% on a router-weight proxy).
-This plan covers the parts we have **not** touched yet: the attention
-projections, the output head, the embedding, and the MTP layers.
+(full-rank terni4 refit + learnable int4 Q; ~9% RMS per-expert error on the
+honest out-of-sample metric). This plan covers the parts we have **not**
+touched yet: the attention projections, the output head, the embedding, and
+the MTP layers.
 
 ## Core idea (in plain words)
 
@@ -29,11 +38,16 @@ their nearest router-weight neighbours.
 
 Total ≈ **22 GB** of untouched weights.
 
-## Core insight (already proven on the FFN)
+## Core insight (REJECTED — kept as the record of the mistake)
 
-The hidden states live in a ~302-dim subspace (top-512 explains 99.93% of
-variance). **Every** linear map that touches the hidden state therefore only
-needs to act on that subspace:
+The claim below did not survive a larger sample: hidden states do **not** live
+in a ~302-dim subspace. Top-512 explains ~59% in-sample / ~41% out-of-sample
+on 259 072 tokens (`README.md` § "honest spectrum"). Low-rank POD of
+activations was dropped and the refit moved to full rank (K=4096).
+
+Historical claim, for the record: the hidden states live in a ~302-dim subspace
+(top-512 explains 99.93% of variance), so **every** linear map that touches the
+hidden state only needs to act on that subspace:
 
 - W [out, 4096]  →  W_core [out, r] @ P [r, 4096]        (r ≈ 512)
 - W [4096, out]  →  Pᵀ [4096, r] @ W_core [r, out]
@@ -105,12 +119,18 @@ int8 Q output 4096→384) on `mtp.{i}.ffn.experts.{k}` instead of
 - Generation smoke test: `dsv4_generate_reduced.py` still decodes coherent
   text after each component is swapped in.
 
-## Goal update — increase context, not shrink size
+## Goal update — increase context, not shrink size  (REJECTED)
 
-Decision: on the reduced model, spend the KV-POD win on **context**, not on
-parameter count.
+Decision at the time: on the reduced model, spend the KV-POD win on **context**,
+not on parameter count.
 
-**VERIFIED (full 43-layer reduced model, 3000 tokens/layer):**
+Rejected later for the same reason as the activation POD: measured KV spectra
+are near full-rank, so the low-rank assumption was wrong from the start, and
+low-rank KV loses more than int8 at an equal ~2x saving (`d3c7c6e`). The int8
+KV-cache replaced it; the three scripts below were deleted with it. Numbers
+kept so the next reader does not re-measure the same dead end:
+
+**(measured then, on 3000 tokens/layer — the sample size that misled):**
 
 - KV subspace (512-dim, K==V MQA): top-256 = **98.9–100%** across all 43
   layers (L0=100.0%, min L40=98.918%, mean ~99.4%). top-384 ≥ 99.77%.
@@ -120,7 +140,8 @@ parameter count.
   ~1.66× total, the sliding KV is the 80% win).
 - Bases: `checkpoints_dsv4/pod_reduced/P_kv_L*.pt` (43 bases, rank 256).
 
-**Integration (DONE + verified end-to-end):**
+**Integration (implemented, verified end-to-end at the time, then rejected and
+deleted in `d3c7c6e`):**
 
 1. `scripts/dsv4_collect_kv_reduced.py` — KV/x_L hooks on the reduced model
    (43 layers, 3000 tokens).
