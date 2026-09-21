@@ -161,7 +161,12 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         scale_z = float(grad_z) / max(n, 1) if ctx.z_loss_weight > 0 else 0.0
 
         grad_hidden = torch.zeros_like(hidden)
-        grad_weight = torch.zeros_like(weight)
+        # Same guard the bias path already uses: under freeze_base the head
+        # weight does not require grad, so materialising a [V, H] accumulator
+        # and running the ``h^T @ g`` GEMM into it is pure waste -- 2.37 GiB and
+        # one large matmul per step at real 27B dims (V=248320, H=5120). Autograd
+        # accepts None for an input that does not require grad.
+        grad_weight = torch.zeros_like(weight) if weight.requires_grad else None
         grad_bias = torch.zeros_like(bias) if bias is not None and bias.requires_grad else None
 
         saved = ctx.saved_logits
@@ -209,7 +214,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             # ROCm (measured 258ms vs 498ms at [30720,32768]@[32768,1152]).
             # The reduction axis (N) is identical; the tile layout of the first
             # operand differs, and this part's GEMM favors the [H, N] shape.
-            grad_weight += (h_chunk.t() @ g).t()
+            if grad_weight is not None:
+                grad_weight += (h_chunk.t() @ g).t()
             if grad_bias is not None:
                 grad_bias += g.sum(dim=0)
 
