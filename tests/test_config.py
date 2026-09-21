@@ -148,8 +148,9 @@ class TestValidation:
 
     def test_v42_config_loads(self):
         """V42 config (W=0, T=512, ce_keep=0.5) loads and validates."""
-        from hagi.config import load_config
         import pathlib
+
+        from hagi.config import load_config
         path = pathlib.Path(__file__).parent.parent / "configs" / "v42_1b.yaml"
         if path.exists():
             cfg = load_config(str(path))
