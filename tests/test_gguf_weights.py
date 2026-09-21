@@ -204,3 +204,91 @@ def test_gpu_footprint_is_reported_in_gib():
     assert math.isclose(G.gpu_footprint_gib(infos), 1000 * 1000 * 2 / 2**30)
     whole = G.gpu_footprint_gib(G.tensor_names())
     assert 45.0 < whole < 60.0, whole   # 50.9 GiB bf16 for the real 27B
+
+
+# --- GGUF -> HF name mapping ------------------------------------------------
+
+def _hf_param_names():
+    """The real Qwen3_5 text stack, built on meta so it allocates nothing."""
+    import json
+    import torch
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    raw = json.loads(
+        Path(r"C:\HAGI_v2\models\ternary-bonsai-2-27b-mtp\donor\config.json")
+        .read_text(encoding="utf-8"))
+    cfg = Qwen3_5Config(**dict(raw["text_config"]))
+    with torch.device("meta"):
+        m = Qwen3_5ForCausalLM(cfg)
+    return {n: tuple(int(x) for x in p.shape) for n, p in m.named_parameters()}, cfg
+
+
+def test_mapping_fills_every_hf_parameter_and_nothing_is_lost():
+    """Complete, exact coverage -- the load path is not silently partial.
+
+    Measured over the shipped GGUF: 866 tensors, 851 mapped to HF parameters,
+    15 belonging to blk.64 (the MTP draft head, which the HF text stack does not
+    carry). Zero unmapped names outside blk.64 and zero HF parameters left
+    unfilled. A loader that filled 850 of 851 would produce a model that runs and
+    is quietly wrong, which no downstream loss check would localise.
+    """
+    hf, cfg = _hf_param_names()
+    gg = G.tensor_names()
+    assert len(gg) == 866
+    assert len(hf) == 851
+    assert cfg.num_hidden_layers == 64 and len(cfg.layer_types) == 64
+
+    filled, unmapped = {}, []
+    for name, shape, _dt in gg:
+        h = G.gguf_to_hf_name(name)
+        if h is None:
+            assert name.startswith("blk.64."), name      # only the MTP block
+            continue
+        if h not in hf:
+            unmapped.append((name, h))
+            continue
+        filled[h] = (name, shape)
+    assert not unmapped, unmapped[:5]
+    missing = sorted(set(hf) - set(filled))
+    assert not missing, missing[:5]
+
+
+def test_mapping_shape_rule_is_only_conv1d():
+    """(C, K) in GGUF is (C, 1, K) in HF, and that is the only form rewrite."""
+    hf, _ = _hf_param_names()
+    for name, shape, _dt in G.tensor_names():
+        h = G.gguf_to_hf_name(name)
+        if h is None or h not in hf:
+            continue
+        want = hf[h]
+        got = G.reshape_for_hf(name, np.zeros(shape, dtype=np.float32)).shape
+        assert tuple(got) == want, (name, h, shape, want)
+
+
+def test_linear_and_full_attention_layers_stay_in_their_own_family():
+    """The hybrid topology survives the mapping: 48 linear, 16 full, no crossover.
+
+    The table is name-based rather than type-aware, so a classic name on a linear
+    layer still resolves to a string -- but to a string that is absent from the
+    HF module, because a linear layer carries no ``self_attn``. That is what
+    makes a crossover impossible: the coverage test rejects any mapping whose
+    target does not exist, so a mixed-up layer cannot load into a hole.
+    """
+    hf, cfg = _hf_param_names()
+    lin = [i for i, t in enumerate(cfg.layer_types) if t == "linear_attention"]
+    full = [i for i, t in enumerate(cfg.layer_types) if t == "full_attention"]
+    assert (len(lin), len(full)) == (48, 16)
+    assert G.gguf_to_hf_name(f"blk.{lin[0]}.attn_qkv.weight") ==         f"model.layers.{lin[0]}.linear_attn.in_proj_qkv.weight"
+    assert G.gguf_to_hf_name(f"blk.{full[0]}.attn_q.weight") ==         f"model.layers.{full[0]}.self_attn.q_proj.weight"
+    # cross-family spellings must not land on a parameter that exists
+    assert G.gguf_to_hf_name(f"blk.{lin[0]}.attn_q.weight") not in hf
+    assert G.gguf_to_hf_name(f"blk.{full[0]}.ssm_a") not in hf
+    assert G.gguf_to_hf_name("blk.64.nextn.eh_proj.weight") is None
+
+
+def test_mtp_block_names_are_refused_not_silently_dropped():
+    """blk.64 has no HF counterpart; returning None must be explicit."""
+    for name in ("blk.64.attn_q.weight", "blk.64.nextn.eh_proj.weight",
+                 "blk.64.ffn_gate.weight"):
+        assert G.gguf_to_hf_name(name) is None, name

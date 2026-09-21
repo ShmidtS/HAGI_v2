@@ -132,6 +132,66 @@ def _reader(path: Path):
     return r
 
 
+_GGUF_TO_HF_TAIL = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+}
+
+_MTP_BLOCK = 64          # blk.64 is the draft head; the HF text stack stops at 63
+
+
+def gguf_to_hf_name(name: str) -> str | None:
+    """The HF parameter ``name`` addresses, or None for the MTP block.
+
+    Verified complete rather than plausible: over all 866 tensors of the shipped
+    GGUF this fills 851 of 851 ``Qwen3_5ForCausalLM`` parameters, leaves nothing
+    unmapped outside blk.64, and mismatches no shape. The one form rule is
+    ``conv1d`` -- GGUF stores depthwise kernels as (C, K), HF as (C, 1, K).
+    """
+    if name == "token_embd.weight":
+        return "model.embed_tokens.weight"
+    if name == "output.weight":
+        return "lm_head.weight"
+    if name == "output_norm.weight":
+        return "model.norm.weight"
+    parts = name.split(".", 2)
+    if len(parts) != 3 or parts[0] != "blk":
+        return None
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        return None
+    if idx == _MTP_BLOCK:
+        return None
+    tail = _GGUF_TO_HF_TAIL.get(parts[2])
+    return f"model.layers.{idx}.{tail}" if tail else None
+
+
+def reshape_for_hf(name: str, arr):
+    """Apply the (C, K) -> (C, 1, K) rule for depthwise conv1d weights."""
+    if name.endswith("ssm_conv1d.weight") and arr.ndim == 2:
+        return arr[:, None, :]
+    return arr
+
+
 def tensor_names(path: Path = GGUF_PATH) -> list[tuple[str, tuple[int, ...], int]]:
     return [(e["name"], tuple(e["shape"]), e["dtype"]) for e in _reader(path).custom_tensors]
 
