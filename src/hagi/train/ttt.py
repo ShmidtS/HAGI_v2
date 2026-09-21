@@ -76,6 +76,15 @@ that, ``max_delta_rms_frac`` caps the applied delta's RMS relative to the
 residual stream it is added to, so a pathological gradient cannot let the
 adapter dominate the base.
 
+It is a backstop, not an active limiter at the shipped settings: measured
+``delta_rms_frac`` stays in 3.3e-3 .. 8.2e-3 against the 0.10 cap, because the
+absolute ``prior`` already shrinks the step far below ``stream_frac`` (see
+"Scale of the target"). It binds only when ``stream_frac`` is raised or
+``prior`` lowered -- which is exactly the configuration a caller tuning for a
+bigger step would choose, so the guard is there for that caller rather than for
+the default one. The non-finite case is handled earlier and louder: ``rls_step``
+refuses non-finite rows outright rather than letting a cap scale them down.
+
 Harvest is deliberately separated from fitting (:meth:`TttRls._harvest`
 produces rows, :meth:`TttRls.rls_step` consumes them) because the
 holdout-exclusion property cannot be tested through the model alone:
@@ -199,6 +208,14 @@ class TttRls:
             )
         if rows_max < 1:
             raise ValueError(f"rows_max must be >= 1, got {rows_max!r}")
+        # Both are amounts of anchoring, and zero is not "no regularisation" but
+        # a different estimator: with prior=0 and fewer rows than rank, ``G`` is
+        # singular and the solve throws mid-run. Reject it at construction like
+        # the five hyperparameters above already do.
+        if reg <= 0.0:
+            raise ValueError(f"reg must be > 0, got {reg!r}")
+        if prior <= 0.0:
+            raise ValueError(f"prior must be > 0, got {prior!r}")
 
         self._model = model
         self.stream_frac = float(stream_frac)
@@ -357,6 +374,14 @@ class TttRls:
         """
         if phi.ndim != 2 or y.ndim != 2:
             raise ValueError("phi and y must be 2D")
+        if phi.shape[0] != y.shape[0]:
+            # The reference checks this (qwen_ttt_lora.py:267); without it a
+            # length mismatch surfaces as a broadcast error deep in the solve,
+            # or -- worse for [N,r]@[r,H] shapes that happen to agree -- as a
+            # silently wrong fit.
+            raise ValueError(
+                f"feature/target row count mismatch: {phi.shape[0]} vs {y.shape[0]}"
+            )
         lora = self._lora[i]
         st = self._state[i]
         if phi.shape[1] != lora.r:
