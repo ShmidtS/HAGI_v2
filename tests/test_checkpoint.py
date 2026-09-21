@@ -163,6 +163,22 @@ class TestRotation:
     def test_latest_on_empty_directory(self, tmp_path):
         assert latest_checkpoint(tmp_path) is None
 
+    def test_latest_skips_symlink_and_non_numeric(self, tmp_path):
+        """latest_checkpoint must ignore symlinks and non-numeric step names."""
+        cfg = tiny_config()
+        model = HAGI(cfg)
+        save_checkpoint(model, cfg, 10, tmp_path, keep_last=5)
+        # A symlink that points elsewhere must NOT be treated as the latest.
+        sym = tmp_path / "step-00000099.pt"
+        sym.symlink_to(tmp_path / "step-0000010.pt")
+        # A non-numeric name that glob matches must be skipped.
+        (tmp_path / "step-foo.pt").write_bytes(b"x")
+        latest = latest_checkpoint(tmp_path)
+        assert latest is not None
+        assert latest.name == "step-0000010.pt"
+        assert latest.is_symlink() is False
+        sym.unlink()
+
     @pytest.mark.parametrize("bad", [-1, 1.5, "3"])
     def test_invalid_step_count_rejected(self, tmp_path, bad):
         cfg = tiny_config()
