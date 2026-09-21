@@ -339,12 +339,26 @@ def test_probe_argv_refuses_malformed_calls():
 
 
 def test_probe_argv_enforces_schema_arg_cap():
-    """maxItems is enforced in the executor, not only in the schema."""
+    """maxItems is enforced in the executor, not only in the schema.
+
+    The docstring claimed this while the check lived solely in `_probe_argv`, so
+    a caller reaching `run_probe_argv` directly -- it is exported, and the legacy
+    `run_probe` facade does -- was uncapped. Measured before the fix: 50 paths
+    executed and returned 50 concatenated copies of the file.
+    """
     assert daemon._probe_argv({"binary": "cat",
                                "args": ["a", "b", "c", "d", "e"]}) == []
     assert daemon._probe_argv({"binary": "cat",
                                "args": ["README.md", "LICENSE"]}) == [
         "cat", "README.md", "LICENSE"]
+    over = ["README.md"] * (daemon.PROBE_MAX_ARGS + 1)
+    denial = daemon._validate_probe(["cat", *over])
+    assert denial is not None and "cap" in denial, denial
+    out = daemon.run_probe_argv(["cat", *over])
+    assert out.startswith("DENIED"), out[:80]
+    assert out.count("alpha") == 0, out[:80]
+    exact = ["README.md"] * daemon.PROBE_MAX_ARGS
+    assert daemon._validate_probe(["cat", *exact]) is None
 
 
 def test_probe_grep_pattern_must_be_bound():
@@ -573,6 +587,21 @@ def test_probe_grep_pattern_is_not_a_path():
     assert not out.startswith(("DENIED", "ERROR")), out
     out = daemon.run_probe_argv(["grep", "-e", "^#", "README.md"])
     assert not out.startswith(("DENIED", "ERROR")), out
+
+
+def test_probe_control_characters_refused_in_paths():
+    """C0 bytes are refused before a child is spawned, not by the OS after.
+
+    NUL did reach subprocess and came back as "ERROR: embedded null character"
+    — a safe outcome at the wrong layer. The invariant is that every argv
+    element is explained by a named rule, and a control byte is not a name any
+    filesystem needs.
+    """
+    for ch in (chr(0), chr(27), chr(7), chr(11), chr(0x7f), chr(31)):
+        for argv in (["cat", ch + "README.md"], ["cat", "sub" + ch + "pub.txt"],
+                     ["grep", "-e", "a", "README" + ch]):
+            assert daemon._validate_probe(list(argv)) is not None, argv
+            assert daemon.run_probe_argv(list(argv)).startswith("DENIED"), argv
 
 
 def test_probe_glob_and_tilde_forms_denied():
