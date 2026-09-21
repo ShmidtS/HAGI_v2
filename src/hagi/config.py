@@ -254,6 +254,66 @@ class MultimodalConfig:
 
 
 @dataclass
+class PyramidAdapterConfig:
+    """Configuration for the shared-weight pyramid residual contour.
+
+    Attributes:
+        enabled: gate for the pyramid branch.
+        levels: branch count per pyramid level, e.g. ``(1,)`` or ``(1, 2, 4)``.
+            With ``(1,)`` and a zero-init scale the adapter is a zero delta;
+            with ``scale`` trained to ``1/residual_scale`` and one branch it is
+            approximately the flat mixer residual repeated.
+        residual_scale: fixed multiplier on the pyramid output before the
+            learnable ``scale`` gate. Default 1.0 (the gate carries the init).
+    """
+
+    enabled: bool = False
+    levels: tuple[int, ...] = (1,)
+    residual_scale: float = 1.0
+
+
+@dataclass
+class TttLoraConfig:
+    """Configuration for the low-rank TTT-LoRA residual contour.
+
+    Attributes:
+        enabled: gate for the LoRA branch.
+        rank: LoRA bottleneck ``r``.
+        alpha: scaling numerator (``delta = alpha/r * (x @ A) @ B.T``).
+        dropout: input dropout (0 disables).
+    """
+
+    enabled: bool = False
+    rank: int = 8
+    alpha: float = 1.0
+    dropout: float = 0.0
+
+
+@dataclass
+class AdaptersConfig:
+    """Opt-in residual adapters attached after each :class:`Block`.
+
+    The default is deliberately empty: HAGI's original forward, parameter
+    set, checkpoint schema, and generation contract remain unchanged until
+    ``enabled`` is set. When enabled, exactly one of ``pyramid`` or
+    ``ttt_lora`` selects the residual contour. The selected contour starts at
+    zero delta and leaves the base attention/mixer weights untouched.
+
+    Attachment point (see :mod:`hagi.model.adapters`): the adapter delta is
+    added **after** the Block's ``x + attn(x)`` and ``x + mixer(x)``. The
+    adapter receives the residual stream that the base mixer sees — the
+    post-attention residual — so the pyramid branches run on the same input as
+    the frozen mixer. The adapter adds a zero-initialized delta to the
+    post-mixer residual stream. The default path (``enabled=False``) holds
+    no adapter at all, so the original forward is reproduced bit-for-bit.
+    """
+
+    enabled: bool = False
+    pyramid: PyramidAdapterConfig = field(default_factory=PyramidAdapterConfig)
+    ttt_lora: TttLoraConfig = field(default_factory=TttLoraConfig)
+
+
+@dataclass
 class ModelConfig:
     """Full architecture."""
 
@@ -290,6 +350,7 @@ class ModelConfig:
     ternary: TernaryConfig = field(default_factory=TernaryConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    adapters: AdaptersConfig = field(default_factory=AdaptersConfig)
 
 
 @dataclass
@@ -439,6 +500,20 @@ class LoggingConfig:
 
 
 @dataclass
+class AdaptConfig:
+    """Online training policy for the opt-in residual adapters.
+
+    Attributes:
+        freeze_base: when True, freeze every non-adapter parameter and train
+            only pyramid ``scale`` and TTT-LoRA ``lora_B`` through the existing
+            CE objective and AdamW partition. This setting is inert while
+            ``model.adapters.enabled`` is False.
+    """
+
+    freeze_base: bool = False
+
+
+@dataclass
 class TrainConfig:
     """Training hyperparameters.
 
@@ -504,6 +579,14 @@ class TrainConfig:
     # prior) and specializes on its own domain. Empty string = disabled.
     init_from: str = ""
     tokenizer: str = "google/gemma-4-E2B-it"
+
+    # Online TTT (Test-Time Training) on the opt-in residual adapters. When the
+    # adapters are enabled and ``adapt.freeze_base`` is True, every non-adapter
+    # parameter is frozen and only the adapter parameters (pyramid ``scale`` and
+    # LoRA ``lora_B``) receive gradients and optimizer updates — standard CE
+    # backward through the existing AdamW routing. The base model, tokenizer
+    # and frozen artifacts remain byte-for-byte unchanged.
+    adapt: AdaptConfig = field(default_factory=AdaptConfig)
 
 
 @dataclass
@@ -683,12 +766,27 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
     norms = n * 2 * h + h
     branch_scales = 2 * n
     body = n * per_attn + n * per_dense_ffn + norms + conv + branch_scales + 1
+
+    # Opt-in residual adapters (per-block, additive deltas). When disabled
+    # (the default) there are zero adapter parameters — the analytic count
+    # matches the real module tree exactly. When enabled the per-block params
+    # are added here so count_params stays a true total (not a base-only count).
+    ad = cfg.adapters
+    adapter = 0
+    if ad.enabled:
+        if ad.pyramid.enabled:
+            # One scalar `scale` per block.
+            adapter += n * 1
+        if ad.ttt_lora.enabled:
+            # Frozen A (not a parameter, persistent=False) + trainable B[r, H].
+            adapter += n * ad.ttt_lora.rank * h
     return {
         "embedding": embed,
         "lm_head": head,
         "body": body,
-        "total": embed + head + body,
-        "active_body": body,
+        "adapter": adapter,
+        "total": embed + head + body + adapter,
+        "active_body": body + adapter,
     }
 
 
@@ -967,6 +1065,67 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("inference.temperature and top_k must be non-negative")
     if not 0.0 < cfg.inference.top_p <= 1.0:
         raise ValueError("inference.top_p must be in (0, 1]")
+
+    # Adapter master switch is opt-in and off by default. A disabled adapter
+    # is not created at all (no per-block modules, no extra parameters), so the
+    # default path is byte-for-byte the original forward. Pyramid and
+    # TTT-LoRA are mutually exclusive residual contours: the default-path
+    # invariant (zero delta) is preserved by construction: pyramid scale
+    # starts at 0 and TTT-LoRA lora_B starts at 0 when their contour is enabled.
+    ad = m.adapters
+    ta = t.adapt
+    if ta.freeze_base and not ad.enabled:
+        raise ValueError(
+            "train.adapt.freeze_base requires model.adapters.enabled=True "
+            "(freeze_base freezes everything except adapter parameters; with "
+            "adapters disabled there is nothing to optimize)"
+        )
+    if ad.enabled:
+        # At least one contour must be enabled when the master switch is on;
+        # otherwise the Block holds an adapter that always emits a zero delta,
+        # which is a silent no-op masquerading as "configured".
+        if not ad.pyramid.enabled and not ad.ttt_lora.enabled:
+            raise ValueError(
+                "model.adapters.enabled is True but no contour is enabled: "
+                "enable model.adapters.pyramid.enabled or "
+                "model.adapters.ttt_lora.enabled"
+            )
+        # Pyramid levels: positive integers, bounded for plausibility.
+        for level in ad.pyramid.levels:
+            if type(level) is not int or level < 1:
+                raise ValueError(
+                    f"adapters.pyramid.levels entries must be positive integers, got {level!r}"
+                )
+        if not 0.0 <= ad.pyramid.residual_scale <= 1.0:
+            raise ValueError("adapters.pyramid.residual_scale must be in [0, 1]")
+        # LoRA shape/finiteness.
+        if ad.ttt_lora.rank < 1:
+            raise ValueError("adapters.ttt_lora.rank must be >= 1")
+        if ad.ttt_lora.alpha <= 0:
+            raise ValueError("adapters.ttt_lora.alpha must be > 0")
+        if not 0.0 <= ad.ttt_lora.dropout < 1.0:
+            raise ValueError("adapters.ttt_lora.dropout must be in [0, 1)")
+        # Rank cannot exceed the hidden width or the frozen QR basis is rank
+        # deficient and the orthonormal A[T] has no real basis left to span.
+        if ad.ttt_lora.enabled and ad.ttt_lora.rank > m.hidden_size:
+            raise ValueError(
+                f"adapters.ttt_lora.rank ({ad.ttt_lora.rank}) must be <= "
+                f"model.hidden_size ({m.hidden_size})"
+            )
+        # Pyramid and TTT-LoRA are independent residual contours but the
+        # current product decision keeps them mutually exclusive: simultaneous
+        # pyramid+TTT is rejected here until a separate decision is made.
+        if ad.pyramid.enabled and ad.ttt_lora.enabled:
+            raise ValueError(
+                "pyramid and ttt_lora adapters are currently mutually exclusive: "
+                "enable only one of model.adapters.pyramid.enabled or "
+                "model.adapters.ttt_lora.enabled"
+            )
+    else:
+        if ad.pyramid.enabled or ad.ttt_lora.enabled:
+            raise ValueError(
+                "model.adapters.enabled must be True to enable pyramid/ttt_lora"
+            )
 
     mg = cfg.merge
     if mg.enabled:

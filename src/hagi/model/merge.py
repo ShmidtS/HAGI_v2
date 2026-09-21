@@ -484,6 +484,16 @@ class MergedHAGI(HAGI):
             block.mixer.norm = BlockRMSNorm(n, self.expert_hidden, m.norm_eps)
         self.out_norm = BlockRMSNorm(n, self.expert_hidden, m.norm_eps)
 
+        # Re-attach opt-in adapters to the final merged blocks. The base HAGI
+        # constructor already ran `_attach_adapters`, but MergedHAGI replaces
+        # `self.blocks` (and swaps each block's mixer.norm) after that call, so
+        # the adapters built on the pre-merge blocks are stale. Re-run the
+        # attachment on the final blocks so each merged Block keeps its adapter
+        # wired to its (possibly swapped) mixer. For the common
+        # disabled-adapter default this is a cheap no-op (the loop body never
+        # runs).
+        self._attach_adapters(h)
+
         # Cross-block mixers on the residual stream.
         inter = max(64, int(2.0 * h))
         residual_scale = (2.0 * m.num_layers * max(1, int(m.loop_depth))) ** -0.5

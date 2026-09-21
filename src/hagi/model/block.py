@@ -33,6 +33,10 @@ class Block(nn.Module):
             rope=rope,
         )
         self.mixer = mixer
+        # Opt-in residual adapters (pyramid / TTT-LoRA). Only set by HAGI when
+        # cfg.model.adapters.enabled is True; stays None otherwise so the
+        # default forward is reproduced bit-for-bit.
+        self.adapters: nn.Module | None = None
 
     def forward(
         self,
@@ -40,5 +44,13 @@ class Block(nn.Module):
         positions: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Capture the exact residual stream that the base mixer receives.
+        # The base attention and mixer keep their original ordering; adapters
+        # run only after both updates and receive the same mixer input.
         x = x + self.attn(x, positions, mask)
-        return x + self.mixer(x)
+        mixer_input = x
+        x = x + self.mixer(x)
+        adapter = self.adapters
+        if adapter is not None:
+            x = x + adapter(mixer_input, x)
+        return x

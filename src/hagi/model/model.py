@@ -111,6 +111,11 @@ class HAGI(nn.Module):
                 )
             )
 
+        # Opt-in residual adapters. Only built when the master switch is on;
+        # otherwise blocks.adapters stays None and the original forward is
+        # reproduced bit-for-bit (no extra parameters, no extra computation).
+        self._attach_adapters(h)
+
 
         self.out_norm = RMSNorm(h, eps=m.norm_eps)
         self.head = LMHead(
@@ -133,6 +138,25 @@ class HAGI(nn.Module):
     def param_summary(self) -> dict[str, int]:
         """Analytic parameter counts by group (see :func:`~hagi.config.count_params`)."""
         return count_params(self.cfg.model)
+
+    def _attach_adapters(self, hidden_size: int) -> None:
+        """Attach an opt-in residual adapter to every block.
+
+        No-op when ``model.adapters.enabled`` is False (the default): the blocks
+        keep ``adapters = None`` and the original forward is unchanged. When
+        enabled, a :class:`~hagi.model.adapters.BlockAdapter` is built per block
+        with the shared frozen mixer and attached to the block's ``adapters``
+        slot so :meth:`Block.forward` adds the delta after the mixer.
+        """
+        from hagi.model.adapters import BlockAdapter
+
+        ad = self.cfg.model.adapters
+        if not ad.enabled:
+            return
+        for block in self.blocks:
+            adapter = BlockAdapter(ad, hidden_size)
+            adapter.attach(block.mixer)
+            block.adapters = adapter
 
     def allocate_cache(self, dtype: torch.dtype, device: torch.device) -> list[KVCache]:
         """Attach a fresh KV-cache to every layer and return the list."""
