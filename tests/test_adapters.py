@@ -218,6 +218,62 @@ class TestTttLoraAdapter:
         assert wide.shape == (4, 16)
         assert torch.allclose(wide @ wide.T, torch.eye(4), atol=1e-5)
 
+    def test_qr_orthonormal_is_deterministic_per_seed(self):
+        """The basis is reproducible from the seed alone.
+
+        The device-aware rewrite reads the ambient device BEFORE pinning the
+        draw to cpu; getting that order wrong was a live bug (the basis silently
+        stayed on the host). This pins the property the rewrite had to preserve.
+        """
+        a = _qr_orthonormal(64, 4, torch.Generator().manual_seed(11))
+        b = _qr_orthonormal(64, 4, torch.Generator().manual_seed(11))
+        assert torch.equal(a, b)
+        assert a.device.type == "cpu" and a.dtype == torch.float32
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
+    def test_adapter_builds_under_cuda_ambient(self):
+        """Construction under a cuda+bf16 ambient must land the basis on device.
+
+        This is what lets a 27B model be built directly on the gpu. On a host
+        with 31.6 GiB of RAM that is a precondition, not an optimization: a
+        host-side build of 22.4B params needs 83.5 GiB fp32 (41.8 bf16) and
+        pages into a crash. Before the fix this raised
+        "Expected a 'cuda' device type for generator but found 'cpu'".
+        """
+        cfg = tiny_config().model.adapters.ttt_lora
+        prev_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("cuda"):
+                adapter = TttLoraAdapter(TINY_HIDDEN, cfg, init_seed=0)
+        finally:
+            torch.set_default_dtype(prev_dtype)
+        assert adapter.lora_A.device.type == "cuda"
+        assert adapter.lora_B.device.type == "cuda"
+        assert adapter.lora_A.dtype == torch.bfloat16
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
+    def test_cuda_ambient_build_matches_cpu_path_numerically(self):
+        """The device-aware build must not change the math, only its placement.
+
+        Compared against the cpu fp32 basis narrowed to bf16 -- which is what
+        the production ``cast_model`` does to this buffer anyway, since
+        ``lora_A`` is a buffer and ``nn.Module.to`` narrows buffers.
+        """
+        cfg = tiny_config().model.adapters.ttt_lora
+        ref = TttLoraAdapter(TINY_HIDDEN, cfg, init_seed=0).lora_A
+        prev_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("cuda"):
+                got = TttLoraAdapter(TINY_HIDDEN, cfg, init_seed=0).lora_A
+        finally:
+            torch.set_default_dtype(prev_dtype)
+        assert torch.equal(got.cpu(), ref.to(torch.bfloat16))
+        r = cfg.rank
+        assert torch.allclose(got.float().cpu().T @ got.float().cpu(),
+                              torch.eye(r), atol=1e-2)
+
 
 class TestBlockAdapterValidation:
     def test_no_contour_when_enabled_raises(self):
