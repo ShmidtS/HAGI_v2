@@ -207,9 +207,6 @@ def _patch():
                 res = (out + acc).to(x.dtype).reshape(B, S, Dd)
                 del output
                 return res
-                res = (out + routed).to(x.dtype).reshape(B, S, Dd)
-                del output
-                return res
 
             return hook
 
