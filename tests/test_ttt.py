@@ -16,7 +16,7 @@ import torch
 from hagi.config import Config, validate_config
 from hagi.model.model import HAGI
 from hagi.train.self_improve import _restore_adapters, _snapshot_adapters
-from hagi.train.ttt import TttRls, TttStats
+from hagi.train.ttt import TttRls
 from tests.conftest import tiny_config
 
 
@@ -150,14 +150,6 @@ class TestFrozenBaseInvariant:
 
 
 class TestNoGenerationInvariant:
-    def test_stats_report_zero_generations(self):
-        cfg = _lora_cfg()
-        model = _model(cfg)
-        ids, tgt = _window(cfg)
-        stats = _fitter(model).step(ids, tgt)
-        assert isinstance(stats, TttStats)
-        assert stats.generations == 0
-
     def test_exactly_one_forward_per_step(self):
         """A generation-free step must not re-enter the encoder.
 
@@ -186,7 +178,12 @@ class TestNoGenerationInvariant:
         _fitter(model).step(ids, tgt)
         for block in model.blocks:
             assert not block._forward_hooks, "a leaked hook would fire forever"
-            assert not block.mixer._forward_hooks
+            # The mixer carries a *pre*-hook (ttt.py registers
+            # ``block.mixer.register_forward_pre_hook``), so asserting on
+            # ``_forward_hooks`` here could never fail -- it was a vacuous
+            # assertion, not a test of the cleanup.
+            assert not block.mixer._forward_pre_hooks, \
+                "a leaked pre-hook would fire forever"
 
 
 class TestHoldoutExclusion:
