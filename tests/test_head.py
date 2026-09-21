@@ -75,10 +75,16 @@ class TestChunkedCrossEntropy:
         assert float((head.projection.weight.grad - w2.grad).abs().max()) < 1e-12
         assert float((head.logit_scale.grad - s2.grad).abs()) < 1e-12
 
-    def test_frozen_projection_skips_weight_gradient(self):
-        """``freeze_base`` must not pay for a ``[V, H]`` accumulator it never
-        reads -- but ``grad_hidden`` still has to be *exact*, since that is the
-        only gradient the adapter-only contours consume.
+    def test_frozen_projection_keeps_grad_hidden_exact(self):
+        """Characterization, not a pin for the allocation guard.
+
+        Autograd *discards* a returned gradient for a ``requires_grad=False``
+        input, so ``weight.grad is None`` holds with the guard reverted too.
+        What this asserts is the part a revert would actually break: freezing
+        the projection leaves ``grad_hidden`` bit-identical to the dense
+        reference, since that is the only gradient the adapter-only contours
+        consume. The allocation itself is pinned by
+        ``test_frozen_projection_skips_the_accumulator_allocation``.
         """
         head = make_head(chunk=7).double()
         head.projection.weight.requires_grad_(False)
@@ -96,6 +102,45 @@ class TestChunkedCrossEntropy:
         assert float((h.grad - h2.grad).abs().max()) < 1e-12
         assert head.projection.weight.grad is None
         assert head.logit_scale.grad is not None
+
+    def test_frozen_projection_skips_the_accumulator_allocation(self, monkeypatch):
+        """Pin the guard at the level it operates on: the allocation.
+
+        Both directions are asserted, so the test cannot pass by the spy never
+        firing. ``[V, H]`` is 2.37 GiB at real dims (V=248320, H=5120) and the
+        GEMM into it runs per CE chunk -- the cost ``freeze_base`` was measured
+        to pay for a value nothing reads.
+        """
+        wshape = tuple(make_head(chunk=7).projection.weight.shape)
+
+        def allocated_during(freeze: bool) -> list:
+            head = make_head(chunk=7).double()
+            head.projection.weight.requires_grad_(not freeze)
+            h = torch.randn(23, 16, dtype=torch.float64, requires_grad=True)
+            t = torch.randint(0, 64, (23,))
+            ce, z = head.loss(h, t)
+            real = torch.zeros_like
+            seen = []
+
+            def _spy(x, *a, **kw):
+                seen.append(tuple(x.shape))
+                return real(x, *a, **kw)
+
+            monkeypatch.setattr(torch, "zeros_like", _spy)
+            try:
+                (ce + 1e-3 * z).backward()
+            finally:
+                monkeypatch.undo()
+            return seen
+
+        frozen = allocated_during(freeze=True)
+        assert wshape not in frozen, (
+            f"frozen projection still allocated {wshape}: {frozen}")
+
+        trained = allocated_during(freeze=False)
+        assert wshape in trained, (
+            f"spy never saw {wshape} for a trainable projection: {trained} "
+            "-- the frozen assertion above would be vacuous")
 
     def test_gradient_reaches_the_gain(self):
         head = make_head()

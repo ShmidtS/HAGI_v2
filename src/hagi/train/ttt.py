@@ -31,10 +31,30 @@ Scale of the target
 -log_probs[:, 0].mean()``), so the raw per-position gradient is ~1/N of the
 individual loss gradient and is tiny relative to the residual stream
 (measured ~5.7e-5 of stream RMS on the tiny config). The target is therefore
-expressed as a fraction of stream RMS (``stream_frac``), which makes the step
-size independent of sequence length and of the CE reduction convention. The
-rescaling scalar is shared by every row of a block, so it reparametrises the
-step size without distorting the relative magnitudes of positions.
+expressed as a fraction of stream RMS (``stream_frac``), which removes the CE
+reduction convention from the scale. It does **not** make the achieved step
+independent of sequence length, and it is a *nominal* target rather than the
+effective one:
+
+* ``prior`` is an absolute pseudo-row count ported from ``TTT_ALPHA``, while
+  the data it competes with is ``phi^T phi`` over the rows in the window. On an
+  RMSNorm'd stream (measured ``rms(mixer_input) = 0.988``) a 52-row window
+  contributes ~52 against a prior of 1000, so the solve is shrunk ~20x.
+  Measured: ``delta_rms_frac`` lands at 1.04e-3 -> 1.87e-3 -> 2.56e-3 over
+  three refits against ``stream_frac = 0.02``, and *rises* as rows accumulate.
+  With ``prior = 1.0`` the same run gives 9.77e-3.
+* Whether a step writes anything at all depends on rows-per-step versus
+  ``refit_rows``. Measured at ``refit_rows = 64``: an 8-token window solves
+  every ~5th step (2/10), a 32-token window every ~3rd (3/10), a >=128-token
+  window every step (10/10). Between refits a step still pays a full
+  forward+backward and writes nothing.
+
+So ``stream_frac`` bounds the intent, not the result. Scaling ``prior`` with
+the window (``prior ~= kappa * refit_rows``) would make the effective step
+match the nominal one across window sizes; that is a behavioural change and is
+not made here. The rescaling scalar is shared by every row of a block, so it
+reparametrises the step size without distorting the relative magnitudes of
+positions.
 
 Frozen base invariant
 ---------------------
@@ -85,8 +105,6 @@ class _BlockRls:
     phi_buf: list[Tensor] = field(default_factory=list)
     y_buf: list[Tensor] = field(default_factory=list)
     buf_rows: int = 0
-    hva: list[Tensor] = field(default_factory=list)
-    yva: list[Tensor] = field(default_factory=list)
     holdout_rows: int = 0
 
 
@@ -94,9 +112,12 @@ class _BlockRls:
 class TttStats:
     """Outcome of one feature→delta adaptation step.
 
-    ``generations`` is always 0 and exists so a caller (or a test) can assert
-    the no-autoregression invariant rather than infer it from the absence of a
-    call.
+    The row counts are the observable proof of the holdout split: rows counted
+    in ``holdout_rows`` never appear in ``train_rows``, so a caller can check
+    that validation data stayed out of the normal equations. The
+    no-autoregression invariant is asserted behaviourally (encoder call count)
+    rather than through a field here -- a field defaulted to zero cannot fail,
+    so it proves nothing.
     """
 
     ce: float
@@ -105,9 +126,7 @@ class TttStats:
     refits: int
     train_rows: int
     holdout_rows: int
-    holdout_resid: float
     delta_rms_frac: float
-    generations: int = 0
 
 
 def _resid(B: Tensor, phi: Tensor, y: Tensor) -> float:
@@ -122,9 +141,11 @@ class TttRls:
     Args:
         model: a :class:`~hagi.model.model.HAGI` whose blocks carry a
             ``ttt_lora`` adapter.
-        stream_frac: target magnitude as a fraction of residual-stream RMS.
-            This is the step size; the low-rank projection then captures the
-            reachable part of it.
+        stream_frac: nominal target magnitude as a fraction of residual-stream
+            RMS. Not the achieved step size -- the absolute ``prior`` shrinks it
+            by ~20x at default ``refit_rows`` on an RMSNorm'd stream, and the
+            low-rank projection captures only the reachable part. See "Scale of
+            the target".
         reg: ridge relative to the mean diagonal of ``G`` (mirrors ``TTT_REG``).
         lam: forgetting factor, applied as ``lam ** n_rows`` per step.
         refit_rows: solve once this many training rows accumulate.
@@ -309,17 +330,6 @@ class TttRls:
             st.y_buf.pop(0)
             st.buf_rows -= dropped.shape[0]
 
-    def _holdout_resid(self, i: int) -> float:
-        """Honest validation residual for block ``i``; NaN if none recorded."""
-        st = self._state[i]
-        if not st.hva:
-            return float("nan")
-        return _resid(
-            self._lora[i].lora_B,
-            torch.cat(st.hva).to(dtype=torch.float32),
-            torch.cat(st.yva).to(dtype=torch.float32),
-        )
-
     @no_grad()
     def rls_step(
         self, i: int, phi: Tensor, y: Tensor, holdout: bool = True
@@ -351,13 +361,28 @@ class TttRls:
         if n == 0:
             return False, 0.0
 
+        # Refuse non-finite rows here rather than at the residual gate. ``G``
+        # and ``C`` are written before the gate runs, so a single
+        # NaN anywhere in the inputs poisons the accumulators for the life of
+        # the fitter: every later refit then proposes a non-finite candidate
+        # that the gate rejects, and the block is frozen forever without
+        # raising. This is the public entry point that writes them, so the
+        # guard belongs at this level and nowhere above it.
+        if not (torch.isfinite(phi).all() and torch.isfinite(y).all()):
+            raise RuntimeError(
+                f"ttt: non-finite feature/target rows for block {i}"
+            )
+
         n_va = n // 5 if (holdout and n >= 5) else (1 if (holdout and n > 1) else 0)
         split = n - n_va
         tr_phi, tr_y = phi[:split], y[:split]
 
         if n_va:
-            st.hva.append(phi[split:])
-            st.yva.append(y[split:])
+            # Counted, not stored. The slice above already keeps these rows out
+            # of ``G``/``C``; retaining copies grew without bound (the training
+            # window is capped by ``rows_max``, this was not) and made a
+            # whole-history re-cat plus a full ``[N,r]@[r,H]`` matmul per block
+            # per step, for a residual no caller read.
             st.holdout_rows += n_va
 
         nt = tr_phi.shape[0]
@@ -379,7 +404,14 @@ class TttRls:
         eye = torch.eye(st.G.shape[0], dtype=st.G.dtype, device=st.G.device)
         B_cand = torch.linalg.solve(st.G + ridge * eye, st.C).T.contiguous()
 
-        if _resid(B_cand, Hb, Yb) >= _resid(lora.lora_B, Hb, Yb):
+        # The reference gates apply-positive (``candidate < current``,
+        # scripts/qwen_ttt_lora.py:324). This port rewrote it as a reject
+        # branch, and the two are NOT equivalent under NaN: ``nan >= x`` is
+        # False, so a non-finite candidate skipped the reject and ``copy_``
+        # wrote it into the weights. Keep the reference's form.
+        current = _resid(lora.lora_B, Hb, Yb)
+        candidate = _resid(B_cand, Hb, Yb)
+        if not (candidate < current):
             return False, 0.0
 
         lora.lora_B.copy_(B_cand.to(dtype=lora.lora_B.dtype))
@@ -408,8 +440,8 @@ class TttRls:
             input_ids: ``[B, T]`` already-known tokens (never generated here).
             targets: ``[B, T]`` next-token targets, shifted by the caller.
             loss_mask: ``[B, T]`` positions to fit. None fits all of them.
-            holdout: when True, the last 1/5 rows of each block are recorded as
-                validation and never enter ``G``/``C``.
+            holdout: when True, the last 1/5 rows of each block are held out of
+                ``G``/``C`` and counted in ``holdout_rows``.
         """
         ce, rows = self._harvest(input_ids, targets, loss_mask)
         if not torch.isfinite(torch.tensor(ce)):
@@ -420,7 +452,6 @@ class TttRls:
         train_rows = 0
         holdout_rows = 0
         frac_max = 0.0
-        resids: list[float] = []
 
         for i, per_firing in rows.items():
             phi, y = self._rows_for(i, per_firing, loss_mask)
@@ -435,9 +466,6 @@ class TttRls:
             if did_update:
                 updated += 1
                 frac_max = max(frac_max, frac)
-            r = self._holdout_resid(i)
-            if r == r:
-                resids.append(r)
 
         return TttStats(
             ce=ce,
@@ -446,6 +474,5 @@ class TttRls:
             refits=refits,
             train_rows=train_rows,
             holdout_rows=holdout_rows,
-            holdout_resid=sum(resids) / len(resids) if resids else float("inf"),
             delta_rms_frac=frac_max,
         )
