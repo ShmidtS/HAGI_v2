@@ -88,3 +88,32 @@ dsv4_release/
 dsv4_bank/
 dsv4_latent_gate.pt*
 _v41/report.txt
+eval/
+glm5_gguf/
+glm5_pod/
+glm5_kvp/
+models/
+reports/
+.pi/
+*.diff
+
+# vendored llama.cpp forks — each has its own .git and its own remotes;
+# tracked upstream, never in this repo (2.4 GB of build trees + .git)
+llama-glm5/
+llama-ds4/
+
+# agent working state (not project source)
+.omo/
+evolve_state/
+self_talk_logs/
+
+# archived spent code IS kept in history (277 KB of source + MANIFEST); only the
+# regenerable GGUF metadata dumps stay out
+_archive/**/*.json
+
+# one-shot audit/cleanup harnesses, at the repo root only (the archived copies
+# under _archive/ are the record of how this cleanup was derived — those stay
+# tracked). Anchored with / so they do not swallow the archive.
+/_audit_*.py
+/_audit_*.json
+/_cleanup.py
