@@ -441,6 +441,12 @@ def _confined_path(arg: str) -> Path | None:
         return None
     if _PATH_META.intersection(arg):
         return None
+    # Control characters are refused as a class, not by enumeration: ``\x00``
+    # reached subprocess and was rejected there ("embedded null character"),
+    # which is a safe outcome but the wrong layer. An argument the executor
+    # cannot represent should be denied before a child is spawned.
+    if any(ord(ch) < 32 or ord(ch) == 0x7f for ch in arg):
+        return None
     if _GLOB_META.intersection(arg):
         return None
     p = PurePosixPath(arg)
@@ -489,6 +495,14 @@ def _validate_probe(argv: list[str]) -> str | None:
     if binary not in ALLOWED_PROBES:
         return f"'{binary}' not allowed"
     rest = argv[1:]
+    # The argument cap lives here, not only in :func:`_probe_argv`, so the
+    # executor is self-sufficient: ``run_probe_argv`` is exported (and called by
+    # the legacy ``run_probe`` facade), and an uncapped call buffered every
+    # matched file before trimming (verified: 50 paths returned 50 copies).
+    # Bounding it here keeps the invariant "output is at most
+    # PROBE_MAX_ARGS x PROBE_MAX_BYTES" true of the executor alone.
+    if len(rest) > PROBE_MAX_ARGS:
+        return f"{len(rest)} arguments exceed the probe cap of {PROBE_MAX_ARGS}"
 
     if binary == "date":
         for a in rest:
@@ -559,8 +573,8 @@ def run_probe_argv(argv: list[str]) -> str:
     ``cwd=PROBE_ROOT`` puts the workspace first in CreateProcess' search order,
     so a planted ``cat.exe`` there would run instead of coreutils), a scrubbed
     environment (the real tokens live in the daemon's env), ``stdin`` closed
-    (no hanger), an explicit UTF-8 decode (the workspace is Russian), and a
-    scrubbed environment (the real tokens live in the daemon's env).
+    (no hanger), and an explicit UTF-8 decode (the workspace is Russian, and
+    ``text=True`` decoded it as cp1251, so an em dash arrived as U+FFFD).
     """
     denial = _validate_probe(list(argv))
     if denial:
