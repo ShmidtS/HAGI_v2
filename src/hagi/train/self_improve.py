@@ -5,9 +5,17 @@ contracts:
 
 1. Generate a deterministic trajectory with :func:`hagi.inference.generate`.
 2. Re-score that trajectory with exact CE through ``HAGI.forward``.
-3. Apply one adapter-only optimizer step through ``Trainer.train_step``.
+3. Apply one adapter-only update — an optimizer step through
+   ``Trainer.train_step`` (``mode="gradient"``) or a closed-form anchored-RLS
+   fit of ``lora_B`` from hidden-state features through :meth:`TttRls.step`
+   (``mode="rls"``).
 4. Re-score the same trajectory and measure ``KL(p_pre || p_post)``.
 5. Repeat until a hard iteration, KL, non-finite-loss, or plateau bound.
+
+``mode="rls"`` generates **once** and reuses that trajectory for every
+iteration, so the autoregressive cost is amortized over the whole loop instead
+of paid per update; it also allocates no optimizer at all. Both modes share the
+guards, the transactional rollback, and the frozen-base contract.
 
 ``generate.py`` remains inference-only. This module is the opt-in entry point;
 ordinary generation and ordinary external-data training do not call it. With
@@ -36,6 +44,7 @@ from hagi.config import Config
 from hagi.inference.generate import generate
 from hagi.model.model import HAGI
 from hagi.train.loop import Trainer
+from hagi.train.ttt import TttRls
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,8 @@ class SelfImproveResult:
     kl_div: float
     update_applied: bool
     adapter_values_after: list[float] = field(default_factory=list)
+    delta_rms_frac: float = 0.0
+    """Applied delta RMS as a fraction of the residual stream (``rls`` mode only)."""
 
 
 @dataclass
@@ -111,6 +122,7 @@ def _restore_adapters(model: HAGI, snapshot: dict[int, torch.Tensor]) -> None:
 def _validate_loop(
     cfg: Config,
     *,
+    mode: str,
     n_new_tokens: int,
     max_iterations: int,
     patience: int,
@@ -118,6 +130,8 @@ def _validate_loop(
     kl_max: float,
 ) -> None:
     """Validate the opt-in contract before allocating an optimizer."""
+    if mode not in {"gradient", "rls"}:
+        raise ValueError(f"mode must be 'gradient' or 'rls', got {mode!r}")
     if not cfg.model.adapters.enabled:
         raise ValueError("model.adapters.enabled=True is required for self-improvement")
     if not cfg.train.adapt.freeze_base:
@@ -144,6 +158,11 @@ def _validate_loop(
         raise ValueError(
             "pyramid and ttt_lora adapters are currently mutually exclusive: "
             "enable only one contour for self-improvement"
+        )
+    if mode == "rls" and not cfg.model.adapters.ttt_lora.enabled:
+        raise ValueError(
+            "mode='rls' fits the TTT-LoRA B matrix, so "
+            "model.adapters.ttt_lora.enabled=True is required"
         )
 
 
@@ -237,6 +256,8 @@ def self_improve(
     cfg: Config,
     prompt_ids: list[int],
     *,
+    mode: str = "gradient",
+    ttt: TttRls | None = None,
     n_new_tokens: int = 16,
     max_iterations: int = 8,
     ce_min_improve: float = 0.0,
@@ -246,17 +267,42 @@ def self_improve(
     pad_token_id: int | None = None,
     trainer: Trainer | None = None,
 ) -> SelfImproveStats:
-    """Run bounded generate -> exact-CE -> adapter-update iterations.
+    """Run bounded score → update → re-score iterations over a trajectory.
 
     The function is intentionally explicit: callers opt in by invoking it. It
-    does not mutate ``cfg`` or the default generation path. The same generated
-    trajectory is scored before and after each update, so the CE change and KL
-    are directly comparable.
+    does not mutate ``cfg`` or the default generation path.
+
+    Args:
+        mode: ``"gradient"`` regenerates a trajectory every iteration and
+            updates adapters through :meth:`Trainer.train_step`. ``"rls"``
+            generates **once**, then reuses that trajectory for every
+            iteration, updating ``lora_B`` in closed form from hidden-state
+            features via :meth:`TttRls.step` — no optimizer, no per-iteration
+            autoregression. The same KL/non-finite guards and the same
+            transactional rollback apply to both modes.
+        ttt: pre-configured fitter for ``mode="rls"``. Built with default
+            hyperparameters when omitted. Caller-built fitters are the seam
+            for tuning ``stream_frac``/``refit_rows``/caps, and their
+            accumulators intentionally persist across calls (online learning).
+            Ignored in ``"gradient"`` mode.
+        n_new_tokens: generation budget per trajectory.
+        max_iterations: iteration bound.
+        ce_min_improve: minimum CE gain for an iteration to count as progress.
+        patience: consecutive non-improving accepted updates before stopping.
+        kl_max: KL(pre || post) bound; a breach rolls the update back.
+        eos_token_id: overrides ``cfg.train.data.eos_token_id``.
+        pad_token_id: overrides ``cfg.train.data.pad_token_id``.
+        trainer: injected trainer for ``"gradient"`` mode. Not used in
+            ``"rls"`` mode, where no optimizer is allocated at all.
+
+    Returns:
+        :class:`SelfImproveStats`.
     """
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
     _validate_loop(
         cfg,
+        mode=mode,
         n_new_tokens=n_new_tokens,
         max_iterations=max_iterations,
         patience=patience,
@@ -273,28 +319,40 @@ def self_improve(
     if any(t == pad for t in prompt_ids):
         raise ValueError("prompt_ids must not contain the pad token_id")
 
-    if trainer is None:
+    if mode == "gradient" and trainer is None:
         trainer = Trainer(model, cfg)
+    if mode == "rls" and ttt is None:
+        ttt = TttRls(model)
     stats = SelfImproveStats()
     best_ce: float | None = None
     no_improve = 0
+    cached: tuple[torch.Tensor, torch.Tensor, int, torch.Tensor] | None = None
 
     for iteration in range(max_iterations):
-        sequence = _generate_trajectory(
-            model,
-            prompt_ids,
-            n_new_tokens=n_new_tokens,
-            eos_token_id=eos,
-            pad_token_id=pad,
-        )
-        n_generated = sequence.numel() - len(prompt_ids)
-        if n_generated < 1:
-            stats.stopped = "empty_trajectory"
-            logger.warning("iteration %d: generation produced no new tokens", iteration)
-            break
+        if mode == "rls" and cached is not None:
+            # Generation is hoisted out of the loop: the trajectory is the
+            # feature source for every subsequent update, so it is paid once.
+            sequence, input_ids, targets, n_generated = cached
+        else:
+            sequence = _generate_trajectory(
+                model,
+                prompt_ids,
+                n_new_tokens=n_new_tokens,
+                eos_token_id=eos,
+                pad_token_id=pad,
+            )
+            n_generated = sequence.numel() - len(prompt_ids)
+            if n_generated < 1:
+                stats.stopped = "empty_trajectory"
+                logger.warning(
+                    "iteration %d: generation produced no new tokens", iteration
+                )
+                break
 
-        input_ids = sequence[:-1].unsqueeze(0)
-        targets = sequence[1:].unsqueeze(0)
+            input_ids = sequence[:-1].unsqueeze(0)
+            targets = sequence[1:].unsqueeze(0)
+            if mode == "rls":
+                cached = (sequence, input_ids, targets, n_generated)
         pre_ce, pre_logits = _score(model, input_ids, targets)
 
         # Snapshot trainable adapter params AND optimizer state BEFORE the step,
@@ -304,7 +362,9 @@ def self_improve(
         # Injected lightweight trainers may not expose an optimizer; in that
         # case the adapter snapshot still protects the model state.
         param_snapshot = _snapshot_adapters(model)
-        optimizer = getattr(trainer, "optimizer", None)
+        # RLS never touches the optimizer, so in rls mode there is no optimizer
+        # state to snapshot and no trainer.step to protect.
+        optimizer = None if mode == "rls" else getattr(trainer, "optimizer", None)
         opt_snapshot = (
             # Deep-copy: optimizer.state_dict() returns live tensor objects
             # that keep mutating as the optimizer steps. A shallow snapshot
@@ -313,25 +373,31 @@ def self_improve(
             if optimizer is not None
             else None
         )
-        pre_step = getattr(trainer, "step", None)
+        pre_step = None if mode == "rls" else getattr(trainer, "step", None)
 
-        model.train()
-        metrics = trainer.train_step(
-            [
-                {
-                    "input_ids": input_ids,
-                    "targets": targets,
-                    "loss_mask": torch.ones_like(targets, dtype=torch.bool),
-                }
-            ]
-        )
-        update_applied = bool(metrics.get("update_applied", False))
+        delta_frac = 0.0
+        if mode == "rls":
+            ttt_stats = ttt.step(input_ids, targets)
+            update_applied = ttt_stats.blocks_updated > 0
+            delta_frac = ttt_stats.delta_rms_frac
+        else:
+            model.train()
+            metrics = trainer.train_step(
+                [
+                    {
+                        "input_ids": input_ids,
+                        "targets": targets,
+                        "loss_mask": torch.ones_like(targets, dtype=torch.bool),
+                    }
+                ]
+            )
+            update_applied = bool(metrics.get("update_applied", False))
 
         # Diagnostics stay FAITHFUL: post_ce/kl_div are the real post-update
         # values regardless of whether the guard accepts or rejects. Keep both
         # post-step states as recovery points if rollback itself fails.
         post_param_snapshot = (
-            _snapshot_adapters(model) if optimizer is not None and update_applied else None
+            _snapshot_adapters(model) if update_applied else None
         )
         post_opt_snapshot = (
             _deepcopy_optimizer_state(optimizer.state_dict())
@@ -405,6 +471,7 @@ def self_improve(
                             kl_div=kl_div,
                             update_applied=update_applied,
                             adapter_values_after=_adapter_values(model),
+                            delta_rms_frac=delta_frac,
                         )
                     )
                     logger.info("iteration %d: CE plateau; stopping", iteration)
@@ -420,6 +487,7 @@ def self_improve(
                 kl_div=kl_div,
                 update_applied=update_applied,
                 adapter_values_after=_adapter_values(model),
+                delta_rms_frac=delta_frac,
             )
         )
 

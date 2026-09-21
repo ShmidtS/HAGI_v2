@@ -22,8 +22,10 @@ import pytest
 import torch
 
 from hagi.model.model import HAGI
+from hagi.train import self_improve as si
 from hagi.train.loop import Trainer
 from hagi.train.self_improve import SelfImproveResult, _adapter_values, self_improve
+from hagi.train.ttt import TttRls
 from tests.conftest import tiny_config
 
 
@@ -403,3 +405,194 @@ def test_rejected_iteration_counted_in_stats():
     assert len(stats.iterations) == 1
     assert stats.accepted_updates == 0
     assert stats.stopped == "kl_bound"
+
+
+# --------------------------------------------------------------------------
+# mode="rls": features -> LoRA delta, generation paid once for the whole loop
+# --------------------------------------------------------------------------
+
+
+def _count_generations(monkeypatch) -> dict[str, int]:
+    """Wrap ``_generate_trajectory`` so the amortization claim is observable."""
+    calls = {"n": 0}
+    orig = si._generate_trajectory
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(si, "_generate_trajectory", spy)
+    return calls
+
+
+def _rls(model: HAGI, **kw) -> TttRls:
+    defaults = dict(stream_frac=0.5, refit_rows=8, max_delta_rms_frac=1.0)
+    defaults.update(kw)
+    return TttRls(model, **defaults)
+
+
+def test_rls_mode_generates_once_across_iterations(monkeypatch):
+    """The acceleration claim, pinned: 1 trajectory for K updates."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    calls = _count_generations(monkeypatch)
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model),
+        n_new_tokens=16,
+        max_iterations=4,
+        patience=5,
+    )
+    assert len(stats.iterations) == 4
+    assert calls["n"] == 1, f"rls must pay generation once, got {calls['n']}"
+
+
+def test_gradient_mode_regenerates_every_iteration(monkeypatch):
+    """Contrast: the default path still pays generation per update."""
+    cfg = _make_cfg(levels=(1,))
+    model = HAGI(cfg)
+    calls = _count_generations(monkeypatch)
+    stats = si.self_improve(
+        model, cfg, [1, 2, 3, 4], n_new_tokens=16, max_iterations=2, patience=5
+    )
+    assert len(stats.iterations) == 2
+    assert calls["n"] == 2
+
+
+def test_rls_mode_never_allocates_a_trainer(monkeypatch):
+    """No optimizer state exists in rls mode, so nothing can drift there."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+
+    def _boom(*a, **k):
+        raise AssertionError("mode='rls' must not build a Trainer")
+
+    monkeypatch.setattr(si, "Trainer", _boom)
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model),
+        n_new_tokens=16,
+        max_iterations=2,
+        patience=5,
+    )
+    assert len(stats.iterations) == 2
+
+
+def test_rls_mode_keeps_base_frozen():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    before = _base_hash(model)
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model),
+        n_new_tokens=16,
+        max_iterations=3,
+        patience=5,
+    )
+    assert _base_hash(model) == before, "base must stay frozen across rls updates"
+    assert stats.accepted_updates >= 1
+
+
+def test_rls_mode_moves_lora_b_and_records_the_step_bound():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    before = [b.adapters.ttt_lora.lora_B.detach().clone() for b in model.blocks]
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model),
+        n_new_tokens=16,
+        max_iterations=3,
+        patience=5,
+    )
+    after = [b.adapters.ttt_lora.lora_B.detach() for b in model.blocks]
+    assert any(
+        not torch.equal(x, y) for x, y in zip(before, after)
+    ), "rls must move lora_B"
+    applied = [r for r in stats.iterations if r.update_applied]
+    assert applied, "expected at least one applied update"
+    assert all(0.0 <= r.delta_rms_frac <= 1.0 for r in applied)
+
+
+def test_rls_mode_honours_the_delta_cap():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model, stream_frac=50.0, max_delta_rms_frac=0.02),
+        n_new_tokens=16,
+        max_iterations=3,
+        patience=5,
+    )
+    assert all(r.delta_rms_frac <= 0.02 + 1e-9 for r in stats.iterations)
+
+
+def test_rls_mode_rolls_back_on_kl_breach():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    pristine = [b.adapters.ttt_lora.lora_B.detach().clone() for b in model.blocks]
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(model),
+        n_new_tokens=16,
+        max_iterations=3,
+        kl_max=0.0,
+    )
+    assert stats.stopped == "kl_bound"
+    assert stats.accepted_updates == 0
+    after = [b.adapters.ttt_lora.lora_B.detach() for b in model.blocks]
+    for x, y in zip(pristine, after):
+        assert torch.equal(x, y), "a rejected rls update must not persist"
+
+
+def test_rls_mode_builds_a_default_fitter_when_omitted():
+    """The caller-built seam is optional, not mandatory."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    stats = si.self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        n_new_tokens=16,
+        max_iterations=2,
+        patience=5,
+    )
+    assert len(stats.iterations) == 2
+
+
+@pytest.mark.parametrize("kw", [
+    {"mode": "bogus"},
+    {"mode": ""},
+    {"mode": None},
+])
+def test_bad_mode_raises(kw):
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    with pytest.raises(ValueError, match="mode must be"):
+        si.self_improve(model, cfg, [1, 2, 3, 4], n_new_tokens=16, **kw)
+
+
+def test_rls_mode_requires_ttt_lora_contour():
+    """Pyramid-only cannot be fitted by an anchored-RLS solve."""
+    cfg = _make_cfg(ttt_lora=False, pyramid=True, levels=(1,))
+    model = HAGI(cfg)
+    with pytest.raises(ValueError, match="ttt_lora.enabled=True is required"):
+        si.self_improve(model, cfg, [1, 2, 3, 4], mode="rls", n_new_tokens=16)
