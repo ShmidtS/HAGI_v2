@@ -459,7 +459,7 @@ V=248320) и гонял в него GEMM **для замороженного в�
 
 * `_qr_orthonormal` рисовал CPU-генератором, который cuda-ambient отвергает
   (`Expected a 'cuda' device type for generator but found 'cpu'`), а
-  `torch.linalg.qr` не имеет bf12-ядра на CPU (`geqrf_cpu not implemented`).
+  `torch.linalg.qr` не имеет bf16-ядра на CPU (`geqrf_cpu not implemented`).
   Значит хелпер в принципе не мог работать под device-контекстом. Теперь рисunek
   и факторизация закреплены за cpu fp32, ambient схватывается ДО этого закрепления
   (иначе базис молча оставался на хосте — поймано измерением: `cuda ctx: cpu`),
