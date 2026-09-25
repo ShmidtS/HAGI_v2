@@ -8,6 +8,12 @@ The current architecture is **V42** (`hagi-channel-v42`) — full causal
 attention + T=512 + punctured receiver. See
 [docs/V42_ARCHITECTURE.md](docs/V42_ARCHITECTURE.md).
 
+> **Read [STATUS.md](STATUS.md) first.** It is the single place that says what
+> is measured, what is proven, what was broken and is being re-measured, and
+> what is still open. [ARCHITECTURE.md](ARCHITECTURE.md) describes the code;
+> [AGENT_WORKLOG.md](AGENT_WORKLOG.md) is the append-only index of the
+> chronological log, archived by month under `docs/archive/`.
+
 ## Growth cycle algorithm
 
 HAGI grows a large model from small domain experts instead of training from
@@ -15,12 +21,14 @@ scratch. The idea and results live in
 [GROWING_HYPOTHESIS.md](GROWING_HYPOTHESIS.md).
 
 The current executable recursive V1 path is
-`scripts/recursive_growth.py`. It runs one bounded CPU generation through the
-authoritative `GrowthRunStore` owner. Without an artifact it uses a synthetic
-packed stream; Banking77 is used only when both `--artifact` and
-`--manifest-sha256` are supplied. A successful receipt is mechanism evidence
-only: `quality_supported=false`, `security_supported=false`, and
-`production_promotion=false` are part of the frozen contract.
+`scripts/recursive_growth.py`. It runs one bounded generation through the
+authoritative `GrowthRunStore` owner. **It has never been run at the real
+model scale**: every orchestrator run used hidden=8, 1 layer, vocab 3060 and a
+CPU budget, and it measures Banking77 packed-token CE, which is a different
+quantity from the 3-domain exact CE the merge result is measured on. The scale
+ceilings that made real-scale self-growth inexpressible (64 steps, CPU-only,
+hidden_size 8) have been removed; the metric mismatch is what still blocks it.
+See [STATUS.md](STATUS.md) § Open.
 
 `scripts/run_growth_cycle.sh` is a separate legacy research driver. It trains
 small experts with saturation stopping, merges them, and then joint-trains the
