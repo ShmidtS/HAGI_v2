@@ -16,6 +16,7 @@ finiteness and adapter movement instead.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 
 import pytest
@@ -25,7 +26,7 @@ from hagi.model.model import HAGI
 from hagi.train import self_improve as si
 from hagi.train.loop import Trainer
 from hagi.train.self_improve import SelfImproveResult, _adapter_values, self_improve
-from hagi.train.ttt import TttRls
+from hagi.train.ttt import TttRls, TttStats
 from tests.conftest import tiny_config
 
 
@@ -284,6 +285,25 @@ def _adapter_snapshot(model: HAGI) -> list[float]:
     return [float(v) for v in _adapter_values(model)]
 
 
+def _assert_nested_state_equal(expected: object, actual: object) -> None:
+    """Compare nested optimizer state without assuming a torch Optimizer shape."""
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        assert torch.equal(actual, expected)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert actual.keys() == expected.keys()
+        for key, value in expected.items():
+            _assert_nested_state_equal(value, actual[key])
+    elif isinstance(expected, (list, tuple)):
+        assert isinstance(actual, type(expected))
+        assert len(actual) == len(expected)
+        for value, other in zip(expected, actual, strict=True):
+            _assert_nested_state_equal(value, other)
+    else:
+        assert actual == expected
+
+
 def test_kl_rejection_rolls_back_adapter_params():
     """A KL-breaching update is rolled back: adapter params match their
     pre-update snapshot exactly (faithful KL diagnostic is preserved)."""
@@ -311,6 +331,150 @@ def test_kl_rejection_rolls_back_adapter_params():
     assert before == after, "adapter params must be rolled back on KL rejection"
 
 
+def test_gradient_noop_restores_pre_state_even_if_trainer_mutates(monkeypatch):
+    """A false ``update_applied`` flag must not hide partial trainer mutation."""
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    from hagi.model.adaptive import adaptive_parameters
+
+    class MutatingNoOpOptimizer:
+        def __init__(self) -> None:
+            self.state = {"momentum": torch.tensor([1.0])}
+
+        def state_dict(self) -> dict:
+            return {"state": self.state}
+
+        def load_state_dict(self, state: dict) -> None:
+            self.state = copy.deepcopy(state["state"])
+
+    class MutatingNoOpTrainer:
+        def __init__(self) -> None:
+            self.step = 7
+            self.calls = 0
+            self.optimizer = MutatingNoOpOptimizer()
+
+        def train_step(self, microbatches: list[dict]) -> dict:
+            self.calls += 1
+            self.step += 1
+            with torch.no_grad():
+                for parameter in adaptive_parameters(model):
+                    if parameter.requires_grad:
+                        parameter.add_(0.25)
+            self.optimizer.state = {"momentum": torch.tensor([9.0])}
+            return {"update_applied": False}
+
+    trainer = MutatingNoOpTrainer()
+    before = {
+        key: (value.clone(), requires_grad)
+        for key, (value, requires_grad) in si._snapshot_adapters(model).items()
+    }
+    optimizer_before = si._deepcopy_optimizer_state(
+        trainer.optimizer.state_dict()
+    )
+
+    monkeypatch.setattr(
+        si,
+        "_generate_trajectory",
+        lambda *args, **kwargs: torch.tensor(
+            [1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=torch.long
+        ),
+    )
+    monkeypatch.setattr(
+        si,
+        "_score",
+        lambda model_arg, input_ids, targets: (
+            1.0,
+            torch.zeros((1, targets.shape[1], cfg.model.vocab_size)),
+        ),
+    )
+    monkeypatch.setattr(si, "_kl_pre_post", lambda *args, **kwargs: 0.0)
+
+    stats = self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4, 5],
+        n_new_tokens=4,
+        max_iterations=1,
+        kl_max=1.0,
+        trainer=trainer,
+    )
+
+    assert len(stats.iterations) == 1
+    assert stats.iterations[0].update_applied is False
+    assert trainer.calls == 1
+    assert trainer.step == 7, "a no-op must restore the pre-step horizon"
+    after = si._snapshot_adapters(model)
+    assert after.keys() == before.keys()
+    assert all(
+        torch.equal(after[key][0], value)
+        and after[key][1] == requires_grad
+        for key, (value, requires_grad) in before.items()
+    )
+    _assert_nested_state_equal(
+        optimizer_before,
+        si._deepcopy_optimizer_state(trainer.optimizer.state_dict()),
+    )
+    assert all(module.training is False for module in model.modules())
+    assert getattr(trainer, "_hagi_self_improve_rollback_poisoned", False) is False
+
+
+def test_gradient_noop_post_recovery_status_is_explicit(monkeypatch):
+    """Successful fallback recovery is ``post``, not an implicit poisoned result."""
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    trainer = Trainer(model, cfg, start_step=3)
+    optimizer = trainer.optimizer
+    pre_params = si._snapshot_adapters(model)
+    pre_opt = si._deepcopy_optimizer_state(optimizer.state_dict())
+    trainer.step = 4
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(0.25)
+    post_params = si._snapshot_adapters(model)
+    post_opt = si._deepcopy_optimizer_state(optimizer.state_dict())
+    real_rollback = si._rollback_gradient_transaction
+    statuses: list[str] = []
+
+    def capture_rollback(*args, **kwargs):
+        status = real_rollback(*args, **kwargs)
+        statuses.append(status)
+        return status
+
+    class FailingPreOptimizer:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+            self.calls = 0
+
+        def state_dict(self) -> dict:
+            return self.wrapped.state_dict()
+
+        def load_state_dict(self, state: dict) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("PRE-OPT-FAIL")
+            self.wrapped.load_state_dict(state)
+
+    failing_optimizer = FailingPreOptimizer(optimizer)
+    monkeypatch.setattr(si, "_rollback_gradient_transaction", capture_rollback)
+    status = si._rollback_gradient_transaction(
+        model,
+        trainer,
+        failing_optimizer,
+        pre_params,
+        pre_opt,
+        post_params,
+        post_opt,
+        pre_step=3,
+        post_step=4,
+    )
+
+    assert status == "post"
+    assert statuses == ["post"]
+    assert trainer.step == 4
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+
+
 def test_kl_rejection_does_not_advance_step():
     """A rejected KL step must not advance completed_steps for the resume
     horizon: trainer.step equals its pre-step value after the loop."""
@@ -331,37 +495,257 @@ def test_kl_rejection_does_not_advance_step():
     assert trainer.step == pre, "rejected update must not advance the step counter"
 
 
-def test_optimizer_restore_failure_still_reverts_step():
-    """If optimizer.load_state_dict itself raises during rollback, trainer.step
-    must still be restored in the finally path and the error re-raised (never
-    leaving the resume horizon advanced or state half-rolled-back)."""
+def test_gradient_exception_recovers_coherent_post_state_when_pre_restore_fails(
+    monkeypatch,
+):
+    """A failed pre-state optimizer load must not strand changed parameters.
+
+    The primary post-score error still wins, and the model/optimizer pair is
+    restored together. If optimizer load fails before mutating anything, the
+    best available coherent state is the post-step snapshot, so its step horizon
+    remains and the trainer is poisoned against reuse. The first load mutates
+    state before raising, proving the fallback does not trust load_state_dict to
+    be atomic. Restoring only parameters would pair old weights with whatever
+    momentum happened to remain and make a retry unsafe.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    real_score = si._score
+    score_calls = {"count": 0}
+    params_before = [param.detach().clone() for param in model.parameters()]
+
+    class OneShotFailingOptimizer:
+        def __init__(self) -> None:
+            self.state = {"momentum": torch.tensor([1.0])}
+            self.load_calls = 0
+
+        def state_dict(self) -> dict:
+            return {"state": self.state}
+
+        def load_state_dict(self, state: dict) -> None:
+            self.load_calls += 1
+            if self.load_calls == 1:
+                self.state = {"momentum": torch.tensor([99.0])}
+                raise RuntimeError("PRE-OPT-RESTORE-FAIL")
+            self.state = copy.deepcopy(state["state"])
+
+    class PostStepTrainer:
+        def __init__(self) -> None:
+            self.step = 4
+            self.optimizer = OneShotFailingOptimizer()
+
+        def train_step(self, microbatches: list[dict]) -> dict:
+            self.step += 1
+            with torch.no_grad():
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.add_(0.25)
+            self.optimizer.state = {"momentum": torch.tensor([9.0])}
+            return {"update_applied": True}
+
+    trainer = PostStepTrainer()
+
+    def failing_second_score(model_arg, input_ids, targets):
+        score_calls["count"] += 1
+        if score_calls["count"] == 1:
+            return real_score(model_arg, input_ids, targets)
+        raise KeyboardInterrupt("GRAD-PRIMARY")
+
+    monkeypatch.setattr(si, "_score", failing_second_score)
+    with pytest.raises(KeyboardInterrupt, match="GRAD-PRIMARY"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=8,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+
+    assert score_calls["count"] == 2
+    assert trainer.step == 5
+    assert trainer.optimizer.load_calls == 2
+    assert torch.equal(
+        trainer.optimizer.state["momentum"], torch.tensor([9.0])
+    )
+    assert any(
+        not torch.equal(param.detach(), before)
+        for param, before in zip(model.parameters(), params_before, strict=True)
+    )
+    assert model.training is False
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+
+    with pytest.raises(RuntimeError, match="trainer is poisoned"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=8,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+    assert score_calls["count"] == 2, "poisoned trainer must be rejected before work"
+
+
+def test_gradient_adapter_restore_failure_reloads_full_post_pair(monkeypatch):
+    """A valid pre-optimizer half must not be paired with a post-parameter half."""
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    real_score = si._score
+    real_restore = si._restore_adapters
+    score_calls = {"count": 0}
+    restore_calls = {"count": 0}
+
+    class RecordingOptimizer:
+        def __init__(self) -> None:
+            self.state = {"momentum": torch.tensor([1.0])}
+            self.load_calls = 0
+
+        def state_dict(self) -> dict:
+            return {"state": self.state}
+
+        def load_state_dict(self, state: dict) -> None:
+            self.load_calls += 1
+            self.state = copy.deepcopy(state["state"])
+
+    class PostStepTrainer:
+        def __init__(self) -> None:
+            self.step = 4
+            self.optimizer = RecordingOptimizer()
+
+        def train_step(self, microbatches: list[dict]) -> dict:
+            self.step += 1
+            with torch.no_grad():
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.add_(0.25)
+            self.optimizer.state = {"momentum": torch.tensor([9.0])}
+            return {"update_applied": True}
+
+    trainer = PostStepTrainer()
+
+    def failing_second_score(model_arg, input_ids, targets):
+        score_calls["count"] += 1
+        if score_calls["count"] == 1:
+            return real_score(model_arg, input_ids, targets)
+        raise KeyboardInterrupt("GRAD-PRIMARY")
+
+    def fail_first_adapter_restore(model_arg, snapshot):
+        restore_calls["count"] += 1
+        if restore_calls["count"] == 1:
+            raise RuntimeError("PRE-ADAPTER-RESTORE-FAIL")
+        real_restore(model_arg, snapshot)
+
+    monkeypatch.setattr(si, "_score", failing_second_score)
+    monkeypatch.setattr(si, "_restore_adapters", fail_first_adapter_restore)
+    with pytest.raises(KeyboardInterrupt, match="GRAD-PRIMARY"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=8,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+
+    assert restore_calls["count"] == 2
+    assert trainer.optimizer.load_calls == 2
+    assert trainer.step == 5
+    assert torch.equal(
+        trainer.optimizer.state["momentum"], torch.tensor([9.0])
+    )
+    assert model.training is False
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+
+
+def test_missing_post_optimizer_snapshot_poisons_gradient_trainer(monkeypatch):
+    """A partial fallback must not be accepted as a coherent post-state."""
     cfg = _make_cfg(levels=(1,), lr=1.0)
     model = HAGI(cfg)
     trainer = Trainer(model, cfg, start_step=3)
-    pre = trainer.step
-    # Poison optimizer.rollback path: load_state_dict must fail, proving the
-    # finally clause runs trainer.step restoration independently.
-    bad_optimizer = trainer.optimizer
-    original_load = bad_optimizer.load_state_dict
+    optimizer = trainer.optimizer
+    pre_param_snapshot = si._snapshot_adapters(model)
+    pre_opt_snapshot = si._deepcopy_optimizer_state(optimizer.state_dict())
+    trainer.step = 4
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.requires_grad:
+                param.add_(0.25)
+    post_param_snapshot = si._snapshot_adapters(model)
+    real_restore = si._restore_adapters
+    restore_calls = {"count": 0}
+
+    def fail_pre_adapter_restore(model_arg, snapshot):
+        restore_calls["count"] += 1
+        if restore_calls["count"] == 1:
+            raise RuntimeError("PRE-ADAPTER-RESTORE-FAIL")
+        real_restore(model_arg, snapshot)
+
+    monkeypatch.setattr(si, "_restore_adapters", fail_pre_adapter_restore)
+    status = si._rollback_gradient_transaction(
+        model,
+        trainer,
+        optimizer,
+        pre_param_snapshot,
+        pre_opt_snapshot,
+        post_param_snapshot,
+        None,
+        pre_step=3,
+        post_step=4,
+    )
+
+    assert status == "poisoned"
+    assert restore_calls["count"] == 1
+    assert trainer.step == 4
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+
+
+def test_optimizer_restore_failure_poisons_trainer_when_post_recovery_fails(
+    monkeypatch,
+):
+    """Failed pre-state rollback cannot masquerade as a successful rejection.
+
+    The optimizer loader fails for both the pre and captured post states. The
+    resulting live state is not trusted even though ``trainer.step`` already
+    advanced, so reuse must fail closed.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg)
+    trainer = Trainer(model, cfg, start_step=3)
 
     def fail_load(_state):
         raise RuntimeError("simulated optimizer load failure")
 
-    bad_optimizer.load_state_dict = fail_load  # type: ignore[method-assign]
-    try:
-        with pytest.raises(RuntimeError, match="simulated optimizer load failure"):
-            self_improve(
-                model,
-                cfg,
-                [1, 2, 3, 4, 5],
-                n_new_tokens=4,
-                max_iterations=1,
-                kl_max=0.0,
-                trainer=trainer,
-            )
-    finally:
-        bad_optimizer.load_state_dict = original_load
-    assert trainer.step == pre, "step must be restored even when rollback raises"
+    monkeypatch.setattr(trainer.optimizer, "load_state_dict", fail_load)
+    with pytest.raises(
+        RuntimeError,
+        match="transaction rollback could not restore the pre-state",
+    ):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4, 5],
+            n_new_tokens=4,
+            max_iterations=1,
+            kl_max=0.0,
+            trainer=trainer,
+        )
+
+    assert trainer.step == 4, "step must retain the actual last observed horizon"
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+    with pytest.raises(RuntimeError, match="trainer is poisoned"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4, 5],
+            n_new_tokens=4,
+            max_iterations=1,
+            kl_max=0.0,
+            trainer=trainer,
+        )
 
 
 def test_accepted_update_advances_step_once():
@@ -384,6 +768,98 @@ def test_accepted_update_advances_step_once():
     assert stats.iterations[0].update_applied is True
     assert trainer.step == pre + stats.accepted_updates
     assert stats.accepted_updates == 1
+
+
+def test_accepted_diagnostic_exception_rolls_back_gradient_transaction(monkeypatch):
+    """A reporting failure after an accepted update rolls back that update."""
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    trainer = Trainer(model, cfg, start_step=7)
+    # Seed real optimizer momentum first. Comparing an all-empty initial
+    # optimizer would pass even if rollback silently discarded every state slot.
+    seed_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7]], dtype=torch.long)
+    trainer.train_step([{
+        "input_ids": seed_ids,
+        "targets": torch.roll(seed_ids, -1, dims=1),
+        "loss_mask": torch.ones_like(seed_ids, dtype=torch.bool),
+    }])
+    model.eval()
+    pre_step = trainer.step
+    params = [param for param in model.parameters() if param.requires_grad]
+    params_before = [param.detach().clone() for param in params]
+    optimizer_before = copy.deepcopy(trainer.optimizer.state_dict())
+    assert optimizer_before["adamw"]["state"], "precondition: optimizer state must be non-empty"
+
+    def fail_adapter_values(*args, **kwargs):
+        raise RuntimeError("simulated accepted diagnostic failure")
+
+    monkeypatch.setattr(si, "_adapter_values", fail_adapter_values)
+    with pytest.raises(RuntimeError, match="simulated accepted diagnostic failure"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=16,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+
+    assert trainer.step == pre_step
+    assert model.training is False
+    for param, expected in zip(params, params_before, strict=True):
+        assert torch.equal(param.detach(), expected)
+
+    _assert_nested_state_equal(
+        optimizer_before,
+        trainer.optimizer.state_dict(),
+    )
+
+
+def test_rls_plateau_logger_exception_rolls_back_current_iteration(monkeypatch):
+    """A plateau-reporting failure restores the state before that iteration."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg).eval()
+    ttt = _rls(model)
+    original_step = ttt.step
+    first_state = None
+    scores = iter((1.0, 0.5, 0.5, 0.5))
+
+    def recording_step(*args, **kwargs):
+        nonlocal first_state
+        result = original_step(*args, **kwargs)
+        if first_state is None:
+            first_state = _rls_state_digest(ttt)
+        return result
+
+    def synthetic_score(*args, **kwargs):
+        return next(scores), torch.zeros(1)
+
+    def fail_info(*args, **kwargs):
+        raise RuntimeError("simulated plateau logger failure")
+
+    monkeypatch.setattr(ttt, "step", recording_step)
+    monkeypatch.setattr(si, "_score", synthetic_score)
+    monkeypatch.setattr(si, "_kl_pre_post", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(si.logger, "info", fail_info)
+
+    with pytest.raises(RuntimeError, match="simulated plateau logger failure"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=2,
+            patience=1,
+            ce_min_improve=0.0,
+            kl_max=10.0,
+        )
+
+    assert first_state is not None
+    _assert_rls_state_equal(first_state, _rls_state_digest(ttt))
+    assert model.training is False
 
 
 def test_rejected_iteration_counted_in_stats():
@@ -541,16 +1017,56 @@ def test_rls_mode_honours_the_delta_cap():
     assert all(r.delta_rms_frac <= 0.02 + 1e-9 for r in stats.iterations)
 
 
+def _rls_state_digest(ttt: TttRls) -> tuple:
+    """Return a compact exact snapshot of all persistent RLS state."""
+    result = []
+    for i in sorted(ttt._state):
+        state = ttt._state[i]
+        result.append(
+            (
+                i,
+                state.G.detach().clone(),
+                state.C.detach().clone(),
+                ttt._lora[i].lora_B.detach().clone(),
+                state.train_rows,
+                state.refits,
+                state.buf_rows,
+                state.holdout_rows,
+                tuple(tensor.detach().clone() for tensor in state.phi_buf),
+                tuple(tensor.detach().clone() for tensor in state.y_buf),
+            )
+        )
+    return tuple(result)
+
+
+def _assert_rls_state_equal(before: tuple, after: tuple) -> None:
+    assert len(before) == len(after)
+    for expected, actual in zip(before, after, strict=True):
+        assert expected[0] == actual[0]
+        assert torch.equal(expected[1], actual[1]), "G must be restored"
+        assert torch.equal(expected[2], actual[2]), "C must be restored"
+        assert torch.equal(expected[3], actual[3]), "lora_B must be restored"
+        assert expected[4:8] == actual[4:8], "RLS counters must be restored"
+        assert len(expected[8]) == len(actual[8]), "phi_buf length must be restored"
+        assert len(expected[9]) == len(actual[9]), "y_buf length must be restored"
+        for expected_row, actual_row in zip(expected[8], actual[8], strict=True):
+            assert torch.equal(expected_row, actual_row)
+        for expected_row, actual_row in zip(expected[9], actual[9], strict=True):
+            assert torch.equal(expected_row, actual_row)
+
+
 def test_rls_mode_rolls_back_on_kl_breach():
     cfg = _make_cfg(ttt_lora=True, pyramid=False)
     model = HAGI(cfg)
     pristine = [b.adapters.ttt_lora.lora_B.detach().clone() for b in model.blocks]
-    stats = si.self_improve(
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+    stats = self_improve(
         model,
         cfg,
         [1, 2, 3, 4],
         mode="rls",
-        ttt=_rls(model),
+        ttt=ttt,
         n_new_tokens=16,
         max_iterations=3,
         kl_max=0.0,
@@ -558,8 +1074,342 @@ def test_rls_mode_rolls_back_on_kl_breach():
     assert stats.stopped == "kl_bound"
     assert stats.accepted_updates == 0
     after = [b.adapters.ttt_lora.lora_B.detach() for b in model.blocks]
-    for x, y in zip(pristine, after):
+    for x, y in zip(pristine, after, strict=True):
         assert torch.equal(x, y), "a rejected rls update must not persist"
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+
+
+def test_rls_reject_diagnostic_survives_a_second_restore_failure(monkeypatch):
+    """A diagnostic error wins; a successful rollback is never retried."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    real_restore = ttt.restore_state
+    calls = {"count": 0}
+
+    def restore_then_fail_on_retry(snapshot):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return real_restore(snapshot)
+        raise RuntimeError("RLS-ROLLBACK-SECONDARY")
+
+    monkeypatch.setattr(ttt, "step", lambda *args, **kwargs: TttStats(
+        ce=1.0,
+        blocks=ttt.block_count,
+        blocks_updated=1,
+        refits=1,
+        train_rows=1,
+        holdout_rows=0,
+        delta_rms_frac=0.1,
+    ))
+    monkeypatch.setattr(si, "_kl_pre_post", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(si.logger, "warning", lambda *args, **kwargs: (_ for _ in ()).throw(
+        KeyboardInterrupt("RLS-DIAGNOSTIC-PRIMARY")
+    ))
+    monkeypatch.setattr(ttt, "restore_state", restore_then_fail_on_retry)
+
+    with pytest.raises(KeyboardInterrupt, match="RLS-DIAGNOSTIC-PRIMARY"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+            kl_max=0.0,
+        )
+    assert calls["count"] == 1
+
+
+def test_rls_accepted_diagnostic_failure_survives_rollback_failure(monkeypatch):
+    """A diagnostic error must win over a secondary RLS restore error."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    restore_calls = {"count": 0}
+
+    monkeypatch.setattr(ttt, "step", lambda *args, **kwargs: TttStats(
+        ce=1.0,
+        blocks=ttt.block_count,
+        blocks_updated=1,
+        refits=1,
+        train_rows=1,
+        holdout_rows=0,
+        delta_rms_frac=0.1,
+    ))
+    monkeypatch.setattr(
+        si,
+        "_adapter_values",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("RLS-DIAGNOSTIC-PRIMARY")
+        ),
+    )
+
+    def failing_restore(_snapshot):
+        restore_calls["count"] += 1
+        raise RuntimeError("RLS-ROLLBACK-SECONDARY")
+
+    monkeypatch.setattr(ttt, "restore_state", failing_restore)
+
+    with pytest.raises(KeyboardInterrupt, match="RLS-DIAGNOSTIC-PRIMARY"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+            kl_max=1.0,
+        )
+    assert restore_calls["count"] == 1
+
+
+def test_rls_mode_exception_rolls_back_partial_fitter_mutation(monkeypatch):
+    """An exception after partial RLS mutation must not poison retry state."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+    adapter_before = [b.adapters.ttt_lora.lora_B.detach().clone() for b in model.blocks]
+
+    def fail_after_mutation(*args, **kwargs):
+        ttt._state[0].G.add_(1.0)
+        ttt._state[0].train_rows += 1
+        raise RuntimeError("simulated RLS failure")
+
+    monkeypatch.setattr(ttt, "step", fail_after_mutation)
+    with pytest.raises(RuntimeError, match="simulated RLS failure"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+    for expected, actual in zip(
+        adapter_before,
+        (b.adapters.ttt_lora.lora_B.detach() for b in model.blocks),
+        strict=True,
+    ):
+        assert torch.equal(expected, actual)
+
+
+def test_rls_mode_reject_diagnostic_exception_rolls_back_mutation(monkeypatch):
+    """A failure after a KL verdict must not bypass the RLS rollback."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+
+    def mutate_then_report(*args, **kwargs):
+        state = ttt._state[0]
+        lora = ttt._lora[0]
+        state.G.add_(1.0)
+        state.C.add_(1.0)
+        state.train_rows += 1
+        state.holdout_rows += 1
+        state.phi_buf.append(torch.ones(1, lora.r))
+        state.y_buf.append(torch.ones(1, lora.hidden_size))
+        state.buf_rows += 1
+        with torch.no_grad():
+            lora.lora_B.add_(1.0)
+        return TttStats(
+            ce=0.0,
+            blocks=ttt.block_count,
+            blocks_updated=1,
+            refits=1,
+            train_rows=1,
+            holdout_rows=1,
+            delta_rms_frac=0.1,
+        )
+
+    def fail_warning(*args, **kwargs):
+        raise RuntimeError("simulated reject diagnostic failure")
+
+    monkeypatch.setattr(ttt, "step", mutate_then_report)
+    monkeypatch.setattr(si, "_kl_pre_post", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(si.logger, "warning", fail_warning)
+
+    with pytest.raises(RuntimeError, match="simulated reject diagnostic failure"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+            kl_max=0.0,
+        )
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+
+
+def test_rls_mode_base_exception_rolls_back_partial_mutation(monkeypatch):
+    """Cancellation must not leave the persistent fitter ahead of pre-state."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+
+    def interrupt_after_mutation(*args, **kwargs):
+        ttt._state[0].G.add_(1.0)
+        ttt._state[0].C.add_(1.0)
+        ttt._state[0].train_rows += 1
+        with torch.no_grad():
+            ttt._lora[0].lora_B.add_(1.0)
+        raise KeyboardInterrupt("simulated cancellation")
+
+    monkeypatch.setattr(ttt, "step", interrupt_after_mutation)
+    with pytest.raises(KeyboardInterrupt, match="simulated cancellation"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+
+
+def test_rls_mode_rejects_fitter_bound_to_another_model():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    owner = HAGI(cfg)
+    other = HAGI(cfg)
+    ttt = _rls(owner)
+    state_before = _rls_state_digest(ttt)
+    other_before = [b.adapters.ttt_lora.lora_B.detach().clone() for b in other.blocks]
+
+    with pytest.raises(ValueError, match="same model"):
+        self_improve(
+            other,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+    for expected, actual in zip(
+        other_before,
+        (b.adapters.ttt_lora.lora_B.detach() for b in other.blocks),
+        strict=True,
+    ):
+        assert torch.equal(expected, actual)
+
+
+def test_rls_mode_restores_model_training_mode_on_success_and_exception(monkeypatch):
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+
+    success_model = HAGI(cfg).train()
+    self_improve(
+        success_model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=_rls(success_model),
+        n_new_tokens=16,
+        max_iterations=1,
+        kl_max=10.0,
+    )
+    assert success_model.training is True
+
+    failure_model = HAGI(cfg).train()
+    failing_ttt = _rls(failure_model)
+
+    def fail_step(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(failing_ttt, "step", fail_step)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        self_improve(
+            failure_model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=failing_ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+    assert failure_model.training is True
+
+
+def test_rls_mode_post_score_exception_restores_and_allows_retry(monkeypatch):
+    """A post-update scoring failure must restore the full RLS transaction."""
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+    original_score = si._score
+    calls = {"count": 0}
+
+    def fail_second_score(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("simulated post-score failure")
+        return original_score(*args, **kwargs)
+
+    monkeypatch.setattr(si, "_score", fail_second_score)
+    with pytest.raises(RuntimeError, match="simulated post-score failure"):
+        self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+
+    monkeypatch.setattr(si, "_score", original_score)
+    stats = self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=ttt,
+        n_new_tokens=16,
+        max_iterations=1,
+        kl_max=10.0,
+    )
+    assert len(stats.iterations) == 1
+
+
+def test_rls_mode_rejects_restore_when_lora_b_requires_grad_false():
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    for block in model.blocks:
+        block.adapters.ttt_lora.lora_B.requires_grad_(False)
+    pristine = [b.adapters.ttt_lora.lora_B.detach().clone() for b in model.blocks]
+    ttt = _rls(model)
+    state_before = _rls_state_digest(ttt)
+    stats = self_improve(
+        model,
+        cfg,
+        [1, 2, 3, 4],
+        mode="rls",
+        ttt=ttt,
+        n_new_tokens=16,
+        max_iterations=1,
+        kl_max=0.0,
+    )
+    assert stats.stopped == "kl_bound"
+    _assert_rls_state_equal(state_before, _rls_state_digest(ttt))
+    for expected, actual in zip(
+        pristine,
+        (b.adapters.ttt_lora.lora_B.detach() for b in model.blocks),
+        strict=True,
+    ):
+        assert torch.equal(expected, actual)
 
 
 def test_rls_mode_builds_a_default_fitter_when_omitted():
@@ -596,3 +1446,411 @@ def test_rls_mode_requires_ttt_lora_contour():
     model = HAGI(cfg)
     with pytest.raises(ValueError, match="ttt_lora.enabled=True is required"):
         si.self_improve(model, cfg, [1, 2, 3, 4], mode="rls", n_new_tokens=16)
+
+
+def test_rls_primary_exception_survives_rollback_logging_failure(monkeypatch):
+    """A failing rollback log must not replace the error the caller must see.
+
+    Rollback already failed, so its own diagnostic is the interesting one, but
+    the exception that caused the rollback is what tells the caller what went
+    wrong. A raising log handler would otherwise surface instead of it, and the
+    caller would debug the wrong failure.
+    """
+    cfg = _make_cfg(ttt_lora=True, pyramid=False)
+    model = HAGI(cfg)
+    ttt = _rls(model)
+
+    def exploding_step(*args, **kwargs):
+        raise KeyboardInterrupt("PRIMARY-INTERRUPT")
+
+    def exploding_log(*args, **kwargs):
+        raise RuntimeError("LOGGER-FAIL")
+
+    def failing_restore(*args, **kwargs):
+        raise RuntimeError("RESTORE-FAIL")
+
+    monkeypatch.setattr(ttt, "step", exploding_step)
+    monkeypatch.setattr(ttt, "restore_state", failing_restore)
+    monkeypatch.setattr(si.logger, "exception", exploding_log)
+
+    with pytest.raises(KeyboardInterrupt, match="PRIMARY-INTERRUPT"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            mode="rls",
+            ttt=ttt,
+            n_new_tokens=16,
+            max_iterations=1,
+        )
+
+
+def test_gradient_primary_exception_survives_rollback_logging_failure(monkeypatch):
+    """Same contract for the gradient contour's post-step rollback path.
+
+    The injected failure must happen *after* ``train_step``. Otherwise it exits
+    during pre-scoring and never exercises optimizer rollback. With both adapter
+    restores and the rollback logger failing, there is no coherent pre-state to
+    claim: the primary error must still win, the post recovery must be marked
+    poisoned, and the caller's module modes must remain intact.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    real_score = si._score
+    score_calls = {"count": 0}
+
+    class RecordingOptimizer:
+        def __init__(self) -> None:
+            self.state = {"momentum": torch.tensor([1.0])}
+            self.load_calls = 0
+
+        def state_dict(self) -> dict:
+            return {"state": self.state}
+
+        def load_state_dict(self, state: dict) -> None:
+            self.load_calls += 1
+            self.state = state["state"]
+
+    class PostStepFailingTrainer:
+        def __init__(self) -> None:
+            self.step = 4
+            self.optimizer = RecordingOptimizer()
+
+        def train_step(self, microbatches: list[dict]) -> dict:
+            self.step += 1
+            self.optimizer.state = {"momentum": torch.tensor([9.0])}
+            return {"update_applied": True}
+
+    trainer = PostStepFailingTrainer()
+
+    def failing_second_score(model_arg, input_ids, targets):
+        score_calls["count"] += 1
+        if score_calls["count"] == 1:
+            return real_score(model_arg, input_ids, targets)
+        raise KeyboardInterrupt("GRAD-PRIMARY")
+
+    def exploding_log(*args, **kwargs):
+        raise RuntimeError("LOGGER-FAIL")
+
+    def failing_adapter_restore(*args, **kwargs):
+        raise RuntimeError("RESTORE-FAIL")
+
+    monkeypatch.setattr(si, "_score", failing_second_score)
+    monkeypatch.setattr(si, "_restore_adapters", failing_adapter_restore)
+    monkeypatch.setattr(si.logger, "exception", exploding_log)
+
+    with pytest.raises(KeyboardInterrupt, match="GRAD-PRIMARY"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=8,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+
+    assert score_calls["count"] == 2
+    assert trainer.step == 5
+    assert trainer.optimizer.load_calls == 2
+    assert torch.equal(trainer.optimizer.state["momentum"], torch.tensor([9.0]))
+    assert model.training is False
+    assert trainer._hagi_self_improve_rollback_poisoned is True
+
+
+def test_gradient_mode_entry_failure_is_inside_transaction(monkeypatch):
+    """A failing ``model.train()`` before the step must still restore mode."""
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    trainer = Trainer(model, cfg, start_step=7)
+    real_train = model.train
+
+    def fail_after_train(mode: bool = True):
+        result = real_train(mode)
+        if mode is True:
+            raise RuntimeError("MODE-ENTER-SECONDARY")
+        return result
+
+    monkeypatch.setattr(model, "train", fail_after_train)
+    with pytest.raises(RuntimeError, match="MODE-ENTER-SECONDARY"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=4,
+            max_iterations=1,
+            kl_max=1.0,
+            trainer=trainer,
+        )
+
+    assert model.training is False
+    assert all(module.training is False for module in model.modules())
+    assert trainer.step == 7
+
+
+def _hostile_eval_restore(monkeypatch, model) -> None:
+    """Fail only the restore of the caller's mode, not the switch into eval.
+
+    ``model.eval()`` is implemented as ``train(False)``, so a train that rejects
+    every ``False`` would break before the primary error is even raised and
+    would prove nothing. Counting the switches separates the two: the first is
+    the call into scoring, the second is the restore on the way out.
+    """
+    real_train = model.train
+    seen = {"eval_calls": 0}
+
+    def hostile_train(mode: bool = True):
+        if mode is False:
+            seen["eval_calls"] += 1
+            if seen["eval_calls"] > 1:
+                raise RuntimeError("MODE-RESTORE-SECONDARY")
+        return real_train(mode)
+
+    monkeypatch.setattr(model, "train", hostile_train)
+
+
+def test_score_primary_exception_survives_failing_mode_restore(monkeypatch):
+    """Scoring's ``finally`` must not replace the error that stopped it."""
+    cfg = _make_cfg(levels=(1,))
+    model = HAGI(cfg).eval()
+    _hostile_eval_restore(monkeypatch, model)
+
+    def primary_failure(*args, **kwargs):
+        raise KeyboardInterrupt("SCORE-PRIMARY")
+
+    monkeypatch.setattr(model, "forward", primary_failure)
+    ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    with pytest.raises(KeyboardInterrupt, match="SCORE-PRIMARY"):
+        si._score(model, ids, torch.tensor([[2, 3, 4, 5]], dtype=torch.long))
+
+
+def test_generate_primary_exception_survives_failing_mode_restore(monkeypatch):
+    """Generation has the same contract as scoring."""
+    cfg = _make_cfg(levels=(1,))
+    model = HAGI(cfg).eval()
+    _hostile_eval_restore(monkeypatch, model)
+
+    def primary_failure(*args, **kwargs):
+        raise KeyboardInterrupt("GENERATE-PRIMARY")
+
+    monkeypatch.setattr(si, "generate", primary_failure)
+    with pytest.raises(KeyboardInterrupt, match="GENERATE-PRIMARY"):
+        si._generate_trajectory(model, [1, 2, 3], n_new_tokens=2, eos_token_id=0, pad_token_id=-1)
+
+
+def test_reject_branch_warning_failure_restores_training_mode(monkeypatch):
+    """Diagnostics emitted after a rollback must not leak the eval() switch.
+
+    ``trainer.train_step`` puts the model in train mode; the loop owns the
+    caller's mode, so a failure while reporting the rejection has to restore it
+    exactly like the rollback itself does.
+    """
+    cfg = _make_cfg(levels=(1, 2, 4), lr=1.0)
+    model = HAGI(cfg).eval()
+    trainer = Trainer(model, cfg, start_step=3)
+
+    def exploding_warning(*args, **kwargs):
+        raise RuntimeError("simulated logger failure during KL reject")
+
+    monkeypatch.setattr(si.logger, "warning", exploding_warning)
+    with pytest.raises(RuntimeError, match="simulated logger failure during KL reject"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4, 5],
+            n_new_tokens=4,
+            max_iterations=1,
+            kl_max=0.0,
+            trainer=trainer,
+        )
+    assert model.training is False, "caller's eval mode must survive the failure"
+    assert trainer.step == 3, "rejected step must not advance the resume horizon"
+
+
+def test_post_recovery_without_known_horizon_is_poisoned(monkeypatch):
+    """A quarantine with no post horizon is uncertain, not a successful rollback.
+
+    ``post`` pairs the captured post-state with the step that produced it, so a
+    resume from a discarded trainer would otherwise continue from a horizon that
+    no snapshot ever witnessed. Returning ``post`` without writing a known
+    ``post_step`` would leave the trainer reusable against an unverifiable
+    state; the only safe result is an explicit ``poisoned``.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    trainer = Trainer(model, cfg, start_step=3)
+    optimizer = trainer.optimizer
+    pre_params = si._snapshot_adapters(model)
+    pre_opt = si._deepcopy_optimizer_state(optimizer.state_dict())
+    trainer.step = 4
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(0.25)
+    post_params = si._snapshot_adapters(model)
+    post_opt = si._deepcopy_optimizer_state(optimizer.state_dict())
+
+    class FailingPreOptimizer:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+            self.calls = 0
+
+        def state_dict(self) -> dict:
+            return self.wrapped.state_dict()
+
+        def load_state_dict(self, state: dict) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("PRE-OPT-FAIL")
+            self.wrapped.load_state_dict(state)
+
+    status = si._rollback_gradient_transaction(
+        model,
+        trainer,
+        FailingPreOptimizer(optimizer),
+        pre_params,
+        pre_opt,
+        post_params,
+        post_opt,
+        pre_step=3,
+        post_step=None,
+    )
+
+    assert status == "poisoned"
+    assert getattr(trainer, "_hagi_self_improve_rollback_poisoned", False) is True
+
+
+def test_post_recovery_with_attribute_rejection_uses_weak_quarantine():
+    """A rejected attribute marker must still leave a verifiable quarantine.
+
+    Recovered post-state is coherent, so its local rollback status remains
+    ``post``; it is discard-only. If the trainer rejects the normal attribute
+    marker, the weak fallback must still make the next public entry reject reuse.
+    Returning ``post`` while leaving no readable quarantine would let the entry
+    gate read the missing attribute as ``False``.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+
+    class MarkerRejectingTrainer:
+        __hash__ = None  # quarantine must not depend on injected hashability
+
+        def __init__(self) -> None:
+            self.step = 4
+            self.optimizer = object()
+
+        def __setattr__(self, name, value):
+            if name == "_hagi_self_improve_rollback_poisoned":
+                raise RuntimeError("POISON-MARKER-REJECTED")
+            super().__setattr__(name, value)
+
+    trainer = MarkerRejectingTrainer()
+    pre_params = si._snapshot_adapters(model)
+    trainer.step = 5
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(0.25)
+    post_params = si._snapshot_adapters(model)
+
+    class OneShotFailingOptimizer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def state_dict(self) -> dict:
+            return {}
+
+        def load_state_dict(self, state: dict) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("PRE-OPT-FAIL")
+
+    optimizer = OneShotFailingOptimizer()
+    status = si._rollback_gradient_transaction(
+        model,
+        trainer,
+        optimizer,
+        pre_params,
+        {},
+        post_params,
+        {},
+        pre_step=3,
+        post_step=4,
+    )
+
+    assert optimizer.calls == 2, "post recovery itself must be complete"
+    assert status == "post"
+    assert getattr(trainer, "_hagi_self_improve_rollback_poisoned", False) is False
+    with pytest.raises(RuntimeError, match="trainer is poisoned"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=2,
+            max_iterations=1,
+            kl_max=1.0,
+            trainer=trainer,
+        )
+
+
+def test_unverifiable_quarantine_returns_poisoned():
+    """A trainer that can store no readable marker is explicitly poisoned.
+
+    This is the exhausted fallback case: the instance refuses marker
+    assignment and cannot be weakly referenced. The coherent post-pair may
+    remain, but there is no durable proof that the trainer is discard-only, so
+    the rollback must not report ``post``.
+    """
+    class UnmarkableTrainer:
+        __slots__ = ("step",)
+
+        def __init__(self) -> None:
+            self.step = 4
+
+    trainer = UnmarkableTrainer()
+    assert si._poison_gradient_trainer(trainer) is False
+    assert not hasattr(trainer, "_hagi_self_improve_rollback_poisoned")
+
+
+def test_gradient_rollback_restores_requires_grad_flags():
+    """``requires_grad`` is transaction state, not a training-time optimisation.
+
+    A trainer that both mutates a value and clears the flag leaves the
+    parameter excluded from every future update. Restoring only the values of
+    parameters that still require grad would report a successful rollback while
+    the adapter stays permanently frozen, so the flag itself must be restored.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    Trainer(model, cfg)
+    from hagi.model.adaptive import adaptive_parameters
+
+    params = adaptive_parameters(model)
+    assert params, "precondition: the contour must own adaptive parameters"
+    snapshot = si._snapshot_adapters(model)
+    with torch.no_grad():
+        for parameter in params:
+            parameter.add_(0.25)
+            parameter.requires_grad_(False)
+
+    si._restore_adapters(model, snapshot)
+
+    for parameter in params:
+        assert parameter.requires_grad is True
+        assert torch.equal(
+            parameter.detach(), snapshot[id(parameter)][0]
+        ), "value must be restored together with the flag"
+
+
+def test_gradient_rollback_reports_failure_when_no_adaptive_param_matches():
+    """A snapshot whose parameters are all gone must not report success.
+
+    Restoring zero parameters while the snapshot is non-empty means the
+    transaction's model half was never applied, so the caller has to see a
+    failure instead of pairing mismatched state with a healthy-looking
+    optimizer.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+    with pytest.raises(RuntimeError, match="adaptive parameter snapshot mismatch"):
+        si._restore_adapters(model, {id(object()): (torch.zeros(1), True)})
