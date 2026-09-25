@@ -1578,6 +1578,71 @@ def test_commit_fences_lease_takeover_through_pointer_publication(
     assert store.read_parent() == replacement
 
 
+def test_parent_cas_fences_lease_takeover_through_pointer_publication(
+    tmp_path: Path, monkeypatch
+):
+    """The replacement-CAS fence must cover the whole pointer publication.
+
+    ``compare_and_swap_parent`` carries its own generation fence, separate
+    from the one in ``commit_accepted_terminal``. That fence had no test:
+    deleting it left the entire orchestrator suite green, so it was a
+    comment claiming a guarantee rather than a guarantee. The takeover is
+    therefore injected inside the locked region, exactly as
+    ``test_commit_fences_lease_takeover_through_pointer_publication`` does
+    for the commit path.
+
+    Removing ``locks.enter_context(self._recovery_locks(...))`` from
+    ``compare_and_swap_parent`` makes ``takeover_succeeded`` true and this
+    test fails.
+    """
+    # ``compare_and_swap_parent`` with an accepted decision is reached in
+    # practice on the idempotent replay path: a crash after the terminal
+    # commit re-enters the CAS with the same accepted decision, and the
+    # binding revalidation still happens under the generation fence.
+    store, old, decision, replacement = _accepted_replacement(tmp_path)
+    run = tmp_path / "g1"
+    lease_path = run / ".owner.lease"
+    assert (run / "report.json").is_file()
+    assert store.read_parent() == replacement
+
+    # Now inject the takeover inside the locked region of the CAS.
+    original = store._accepted_decision_binds
+    takeover_succeeded = False
+    calls = []
+
+    def takeover_during_locked_validation(generation_id, pointer, bound):
+        nonlocal takeover_succeeded
+        calls.append(generation_id)
+        result = original(generation_id, pointer, bound)
+        # Only the call made under the fence is inside the CAS window; the
+        # pre-lock call happens before the lock is taken.
+        if len(calls) < 2:
+            return result
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease["expires_at"] = 0
+        lease_path.write_bytes(canonical_json_bytes(lease))
+        try:
+            store.recover_stale_lock(
+                "g1", "owner-b", "takeover raced parent CAS", lease_seconds=60
+            )
+        except ValueError as exc:
+            assert "locked" in str(exc)
+        else:
+            takeover_succeeded = True
+        return result
+
+    monkeypatch.setattr(store, "_accepted_decision_binds", takeover_during_locked_validation)
+    store.compare_and_swap_parent(
+        old, replacement, owner_id="owner-a", accepted_decision=decision
+    )
+
+    assert not takeover_succeeded, (
+        "lease takeover committed inside the parent CAS window; the generation "
+        "fence did not cover pointer publication"
+    )
+    assert store.read_parent() == replacement
+
+
 def test_report_crash_window_recovers_report_and_state(tmp_path: Path, monkeypatch):
     store = GrowthRunStore(tmp_path)
     store.reserve("g0", owner_id="owner")
