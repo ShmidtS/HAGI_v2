@@ -38,6 +38,9 @@ def main() -> int:
     parser.add_argument("--mixer-init-scale", type=float, default=0.0)
     parser.add_argument("--drop-expert-mixers", action="store_true",
                         help="ignore mixers.* in expert states (hierarchical merge)")
+    parser.add_argument("--expert-weight-format", choices=("ternary_master", "effective_sparse"),
+                        default=None,
+                        help="expert tensor provenance override (default: config value)")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -90,6 +93,7 @@ def main() -> int:
         n_mixers=args.n_mixers,
         mixer_init_scale=args.mixer_init_scale,
         drop_expert_mixers=args.drop_expert_mixers,
+        expert_weight_source=args.expert_weight_format,
     )
     model = model.to(args.device)
     counts = model.param_summary()
@@ -100,6 +104,8 @@ def main() -> int:
 
     out = args.out or f"{cfg.train.checkpoint_dir}/step-0000000.pt"
     Path(out).parent.mkdir(parents=True, exist_ok=True)
+    if args.expert_weight_format is not None:
+        cfg.merge.expert_weight_source = args.expert_weight_format
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "model": model.state_dict(),

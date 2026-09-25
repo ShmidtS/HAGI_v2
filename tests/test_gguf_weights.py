@@ -211,6 +211,7 @@ def test_gpu_footprint_is_reported_in_gib():
 def _hf_param_names():
     """The real Qwen3_5 text stack, built on meta so it allocates nothing."""
     import json
+
     import torch
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
