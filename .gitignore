@@ -95,7 +95,11 @@ glm5_kvp/
 models/
 reports/
 .pi/
+artifacts/
 *.diff
+
+# Local pytest basetemp directories (regenerable test state, not project data)
+/.tmp-*/
 
 # vendored llama.cpp forks — each has its own .git and its own remotes;
 # tracked upstream, never in this repo (2.4 GB of build trees + .git)
