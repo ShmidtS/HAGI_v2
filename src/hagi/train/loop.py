@@ -29,9 +29,9 @@ import torch
 from torch import nn
 
 from hagi.config import Config
-from hagi.model.adapters import BlockAdapter
+from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
-from hagi.model.ternary import cache_ternary_weights, clear_ternary_weights
+from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 
 logger = logging.getLogger(__name__)
@@ -104,37 +104,42 @@ def configure_runtime() -> None:
     torch.set_float32_matmul_precision("high")
 
 
-def cast_model(model: nn.Module, precision: str) -> None:
-    """Cast the model to ``precision``, keeping marked parameters in fp32.
+def cast_model(model: nn.Module, precision: str, *, ternary_fp32_master: bool = False) -> None:
+    """Cast the model to ``precision`` and keep selected masters in FP32.
 
-    A parameter is kept in fp32 when its module sets ``keep_fp32 = True``. Three
-    kinds carry the marker, for the same underlying reason — a small parameter
-    whose meaningful updates are below bf16's local resolution:
+    ``keep_fp32`` always protects sensitive scalar/gain modules. When
+    ``ternary_fp32_master`` is true, ``BitLinear.weight`` masters are also
+    restored to FP32 after the BF16 cast; the effective ternary weight is still
+    cast to the activation dtype in each forward. This is a training/master
+    precision switch, not physical packed storage.
 
-    * **Normalization gains.** A gain at 1.0 receives gradients around 1e-4 to
-      1e-5. The smallest bf16 step above 1.0 is ~0.0078, so those updates round
-      to zero and every normalization layer stays frozen at its initialization
-      for the entire run.
-    * **The receiver gain.** One scalar controlling the whole output
-      distribution's sharpness, starting at ``1/sqrt(H)`` ~0.022.
-
-    Cost is a few times ``L * H`` parameters' worth of memory, which is
-    negligible against the body, and it is not optional.
-
-    Norm variance precision follows ``precision`` when the module was built with
-    ``fp32_variance=True`` (the default): under bf16 the fused kernel is 5x
-    faster and numerically identical (verified max diff 0.0), so the variance
-    accumulator is switched to the input dtype.
+    Normalization gains and the receiver gain are kept in FP32 because their
+    small updates are below BF16's local resolution at typical magnitudes.
+    Norm variance follows the activation dtype under BF16 for the existing
+    fused-kernel path.
     """
     if precision == "fp32":
         return
-    model.to(torch.bfloat16)
+    protected_params: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+    ternary_params: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
     for module in model.modules():
         if getattr(module, "keep_fp32", False):
-            for param in module.parameters(recurse=False):
-                param.data = param.data.float()
+            protected_params.extend(
+                (param, param.detach().clone())
+                for param in module.parameters(recurse=False)
+            )
+        if ternary_fp32_master and isinstance(module, BitLinear):
+            ternary_params.append((module.weight, module.weight.detach().clone()))
+    model.to(torch.bfloat16)
+    for module in model.modules():
         if isinstance(module, (RMSNorm, HeadNorm, BlockRMSNorm)):
             module.fp32_variance = False
+    for param, snapshot in protected_params:
+        param.data = param.data.float()
+        param.data.copy_(snapshot)
+    for param, snapshot in ternary_params:
+        param.data = param.data.float()
+        param.data.copy_(snapshot)
 
 
 def clip_gradients(model: nn.Module, max_norm: float) -> float:
@@ -164,19 +169,8 @@ def clip_gradients_by_group(
 
 
 def _freeze_base_for_adapters(model: nn.Module) -> None:
-    """Freeze all parameters except the parameters owned by block adapters."""
-    adapter_params = {
-        id(param)
-        for module in model.modules()
-        if isinstance(module, BlockAdapter)
-        for param in module.parameters()
-    }
-    if not adapter_params:
-        raise RuntimeError(
-            "train.adapt.freeze_base=True requires at least one attached BlockAdapter"
-        )
-    for param in model.parameters():
-        param.requires_grad_(id(param) in adapter_params)
+    """Backward-compatible alias for the explicit adaptive ownership helper."""
+    freeze_base_in_place(model)
 
 
 class Trainer:
@@ -192,13 +186,22 @@ class Trainer:
         self.model = model
         self.cfg = cfg
         self.step = start_step
-        cast_model(model, cfg.train.precision)
-        if cfg.model.adapters.enabled and cfg.train.adapt.freeze_base:
+        cast_model(
+            model,
+            cfg.train.precision,
+            ternary_fp32_master=cfg.train.ternary_fp32_master,
+        )
+        if (
+            cfg.model.adapters.enabled
+            or cfg.model.cortex.enabled
+            or cfg.model.decision.enabled
+        ) and cfg.train.adapt.freeze_base:
             _freeze_base_for_adapters(model)
         elif cfg.train.adapt.freeze_base:
             raise ValueError(
-                "train.adapt.freeze_base=True requires model.adapters.enabled=True "
-                "(no adapter parameters exist to optimize when adapters are disabled)"
+                "train.adapt.freeze_base=True requires model.adapters.enabled=True, "
+                "model.cortex.enabled=True, or model.decision.enabled=True"
+                " (no adaptive parameters exist to optimize when all are disabled)"
             )
         if getattr(cfg.train, "compile_model", False):
             # ROCm flash-attention backward breaks torch.compile (a fake/meta
@@ -236,17 +239,15 @@ class Trainer:
         model.train()
         device = next(model.parameters()).device
         self.optimizer.zero_grad(set_to_none=True)
-        adapter_only = cfg.model.adapters.enabled and cfg.train.adapt.freeze_base
-
-        # OFDM coherence interval: the ternary map Q*s is constant across the
-        # microbatches of one optimizer step (the master W only changes on
-        # optimizer.step). Cache it once; clear after the step so the next
-        # step recomputes against the updated master. Always on: the cached
-        # path is also the host-bound fix (zero per-forward copies), so it is
-        # a win even at grad_accum=1.
+        # Decision-only is an explicit pre-registered experimental mode: the
+        # caller supplies decision labels and omits LM targets. It is not a
+        # fallback; ``receiver='decision_only'`` and the independent decision
+        # denominator make that choice observable. Empty scored steps remain
+        # fail-closed above.
+        adaptive_only = cfg.train.adapt.freeze_base
         use_ternary_cache = (
             cfg.model.ternary.enabled
-            and not adapter_only
+            and not adaptive_only
             and getattr(cfg.train, "ternary_step_cache", True)
         )
         if use_ternary_cache:
@@ -259,29 +260,49 @@ class Trainer:
         keep_mode = str(getattr(cfg.train, "ce_keep_mode", "bernoulli"))
 
         # Weight each microbatch by its scored-token count so unequal microbatches
-        # average correctly rather than over-weighting sparse ones.
-        prepared: list[tuple[dict, torch.Tensor | None]] = []
+        # average correctly rather than over-weighting sparse ones. Decision rows
+        # use an independent denominator: the auxiliary objective must not change
+        # when a sequence contains more language tokens.
+        prepared: list[tuple[dict, torch.Tensor, torch.Tensor]] = []
         token_counts: list[torch.Tensor] = []
+        decision_counts: list[torch.Tensor] = []
         for batch in microbatches:
             ids = batch["input_ids"].to(device)
-            targets = batch["targets"].to(device)
+            targets = batch["targets"].to(device) if "targets" in batch else None
             base_mask = batch["loss_mask"].to(device) if "loss_mask" in batch else None
-            mask = puncture_loss_mask(
-                tuple(targets.shape),
-                rate=keep_rate,
-                mode=keep_mode,
-                step=self.step,
-                device=device,
-                base=base_mask,
-            )
-            # Keep counts on device.  Converting each mask sum with int() forced
-            # one full HIP stream synchronization per microbatch.
-            count = (
-                mask.sum(dtype=torch.int64)
-                if mask is not None
-                else torch.tensor(targets.numel(), device=device, dtype=torch.int64)
-            )
-            token_counts.append(count.clamp_min(1))
+            if targets is not None:
+                mask = puncture_loss_mask(
+                    tuple(targets.shape),
+                    rate=keep_rate,
+                    mode=keep_mode,
+                    step=self.step,
+                    device=device,
+                    base=base_mask,
+                )
+                count = (
+                    mask.sum(dtype=torch.int64)
+                    if mask is not None
+                    else torch.tensor(targets.numel(), device=device, dtype=torch.int64)
+                )
+            else:
+                mask = None
+                count = torch.zeros((), device=device, dtype=torch.int64)
+            decision_targets = batch.get("decision_targets")
+            if decision_targets is not None:
+                decision_targets = decision_targets.to(device)
+            decision_mask = batch.get("decision_mask")
+            if decision_mask is not None:
+                decision_mask = decision_mask.to(device)
+            if decision_targets is not None:
+                decision_count = (
+                    decision_mask.sum(dtype=torch.int64)
+                    if decision_mask is not None
+                    else torch.tensor(decision_targets.numel(), device=device, dtype=torch.int64)
+                )
+            else:
+                decision_count = torch.zeros((), device=device, dtype=torch.int64)
+            token_counts.append(count)
+            decision_counts.append(decision_count)
             prepared.append(
                 (
                     {
@@ -293,19 +314,28 @@ class Trainer:
                         "spectrograms": batch["spectrograms"].to(device)
                         if "spectrograms" in batch
                         else None,
+                        "decision_targets": decision_targets,
+                        "decision_mask": decision_mask,
                     },
-                    mask,
+                    count,
+                    decision_count,
                 )
             )
-        total_tokens = torch.stack(token_counts).sum().clamp_min(1)
+        total_tokens = torch.stack(token_counts).sum()
+        total_decisions = torch.stack(decision_counts).sum()
+        total_tokens_normalized = total_tokens.clamp_min(1)
+        total_decisions_normalized = total_decisions.clamp_min(1)
+        if int(total_tokens) == 0 and int(total_decisions) == 0:
+            raise ValueError("train_step received no scored LM tokens or decision rows")
 
         ce_sum = torch.zeros((), device=device, dtype=torch.float32)
         loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         z_sum = torch.zeros((), device=device, dtype=torch.float32)
+        decision_sum = torch.zeros((), device=device, dtype=torch.float32)
         exact_ce_value: float | None = None
         exact_interval = int(cfg.train.logging.exact_ce_interval)
-        for microbatch_index, ((batch, _mask), count) in enumerate(
-            zip(prepared, token_counts, strict=True)
+        for microbatch_index, ((batch, count, decision_count),) in enumerate(
+            zip(prepared, strict=True)
         ):
             # non_blocking=True on .to() is disabled: on this ROCm build the
             # async H2D transfer raced the compute stream and produced
@@ -326,8 +356,15 @@ class Trainer:
                 loss_mask=batch["loss_mask"],
                 images=batch["images"],
                 spectrograms=batch["spectrograms"],
+                decision_targets=batch["decision_targets"],
+                decision_mask=batch["decision_mask"],
             )
-            if microbatch_index == 0 and exact_interval > 0 and self.step % exact_interval == 0:
+            if (
+                microbatch_index == 0
+                and exact_interval > 0
+                and self.step % exact_interval == 0
+                and batch["targets"] is not None
+            ):
                 flat_hidden = output.hidden.detach().reshape(-1, output.hidden.shape[-1])
                 flat_targets = batch["targets"].reshape(-1)
                 rows = min(int(cfg.train.logging.exact_ce_rows), flat_targets.numel())
@@ -344,13 +381,27 @@ class Trainer:
                             flat_targets.index_select(0, sample),
                         )
                     )
-            weight = count.to(torch.float32) / total_tokens
-            (output.loss * weight).backward()
-
-            ce_sum = ce_sum + output.ce.detach().float() * weight
-            loss_sum = loss_sum + output.loss.detach().float() * weight
-            if output.z_loss is not None:
-                z_sum = z_sum + output.z_loss.detach().float() * weight
+            lm_weight = count.to(torch.float32) / total_tokens_normalized if output.lm_loss is not None else None
+            decision_weight = (
+                decision_count.to(torch.float32) / total_decisions_normalized
+                if output.decision_loss is not None
+                else None
+            )
+            objective = None
+            if output.lm_loss is not None:
+                objective = output.lm_loss * lm_weight
+            if output.decision_loss is not None:
+                weighted = float(cfg.model.decision.loss_weight) * output.decision_loss * decision_weight
+                objective = weighted if objective is None else objective + weighted
+            if objective is not None:
+                objective.backward()
+                loss_sum = loss_sum + objective.detach().float()
+                if output.ce is not None and lm_weight is not None:
+                    ce_sum = ce_sum + output.ce.detach().float() * lm_weight
+                if output.z_loss is not None and lm_weight is not None:
+                    z_sum = z_sum + output.z_loss.detach().float() * lm_weight
+                if output.decision_loss is not None and decision_weight is not None:
+                    decision_sum = decision_sum + output.decision_loss.detach().float() * decision_weight
             del output
 
         body_norm_raw, rest_norm_raw = clip_gradients_by_group(model, cfg.train.max_grad_norm)
@@ -389,21 +440,30 @@ class Trainer:
         if use_ternary_cache:
             clear_ternary_weights(model)
 
-        if not adapter_only and hasattr(model, "commit_controller_updates"):
+        if not adaptive_only and hasattr(model, "commit_controller_updates"):
             model.commit_controller_updates()
 
         # Metrics cross the device boundary once, after all scheduled GPU work.
         # Previously every float()/int() below synchronized the HIP stream.
-        loss_value, ce_value, z_value, tokens_value = torch.stack(
-            (loss_sum, ce_sum, z_sum, total_tokens.to(torch.float32))
+        loss_value, ce_value, z_value, tokens_value, decision_value, decisions_value = torch.stack(
+            (loss_sum, ce_sum, z_sum, total_tokens.to(torch.float32), decision_sum, total_decisions.to(torch.float32))
         ).tolist()
-        receiver = "conditional_nce" if cfg.model.head.sampled_softmax_k > 0 else "exact_ce"
+        has_lm_objective = tokens_value > 0
+        receiver = (
+            "conditional_nce"
+            if cfg.model.head.sampled_softmax_k > 0
+            else "exact_ce"
+        )
+        if not has_lm_objective and decisions_value > 0:
+            receiver = "decision_only"
+        if not has_lm_objective:
+            ce_value = None
         metrics = {
             "step": self.step,
             "loss": loss_value,
             "ce": ce_value,
-            "bpt": ce_value / math.log(2.0),
-            "ppl": math.exp(min(ce_value, 20.0)),
+            "bpt": ce_value / math.log(2.0) if ce_value is not None else None,
+            "ppl": math.exp(min(ce_value, 20.0)) if ce_value is not None else None,
             "z_loss": z_value,
             "grad_norm": body_norm,
             "body_grad_norm": body_norm,
@@ -411,11 +471,15 @@ class Trainer:
             "lr": adam_lr,
             "muon_lr": muon_lr,
             "tokens": int(tokens_value),
+            "n_decisions": int(decisions_value),
+            "decision_loss": decision_value if decisions_value > 0 else None,
             "ce_keep_rate": keep_rate,
             "receiver": receiver,
             "update_applied": True,
         }
-        if receiver == "conditional_nce":
+        if receiver == "decision_only":
+            metrics["lm_ce"] = None
+        elif receiver == "conditional_nce":
             metrics["nce"] = ce_value
             metrics["nce_bits"] = ce_value / math.log(2.0)
         if exact_ce_value is not None:
@@ -434,6 +498,11 @@ def format_metrics(metrics: dict) -> str:
     if not metrics.get("update_applied", True):
         return f"step {metrics['step']} | skipped"
     receiver = metrics.get("receiver", "exact_ce")
+    if receiver == "decision_only":
+        return (
+            f"step {metrics['step']} | decision_loss="
+            f"{metrics.get('decision_loss', 0.0):.4f} | decisions={metrics.get('n_decisions', 0)}"
+        )
     objective_name = "nce" if receiver == "conditional_nce" else "ce"
     bits_name = "nce_bits" if receiver == "conditional_nce" else "bpt"
     parts = [

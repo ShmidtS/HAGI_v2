@@ -9,7 +9,7 @@
 #   [5] joint-train the merged model to saturation
 #
 # Usage: bash scripts/run_growth_cycle.sh
-set -u
+set -euo pipefail
 cd /c/HAGI_v2
 
 PY=".venv/Scripts/python.exe"
@@ -21,10 +21,13 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 wait_pid() {
   local pid="$1"
   log "waiting for PID $pid to exit..."
-  while kill -0 "$pid" 2>/dev/null; do
-    sleep 10
-  done
-  log "PID $pid exited"
+  if wait "$pid"; then
+    log "PID $pid exited successfully"
+  else
+    local status=$?
+    log "ERROR: PID $pid exited with status $status"
+    return "$status"
+  fi
 }
 
 latest_ckpt() { ls -1 "$1"/*.pt 2>/dev/null | sort | tail -1; }
