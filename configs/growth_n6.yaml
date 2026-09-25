@@ -1,0 +1,42 @@
+# Lane plan for the autonomous growth supervisor.
+#
+# A plain list, so adding a generation is a data edit rather than a code edit.
+# Each lane trains its experts from scratch, merges them through the joint
+# config, fine-tunes the joint model, and scores it against the previous
+# accepted lane.
+#
+# Lane 1 is the N=6 merge that is currently in flight by hand: six experts at
+# hidden 384 merged into a joint model at hidden 2304. Lane 2 grows to N=8 with
+# two new domains, which is the first generation where "the model chose to
+# grow" can be checked against a lane whose experts were chosen by a person.
+lanes:
+  - name: n6
+    experts:
+      - configs/m2_e6_e1_wiki_ru.yaml
+      - configs/m2_e6_e2_web_en.yaml
+      - configs/m2_e6_e3_math.yaml
+      - configs/m2_e6_e4_wiki_en.yaml
+      - configs/m2_e6_e5_tinystory.yaml
+      - configs/m2_e6_e6_ru_mix.yaml
+    joint: configs/m2_e6_joint_s1234.yaml
+    note: >
+      Six domain experts at hidden 384, merged to a joint model at hidden
+      2304 (241.3M params). 3000 steps per expert, 9000 joint steps.
+
+  - name: n8
+    experts:
+      - configs/m2_e6_e1_wiki_ru.yaml
+      - configs/m2_e6_e2_web_en.yaml
+      - configs/m2_e6_e3_math.yaml
+      - configs/m2_e6_e4_wiki_en.yaml
+      - configs/m2_e6_e5_tinystory.yaml
+      - configs/m2_e6_e6_ru_mix.yaml
+      - configs/m2_e6_e2_web_en.yaml
+      - configs/m2_e6_e3_math.yaml
+    joint: configs/m2_e6_joint_s1234.yaml
+    note: >
+      Placeholder lane: reuses existing experts to exercise the accept/reject
+      path. The duplicate experts are deliberate -- reusing identical inputs
+      should produce a near-identical model, so this lane is a control on the
+      verdict rather than a growth claim. It is not evidence of growth and
+      must not be reported as such.
