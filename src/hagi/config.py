@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 CHECKPOINT_FORMAT_VERSION = 12
 
@@ -314,6 +315,43 @@ class AdaptersConfig:
 
 
 @dataclass
+class PyramidalCortexConfig:
+    """Directed low-rank side memory between contiguous model levels.
+
+    The cortex is disabled by default. When enabled, unique transformer blocks
+    are split into ``num_levels`` contiguous groups. At each group boundary a
+    same-token bottleneck summary is published and only earlier levels feed a
+    later boundary through positive ``link_strides`` offsets. No state survives
+    a forward call or generation step.
+
+    Attributes:
+        enabled: build the model-global cortex side channel.
+        num_levels: number of contiguous layer levels; must be between 2 and
+            ``model.num_layers``.
+        rank: bottleneck width shared by feature and reconstruction maps.
+        link_strides: positive, unique, sorted offsets from an earlier level.
+            ``(1, 2)`` is the default adjacent-plus-skip highway.
+        residual_scale: fixed multiplier on the reconstructed residual.
+    """
+
+    enabled: bool = False
+    num_levels: int = 4
+    rank: int = 64
+    link_strides: tuple[int, ...] = (1, 2)
+    residual_scale: float = 0.1
+
+
+@dataclass
+class DecisionConfig:
+    """Opt-in finite-option decision plane over the final causal state."""
+
+    enabled: bool = False
+    num_options: int = 4
+    loss_weight: float = 1.0
+    confidence_bins: int = 10
+
+
+@dataclass
 class ModelConfig:
     """Full architecture."""
 
@@ -351,6 +389,8 @@ class ModelConfig:
     head: HeadConfig = field(default_factory=HeadConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
     adapters: AdaptersConfig = field(default_factory=AdaptersConfig)
+    cortex: PyramidalCortexConfig = field(default_factory=PyramidalCortexConfig)
+    decision: DecisionConfig = field(default_factory=DecisionConfig)
 
 
 @dataclass
@@ -501,13 +541,13 @@ class LoggingConfig:
 
 @dataclass
 class AdaptConfig:
-    """Online training policy for the opt-in residual adapters.
+    """Online training policy for opt-in adaptive components.
 
     Attributes:
-        freeze_base: when True, freeze every non-adapter parameter and train
-            only pyramid ``scale`` and TTT-LoRA ``lora_B`` through the existing
-            CE objective and AdamW partition. This setting is inert while
-            ``model.adapters.enabled`` is False.
+        freeze_base: freeze every non-adaptive parameter and train only
+            components marked by :class:`AdaptiveComponent` (BlockAdapter and/or
+            PyramidalCortex) through the existing CE objective and optimizer
+            partition. At least one such component must be enabled.
     """
 
     freeze_base: bool = False
@@ -540,6 +580,11 @@ class TrainConfig:
     # per-direction isotropy Muon provides buys nothing that AdamW does not.
     # Default off; Muon remains selectable for fp16/dense bodies where it helps.
     use_muon: bool = False
+    # Keep BitLinear master weights in fp32 while BF16 activations and matmuls
+    # use BF16 effective ternary weights. Disabled by default to preserve
+    # legacy BF16 behavior; this changes training/master precision, not
+    # physical packed storage.
+    ternary_fp32_master: bool = False
     # Freeze BitLinear ternary maps once per optimizer step across grad_accum
     # microbatches (OFDM coherence-interval analogy). Masters only change on
     # optimizer.step, so re-quantizing every microbatch is pure waste. STE via
@@ -666,11 +711,27 @@ class MergeConfig:
             experts' own combined output (router-weighted sum, when the
             experts carry a router); otherwise a path to an external teacher
             (e.g. a DeepSeek MoE checkpoint assembled brick-by-brick).
+        ternary_tree_schema_version: schema version of the fixed ternary tree
+            transform, pinned at 1.
+        ternary_lift_mode: which outer ternary lift the recursive
+            ``ternary_f3`` body uses. The default ``"f3_tree"`` keeps the legacy
+            staged :class:`~hagi.model.merge.TernaryF3Tree` behavior
+            byte-for-byte. The explicit opt-in ``"parent_preserving"`` uses the
+            orthogonal
+            :class:`~hagi.model.merge.ParentPreservingTernaryLift`, which fixes
+            the all-equal direction, so lifting three identical parent copies
+            preserves the parent logits instead of aggregating them. The mode
+            is never inferred and applies only to ``mixer_type="ternary_f3"``.
+
     """
 
     enabled: bool = False
     n_experts: int = 4
     expert_hidden: int = 128
+    expert_weight_source: str = "ternary_master"
+    ternary_depth: int = 0
+    ternary_tree_schema_version: int = 1
+    ternary_lift_mode: str = "f3_tree"
     expert_checkpoints: list[str] = field(default_factory=list)
     mixer_init_scale: float = 0.0
     freeze_experts: bool = False
@@ -682,6 +743,12 @@ class MergeConfig:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     distill_teacher: str = "self"
+
+
+# Outer ternary lifts available to the recursive ``ternary_f3`` body. The
+# order is explicit: ``f3_tree`` is the legacy staged transform and stays the
+# default, so nothing changes unless a caller opts in.
+_TERNARY_LIFT_MODES = ("f3_tree", "parent_preserving")
 
 
 @dataclass
@@ -780,13 +847,42 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
         if ad.ttt_lora.enabled:
             # Frozen A (not a parameter, persistent=False) + trainable B[r, H].
             adapter += n * ad.ttt_lora.rank * h
+
+    cortex = 0
+    cx = cfg.cortex
+    if cx.enabled:
+        source_levels = {
+            level - stride
+            for level in range(cx.num_levels)
+            for stride in cx.link_strides
+            if level - stride >= 0
+        }
+        target_levels = {
+            level
+            for level in range(cx.num_levels)
+            if any(level - stride >= 0 for stride in cx.link_strides)
+        }
+        edges = [
+            (source, target)
+            for target in range(cx.num_levels)
+            for stride in cx.link_strides
+            if (source := target - stride) >= 0
+        ]
+        cortex = (
+            len(source_levels) * h * cx.rank
+            + len(target_levels) * cx.rank * h
+            + len(edges) * cx.rank * cx.rank
+        )
+    decision = h * cfg.decision.num_options if cfg.decision.enabled else 0
     return {
         "embedding": embed,
         "lm_head": head,
         "body": body,
         "adapter": adapter,
-        "total": embed + head + body + adapter,
-        "active_body": body + adapter,
+        "cortex": cortex,
+        "decision": decision,
+        "total": embed + head + body + adapter + cortex + decision,
+        "active_body": body + adapter + cortex + decision,
     }
 
 
@@ -888,11 +984,33 @@ def _apply_dict(obj: object, data: dict) -> None:
             setattr(obj, key, value)
 
 
+def _expand_root(value: object, root: Path) -> object:
+    """Interpolate ``${HAGI_ROOT}`` in a config string path.
+
+    Checkpoint lists previously hardcoded ``C:\\HAGI_v2\\...``, which pinned
+    every run to one checkout and made an isolated worktree unable to load its
+    own experts. ``${ENV_VAR}`` interpolation is the convention already used
+    for secrets in this project; this reuses it for the repository root so no
+    new mechanism is introduced. Non-strings pass through untouched.
+    """
+    if isinstance(value, str) and "${HAGI_ROOT}" in value:
+        return value.replace("${HAGI_ROOT}", root.as_posix())
+    if isinstance(value, list):
+        return [_expand_root(item, root) for item in value]
+    if isinstance(value, dict):
+        return {k: _expand_root(v, root) for k, v in value.items()}
+    return value
+
+
 def load_config(path: str | None = None, **overrides: object) -> Config:
     """Load YAML, optionally auto-size from a body budget, then validate.
 
     Dotted override keys address nested fields, e.g.
     ``load_config(p, **{"train.max_steps": 1000})``.
+
+    ``${HAGI_ROOT}`` in any path is expanded to the repository root (the parent
+    of the ``configs/`` directory holding the YAML, falling back to the current
+    working directory) before validation.
     """
     import yaml
 
@@ -900,6 +1018,10 @@ def load_config(path: str | None = None, **overrides: object) -> Config:
     if path:
         with open(path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
+        config_path = Path(path).resolve()
+        root = config_path.parent.parent if config_path.parent.name == "configs" else Path.cwd()
+        data = _expand_root(data, root)
+
         model_data = data.get("model", {}) or {}
         budget = int(model_data.get("target_params", 0) or 0)
         if budget > 0:
@@ -1029,6 +1151,12 @@ def validate_config(cfg: Config) -> None:
 
     if t.precision not in {"bf16", "fp32"}:
         raise ValueError("train.precision must be 'bf16' or 'fp32'")
+    if type(t.ternary_fp32_master) is not bool:
+        raise ValueError("train.ternary_fp32_master must be a bool")
+    if t.ternary_fp32_master and not m.ternary.enabled:
+        raise ValueError("train.ternary_fp32_master requires model.ternary.enabled=True")
+    if t.ternary_fp32_master and t.precision != "bf16":
+        raise ValueError("train.ternary_fp32_master requires train.precision='bf16'")
     if t.max_grad_norm <= 0:
         raise ValueError("train.max_grad_norm must be positive")
     if t.logging.exact_ce_interval < 0:
@@ -1074,11 +1202,10 @@ def validate_config(cfg: Config) -> None:
     # starts at 0 and TTT-LoRA lora_B starts at 0 when their contour is enabled.
     ad = m.adapters
     ta = t.adapt
-    if ta.freeze_base and not ad.enabled:
+    if ta.freeze_base and not (ad.enabled or m.cortex.enabled or m.decision.enabled):
         raise ValueError(
-            "train.adapt.freeze_base requires model.adapters.enabled=True "
-            "(freeze_base freezes everything except adapter parameters; with "
-            "adapters disabled there is nothing to optimize)"
+            "train.adapt.freeze_base requires model.adapters.enabled=True, "
+            "model.cortex.enabled=True, or model.decision.enabled=True"
         )
     if ad.enabled:
         # At least one contour must be enabled when the master switch is on;
@@ -1127,10 +1254,115 @@ def validate_config(cfg: Config) -> None:
                 "model.adapters.enabled must be True to enable pyramid/ttt_lora"
             )
 
+    cx = m.cortex
+    if cx.enabled:
+        if m.num_layers < 2 or not 2 <= cx.num_levels <= m.num_layers:
+            raise ValueError(
+                "model.cortex.num_levels must be at least 2 and at most model.num_layers"
+            )
+        if type(cx.rank) is not int or not 1 <= cx.rank <= m.hidden_size:
+            raise ValueError(
+                f"model.cortex.rank must be in [1, model.hidden_size], got {cx.rank!r}"
+            )
+        strides = tuple(cx.link_strides)
+        if not strides or any(type(value) is not int or value < 1 for value in strides):
+            raise ValueError("model.cortex.link_strides must contain positive integers")
+        if len(set(strides)) != len(strides):
+            raise ValueError("model.cortex.link_strides entries must be unique")
+        if tuple(sorted(strides)) != strides:
+            raise ValueError("model.cortex.link_strides must be sorted ascending")
+        if strides[-1] >= cx.num_levels:
+            raise ValueError("model.cortex.link_strides must be smaller than num_levels")
+        if not math.isfinite(cx.residual_scale) or cx.residual_scale <= 0.0:
+            raise ValueError("model.cortex.residual_scale must be finite and positive")
+
+    dec = m.decision
+    if type(dec.enabled) is not bool:
+        raise ValueError("model.decision.enabled must be a bool")
+    if type(dec.num_options) is not int or not 2 <= dec.num_options <= 1 << 20:
+        raise ValueError("model.decision.num_options must be an integer in [2, 1048576]")
+    if type(dec.loss_weight) not in (int, float) or not math.isfinite(float(dec.loss_weight)) or dec.loss_weight <= 0:
+        raise ValueError("model.decision.loss_weight must be finite and positive")
+    if type(dec.confidence_bins) is not int or not 1 <= dec.confidence_bins <= 1 << 20:
+        raise ValueError("model.decision.confidence_bins must be an integer in [1, 1048576]")
+
     mg = cfg.merge
+    if type(mg.ternary_lift_mode) is not str or mg.ternary_lift_mode not in _TERNARY_LIFT_MODES:
+        raise ValueError(
+            "merge.ternary_lift_mode must be 'f3_tree' or "
+            f"'parent_preserving', got {mg.ternary_lift_mode!r}"
+        )
+    if mg.ternary_lift_mode != "f3_tree" and mg.mixer_type != "ternary_f3":
+        raise ValueError(
+            "merge.ternary_lift_mode='parent_preserving' requires "
+            "merge.mixer_type='ternary_f3'"
+        )
     if mg.enabled:
-        if mg.mixer_type not in {"swiglu", "hadamard"}:
-            raise ValueError("merge.mixer_type must be 'swiglu' or 'hadamard'")
+        if type(mg.expert_weight_source) is not str or mg.expert_weight_source not in {
+            "ternary_master",
+            "effective_sparse",
+        }:
+            raise ValueError(
+                "merge.expert_weight_source must be 'ternary_master' or 'effective_sparse'"
+            )
+        if type(mg.ternary_depth) is not int or mg.ternary_depth < 0:
+            raise ValueError("merge.ternary_depth must be a nonnegative integer")
+        if type(mg.ternary_tree_schema_version) is not int or mg.ternary_tree_schema_version < 1:
+            raise ValueError("merge.ternary_tree_schema_version must be a positive integer")
+        if mg.mixer_type not in {"swiglu", "hadamard", "ternary_f3"}:
+            raise ValueError("merge.mixer_type must be 'swiglu', 'hadamard', or 'ternary_f3'")
+        if mg.ternary_lift_mode != "f3_tree" and mg.mixer_type != "ternary_f3":
+            raise ValueError(
+                "merge.ternary_lift_mode='parent_preserving' requires "
+                f"merge.mixer_type='ternary_f3', got {mg.mixer_type!r}"
+            )
+        if mg.mixer_type == "ternary_f3":
+            if mg.n_experts != 3:
+                raise ValueError("merge.n_experts must be exactly 3 for ternary_f3")
+            if mg.ternary_depth < 1:
+                raise ValueError("merge.ternary_depth must be >= 1 for ternary_f3")
+            if mg.ternary_tree_schema_version != 1:
+                raise ValueError(
+                    "merge.ternary_tree_schema_version must be 1 for ternary_f3"
+                )
+            if mg.ternary_lift_mode not in _TERNARY_LIFT_MODES:
+                raise ValueError(
+                    "merge.ternary_lift_mode must be 'f3_tree' or "
+                    f"'parent_preserving', got {mg.ternary_lift_mode!r}"
+                )
+            if m.embedding.tie_lm_head:
+                raise ValueError("ternary_f3 requires model.embedding.tie_lm_head=False")
+            if m.embedding.conv_kernel != 1:
+                raise ValueError("ternary_f3 requires model.embedding.conv_kernel=1")
+            if m.head.unigram_prior:
+                raise ValueError(
+                    "ternary_f3 requires head.unigram_prior=False; prior adds once, not per child"
+                )
+            if m.loop_depth != 2:
+                raise ValueError(
+                    "ternary_f3 requires model.loop_depth=2 as the fixed technical self-improve seam"
+                )
+            if t.ternary_fp32_master:
+                raise ValueError(
+                    "ternary_f3 effective_sparse body does not use BitLinear FP32 masters"
+                )
+            if m.cortex.enabled or m.decision.enabled:
+                raise ValueError("ternary_f3 requires cortex and decision disabled")
+            if m.adapters.ttt_lora.enabled:
+                raise ValueError("ternary_f3 forbids model.adapters.ttt_lora")
+            if m.hidden_size % 3:
+                raise ValueError("ternary_f3 requires model.hidden_size divisible by 3")
+            if m.hidden_size // 3 != mg.expert_hidden:
+                raise ValueError(
+                    "ternary_f3 requires merge.expert_hidden == model.hidden_size // 3"
+                )
+            if m.attention.head_dim % 2:
+                raise ValueError("ternary_f3 requires an even attention.head_dim")
+        elif mg.ternary_lift_mode != "f3_tree" and mg.mixer_type != "ternary_f3":
+            raise ValueError(
+                "merge.ternary_lift_mode='parent_preserving' requires "
+                f"merge.mixer_type='ternary_f3', got {mg.mixer_type!r}"
+            )
         if mg.mixer_rank < 1:
             raise ValueError("merge.mixer_rank must be >= 1")
         if mg.mixer_hadamard_groups:
@@ -1166,6 +1398,12 @@ def describe(cfg: Config) -> str:
     bits = math.log2(3) if m.ternary.enabled else 16.0
     loop = max(1, int(m.loop_depth))
     eff_l = m.num_layers * loop
+    weight_line = f"weight rate: {bits:.3f} bits/weight -> body {counts['body'] * bits / 8 / 1e9:.3f} GB packed"
+    if cfg.train.ternary_fp32_master and m.ternary.enabled and cfg.train.precision == "bf16":
+        weight_line = (
+            f"effective ternary rate: {bits:.3f} bits/weight (not physically packed); "
+            "BitLinear master policy: fp32"
+        )
     lines = [
         f"H={m.hidden_size} L={m.num_layers}"
         + (f"x{loop}={eff_l}" if loop > 1 else "")
@@ -1178,9 +1416,11 @@ def describe(cfg: Config) -> str:
         f"attention: {n_full} full / {m.num_layers - n_full} windowed(W={m.sliding.window})",
         f"mm: {'on' if m.multimodal.enabled else 'off'}"
         f" | ternary_cache: {cfg.train.ternary_step_cache}"
+        f" | ternary_fp32_master: {cfg.train.ternary_fp32_master}"
         f" | ce_keep: {cfg.train.ce_keep_rate:g}/{cfg.train.ce_keep_mode}"
-        f" | sampled_k: {m.head.sampled_softmax_k or 'full'}",
-        f"weight rate: {bits:.3f} bits/weight -> body {counts['body'] * bits / 8 / 1e9:.3f} GB packed",
+        f" | sampled_k: {m.head.sampled_softmax_k or 'full'}"
+        + (f" | decision: {m.decision.num_options}" if m.decision.enabled else " | decision: off"),
+        weight_line,
     ]
     return "\n".join(lines)
 

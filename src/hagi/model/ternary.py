@@ -119,8 +119,8 @@ class BitLinear(nn.Module):
         self.out_features = out_features
         self.eps = float(eps)
         # Marks this weight as a 2D hidden-mixing matrix for the optimizer
-        # partition; see hagi.model.ffn.linear for why the marker rather than the
-        # module type is what the partition reads.
+        # partition; see hagi.model.ffn.linear for why the marker rather than
+        # the module type is what the partition reads.
         self.is_channel_weight = True
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.normal_(self.weight, std=in_features**-0.5)
@@ -146,14 +146,17 @@ class BitLinear(nn.Module):
         self._step_q = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         if self._step_q is not None:
             # STE over the precomputed map: forward = q, backward = identity on
             # the master. Zero host-side copies (the host-bound fix).
-            return F.linear(x, _CachedSTE.apply(self.weight, self._step_q), self.bias)
+            eff = _CachedSTE.apply(self.weight, self._step_q).to(x.dtype)
+            return F.linear(x, eff, bias)
         if not torch.is_grad_enabled():
             eff, _ = ternarize(self.weight, self.eps)
-            return F.linear(x, eff.to(x.dtype), self.bias)
-        return F.linear(x, _TernarizeSTE.apply(self.weight, self.eps), self.bias)
+            return F.linear(x, eff.to(x.dtype), bias)
+        eff = _TernarizeSTE.apply(self.weight, self.eps).to(x.dtype)
+        return F.linear(x, eff, bias)
 
     def extra_repr(self) -> str:
         return (

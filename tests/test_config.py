@@ -178,6 +178,21 @@ class TestApplyDict:
         _apply_dict(cfg, {"train": {"muon": {"ns_coeffs": [1.0, 2.0, 3.0]}}})
         assert isinstance(cfg.train.muon.ns_coeffs, tuple)
 
+    def test_ternary_fp32_master_is_validated_and_serializable(self):
+        cfg = tiny_config(**{"train.ternary_fp32_master": True})
+        assert cfg.train.ternary_fp32_master is True
+        with pytest.raises(ValueError, match="ternary_fp32_master"):
+            cfg.train.ternary_fp32_master = 1
+            validate_config(cfg)
+        cfg.train.ternary_fp32_master = True
+        cfg.train.precision = "fp32"
+        with pytest.raises(ValueError, match="requires train.precision='bf16'"):
+            validate_config(cfg)
+        cfg.train.precision = "bf16"
+        cfg.model.ternary.enabled = False
+        with pytest.raises(ValueError, match="requires model.ternary.enabled=True"):
+            validate_config(cfg)
+
 
 def test_describe_reports_shape_and_rate():
     text = describe(tiny_config())
