@@ -44,7 +44,11 @@ model:
     tie_lm_head: false
   ffn:
     expansion: 1.0
-    intermediate_size: 1536
+    # 0 derives the width from ffn.expansion * hidden_size, which is what the
+    # experts do (384 each) and what makes the merge block-diagonal. A hard
+    # 1536 here broke the merge: the concatenated expert FFNs are 6 * 384 =
+    # 2304 wide, and the mixer refused (2304, 2304) against (1536, 2304).
+    intermediate_size: 0
     multiple_of: 64
   head:
     ce_chunk_rows: 16384
