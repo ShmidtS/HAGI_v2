@@ -172,12 +172,16 @@ def test_real_synthetic_cycle_uses_real_owner_and_claims(tmp_path):
         evaluator=_rejecting_evaluator,
     )
     assert result.generation_id == "generation-1"
-    assert result.mechanism_supported is True
+    # A rejected candidate must not claim mechanism support. This assertion is
+    # the falsifier for the old hard-coded ``True``; reverting
+    # ``_evidence_payload`` to the literal fails the run below too.
+    assert result.decision == "rejected"
+    assert result.mechanism_supported is False
     assert result.quality_supported is False
     assert result.security_supported is False
     assert result.production_promotion is False
     evidence = json.loads(Path(result.holdout_evidence_path).read_text(encoding="utf-8"))
-    assert evidence["mechanism_supported"] is True
+    assert evidence["mechanism_supported"] is False
     assert evidence["quality_supported"] is False
     assert evidence["security_supported"] is False
     assert evidence["production_promotion"] is False

@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from hagi.model.merge import (
+    KNOWN_COORDINATE_LAYOUTS as _KNOWN_COORDINATE_LAYOUTS,
+)
+from hagi.model.merge import (
+    CrossParentPreservingTernaryTree as _CrossParentPreservingTernaryTree,
+)
+from hagi.model.merge import (
     RecursiveF3HAGI,
     TernaryF3Tree,
     merge_recursive_f3,
@@ -41,6 +47,37 @@ from hagi.orchestrator.state import (
 )
 from hagi.train.checkpoint import config_from_dict, config_to_dict, load_payload
 
+# Receiver gain per pinned cross-parent transform. The staged F3 tree
+# aggregates the three children, so its declared receiver is sum(s_i)/sqrt(3);
+# the parent-preserving lift fixes the repeated branch, giving sum(s_i)/3.
+_TREE_RECEIVER_GAIN = 3.0
+_F3_TREE_RECEIVER_GAIN = math.sqrt(3.0)
+
+_F3_TREE_LAYOUT = TernaryF3Tree(1, 2).coordinate_layout
+_PARENT_PRESERVING_LAYOUT = _CrossParentPreservingTernaryTree(1, 2).coordinate_layout
+
+
+def _declared_transform_tree(candidate: Any) -> Any:
+    """Rebuild the transform a candidate declares, and only that one.
+
+    A candidate is always validated against the transform it declares, so a
+    checkpoint written under one transform can never be replayed under the
+    other, and an unknown layout stays rejected.
+    """
+    if candidate.coordinate_layout == _F3_TREE_LAYOUT:
+        return TernaryF3Tree(candidate.ternary_depth, candidate.leaf_hidden)
+    if candidate.coordinate_layout == _PARENT_PRESERVING_LAYOUT:
+        return _CrossParentPreservingTernaryTree(
+            candidate.ternary_depth, candidate.leaf_hidden
+        )
+    raise ValueError("invalid coordinate layout")
+
+
+def _transform_receiver_gain(candidate: Any) -> float:
+    if candidate.coordinate_layout == _PARENT_PRESERVING_LAYOUT:
+        return _TREE_RECEIVER_GAIN
+    return _F3_TREE_RECEIVER_GAIN
+
 CHILD_NAMES = ("child_A", "child_B", "child_C")
 SOURCE_NAMES = ("A", "B", "C")
 _SEED_STRIDE = 1009
@@ -55,7 +92,12 @@ _SELF_IMPROVE_CE_MIN_IMPROVE = 0.0
 _SELF_IMPROVE_KL_MAX = 1.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _KNOWN_WEIGHT_SOURCES = {"ternary_master", "effective_sparse"}
-_COORDINATE_LAYOUT = "branch_major_pair_interleaved"
+# Every coordinate layout a candidate may declare. The set lives in
+# ``hagi.model.merge`` next to the transforms themselves (merge never imports
+# the orchestrator, so the import direction stays acyclic) and is re-exported
+# here under a public name for callers that already depend on the
+# orchestrator. An unknown or misspelled layout is still rejected, fail-closed.
+KNOWN_COORDINATE_LAYOUTS = _KNOWN_COORDINATE_LAYOUTS
 _PYRAMID_CONTOUR_KEY = re.compile(r"^blocks\.[0-9]+\.adapters\.pyramid\.scale$")
 _CHILD_MANIFEST_FIELDS = {
     "schema_version", "generation_id", "name", "source_id", "seed", "span",
@@ -433,8 +475,10 @@ class CandidateArtifact:
             raise ValueError("ternary_depth must be at least one")
         if _exact_int(self.leaf_hidden, "leaf_hidden") <= 0 or self.leaf_hidden % 2:
             raise ValueError("leaf_hidden must be positive and even")
-        if self.coordinate_layout != _COORDINATE_LAYOUT:
-            raise ValueError("invalid coordinate layout")
+        if self.coordinate_layout not in _KNOWN_COORDINATE_LAYOUTS:
+            raise ValueError(
+                f"invalid coordinate layout: {self.coordinate_layout!r}"
+            )
         if self.weight_source not in _KNOWN_WEIGHT_SOURCES:
             raise ValueError("unknown weight source")
         if _finite(self.logit_scale_source, "logit_scale_source") <= 0 or _finite(self.logit_scale_target, "logit_scale_target") <= 0:
@@ -640,8 +684,10 @@ class GenerationResult:
     pareto_improvement: bool
 
     def __post_init__(self) -> None:
-        if self.decision not in {"accepted", "rejected"} or self.mechanism_supported is not True:
+        if self.decision not in {"accepted", "rejected"}:
             raise ValueError("invalid mechanism decision")
+        if self.mechanism_supported is not (self.decision == "accepted"):
+            raise ValueError("mechanism_supported must equal (decision == 'accepted')")
         for name in ("incumbent_macro_ce", "candidate_macro_ce", "ce_regression", "worst_source_regression"):
             _finite(getattr(self, name), name)
         if self.quality_supported is not False or self.security_supported is not False or self.production_promotion is not False:
@@ -1060,7 +1106,7 @@ def _validate_candidate_payload(candidate: CandidateArtifact, request: Generatio
         raise ValueError("candidate leaf geometry mismatch")
     if candidate.weight_source != config.merge.expert_weight_source:
         raise ValueError("candidate weight source mismatch")
-    tree = TernaryF3Tree(candidate.ternary_depth, candidate.leaf_hidden)
+    tree = _declared_transform_tree(candidate)
     if candidate.coordinate_layout != tree.coordinate_layout or candidate.transform_digest != tree.transform_digest:
         raise ValueError("candidate transform metadata mismatch")
     if _decode_text_buffer(state.get("recursive_f3_transform_digest"), "transform") != candidate.transform_digest:
@@ -1071,7 +1117,12 @@ def _validate_candidate_payload(candidate: CandidateArtifact, request: Generatio
         raise ValueError("candidate scale buffers are missing")
     source = _finite(source_value.item(), "checkpoint logit_scale_source")
     target = _finite(target_value.item(), "checkpoint logit_scale_target")
-    if source <= 0 or target <= 0 or not math.isclose(source, math.sqrt(3.0) * target, rel_tol=1e-12, abs_tol=1e-12):
+    # The receiver gain is a property of the declared transform, not a constant:
+    # the staged F3 tree aggregates the three children (sqrt(3)), while the
+    # parent-preserving lift fixes the repeated branch (3). Reading it from the
+    # rebuilt tree keeps the invariant exact for both pinned transforms.
+    expected_gain = _transform_receiver_gain(candidate)
+    if source <= 0 or target <= 0 or not math.isclose(source, expected_gain * target, rel_tol=1e-12, abs_tol=1e-12):
         raise ValueError("candidate scale relation is invalid")
     if not math.isclose(source, candidate.logit_scale_source, rel_tol=1e-12, abs_tol=1e-12) or not math.isclose(target, candidate.logit_scale_target, rel_tol=1e-12, abs_tol=1e-12):
         raise ValueError("candidate declared scales mismatch checkpoint")
@@ -1327,6 +1378,7 @@ def _verdict(
         "ce_regression": regression,
         "worst_source_regression": worst,
         "pareto_improvement": regression < 0.0,
+        "mechanism_supported": accepted,
         "source_metrics": {
             "incumbent": incumbent,
             "candidate": candidate_metrics,
@@ -1375,6 +1427,31 @@ def _request_bindings(request: GenerationRequest) -> dict[str, Any]:
     }
 
 
+def _mechanism_supported(verdict: dict[str, Any]) -> bool:
+    """Whether the held-out evidence actually supports the growth mechanism.
+
+    This used to be the literal ``True``, written independently of the
+    evaluator. A persisted evidence file therefore claimed mechanism support
+    even for a rejected candidate, which is the same class of dishonesty that
+    killed the DecisionPlane gate: an unconditional claim that no measurement
+    can contradict.
+
+    The claim is now derived from the verdict, and deliberately narrowly: the
+    mechanism is supported only when the candidate was accepted on held-out
+    evidence, i.e. macro CE did not regress and no source regressed beyond the
+    declared tolerance. A rejected candidate supports nothing, and quality /
+    security / production promotion stay ``False`` because this gate measures
+    neither.
+    """
+    if verdict.get("decision") != "accepted":
+        return False
+    if verdict.get("ce_regression", 0.0) > 0.0:
+        return False
+    if verdict.get("worst_source_regression", 0.0) > 0.01:
+        return False
+    return True
+
+
 def _evidence_payload(
     request: GenerationRequest,
     candidate: CandidateArtifact,
@@ -1382,9 +1459,10 @@ def _evidence_payload(
     children: tuple[ChildArtifact, ...],
 ) -> dict[str, Any]:
     return {
-        "schema": "recursive_f3_holdout_evidence_v1", "schema_version": 1,
+        "schema": "recursive_f3_holdout_evidence_v2", "schema_version": 2,
         "generation_id": request.generation_id, "decision": verdict["decision"],
-        "mechanism_supported": True, "quality_supported": False,
+        "mechanism_supported": _mechanism_supported(verdict),
+        "quality_supported": False,
         "security_supported": False, "production_promotion": False,
         "pareto_improvement": verdict["pareto_improvement"],
         "incumbent_macro_ce": verdict["incumbent_macro_ce"],
@@ -1403,17 +1481,43 @@ def _write_evidence(path: Path, payload: dict[str, Any]) -> str:
     return sha256_bytes(data)
 
 
+def _legacy_mechanism_pinned(evidence: dict[str, Any], run: Path) -> bool:
+    """Whether this evidence predates the derived mechanism claim.
+
+    Schema v1 pinned ``mechanism_supported`` to the literal ``True`` for every
+    run, accepted or rejected, so 39 historical ``.omc/runs`` artifacts carry
+    ``rejected`` + ``True``. Those files carry no information in that field,
+    but they are the record of runs that really happened; making them
+    unresumable to enforce a cleaner invariant would discard history for a
+    cosmetic gain ([Chesterton](omc-software-laws#chestertons-fence)).
+
+    The escape is narrow and does not extend the claim: it applies only to
+    v1 evidence that the writer of that era produced, and the flag is never
+    surfaced from a legacy replay -- it is recomputed below, so the caller
+    sees the honest value while the old bytes stay readable.
+    """
+    if evidence["schema"] != "recursive_f3_holdout_evidence_v1":
+        return False
+    return evidence["mechanism_supported"] is True
+
+
 def _validate_evidence(
     evidence: Any, request: GenerationRequest, run: Path
 ) -> dict[str, Any]:
     if not isinstance(evidence, dict) or set(evidence) != _EVIDENCE_FIELDS:
         raise ValueError("invalid persisted holdout evidence schema")
     fixed = {
-        "schema": "recursive_f3_holdout_evidence_v1", "schema_version": 1,
-        "generation_id": request.generation_id, "mechanism_supported": True,
+        "generation_id": request.generation_id,
         "quality_supported": False, "security_supported": False,
         "production_promotion": False,
     }
+    # v1 pinned the mechanism claim to a literal; v2 derives it. Both schemas
+    # stay readable, because 39 v1 runs on disk predate the derivation.
+    if (evidence["schema"], evidence["schema_version"]) not in {
+        ("recursive_f3_holdout_evidence_v1", 1),
+        ("recursive_f3_holdout_evidence_v2", 2),
+    }:
+        raise ValueError("invalid persisted holdout evidence schema")
     boolean_claims = (
         "mechanism_supported",
         "quality_supported",
@@ -1425,6 +1529,17 @@ def _validate_evidence(
         type(evidence[key]) is not bool for key in boolean_claims
     ) or any(evidence[key] != value for key, value in fixed.items()) or evidence["decision"] not in {"accepted", "rejected"}:
         raise ValueError("invalid persisted holdout evidence")
+    # The mechanism claim must follow from the persisted metrics, not from a
+    # literal. Recompute it the way the writer does, so a hand-edited evidence
+    # file that flips the flag is rejected on load instead of being trusted.
+    if evidence["mechanism_supported"] != _mechanism_supported(
+        {
+            "decision": evidence["decision"],
+            "ce_regression": evidence["ce_regression"],
+            "worst_source_regression": evidence["worst_source_regression"],
+        }
+    ) and not _legacy_mechanism_pinned(evidence, run):
+        raise ValueError("persisted mechanism claim does not follow from the verdict")
     if evidence["bindings"] != _request_bindings(request):
         raise ValueError("persisted evidence request binding mismatch")
     _validate_persisted_self_improve_ledger(evidence["candidate_f3"], request)
@@ -1525,7 +1640,14 @@ def _result_from_evidence(request: GenerationRequest, report: dict[str, Any], ev
         candidate_macro_ce=evidence["candidate_macro_ce"],
         ce_regression=evidence["ce_regression"],
         worst_source_regression=evidence["worst_source_regression"],
-        mechanism_supported=True, quality_supported=False, security_supported=False,
+        mechanism_supported=_mechanism_supported(
+            {
+                "decision": report["decision"],
+                "ce_regression": evidence["ce_regression"],
+                "worst_source_regression": evidence["worst_source_regression"],
+            }
+        ),
+        quality_supported=False, security_supported=False,
         production_promotion=False, pareto_improvement=evidence["pareto_improvement"],
     )
 
