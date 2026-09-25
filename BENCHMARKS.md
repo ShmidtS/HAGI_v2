@@ -1,4 +1,8 @@
-# BENCHMARKS — HAGI V48
+# BENCHMARKS — HAGI
+
+> Version labels below (V46/V48) are historical and predate the current
+> `hagi 4.2.0`. The numbers themselves were measured and are kept as they
+> were the basis for the compile decision; see STATUS.md for current state.
 
 Документально подтверждённые замеры wall-time и throughput. Все замеры на
 AMD Radeon 8060S (iGPU, bandwidth-bound, cap (11,5)), torch 2.10.0+rocm7.13,
