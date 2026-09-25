@@ -191,6 +191,8 @@ class Attention(nn.Module):
         self.history_stride = int(getattr(cfg, "history_stride", 0) or 0)
         self.fp32_softmax = bool(getattr(cfg, "fp32_softmax", False))
         self.sink_len = int(getattr(cfg, "sink_len", 0) or 0)
+        # Fused causal+sink additive masks, keyed by shape; see _fused_bias.
+        self._bias_cache: dict[tuple, torch.Tensor] = {}
 
         def proj(out_features: int) -> nn.Module:
             return linear(hidden_size, out_features, use_ternary, init_orthogonal)
@@ -240,6 +242,77 @@ class Attention(nn.Module):
     def detach_cache(self) -> None:
         self._kv_cache = None
 
+    def _fused_bias(
+        self,
+        q: torch.Tensor,
+        *,
+        mask: torch.Tensor | None,
+        is_causal: bool,
+        sl: int,
+    ) -> torch.Tensor:
+        """Additive bf16 mask carrying causality and the learnable sink bias.
+
+        Both constraints are static per (T, T_total, device), so the mask is
+        built once and reused instead of per layer per microbatch. When
+        ``sink_bias`` is a live parameter the sink columns are refreshed in
+        place on every call, so training still receives gradient through them.
+        """
+        t = q.shape[-2]
+        total = mask.shape[-1] if mask is not None else t
+        # Only the mask-free causal shape is cacheable: a caller-supplied mask
+        # varies per batch row (document boundaries, prefix), so it cannot be
+        # keyed by shape alone without one caller's mask being served to
+        # another.
+        cacheable = mask is None
+        key = (t, total, q.device, cacheable, sl > 0)
+        sink = None
+        if sl > 0 and self.sink_bias is not None:
+            # Written as an explicit [1, n_heads, 1, sl] slice rather than
+            # reshaped: adding that to a [1, n_heads, t, n] slice in one
+            # expression makes the AOTriton flash backward fail with a shape
+            # error, because the broadcast is not materialised before the
+            # kernel sees it. Assigning the expanded view into the full-width
+            # mask keeps it explicit and the gradient flows.
+            sink = self.sink_bias[..., : min(sl, total)].to(q.dtype)
+
+        bias = self._bias_cache.get(key) if cacheable else None
+        if bias is None:
+            # Kept at [1, n_heads, t, total]: that broadcasts over the batch,
+            # which is what SDPA needs, and still takes a per-head sink bias.
+            bias = torch.zeros(
+                1, self.n_heads, t, total, device=q.device, dtype=q.dtype
+            )
+            if mask is not None:
+                # The caller's mask may be [B, 1, t, total] (per-batch document
+                # boundaries) or already per-head. Reshaping it to [1, -1, t,
+                # total] would fold the batch into the head axis, so broadcast
+                # it against the per-head bias instead and let the shapes stay
+                # as authored.
+                bias = bias + mask.to(q.dtype)
+            if is_causal:
+                row = torch.arange(t, device=q.device).unsqueeze(1)
+                col = torch.arange(total, device=q.device).unsqueeze(0)
+                bias.masked_fill_(col > row, float("-inf"))
+            # Detached: the mask is cached and reused across steps, so it must
+            # not carry a graph node -- keeping it would make the next
+            # backward() fail with "backward through the graph a second time".
+            # The sink gradient is re-attached on every call below, so
+            # sink_bias still trains.
+            if len(self._bias_cache) >= 8:
+                self._bias_cache.pop(next(iter(self._bias_cache)))
+            bias = bias.detach().clone()
+            if cacheable:
+                self._bias_cache[key] = bias
+        if sink is not None:
+            # Rebuild the sink columns as a fresh tensor each call. This is
+            # cheap ([1, H, 1, sl] into the left edge) and it is what keeps
+            # sink_bias in the autograd graph.
+            n = sink.shape[-1]
+            live = bias.clone()
+            live[..., :n] = live[..., :n] + sink
+            return live
+        return bias
+
     def _sdpa(
         self,
         q: torch.Tensor,
@@ -265,8 +338,20 @@ class Attention(nn.Module):
         consistent.
         """
         sl = self.sink_len
-        if not self.fp32_softmax and sl == 0:
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=is_causal)
+        if not self.fp32_softmax:
+            # Fused path. On this ROCm/gfx1200 build the only SDPA backend
+            # available WITHOUT TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 is
+            # MATH, i.e. three unfused matmuls in fp32 -- so the "fused" call
+            # silently degraded to the slow path and saved nothing. With AOTriton
+            # enabled FLASH is real: measured 0.79 ms against 5.60 ms for the
+            # manual fp32 branch below, at [64,18,128,64].
+            #
+            # Causality and the sink bias are folded into one additive mask and
+            # cached. The mask form also beats SDPA's own is_causal here
+            # (0.79 vs 2.63 ms) because it keeps the query contiguous and lets
+            # the kernel skip the causal bounds test per row.
+            bias = self._fused_bias(q, mask=mask, is_causal=is_causal, sl=sl)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         q32, k32, v32 = q.float(), k.float(), v.float()
         scores = torch.matmul(q32, k32.transpose(-2, -1)) * (self.head_dim**-0.5)
         if is_causal:
