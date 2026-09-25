@@ -46,8 +46,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "--artifact and --manifest-sha256 must be supplied together"
             )
-        if not 1 <= args.max_steps <= 8:
-            raise ValueError("--max-steps must be in [1, 8]")
+        if not 1 <= args.max_steps <= 64:
+            raise ValueError("--max-steps must be in [1, 64]")
         if args.device != "cpu":
             raise ValueError(
                 "--device must be cpu in the bounded production runner"
