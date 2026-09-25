@@ -1,0 +1,109 @@
+inference:
+  max_new_tokens: 512
+  min_new_tokens: 1
+  repetition_penalty: 1.05
+  repetition_window: 128
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+merge:
+  enabled: false
+model:
+  attention:
+    head_dim: 64
+    max_seq_len: 4096
+    num_kv_heads: 6
+    num_query_heads: 18
+    qk_norm: true
+    rope_theta: 10000.0
+  embedding:
+    conv_kernel: 1
+    init_std: 0.02
+    tie_lm_head: false
+  ffn:
+    expansion: 1.0
+    multiple_of: 64
+  head:
+    ce_chunk_rows: 16384
+    ce_save_logits: true
+    logit_scale_max: 1.0
+    sampled_in_batch_fraction: 0.5
+    sampled_proposal: prior
+    sampled_softmax_k: 2048
+    unigram_path: data/unigram.compact.npy
+    unigram_prior: true
+    unigram_smoothing: 1.0
+    z_loss_weight: 0.0001
+  hidden_size: 1152
+  init_orthogonal: true
+  loop_depth: 1
+  multimodal:
+    bridge_heads: 8
+    bridge_layers: 2
+    enabled: false
+    grounding_weight: 0.1
+    infonce_temperature: 0.07
+    modality_dropout: 0.3
+    n_bridge_queries: 32
+    variance_gamma: 1.0
+  norm_eps: 1.0e-05
+  num_layers: 3
+  sliding:
+    full_every: 4
+    history_stride: 0
+    window: 0
+  ternary:
+    enabled: true
+    eps: 1.0e-05
+  vocab_size: 32768
+train:
+  adam:
+    beta1: 0.9
+    beta2: 0.95
+    body_lr_scale: 8.0
+    weight_decay: 0.1
+  batch_size: 64
+  ce_keep_mode: stride
+  ce_keep_rate: 0.25
+  checkpoint_dir: checkpoints/m2_baseline_h1152
+  checkpoint_interval: 4500
+  checkpoint_keep_last: 2
+  compile_model: false
+  data:
+    cross_doc_attention: true
+    data_dir: data
+    eos_token_id: 1
+    num_workers: 0
+    pad_token_id: 0
+    seed: 1234
+    seq_len: 128
+    weights:
+      wikipedia_ru: 0.16666666666666666
+      oscar_ru: 0.16666666666666666
+      slimpajama: 0.16666666666666666
+      edu: 0.16666666666666666
+      openwebmath: 0.16666666666666666
+      python_instruct: 0.16666666666666666
+  grad_accum_steps: 1
+  grad_checkpointing: false
+  learning_rate: 0.0001
+  logging:
+    diag_chunk_rows: 512
+    diag_interval: 25
+    exact_ce_interval: 25
+    exact_ce_rows: 512
+    log_interval: 25
+  max_grad_norm: 1.0
+  max_steps: 9000
+  precision: bf16
+  saturation_min_steps: 9000
+  saturation_patience: 200
+  saturation_tol: 0.005
+  schedule:
+    decay_fraction: 0.2
+    min_lr_ratio: 0.02
+    warmup_steps: 50
+  ternary_step_cache: true
+  tokenizer: google/gemma-4-E2B-it
+  use_muon: false
+  z_loss_weight: 0.0001
