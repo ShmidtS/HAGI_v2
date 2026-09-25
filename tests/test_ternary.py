@@ -127,3 +127,37 @@ class TestBitLinear:
     def test_master_weight_is_the_only_parameter(self):
         names = {n for n, _ in BitLinear(8, 4, bias=False).named_parameters()}
         assert names == {"weight"}, "the ternary scale must not be a parameter"
+
+    def test_fp32_master_accepts_bf16_activations_and_returns_bf16(self):
+        layer = BitLinear(16, 8)
+        layer.weight.data = layer.weight.data.float()
+        x = torch.randn(4, 16, dtype=torch.bfloat16)
+        out = layer(x)
+        assert out.dtype == torch.bfloat16
+        assert_finite(out, "bitlinear bf16 output")
+        out.float().sum().backward()
+        assert layer.weight.grad is not None
+        assert layer.weight.grad.dtype == torch.float32
+        assert_finite(layer.weight.grad, "fp32 master grad")
+
+    def test_cached_fp32_master_path_returns_bf16(self):
+        layer = BitLinear(16, 8)
+        layer.weight.data = layer.weight.data.float()
+        layer.cache_quantized()
+        x = torch.randn(2, 16, dtype=torch.bfloat16)
+        out = layer(x)
+        assert out.dtype == torch.bfloat16
+        assert_finite(out, "cached bf16 output")
+
+    def test_fp32_master_bias_uses_compute_dtype(self):
+        layer = BitLinear(16, 8, bias=True)
+        layer.weight.data = layer.weight.data.float()
+        x = torch.randn(2, 16, dtype=torch.bfloat16)
+        out = layer(x)
+        assert out.dtype == torch.bfloat16
+        assert_finite(out, "fp32 master bias output")
+        out.float().sum().backward()
+        assert layer.weight.grad is not None
+        assert layer.weight.grad.dtype == torch.float32
+        assert layer.bias.grad is not None
+        assert layer.bias.grad.dtype == torch.float32
