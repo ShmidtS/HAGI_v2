@@ -734,6 +734,7 @@ class MergeConfig:
     ternary_lift_mode: str = "f3_tree"
     expert_checkpoints: list[str] = field(default_factory=list)
     mixer_init_scale: float = 0.0
+    scratch_block_norm: bool = False
     freeze_experts: bool = False
     mixer_type: str = "hadamard"
     mixer_rank: int = 64

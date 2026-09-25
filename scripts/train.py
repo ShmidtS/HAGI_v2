@@ -263,10 +263,19 @@ def main() -> int:
                 ).to(device)
             else:
                 # No expert checkpoints configured: build the merged body from the
-                # current (random) weights so the machinery is exercised.
-                model = MergedHAGI(
-                    cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale
-                ).to(device)
+                # current (random) weights so the machinery is exercised. With
+                # ``scratch_block_norm`` this is arm S: the merged arm's
+                # architecture with random weights, which is the only way to
+                # separate merging from conditioning (see
+                # .omc/plans/clean_merge_test_20260926.md).
+                if getattr(cfg.merge, "scratch_block_norm", False):
+                    from hagi.model.scratch_blocknorm import ScratchBlockNormHAGI
+
+                    model = ScratchBlockNormHAGI(cfg, n_blocks=cfg.merge.n_experts).to(device)
+                else:
+                    model = MergedHAGI(
+                        cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale
+                    ).to(device)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",
