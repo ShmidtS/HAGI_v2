@@ -24,6 +24,7 @@ from hagi.orchestrator.recursive import (
     EvaluationContext,
     EvaluationResult,
     GenerationRequest,
+    GenerationResult,
     HoldoutContract,
     SelfImprovementLedger,
     SourceMetric,
@@ -1729,6 +1730,54 @@ def test_terminal_replay_invokes_durable_f3_reconstruction(
     )
 
     assert calls == [(tmp_path / "g1", frozenset(recursive_module._CANDIDATE_EVIDENCE_FIELDS))]
+
+
+@pytest.mark.parametrize(
+    "decision,flag,raises",
+    [
+        ("accepted", True, False),
+        # The discriminating row: the old invariant accepted this, the new one
+        # rejects it. Without it the test cannot distinguish the fix from a
+        # relaxation of the check.
+        ("accepted", False, True),
+        ("rejected", False, False),
+        ("rejected", True, True),
+    ],
+)
+def test_generation_result_mechanism_flag_must_follow_decision(
+    decision: str, flag: bool, raises: bool
+) -> None:
+    """The mechanism claim must be derivable, so it must be constrained.
+
+    ``mechanism_supported`` used to be pinned to ``True`` by the writer, so a
+    rejected generation persisted support it had not earned. The invariant is
+    now bidirectional: neither ``rejected`` + ``True`` (the original defect)
+    nor ``accepted`` + ``False`` (the silent-loss direction) can be built.
+    """
+    def build() -> GenerationResult:
+        return GenerationResult(
+            decision=decision,
+            generation_id="g-invariant",
+            report_path="r",
+            manifest_path="m",
+            candidate_checkpoint_path="c",
+            holdout_evidence_path="e",
+            incumbent_macro_ce=1.0,
+            candidate_macro_ce=1.0,
+            ce_regression=0.0,
+            worst_source_regression=0.0,
+            mechanism_supported=flag,
+            quality_supported=False,
+            security_supported=False,
+            production_promotion=False,
+            pareto_improvement=False,
+        )
+
+    if raises:
+        with pytest.raises(ValueError):
+            build()
+    else:
+        assert build().mechanism_supported is flag
 
 
 @pytest.mark.parametrize(
