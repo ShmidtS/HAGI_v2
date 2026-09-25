@@ -1,0 +1,51 @@
+{
+  "error": null,
+  "expert_set": "merged",
+  "level1": {
+    "merged_4500": {
+      "checkpoint": "checkpoints/m2_merged_joint_s5678/step-0004500.pt",
+      "domains": {
+        "en": 6.485743403434753,
+        "mathcode": 6.7356597781181335,
+        "ru": 5.2835922837257385
+      },
+      "macro": 6.1683318217595415
+    },
+    "merged_4500_dup": {
+      "checkpoint": "checkpoints/m2_merged_joint_s5678/step-0004500.pt",
+      "domains": {
+        "en": 6.48457658290863,
+        "mathcode": 6.735556244850159,
+        "ru": 5.275565266609192
+      },
+      "macro": 6.165232698122661
+    },
+    "merged_9000": {
+      "checkpoint": "checkpoints/m2_merged_joint_s5678/step-0009000.pt",
+      "domains": {
+        "en": 6.361998617649078,
+        "mathcode": 6.312940716743469,
+        "ru": 4.972676515579224
+      },
+      "macro": 5.882538616657257
+    }
+  },
+  "level2": {
+    "domains": {
+      "en": 7.82215678691864,
+      "mathcode": 7.747864484786987,
+      "ru": 7.671335279941559
+    },
+    "expert_hidden": 1152,
+    "level2_hidden": 3456,
+    "macro": 7.747118850549062
+  },
+  "level2_shape": {
+    "expert_heads": 18,
+    "expert_hidden": 1152,
+    "head_dim": 64,
+    "level2_heads": 54,
+    "level2_hidden": 3456,
+    "n_experts": 3
+  }
+}
