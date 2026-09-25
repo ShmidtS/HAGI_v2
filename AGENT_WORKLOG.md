@@ -1878,3 +1878,399 @@ Slice A. `build_lora_mm` поднимает узел `ggml_mul_mat(lw->a, cur)` 
 вместо полноценной генерации**. Построено, встроено в серверный граф, промерено.
 Утверждение «модель стала лучше» мой же стандарт доказательства не пропускает,
 и я его не пропускаю.
+
+## 2026-09-25 — Unified accepted commit: legacy terminal receipt
+
+Независимое воспроизведение закрыло реальный fail-closed разрыв в
+`GrowthRunStore.commit_accepted_terminal`: при PREPARED accepted-generation и
+постороннем legacy `terminal-receipt.json` commit проходил, публиковал
+`report.json` и заменял `current-parent.json`. Последующий `recover()` этот же
+run отвергал как конфликт terminal markers, то есть commit мог оставить
+неинтерпретируемое terminal-состояние.
+
+TDD на quiescent snapshot:
+
+- RED: `test_unified_commit_rejects_legacy_terminal_receipt` →
+  `DID NOT RAISE ValueError`, `HASH_GUARD=UNCHANGED`;
+- fix: preflight отвергает legacy receipt рядом с существующей проверкой
+  `failure.json`, до первого durable write;
+- GREEN: 1 targeted test passed; полный focused suite — **173 passed in
+  17.50s**, `HASH_GUARD=UNCHANGED`;
+- Ruff, `py_compile`, targeted `git diff --check` — чисто. Полный
+  `git diff --check` остаётся красным только из-за чужого
+  `tests/test_self_improve.py:1081` (parallel writer), мои два изменённых файла
+  проходят RC=0.
+
+Параллельно закрыты и проверены другие подтверждённые контракты: повторный
+`run_generation` с другим request больше не коммитит persisted PREPARED до
+revalidation evidence; post-commit lease takeover завершает transaction без
+переписывания owner committed pointer; unbound accepted schema-v1 отвергается
+до marker/pointer. Pinned snapshots для двух независимых review сохранены в
+`.omc/attempts/owner_legacy_receipt_commit.md`. Это mechanism evidence, не
+`quality_supported` и не `security_supported`; оба флага остаются `false`.
+
+## 2026-09-25 — Recursive gate после provenance hardening
+
+До следующего control-plane edit зафиксирован quiescent snapshot:
+`FINAL_STABLE=12`. Полный `tests/test_recursive_growth*.py` дал
+**193 passed in 26.09s** с `HASH_MATCH=yes`; `py_compile`, Ruff и
+`git diff --check` прошли. Broader non-blocked suite формально дал
+**965 passed, 15 warnings in 94.73s**, но verdict stale: pre/post tree
+hash различался из-за параллельных изменений в
+`scripts/recursive_growth.py` и `tests/test_recursive_growth_runner.py`.
+Зелёный exit code при churn не считается evidence.
+
+Независимый read-only audit подтвердил, что ordered child digests и
+terminal F3 reconstruction уже реализованы. Остаются два проверяемых
+blocker'а: durable binding post-update contour values и sealed token-span
+budget `[p, p + W*S + 1)` с out-of-file проверкой до `PackedStream`.
+До их закрытия mechanism/training promotion не выполняется;
+`quality_supported=false` и `security_supported=false` сохраняются.
+
+README consistency fallback (MiniMax/Qwen reviewer routes завершились
+инфраструктурным `402` без вывода) выполнен вручную по
+`.omc/plans/recursive_growth_v1.md`, `.omc/plans/real_growth_cycle.md`,
+`scripts/recursive_growth.py` и `src/hagi/orchestrator/real_cycle.py`.
+`README.md` теперь отделяет legacy `scripts/run_growth_cycle.sh`
+(saturation + joint training) от текущего bounded V1 owner CLI, явно
+фиксирует synthetic/Banking77 границы и mechanism-only flags. Проверки
+`git diff --check -- README.md` и полный `git diff --check` прошли; новый
+тестовый verdict после последующего churn не заявляется.
+
+### Quail source-level fallback
+
+Оба delegated reviewer route для `fsdatalab/quail` завершились
+инфраструктурным `402` без вывода, поэтому исходники проверены напрямую
+через GitHub API/raw files. Подтверждены: typed `PhysicalPlan` с graph и
+stream validation; безопасные plan-edit операции с переоценкой; prefix-credit
+cache; anchor-retention schedule; generic runner с per-node
+wall/token/KV/peak-memory metrics; server `Store` с immutable spec hash,
+revision, execution epoch, idempotent query ID и SQLite online-backup.
+
+Для HAGI это отложенный reference для будущего workload-aware evaluation
+runtime: typed execution plan и измеримые resource counters полезны, но
+Quail не реализует F3 provenance, recursive parent CAS или bounded training
+rollback. Интеграция/зависимость сейчас не добавляются. Upstream —
+MIT, `quail-engine==0.1.0`; Linux CUDA runtime и H100/Blackwell не
+соответствуют текущей Windows/CPU verification path.
+
+### Contour provenance design verdict
+
+Независимый design review (единственный успешно завершённый reviewer
+route) рекомендует минимальный контракт `contour_state_sha256` в
+`SelfImprovementLedger`; повторный generate→score→optimizer transcript не
+нужен и вышел бы за trusted-local callback seam. Digest вычисляется
+owner’ом из фактических snapshot tensor bytes тем же canonical key/shape/
+dtype/bytes digest, что и `_derived_base_digest`, но только для
+`_PYRAMID_CONTOUR_KEY`. Проверка обязательна в live candidate validation и
+terminal replay; exact-zero при `accepted_updates=0` и
+`_MAX_SELF_IMPROVE_UPDATES=1` остаются отдельными инвариантами. Добавить
+one live falsification-тест и one terminal replay falsification-тест; при
+churn код пока не редактировался.
+
+### Autonomous continuation — contour and span lanes
+
+После успешного quiescence gate (`FINAL_STABLE=12`) contour fix передан
+изолированному focused-исполнителю; worktree основной копии не менялся
+до его результата. Отдельно запущены read-only span-budget design и
+smoke-readiness audit; их результаты не опрашиваются polling'ом. Внешний
+reference-first поиск через DDG не дал результатов из-за bot detection,
+поэтому новый span-формат не нормализуется без design verdict и
+сопоставления с локальным SSOT. До завершения lanes не запускаются
+training или mechanism smoke; quality/security/production claims остаются
+`false`.
+
+
+## 2026-09-26 — Contour integrity binding and branch-major fixture repair
+
+`SelfImprovementLedger` now persists `contour_state_sha256`, computed from
+all fresh `*.adapters.pyramid.scale` tensors using the same canonical
+key/shape/dtype/exact-bytes records as the derived-base digest. The owner
+computes it from one post-save checkpoint snapshot; live validation and
+terminal replay independently recompute it from `payload["model"]`.
+
+Independent adversarial review found and closed a semantic false-accept:
+`accepted_updates=1` could previously be declared while every contour
+remained zero. Positive accepted updates now require at least one owned
+contour tensor to differ from exact zero. A focused regression test covers
+the bypass. The security review confirmed that unkeyed SHA-256 proves
+integrity and internal consistency, not callback authorship; therefore
+`quality_supported=false`, `security_supported=false`, and production
+promotion remain false under the trusted-local-callback boundary.
+
+Focused recursive owner/runner verification: 96 passed. Ruff, py_compile,
+and git diff-check passed. Full repository verification initially exposed
+one independent regression found by full-suite verification, with two
+contributing causes. First, `ParentPreservingTernaryLift.apply_row` applied an
+extra transpose, so the orthogonal lift acted on intra-block triples instead
+of the three parent branches; orthogonal norm and inverse tests could still
+pass because the operator stayed orthogonal. Second, the identity fixture
+built channel-major triples while the contract is branch-major. Both were
+corrected; `tests/test_recursive_growth.py` now passes 50 tests. Final
+quiescent suite: 1090 passed, 15 warnings, RC=0.
+
+## 2026-09-26 — Sealed span budget and measured synthetic verdict
+
+Sealed budget contract fixed explicitly: `W` = training window length, `S` =
+bounded child training steps, trailing `+1` = final target token. The research
+notation had no prior product definition, so it is now defined rather than
+guessed. `_sealed_span_budget` and `_sealed_token_slice` validate
+`p >= 0` and `p + W*S + 1 <= file_token_count` before any token is
+materialized, so an out-of-file span fails closed before a digest, evaluator,
+or training callback can observe it. Two tests cover the exact window and the
+out-of-file rejection.
+
+The preregistered synthetic cycle (seed 301097) was then executed end to end.
+It is fully deterministic: incumbent macro CE 4.8343239890204535, candidate
+macro CE 4.951174789004855, ce_regression +0.11685, decision `rejected`,
+`mechanism_supported=true`, `quality_supported=false`. Two independent
+directory runs and a third run after later edits produced identical numbers.
+
+Independent diagnosis concluded this is not a regression. The staged
+`TernaryF3Tree` is orthogonal but maps repeated branches `(x,x,x)` to
+`(sqrt(3)*x, 0, 0)`, so a three-way self-merge does not preserve function; the
+fail-closed gate is behaving correctly. Historical artifacts carry the same
+`transform_digest`, `child_config_sha256`, and `data_manifest_sha256`, so the
+behavior predates the recent merge work. The default `merge.ternary_lift_mode`
+remains `f3_tree`; the opt-in `parent_preserving` lift is not yet promotable
+because the owner schema pins a single coordinate layout and rejects the
+parent-preserving layout outright.
+
+While wiring the preregistered lift comparison, two real defects were found and
+fixed: the candidate declared its transform digest from a hardcoded
+`TernaryF3Tree` instead of the transform the model actually applied, and
+`run_bounded_cycle` could not forward a transform name at all. Both are fixed
+without changing default behavior, confirmed by byte-identical CE output
+before and after.
+
+Verification on a quiescent tree: 1125 passed, RC=0. Focused recursive
+owner/runner: 104 passed. Ruff, py_compile, and diff checks pass.
+
+`quality_supported`, `security_supported`, and production promotion remain
+false. A rejected gate on a mathematically lossy merge is the correct outcome,
+not a defect to be tuned away.
+
+---
+
+## 2026-09-25 — Recursive Banking77 bounded improvement
+
+- Pinned Banking77 manifest: SHA-256
+  `44d50edd994e7c32f30066a26052e15f902c74b79a7498ba60f475c76b453f3b`.
+- One-step self-improvement now applies a real contour update; zero-update
+  counterfactual confirms the post-merge update improves every tested seed,
+  but only by approximately 1.2e-6 to 2.5e-6 macro CE.
+- Preregistered Banking77 seeds: 1234, 2243, 3252.
+  Results: 2 accepted, 1 rejected; mean CE delta -0.024269256326887145,
+  standard deviation 0.03277656016980136. Promotion remains false.
+- Learning-rate A/B (`3e-4` vs `1e-4`) preserved 2/3 acceptance and changed
+  CE only at approximately 1e-6, so scalar contour step size is not the
+  dominant variance source.
+- Child warmup A/B (`2000` inherited vs `0`) also preserved 2/3 acceptance;
+  mean CE delta -0.025097866853078205, standard deviation 0.03285173403336967.
+  The change was reverted as not materially beneficial.
+- Current evidence supports a bounded, fail-closed improvement mechanism, not
+  universal autonomy or production promotion. Remaining variance is associated
+  with merged-child candidate construction / initialization across seeds.
+- Verification: recursive-focused suite 201 passed; ruff clean; py_compile
+  clean; git diff --check clean.
+
+### Follow-up: variance localization
+
+- Zero-update counterfactual (matched, same seeds/data/gate): self-update
+  improves every seed by roughly 1.2e-6 to 2.5e-6 macro CE.
+- Child training budget A/B (`1` vs `2` bounded child steps, parent fixed at
+  `1`): acceptance stayed 2/3 and per-seed CE deltas agreed to about 1e-6
+  (1234 -0.03008271257082562, 2243 +0.011024713516235352,
+  3252 -0.05375269055366516).
+- Conclusion: neither contour learning rate, child warmup, nor child step
+  budget explains the seed variance. The dominant term is merged-child
+  construction/initialization under a shared holdout partition.
+- Per-source deltas show rejection on seed 2243 is a genuine Pareto failure
+  (A +0.023606, B +0.039814, C -0.030348), not a metric or gate defect.
+- Full repository test suite: 1075 passed.
+
+### Generation-2 diagnostic
+
+- Banking77 two-generation chain now uses durable lineage and isolated
+  `build/<generation_id>` roots.
+- Seed 1234: generation-1 accepted; generation-2 rejected with CE delta
+  `+0.2360283633073159`.
+- Identity-child counterfactual (children copied from accepted parent, no child
+  training) also rejects at `+0.2396636704603829`, isolating degradation to
+  recursive F3 self-merge rather than child optimization.
+- Root cause: `TernaryF3Tree` is orthonormal, but its staged F3 action maps
+  repeated branches `(x,x,x)` to `(sqrt(3)*x,0,0)` per complex coordinate.
+  Therefore a three-way self-merge is not function-preserving; generation-2
+  changes attention/head geometry even before the one-token contour update.
+- The existing F3 digest and staged-transform contract must not be silently
+  replaced with a non-equivalent matrix. A future increment must introduce a
+  separately named, preregistered parent-preserving lift and test it against
+  attention, FFN, norms, head scaling, and held-out Pareto gates.
+
+## 2026-09-25 — Bounded daemon fast-path: измерительный gate вместо новой архитектуры
+
+- `scripts/daemon_gate_bench.py` прогоняет детерминированный 15-turn trace
+  через реальный `bonsai_evolution_daemon.main` без LLM-сети: каждый третий
+  ход искусственно флагgated по confidence, остальные fast-path.
+- Наблюдение: 15 scripted generations, ровно 5 critique и 5 retry calls,
+  15 accepted, 0 rejected; `gating_matches_expectation=true`. Это заменяет
+  прежнее доказательство «экономия одного вызова» измерением полного
+  bounded orchestration trace.
+- Fail-closed: при рассинхронизации expected/observed calls harness возвращает
+  exit 2; добавлены тесты на happy path, mismatch, границы `--turns` и
+  JSON-сериализуемость.
+- Проверка: `pytest -q tests/test_daemon_gate_bench.py tests/test_daemon.py`
+  → **62 passed**; `py_compile` и `git diff --check` чисты.
+- Это не доказательство качества модели: scripted latency — только стоимость
+  оркестрации. Реальный quality/latency benchmark с настоящей моделью
+  остаётся следующим bounded experiment.
+
+## 2026-09-25 — Milestone 1 закрыт: воспроизводимый baseline + первый CPU train smoke
+
+- **Тесты (self-contained suite).** `python -m pytest tests/ --ignore=tests/
+  test_dataset.py --ignore=tests/test_lora_bootstrap.py -q` → **1043 passed**.
+  Два исключения осознанные: `test_lora_bootstrap.py` требует локального
+  артефакта `models/ternary-bonsai-2-27b-mtp/donor/config.json`,
+  `test_dataset.py` — локальный корпус.
+- **Снят ложный блокер.** Ранний отчёт утверждал про «упавший rollback-контракт»
+  в `self_improve.py`; в текущем checkout `tests/test_self_improve.py` →
+  **53 passed**. Дефект был артефактом изолированного worktree со смешанным
+  импортом из `C:\HAGI_v2`, а не реальной ошибкой. Ничего не «чинилось».
+- **Первый фактический end-to-end прогон нативной HAGI** (раньше в worklog
+  не было ни одного): `configs/autonomous_bounded_20260925.yaml`, H=128 L=3,
+  8.6M params, CPU, fp32, sampled_k=2048.
+  - train 6 шагов → `checkpoints/smoke_20260925/step-0000006.pt`,
+    exact_ce 7.2287 → 7.0505, `update_applied` на всех шагах;
+  - resume с optimizer state подтверждён: `resumed ... at step 6 (optimizer
+    state: yes)`;
+  - ещё 4 шага → `step-0000010.pt`, exact_ce 6.9261/6.7971;
+  - `scripts/infer.py --checkpoint .../step-0000010.pt` → конечный текст без
+    NaN/Inf, vocab map 262144→32768, banned id 255 соблюдён.
+- **Ограничение, зафиксированное честно:** 6–10 шагов и exact_ce ~7.0–7.7
+  ничего не доказывают о качестве — это проверка контракта
+  train→checkpoint→resume→generate, а не научный результат. `nce` (7.60)
+  и `exact_ce` (7.05) расходятся, что ожидаемо: sampled softmax K=2048 против
+  полного алфавита; exact_ce остаётся SSOT.
+- **Пробелы, которые следующий milestone обязан закрыть:** абсолютные пути
+  `C:\HAGI_v2\...` в `configs/level0_merged_3.yaml` и
+  `configs/level1/expert_*.yaml` (ломают переносимость и worktree isolation);
+  `torch.compile: true` в этих же конфигах противоречит
+  `docs/V42_ARCHITECTURE.md:75-81` (на этом ROCm build compile был net
+  negative, а при batch ≥320 давал non-finite градиенты).
+- **Кредит-landing контур остаётся закрытым** (held-out N=8191, отрицательный
+  результат, коммиты `1cda6b5`/`500ea9e`). Повторный sweep λ вокруг уже
+  измеренного оптимума не проводится.
+
+## 2026-09-25 — α=0 проба: дефект в merge, а не в обновлении
+
+Маршрут: `debugging` (root cause) + независимое архитектурное ревью +
+исполняемые пробы вместо рассуждений.
+
+- План-артефакт: `.omc/plans/autonomous_hagi_20260925.md` (Understand-фаза),
+  ledger — `.omc/attempts/trust_region_2026-09-25.md`.
+- Дрейф поверхности оказался не моим: параллельный писатель держал
+  `pytest tests -q` и `scripts/train.py ... smoke_20260925` в том же дереве.
+  После его остановки orchestrator-surface стабилизировался (3 замера / 90 с
+  — одинаковый хэш), baseline: 139 тестов orchestrator/gate passed.
+- Живой гейт — `recursive.py:1250 _verdict` (macro <= 0.0 И worst-source
+  <= 0.01). `orchestrator/quality_gate.py` — мёртвый код с другими
+  критериями; не тронут ([Chesterton], [YAGNI]).
+- Ключевая проба `scripts/probe_alpha_zero_merge.py` (новый, read-only к
+  `src/hagi/**`), отчёт `.omc/alpha_zero_probe_20260925.json`, exit 0, ~5.6 s
+  CPU на 3 seed'ах. При `prompt_ids=None` (contour валидно нулевой,
+  `accepted_updates=0`) per-source бюджет 0.01 пробит УЖЕ без
+  градиентного шага:
+    416114: A +0.0427, macro -0.0031
+    416115: B +0.0258, macro +0.0096
+    416116: A +0.0123, B +0.0728, C +0.0537, macro +0.0463
+  Вывод: дефект создаёт F3-merge, а не обновление. Trust region на шаге
+  обновления — NO-OP; лейн закрыт ДО реализации, кода не написано.
+- Второй факт из того же артефакта: `contour_keys == ["blocks.0.adapters.pyramid.scale"]`
+  — весь адаптивный контур это ОДИН скаляр (`real_cycle.py:176` задаёт
+  `pyramid.levels = (1,)`), и он зануляется прямо перед шагом. Любое
+  утверждение о «росте» обязано считаться с этим.
+- Найден живой дефект: `src/hagi/model/merge.py:1018` использует
+  `_CROSS_PARENT_TRANSFORMS`, которое нигде не определено
+  (`hasattr(...) == False`) → `NameError` на валидном пути загрузки
+  recursive-состояния. НЕ исправлено: файл изменяется каждые ~20 с
+  параллельным писателем (3 замера: 762390d7 / 01d3662d / 7abaf2c8).
+  Стоп-фактор «движущаяся цель» срабатывает опять.
+- Шумовой пол гейта (Oracle: 0.0021 nats при >=1000 позициях → ~0.0042 при
+  n=256, т.е. бюджет 0.01 ≈ 2.4 непарных шумовых единицы) НЕ измерен на
+  этой машине: проба `.omc/paired_se_probe.py` упала на том же NameError.
+  Бюджет 0.01 нельзя считать валидированным до измерения на стабильном
+  снапшоте.
+- Следующий шаг определён и зафиксирован: M1 — инвариант «идентичные дети →
+  побитово идентичный родитель» через реальный `merge_recursive_f3`. Это
+  проверяется без обучения и без gate, и именно оно отличает «merge
+  чинится» от «merge не чинится». Исполнение заблокировано живым
+  редактором `merge.py`.
+- Статус без изменений: `quality_claim_supported=false`,
+  `production_promotion=false`. Ни одно новое утверждение о качестве модели
+  не делается.
+
+## 2026-09-25 — Инвариант parent_preserving подтверждён исполнением
+
+- `.omc/verify_lift_invariant.py` (exit 0) подтверждает алгебраическое
+  свойство, которого не хватало staged-F3:
+  ортогональна, det = 1, фиксирует (1,1,1) с точностью 2.2e-16;
+  дублированная тройка сохраняется; три РАЗНЫХ родителя реально смешиваются;
+  обратный round-trip точен.
+- Именно это свойство делает self-merge тождественным. Оно теперь
+  доказуемо, а не предполагается.
+- Одновременно введён обязательный ключ прозрачности
+  `recursive_f3_cross_parent_transform`: старые чекпойнты теперь корректно
+  отвергаются. Числа α=0-пробы относятся к предыдущей схеме.
+- Единственная правдоподобная следующая мера, пререгистрированная ДО прогона:
+  повторить α=0 пробу под `parent_preserving`. Критерий успеха: |delta| <= 0.01
+  минимум на 2 из 3 seed'ов И macro <= 0.0. Провал именно на источнике C при
+  416116 — различающий сигнал для эскалации.
+- Шумовой пол при 256 строках по-прежнему не измерен. Бюджет 0.01 nats не
+  считать валидированным.
+- Статус: `quality_claim_supported=false`, `production_promotion=false`.
+
+## 2026-09-25 — M2: lift работает (9/9), бюджет ещё не достигнут (0/3)
+
+- Пререгистрированный критерий: |delta| <= 0.01 минимум на 2/3 seed'ов И
+  macro <= 0.0. Факт: **0/3 -> FAIL**. Критерий не ослаблялся постфактум.
+- Но lift улучшил КАЖДЫЙ источник на КАЖДОМ seed'е (9/9 направлений):
+  средний macro +0.0176 -> -0.0180 (улучшение 0.0355 нат), средний
+  worst-source +0.0471 -> +0.0091 (улучшение 0.0380 нат),
+  покомпонентно A -0.0372, B -0.0402, C -0.0292.
+  9/9 одного знака несовместимо с нулевым эффектом (p = 1/512), значит lift
+  причинно эффективен — он просто ещё не уложился в бюджет 0.01.
+- Оговорённый различающий сигнал сработал: хуже всего источник C при
+  416116 (+0.0180), и только этот seed сохранил положительный macro.
+  Пререгистрированное следствие — эскалация к отказу от примитива роста
+  depth+1 на 3 экспертах, а не дальнейшая подстройка lift (n=3, подгонка
+  постфактум запрещена).
+- Моя проба изолирована: `scripts/probe_alpha_zero_merge.py` получил флаг
+  `--lift-mode` и проброс `cross_parent_transform`; ни один файл в `src/`
+  не редактировался. При старом чекпойнте fail-closed сработал правильно
+  («checkpoint cannot be replayed under the other cross-parent transform»).
+- Не измерено: парный шумовой пол при 256 строках. Поэтому «9/9» — это счёт
+  знаков, а не тест значимости, и бюджет 0.01 по-прежнему не валидирован.
+- Статус: `quality_claim_supported=false`, `production_promotion=false`.
+
+## 2026-09-25 — Шумовой пол измерен: бюджет 0.01 ниже разрешения прибора
+
+- `.omc/paired_se_probe.py` (exit 0) на свежих артефактах `parent_preserving`:
+  парный SE = **0.0251 нат** (по источникам 0.0229–0.0285), 256 оценённых
+  токенов на источник.
+- Бюджет гейта 0.01 нат = всего **0.40 сигмы**. Гейт физически не может
+  отличить регрессию 0.01 от шума выборки и будет отвергать по причинам,
+  не связанным с моделью. При истинном нуле примерно 34% источников
+  отвергается шумом; по трём источникам это ~90% поколений.
+- Следствия, разведённые явно:
+  - СОХРАНЯЕТСЯ: эффект lift реален — улучшение 0.029–0.040 нат при
+    SE 0.025, покомпонентные дельты -0.034..-0.051 = 1.3–1.7 SE.
+  - ОТМЕНЯЕТСЯ: 0/3 по пререгистрированному критерию НЕ является
+    доказательством недостаточности lift — критерий был ниже разрешения
+    прибора. Эскалация к отказу от примитива роста НЕ обоснована.
+  - Приоритеты переставлены: сначала чинить измерительный инструмент.
+- Следующий шаг пререгистрирован: поднять число оценённых строк до
+  парного SE <= бюджет/3 (~0.0033 нат), что по масштабированию 1/sqrt(n)
+  требует примерно 58x больше строк, то есть ~15 000 на источник. Сначала
+  решить, доступно ли это в закреплённом split Banking77, иначе расширять
+  бюджет. Обе меры сразу не менять.
+- Статус: `quality_claim_supported=false`, `production_promotion=false`.

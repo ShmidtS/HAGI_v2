@@ -29,12 +29,16 @@ HAGI_v2/
 │   ├── version.py            # версия и идентичность архитектуры
 │   ├── data/                 # пайплайн данных
 │   │   ├── dataset.py        # packed-corpus загрузчик
+│   │   ├── artifacts.py     # opt-in versioned manifests/acquisition boundary
 │   │   └── vocab_map.py      # маппинг компактного словаря
 │   ├── inference/
 │   │   └── generate.py       # авторегрессивная генерация с KV-cache
 │   ├── model/                # архитектура модели
 │   │   ├── model.py          # HAGI (главный класс)
 │   │   ├── merge.py          # MergedHAGI + Hadamard/CrossMixer
+│   │   ├── ternary.py        # ternary STE и FP32-master/BF16 compute seam
+│   │   ├── cortex.py         # opt-in directed low-rank cross-level cortex
+│   │   ├── adaptive.py       # ownership boundary для trainable side-components
 │   │   ├── block.py          # трансформер-блок
 │   │   ├── attention.py      # GQA + QK-norm + RoPE + windowing
 │   │   ├── embedding.py      # SourceEncoder (codebook + conv-фильтр)
@@ -42,6 +46,7 @@ HAGI_v2/
 │   │   ├── head.py           # LMHead (receiver)
 │   │   ├── norms.py          # RMSNorm / BlockRMSNorm / HeadNorm
 │   │   ├── rope.py           # 1D/2D RoPE
+│   │   ├── decision.py       # opt-in finite-option decision head
 │   │   ├── kv_cache.py       # KV-cache
 │   │   ├── outputs.py        # ModelOutput
 │   │   ├── ternary.py        # BitLinear (b1.58 квантование)
@@ -120,7 +125,40 @@ Fused QKV-проекция (одна матрица вместо трёх). Ма
   материализуется `[N, V]`. При `sampled_softmax_k > 0` — shared-bank NCE
   (условный NCE против source prior).
 
-### 2.5 Мультимодальность — `model/multimodal.py`
+### 2.5 Pyramidal Cortex — `model/cortex.py`
+
+`PyramidalCortex` — opt-in, model-global side channel между непрерывными
+уровнями скрытых состояний. Он выключен по умолчанию и не является старым
+per-block `PyramidAdapter`. На границе каждого уровня публикуется low-rank
+summary; направленные adjacent/skip edges передают его только в следующие
+уровни. State живёт один pass (`loop_depth` начинает новый state), не переносится
+между токенами или generation steps и совместим с KV-decode.
+
+Links инициализируются нулями: untrained Cortex — точная no-op delta.
+Опционально `train.ternary_fp32_master=true` сохраняет FP32 masters для
+`BitLinear`, но effective ternary matmul остаётся в BF16; это training
+policy, а не физический packed storage. `freeze_base=True` оставляет
+trainable только adaptive-параметры Cortex и BlockAdapter.
+`self_improve(mode="rls")` обновляет только TTT-LoRA; для Cortex
+используется gradient path. Физические INT2/INT4/INT8/FP8 kernels не являются
+частью этого MVP; 4/8-bit поля Cortex runner — гипотетическая модель хранения,
+тогда как `ternary_precision_ab.py` измеряет live parameter/optimizer bytes.
+
+Полный контракт и bounded experiment gate: `docs/PYRAMIDAL_CORTEX.md` и
+`scripts/pyramidal_cortex_ab.py`.
+
+### 2.6 DecisionPlane — `model/decision.py`
+
+`model.decision.enabled=true` добавляет opt-in head над последней текстовой
+позицией после final norm/mixers. Он не изменяет LM logits. `ModelOutput`
+разделяет `lm_loss` и `decision_loss`; trainer нормализует их независимо.
+Поддерживаются mixed objective и отдельный pre-registered `decision_only`
+mechanism lane, причём metrics явно маркируют `receiver="decision_only"`.
+Decision head входит в `freeze_base`, не сливается из expert state и
+сохраняет full-vs-KV final-position parity. Трёхseedовый synthetic gate
+подтвердил mechanism, но не quality; статус — research-only.
+
+### 2.7 Мультимодальность — `model/multimodal.py`
 
 Опциональный Q-Former-подобный мост: сжимает любую модальность в фиксированное
 число `n_bridge_queries` токенов. Выключен в текущих конфигах.
@@ -251,20 +289,34 @@ Joint:   короткое обучение, учит блоки взаимоде
 - `load_mix` — per-source веса из `mix.json`.
 - `dataset_path` — предпочитает `.compact2.bin` > `.compact.bin` > `.bin`.
 
+Opt-in `data/artifacts.py` не меняет этот production interface. Он
+публикует новый dataset только после полного manifest/file-map,
+SHA-256, count/range и staging-time validation. Bounded acquisition и
+versioned preparation находятся в `scripts/prepare_training_data.py`;
+`scripts/prepare_banking77.py` публикует отдельно pinned Banking77 с
+preserved labels/provenance и little-endian EOS-packed token shards.
+`scripts/common_reference_eval.py` читает exact UTF-8 held-out text, не
+изменяя production loader. Детали и frontier verdict — в
+`docs/RESEARCH_FRONTIER.md`.
+
 ---
 
 ## 6. Обучение — `train/`
 
 ### 6.1 `loop.py`
 
-Один objective, один раз на microbatch. Gradient accumulation взвешивает
-каждый microbatch по числу scored-токенов. Ключевые наблюдаемые: `ce`
-(против unigram-энтропии 8.06 nats), `qk_gain` (индикатор насыщения softmax),
-`logit_scale` (рост gain'а receiver'а).
+Основной LM objective и опциональный decision auxiliary вычисляются
+один раз на microbatch. Gradient accumulation независимо нормализует
+scored LM tokens и decision rows. Ключевые наблюдаемые: `ce`
+(против unigram-энтропии 8.06 nats), `decision_loss`, `qk_gain`
+(индикатор насыщения softmax), `logit_scale` (рост gain'а receiver'а).
 
 - `puncture_loss_mask` — erasure channel на supervision (ce_keep_rate).
-- `cast_model` — bf16 + fp32-гейны (`keep_fp32`).
+- `cast_model` — bf16 + fp32-гейны (`keep_fp32`) и optional FP32
+  `BitLinear` masters при BF16 effective matmul.
 - `clip_gradients_by_group` — раздельный клип Muon/AdamW.
+- Decision rows используют отдельный denominator; пустой scored step
+  отклоняется, а pre-registered decision-only lane маркируется отдельно.
 - Saturation early-stop на exact_ce.
 
 ### 6.2 `optim.py`
