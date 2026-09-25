@@ -558,11 +558,20 @@ def train(
         import json
         from pathlib import Path
         consumed = start_offset + trainer.step * cfg.train.batch_size * cfg.train.data.seq_len * accum
-        # Write to the corpus root (parent of the slice dir) so the pipeline's
-        # ``_consumed`` can read the cumulative offset regardless of slice.
+        # The pipeline's ``_consumed`` reads the cumulative offset from the
+        # corpus root (the parent of the slice dir), so that file must stay
+        # where it is. It was, however, the ONLY record of what a run
+        # consumed, and every run sharing a corpus root overwrote it -- the
+        # M2 arms' consumption evidence was destroyed that way, leaving the
+        # train/holdout disjointness claim with no artifact to check.
+        # A per-run record next to the checkpoints fixes that without moving
+        # the file the pipeline depends on.
         out = Path(cfg.train.checkpoint_dir).parent / "consumed.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"consumed_tokens": int(consumed), "step": int(trainer.step)}))
+        per_run = Path(cfg.train.checkpoint_dir) / "consumed.json"
+        payload = json.dumps({"consumed_tokens": int(consumed), "step": int(trainer.step)})
+        for path in (out, per_run):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload)
         logger.info("consumed %d tokens (step %d) -> %s", consumed, trainer.step, out)
     data_iter = iter(dataloader)
 
