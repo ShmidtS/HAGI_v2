@@ -54,6 +54,17 @@ type _AdapterSnapshot = dict[int, tuple[torch.Tensor, bool]]
 _POISONED_TRAINERS: weakref.WeakValueDictionary[int, object] = (
     weakref.WeakValueDictionary()
 )
+# Quarantines that could not be proven. A trainer that rejects attribute
+# assignment and cannot be weakly referenced has no writable marker at all, so
+# its id is the only surviving evidence that it must not be reused. Only the id
+# is stored: holding the object would be needed to defeat id recycling, but a
+# recycled id makes the gate refuse a healthy trainer, which is the safe
+# direction, whereas keeping the object alive forever is a leak. The ledger is
+# therefore never pruned: a bounded ledger would have to drop entries, and a
+# dropped entry re-opens exactly the acceptance this ledger exists to prevent.
+# The set only grows through the trainer injection seam, never a production
+# trainer, so its size is bounded by the number of such trainers ever built.
+_UNVERIFIABLE_QUARANTINE: set[int] = set()
 
 
 class _StatefulOptimizer(Protocol):
@@ -301,13 +312,21 @@ def _is_gradient_trainer_poisoned(trainer: object) -> bool:
     """Return whether reuse of ``trainer`` must fail closed.
 
     The instance attribute is the normal marker. The weak external set is the
-    fallback for injected trainers that reject attribute assignment, and an
-    unreadable trainer is treated as unprovable and therefore quarantined.
+    fallback for injected trainers that reject attribute assignment, the
+    unverifiable ledger is the last resort for trainers that admit no marker at
+    all, and an unreadable trainer is treated as unprovable and therefore
+    quarantined.
     """
     try:
         if getattr(trainer, "_hagi_self_improve_rollback_poisoned", False) is True:
             return True
     except BaseException:
+        return True
+    if id(trainer) in _UNVERIFIABLE_QUARANTINE:
+        # No marker was ever written, so the missing attribute and the empty
+        # registry both read as "not poisoned" and the gate would re-accept a
+        # trainer that was already declared discard-only. The recorded id is the
+        # only surviving proof of that declaration.
         return True
     try:
         return _POISONED_TRAINERS.get(id(trainer)) is trainer
@@ -340,6 +359,10 @@ def _poison_gradient_trainer(trainer: object) -> bool:
     confirmed = _is_gradient_trainer_poisoned(trainer)
     if not confirmed:
         _report_rollback_failure("gradient trainer poison marker failed")
+        # Both channels were unusable, so record the refusal to reuse by id
+        # before returning. Without this the object carries no trace of the
+        # quarantine and the next public entry would accept it.
+        _UNVERIFIABLE_QUARANTINE.add(id(trainer))
     return confirmed
 
 

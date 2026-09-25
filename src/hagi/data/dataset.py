@@ -41,13 +41,21 @@ logger = logging.getLogger(__name__)
 TOKEN_DTYPE = np.uint32
 
 
-def dataset_path(data_dir: str | Path, name: str) -> Path:
+def dataset_path(
+    data_dir: str | Path, name: str, *, require_compacted: bool = False
+) -> Path:
     """Resolve ``<data_dir>/<name>.bin``, preferring the compacted streams.
 
     ``scripts/compact_vocab.py`` writes ``<name>.compact.bin`` (and a second
     compaction run writes ``<name>.compact2.bin``) against a dense id map. When
     present, the most-compacted stream is used so the model never sees dropped
     ids; otherwise the raw stream is used. Rejects traversal in ``name``.
+
+    The raw fallback is only sound when the caller has validated the stream:
+    raw ``.bin`` files hold ids from the 248320-entry source vocabulary, which
+    is out of range for a 32768 model vocabulary. ``scripts/check_corpus_ids.py``
+    is that guard. Passing ``require_compacted=True`` makes the fallback
+    impossible instead of merely discouraged.
     """
     if not isinstance(name, str) or not name or Path(name).name != name or "\\" in name:
         raise ValueError(f"invalid dataset name: {name!r}")
@@ -56,6 +64,12 @@ def dataset_path(data_dir: str | Path, name: str) -> Path:
         compact = base.with_suffix(suffix)
         if compact.exists():
             return compact
+    if require_compacted:
+        raise FileNotFoundError(
+            f"{base.name}: no compacted stream under {data_dir}; the raw stream "
+            f"uses the source vocabulary and is out of range for this model. "
+            f"Run scripts/compact_vocab.py first."
+        )
     return base
 
 
@@ -259,6 +273,42 @@ class PackedMixDataset(IterableDataset):
                 doc_ids = torch.cumsum(is_eos, dim=0) - is_eos
                 item["doc_ids"] = doc_ids
             yield item
+
+
+def _assert_ids_in_vocabulary(
+    root: str | Path, weights: dict[str, float], vocab_size: int
+) -> None:
+    """Fail closed when a training stream holds out-of-range token ids.
+
+    Raw ``.bin`` streams carry the 248320-entry source vocabulary. A config
+    whose mix resolves to such a stream would train on ids the embedding table
+    does not have, so the run is meaningless rather than merely slow. The scan
+    reads a bounded number of tokens from each file: an out-of-range id is
+    illegal everywhere, and a fully in-range head is sufficient evidence.
+    """
+    head_tokens = 1 << 20
+    for name in sorted(weights):
+        path = dataset_path(root, name)
+        total = path.stat().st_size // 4
+        if total == 0:
+            raise ValueError(f"{name}: empty corpus at {path}")
+        compacted = ".compact" in path.name
+        with path.open("rb") as fh:
+            head = np.frombuffer(fh.read(min(head_tokens, total) * 4), dtype=TOKEN_DTYPE)
+        max_id = int(head.max())
+        if max_id >= vocab_size:
+            raise ValueError(
+                f"{name} ({path.name}): token id {max_id} is outside the model "
+                f"vocabulary of {vocab_size}. The raw stream uses the source "
+                f"tokenizer; run scripts/compact_vocab.py or point the mix at a "
+                f"corpus that is already compacted."
+            )
+        if not compacted:
+            logger.warning(
+                "data: %s resolves to the raw stream %s; ids are in range but "
+                "the corpus was not produced by scripts/compact_vocab.py",
+                name, path.name,
+            )
 
 
 def build_dataloader(
