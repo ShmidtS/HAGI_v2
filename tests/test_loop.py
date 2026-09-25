@@ -20,6 +20,7 @@ import torch
 
 from hagi.model.model import HAGI
 from hagi.model.norms import HeadNorm, RMSNorm
+from hagi.model.ternary import BitLinear
 from hagi.train.loop import Trainer, cast_model, clip_gradients, format_metrics, puncture_loss_mask
 from tests.conftest import TINY_VOCAB, tiny_config
 
@@ -53,12 +54,96 @@ class TestCastModel:
         cast_model(model, "fp32")
         assert model.blocks[0].attn.qkv_proj.weight.dtype == torch.float32
 
+    def test_bf16_default_keeps_ternary_body_bf16(self):
+        model = HAGI(tiny_config())
+        cast_model(model, "bf16")
+        ternary = next(m for m in model.modules() if isinstance(m, BitLinear))
+        assert ternary.weight.dtype == torch.bfloat16
+
+    def test_bf16_opt_in_keeps_only_ternary_weight_master_fp32(self):
+        model = HAGI(tiny_config())
+        cast_model(model, "bf16", ternary_fp32_master=True)
+        ternary = next(m for m in model.modules() if isinstance(m, BitLinear))
+        assert ternary.weight.dtype == torch.float32
+        if ternary.bias is not None:
+            assert ternary.bias.dtype == torch.bfloat16
+
+    def test_bf16_opt_in_keeps_bias_bf16_on_a_biased_bitlinear(self):
+        layer = BitLinear(4, 3, bias=True)
+        cast_model(layer, "bf16", ternary_fp32_master=True)
+        assert layer.weight.dtype == torch.float32
+        assert layer.bias is not None
+        assert layer.bias.dtype == torch.bfloat16
+
+    def test_bf16_fp32_master_preserves_exact_bitlinear_weight_values(self):
+        layer = BitLinear(2, 1, bias=False)
+        before = torch.tensor([[0.123456789, -0.987654321]], dtype=torch.float32)
+        with torch.no_grad():
+            layer.weight.copy_(before)
+
+        cast_model(layer, "bf16", ternary_fp32_master=True)
+
+        assert layer.weight.dtype == torch.float32
+        assert torch.equal(before, layer.weight.detach())
+
+    def test_bf16_fp32_master_round_trip_preserves_mixed_dtypes_and_values(self):
+        model = HAGI(tiny_config())
+        cast_model(model, "bf16", ternary_fp32_master=True)
+        ternary = next(m for m in model.modules() if isinstance(m, BitLinear))
+
+        weight_dtype = ternary.weight.dtype
+        bias_dtype = ternary.bias.dtype if ternary.bias is not None else None
+
+        state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        restored = HAGI(tiny_config())
+        cast_model(restored, "bf16", ternary_fp32_master=True)
+        restored.load_state_dict(state)
+
+        restored_ternary = next(m for m in restored.modules() if isinstance(m, BitLinear))
+        assert restored_ternary.weight.dtype == weight_dtype
+        assert torch.equal(restored_ternary.weight, ternary.weight)
+        if ternary.bias is not None:
+            assert restored_ternary.bias.dtype == bias_dtype
+            assert torch.equal(restored_ternary.bias, ternary.bias)
+
     def test_bf16_forward_still_runs(self):
         cfg = tiny_config()
         model = HAGI(cfg)
         cast_model(model, "bf16")
         out = model(*[microbatch()[k] for k in ("input_ids", "targets")])
         assert math.isfinite(float(out.loss.detach()))
+
+    def test_trainer_applies_fp32_ternary_masters_and_updates(self):
+        cfg = tiny_config(
+            **{
+                "train.precision": "bf16",
+                "train.ternary_fp32_master": True,
+                "train.max_steps": 1,
+                "train.schedule.warmup_steps": 0,
+                "train.use_muon": False,
+                "train.grad_accum_steps": 1,
+            }
+        )
+        model = HAGI(cfg)
+        trainer = Trainer(model, cfg)
+        ternary = [module for module in model.modules() if isinstance(module, BitLinear)]
+        assert ternary
+        assert all(module.weight.dtype == torch.float32 for module in ternary)
+        before = [module.weight.detach().clone() for module in ternary]
+        ids = torch.randint(0, cfg.model.vocab_size, (2, 8))
+        metrics = trainer.train_step(
+            [{"input_ids": ids, "targets": ids, "loss_mask": torch.ones_like(ids, dtype=torch.bool)}]
+        )
+        assert metrics["update_applied"] is True
+        assert any(
+            not torch.equal(module.weight.detach(), old)
+            for module, old in zip(ternary, before, strict=True)
+        )
+        assert all(
+            module.weight.grad is not None and module.weight.grad.dtype == torch.float32
+            for module in ternary
+        )
 
 
 class TestClipGradients:

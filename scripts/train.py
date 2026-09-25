@@ -1,10 +1,10 @@
 """Training entry point. Every parameter comes from the YAML config.
 
 Usage:
-    python scripts/train.py --config configs/v41_1b.yaml
-    python scripts/train.py --config configs/v41_1b.yaml --dry-run
-    python scripts/train.py --config configs/v41_1b.yaml --resume
-    python scripts/train.py --config configs/v41_1b.yaml --steps 500 --profile 3
+    python scripts/train.py --config configs/level0_ab/ru_baseline.yaml
+    python scripts/train.py --config configs/level0_ab/ru_baseline.yaml --dry-run
+    python scripts/train.py --config configs/level0_ab/ru_baseline.yaml --resume
+    python scripts/train.py --config configs/level0_ab/ru_baseline.yaml --steps 500 --profile 3
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 
 # Make `hagi` importable when run directly, before any hagi import.
-_SRC = Path(__file__).resolve().parent.parent / "src"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _REPO_ROOT / "src"
+DEFAULT_CONFIG = _REPO_ROOT / "configs" / "level0_ab" / "ru_baseline.yaml"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
@@ -80,7 +82,11 @@ def dry_run(model, cfg, device: torch.device) -> int:
 
     from hagi.train.loop import cast_model
 
-    cast_model(model, cfg.train.precision)
+    cast_model(
+        model,
+        cfg.train.precision,
+        ternary_fp32_master=cfg.train.ternary_fp32_master,
+    )
     batch, seq = 2, min(cfg.train.data.seq_len, 256)
     ids = torch.randint(0, cfg.model.vocab_size, (batch, seq), device=device)
     doc_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
@@ -136,9 +142,9 @@ def dry_run(model, cfg, device: torch.device) -> int:
     return 0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the HAGI channel language model")
-    parser.add_argument("--config", default="configs/v41_1b.yaml")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--data-dir", default=None, help="overrides train.data.data_dir")
     parser.add_argument("--steps", type=int, default=None, help="overrides train.max_steps")
     parser.add_argument("--checkpoint-dir", default=None)
@@ -165,7 +171,22 @@ def main() -> int:
         help="token offset into the corpus to begin reading from (recursive growth: the next expert continues where the previous one stopped)",
     )
     parser.add_argument("--profile", type=int, default=0, help="profile the first N steps; 0 = off")
-    args = parser.parse_args()
+    return parser
+
+
+def default_config_path_overrides(config_path: str | Path) -> dict[str, object]:
+    """Resolve bundled data paths when the built-in config is used off-repo."""
+    if Path(config_path).resolve() != DEFAULT_CONFIG.resolve():
+        return {}
+    return {
+        "model.head.unigram_path": str(_REPO_ROOT / "data" / "unigram.compact.npy"),
+        "train.data.data_dir": str(_REPO_ROOT / "data"),
+        "train.checkpoint_dir": str(_REPO_ROOT / "checkpoints_l0_ab" / "ru_baseline"),
+    }
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     log_path = setup_logging(args.log_dir)
     logger.info("log file: %s", log_path)
@@ -174,7 +195,7 @@ def main() -> int:
     from hagi.model.model import HAGI
     from hagi.version import __architecture__, __version__
 
-    overrides: dict[str, object] = {}
+    overrides: dict[str, object] = default_config_path_overrides(args.config)
     if args.steps is not None:
         overrides["train.max_steps"] = args.steps
     if args.checkpoint_dir is not None:
@@ -193,31 +214,59 @@ def main() -> int:
     # concatenation of N subspaces grown from one shared prior. Seed the RNG
     # immediately before constructing the model. init_seed=0 leaves the current
     # RNG state untouched (no seeding).
+    resume_path = None
+    if args.resume is not None:
+        from hagi.train.checkpoint import latest_checkpoint, load_payload
+
+        resume_path = args.resume if args.resume != "latest" else latest_checkpoint(
+            cfg.train.checkpoint_dir
+        )
+        if resume_path is None:
+            raise FileNotFoundError(f"--resume: no step-*.pt in {cfg.train.checkpoint_dir}")
+
     if cfg.model.init_seed:
         torch.manual_seed(cfg.model.init_seed)
-    model = HAGI(cfg).to(device)
-    if cfg.merge.enabled:
-        from hagi.model.merge import MergedHAGI, merge_experts
+    if resume_path is not None:
+        from hagi.model.merge import build_model_from_payload
+        from hagi.train.checkpoint import config_from_dict, load_payload
 
-        if cfg.merge.expert_checkpoints:
-            from hagi.train.checkpoint import load_payload
+        resume_payload = load_payload(resume_path, str(device))
+        model = build_model_from_payload(
+            config_from_dict(resume_payload["config"]),
+            resume_payload["model"],
+            n_mixers=1,
+            mixer_init_scale=cfg.merge.mixer_init_scale,
+            device=device,
+        )
+    else:
+        model = HAGI(cfg).to(device)
+        if cfg.merge.enabled:
+            from hagi.model.merge import MergedHAGI, merge_experts
 
-            states = [load_payload(p, str(device))["model"] for p in cfg.merge.expert_checkpoints]
-            model = merge_experts(
-                cfg,
-                states,
-                n_mixers=1,
-                mixer_init_scale=cfg.merge.mixer_init_scale,
-                # Hierarchical merge: the experts are themselves merged models
-                # with their own cross-block mixers, which must be dropped and
-                # replaced by a fresh level-N mixer. Harmless for plain experts
-                # (they have no ``mixers.*`` keys).
-                drop_expert_mixers=True,
-            ).to(device)
-        else:
-            # No expert checkpoints configured: build the merged body from the
-            # current (random) weights so the machinery is exercised.
-            model = MergedHAGI(cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale).to(device)
+            if cfg.merge.expert_checkpoints:
+                from hagi.train.checkpoint import load_payload
+
+                states = [
+                    load_payload(p, str(device))["model"]
+                    for p in cfg.merge.expert_checkpoints
+                ]
+                model = merge_experts(
+                    cfg,
+                    states,
+                    n_mixers=1,
+                    mixer_init_scale=cfg.merge.mixer_init_scale,
+                    # Hierarchical merge: the experts are themselves merged models
+                    # with their own cross-block mixers, which must be dropped and
+                    # replaced by a fresh level-N mixer. Harmless for plain experts
+                    # (they have no ``mixers.*`` keys).
+                    drop_expert_mixers=True,
+                ).to(device)
+            else:
+                # No expert checkpoints configured: build the merged body from the
+                # current (random) weights so the machinery is exercised.
+                model = MergedHAGI(
+                    cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale
+                ).to(device)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",
@@ -263,11 +312,9 @@ def main() -> int:
         _, _ = load_model(path, model, str(device), skip_prefixes=("mixers.",))
         logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
     elif args.resume is not None:
-        from hagi.train.checkpoint import latest_checkpoint, load_model, load_payload
+        from hagi.train.checkpoint import load_model
 
-        path = args.resume if args.resume != "latest" else latest_checkpoint(cfg.train.checkpoint_dir)
-        if path is None:
-            raise FileNotFoundError(f"--resume: no step-*.pt in {cfg.train.checkpoint_dir}")
+        path = resume_path
         start_step, _ = load_model(path, model, str(device))
         if args.no_optimizer_state:
             optimizer_state = None
