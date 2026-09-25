@@ -2046,9 +2046,157 @@ before and after.
 Verification on a quiescent tree: 1125 passed, RC=0. Focused recursive
 owner/runner: 104 passed. Ruff, py_compile, and diff checks pass.
 
-`quality_supported`, `security_supported`, and production promotion remain
-false. A rejected gate on a mathematically lossy merge is the correct outcome,
-not a defect to be tuned away.
+## 2026-09-26 — Preregistered cross-parent transform comparison
+
+The owner provenance contract now accepts both pinned cross-parent transforms
+instead of assuming the staged F3 tree. Two defects blocked the comparison
+before measurement: candidate validation rebuilt a hardcoded
+`TernaryF3Tree` and rejected any other declared layout, and the receiver-gain
+invariant was hardcoded to `sqrt(3)`. The gain is a property of the transform
+(legacy staged F3 aggregates the three children, the parent-preserving lift
+fixes the repeated branch and uses 3), and the rebuilt checkpoint confirms the
+ratio is exactly 3.0. Validation now rebuilds the tree the candidate declares
+and reads the gain from that transform, so a checkpoint written under one
+transform still cannot be replayed under the other, and an unknown layout stays
+rejected.
+
+Preregistered comparison, synthetic v3, seed 301097, max_steps 2, identical
+children and budget:
+
+| transform | decision | incumbent | candidate | ce_regression | worst source |
+|---|---|---|---|---|---|
+| `f3_tree` | rejected | 4.834324 | 4.951175 | +0.116851 | +0.197446 |
+| `parent_preserving` | rejected | 4.834324 | 4.894292 | +0.059968 | +0.122170 |
+
+The parent-preserving lift roughly halves the merge regression and clearly
+reduces the worst-source regression, which is the expected direction for a
+transform that preserves the parent function. It still does not clear the gate,
+so the verdict stays `rejected` and the default remains `f3_tree`. No default
+was changed retroactively: the default only moves if a preregistered run
+accepts. Quality is not yet supported; a smaller measured loss is not an
+improvement until the gate accepts it.
+
+## 2026-09-26 — The measuring instrument was broken: weights were never loaded
+
+An independent review claimed the scorer was nondeterministic (spread 0.2 nats).
+That claim was partly wrong and the real defect was worse. Scoring the same
+parent checkpoint five times through the production path gave five different
+per-source results. Rebuilding the model from identical bytes showed 7 of 16
+tensors differing on every rebuild, so the scorer was not noisy: it was scoring a
+freshly randomized model.
+
+Root cause: for non-recursive checkpoints `build_model_from_payload`
+constructed `HAGI(cfg)` and returned it without ever loading the state, so every
+non-recursive measurement ignored the checkpoint entirely. The fix is one strict
+`load_state_dict(state, strict=True)` before the move to device. Five repeats of
+the same bytes now agree exactly, and the whole suite passes at 1186.
+
+Every CE number measured before this fix is void, including the earlier
+preregistered transform comparison. Re-measured with a correct instrument,
+synthetic v3, seed 301097, max_steps 2:
+
+| transform | decision | incumbent | candidate | ce_regression |
+|---|---|---|---|---|
+| `f3_tree` | rejected | 4.874175 | 4.969644 | +0.095469 |
+| `parent_preserving` | accepted | 4.874175 | 4.874175 | -0.000001 |
+
+The `f3_tree` self-merge still degrades, now by +0.0955 rather than +0.1169. The
+parent-preserving lift is accepted, but its per-source deltas are about 1e-6,
+which is numerical noise rather than a measured gain: the candidate and the
+parent differ as models, yet score the same. A gate that accepts on a 1e-6
+delta is not evidence of improvement, so this acceptance must not be read as
+quality support. The honest statement is that the parent-preserving lift stops
+the loss the staged tree causes, which is a necessary condition for growth and
+not a sufficient one.
+
+## 2026-09-26 — Child warmup starved the merge test of signal
+
+With the measurement instrument fixed, the next preregistered unit was a wider
+child budget. Raising it from 2 to 8 steps changed nothing, and the reason was
+not the budget: children still differed from each other by only about 5e-6
+after eight applied updates.
+
+Root cause: `ScheduleConfig.warmup_steps` defaults to 2000 and
+`optim.py` scales the learning rate by `step / warmup_steps`, so a bounded run
+spends its whole budget below one percent of the base rate. Every child was
+effectively a copy of its parent, and the merge test had almost no signal to
+resolve. This is the same defect the one-step self-improvement path already
+worked around locally, applied there and never applied to child training.
+
+Setting the child schedule's warmup to zero, mirroring that existing fix, makes
+the children actually diverge: 4.8e-06 to 2.0e-03, roughly 400x more
+separation. Re-measured, synthetic v3, seed 301097, max_steps 8:
+
+| transform | decision | ce_regression | per-source deltas |
+|---|---|---|---|
+| `f3_tree` | rejected | +0.095361 | A +0.1794, B +0.0106, C +0.0960 |
+| `parent_preserving` | rejected | +0.001622 | A +0.0028, B -0.0047, C +0.0068 |
+
+The parent-preserving lift now cuts the merge regression by about 59x and the
+result is well above the earlier 1e-6 noise floor, so this is a real
+architectural effect rather than a measurement artifact. It still does not clear
+the gate: the candidate is marginally worse than the incumbent, so the run is
+correctly rejected and the default stays `f3_tree`.
+
+Honest reading: the parent-preserving lift removes almost all of the loss the
+staged tree causes, and what remains is a small residual rather than the
+structural breakage seen before. Whether that residual is closable is an open
+question that a multi-seed preregistration must answer; a single accepted-looking
+run is not evidence.
+
+## 2026-09-26 — Residual is the price of heterogeneous specialization
+
+The remaining `parent_preserving` regression was localized rather than assumed.
+Verified numerically: `||QᵀQ − I||∞ = 0.0` and `||Q·1 − 1||∞ = 0.0`, and
+`Q(h,h,h)` returns three copies of `h`, so the transform does preserve the
+function for equal branches.
+
+The residual is therefore the cost of mixing unequal branches, not a defect in
+the transform. The children are deliberately specialized: their relative L2
+difference is about 0.0119, and the owner contract rejects identical child
+sources outright ("each child source must bind a distinct source manifest"), so
+a same-source control probe is impossible by construction. The residual is also
+not a systematic bias: per-source deltas run +0.0028 on A, -0.0047 on B, and
++0.0068 on C, in both directions.
+
+Honest reading: the parent-preserving lift removed about 59x of the loss the
+staged F3 tree causes, and what remains is the intrinsic price of merging
+differently specialized experts. Whether that price is worth paying is a
+separate question from whether the transform is correct, and the current
+synthetic budget cannot answer it. Closing it needs either a wider child budget
+that produces genuinely stronger specialists, or a joint post-merge training
+stage, and each needs its own preregistration across multiple seeds.
+
+## 2026-09-26 — Post-merge joint stage is architecturally blocked, not missing
+
+The measured residual (+0.0016 under the parent-preserving lift) is a mixing
+cost, so the natural next unit was a bounded post-merge joint stage. It was
+implemented, measured, and then removed again because it cannot work by
+construction, and the reason is worth recording.
+
+Under the recursive contract `train.adapt.freeze_base` is true, so a Trainer
+built on a merged candidate exposes exactly one trainable tensor:
+`blocks.0.adapters.pyramid.scale`, the fresh contour. A joint pass over the
+merged stream therefore cannot move the merged body at all. Measured: four joint
+steps on the candidate left every embedding weight bit-identical, and the
+candidate checkpoint at 0, 4, 16, and 64 joint steps was byte-for-byte
+identical. The two runs that appeared to differ earlier were rejected by the
+contour invariant, correctly: joint training moved the contour, which only the
+self-improvement seam may move and declare.
+
+A second, unrelated confusion was cleared at the same time. The trainer reports
+`body_grad_norm` as NaN whenever Muon is disabled, because the Muon group is
+empty by design and `clip_gradients_by_group` returns NaN for an empty group.
+This is a reporting artifact, not a failed update: `rest_grad_norm` was finite
+(0.063) and `update_applied` was true. Reading `body_grad_norm` as a failure
+signal would send any future investigation down the wrong path.
+
+Consequence for growth: a post-merge body adaptation is not a matter of adding
+a training stage, it requires an explicit ownership decision about what a
+candidate may train. Today that ownership is deliberately narrow, and widening it
+is an architecture change that needs its own preregistration and its own gate.
+
+Verification after removing the dead code: 104 focused tests pass, Ruff clean.
 
 ---
 
@@ -2107,7 +2255,64 @@ not a defect to be tuned away.
   separately named, preregistered parent-preserving lift and test it against
   attention, FFN, norms, head scaling, and held-out Pareto gates.
 
-## 2026-09-25 — Bounded daemon fast-path: измерительный gate вместо новой архитектуры
+## 2026-09-25 — Parent-preserving cross-parent F3: mechanism landed, quality NOT established
+
+- **Root cause (measured, not hypothesised)**: `TernaryF3Tree` maps a duplicated
+  branch triple `(x, x, x)` to `(sqrt(3)*x, 0, 0)` per complex coordinate.
+  Self-merging three IDENTICAL parents was therefore never function-preserving.
+  Identity-child counterfactual isolated the +0.236 gen-2 CE to the merge itself,
+  not to child training.
+- **The real gap found**: `ParentPreservingTernaryLift` (Q(pi/2), orthogonal,
+  fixes the all-ones vector) already existed in `src/hagi/model/merge.py` from a
+  previous session and was never wired into the merge path. It was written but
+  unused.
+- **Design decision, adversarial-reviewed before implementation**: three
+  candidates were compared and two were REJECTED — "Q outer + F3 inner" (F3
+  annihilates the consensus direction, so any composition with an F3 level on a
+  path seeing three identical streams cannot preserve duplication) and "Q at every
+  staged level" (Q on the thinnest level re-mixes inside a parent the F3 tree
+  already mixed). Selected: Q on the outer cross-parent step only. `TernaryF3Tree`
+  is untouched and remains correct for the inner child-to-parent step.
+- **Gates passed at tensor level (float64, reproducible)**: self-merge
+  preservation at parent_depth 0/1/2 (atol 1e-12), orthogonality, all-ones
+  invariance, invertibility, and mixing capacity on distinct parents. The
+  cross-parent logit gain for three identical parents is exactly 1.0.
+- **Three defects found after the unit tests were green**, none of which a
+  tensor-level suite could catch: (1) `coordinate_layout` had geometry packed
+  into what is supposed to be a layout NAME, so the orchestrator rejected every
+  candidate built with the new transform — the feature was unreachable; (2) the
+  saved config and the recorded provenance could disagree when the transform was
+  passed explicitly; (3) no test pinned which transform runs at which stage, so
+  swapping the inner and outer trees would have passed everything. Fixed, with the
+  stage test proven falsifiable by an observed temporary swap (8 failures).
+- **CORRECTION — a favourable number was withdrawn.** A delegated lane reported an
+  identity-child CE delta of exactly `0.0` for the new transform. Re-running the
+  same harness with the same seed did not reproduce it. Measured instead:
+  `f3_tree` gen-1 `+0.164`, `parent_preserving` gen-1 `+0.0267`; gen-2 sits at the
+  float32 noise floor for both arms and discriminates nothing. So the new transform
+  REDUCES self-merge degradation roughly 6x but does NOT eliminate it. An
+  independent stand of my own agrees. The `0.0` claim is withdrawn.
+- **Residual cause not yet isolated.** The cross-parent step is exact, so the
+  remaining perturbation is downstream of it. Candidates, none confirmed: the
+  `head_scale_divisor = 3.0` head-receiver compensation, `BlockTreeNorm` per-leaf
+  statistics under duplicated leaves, `RecursiveBranchScale`.
+- **Real-path Banking77 execution remains blocked on data, not code**: the only
+  artifact on disk hashes to `9927589c...`, not the frozen preregistered pin
+  `44d50edd...`, because the manifest carries a `retrieval_timestamp`. The pin was
+  not altered and no data was fabricated. Fixing this by re-pinning would silently
+  weaken the gate and is explicitly deferred.
+- **Verification**: 180 passed across the cross-parent, recursive-growth,
+  orchestrator and config suites; ruff clean on every touched file; the F3
+  contract confirmed byte-identical (`_f3_real_column_matrix` still digests to the
+  pinned `07e2571f2bfd0ff9`).
+- **Claim boundary**: tensor-level mechanism supported. End-to-end function
+  preservation NOT supported. `quality_supported`, `security_supported`,
+  `autonomy_supported` and `production_promotion` all remain false. Mixing-capacity
+  sufficiency is unmeasured, and it is the reason this is not a finished result:
+  the transform trades internal mixing for exact parent preservation, and whether
+  that trade still allows real growth is the open question.
+
+
 
 - `scripts/daemon_gate_bench.py` прогоняет детерминированный 15-turn trace
   через реальный `bonsai_evolution_daemon.main` без LLM-сети: каждый третий
@@ -2274,3 +2479,310 @@ not a defect to be tuned away.
   решить, доступно ли это в закреплённом split Banking77, иначе расширять
   бюджет. Обе меры сразу не менять.
 - Статус: `quality_claim_supported=false`, `production_promotion=false`.
+
+## 2026-09-25 — Внешний пин-гейт: измерение на невидимом suite (механизм)
+
+Добавлен `src/hagi/orchestrator/external_eval.py`: контракт внешнего
+task-suite (suite_id, split, source/manifest/protocol digests, tokenizer,
+scorer_id, per-row digests), скоринг чекпойнта на этом suite и
+champion/challenger-селектор. Стиль зеркалит ЖИВОЙ гейт в
+`recursive.py::_verdict` (L1276), а не мёртвый `quality_gate.py`
+(его `validate_quality_report` не вызывается нигде вне своего теста).
+Формат verdict и полей `source_metrics` переиспользует форму
+`SourceMetric`/`_metric`; хеширование — только `canonical_json_bytes` /
+`sha256_bytes` из `state.py`.
+
+### Что ДОКАЗАНО (механизм, поведение)
+
+- Digest-пины бьют: подмена байтов suite, неверный манифест и неверный
+  digest чекпойнта приводят к `ValueError`, а не к проходному default.
+  `_verified_bytes` проверяет источник, манифест и чекпойнт раздельно;
+  `validate_manifest` (`data/artifacts.py`) — независимый второй пин.
+- Гейт реально различает: худший challenger отвергается, байты champion
+  не изменяются (проверено побайтово); равный по CE challenger отвергается
+  при margin 0.0; лучший challenger проходит только при заявленном
+  потолке per-source регрессии.
+- Margin обязателен: `margin=None` бросает исключение, тихого дефолта нет.
+  Основание измерением: парный SE текущего холдаута 0.0251 нат (запись
+  выше в этом файле) выше любого правдоподобного дефолта, поэтому дефолт
+  означал бы «детектим улучшение прибором, который этого не видит».
+- Verdict детерминирован и сериализуем: `evidence_sha256` / `verdict_sha256`
+  меняются при изменении любого пин-поля; дубликаты строк в suite
+  запрещены на записи.
+
+### Найденная в ходе работы проблема (важна за пределами этой задачи)
+
+`build_model_from_payload` (`model/merge.py:1655`) создаёт экземпляр
+класса, но НЕ загружает веса из `state`. Вызывающий обязан сделать
+`load_state_dict` сам. `real_cycle._score_checkpoint_bytes` этого не делает,
+то есть существующий путь оценки чекпойнта измеряет свежую случайную
+инициализацию. Правка чужого кода вне объёма этой задачи не вносилась;
+здесь `load_state_dict(strict=True)` вызывается явно. Это кандидат в
+отдельный тикет — сам факт зафиксирован фальсификатором
+(`test_better_challenger_is_promoted_only_with_margin` падает без него).
+
+### Что НЕ ДОКАЗАНО (явная граница заявления)
+
+- **Не доказано качество.** Ни один прогон этого модуля на реальном suite
+  не выполнен; все числа в тестах — синтетические (4 строки, крошечная
+  случайная модель). Модуль не утверждает, что кандидат «лучше».
+- **Не доказана применимость к 256-строку или любому реальному холдауту.**
+  Порог принятия не откалиброван. При текущем парном SE 0.0251 нат любой
+  margin, дающий приемлемую частоту ложных отклонений, будет много больше
+  типичных достижимых дельт; то есть на текущем размере прибора гейт,
+  скорее всего, будет отвергать почти всё. Это не дефект кода, но делает
+  подбор margin обязательным шагом, а не формальностью.
+- **Не доказана безопасность.** Никакой защиты от подмены самих пинов
+  (source_sha256 и т.п. берутся от вызывающего) здесь нет; это доверие к
+  контракту, а не к криптографии. Не проверяется и защита от отравления
+  suite заранее.
+- **Не доказана автономность.** Селектор вызывается вручную, байты чемпиона
+  перезаписываются только при решении `promote`, истории и отката нет.
+- Не проверялось: RecursiveF3/merged-чекпойнты, GPU, длинные последовательности,
+  реальные tokenizer'ы, масштабирование времени на suite в 15 000 строк.
+
+### Воспроизведение
+
+```
+python -m pytest -q tests/test_external_eval.py            # 13 passed
+python -m pytest -q tests/test_quality_gate.py tests/test_recursive_growth_prepared.py  # 18 passed
+ruff check src/hagi/orchestrator/external_eval.py tests/test_external_eval.py  # All checks passed
+python -m py_compile src/hagi/orchestrator/external_eval.py  # exit 0
+```
+
+Фальсификация тестов (проверено: каждая мутация роняет тесты) —
+убрать `load_state_dict`, заменить fail-closed на margin=0.01, отключить
+проверку digest, убрать проверку регрессии, писать байты чемпиона всегда.
+
+- Статус: механизм заявлен, качество не заявлено.
+
+## 2026-09-25 — Дефект измерения: чекпойнты оценивались на случайных весах
+
+Маршрут: `code-review` (нет самоодобрения) + `debugging` (root cause).
+Контекст: ревью делегированного модуля внешнего гейта.
+
+- `src/hagi/orchestrator/external_eval.py` вызывает `load_state_dict(strict=True)`
+  явно. Именно это вскрыло, что окружающий код этого НЕ делает:
+  `merge.py:1660 build_model_from_payload` конструирует класс из конфига,
+  но не загружает `state`. Для нерекурсивных чекпойнтов возвращается
+  `HAGI(cfg).to(device)` с выброшенными весами. Ветка
+  `RecursiveF3HAGI.from_state_dict` грузит веса корректно.
+- Проверено на реальном артефакте
+  `.omc/runs/alpha-zero-probe-20260925c/seed-416115/parent/step-0000000.pt`:
+  `is_recursive_state=False`, `encoder.embedding.weight` загружается
+  НЕверно. И `real_cycle._score_checkpoint_bytes` (L459), и
+  `.omc/paired_se_probe.py:22` не вызывают `load_state_dict` -> оценивается
+  свежая случайная инициализация.
+- СЛЕДСТВИЕ ДЛЯ ИСТОРИИ ИССЛЕДОВАНИЙ: парный SE 0.0251 нат и дельты lift
+  9/9 измерены между двумя случайными моделями. Они НЕ отменяются как
+  ложные, но и не действительны: статус `withdrawn pending re-measurement`.
+  Вывод «бюджет 0.01 ниже разрешения прибора» выведен из того же замера,
+  поэтому тоже предварителен.
+- НЕ затронуто: алгебраический инвариант `parent_preserving`
+  (ортогональна, det=1, фиксирует (1,1,1), дублированная тройка
+  сохраняется) проверена `.omc/verify_lift_invariant.py`, который не
+  проходит через этот загрузчик.
+- Второй независимый дефект: кандидат alpha=0 больше не пересобирается
+  (`recursive state_dict missing provenance:
+  ['recursive_f3_cross_parent_transform']`), то есть лейн невоспроизводим.
+- Попытка фикса: минимальный `load_state_dict(state, strict=True)` после
+  конструирования. На реальном артефакте подтверждён исправляющим
+  (`weights now loaded correctly: True`), но сломал 23 теста в зоне,
+  которой владеет параллельный писатель (`src/hagi/model/merge.py`
+  переписывается каждые ~20-60 с). Фикс ОТКАЧЕН, чтобы не портить чужую
+  работу; находка и патч зафиксированы в
+  `.omc/attempts/FINDING_checkpoint_weights_not_loaded.md`.
+- Прибор, независимо: holdout пиннится ровно на 256 токенов на источник
+  (это выбор контракта, не предел данных), при том что тестовый шард уже
+  закреплён на 42 560 токенов. При 1/sqrt(n) SE падает 0.0251 -> 0.0019
+  нат, бюджет 0.01 становится 5.1 сигмы вместо 0.40. Новых данных не
+  требуется. Расчёт: `.omc/attempts/holdout_resolution_2026-09-25.md`.
+- Статус без изменений: `quality_claim_supported=false`,
+  `production_promotion=false`. Ни одного нового утверждения о качестве
+  модели не делается.
+
+## 2026-09-25 — Milestone 2: рост 3×H=384 → H=1152 против честного baseline
+
+- **Дизайн (зафиксирован ДО запуска, по ревью oracle).** Три доменных
+  эксперта (RU / EN / MATH+CODE, каждый H=384, L=3, 27.7M params) → merge
+  в H=1152 (98.1M total, 22.6M body). Baseline from scratch — та же
+  геометрия H=1152, тот же seed 1234, тот же mixture, те же 9000 шагов.
+  Обе линии получили равный joint-бюджет: baseline не «проигрывает заранее»
+  ни по ёмкости, ни по compute.
+- **Canary перед запуском (обязательный гейт).** На H=128 тело составляло
+  2.6% параметров и могло не покинуть unigram prior. H=384 поднял body до
+  9.1%: exact CE 7.8083 → 6.7766 за 600 шагов (~53 с на GPU, 0 skipped
+  updates). Тело действительно учится — только после этого масштаб признан
+  годным для вывода.
+- **Промежуточный результат на тренировочных батчах (не финальная метрика).**
+  На шаге 0 merged уже 7.3537 против baseline 7.7777 при равной ёмкости.
+  К 4500 baseline 7.5022, merged 6.9941.
+- **Честный held-out (новый `scripts/eval_holdout.py`).** Все `exact_ce` в
+  логах трейнера — метрика на тренировочных батчах, то есть загрязнённая.
+  Скрипт читает хвостовой участок корпуса, которого обучение не касалось,
+  и отказывается выдавать оценку, если корпус израсходован.
+  Обнаружено: `python_instruct` — всего 3.1M токенов и израсходован полностью,
+  поэтому CODE-половина домена mathcode исключена из held-out, а не
+  подменена тренировочными числами. Это ограничение измерения, а не модели.
+- **Моя ошибка, зафиксированная честно.** Первый baseline (H=384) не был
+  убит (`pkill` не сработал на Windows) и продолжил писать в общий каталог
+  поверх перезапущенного H=1152: `step-0009000.pt` оказался с
+  `embedding (32768, 384)` при модели 1152. Загрузчик это честно отверг
+  (`IncompatibleCheckpointError`), но линия была недействительна.
+  Baseline перезапущен с нуля в отдельный каталог `checkpoints/m2_baseline_h1152`.
+  Урок: на Windows `pkill -f` по cmdline ненадёжен — остановку процесса надо
+  подтверждать по `psutil` (create_time + cmdline) и проверять артефакты
+  после, а не доверять факту «команда возврата 0».
+- **Не сделано сознательно.** Не переключал `compile_model: true` в
+  `configs/level0_experts/*` и `configs/level1/*` на `false`: это изменение
+  исследовательского рецепта, а мой замер относится к другим конфигам.
+  Противоречие с `docs/V42_ARCHITECTURE.md:75-81` зафиксировано как долг.
+
+### Follow-up: дефект закрыт, числа требуют переизмерения
+
+- Фикс `model.load_state_dict(state, strict=True)` в
+  `build_model_from_payload` применён в live-дереве (merge.py:1702).
+- Проверено на ВСЕХ сохранённых артефактах: 370 файлов из `.omc/runs/**`
+  (284 нерекурсивных, 54 рекурсивных) -> pass=370, fail=0. Раньше на
+  нерекурсивных расхождение достигало maxdiff 1.75, ключи
+  `encoder.embedding.weight`, `blocks.0.attn.qkv_proj.weight`,
+  `head.projection.weight`.
+- Рекурсивная ветка грузила веса всегда (`merge.py:1239`, `:1639`), поэтому
+  находки, сделанные на ternary_f3-чекпойнтах, ВЫЖИВАЮТ. Отзываются только
+  замеры нерекурсивного пути: парный SE 0.0251 нат и 9/9 одно-знаковых дельт
+  parent_preserving -> статус `withdrawn pending re-measurement`.
+- 20-32 рекурсивных файла не собираются по другой, пред-существующей
+  причине: provenance fail-closed (13 x missing
+  `recursive_f3_cross_parent_transform`, 6 x digest mismatch, 1 x
+  f3_tree vs parent_preserving). К фиксу весов отношения не имеет.
+- Регрессия зафиксирована новым фальсификатором
+  `tests/test_checkpoint_weight_loading.py` (4 теста). Проверено мутацией:
+  удаление `load_state_dict` роняет все 4 -> гвард живой, а не декоративный.
+- Общий прогон: **1195 passed, 0 failed**.
+- Статус: `quality_claim_supported=false`, `production_promotion=false`.
+
+## 2026-09-25 — Milestone 2 РЕЗУЛЬТАТ: рост выигрывает на равной ёмкости и равном бюджете
+
+Held-out exact CE (полный алфавит, `scripts/eval_holdout.py`, хвостовой
+участок корпуса, 40 батчей на домен, 128 токенов/батч = 5120 токенов/домен):
+
+| домен    | merged (3×H384→H1152) | baseline (H1152 from scratch) | delta   |
+|----------|------------------------|--------------------------------|---------|
+| ru       | 5.2249 | 6.0473 | **-0.8224** |
+| en       | 6.2891 | 6.6452 | **-0.3561** |
+| mathcode | 6.3461 | 6.8545 | **-0.5084** |
+| **AVG**   | **5.9534** | **6.5157** | **-0.5623** |
+
+Условия, при которых вывод корректен:
+- ёмкость идентична: 98.1M total / 22.6M body у обеих моделей;
+- joint-бюджет идентичен: 9000 шагов × 64 × 128 = 73.7M токенов у обеих;
+- baseline не видел ни одного экспертного шага (from scratch, тот же seed);
+- метрика — held-out, не тренировочные батчи;
+- гейт «merged хуже unigram prior» не сработал ни в одном домене.
+
+**Что этот результат доказывает.** При равной ёмкости и равном joint-бюджете
+трёхдоменная структура роста даёт -0.56 exact CE против from scratch на том
+же compute. Это укрепляет (но не завершает) гипотезу роста: историческое
+возражение к 4.83 vs 5.44 было в том, что эксперты получили больше токенов.
+Здесь эксперты получили по 24.6M каждый, но эти токены **не входят** в
+joint-бюджет сравнения — обе финальные модели получили ровно 73.7M.
+
+**Что этот результат НЕ доказывает (запрещённые утверждения).**
+- Не доказывает масштабирование: это одна точка (3→1), нет зависимости от N.
+- Не доказывает универсальность: измерены 3 домена, не задачи.
+- Не про автономный self-improvement: online-адаптация не участвовала.
+- Один seed (1234), без bootstrap CI — по ревью oracle этого достаточно,
+  чтобы объявить направление, но недостаточно для «установленного факта».
+- CODE-домен оценён только по openwebmath: `python_instruct` (3.1M токенов)
+  израсходован обучением, честного held-out для него не существует.
+
+**Протокол на будущее.** Дизайн, гейты и запрещённые утверждения объявляются
+до запуска; при провале публикуется отрицательный результат, а не рестарт с
+другим seed. Метрики лежат в `reports/m2_*_holdout.json`.
+
+## 2026-09-25 — Milestone 2 РЕПЛИЦИРОВАН: 6/6 ячеек в пользу growth
+
+Полный повтор Milestone 2 на seed 5678 (эксперты, baseline, joint — всё
+переобучено с нуля, ~50 мин GPU). Held-out exact CE:
+
+| домен    | seed | merged | baseline | delta |
+|----------|------|--------|----------|-------|
+| ru       | 1234 | 5.2249 | 6.0473 | -0.8224 |
+| ru       | 5678 | 5.2270 | 6.0347 | -0.8077 |
+| en       | 1234 | 6.2891 | 6.6452 | -0.3561 |
+| en       | 5678 | 6.3030 | 6.6519 | -0.3489 |
+| mathcode | 1234 | 6.3461 | 6.8545 | -0.5084 |
+| mathcode | 5678 | 6.3339 | 6.8476 | -0.5137 |
+| **AVG**   | both | **5.9540** | **6.5135** | **-0.5595** |
+
+- 6/6 дельт отрицательны, min -0.8224, max -0.3489, sd между дельтами 0.192.
+- Разброс **между seed** минимален: ru 0.002, en 0.014, mathcode 0.012 по
+  абсолютному CE. То есть шум seed не объясняет эффект — разрыв ~0.56 nats
+  на порядок больше собственной дисперсии линий.
+- Гейт oracle «один seed не результат» закрыт: результат реплицирован.
+
+**Обновлённый статус.** Growth-гипотеза теперь поддержана на измеримой
+величине: при равной ёмкости и равном joint-бюджете трёхдоменный рост даёт
+-0.56 exact CE, воспроизводимо. Это НЕ доказывает масштабирование (одна
+точка 3→1), универсальность (три домена) и не относится к
+online-адаптации.
+
+**Следующий milestone (кандидат, требует ревью):** масштаб-зависимость —
+повторить на 6→1, чтобы проверить, держится ли эффект и растёт ли.
+Альтернатива: закрыть гейт 2 (merged против собственного unmerged-эксперта).
+
+## 2026-09-25 — Шаги 1-2 закрыты (измеримость), commit d028f1d
+
+**Шаг 1 — data/*.bin валиден.** `scripts/check_corpus_ids.py` прогнан по всем
+9 корпусам при vocab_size=32768, exit 0. `max_id=32767` у всех, failures=0.
+Отчёт: `reports/corpus_ids_all_20260925.json`. Ни один корпус не пришлось
+пере-токенизировать: config уже разрешает `*.compact.bin` через
+`dataset_path`, и именно эти потоки валидны. Заявление HAGI_TASK.md
+«id до 255971» верно только для СЫРЫХ `*.bin` (без `.compact`), которые
+ни один конфиг не использует. Это расхождение между записью в брифе и
+состоянием дерева зафиксировано, а не «исправлено» — менять корпуса не нужно.
+
+**Шаг 2 — mechanism_supported вычисляется, а не утверждается.** Раньше флаг
+писался литералом `True`, и rejected-кандидат всё равно персистовал заявку о
+поддержке механизма. Теперь:
+- `_mechanism_supported()` (recursive.py:1428) выводит флаг из вердикта;
+- `GenerationResult.__post_init__` ограничивает его двусторонне против
+  `decision` — нельзя ни `rejected`+`True` (исходный дефект), ни
+  `accepted`+`False` (тихая потеря);
+- `_validate_evidence` пересчитывает флаг из персистентных метрик, поэтому
+  ручная правка файла отвергается, а не принимается;
+- новая схема `recursive_f3_holdout_evidence_v2`.
+
+**Совместимость v1 измерена, не предположена.** 54 evidence-файла в
+`.omc/runs`, из них 39 несут `rejected` + `True` — следствие прежнего
+литерала. Проверено программно: все 39 проходят как legacy, честное
+пересчитанное значение — `false`. Старые байты читаются, но наружу
+отдаётся пересчитанный флаг.
+
+**Чем измерено.**
+- `python -m pytest tests/ -q` -> **1211 passed, 0 failed** (140 с).
+- Мутационные проверки гварда (обе реально роняют тест):
+  - возврат инварианта в `is not True` -> падают 2 строки
+    `test_generation_result_mechanism_flag_must_follow_decision`;
+  - возврат литерала `True` в `_evidence_payload` -> падает
+    `test_real_synthetic_cycle_uses_real_owner_and_claims`.
+
+**Вердикт: PASS** для шагов 1 и 2.
+
+**Найдено и исправлено попутно.** Незакоммиченный `tests/test_mechanism_claim.py`
+(работа прошлой сессии) содержал `_evaluator(candidate=(1.0, 1.05, 0.5))` —
+смешанный кандидат, чей macro CE (0.85) ниже incumbent (1.0), то есть это
+**accepted**, а не rejected. Тест назывался «rejected run cannot claim
+support» и при этом проверял accepted-путь. Исправлено на
+`candidate=(1.2, 1.3, 1.4)`; комментарий в тесте теперь объясняет, почему
+смешанный кандидат не подходит.
+
+**Что осталось непроверенным (явно).**
+- Шаг 3 (`state.py`): независимый explore-агент сообщает, что все три
+  High-находки УЖЕ закрыты в текущем дереве — `state.py:43` `_strict_json_bytes`,
+  `_read_state:958`, валидатор `current-parent.json:1822`, фенс в
+  `.omc/attempts/parent_cas_lease_fencing.md:3-4`; повторное ревью в
+  `.omc/plans/recursive_owner_slice.md:3-6` даёт **0 High**. Я это не
+  перепроверял лично — нужен свежий зафиксированный снапшот + подпись ревьюера.
+- Шаг 4 (baseline Banking77 + sigma): не начат.
+- Ни одно утверждение выше не является утверждением о качестве модели.
