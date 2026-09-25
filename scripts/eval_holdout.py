@@ -85,6 +85,16 @@ def _batches(tokens: np.ndarray, seq_len: int, count: int) -> list[torch.Tensor]
 
 @torch.no_grad()
 def score(model: torch.nn.Module, batches: list[torch.Tensor], device) -> dict:
+    """Mean exact full-alphabet CE over the given batches.
+
+    The name matters: the model's default ``out.loss`` is the *sampled* NCE
+    when ``sampled_softmax_k > 0`` (the m2 configs use 2048), which is a local
+    conditional partition rather than the full coding cost. Reporting that
+    number as ``exact_ce`` would quietly make every held-out comparison a
+    comparison of sampled estimates. So the head's ``exact_loss`` is called
+    explicitly here, which costs a full [N, V] pass but is what a held-out
+    number has to be.
+    """
     model.eval()
     total_nats = 0.0
     total_tokens = 0
@@ -92,9 +102,20 @@ def score(model: torch.nn.Module, batches: list[torch.Tensor], device) -> dict:
         x = batch[:-1].unsqueeze(0).to(device)
         y = batch[1:].unsqueeze(0).to(device)
         out = model(x, targets=y)
-        loss = out.loss if hasattr(out, "loss") else out["loss"]
+        if hasattr(out, "exact_ce") and out.exact_ce is not None:
+            ce_t = out.exact_ce
+        else:
+            # No diagnostic on this forward: recompute the exact objective from
+            # the final hidden states rather than falling back to the sampled
+            # loss, which would be the bug this function exists to avoid.
+            # The model is called with x = batch[:-1] and y = batch[1:], so
+            # out.hidden has one fewer position than the batch and aligns 1:1
+            # with y.
+            hidden = out.hidden.reshape(-1, out.hidden.shape[-1])
+            targets = y.reshape(-1)
+            ce_t = model.head.exact_loss(hidden, targets)
         n = int(y.numel())
-        total_nats += float(loss) * n
+        total_nats += float(ce_t) * n
         total_tokens += n
     ce = total_nats / max(total_tokens, 1)
     return {"exact_ce": ce, "ppl": math.exp(ce), "tokens": total_tokens}
