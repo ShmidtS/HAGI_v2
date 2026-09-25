@@ -1362,8 +1362,8 @@ def _verdict(
             or candidate_metrics[source]["row_ids_sha256"] != expected_rows
         ):
             raise ValueError("evaluation row identity mismatch")
-    incumbent_macro = sum(incumbent[source]["exact_ce"] for source in SOURCE_NAMES) / 3.0
-    candidate_macro = sum(candidate_metrics[source]["exact_ce"] for source in SOURCE_NAMES) / 3.0
+    incumbent_macro = sum(incumbent[source]["exact_ce"] for source in SOURCE_NAMES) / len(SOURCE_NAMES)
+    candidate_macro = sum(candidate_metrics[source]["exact_ce"] for source in SOURCE_NAMES) / len(SOURCE_NAMES)
     deltas = {
         source: candidate_metrics[source]["exact_ce"] - incumbent[source]["exact_ce"]
         for source in SOURCE_NAMES
@@ -1574,7 +1574,7 @@ def _validate_evidence(
                 raise ValueError("persisted row identity mismatch")
             if _finite(item["exact_ce"], "persisted exact_ce") < 0:
                 raise ValueError("persisted exact_ce must be nonnegative")
-        macros.append(sum(group[source]["exact_ce"] for source in SOURCE_NAMES) / 3.0)
+        macros.append(sum(group[source]["exact_ce"] for source in SOURCE_NAMES) / len(SOURCE_NAMES))
     if any(metrics["incumbent"][source]["scored_rows"] != metrics["candidate"][source]["scored_rows"] for source in SOURCE_NAMES):
         raise ValueError("persisted scored rows mismatch")
     deltas = {source: metrics["candidate"][source]["exact_ce"] - metrics["incumbent"][source]["exact_ce"] for source in SOURCE_NAMES}
