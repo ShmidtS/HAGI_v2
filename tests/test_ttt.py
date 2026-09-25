@@ -15,8 +15,12 @@ import torch
 
 from hagi.config import Config, validate_config
 from hagi.model.model import HAGI
-from hagi.train.self_improve import _restore_adapters, _snapshot_adapters
-from hagi.train.ttt import TttRls
+from hagi.train.ttt import (
+    _SNAPSHOT_HARD_MAX_BYTES,
+    TttRls,
+    _restore_training_mode,
+    _snapshot_training_modes,
+)
 from tests.conftest import tiny_config
 
 
@@ -111,6 +115,9 @@ class TestHyperparameterValidation:
         {"prior": -1.0},
         {"reg": 0.0},
         {"reg": -1.0},
+        {"snapshot_max_bytes": 0},
+        {"snapshot_max_bytes": -1},
+        {"snapshot_max_bytes": 1.0},
     ])
     def test_bad_hyperparams_raise(self, kw):
         with pytest.raises(ValueError):
@@ -357,22 +364,444 @@ class TestLossMask:
 
 
 class TestTransactionalRollback:
+    @pytest.mark.parametrize("was_training", [False, True])
+    def test_mode_restore_fallback_recovers_full_module_tree(
+        self, monkeypatch, was_training
+    ):
+        """A failed public mode switch must not leave submodules inconsistent."""
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        model.train(was_training)
+        training_modes = _snapshot_training_modes(model)
+        model.train(not was_training)
+
+        def failing_train(mode: bool = True):
+            raise RuntimeError("MODE-RESTORE-SECONDARY")
+
+        monkeypatch.setattr(model, "train", failing_train)
+        _restore_training_mode(model, training_modes)
+
+        assert model.training is was_training
+        assert all(module.training is was_training for module in model.modules())
+
+    def test_harvest_entry_eval_failure_restores_mode_and_removes_hooks(
+        self, monkeypatch
+    ):
+        """Cleanup must cover the mode switch that happens after hook setup."""
+        cfg = _lora_cfg()
+        model = _model(cfg).train()
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+
+        def hook_state():
+            return tuple(
+                (
+                    set(block._forward_pre_hooks),
+                    set(block._forward_hooks),
+                    set(block.mixer._forward_pre_hooks),
+                )
+                for block in model.blocks
+            )
+
+        before_hooks = hook_state()
+        real_train = model.train
+        calls = {"n": 0}
+
+        def fail_after_switch(mode: bool = True):
+            real_train(mode)
+            calls["n"] += 1
+            raise RuntimeError(f"MODE-{calls['n']}")
+
+        monkeypatch.setattr(model, "train", fail_after_switch)
+        with pytest.raises(RuntimeError, match="MODE-1"):
+            fitter._harvest(ids, tgt, None)
+
+        assert calls["n"] == 2  # failing entry eval + guarded restore attempt
+        assert model.training is True
+        assert all(module.training is True for module in model.modules())
+        assert hook_state() == before_hooks
+
+    def test_harvest_primary_survives_failing_restore_and_cleans_hooks(
+        self, monkeypatch
+    ):
+        """The primary harvest error wins and the mode is still guaranteed."""
+        cfg = _lora_cfg()
+        model = _model(cfg).train()
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+        before_hooks = tuple(
+            (
+                set(block._forward_pre_hooks),
+                set(block._forward_hooks),
+                set(block.mixer._forward_pre_hooks),
+            )
+            for block in model.blocks
+        )
+        real_train = model.train
+
+        def fail_before_restore(mode: bool = True):
+            if mode is True:
+                raise RuntimeError("MODE-RESTORE-SECONDARY")
+            return real_train(mode)
+
+        def primary_failure(*args, **kwargs):
+            raise KeyboardInterrupt("HARVEST-PRIMARY")
+
+        monkeypatch.setattr(model, "train", fail_before_restore)
+        monkeypatch.setattr(model, "forward", primary_failure)
+        with pytest.raises(KeyboardInterrupt, match="HARVEST-PRIMARY"):
+            fitter._harvest(ids, tgt, None)
+
+        assert model.training is True
+        assert all(module.training is True for module in model.modules())
+        after_hooks = tuple(
+            (
+                set(block._forward_pre_hooks),
+                set(block._forward_hooks),
+                set(block.mixer._forward_pre_hooks),
+            )
+            for block in model.blocks
+        )
+        assert after_hooks == before_hooks
+
+    def test_harvest_preserves_mixed_module_modes(self):
+        """A supported per-submodule mode setup must survive harvesting exactly.
+
+        ``nn.Module.train`` is allowed to leave a child in eval mode while the
+        root is in train mode. Restoring only the root flag would silently
+        normalize that deliberate configuration, so cleanup must preserve each
+        module's own ``training`` flag.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg).train()
+        model.blocks[0].eval()
+        before = tuple((id(module), module.training) for module in model.modules())
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+
+        fitter.step(ids, tgt)
+
+        after = tuple((id(module), module.training) for module in model.modules())
+        assert after == before
+
+    def test_harvest_hook_cleanup_survives_failing_handle_remove(
+        self, monkeypatch
+    ):
+        """Cleanup must not depend on ``RemovableHandle.remove()`` succeeding.
+
+        The handle keeps no reference back to the module, so a raising removal
+        would leave every later hook attached and let that secondary failure
+        replace the error that stopped the step.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg).train()
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+        other_hook = object()
+        block = model.blocks[0]
+        block._forward_pre_hooks[9000] = other_hook
+        before = tuple(
+            (
+                set(block._forward_pre_hooks),
+                set(block._forward_hooks),
+                set(block.mixer._forward_pre_hooks),
+            )
+            for block in model.blocks
+        )
+
+        def exploding_remove(self):
+            raise RuntimeError("REMOVE-SECONDARY")
+
+        def primary_failure(*args, **kwargs):
+            raise KeyboardInterrupt("HARVEST-PRIMARY")
+
+        monkeypatch.setattr(
+            torch.utils.hooks.RemovableHandle,
+            "remove",
+            exploding_remove,
+            raising=True,
+        )
+        monkeypatch.setattr(model, "forward", primary_failure)
+        with pytest.raises(KeyboardInterrupt, match="HARVEST-PRIMARY"):
+            fitter._harvest(ids, tgt, None)
+
+        after = tuple(
+            (
+                set(block._forward_pre_hooks),
+                set(block._forward_hooks),
+                set(block.mixer._forward_pre_hooks),
+            )
+            for block in model.blocks
+        )
+        assert after == before
+        assert block._forward_pre_hooks[9000] is other_hook
+        assert model.training is True
+        assert all(module.training is True for module in model.modules())
+
+    def test_harvest_registration_failure_cleans_already_attached_hooks(
+        self, monkeypatch
+    ):
+        """A failure halfway through registration must not leave earlier hooks."""
+        cfg = _lora_cfg()
+        model = _model(cfg).train()
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+        first_block = model.blocks[0]
+        before = tuple(
+            (set(b._forward_pre_hooks), set(b._forward_hooks), set(b.mixer._forward_pre_hooks))
+            for b in model.blocks
+        )
+
+        def fail_registration(*args, **kwargs):
+            raise RuntimeError("REGISTER-SECONDARY")
+
+        monkeypatch.setattr(first_block, "register_forward_hook", fail_registration)
+        with pytest.raises(RuntimeError, match="REGISTER-SECONDARY"):
+            fitter._harvest(ids, tgt, None)
+
+        after = tuple(
+            (set(b._forward_pre_hooks), set(b._forward_hooks), set(b.mixer._forward_pre_hooks))
+            for b in model.blocks
+        )
+        assert after == before
+        assert model.training is True
+        assert all(module.training is True for module in model.modules())
+
+    def test_harvest_cleanup_uses_public_remove_on_success(self, monkeypatch):
+        """Normal cleanup follows PyTorch's public handle contract."""
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+        real_remove = torch.utils.hooks.RemovableHandle.remove
+        calls = {"n": 0}
+
+        def counting_remove(self):
+            calls["n"] += 1
+            return real_remove(self)
+
+        monkeypatch.setattr(
+            torch.utils.hooks.RemovableHandle,
+            "remove",
+            counting_remove,
+            raising=True,
+        )
+        fitter.step(ids, tgt)
+        assert calls["n"] == 2 * len(model.blocks)
+
+    def test_harvest_success_path_leaves_no_hooks(self):
+        """A clean step must not accumulate hook registrations on the blocks."""
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        fitter = _fitter(model)
+        ids, tgt = _window(cfg)
+        for _ in range(3):
+            fitter.step(ids, tgt)
+        for block in model.blocks:
+            assert not block._forward_pre_hooks
+            assert not block._forward_hooks
+            assert not block.mixer._forward_pre_hooks
+
+    def test_snapshot_cap_cannot_be_raised_after_construction(self):
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        fitter = _fitter(model, snapshot_max_bytes=1)
+        with pytest.raises(AttributeError, match="snapshot_max_bytes"):
+            fitter.snapshot_max_bytes = _SNAPSHOT_HARD_MAX_BYTES * 100
+        with pytest.raises(MemoryError, match="rollback snapshot"):
+            fitter.snapshot_state()
+
+    def test_snapshot_memory_cap_fails_before_mutation(self):
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        fitter = _fitter(model, snapshot_max_bytes=1)
+        before_g = fitter._state[0].G.detach().clone()
+        before_b = fitter._lora[0].lora_B.detach().clone()
+        with pytest.raises(MemoryError, match="rollback snapshot"):
+            fitter.snapshot_state()
+        assert torch.equal(fitter._state[0].G, before_g)
+        assert torch.equal(fitter._lora[0].lora_B, before_b)
+
+    @pytest.mark.parametrize(
+        "malformed", ["phi_width", "target_width", "phi_dtype", "row_count"]
+    )
+    def test_malformed_row_geometry_poisons_until_valid_restore(self, malformed):
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model)
+        fitter.step(ids, tgt)
+        valid = fitter.snapshot_state()
+        entry = valid[0]
+        phi_rows = list(entry[8])
+        y_rows = list(entry[9])
+        assert phi_rows and y_rows
+
+        if malformed == "phi_width":
+            phi_rows[0] = torch.empty(
+                (phi_rows[0].shape[0], phi_rows[0].shape[1] + 1),
+                dtype=phi_rows[0].dtype,
+                device=phi_rows[0].device,
+            )
+        elif malformed == "target_width":
+            y_rows[0] = torch.empty(
+                (y_rows[0].shape[0], y_rows[0].shape[1] + 1),
+                dtype=y_rows[0].dtype,
+                device=y_rows[0].device,
+            )
+        elif malformed == "phi_dtype":
+            phi_rows[0] = phi_rows[0].to(dtype=torch.float64)
+        else:
+            y_rows[0] = y_rows[0][:0]
+
+        invalid = list(valid)
+        invalid[0] = (*entry[:8], tuple(phi_rows), tuple(y_rows), entry[10])
+        with pytest.raises(ValueError, match="row geometry"):
+            fitter.restore_state(tuple(invalid))
+        with pytest.raises(RuntimeError, match="poisoned"):
+            fitter.step(ids, tgt)
+        fitter.restore_state(valid)
+        assert fitter.step(ids, tgt).blocks == len(model.blocks)
+
+    def test_snapshot_row_tamper_fails_closed_instead_of_restoring(self):
+        """A snapshot that was mutated after the fact must not be restored.
+
+        Row tensors are retained by reference, so a snapshot the caller edited
+        in place is the same object the live buffer still holds. Restoring it
+        would silently "roll back" to the tampered values and clear the poison
+        flag, making the fitter look usable with values nobody verified.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model)
+        fitter.step(ids, tgt)
+        snapshot = fitter.snapshot_state()
+        assert fitter._state[0].phi_buf
+        snapshot[0][8][0].add_(1.0)
+        with pytest.raises(ValueError, match="digest mismatch"):
+            fitter.restore_state(snapshot)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            fitter.step(ids, tgt)
+
+    @pytest.mark.parametrize("position", [1, 2, 3])
+    def test_snapshot_accumulator_tamper_fails_closed(self, position):
+        """``G``, ``C`` and ``lora_B`` come back as clones.
+
+        Cloning means an external edit cannot reach live state, but it also
+        means the snapshot itself can be rewritten after the fact, and geometry
+        checks cannot see it: a snapshot whose ``G`` was scaled looks perfectly
+        well-formed. Restoring it would present unverified values as a rolled
+        back fitter, so every mutable tensor has to be covered by the digest.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model)
+        fitter.step(ids, tgt)
+        snapshot = fitter.snapshot_state()
+        snapshot[0][position].add_(1.0)
+        with pytest.raises(ValueError, match="digest mismatch"):
+            fitter.restore_state(snapshot)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            fitter.step(ids, tgt)
+
+    @pytest.mark.parametrize(
+        "position,message",
+        [
+            (4, "digest mismatch"),
+            (5, "digest mismatch"),
+            (6, "digest mismatch"),
+            (7, "digest mismatch"),
+        ],
+    )
+    def test_snapshot_counter_tamper_fails_closed(self, position, message):
+        """The four bookkeeping counters are part of the snapshot unit too.
+
+        ``train_rows``/``refits``/``holdout_rows`` are plain ints, so a type and
+        sign check cannot tell an honest counter from an edited one: a snapshot
+        claiming rows that were never consumed restores a fitter whose online
+        schedule no longer matches the data it holds. ``buf_rows`` already
+        fails on its own cross-check, and is pinned here so both routes stay
+        fail-closed.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model)
+        fitter.step(ids, tgt)
+        snapshot = fitter.snapshot_state()
+        entry = snapshot[0]
+        counter = entry[position]
+        tampered = (*entry[:position], counter + 1, *entry[position + 1 :])
+        invalid = (tampered, *snapshot[1:])
+        with pytest.raises(ValueError, match=message):
+            fitter.restore_state(invalid)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            fitter.step(ids, tgt)
+
+    def test_valid_snapshot_digest_does_not_create_false_negatives(self):
+        """The digest must reject edited snapshots without rejecting real ones.
+
+        An ordinary loop repeatedly restores the same snapshot while rows keep
+        being recorded, so a digest that drifted on a legitimate state change
+        would break the actual update path, not just an adversarial one.
+        """
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model, rows_max=4, refit_rows=10**9)
+        for _ in range(6):
+            fitter.step(ids, tgt)
+        snapshot = fitter.snapshot_state()
+        for _ in range(4):
+            fitter.step(ids, tgt)
+            fitter.restore_state(snapshot)
+            assert fitter._rollback_poisoned is False
+        assert fitter.step(ids, tgt).blocks == len(model.blocks)
+
+    def test_malformed_snapshot_poisons_until_valid_restore(self):
+        cfg = _lora_cfg()
+        model = _model(cfg)
+        ids, tgt = _window(cfg)
+        fitter = _fitter(model)
+        valid = fitter.snapshot_state()
+        invalid = list(valid)
+        invalid[0] = (
+            valid[0][0],
+            valid[0][1],
+            valid[0][2],
+            valid[0][3][:, :1],
+            *valid[0][4:],
+        )
+        with pytest.raises(ValueError, match="lora_B mismatch"):
+            fitter.restore_state(tuple(invalid))
+        with pytest.raises(RuntimeError, match="poisoned"):
+            fitter.step(ids, tgt)
+        fitter.restore_state(valid)
+        stats = fitter.step(ids, tgt)
+        assert stats.blocks == len(model.blocks)
+
     def test_snapshot_restore_roundtrip(self):
         cfg = _lora_cfg()
         model = _model(cfg)
         ids, tgt = _window(cfg)
         fitter = _fitter(model)
         fitter.step(ids, tgt)
-        snap = _snapshot_adapters(model)
         before = _lora_b(model)
+        before_g = fitter._state[0].G.detach().clone()
+        before_c = fitter._state[0].C.detach().clone()
+        snapshot = fitter.snapshot_state()
         for _ in range(5):
             fitter.step(ids, tgt)
         assert any(
             not torch.equal(x, y) for x, y in zip(before, _lora_b(model))
         ), "the later steps should have moved lora_B"
-        _restore_adapters(model, snap)
+        fitter.restore_state(snapshot)
         for x, y in zip(before, _lora_b(model)):
             assert torch.equal(x, y)
+        assert torch.equal(fitter._state[0].G, before_g)
+        assert torch.equal(fitter._state[0].C, before_c)
 
 
 class TestLoopDepth:
