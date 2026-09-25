@@ -34,6 +34,7 @@ import torch  # noqa: E402
 
 # ROCm Windows torch ships without torch._C._distributed_c10d, so transformers'
 # eager FSDP/DTensor imports crash at import time. No-op elsewhere.
+from hagi.model.factory import build_model_for_config  # noqa: E402
 from hagi.train._rocm_fsdp_stub import install as install_rocm_stub  # noqa: E402
 
 install_rocm_stub()
@@ -268,14 +269,9 @@ def main() -> int:
                 # architecture with random weights, which is the only way to
                 # separate merging from conditioning (see
                 # .omc/plans/clean_merge_test_20260926.md).
-                if getattr(cfg.merge, "scratch_block_norm", False):
-                    from hagi.model.scratch_blocknorm import ScratchBlockNormHAGI
-
-                    model = ScratchBlockNormHAGI(cfg, n_blocks=cfg.merge.n_experts).to(device)
-                else:
-                    model = MergedHAGI(
-                        cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale
-                    ).to(device)
+                # The class choice lives in hagi.model.factory so the evaluator
+                # rebuilds the same architecture for a checkpoint written here.
+                model = build_model_for_config(cfg).to(device)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",

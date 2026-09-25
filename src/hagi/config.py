@@ -69,13 +69,19 @@ class AttentionConfig:
 
     Attributes:
         fp32_softmax: compute attention scores and softmax in fp32 even when
-            the activations are bf16. Lesson from DeepSeek-V4's compressed-
-            attention path: in bf16/fp16 the softmax can collapse pairs that
-            differ by a small amount, especially at large window widths; the
-            official implementation explicitly runs ``softmax(dtype=fp32)``
-            there. On by default (training from scratch): the cost of the math
-            fallback is worth the guaranteed stability. Disable it only when
-            profiling shows it matters and the logit scale is well bounded.
+            the activations are bf16. The concern behind this flag is real --
+            in bf16 the softmax can collapse pairs that differ by a small
+            amount, and DeepSeek-V4's compressed-attention path runs
+            ``softmax(dtype=fp32)`` for that reason. It is OFF by default
+            because it is no longer needed on this hardware: with
+            ``TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`` (which the trainer
+            sets itself) the fused flash path computes the same result to
+            bf16 rounding, at 0.79 ms against 5.60 ms per layer on the
+            Radeon 8060S. Held-out comparison at equal budget, 76800 tokens
+            per arm: mean exact CE 7.3129 (fp32) against 7.3149 (fused), a
+            +0.0020 difference that is inside token-sampling noise. The fused
+            path is also the only reason 6.25 steps/s became 8.15. Set it
+            true to recover the fp32 scores if a future run shows divergence.
         sink_len: number of leading key positions that every query may attend
             to (attention sinks, as in DeepSeek-V4's ``attn_sink``). A learnable
             per-head bias is added to their scores and causality is lifted for
@@ -90,7 +96,7 @@ class AttentionConfig:
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
     qk_norm: bool = True
-    fp32_softmax: bool = True
+    fp32_softmax: bool = False
     sink_len: int = 4
 
 

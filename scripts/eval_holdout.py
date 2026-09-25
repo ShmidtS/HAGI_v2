@@ -32,8 +32,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from hagi.config import load_config  # noqa: E402
-from hagi.model.merge import MergedHAGI  # noqa: E402
-from hagi.model.model import HAGI  # noqa: E402
+from hagi.model.factory import build_model_for_config  # noqa: E402
 from hagi.train.checkpoint import load_model  # noqa: E402
 from hagi.train.loop import configure_runtime  # noqa: E402
 
@@ -119,12 +118,7 @@ def main() -> int:
         if args.device == "auto"
         else torch.device(args.device)
     )
-    if cfg.merge.enabled:
-        model = MergedHAGI(
-            cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale
-        ).to(device)
-    else:
-        model = HAGI(cfg).to(device)
+    model = build_model_for_config(cfg).to(device)
     load_model(args.resume, model, str(device))
     model.eval()
 
