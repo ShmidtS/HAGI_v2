@@ -2301,6 +2301,8 @@ Verification after removing the dead code: 104 focused tests pass, Ruff clean.
   `44d50edd...`, because the manifest carries a `retrieval_timestamp`. The pin was
   not altered and no data was fabricated. Fixing this by re-pinning would silently
   weaken the gate and is explicitly deferred.
+  **[CORRECTED 2026-09-25 — see below. The conclusion here was wrong; the
+  observation about the timestamp was right.]**
 - **Verification**: 180 passed across the cross-parent, recursive-growth,
   orchestrator and config suites; ruff clean on every touched file; the F3
   contract confirmed byte-identical (`_f3_real_column_matrix` still digests to the
@@ -2786,3 +2788,110 @@ support» и при этом проверял accepted-путь. Исправл�
   перепроверял лично — нужен свежий зафиксированный снапшот + подпись ревьюера.
 - Шаг 4 (baseline Banking77 + sigma): не начат.
 - Ни одно утверждение выше не является утверждением о качестве модели.
+
+## 2026-09-25 — Вводная принята: шаги 0–2 закрыты, шаг 3 на ревью, П1 найден
+
+### Шаг 0 — не трогаю архитектуру
+Соблюдён: сначала измеримость, геометрия только читалась.
+
+### Шаг 1 — PASS (корпуса)
+- Команда: `python scripts/check_corpus_ids.py --data-dir data --vocab-size 32768`
+  → `OK: 9 corpora within vocabulary 32768`, exit 0, `reports/corpus_ids.json`.
+- **Уточнение к вводной.** Сырые `data/*.bin` действительно невалидны
+  (max_id 255962–255998 при vocab 32768), но `*.compact.bin` валидны, и
+  `dataset_path` выбирает именно их. То есть тренировка шла на валидных
+  данных; риск был в молчаливом откате на сырой поток.
+- Сделано fail-closed, а не Advisory:
+  - `src/hagi/data/dataset.py`: `_assert_ids_in_vocabulary()` вызывается из
+    `build_dataloader`; отказ на пустом корпусе и на id вне словаря;
+    `dataset_path(..., require_compacted=True)` запрещает откат;
+  - `tests/test_corpus_guard.py`: 5 тестов, включая exit code 1 у CLI.
+- Тест поймал мой собственный дефект: первая версия пропускала compacted-файл
+  без проверки, поэтому пустой файл проходил. Проверка перенесена на данные,
+  а не на имя файла.
+
+### Шаг 2 — PASS (mechanism_supported)
+- Было: литерал `True` в `_evidence_payload`, не зависящий от вердикта.
+- Стало: `_mechanism_supported(verdict)` — флаг вычисляется из
+  `decision`, `ce_regression`, `worst_source_regression`; в
+  `_validate_evidence` флаг пересчитывается при загрузке, подделка отвергается.
+- `tests/test_mechanism_claim.py`: 7 тестов, включая сквозной —
+  отвергнутая генерация персистит `mechanism_supported: false`.
+- Побочный эффект: литерал `mechanism_supported: True` был и в `fixed`
+  валидатора — тесты это поймали, литерал удалён (иначе проверка была бы
+  театром).
+
+### Шаг 3 — делегировано независимому ревью (background), финальный вердикт мой.
+
+### Приоритет 1 — root cause найден, измерен, не исправлен
+Утверждение вводной подтверждено, а механизм назван точнее, чем в ней:
+проблема не в раскладке `coordinate_layout`, а в самой матрице.
+
+`parent_preserving_ternary_matrix()` ортогональна и фиксирует (1,1,1), но
+НЕ тождественна. Прямая проверка:
+
+    M @ (2, -1, 0.5) = (2.0, 0.5, -1.0)     # не тождественно
+
+Докстринг `src/hagi/model/merge.py:295-298` утверждает: «lifting three
+identical parent copies is the identity on their diagonal». Это свойство
+ложно — матрица сохраняет сумму, а не каждую копию родителя. Отсюда
+регрессия gen-2 `(x,x,x) → (√3·x, 0, 0)`, существующая до первого
+градиентного шага.
+
+Дополнительно: `CrossParentPreservingTernaryTree` (layout
+`branch_major_outer_ternary`) математически корректен — round-trip 2.2e-16,
+инвариант нормы держится. Его блокировка — сравнение layout-строк с
+`TernaryF3Tree` (`branch_major_pair_interleaved`), то есть контракт раскладки,
+а не метод. Но менять это — архитектурное изменение, запрещённое Шагом 0
+до закрытия шагов 3–4.
+
+## 2026-09-25 — Banking77 manifest pin: разблокирован реальный путь
+
+Предыдущая сессия объявила реальный путь Banking77 «заблокированным по данным»
+и отложила исправление как «молчаливое ослабление гейта». Вывод был неверным;
+наблюдение, на котором он стоял, — верным.
+
+**Что измерено.**
+- `sha256sum` единственного артефакта на диске =
+  `44d50edd994e7c32f30066a26052e15f902c74b79a7498ba60f475c76b453f3b`.
+- Prereg `.omc/plans/decision_banking77.md:14-15` фиксирует ровно `44d50edd`,
+  написан 24.09 19:49, то есть ДО коммита скрипта (25.09 20:50, `c54428f`).
+- Константа скрипта была `9927589c...` — не совпадала ни с одним из
+  существующих manifest.json в репозитории.
+- `retrieval_timestamp` действительно есть (`manifest.json` -> `sources[]`,
+  `2026-09-24T13:42:49Z`) — но он **не** в верхнем уровне, и именно поэтому
+  пина `9927589c` он не объясняет: пересериализация манифеста без этого поля
+  даёт `19265399...`/`ac36d282...`, а не `9927589c`.
+- Данные целы: sha256 каждого файла совпадает с записью в манифесте и с
+  пином в `prepare_banking77.py:55-60` (train.csv `b06e26ac`, test.csv
+  `d12d6e3b`, text `881989b4`/`b4148261`, revision `57ec275d...`).
+
+**Вердикт ревьюера: REFUTED мою первую попытку, но подтвердил суть.**
+Я проверил только верхний уровень JSON и предложил сменить ОДНУ константу.
+Ревьюер (adversarial, отдельный агент) опроверг оба пункта: (1) timestamp есть,
+вложенный в `sources[]`; (2) пин живёт ещё в трёх скриптах и закреплён ассертом
+`tests/test_tokenizer_banking77.py:589` — смена одной константы оставила бы
+`tokenizer_banking77.load_corpus` гарантированно падающим. Оба замечания верны,
+проверены мной и приняты. Решение принималось после этого, не до.
+
+**Что сделано (атомарно, 4 константы + тест).** `9927589c` -> `44d50edd` в
+`decision_plane_banking77.py:57`, `tokenizer_banking77.py:55`,
+`prepare_nlupp_hotels.py:52`, `probe_alpha_zero_merge.py:59` и в ассерте теста.
+Заодно подтверждено, что библиотечный код `real_cycle.py:62` уже держал
+`44d50edd` — то есть расходились именно скрипты, а не prereg.
+
+**Чем измерено.**
+- `parse_args` против реального артефакта -> OK (`seed=1234 num_seeds=3`).
+- Гейт `tokenizer_banking77` -> `_sha256_file(manifest) == EXPECTED` -> True.
+- `python -m pytest tests/ -q` -> **1216 passed, 0 failed** (105 с).
+
+**Вердикт: PASS.** Реальный путь Banking77 больше не заблокирован.
+
+**Что осталось непроверенным (явно).**
+- Прогон гейта на GPU НЕ выполнялся: ни одного нового baseline-прогона не
+  сделано. Sigma не измерена. Шаг 4 не закрыт.
+- `exact_ce` на 3080-строчном holdout как скрипта не существует; метрика
+  этого гейта — decision nll/ece/accuracy. Если `exact_ce` — требуемая
+  величина, её надо построить и пре-регистрировать ДО прогона.
+- Прежние отчёты, где `9927589c` записан как «reported» — эхо константы,
+  а не независимые измерения; переоценивать их нельзя.

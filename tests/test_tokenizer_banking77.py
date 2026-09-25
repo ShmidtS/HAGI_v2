@@ -586,5 +586,5 @@ def test_cli_defaults_to_exact_protocol_and_has_no_hash_override():
             "--output", "out.json",
             "--device", "cpu",
         ])
-    assert EXPECTED_MANIFEST_SHA256.startswith("9927589c")
+    assert EXPECTED_MANIFEST_SHA256.startswith("44d50edd")
     assert EXPECTED_CANDIDATE_TOKENIZER_SHA256.startswith("0997f410")

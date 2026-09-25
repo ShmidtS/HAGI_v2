@@ -56,7 +56,7 @@ DEFAULT_ARTIFACT = _ROOT / "artifacts" / "datasets" / "banking77" / "57ec275d807
 PINNED_MANIFEST_SHA256 = rc.BANKING77_MANIFEST_SHA256
 # Recorded in reports/banking77_pinned_multiseed_20260925.json as the
 # tokenizer/artifact manifest digest for the published Banking77 artifact.
-REPORTED_ARTIFACT_MANIFEST_SHA256 = "9927589c92c84d78fe13608fd1799dd959e973d6e759ac53ce3e4d43dedd875f"
+REPORTED_ARTIFACT_MANIFEST_SHA256 = "44d50edd994e7c32f30066a26052e15f902c74b79a7498ba60f475c76b453f3b"
 DEFAULT_SEEDS = (416114, 416115, 416116)
 # Diagnostic switch: the outer ternary lift used to build the candidate.
 # "f3_tree" is the legacy staged transform (default, unchanged);
