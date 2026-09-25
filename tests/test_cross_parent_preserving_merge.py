@@ -21,7 +21,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from hagi.config import Config
 from hagi.model.merge import (
     CrossParentPreservingTernaryTree,
     RecursiveF3HAGI,
@@ -31,11 +30,9 @@ from hagi.model.merge import (
 from hagi.model.merge import (
     merge_recursive_f3 as _merge_recursive_f3,
 )
-from hagi.model.model import HAGI
 from hagi.train.checkpoint import config_from_dict, load_payload, save_checkpoint
 from tests.test_recursive_growth import (
     CHILD_CONFIGS,
-    _base_config,
     _identical_children,
     _lift_target_config,
 )
@@ -341,7 +338,13 @@ def test_f6_checkpoint_round_trip_under_the_wrong_transform_raises(tmp_path) -> 
 
 
 def test_provenance_name_and_digest_both_gate_replay() -> None:
-    """The recorded name and the recorded digest are both enforced."""
+    """The recorded name and the recorded digest are both enforced.
+
+    Each half forges a tampered state dict and requires ``from_state_dict`` to
+    raise, so the test can fail: a state whose name is forged is rejected by
+    name validation, and a state whose NAME is left intact but whose DIGEST
+    buffer is mutated is rejected by the digest gate specifically.
+    """
     children, _parent = _identical_children()
     model = merge_recursive_f3(
         _lift_target_config("parent_preserving"),
@@ -353,11 +356,30 @@ def test_provenance_name_and_digest_both_gate_replay() -> None:
     for key in RecursiveF3HAGI._PROVENANCE_KEYS:
         assert key in state, f"provenance key {key} is not persistent"
 
-    # Forging an unknown transform name is rejected by provenance validation.
-    from hagi.model.merge import _CROSS_PARENT_TRANSFORMS
+    # (a) Forge the NAME only. The transform must not exist, so replay fails
+    # closed naming the recorded transform.
+    forged_name = dict(state)
+    forged_name["recursive_f3_cross_parent_transform"] = torch.frombuffer(
+        bytearray(b"bogus"), dtype=torch.uint8
+    ).reshape(1, 5)
+    with pytest.raises(ValueError, match="cross-parent transform"):
+        RecursiveF3HAGI.from_state_dict(model.cfg, forged_name)
 
-    assert "parent_preserving" in _CROSS_PARENT_TRANSFORMS
-    assert "f3_tree" in _CROSS_PARENT_TRANSFORMS
+    # (b) Forge the DIGEST only, leaving the name intact. The name gate passes
+    # and the failure must be the digest gate, not the name gate.
+    forged_digest = dict(state)
+    original_digest = forged_digest["recursive_f3_transform_digest"].clone()
+    forged_digest["recursive_f3_transform_digest"] = original_digest + 1.0
+    assert (
+        forged_digest["recursive_f3_cross_parent_transform"]
+        == state["recursive_f3_cross_parent_transform"]
+    ), "the digest forgery must leave the transform name untouched"
+    with pytest.raises(ValueError, match="digest"):
+        RecursiveF3HAGI.from_state_dict(model.cfg, forged_digest)
+
+    # (c) The untampered state still replays, so (a) and (b) are not passing
+    # because the state is rejected for some unrelated reason.
+    RecursiveF3HAGI.from_state_dict(model.cfg, state)
 
 
 # End-to-end: the mechanism survives a real model merge, not just matrices.
@@ -395,13 +417,102 @@ def test_new_transform_does_not_mutate_the_legacy_transform() -> None:
     )
 
 
-def test_shared_helpers_imported_by_this_file_still_exist() -> None:
-    """Guard that the shared test helpers this file builds on are present."""
-    assert isinstance(_base_config(), Config)
-    children, parent = _identical_children()
-    assert len(children) == 3
-    assert isinstance(parent, HAGI)
-    assert all(set(child) == set(children[0]) for child in children)
+# STAGE -- the cross-parent mode is OUTER only. The inner child-to-parent
+# step must keep using TernaryF3Tree, and must be bit-identical under both
+# cross-parent modes, in every assembled part.
+
+
+@pytest.mark.parametrize("mode", ["f3_tree", "parent_preserving"])
+def test_parent_tree_is_the_legacy_inner_tree_in_both_modes(mode: str) -> None:
+    """``parent_tree`` is the INNER child-to-parent step, never the cross one."""
+    children, _parent = _identical_children()
+    model = merge_recursive_f3(
+        _lift_target_config(mode),
+        children,
+        parent_depth=0,
+        expert_weight_source="effective_sparse",
+        cross_parent_transform=mode,
+    )
+    assert isinstance(model.parent_tree, TernaryF3Tree), (
+        f"parent_tree must stay TernaryF3Tree in mode {mode}, got "
+        f"{type(model.parent_tree).__name__}"
+    )
+    assert not isinstance(model.parent_tree, CrossParentPreservingTernaryTree), (
+        f"the cross-parent tree must not be used for the inner step in mode {mode}"
+    )
+    # The cross-parent selection lives on target_tree, and it is the ONLY
+    # place the mode is applied.
+    if mode == "f3_tree":
+        assert isinstance(model.target_tree, TernaryF3Tree)
+    else:
+        assert isinstance(model.target_tree, CrossParentPreservingTernaryTree)
+
+
+def test_inner_assembly_is_identical_under_both_cross_parent_modes() -> None:
+    """parent_depth=1: the outer mode must not perturb the inner step.
+
+    With ``parent_depth=1`` the children are themselves recursive parents, so
+    the inner ``TernaryF3Tree`` step is exercised. A regression that swapped
+    ``parent_tree`` for the cross-parent tree would change every entry below.
+    """
+    children, _parent = _identical_children()
+    merged = {}
+    for mode in ("f3_tree", "parent_preserving"):
+        model = merge_recursive_f3(
+            _lift_target_config(mode),
+            children,
+            parent_depth=1,
+            expert_weight_source="effective_sparse",
+            cross_parent_transform=mode,
+        )
+        assert model.parent_depth == 1
+        assert model.leaf_hidden == _recursive_leaf_hidden_for_test()
+        merged[mode] = model.state_dict()
+
+    legacy, new = merged["f3_tree"], merged["parent_preserving"]
+    assert set(legacy) == set(new)
+
+    # Parts assembled by the INNER step / geometry, which the outer mode
+    # must not touch.
+    inner_keys = [key for key in sorted(legacy) if _is_inner_key(key)]
+    assert inner_keys, "no inner-step keys were identified -- test is vacuous"
+    for key in inner_keys:
+        assert torch.equal(legacy[key], new[key]), (
+            f"inner-step key {key!r} differs between cross-parent modes: "
+            f"max_abs="
+            f"{float((legacy[key] - new[key]).abs().max()):.3e}"
+        )
+
+    # The parts that legitimately DO differ: the receiver, the transform
+    # provenance, and the head scale that compensates for it. Assert they
+    # differ, otherwise the comparison above proves nothing.
+    assert not torch.equal(
+        legacy["head.projection.weight"], new["head.projection.weight"]
+    ), "the two cross-parent modes produced the same receiver -- vacuous test"
+
+
+def _recursive_leaf_hidden_for_test() -> int:
+    return _lift_target_config("f3_tree", depth=2).merge.expert_hidden // 3
+
+
+def _is_inner_key(key: str) -> bool:
+    """Keys assembled by the inner child-to-parent step, not the receiver."""
+    return key.endswith(
+        (
+            "out_norm.weight",
+            ".attn.attn_norm.weight",
+            ".mixer.norm.weight",
+            ".attn.qkv_proj.weight",
+            ".attn.out_proj.weight",
+            ".mixer.gate.weight",
+            ".mixer.up.weight",
+            ".mixer.down.weight",
+            ".branch_scale.scale",
+            ".attn.q_norm.weight",
+            ".attn.k_norm.weight",
+            "encoder.embedding.weight",
+        )
+    )
 
 
 def _max_abs(left: torch.Tensor, right: torch.Tensor) -> float:

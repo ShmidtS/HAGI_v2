@@ -30,7 +30,6 @@ import numpy as np
 import torch
 
 from hagi.inference.generate import generate
-from hagi.model.model import HAGI
 from hagi.train.loop import cast_model
 
 try:
@@ -93,6 +92,16 @@ def main() -> int:
 
     payload = load_payload(ckpt_path, device)
     cfg = config_from_dict(payload["config"])
+    state = payload["model"]
+    from hagi.model.merge import build_model_from_payload
+
+    model = build_model_from_payload(
+        cfg,
+        state,
+        n_mixers=1,
+        mixer_init_scale=cfg.merge.mixer_init_scale,
+        device=device,
+    )
     vocab = cfg.model.vocab_size
 
     # Ids the model must never emit: special tokens (PAD/BOS/UNK/MASK/multimodal),
@@ -132,14 +141,12 @@ def main() -> int:
         print(f"max_tokens {args.max_tokens} почти равен max_seq_len {max_seq_len}; уменьшите max_tokens")
         return 1
 
-    model = HAGI(cfg).to(device)
-    if cfg.merge.enabled:
-        from hagi.model.merge import MergedHAGI
-
-        model = MergedHAGI(cfg, n_mixers=1, mixer_init_scale=cfg.merge.mixer_init_scale).to(device)
-    state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
-    model.load_state_dict(state["model"] if "model" in state else state, strict=True)
-    cast_model(model, cfg.train.precision)  # bf16 + fp32-гейны, как в обучении
+    model.load_state_dict(state, strict=True)
+    cast_model(
+        model,
+        cfg.train.precision,
+        ternary_fp32_master=cfg.train.ternary_fp32_master,
+    )  # preserve fp32 ternary masters when the training config requests them
     model.eval()
 
     tokenizer = gt.Tokenizer(cfg.train.tokenizer)
