@@ -90,16 +90,30 @@ class TestPackedStream:
         second = stream.next_window()
         assert int(first[-1]) == int(second[0])
 
-    def test_wraps_at_end_of_file(self, corpus):
+    def test_stops_at_end_of_file(self, corpus):
         stream = PackedStream(corpus / "a.bin", 8, 1, np.random.default_rng(0))
-        for _ in range(60):
-            window = stream.next_window()
-            assert window.shape == (9,)
+        windows = []
+        while (window := stream.next_window()) is not None:
+            windows.append(window)
+        expected = (stream.n_tokens - (stream.seq_len + 1)) // stream.seq_len + 1
+        assert len(windows) == expected
+        assert all(window.shape == (9,) for window in windows)
+        assert stream.next_window() is None
 
     def test_too_short_file_raises(self, tmp_path):
         write_bin(tmp_path / "tiny.bin", [1, 2, 3])
         with pytest.raises(ValueError):
             PackedStream(tmp_path / "tiny.bin", 8, 1, np.random.default_rng(0))
+
+    @pytest.mark.parametrize("offset,match", [(-1, "non-negative"), (192, "sealed budget"), (1000, "sealed budget")])
+    def test_out_of_file_offset_is_rejected(self, corpus, offset, match):
+        with pytest.raises(ValueError, match=match):
+            PackedStream(corpus / "a.bin", 8, 1, np.random.default_rng(0), offset)
+
+    @pytest.mark.parametrize("offset", [0, 191])
+    def test_in_file_offset_is_not_clamped(self, corpus, offset):
+        stream = PackedStream(corpus / "a.bin", 8, 1, np.random.default_rng(0), offset)
+        assert stream.consumed == offset
 
 
 class TestDocIds:
@@ -149,11 +163,11 @@ class TestTargets:
 
     def test_no_padding_is_ever_emitted(self, tmp_path):
         """Packing's entire point: every scored position carries a real token."""
-        write_bin(tmp_path / "s.bin", list(range(100, 400)))
+        write_bin(tmp_path / "s.bin", list(range(100, 1000)))
         dataset = PackedMixDataset(str(tmp_path), seq_len=16, eos_token_id=1, weights={"s": 1.0})
-        it = iter(dataset)
-        for _ in range(20):
-            item = next(it)
+        items = list(dataset)
+        assert len(items) == 56
+        for item in items:
             assert int(item["input_ids"].min()) > 0
 
     def test_dtype_is_int64(self, tmp_path):
@@ -173,13 +187,13 @@ class TestMixing:
         )
         it = iter(dataset)
         seen_low = seen_high = False
-        for _ in range(60):
-            first = int(next(it)["input_ids"][0])
+        for item in it:
+            first = int(item["input_ids"][0])
             if first < 300:
                 seen_low = True
             else:
                 seen_high = True
-        assert seen_low and seen_high, "one source never appeared in 60 windows"
+        assert seen_low and seen_high, "one source never appeared before exhaustion"
 
     def test_seed_is_reproducible(self, corpus):
         def first_windows(seed):

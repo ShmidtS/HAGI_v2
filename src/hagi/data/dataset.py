@@ -135,8 +135,15 @@ class PackedStream:
         self.n_tokens = len(self.tokens)
         if self.n_tokens < seq_len + 1:
             raise ValueError(f"{path.name} holds {self.n_tokens} tokens, need at least {seq_len + 1}")
-        # Clamp the start offset so a full window fits before EOF.
-        self.cursor = int(min(max(start_offset, 0), self.n_tokens - seq_len - 1))
+        if type(start_offset) is not int or start_offset < 0:
+            raise ValueError("start_offset must be a non-negative exact int")
+        max_start = self.n_tokens - seq_len - 1
+        if start_offset > max_start:
+            raise ValueError(
+                f"start_offset {start_offset} exceeds sealed budget [0, {max_start}]"
+            )
+        # The sealed span is a hard boundary: do not clamp an invalid offset.
+        self.cursor = start_offset
         self.exhausted = False
 
     @property
@@ -164,10 +171,10 @@ class PackedStream:
 
 
 class PackedMixDataset(IterableDataset):
-    """Infinite iterator over proportionally-mixed packed windows.
+    """Finite iterator over proportionally-mixed packed windows.
 
-    Iterable rather than indexed: the corpus is a stream with no meaningful
-    length, and an indexed dataset would need either a random seek per item
+    Iterable rather than indexed: a contiguous corpus slice has a bounded number
+    of windows, while an indexed dataset would need either a random seek per item
     (disk-bound) or a precomputed index of every window (gigabytes of state).
 
     Each worker gets its own generator seed and its own start offsets, so workers
