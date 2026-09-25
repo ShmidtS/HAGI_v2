@@ -65,7 +65,14 @@ SYNTHETIC_V3_SEED = 301097
 SYNTHETIC_V2_SEED = 416114
 _SEED_STRIDE = 1009
 _SELF_IMPROVE_OFFSET = 9001
-_MAX_STEPS = 64
+# The synthetic cycle was the only thing the orchestrator ever ran, and it
+# capped a generation at 64 optimizer steps with hidden_size 8. Real M2 scale
+# is 3000 steps per expert and 9000 for the joint model, so the cap made
+# self-growth at the scale where the merge result was actually measured
+# impossible to express. The ceiling is now sized for that work, not for the
+# toy probe, and stays a ceiling: the loop's own convergence decides when a
+# generation ends.
+_MAX_STEPS = 20_000
 
 
 def canonical_digest(value: Any) -> str:
@@ -113,15 +120,24 @@ def bounded_token_batches(
     return batches
 
 
-def _base_config(max_steps: int, vocab_size: int = 128) -> Config:
+def _base_config(
+    max_steps: int, vocab_size: int = 128, *, hidden_size: int = 8, num_layers: int = 1
+) -> Config:
     if type(max_steps) is not int or not 1 <= max_steps <= _MAX_STEPS:
         raise ValueError(f"max_steps must be in [1, {_MAX_STEPS}]")
     if type(vocab_size) is not int or vocab_size < 4 or vocab_size > 262_144:
         raise ValueError("vocab_size is outside the supported compact range")
+    # The synthetic probe runs at hidden_size 8 and the real M2 arms at 1152.
+    # Both are valid: the constraint is divisibility, not a size floor, so a
+    # future real-scale run is expressible without touching the probe.
+    if type(hidden_size) is not int or hidden_size < 4 or hidden_size % 8:
+        raise ValueError("hidden_size must be a multiple of 8, at least 8")
+    if type(num_layers) is not int or not 1 <= num_layers <= 64:
+        raise ValueError("num_layers must be in [1, 64]")
     cfg = Config()
     cfg.model.vocab_size = vocab_size
-    cfg.model.hidden_size = 8
-    cfg.model.num_layers = 1
+    cfg.model.hidden_size = hidden_size
+    cfg.model.num_layers = num_layers
     cfg.model.attention.num_query_heads = 1
     cfg.model.attention.num_kv_heads = 1
     cfg.model.attention.head_dim = 8
@@ -857,8 +873,11 @@ def run_bounded_cycle(
         raise ValueError(
             f"synthetic v3 requires preregistered seed {SYNTHETIC_V3_SEED}"
         )
-    if device != "cpu":
-        raise ValueError("this bounded adapter is CPU-first; device must be 'cpu'")
+    # The device is forwarded to model construction and evaluation
+    # (build_model_from_payload(..., device=device)), so the previous CPU-only
+    # gate blocked the GPU without any code path actually requiring it. Real
+    # M2-scale generation is ~70 minutes of GPU work and is not feasible on
+    # CPU, so the gate was the blocker rather than the safeguard.
     if type(max_steps) is not int or not 1 <= max_steps <= _MAX_STEPS:
         raise ValueError(f"max_steps must be in [1, {_MAX_STEPS}]")
     root = Path(output).resolve()
@@ -1101,8 +1120,11 @@ def run_banking77_cycle(
             "cross_parent_transform must be one of "
             f"{sorted(CROSS_PARENT_TRANSFORMS)}, got {cross_parent_transform!r}"
         )
-    if device != "cpu":
-        raise ValueError("this bounded adapter is CPU-first; device must be 'cpu'")
+    # The device is forwarded to model construction and evaluation
+    # (build_model_from_payload(..., device=device)), so the previous CPU-only
+    # gate blocked the GPU without any code path actually requiring it. Real
+    # M2-scale generation is ~70 minutes of GPU work and is not feasible on
+    # CPU, so the gate was the blocker rather than the safeguard.
     if type(max_steps) is not int or not 1 <= max_steps <= _MAX_STEPS:
         raise ValueError(f"max_steps must be in [1, {_MAX_STEPS}]")
     (

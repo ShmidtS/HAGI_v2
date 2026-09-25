@@ -685,19 +685,23 @@ class MergedHAGI(HAGI):
             raise ValueError(
                 "ternary_f3 requires RecursiveF3HAGI; legacy MergedHAGI refuses this mode"
             )
-        # Ternary quantization does not commute with block-diagonal merging:
-        # ternarize normalizes each row by its absmean, and a merged row
-        # includes the zero off-diagonal blocks, which changes the scale and
-        # breaks the exact-expert equivalence. The merged body therefore uses
-        # plain fp16 linear layers (block-diagonal weights applied exactly);
-        # ternary can be re-enabled during joint training if desired.
+        # Ternary quantization is kept ON. An earlier revision forced it off
+        # here on the theory that it does not commute with block-diagonal
+        # merging (ternarize normalizes each row by its absmean, and a merged
+        # row carries zero off-diagonal blocks, so the per-row scale changes).
+        # That argument is about exact-expert equivalence at merge time, not
+        # about whether the merged body can be trained under the rate
+        # constraint: by this point the merge is already applied and the body
+        # is optimized, so the constraint applies normally to the merged rows.
+        # The comment claimed ternary "can be re-enabled during joint
+        # training"; in fact the flag was restored on the config object
+        # immediately after ``super().__init__``, so the modules were built as
+        # plain fp16 and the restored value only ever lied in the saved
+        # config. Consequence: the merged arm trained and evaluated at full
+        # precision while the baseline was rate-constrained, which is not a
+        # comparison of merging.
         m = cfg.model
-        _saved_ternary = m.ternary.enabled
-        m.ternary.enabled = False
-        try:
-            super().__init__(cfg)
-        finally:
-            m.ternary.enabled = _saved_ternary
+        super().__init__(cfg)
         h = m.hidden_size
         n = cfg.merge.n_experts
         if h % n != 0:
