@@ -131,3 +131,86 @@ def test_attribution_script_measures_both_budgets() -> None:
         "the attribution harness must score a mid-training checkpoint too, "
         "otherwise a step-budget artifact is indistinguishable from a merge win"
     )
+
+
+# --- the empty-group-list defect that blocked the level-2 DFT3 merge -----
+
+
+def test_empty_hadamard_group_list_means_unspecified() -> None:
+    """``mixer_hadamard_groups: []`` must behave exactly like ``None``.
+
+    The merged M2 configs carry the default ``mixer_hadamard_groups: []``.
+    ``all([])`` is True, so the ternary-group branch claimed the empty list
+    and reshaped with ``n_blocks // 3 == 0``:
+
+        RuntimeError: shape '[32768, 0, 3, 1152]' is invalid
+
+    That made every level-2 three-way DFT3 merge fail to build, which is the
+    recursion this project exists to test. The fix normalises the empty list
+    to None so both spellings of "unspecified" agree.
+    """
+    import torch
+
+    from hagi.model.merge import hadamard_apply_2d
+
+    weight = torch.randn(16, 3 * 8)
+    assert torch.allclose(
+        hadamard_apply_2d(weight, 3, []), hadamard_apply_2d(weight, 3, None)
+    ), "empty group list must not take a different branch than None"
+
+
+@pytest.mark.parametrize("n_blocks", [2, 3, 4])
+def test_hadamard_group_list_none_and_empty_agree(n_blocks: int) -> None:
+    import torch
+
+    from hagi.model.merge import hadamard_apply_2d
+
+    weight = torch.randn(8, n_blocks * 8)
+    assert hadamard_apply_2d(weight, n_blocks, []).shape == weight.shape
+    assert torch.allclose(
+        hadamard_apply_2d(weight, n_blocks, []),
+        hadamard_apply_2d(weight, n_blocks, None),
+    )
+
+
+def test_a_populated_group_list_still_takes_its_own_branch() -> None:
+    """Normalising the empty list must not collapse a real grouping.
+
+    ``[2, 2]`` splits 4 blocks hierarchically and must differ from the flat
+    ungrouped transform. ``[4]`` is deliberately NOT used: a single group
+    spanning every block is the same rotation, so asserting a difference
+    there would be asserting something false.
+    """
+    import torch
+
+    from hagi.model.merge import hadamard_apply_2d
+
+    weight = torch.randn(8, 4 * 8)
+    ungrouped = hadamard_apply_2d(weight, 4, None)
+    assert not torch.allclose(hadamard_apply_2d(weight, 4, [2, 2]), ungrouped), (
+        "an explicit [2, 2] grouping was ignored, so the empty-list fix is too broad"
+    )
+
+
+def test_every_merged_config_with_a_default_group_list_can_still_merge() -> None:
+    """The defect lived in the merged configs, so guard that path.
+
+    ``mixer_hadamard_groups`` is absent from the merged configs, which the
+    dataclass surfaces as the default ``[]``. Building the head rotation with
+    that value must not raise - that RuntimeError is exactly what stopped the
+    level-2 three-way DFT3 merge from building.
+    """
+    import torch
+
+    from hagi.config import load_config
+    from hagi.model.merge import hadamard_apply_2d
+
+    for path in sorted(_CONFIGS.glob("m2_merged_joint*.yaml")):
+        merge = load_config(str(path)).merge
+        assert merge.mixer_hadamard_groups == [], (
+            f"{path.name} resolves mixer_hadamard_groups to "
+            f"{merge.mixer_hadamard_groups!r}; this guard assumed the default [] "
+            "and should be revisited if the default changed"
+        )
+    weight = torch.randn(8, 3 * 8)
+    assert hadamard_apply_2d(weight, 3, []).shape == weight.shape

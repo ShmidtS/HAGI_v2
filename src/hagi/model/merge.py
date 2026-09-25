@@ -502,6 +502,14 @@ def hadamard_apply_2d(
     if n_blocks == 1:
         return weight
     bd = weight.shape[1] // n_blocks
+    # An empty group list means "no explicit grouping", not "a group of size
+    # zero". ``all([])`` is True, so the ternary-group branch below used to
+    # claim the empty list and reshape with ``n_blocks // 3 == 0``, which
+    # raised RuntimeError on any merge whose config carried the default
+    # ``mixer_hadamard_groups: []``. Treating it as None keeps the two
+    # spellings of "unspecified" equivalent.
+    if not group_sizes:
+        group_sizes = None
     if group_sizes is not None:
         if all(_is_ternary_group(g) for g in group_sizes) and bd % 2 == 0:
             return _dft3_apply_2d(weight, n_blocks, bd)
