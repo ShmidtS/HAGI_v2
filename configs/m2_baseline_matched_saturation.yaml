@@ -1,0 +1,129 @@
+# Compute-matched control arm C (pre-registered in
+# .omc/plans/compute_matched_control_20260925.md).
+#
+# Copied verbatim from configs/m2_baseline_merged.yaml except for the three
+# saturation parameters and max_steps, so that "train to saturation" means
+# what was asked: stop once perplexity has not improved for 400 optimizer
+# steps. exact_ce is the coding-cost equivalent of perplexity and is what the
+# trainer's saturation rule tracks.
+#
+# saturation_patience counts SAMPLES of exact_ce; logging.exact_ce_interval is
+# 25, so 400 optimizer steps = 16 samples.
+#
+# max_steps is a ceiling, not the intended stopping rule. The ceiling only
+# exists so an unsaturated run terminates.
+#
+# exact_ce_rows is raised 512 -> 4096. At 512 rows the estimator noise is about
+# 0.23 nats while the early loss is still falling by more than that per 100
+# steps, so the running minimum almost never improved and the run stopped
+# spuriously at step 701. Noise scales as 1/sqrt(rows), so 4096 rows cut it
+# to roughly 0.08 nats, below the real signal.
+inference:
+  max_new_tokens: 512
+  min_new_tokens: 1
+  repetition_penalty: 1.05
+  repetition_window: 128
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+merge:
+  enabled: false
+model:
+  attention:
+    head_dim: 64
+    max_seq_len: 4096
+    num_kv_heads: 6
+    num_query_heads: 18
+    qk_norm: true
+    rope_theta: 10000.0
+  embedding:
+    conv_kernel: 1
+    init_std: 0.02
+    tie_lm_head: false
+  ffn:
+    expansion: 1.0
+    multiple_of: 64
+  head:
+    ce_chunk_rows: 16384
+    ce_save_logits: true
+    logit_scale_max: 1.0
+    sampled_in_batch_fraction: 0.5
+    sampled_proposal: prior
+    sampled_softmax_k: 2048
+    unigram_path: data/unigram.compact.npy
+    unigram_prior: true
+    unigram_smoothing: 1.0
+    z_loss_weight: 0.0001
+  hidden_size: 1152
+  init_orthogonal: true
+  loop_depth: 1
+  multimodal:
+    bridge_heads: 8
+    bridge_layers: 2
+    enabled: false
+    grounding_weight: 0.1
+    infonce_temperature: 0.07
+    modality_dropout: 0.3
+    n_bridge_queries: 32
+    variance_gamma: 1.0
+  norm_eps: 1.0e-05
+  num_layers: 3
+  sliding:
+    full_every: 4
+    history_stride: 0
+    window: 0
+  ternary:
+    enabled: true
+    eps: 1.0e-05
+  vocab_size: 32768
+train:
+  adam:
+    beta1: 0.9
+    beta2: 0.95
+    body_lr_scale: 8.0
+    weight_decay: 0.1
+  batch_size: 64
+  ce_keep_mode: stride
+  ce_keep_rate: 0.25
+  checkpoint_dir: checkpoints/m2_baseline_matched_saturation
+  checkpoint_interval: 4500
+  checkpoint_keep_last: 2
+  compile_model: false
+  data:
+    cross_doc_attention: true
+    data_dir: data
+    eos_token_id: 1
+    num_workers: 0
+    pad_token_id: 0
+    seed: 1234
+    seq_len: 128
+    weights:
+      wikipedia_ru: 0.16666666666666666
+      oscar_ru: 0.16666666666666666
+      slimpajama: 0.16666666666666666
+      edu: 0.16666666666666666
+      openwebmath: 0.16666666666666666
+      python_instruct: 0.16666666666666666
+  grad_accum_steps: 1
+  grad_checkpointing: false
+  learning_rate: 0.0001
+  logging:
+    diag_chunk_rows: 512
+    diag_interval: 25
+    exact_ce_interval: 25
+    exact_ce_rows: 4096
+    log_interval: 25
+  max_grad_norm: 1.0
+  max_steps: 18000
+  precision: bf16
+  saturation_min_steps: 0
+  saturation_patience: 0
+  saturation_tol: 0.001
+  schedule:
+    decay_fraction: 0.2
+    min_lr_ratio: 0.02
+    warmup_steps: 50
+  ternary_step_cache: true
+  tokenizer: google/gemma-4-E2B-it
+  use_muon: false
+  z_loss_weight: 0.0001
