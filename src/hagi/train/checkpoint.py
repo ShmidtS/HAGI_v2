@@ -118,6 +118,16 @@ def load_model(
 
     incoming = state["model"]
     current = model.state_dict()
+    from hagi.model.merge import RecursiveF3HAGI
+
+    payload_is_recursive = RecursiveF3HAGI.is_recursive_state(incoming)
+    model_is_recursive = isinstance(model, RecursiveF3HAGI)
+    if payload_is_recursive != model_is_recursive:
+        kind = "recursive F3" if payload_is_recursive else "legacy"
+        raise _fail(
+            f"checkpoint model kind {kind!r} does not match "
+            f"{type(model).__name__!r}; rebuild with build_model_from_payload"
+        )
     if skip_prefixes:
         incoming = {k: v for k, v in incoming.items() if not k.startswith(skip_prefixes)}
         current = {k: v for k, v in current.items() if not k.startswith(skip_prefixes)}
