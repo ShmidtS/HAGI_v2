@@ -18,10 +18,15 @@ quality, security, autonomy or promotion claim.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
+from hagi.config import Config, validate_config
 from hagi.model.merge import (
+    _CROSS_PARENT_TRANSFORMS,
+    KNOWN_COORDINATE_LAYOUTS,
     CrossParentPreservingTernaryTree,
     RecursiveF3HAGI,
     TernaryF3Tree,
@@ -30,9 +35,16 @@ from hagi.model.merge import (
 from hagi.model.merge import (
     merge_recursive_f3 as _merge_recursive_f3,
 )
+from hagi.model.model import HAGI
+from hagi.orchestrator.recursive import (
+    CandidateArtifact,
+    SelfImprovementLedger,
+    SourceSpan,
+)
 from hagi.train.checkpoint import config_from_dict, load_payload, save_checkpoint
 from tests.test_recursive_growth import (
     CHILD_CONFIGS,
+    _base_config,
     _identical_children,
     _lift_target_config,
 )
@@ -358,28 +370,45 @@ def test_provenance_name_and_digest_both_gate_replay() -> None:
 
     # (a) Forge the NAME only. The transform must not exist, so replay fails
     # closed naming the recorded transform.
-    forged_name = dict(state)
-    forged_name["recursive_f3_cross_parent_transform"] = torch.frombuffer(
+    name_buffer = state["recursive_f3_cross_parent_transform"]
+    forged = torch.zeros_like(name_buffer)
+    forged.view(-1)[: len(b"bogus")] = torch.frombuffer(
         bytearray(b"bogus"), dtype=torch.uint8
-    ).reshape(1, 5)
-    with pytest.raises(ValueError, match="cross-parent transform"):
+    )
+    forged_name = dict(state)
+    forged_name["recursive_f3_cross_parent_transform"] = forged
+    with pytest.raises(ValueError, match="cross_parent_transform is unknown"):
         RecursiveF3HAGI.from_state_dict(model.cfg, forged_name)
 
-    # (b) Forge the DIGEST only, leaving the name intact. The name gate passes
-    # and the failure must be the digest gate, not the name gate.
+    # (b) Forge the DIGEST only, leaving the name intact. The digest is a
+    # 64-byte text buffer, so the forgery must stay valid UTF-8 of the same
+    # length -- otherwise the failure would be a decode error rather than the
+    # digest gate. The name gate must pass and the digest gate must be the
+    # thing that raises.
     forged_digest = dict(state)
-    original_digest = forged_digest["recursive_f3_transform_digest"].clone()
-    forged_digest["recursive_f3_transform_digest"] = original_digest + 1.0
+    digest_text = bytes(
+        forged_digest["recursive_f3_transform_digest"].tolist()
+    ).decode("utf-8")
+    assert len(digest_text) == 64, digest_text
+    flipped = ("1" if digest_text[0] != "1" else "2") + digest_text[1:]
+    assert flipped != digest_text
+    forged_digest["recursive_f3_transform_digest"] = torch.tensor(
+        list(flipped.encode("utf-8")), dtype=torch.uint8
+    )
     assert (
         forged_digest["recursive_f3_cross_parent_transform"]
         == state["recursive_f3_cross_parent_transform"]
-    ), "the digest forgery must leave the transform name untouched"
+    ).all(), "the digest forgery must leave the transform name untouched"
     with pytest.raises(ValueError, match="digest"):
         RecursiveF3HAGI.from_state_dict(model.cfg, forged_digest)
 
     # (c) The untampered state still replays, so (a) and (b) are not passing
     # because the state is rejected for some unrelated reason.
     RecursiveF3HAGI.from_state_dict(model.cfg, state)
+
+    # The forged name is genuinely unknown, so the gate is not passing because
+    # every name is rejected, nor because 'bogus' happens to be accepted.
+    assert "bogus" not in _CROSS_PARENT_TRANSFORMS
 
 
 # End-to-end: the mechanism survives a real model merge, not just matrices.
@@ -455,18 +484,25 @@ def test_inner_assembly_is_identical_under_both_cross_parent_modes() -> None:
     the inner ``TernaryF3Tree`` step is exercised. A regression that swapped
     ``parent_tree`` for the cross-parent tree would change every entry below.
     """
-    children, _parent = _identical_children()
+    children, _parent = _depth2_identical_children()
+    child_configs = [_depth2_child_config() for _ in range(3)]
     merged = {}
     for mode in ("f3_tree", "parent_preserving"):
-        model = merge_recursive_f3(
-            _lift_target_config(mode),
+        model = _merge_recursive_f3(
+            _depth2_target_config(mode),
             children,
+            child_configs=child_configs,
             parent_depth=1,
             expert_weight_source="effective_sparse",
             cross_parent_transform=mode,
         )
         assert model.parent_depth == 1
-        assert model.leaf_hidden == _recursive_leaf_hidden_for_test()
+        assert model.ternary_depth == 2
+        # leaf_hidden = expert_hidden / 3**parent_depth = 192 / 3 = 64, and
+        # the child width is exactly 3 * leaf_hidden, which is what makes this
+        # a real inner step rather than the identity.
+        assert model.leaf_hidden == 64
+        assert model.leaf_hidden < 192, "leaf geometry collapsed -- inner step is identity"
         merged[mode] = model.state_dict()
 
     legacy, new = merged["f3_tree"], merged["parent_preserving"]
@@ -491,8 +527,51 @@ def test_inner_assembly_is_identical_under_both_cross_parent_modes() -> None:
     ), "the two cross-parent modes produced the same receiver -- vacuous test"
 
 
-def _recursive_leaf_hidden_for_test() -> int:
-    return _lift_target_config("f3_tree", depth=2).merge.expert_hidden // 3
+def _depth2_identical_children() -> tuple[list[dict[str, torch.Tensor]], HAGI]:
+    """Three identical DEPTH-1 recursive models used as the depth-2 children.
+
+    A depth-2 target with ``parent_depth=1`` requires each child to be itself a
+    recursive parent (its ``branch_scale`` has ``3**parent_depth = 3`` leaves
+    and its widths are the target's ``expert_hidden``). A flat level-0 model
+    is rejected, which is exactly why the earlier flat fixture could not
+    exercise the inner step.
+    """
+    level0, _root = _identical_children()
+    child_cfg = _lift_target_config("f3_tree")
+    child = merge_recursive_f3(
+        child_cfg,
+        level0,
+        parent_depth=0,
+        expert_weight_source="effective_sparse",
+        cross_parent_transform="f3_tree",
+    )
+    state = {key: value.detach().clone() for key, value in child.state_dict().items()}
+    return [copy.deepcopy(state) for _ in range(3)], child
+
+
+def _depth2_child_config() -> Config:
+    """Config of the depth-1 recursive children (the depth-2 target's parents)."""
+    return _lift_target_config("f3_tree")
+
+
+def _depth2_target_config(mode: str) -> Config:
+    cfg = _base_config()
+    cfg.merge.enabled = True
+    cfg.merge.n_experts = 3
+    cfg.merge.expert_hidden = 192
+    cfg.merge.mixer_type = "ternary_f3"
+    cfg.merge.ternary_depth = 2
+    cfg.merge.ternary_tree_schema_version = 1
+    cfg.merge.expert_weight_source = "effective_sparse"
+    cfg.merge.mixer_hadamard_groups = [3]
+    cfg.merge.ternary_lift_mode = mode
+    cfg.model.hidden_size = 3 * 192
+    cfg.model.attention.num_query_heads = 18
+    cfg.model.attention.num_kv_heads = 18
+    cfg.model.attention.head_dim = 32
+    cfg.model.ffn.intermediate_size = 3 * 192
+    validate_config(cfg)
+    return cfg
 
 
 def _is_inner_key(key: str) -> bool:
@@ -517,3 +596,110 @@ def _is_inner_key(key: str) -> bool:
 
 def _max_abs(left: torch.Tensor, right: torch.Tensor) -> float:
     return float((left.detach() - right.detach()).abs().max())
+
+
+# G-blocks -- ORCHESTRATOR ACCEPTANCE (the reported blocking defect).
+#
+# The tree's coordinate_layout used to be "branch_major_outer_ternary"
+# concatenated with its geometry ("...:cross_parent:1:2"), while the
+# orchestrator compared it against a single pinned string, so every
+# parent-preserving candidate was rejected with
+# ValueError("invalid coordinate layout") before it could ever be evaluated.
+# These tests exercise the orchestrator's own validation dataclass, not a
+# merge-level tensor unit, and are capable of failing.
+
+
+def _artifact_fields(model: RecursiveF3HAGI, cfg: Config) -> dict[str, object]:
+    """The fields a CandidateArtifact carries, from a real merged model."""
+    depth = cfg.merge.ternary_depth
+    leaf_hidden = cfg.merge.expert_hidden // (3 ** (depth - 1))
+    return {
+        "generation_id": "gen-0001",
+        "parent_checkpoint_sha256": "a" * 64,
+        "parent_config_sha256": "b" * 64,
+        "protocol_sha256": "c" * 64,
+        "checkpoint_path": "candidate.pt",
+        "checkpoint_sha256": "d" * 64,
+        "manifest_path": "candidate.json",
+        "manifest_sha256": "e" * 64,
+        "candidate_config_sha256": "f" * 64,
+        "candidate_state_key_digest": "0" * 64,
+        "ternary_depth": depth,
+        "leaf_hidden": leaf_hidden,
+        "coordinate_layout": model.target_tree.coordinate_layout,
+        "transform_digest": model.target_tree.transform_digest,
+        "weight_source": cfg.merge.expert_weight_source,
+        "logit_scale_source": float(model.recursive_f3_logit_scale_source.item()),
+        "logit_scale_target": float(model.recursive_f3_logit_scale_target.item()),
+        "child_checkpoint_sha256": ("1" * 64, "2" * 64, "3" * 64),
+        "child_config_sha256": ("4" * 64, "4" * 64, "4" * 64),
+        "self_improve": _orchestrator_ledger(),
+    }
+
+
+def _orchestrator_ledger() -> SelfImprovementLedger:
+    prompt_span = SourceSpan("A", 0, 4, "5" * 64)
+    return SelfImprovementLedger(
+        seed=1,
+        source_id="A",
+        prompt_span=prompt_span,
+        prompt_token_sha256="6" * 64,
+        prompt_text_sha256="7" * 64,
+        prompt_token_count=4,
+        optimizer_parameter_ids=("blocks.0.adapters.pyramid.scale",),
+        accepted_updates=0,
+        derived_base_state_sha256="8" * 64,
+        contour_state_sha256="9" * 64,
+    )
+
+
+@pytest.mark.parametrize("mode", ["f3_tree", "parent_preserving"])
+def test_orchestrator_accepts_a_candidate_under_either_cross_parent_transform(
+    mode: str,
+) -> None:
+    children, _parent = _identical_children()
+    cfg = _lift_target_config(mode)
+    model = merge_recursive_f3(
+        cfg,
+        children,
+        parent_depth=0,
+        expert_weight_source="effective_sparse",
+        cross_parent_transform=mode,
+    )
+    # The candidate the real orchestrator would receive, built from the merge.
+    artifact = CandidateArtifact(**_artifact_fields(model, cfg))
+    assert artifact.coordinate_layout == model.target_tree.coordinate_layout
+    assert artifact.transform_digest == model.transform_digest
+
+
+def test_orchestrator_rejects_an_unknown_coordinate_layout() -> None:
+    children, _parent = _identical_children()
+    cfg = _lift_target_config("parent_preserving")
+    model = merge_recursive_f3(
+        cfg,
+        children,
+        parent_depth=0,
+        expert_weight_source="effective_sparse",
+        cross_parent_transform="parent_preserving",
+    )
+    fields = _artifact_fields(model, cfg)
+    for bogus in (
+        "branch_major_outer_ternary:cross_parent:1:2",  # the old geometry name
+        "branch_major_ouster_ternary",  # typo
+        "",
+    ):
+        with pytest.raises(ValueError, match="coordinate layout"):
+            CandidateArtifact(**{**fields, "coordinate_layout": bogus})
+
+
+def test_known_layouts_cover_both_transforms_and_nothing_else() -> None:
+    assert KNOWN_COORDINATE_LAYOUTS == frozenset(
+        {"branch_major_pair_interleaved", "branch_major_outer_ternary"}
+    )
+    assert KNOWN_COORDINATE_LAYOUTS is not None
+    # The layout a candidate declares is a pure name: no geometry in it.
+    for depth in (1, 2):
+        tree = CrossParentPreservingTernaryTree(depth, 2)
+        assert tree.coordinate_layout in KNOWN_COORDINATE_LAYOUTS
+        assert ":" not in tree.coordinate_layout
+        assert TernaryF3Tree(depth, 2).coordinate_layout in KNOWN_COORDINATE_LAYOUTS

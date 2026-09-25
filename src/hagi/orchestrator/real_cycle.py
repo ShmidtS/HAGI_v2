@@ -15,6 +15,7 @@ import torch
 from hagi.config import CHECKPOINT_FORMAT_VERSION, Config, validate_config
 from hagi.data.artifacts import load_published_artifact
 from hagi.model.merge import (
+    CROSS_PARENT_TRANSFORMS,
     build_model_from_payload,
     merge_recursive_f3,
     state_key_digest,
@@ -548,6 +549,13 @@ def _build_child(
         if not key.endswith(".adapters.pyramid.scale")
     }
     model = build_model_from_payload(cfg, parent_state)
+    # A bounded child run of a few steps cannot spend its whole budget inside the
+    # scheduler's warmup, where the effective learning rate is a fraction of a
+    # percent of the base rate. Left as configured (warmup 2000) every child
+    # would keep the parent's weights almost exactly, and the merge test would
+    # have no signal to resolve. This mirrors the same fix already applied to
+    # the one-step self-improvement update.
+    cfg.train.schedule.warmup_steps = 0
     trainer = Trainer(model, cfg)
     for step in range(max_steps):
         offset = (context.seed + step * 3) % max(1, len(stream) - 1)
@@ -1079,8 +1087,20 @@ def run_banking77_cycle(
     max_steps: int = 1,
     manifest_sha256: str = BANKING77_MANIFEST_SHA256,
     device: str = "cpu",
+    cross_parent_transform: str = _DEFAULT_CROSS_PARENT_TRANSFORM,
 ) -> Any:
-    """Run one bounded real-data cycle from validated packed Banking77 shards."""
+    """Run one bounded real-data cycle from validated packed Banking77 shards.
+
+    ``cross_parent_transform`` selects the transform that mixes the three
+    parent streams of the recursive merge. It defaults to the legacy staged F3
+    tree so an existing run reproduces byte-for-byte; the alternative
+    ``"parent_preserving"`` must be requested by name.
+    """
+    if cross_parent_transform not in CROSS_PARENT_TRANSFORMS:
+        raise ValueError(
+            "cross_parent_transform must be one of "
+            f"{sorted(CROSS_PARENT_TRANSFORMS)}, got {cross_parent_transform!r}"
+        )
     if device != "cpu":
         raise ValueError("this bounded adapter is CPU-first; device must be 'cpu'")
     if type(max_steps) is not int or not 1 <= max_steps <= _MAX_STEPS:
@@ -1161,7 +1181,12 @@ def run_banking77_cycle(
         request,
         store,
         lambda context: _build_child(context, build_root, tokens, max_steps),
-        lambda context: _build_candidate(context, build_root, train_parts[0][:1]),
+        lambda context: _build_candidate(
+            context,
+            build_root,
+            train_parts[0][:1],
+            cross_parent_transform=cross_parent_transform,
+        ),
         lambda context: path_only_evaluator(context, device=device),
         owner_id=OWNER_ID,
     )

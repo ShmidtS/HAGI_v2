@@ -54,6 +54,20 @@ def test_unknown_decision_supports_nothing():
     assert R._mechanism_supported(_verdict("inconclusive", -1.0, -1.0)) is False
 
 
+def test_legacy_exemption_does_not_extend_to_accepted_runs():
+    """A v1 file claiming support for an accepted verdict must be rejected."""
+    rejected = {
+        "schema": "recursive_f3_holdout_evidence_v1",
+        "decision": "rejected",
+        "mechanism_supported": True,
+    }
+    accepted = dict(rejected, decision="accepted")
+    # The old writer's known anomaly is rejected + True: historically real.
+    assert R._legacy_mechanism_pinned(rejected, Path(".")) is True
+    # An accepted verdict is a real claim, not legacy noise.
+    assert R._legacy_mechanism_pinned(accepted, Path(".")) is False
+
+
 def test_validator_rejects_a_flipped_mechanism_claim():
     """A hand-edited evidence file must fail closed, not be trusted.
 

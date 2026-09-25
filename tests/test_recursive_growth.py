@@ -927,9 +927,14 @@ def test_parent_preserving_mode_preserves_parent_logits_for_three_identical_copi
     assert model.logit_scale_target == pytest.approx(child_scale_sum / 3.0)
     assert model.logit_scale_source == pytest.approx(child_scale_sum)
     assert model.transform_digest == model.target_tree.transform_digest
-    assert model.target_tree.coordinate_layout.startswith(
-        ParentPreservingTernaryLift.coordinate_layout
+    # coordinate_layout is a pure NAME: no geometry may leak into it, so it is
+    # exactly the lift's layout rather than a geometry-qualified variant.
+    assert (
+        model.target_tree.coordinate_layout
+        == ParentPreservingTernaryLift.coordinate_layout
+        == "branch_major_outer_ternary"
     )
+    assert ":" not in model.target_tree.coordinate_layout
 
 
 def test_legacy_mode_keeps_its_aggregate_gain_for_three_identical_copies():

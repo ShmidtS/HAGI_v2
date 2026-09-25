@@ -1495,8 +1495,16 @@ def _legacy_mechanism_pinned(evidence: dict[str, Any], run: Path) -> bool:
     v1 evidence that the writer of that era produced, and the flag is never
     surfaced from a legacy replay -- it is recomputed below, so the caller
     sees the honest value while the old bytes stay readable.
+
+    It is restricted to ``rejected`` runs. That is the only combination the
+    old writer actually produced inconsistently (rejected + True), so an
+    ``accepted`` file whose flag disagrees with its metrics is rejected rather
+    than excused, and a hand-written file cannot claim this exemption for an
+    accepted verdict.
     """
     if evidence["schema"] != "recursive_f3_holdout_evidence_v1":
+        return False
+    if evidence["decision"] != "rejected":
         return False
     return evidence["mechanism_supported"] is True
 
@@ -1745,6 +1753,12 @@ def run_generation(
         raise ValueError("request parent does not match current parent")
     store.reserve(request.generation_id, owner_id=owner_id)
     store.mark_running(request.generation_id, owner_id=owner_id)
+    # The build phase below trains models and can far outlast the default
+    # 300 s lease. Renew before entering it: a generation that then outlives
+    # its lease stays recoverable by takeover, and the lifecycle fence keeps
+    # the stale writer from publishing. Without this the owner silently lost
+    # the run halfway through the most expensive phase.
+    store.renew_owner_lease(request.generation_id, owner_id=owner_id)
     try:
         parent_payload, parent_cfg = _payload(request.parent_checkpoint_path)
         _regular_bytes(Path(request.parent_checkpoint_path), request.parent.checkpoint_sha256)

@@ -1812,6 +1812,55 @@ def test_unverifiable_quarantine_returns_poisoned():
     assert not hasattr(trainer, "_hagi_self_improve_rollback_poisoned")
 
 
+def test_unverifiable_quarantine_blocks_next_public_entry(monkeypatch):
+    """A quarantine nobody can read must still fail closed at the entry gate.
+
+    ``_poison_gradient_trainer`` reports ``False`` when it can write no durable
+    marker: the instance rejects attribute assignment and is not weak
+    referenceable, so both channels are gone. That return value only stops a
+    caller from reporting ``post``; on its own it leaves the object unmarked. If
+    the entry gate then reads the absent attribute as "not poisoned" and the empty
+    registry as "not poisoned", the same trainer is accepted for a fresh
+    transaction on state that was never proven discard-only. The gate therefore
+    has to refuse on the same evidence the helper could not produce, not only on
+    a marker that may not exist.
+    """
+    cfg = _make_cfg(levels=(1,), lr=1.0)
+    model = HAGI(cfg).eval()
+
+    class UnmarkableTrainer:
+        """No attribute writes, no weakref support, no usable public API."""
+
+        __slots__ = ("step",)
+
+        def __init__(self) -> None:
+            object.__setattr__(self, "step", 4)
+
+    trainer = UnmarkableTrainer()
+
+    assert si._poison_gradient_trainer(trainer) is False, (
+        "precondition: no marker can be written for this trainer"
+    )
+
+    monkeypatch.setattr(
+        si, "_score",
+        lambda *args, **kwargs: pytest.fail(
+            "the gate must refuse before any scoring happens"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="poisoned"):
+        si.self_improve(
+            model,
+            cfg,
+            [1, 2, 3, 4],
+            n_new_tokens=8,
+            max_iterations=1,
+            kl_max=10.0,
+            trainer=trainer,
+        )
+
+
 def test_gradient_rollback_restores_requires_grad_flags():
     """``requires_grad`` is transaction state, not a training-time optimisation.
 
