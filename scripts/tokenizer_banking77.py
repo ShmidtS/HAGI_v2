@@ -52,7 +52,7 @@ from hagi.data.artifacts import _reject_link_chain, load_published_artifact  # n
 from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.optim import _muon_parameters, learning_rate_at  # noqa: E402
 
-EXPECTED_MANIFEST_SHA256 = "9927589c92c84d78fe13608fd1799dd959e973d6e759ac53ce3e4d43dedd875f"
+EXPECTED_MANIFEST_SHA256 = "44d50edd994e7c32f30066a26052e15f902c74b79a7498ba60f475c76b453f3b"
 EXPECTED_REVISION = "57ec275d8078af65b7731c2a98be812d844a6d6b"
 EXPECTED_DATASET = "PolyAI-LDN/task-specific-datasets/banking_data"
 EXPECTED_LICENSE = "CC-BY-4.0"

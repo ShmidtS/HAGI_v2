@@ -13,6 +13,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from hagi.model.merge import CROSS_PARENT_TRANSFORMS  # noqa: E402
 from hagi.orchestrator.real_cycle import (  # noqa: E402
     SYNTHETIC_V3_SEED,
     result_data_provenance,
@@ -29,6 +30,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--manifest-sha256")
+    parser.add_argument(
+        "--cross-parent-transform",
+        default="f3_tree",
+        choices=list(CROSS_PARENT_TRANSFORMS),
+        help=(
+            "transform that mixes the three parent streams of the recursive "
+            "merge; 'f3_tree' is the legacy default"
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -55,6 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_steps=args.max_steps,
                 manifest_sha256=args.manifest_sha256,
                 device=args.device,
+                cross_parent_transform=args.cross_parent_transform,
             )
             data_kind = "banking77"
             data_manifest_sha256, tokenizer_name = result_data_provenance(result)
@@ -71,12 +82,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=seed,
                 max_steps=args.max_steps,
                 device=args.device,
+                cross_parent_transform=args.cross_parent_transform,
             )
             data_kind = "synthetic"
             data_manifest_sha256 = None
             tokenizer_name = "synthetic-packed-v1"
         payload = {
             "data_kind": data_kind,
+            "cross_parent_transform": args.cross_parent_transform,
             "tokenizer_name": tokenizer_name,
             "decision": result.decision,
             "generation_id": result.generation_id,
