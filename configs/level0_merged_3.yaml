@@ -52,9 +52,9 @@ merge:
   n_experts: 3
   expert_hidden: 128
   expert_checkpoints:
-  - C:\HAGI_v2\checkpoints_l0\ru_general\step-0053901.pt
-  - C:\HAGI_v2\checkpoints_l0\en_general\step-0032001.pt
-  - C:\HAGI_v2\checkpoints_l0\math_code\step-0006300.pt
+  - ${HAGI_ROOT}\checkpoints_l0\ru_general\step-0053901.pt
+  - ${HAGI_ROOT}\checkpoints_l0\en_general\step-0032001.pt
+  - ${HAGI_ROOT}\checkpoints_l0\math_code\step-0006300.pt
   freeze_experts: false
   mixer_init_scale: 0.0
   mixer_type: hadamard

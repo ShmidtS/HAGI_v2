@@ -52,24 +52,24 @@ merge:
   mixer_type: hadamard
   expert_hidden: 128
   expert_checkpoints:
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice0\step-0010601.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice1\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice2\step-0009701.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice3\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice4\step-0004301.pt
-  - C:\HAGI_v2\checkpoints_corpus\edu\slice5\step-0002858.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice0\step-0008401.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice1\step-0004601.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice2\step-0005701.pt
-  - C:\HAGI_v2\checkpoints_corpus\slimpajama\slice3\step-0006501.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_ru\slice0\step-0008001.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_ru\slice1\step-0004301.pt
-  - C:\HAGI_v2\checkpoints_corpus\oscar_ru\slice0\step-0008701.pt
-  - C:\HAGI_v2\checkpoints_corpus\openwebmath\slice0\step-0006110.pt
-  - C:\HAGI_v2\checkpoints_corpus\smoltalk\slice0\step-0005501.pt
-  - C:\HAGI_v2\checkpoints_corpus\tinystories\slice0\step-0004396.pt
-  - C:\HAGI_v2\checkpoints_corpus\wikipedia_en\slice0\step-0004228.pt
-  - C:\HAGI_v2\checkpoints_corpus\python_instruct\slice0\step-0000190.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice0\step-0010601.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice1\step-0005501.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice2\step-0009701.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice3\step-0005501.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice4\step-0004301.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\edu\slice5\step-0002858.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\slimpajama\slice0\step-0008401.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\slimpajama\slice1\step-0004601.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\slimpajama\slice2\step-0005701.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\slimpajama\slice3\step-0006501.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\wikipedia_ru\slice0\step-0008001.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\wikipedia_ru\slice1\step-0004301.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\oscar_ru\slice0\step-0008701.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\openwebmath\slice0\step-0006110.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\smoltalk\slice0\step-0005501.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\tinystories\slice0\step-0004396.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\wikipedia_en\slice0\step-0004228.pt
+  - ${HAGI_ROOT}\checkpoints_corpus\python_instruct\slice0\step-0000190.pt
   freeze_experts: false
   mixer_init_scale: 0.0
 train:
