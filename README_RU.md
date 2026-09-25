@@ -64,6 +64,45 @@ F₃ =  ⎢ 1   ω   ω² ⎥ ,   ω = e^(2πi/3),  |F₃[j,k]| = 1/√3
    → (слитая модель = «эксперт» следующего уровня, цикл повторяется)
 ```
 
+### Опциональная Pyramidal Cortex
+
+В HAGI есть отдельный opt-in `PyramidalCortex`: направленные
+low-rank-связи между непрерывными уровнями скрытого состояния. Это
+не старый per-block `PyramidAdapter`: Cortex — model-global side channel
+с zero-init directed edges и без persistent token state. Он выключен по
+умолчанию; bounded multi-seed/holdout runner —
+`scripts/pyramidal_cortex_ab.py`. Synthetic run даёт только mechanism signal;
+quality verdict требует real packed data и минимум три seeds. Отдельно
+`scripts/ternary_precision_ab.py` сравнивает FP32, legacy BF16 и BF16
+compute с FP32 ternary masters из одного pre-cast FP32 state source на
+идентичных batches; post-cast BF16 tensors не считаются bitwise equal. Подробности —
+в `docs/PYRAMIDAL_CORTEX.md`. Физические INT2/INT4/INT8/FP8 kernels в
+этом срезе не реализованы.
+
+### Новые независимые исследовательские срезы
+
+Три среза описаны в [docs/RESEARCH_FRONTIER.md](docs/RESEARCH_FRONTIER.md):
+
+- `DecisionPlane` — opt-in finite-option head над последней каузальной
+  позицией. На pinned Banking77 mechanism/evidence gates проходят; real
+  3-seed gate выигрывает NLL против majority/frozen в 3/3 и accuracy в 3/3,
+  но ECE≤0.15 только в 2/3. Статус — research-only.
+- Versioned data artifacts — SHA-256 manifests, strict UTF-8,
+  exact dedup/quarantine, EOS-packed uint32 shards и bounded acquisition.
+  Infrastructure promoted; pinned Banking77 artifact опубликован и validated.
+  Ни то, ни другое не является доказанным улучшением модели.
+- `tie_lm_head=True/False` — paired A/B. Untied выиграл mean native-token
+  CE на 2/3 real-stream seeds, но превысил memory limit 1.934x > 1.75x,
+  поэтому не promoted; tied остаётся default.
+
+Native-token CE не используется для сравнения разных tokenizers. Opt-in
+`scripts/common_reference_eval.py` уже реализован и offline проверен. Текущий
+pre-registered tokenizer lane выполнил exact протокол matched
+**from-scratch tiny HAGI** на идентичных pinned immutable документах. Candidate
+`tokenizer-0997f410` выиграл только 1/3 seeds, поэтому all-seed/median/mean
+BPB gates провалены. Кандидат **rejected** для replacement; baseline
+tokenizer остаётся неизменным, повторный run ради прохождения gate запрещён.
+
 ---
 
 ## Часть 2. Сжатие DeepSeek-V4-Flash

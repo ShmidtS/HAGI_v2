@@ -14,11 +14,20 @@ HAGI grows a large model from small domain experts instead of training from
 scratch. The idea and results live in
 [GROWING_HYPOTHESIS.md](GROWING_HYPOTHESIS.md).
 
-The current pipeline is a **recursive ternary growth cycle** — merge happens
-in **groups of three** via the complex DFT-3 (F₃) mixer, never by powers of
-two. Full driver: `scripts/run_growth_cycle.sh`.
+The current executable recursive V1 path is
+`scripts/recursive_growth.py`. It runs one bounded CPU generation through the
+authoritative `GrowthRunStore` owner. Without an artifact it uses a synthetic
+packed stream; Banking77 is used only when both `--artifact` and
+`--manifest-sha256` are supplied. A successful receipt is mechanism evidence
+only: `quality_supported=false`, `security_supported=false`, and
+`production_promotion=false` are part of the frozen contract.
 
-The cycle, repeated for each level:
+`scripts/run_growth_cycle.sh` is a separate legacy research driver. It trains
+small experts with saturation stopping, merges them, and then joint-trains the
+merged model; it is not the V1 recursive owner and must not be presented as
+evidence for recursive autonomy or quality.
+
+The legacy shell cycle is repeated for each level:
 
 1. **Sort corpora into weakly-correlated domains.** `scripts/analyze_corpora.py`
    builds a unigram profile per corpus, computes the pairwise correlation
@@ -36,11 +45,60 @@ The cycle, repeated for each level:
    F₃ ⊗ I mixer (`mixer_hadamard_groups: [3]`). F₃ is unitary, every entry has
    modulus 1/√3 — uniform mixing with no blind channels. Groups of size 3ᵏ
    (3, 9, 27, …) are supported via Kronecker recursion F₃ᵏ.
-5. **Joint-train the merged model to saturation.** Teaches the recombined
-   blocks to interact; also early-stopped by saturation, not a fixed count.
+5. **Legacy joint-train the merged model to saturation.** This teaches the
+   recombined blocks to interact; it is part of the historical shell path,
+   not the V1 recursive transaction. V1 has no joint optimizer: its executable
+   phases are bounded child training, F3 consolidation, fresh-adapter
+   self-improvement, and an independent holdout gate.
 
-The merged H=384 model can itself be treated as a level-1 expert, so the
-cycle recurses (3 → 9 → 27 experts equivalent up to channel permutation).
+The merged H=384 model can itself be treated as a level-1 expert in that
+legacy path. The V1 owner instead records the exact child bytes, derived F3
+payload, self-improvement ledger, and held-out decision before any parent CAS.
+
+## Opt-in Pyramidal Cortex
+
+The project also contains an experimental **model-global**
+`PyramidalCortex`: directed low-rank links between contiguous hidden-layer
+levels, with zero-init edge links and no state across tokens. It is
+disabled by default and is distinct from the older per-block
+`PyramidAdapter`. Its bounded multi-seed/holdout runner is
+`scripts/pyramidal_cortex_ab.py`; synthetic runs report mechanism signals
+only, while a quality verdict requires real packed data and at least three
+seeds. Physical INT2/INT4/INT8/FP8 kernels are not implemented yet. For a
+separate bounded precision smoke, use
+`scripts/ternary_precision_ab.py`: it compares FP32, legacy BF16, and
+BF16 compute with FP32 ternary masters from one common pre-cast FP32
+state source and identical batches (post-cast BF16 tensors are not claimed
+bitwise equal).
+See [docs/PYRAMIDAL_CORTEX.md](docs/PYRAMIDAL_CORTEX.md).
+
+## Opt-in research slices
+
+Three independently evaluated slices live in
+[docs/RESEARCH_FRONTIER.md](docs/RESEARCH_FRONTIER.md):
+
+- **DecisionPlane** — an opt-in finite-option head over the final causal
+  state, with independently normalized LM/decision objectives. Synthetic and
+  pinned real Banking77 mechanism/evidence gates pass. The real 3-seed quality
+  gate beat majority and frozen NLL in 3/3 and passed accuracy in 3/3, but
+  ECE≤0.15 passed in only 2/3, so it remains research-only.
+- **Versioned data artifacts** — fail-closed SHA-256 manifests, strict
+  UTF-8 records, exact dedup/quarantine, EOS-packed uint32 shards and
+  bounded hash-checked acquisition. This is promoted as opt-in data
+  infrastructure. A pinned Banking77 artifact is now published and validated;
+  neither status is a model-quality gain.
+- **Tied vs untied receiver embeddings** — paired exact-initialization A/B.
+  The untied variant won mean native-token CE on 2/3 bounded real-stream
+  seeds but exceeded its pre-registered memory limit (1.934x > 1.75x), so
+  it is rejected and tied remains the default.
+
+Native-token CE is not used to compare different tokenizers. The opt-in
+`scripts/common_reference_eval.py` evaluator is implemented and offline
+verified. The matched from-scratch tiny-HAGI tokenizer gate then completed
+the exact 3×2×471 Banking77 protocol. Candidate `tokenizer-0997f410` won only
+one of three seeds, so all-seed/median/mean BPB quality gates failed. The
+candidate is rejected for replacement; the baseline tokenizer remains
+unchanged, and the run is not repeated to chase the gate.
 
 ### Scripts
 
@@ -48,8 +106,20 @@ cycle recurses (3 → 9 → 27 experts equivalent up to channel permutation).
 - `scripts/train.py` — train / resume / init-from a model (saturation-aware).
 - `scripts/compact_checkpoint.py` — lossless zstd compaction of checkpoints.
 - `scripts/merge_experts.py` — low-level block-diagonal merge CLI (DFT-3).
-- `scripts/run_growth_cycle.sh` — end-to-end growth cycle driver.
+- `scripts/run_growth_cycle.sh` — legacy saturation/merge/joint-training
+  research shell; it is not the authoritative V1 owner.
+- `scripts/recursive_growth.py` — opt-in bounded recursive owner CLI; the
+  current `--max-steps` range is `1..8`, and synthetic output is mechanism-only.
 - `scripts/compact_model.py` — geometry experiments (rotation / SVD / sorting).
+- `scripts/pyramidal_cortex_ab.py` — matched holdout/multi-seed Cortex gate.
+- `scripts/ternary_precision_ab.py` — matched FP32/BF16/FP32-master smoke.
+- `scripts/prepare_training_data.py` — bounded acquisition and versioned packed artifacts.
+- `scripts/prepare_banking77.py` — pinned Banking77 text/label/token publication.
+- `scripts/common_reference_eval.py` — exact UTF-8 retained-prefix likelihood/BPB.
+- `scripts/tokenizer_banking77.py` — opt-in matched from-scratch tokenizer frontier gate.
+- `scripts/decision_plane_ab.py` — synthetic finite-option decision mechanism gate.
+- `scripts/decision_plane_banking77.py` — pinned real 77-way decision gate.
+- `scripts/embedding_tie_ab.py` — paired tied/untied receiver-head A/B.
 
 ### Configs
 
@@ -60,10 +130,21 @@ cycle recurses (3 → 9 → 27 experts equivalent up to channel permutation).
 
 ## Quick start
 
+The following is the legacy training path, not a quality or autonomy gate:
+
 ```bash
 pip install -e .
 python scripts/train.py --config configs/level0_merged_3.yaml --resume checkpoints_l0_merged/step-0000000.pt
 ```
+
+For one bounded owner-authoritative synthetic smoke cycle:
+
+```bash
+python scripts/recursive_growth.py --output .omc/runs/recursive-smoke --max-steps 1
+```
+
+A real Banking77 run additionally requires a validated artifact and its exact
+manifest digest; its result still cannot set `quality_supported=true`.
 
 ## DeepSeek-V4 MoE compression (status: pass complete, e2e validated; gate training)
 
