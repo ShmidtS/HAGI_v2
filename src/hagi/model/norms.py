@@ -96,6 +96,62 @@ class BlockRMSNorm(nn.Module):
         return f"n_blocks={self.n_blocks}, block_dim={self.block_dim}, eps={self.eps}"
 
 
+class BlockTreeNorm(nn.Module):
+    """RMSNorm over recursive ternary leaves.
+
+    The last dimension is one leaf hidden vector.  The preceding dimensions
+    describe the fixed three-way hierarchy: ``[top_level, inner_blocks,
+    leaf_hidden]`` with ``top_level == 3``.  Each leaf is normalized
+    independently; a wide RMSNorm over the concatenated stream is not
+    equivalent because sibling leaves have different statistics.
+    """
+
+    def __init__(
+        self,
+        depth: int,
+        leaf_hidden: int,
+        eps: float = 1e-5,
+        fp32_variance: bool = True,
+    ) -> None:
+        super().__init__()
+        if type(depth) is not int or depth < 1:
+            raise ValueError("depth must be a positive integer")
+        if type(leaf_hidden) is not int or leaf_hidden < 1:
+            raise ValueError("leaf_hidden must be a positive integer")
+        if leaf_hidden % 2:
+            raise ValueError("leaf_hidden must be even for the real F3 lift")
+        self.depth = depth
+        self.leaf_hidden = leaf_hidden
+        self.inner_blocks = 3 ** (depth - 1)
+        self.n_leaves = 3**depth
+        self.eps = float(eps)
+        self.fp32_variance = bool(fp32_variance)
+        self.keep_fp32 = True
+        self.weight = nn.Parameter(
+            torch.ones(3, self.inner_blocks, self.leaf_hidden)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.n_leaves * self.leaf_hidden:
+            raise ValueError(
+                f"expected hidden width {self.n_leaves * self.leaf_hidden}, "
+                f"got {x.shape[-1]}"
+            )
+        shape = x.shape[:-1] + (3, self.inner_blocks, self.leaf_hidden)
+        xb = x.reshape(shape)
+        if self.fp32_variance and x.dtype in (torch.float16, torch.bfloat16):
+            out = F.rms_norm(xb.float(), (self.leaf_hidden,), None, self.eps)
+            return (out * self.weight.float()).reshape(x.shape).to(x.dtype)
+        out = F.rms_norm(xb, (self.leaf_hidden,), None, self.eps)
+        return (out * self.weight.to(x.dtype)).reshape(x.shape)
+
+    def extra_repr(self) -> str:
+        return (
+            f"depth={self.depth}, leaf_hidden={self.leaf_hidden}, "
+            f"inner_blocks={self.inner_blocks}, eps={self.eps}"
+        )
+
+
 class HeadNorm(nn.Module):
     """Per-head RMSNorm over ``head_dim`` for QK normalization.
 

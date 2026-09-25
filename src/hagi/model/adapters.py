@@ -42,6 +42,7 @@ import torch
 from torch import nn
 
 from hagi.config import AdaptersConfig, PyramidAdapterConfig, TttLoraConfig
+from hagi.model.adaptive import AdaptiveComponent
 
 
 def _qr_orthonormal(
@@ -239,7 +240,7 @@ class TttLoraAdapter(nn.Module):
         return delta.to(dtype=x.dtype)
 
 
-class BlockAdapter(nn.Module):
+class BlockAdapter(AdaptiveComponent):
     """Composable residual adapter for :class:`~hagi.model.block.Block`.
 
     Holds an optional :class:`PyramidAdapter` and an optional

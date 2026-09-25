@@ -13,12 +13,15 @@ gradient signal; periodic exact CE is the coding-cost SSOT.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint_util
 from torch import nn
 
 from hagi.config import Config, count_params, ffn_width, layer_windows
 from hagi.model.attention import AttentionConfig, build_attention_mask
 from hagi.model.block import Block
+from hagi.model.cortex import PyramidalCortex
+from hagi.model.decision import DecisionHead
 from hagi.model.embedding import SourceEncoder
 from hagi.model.ffn import FeedForward
 from hagi.model.head import LMHead
@@ -36,6 +39,11 @@ class HAGI(nn.Module):
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
+        if type(self) is HAGI and cfg.merge.mixer_type == "ternary_f3":
+            raise ValueError(
+                "HAGI cannot instantiate merge.mixer_type='ternary_f3'; "
+                "use RecursiveF3HAGI or build_model_from_payload"
+            )
         self.cfg = cfg
         m = cfg.model
         h = m.hidden_size
@@ -116,6 +124,16 @@ class HAGI(nn.Module):
         # reproduced bit-for-bit (no extra parameters, no extra computation).
         self._attach_adapters(h)
 
+        # Directed same-token memory between contiguous layer levels. The
+        # module is absent by default, so the baseline module tree and forward
+        # remain unchanged. State is created per pass in _run_blocks, never
+        # stored across tokens or generation calls.
+        self.cortex: PyramidalCortex | None = (
+            PyramidalCortex(m.num_layers, h, m.cortex) if m.cortex.enabled else None
+        )
+        self.decision_head: DecisionHead | None = (
+            DecisionHead(h, m.decision.num_options) if m.decision.enabled else None
+        )
 
         self.out_norm = RMSNorm(h, eps=m.norm_eps)
         self.head = LMHead(
@@ -230,12 +248,20 @@ class HAGI(nn.Module):
 
         loops = self._loop_depth if not use_state else 1
         for _ in range(loops):
-            for block, window in zip(self.blocks, self._window_layers, strict=True):
+            # A pass-local state container keeps the side channel causal and
+            # prevents stale summaries from leaking across loop_depth repeats.
+            cortex_states = self.cortex.start_sequence() if self.cortex is not None else None
+            for layer_index, (block, window) in enumerate(
+                zip(self.blocks, self._window_layers, strict=True)
+            ):
                 mask = mask_by_window[window]
                 if checkpointing:
                     h = checkpoint_util.checkpoint(block, h, positions, mask, use_reentrant=False)
                 else:
                     h = block(h, positions, mask)
+                if self.cortex is not None and cortex_states is not None and self.cortex.is_boundary(layer_index):
+                    level = self.cortex.level_for_boundary(layer_index)
+                    h = self.cortex.apply_boundary(h, level, cortex_states)
         return h
 
     def _apply_mixers(self, h: torch.Tensor) -> torch.Tensor:
@@ -260,6 +286,8 @@ class HAGI(nn.Module):
         positions: torch.Tensor | None = None,
         use_cache: bool = False,
         return_logits: bool = False,
+        decision_targets: torch.Tensor | None = None,
+        decision_mask: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Encode, transmit, decode.
 
@@ -277,10 +305,52 @@ class HAGI(nn.Module):
             use_cache: incremental decode (source filter state + KV-cache).
             return_logits: also return full logits. Costs ``B*T*V`` floats — for
                 generation and diagnostics only.
+            decision_targets: optional ``[B]`` finite-option labels. One
+                decision is scored from the last text position per sequence.
+                This is the explicit sequence-summary contract: the final
+                causal state has attended to all prior text, so later-token
+                bias is intentional for incremental decoding.
+            decision_mask: optional ``[B]`` bool mask selecting decision rows.
 
         Returns:
             :class:`ModelOutput`.
         """
+        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
+            raise ValueError(
+                f"input_ids must have shape [B, T] with B >= 1, got {tuple(input_ids.shape)}"
+            )
+        if self.decision_head is None:
+            if decision_targets is not None or decision_mask is not None:
+                raise ValueError(
+                    "decision_targets/decision_mask require model.decision.enabled=True"
+                )
+        else:
+            batch = input_ids.shape[0]
+            if decision_targets is not None:
+                if decision_targets.dtype != torch.long:
+                    raise ValueError("decision_targets must have dtype torch.long")
+                if tuple(decision_targets.shape) != (batch,):
+                    raise ValueError(
+                        f"decision_targets must have shape [{batch}], got {tuple(decision_targets.shape)}"
+                    )
+                if decision_targets.device != input_ids.device:
+                    raise ValueError("decision_targets must be on the same device as input_ids")
+                if int(decision_targets.min()) < 0 or int(decision_targets.max()) >= self.decision_head.num_options:
+                    raise ValueError(
+                        f"decision_targets must be in [0, {self.decision_head.num_options})"
+                    )
+            if decision_mask is not None:
+                if decision_mask.dtype != torch.bool:
+                    raise ValueError("decision_mask must have dtype torch.bool")
+                if tuple(decision_mask.shape) != (batch,):
+                    raise ValueError(
+                        f"decision_mask must have shape [{batch}], got {tuple(decision_mask.shape)}"
+                    )
+                if decision_mask.device != input_ids.device:
+                    raise ValueError("decision_mask must be on the same device as input_ids")
+                if decision_targets is None and bool(decision_mask.any()):
+                    raise ValueError("a selected decision_mask row requires decision_targets")
+
         h = self.encoder(input_ids, use_state=use_cache)
         t_text = h.shape[1]
 
@@ -308,47 +378,77 @@ class HAGI(nn.Module):
         text_hidden = h[:, prefix_len:] if prefix_len else h
         out = ModelOutput(hidden=text_hidden)
 
+        if self.decision_head is not None:
+            out.decision_logits = self.decision_head(text_hidden[:, -1])
+
         if return_logits:
             out.logits = self.head.logits(text_hidden)
 
-        if targets is None:
-            return out
+        lm_loss = None
+        if targets is not None:
+            if targets.shape[:2] != (input_ids.shape[0], t_text):
+                raise ValueError(
+                    f"targets shape {tuple(targets.shape)} does not match input_ids "
+                    f"{tuple(input_ids.shape)}"
+                )
 
-        if targets.shape[:2] != (input_ids.shape[0], t_text):
-            raise ValueError(
-                f"targets shape {tuple(targets.shape)} does not match input_ids "
-                f"{tuple(input_ids.shape)}"
+            flat_hidden = text_hidden.reshape(-1, text_hidden.shape[-1])
+            flat_targets = targets.reshape(-1)
+            if loss_mask is not None:
+                # Boolean fancy indexing gathers the scored rows in one op. The
+                # previous ``nonzero()`` + ``index_select`` pair forced a GPU-to-CPU
+                # sync (variable-length result) and showed up as ~1.1 s/step of
+                # host time in the profiler on this ROCm build.
+                keep = loss_mask.reshape(-1)
+                flat_hidden = flat_hidden[keep]
+                flat_targets = flat_targets[keep]
+
+            ce, z_loss = self.head.loss(flat_hidden, flat_targets)
+            lm_loss = ce
+            if self.cfg.train.z_loss_weight > 0:
+                lm_loss = lm_loss + self.cfg.train.z_loss_weight * z_loss
+
+            grounding = None
+            if self.bridge is not None and modal_pooled is not None:
+                text_pooled = text_hidden.float().mean(dim=1)
+                gw = float(self.cfg.model.multimodal.grounding_weight)
+                grounding = self.bridge.grounding(text_pooled, modal_pooled.float())
+                if gw != 0.0:
+                    lm_loss = lm_loss + gw * grounding
+
+            out.ce = ce
+            out.z_loss = z_loss
+            out.grounding = grounding
+            out.n_tokens = int(flat_targets.numel())
+            out.lm_loss = lm_loss
+
+        decision_loss = None
+        if out.decision_logits is not None and decision_targets is not None:
+            row_loss = F.cross_entropy(
+                out.decision_logits.float(), decision_targets, reduction="none"
             )
+            if decision_mask is None:
+                n_decisions = int(decision_targets.numel())
+                decision_loss = row_loss.mean()
+                out.decision_targets = decision_targets
+            else:
+                selected = row_loss * decision_mask.to(row_loss.dtype)
+                n_decisions = int(decision_mask.sum().item())
+                if n_decisions:
+                    decision_loss = selected.sum() / n_decisions
+                    out.decision_targets = decision_targets[decision_mask]
+                else:
+                    out.decision_targets = decision_targets[:0]
+            out.n_decisions = n_decisions
 
-        flat_hidden = text_hidden.reshape(-1, text_hidden.shape[-1])
-        flat_targets = targets.reshape(-1)
-        if loss_mask is not None:
-            # Boolean fancy indexing gathers the scored rows in one op. The
-            # previous ``nonzero()`` + ``index_select`` pair forced a GPU-to-CPU
-            # sync (variable-length result) and showed up as ~1.1 s/step of
-            # host time in the profiler on this ROCm build.
-            keep = loss_mask.reshape(-1)
-            flat_hidden = flat_hidden[keep]
-            flat_targets = flat_targets[keep]
-
-        ce, z_loss = self.head.loss(flat_hidden, flat_targets)
-        loss = ce
-        if self.cfg.train.z_loss_weight > 0:
-            loss = loss + self.cfg.train.z_loss_weight * z_loss
-
-        grounding = None
-        if self.bridge is not None and modal_pooled is not None:
-            text_pooled = text_hidden.float().mean(dim=1)
-            gw = float(self.cfg.model.multimodal.grounding_weight)
-            grounding = self.bridge.grounding(text_pooled, modal_pooled.float())
-            if gw != 0.0:
-                loss = loss + gw * grounding
-
-        out.loss = loss
-        out.ce = ce
-        out.z_loss = z_loss
-        out.grounding = grounding
-        out.n_tokens = int(flat_targets.numel())
+        total = None
+        if lm_loss is not None:
+            total = lm_loss
+        if decision_loss is not None:
+            weighted = self.cfg.model.decision.loss_weight * decision_loss
+            total = weighted if total is None else total + weighted
+        out.decision_loss = decision_loss
+        out.loss = total
         return out
 
     @torch.no_grad()

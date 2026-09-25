@@ -23,6 +23,39 @@ from hagi.model.norms import RMSNorm
 from hagi.model.ternary import BitLinear
 
 
+class RecursiveBranchScale(nn.Module):
+    """Per-leaf branch gain for the opt-in recursive F3 body.
+
+    A recursive parent cannot replace unequal child gains with one RMS scalar:
+    each child occupies a distinct leaf subspace before the F3 transform.
+    The parameter deliberately remains named ``scale`` so recursive state
+    manifests and checkpoint diagnostics use one explicit key.
+    """
+
+    def __init__(self, n_leaves: int, residual_scale: float, clamp_ratio: float = 2.0) -> None:
+        super().__init__()
+        if type(n_leaves) is not int or n_leaves < 1:
+            raise ValueError("n_leaves must be a positive integer")
+        self.n_leaves = n_leaves
+        self.residual_scale = float(residual_scale)
+        self.clamp_ratio = float(clamp_ratio)
+        self.keep_fp32 = True
+        self.scale = nn.Parameter(torch.full((n_leaves,), self.residual_scale))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[-1] % self.n_leaves:
+            raise ValueError(
+                f"recursive branch scale expects [B,T,n_leaves*leaf_hidden], "
+                f"got {tuple(x.shape)}"
+            )
+        leaf_hidden = x.shape[-1] // self.n_leaves
+        lo = self.residual_scale / self.clamp_ratio
+        hi = self.residual_scale * self.clamp_ratio
+        scale = self.scale.clamp(lo, hi).to(x.dtype)
+        shaped = x.reshape(*x.shape[:-1], self.n_leaves, leaf_hidden)
+        return (shaped * scale.reshape(1, 1, -1, 1)).reshape_as(x)
+
+
 class BranchScale(nn.Module):
     """Learnable cap on a residual branch's output norm.
 
