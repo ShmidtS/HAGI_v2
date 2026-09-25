@@ -908,12 +908,10 @@ class CrossParentPreservingTernaryTree(nn.Module):
         self.depth = depth
         self.leaf_hidden = leaf_hidden
         self.n_leaves = 3**depth
-        self.coordinate_layout = (
-            f"{ParentPreservingTernaryLift.coordinate_layout}:cross_parent"
-            f":{depth}:{leaf_hidden}"
-        )
+        self.coordinate_layout = ParentPreservingTernaryLift.coordinate_layout
         digest_input = (
-            f"{self.coordinate_layout}:{parent_preserving_ternary_digest()}"
+            f"{self.coordinate_layout}:{depth}:{leaf_hidden}"
+            f":{parent_preserving_ternary_digest()}"
         )
         self.transform_digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
         self._lift = ParentPreservingTernaryLift()
@@ -947,10 +945,25 @@ class CrossParentPreservingTernaryTree(nn.Module):
         return f"depth={self.depth}, leaf_hidden={self.leaf_hidden}"
 
 
+#: Every coordinate layout a recursive candidate may declare. ``coordinate_layout``
+#: is a NAME for how a vector is laid out, never a geometry-dependent string, so
+#: the set stays small and stable; unknown names fail closed downstream. The
+#: orchestrator imports this from here (merge does not import the orchestrator),
+#: so both transforms are accepted by one check.
+KNOWN_COORDINATE_LAYOUTS: frozenset[str] = frozenset(
+    {
+        "branch_major_pair_interleaved",  # TernaryF3Tree (instance attribute)
+        ParentPreservingTernaryLift.coordinate_layout,
+    }
+)
+
 #: Names of the cross-parent transforms a recursive merge may use. The legacy
 #: staged F3 tree stays the default so existing behaviour remains reachable
 #: unchanged; the parent-preserving lift must always be selected by name.
 _CROSS_PARENT_TRANSFORMS = ("f3_tree", "parent_preserving")
+
+#: Public alias for the set of cross-parent transform names.
+CROSS_PARENT_TRANSFORMS = _CROSS_PARENT_TRANSFORMS
 
 
 def _cross_parent_mode_from_config(cfg: Config) -> str:
@@ -1680,8 +1693,14 @@ def build_model_from_payload(
     if cfg.merge.mixer_type == "ternary_f3":
         raise ValueError("ternary_f3 model state has no recursive provenance")
     if cfg.merge.enabled:
-        return MergedHAGI(cfg, n_mixers=n_mixers, mixer_init_scale=mixer_init_scale).to(device)
-    return HAGI(cfg).to(device)
+        model = MergedHAGI(cfg, n_mixers=n_mixers, mixer_init_scale=mixer_init_scale)
+    else:
+        model = HAGI(cfg)
+    # A freshly constructed model carries random weights. Without this load the
+    # caller would score an unrelated model and every measurement taken from it
+    # would be noise. Validation stays delegated to the strict state load.
+    model.load_state_dict(state, strict=True)
+    return model.to(device)
 
 
 def merge_experts(
