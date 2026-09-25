@@ -1,0 +1,60 @@
+{
+  "checkpoint": "checkpoints/m2_merged_joint/step-0009000.pt",
+  "config": "configs/m2_merged_joint.yaml",
+  "domains": {
+    "en": {
+      "random_init": {
+        "exact_ce": 7.624637794494629,
+        "ppl": 2048.038519832798,
+        "tokens": 1280
+      },
+      "scrambled": {
+        "exact_ce": 7.621902751922607,
+        "ppl": 2042.4447004460235,
+        "tokens": 1280
+      },
+      "trained": {
+        "exact_ce": 6.396772146224976,
+        "ppl": 599.9055020476314,
+        "tokens": 1280
+      },
+      "trained_beats_random_by_nats": 1.2278656482696535
+    },
+    "mathcode": {
+      "random_init": {
+        "exact_ce": 7.622659540176391,
+        "ppl": 2043.9909836350016,
+        "tokens": 1280
+      },
+      "scrambled": {
+        "exact_ce": 7.620408964157105,
+        "ppl": 2039.395999164026,
+        "tokens": 1280
+      },
+      "trained": {
+        "exact_ce": 6.3508553981781,
+        "ppl": 572.9826277418579,
+        "tokens": 1280
+      },
+      "trained_beats_random_by_nats": 1.2718041419982908
+    },
+    "ru": {
+      "random_init": {
+        "exact_ce": 7.625555801391601,
+        "ppl": 2049.9194965619777,
+        "tokens": 1280
+      },
+      "scrambled": {
+        "exact_ce": 7.623246479034424,
+        "ppl": 2045.1910335122661,
+        "tokens": 1280
+      },
+      "trained": {
+        "exact_ce": 4.962872886657715,
+        "ppl": 143.00404072197438,
+        "tokens": 1280
+      },
+      "trained_beats_random_by_nats": 2.662682914733886
+    }
+  }
+}
