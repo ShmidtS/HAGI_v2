@@ -66,7 +66,7 @@ train:
   ce_keep_mode: stride
   ce_keep_rate: 0.25
   checkpoint_dir: checkpoints/m2_expert_mathcode
-  checkpoint_interval: 1500
+  checkpoint_interval: 1000
   checkpoint_keep_last: 2
   compile_model: false
   data:
