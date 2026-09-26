@@ -301,6 +301,79 @@ def prune(keep: int, rows: list[Path]) -> None:
             LOG.info("pruned %s (%.0f MB)", old.name, size_mb)
 
 
+def screen_candidates(
+    joint_config: Path,
+    device: str,
+    attempts: int,
+    *,
+    k: int,
+) -> tuple[Path, list[dict]]:
+    """Rank K merge configurations cheaply, return the winner's config path.
+
+    Each candidate is trained for a short screening budget and scored on the
+    same held-out evaluator as a full run, so the comparison is on the same
+    scale as the final number. The screen is a prior, not evidence -- see
+    hagi.orchestrator.merge_select -- and every screen score is returned so a
+    wrong pick is visible in the ledger rather than hidden.
+
+    With k=1 this is exactly the previous behaviour: one candidate, the base
+    config unchanged, no screening overhead.
+    """
+    from hagi.orchestrator.merge_select import (
+        enumerate_candidates,
+        screen_steps_for,
+        write_candidate_config,
+    )
+
+    if k <= 1:
+        return joint_config, [{"label": "base", "screen_exact_ce": None}]
+
+    raw = yaml.safe_load(joint_config.read_text(encoding="utf-8"))
+    budget = int(raw["train"]["max_steps"])
+    steps = screen_steps_for(budget)
+    candidates = enumerate_candidates(raw["merge"]["expert_checkpoints"])[:k]
+    LOG.info(
+        "screening %d merge candidate(s) at %d steps each (full budget %d)",
+        len(candidates), steps, budget,
+    )
+
+    scored: list[dict] = []
+    for cand in candidates:
+        cfg = write_candidate_config(
+            joint_config,
+            cand,
+            joint_config.with_name(f"{joint_config.stem}__{cand.label}.yaml"),
+            screen_steps=steps,
+            checkpoint_dir=f"checkpoints/_screen_{cand.label}",
+        )
+        ckpt = train_phase(cfg, ROOT / f"logs/screen_{cand.label}.log", device, attempts)
+        if ckpt is None:
+            LOG.warning("screen %s produced no checkpoint; skipping", cand.label)
+            continue
+        report = evaluate(
+            cfg, ckpt, ROOT / f"reports/screen_{cand.label}.json", device
+        )
+        if report is None:
+            continue
+        mean = mean_ce(report)
+        scored.append({"label": cand.label, "screen_exact_ce": mean})
+        LOG.info("screen %-18s mean CE %.4f", cand.label, mean if mean is not float("nan") else float("nan"))
+        # The screen's checkpoints are disposable; keep only the winner's dir.
+        for old in (ROOT / f"checkpoints/_screen_{cand.label}").glob("step-*.pt"):
+            old.unlink()
+
+    usable = [s for s in scored if s["screen_exact_ce"] is not None]
+    if not usable:
+        LOG.warning("no candidate scored; falling back to the base config")
+        return joint_config, scored
+    best = min(usable, key=lambda s: s["screen_exact_ce"])
+    LOG.info("screen winner: %s (%.4f)", best["label"], best["screen_exact_ce"])
+    return (
+        joint_config.with_name(f"{joint_config.stem}__{best['label']}.yaml"),
+        scored,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--plan", required=True, help="YAML list of lanes")
@@ -310,6 +383,10 @@ def main() -> int:
     ap.add_argument("--keep", type=int, default=2, help="checkpoints kept per run")
     ap.add_argument("--total-margin", type=float, default=DEFAULT_TOTAL_MARGIN)
     ap.add_argument("--domain-margin", type=float, default=DEFAULT_DOMAIN_MARGIN)
+    ap.add_argument(
+        "--merge-k", type=int, default=1,
+        help="merge configurations to screen per lane (1 = current behaviour)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="plan only, run nothing")
     args = ap.parse_args()
 
@@ -347,6 +424,9 @@ def main() -> int:
             checkpoints.append(ckpt)
         else:
             joint = ROOT / lane.joint_config
+            joint, screens = screen_candidates(
+                joint, args.device, args.attempts, k=args.merge_k
+            )
             ckpt = train_phase(joint, ROOT / f"logs/growth_{lane.name}_joint.log",
                               args.device, args.attempts)
             if ckpt is None:
@@ -364,6 +444,7 @@ def main() -> int:
                     append_ledger({
                         "lane": lane.name,
                         "phase": "evaluated",
+                        "merge_screen": screens,
                         "incumbent": incumbent_name,
                         "report": f"reports/growth_{lane.name}.json",
                         "elapsed_s": round(time.time() - started, 1),
