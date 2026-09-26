@@ -139,8 +139,23 @@ def main() -> int:
         if args.device == "auto"
         else torch.device(args.device)
     )
-    model = build_model_for_config(cfg).to(device)
-    load_model(args.resume, model, str(device))
+    # A recursive checkpoint has no untrained form -- its body is the lift of
+    # three specific children -- so it must be built from its own state rather
+    # than from the config. Everything else keeps the config-first path.
+    from hagi.train.checkpoint import load_payload
+
+    _probe = load_payload(args.resume, "cpu")
+    from hagi.model.merge import RecursiveF3HAGI
+
+    if RecursiveF3HAGI.is_recursive_state(_probe["model"]):
+        from hagi.model.merge import build_model_from_payload
+
+        model = build_model_from_payload(
+            cfg, _probe["model"], device=device
+        )
+    else:
+        model = build_model_for_config(cfg).to(device)
+        load_model(args.resume, model, str(device))
     model.eval()
 
     root = Path(cfg.train.data.data_dir)
