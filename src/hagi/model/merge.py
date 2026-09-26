@@ -42,7 +42,7 @@ from collections.abc import Mapping, Sequence
 import torch
 from torch import nn
 
-from hagi.config import Config
+from hagi.config import Config, ffn_width
 from hagi.model.ffn import BranchScale, RecursiveBranchScale
 from hagi.model.model import HAGI
 
@@ -1765,6 +1765,37 @@ def merge_experts(
     h = m.hidden_size
     if h % n != 0:
         raise ValueError(f"hidden_size {h} must be divisible by n_experts {n}")
+
+    # Geometry checks that would otherwise surface much later as an opaque
+    # "merged shape (a, b) != target (c, d)" from inside the concatenation
+    # loop. Each of these was found by hand while building the N=24 lane, and
+    # each is a property of the joint config alone, so it is checked here
+    # where the message can name the actual rule.
+    attn = m.attention
+    if attn.num_query_heads * attn.head_dim != h:
+        raise ValueError(
+            f"num_query_heads {attn.num_query_heads} * head_dim {attn.head_dim} "
+            f"= {attn.num_query_heads * attn.head_dim} does not match "
+            f"hidden_size {h}"
+        )
+    expert_h = h // n
+    if attn.num_query_heads % n or attn.num_kv_heads % n:
+        raise ValueError(
+            f"the joint head counts must be the sum over {n} experts, but "
+            f"num_query_heads {attn.num_query_heads} and num_kv_heads "
+            f"{attn.num_kv_heads} are not both divisible by {n}. merge "
+            "concatenates per-head QK gains and sink_bias along the head axis, "
+            "so every expert's heads have to appear in the joint."
+        )
+    expert_ffn = ffn_width(m)
+    if expert_ffn * n != h or h % m.ffn.multiple_of != 0:
+        raise ValueError(
+            f"ffn width {expert_ffn} x {n} experts = {expert_ffn * n} does not "
+            f"line up with hidden_size {h}; and hidden_size must be a multiple "
+            f"of ffn.multiple_of ({m.ffn.multiple_of}) so each expert's width "
+            "is exact. A width that rounds up (e.g. 96 under multiple_of 64 "
+            "becomes 128) silently widens the merged FFN."
+        )
 
     model = MergedHAGI(
         model_cfg,
