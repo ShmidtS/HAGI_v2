@@ -1284,22 +1284,40 @@ class RecursiveF3HAGI(HAGI):
             raise ValueError("child_configs must contain Config values")
         from hagi.train.checkpoint import config_to_dict
 
-        canonical_config_json = json.dumps(
-            config_to_dict(child_configs[0]),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
+        def _canonical(cfg: Config) -> str:
+            """Architecture-fingerprint of a child, for the three-way match.
+
+            Three leaves of one F3 level must be the same model on different
+            data. The original comparison hashed the whole config, which also
+            pinned ``train.data.seed`` and ``train.checkpoint_dir`` -- neither
+            of which describes the model, and both of which MUST differ for
+            three children trained on different draws into different
+            directories. Requiring them to match made the tree unbuildable:
+            the only way to pass was to pass the same config object three
+            times, which trains three leaves on identical data and collapses
+            the level to one.
+
+            The point of the check is that a recursive parent cannot mix
+            architectures -- a 3-way lift only makes sense over three equal
+            shapes. So seed and output path are excluded; everything that
+            determines the parameter shapes and the forward pass is not.
+            """
+            data = copy.deepcopy(config_to_dict(cfg))
+            train = data.get("train", {})
+            train.get("data", {}).pop("seed", None)
+            train.pop("checkpoint_dir", None)
+            return json.dumps(
+                data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            )
+
+        canonical_config_json = _canonical(child_configs[0])
         canonical_child_config = child_configs[0]
         for child_cfg in child_configs[1:]:
-            child_json = json.dumps(
-                config_to_dict(child_cfg),
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
-            if child_json != canonical_config_json:
-                raise ValueError("all recursive children must use one canonical Config")
+            if _canonical(child_cfg) != canonical_config_json:
+                raise ValueError(
+                    "all recursive children must share one architecture: only "
+                    "data.seed and checkpoint_dir may differ between leaves"
+                )
         if not all(isinstance(state, Mapping) for state in child_states):
             raise ValueError("child states must be mappings of tensor names")
         selected_source = (
