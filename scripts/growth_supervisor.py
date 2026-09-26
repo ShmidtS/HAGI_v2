@@ -175,15 +175,18 @@ def train_phase(config: Path, log_path: Path, device: str, attempts: int) -> Pat
     """
     out = checkpoint_dir_of(config)
     for attempt in range(1, attempts + 1):
-        if latest_checkpoint(out) is not None:
-            LOG.info("resume %s from existing checkpoint", out)
+        existing = latest_checkpoint(out)
         cmd = [
             sys.executable, "scripts/train.py",
             "--config", str(config),
             "--device", device,
         ]
-        if attempt > 1:
-            cmd.append("--resume")
+        if existing is not None:
+            # Resume whenever something is on disk, not only on a retry. Without
+            # this the supervisor restarted a fully trained run from step 0,
+            # spending 45 minutes to reproduce a checkpoint it already had.
+            LOG.info("resume %s from %s", out, existing.name)
+            cmd += ["--resume", str(existing)]
         code = run(cmd, log_path, timeout=60 * 60 * 24)
         ckpt = latest_checkpoint(out)
         if code == 0 and ckpt is not None:
