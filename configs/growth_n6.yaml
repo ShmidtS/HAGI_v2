@@ -40,3 +40,15 @@ lanes:
       should produce a near-identical model, so this lane is a control on the
       verdict rather than a growth claim. It is not evidence of growth and
       must not be reported as such.
+
+  - name: n6_replay
+    experts:
+      - configs/m2_e6_e1_wiki_ru.yaml
+      - configs/m2_e6_e2_web_en.yaml
+    joint: configs/m2_e6_joint_s1234.yaml
+    note: >
+      Smoke lane for the supervisor itself: two experts and a joint config
+      that are all already trained, so every phase should resume from disk and
+      finish in under a minute. It exists to prove the train/merge/eval/ledger
+      path works unattended. It is not a growth claim -- it reuses an
+      incumbent's own inputs, so the verdict should be "no change".
