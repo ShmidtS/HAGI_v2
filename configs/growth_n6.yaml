@@ -23,7 +23,7 @@ lanes:
       Six domain experts at hidden 384, merged to a joint model at hidden
       2304 (241.3M params). 3000 steps per expert, 9000 joint steps.
 
-  - name: n8
+  - name: n7
     experts:
       - configs/m2_e6_e1_wiki_ru.yaml
       - configs/m2_e6_e2_web_en.yaml
@@ -31,23 +31,11 @@ lanes:
       - configs/m2_e6_e4_wiki_en.yaml
       - configs/m2_e6_e5_tinystory.yaml
       - configs/m2_e6_e6_ru_mix.yaml
-      - configs/m2_e6_e2_web_en.yaml
-      - configs/m2_e6_e3_math.yaml
-    joint: configs/m2_e6_joint_s1234.yaml
+      - configs/m2_e6_e7_code.yaml
+    joint: configs/m2_e6_joint_n7_s1234.yaml
     note: >
-      Placeholder lane: reuses existing experts to exercise the accept/reject
-      path. The duplicate experts are deliberate -- reusing identical inputs
-      should produce a near-identical model, so this lane is a control on the
-      verdict rather than a growth claim. It is not evidence of growth and
-      must not be reported as such.
-
-  - name: n6_replay
-    experts:
-      - configs/m2_e6_e1_wiki_ru.yaml
-    joint: configs/m2_e6_joint_s1234.yaml
-    note: >
-      Smoke lane for the supervisor itself: two experts and a joint config
-      that are all already trained, so every phase should resume from disk and
-      finish in under a minute. It exists to prove the train/merge/eval/ledger
-      path works unattended. It is not a growth claim -- it reuses an
-      incumbent's own inputs, so the verdict should be "no change".
+      Second generation. The seventh expert trains on python_instruct, which
+      no other expert uses, so the expert set is no longer a partition of the
+      same six corpora. A gain over the n6 incumbent (6.1815) cannot be
+      explained as better coverage of the same mix. If it lands inside the
+      verdict margin, that is a negative result and is recorded as one.
