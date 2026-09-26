@@ -1345,7 +1345,6 @@ class RecursiveF3HAGI(HAGI):
         for state in child_states[1:]:
             if set(state) - provenance_keys != keys:
                 raise ValueError("recursive child state key sets must match")
-        reference_dtype: torch.dtype | None = None
         reference_device: torch.device | None = None
         for key in sorted(keys):
             tensors = [state[key] for state in child_states]
@@ -1357,11 +1356,6 @@ class RecursiveF3HAGI(HAGI):
                 raise ValueError(f"recursive child dtype mismatch on {key}")
             if any(tensor.device != tensors[0].device for tensor in tensors[1:]):
                 raise ValueError(f"recursive child device mismatch on {key}")
-            if reference_dtype is None:
-                reference_dtype = tensors[0].dtype
-                reference_device = tensors[0].device
-            elif tensors[0].dtype != reference_dtype or tensors[0].device != reference_device:
-                raise ValueError("recursive child state must use one dtype and device")
             if tensors[0].is_floating_point() and not all(
                 torch.isfinite(tensor).all() for tensor in tensors
             ):
