@@ -10,7 +10,26 @@ requires-python = ">=3.12"
 dependencies = ["numpy", "torch>=2.0", "pyyaml", "gigatoken"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "gguf==0.19.0", "transformers==5.16.0"]
+dev = [
+    "pytest",
+    "ruff",
+    "gguf==0.19.0",
+    "transformers>=5.17",
+    "tokenizers>=0.23",
+    "tiktoken",
+    "sentencepiece",
+]
+
+# torch is NOT listed with a version on purpose.
+#
+# This project trains on an AMD GPU (gfx1201, ROCm 7.13). There is no pip
+# route to a Windows ROCm torch: download.pytorch.org/whl/rocm* publishes
+# zero win_amd64 wheels (checked: 133 entries, none Windows) and
+# repo.radeon.com/rocm/manylinux is Linux-only. The installed
+# torch 2.10.0+rocm7.13.0a20260512 was installed from an AMD HIP build
+# outside pip, so `pip install -U torch` would replace it with the CUDA wheel
+# and take the GPU with it. Bumping torch therefore has to be a deliberate
+# manual ROCm install, not a dependency resolve.
 
 [tool.setuptools]
 package-dir = {"" = "src"}
