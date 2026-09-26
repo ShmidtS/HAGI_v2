@@ -1,14 +1,8 @@
-# F3 tree leaf, width 256 (TREE-2 / FLAT-9 arm).
-#
-# Nine leaves, one canonical architecture, differing only in data seed --
-# merge_recursive_f3 requires children to share everything except
-# train.data.seed and checkpoint_dir. Width 256 so that three of them lift
-# into a 768 mid-parent and three mid-parents lift into the 2304 root,
-# matching the measured flat geometry (241.3M) exactly.
-#
-# Leaf body constraints imposed by the F3 child fences: ternary off, cortex
-# off, adapters off, decision off, unigram prior off, tied head off,
-# conv_kernel 1, loop_depth 2.
+# Depth-1 F3 parent WITH BARK: same three leaves lifted by the
+# parent-preserving orthogonal transform into H=1152, plus a root-mode
+# PyramidalCortex in the parent. The leaves carry no cortex (the F3 child
+# fence forbids it); the bark is born in the lift. This is the recursive
+# architecture as originally intended: tree depth + cross-level bark.
 inference:
   max_new_tokens: 512
   min_new_tokens: 1
@@ -18,17 +12,27 @@ inference:
   top_k: 50
   top_p: 0.95
 merge:
-  enabled: false
+  enabled: true
+  mixer_type: ternary_f3
+  n_experts: 3
+  expert_hidden: 384
+  ternary_depth: 1
+  ternary_lift_mode: parent_preserving
+  expert_weight_source: effective_sparse
+  freeze_experts: false
+  mixer_init_scale: 0.0
+  expert_checkpoints:
+  - checkpoints/f3_leaf_s1001/step-0003000.pt
+  - checkpoints/f3_leaf_s1002/step-0003000.pt
+  - checkpoints/f3_leaf_s1003/step-0003000.pt
 model:
   attention:
     head_dim: 64
     max_seq_len: 4096
-    num_kv_heads: 2
-    num_query_heads: 6
+    num_kv_heads: 6
+    num_query_heads: 18
     qk_norm: true
     rope_theta: 10000.0
-  cortex:
-    enabled: false
   embedding:
     conv_kernel: 1
     init_std: 0.02
@@ -47,7 +51,7 @@ model:
     unigram_prior: false
     unigram_smoothing: 1.0
     z_loss_weight: 0.0001
-  hidden_size: 256
+  hidden_size: 1152
   init_orthogonal: true
   loop_depth: 2
   multimodal:
@@ -69,6 +73,14 @@ model:
     enabled: false
     eps: 1.0e-05
   vocab_size: 32768
+  cortex:
+    enabled: true
+    num_levels: 3
+    rank: 64
+    link_strides:
+    - 1
+    - 2
+    residual_scale: 0.1
 train:
   adam:
     beta1: 0.9
@@ -78,7 +90,7 @@ train:
   batch_size: 64
   ce_keep_mode: stride
   ce_keep_rate: 0.25
-  checkpoint_dir: checkpoints/tree_leaf_08
+  checkpoint_dir: checkpoints/f3_parent_d1_cortex
   checkpoint_interval: 1000
   checkpoint_keep_last: 2
   compile_model: false
@@ -88,12 +100,12 @@ train:
     eos_token_id: 1
     num_workers: 0
     pad_token_id: 0
-    seed: 2008
+    seed: 1001
     seq_len: 128
     weights:
+      wikipedia_ru: 0.34
       oscar_ru: 0.33
       slimpajama: 0.33
-      wikipedia_ru: 0.34
   grad_accum_steps: 1
   grad_checkpointing: false
   learning_rate: 0.0001
@@ -104,7 +116,7 @@ train:
     exact_ce_rows: 512
     log_interval: 25
   max_grad_norm: 1.0
-  max_steps: 3000
+  max_steps: 9000
   precision: bf16
   saturation_min_steps: 3000
   saturation_patience: 200

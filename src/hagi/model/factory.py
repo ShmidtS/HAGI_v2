@@ -46,10 +46,16 @@ def build_model_for_config(cfg: Config, *, n_blocks: int | None = None) -> nn.Mo
         # "HAGI cannot instantiate merge.mixer_type='ternary_f3'" -- the tree
         # existed, passed its design gates, and could not be built from a
         # config, which is why no recursive measurement exists.
+        # A recursive parent cannot be built from a config alone: its body IS
+        # the lift of three specific children, so the tree structures exist
+        # only once those child states are supplied. Construction goes through
+        # build_model_from_payload, which detects the provenance markers.
         if getattr(merge, "mixer_type", None) == "ternary_f3":
-            from hagi.model.merge import RecursiveF3HAGI
-
-            return RecursiveF3HAGI(cfg)
+            raise ValueError(
+                "ternary_f3 has no untrained form; build it with "
+                "hagi.model.merge.build_model_from_payload (from a checkpoint) "
+                "or merge_recursive_f3 (from three child states)"
+            )
 
         n_mixers = int(getattr(merge, "n_mixers", 1) or 1)
         if n_mixers <= 1:
