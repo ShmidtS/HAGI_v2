@@ -66,7 +66,7 @@ train:
   batch_size: 64
   ce_keep_mode: stride
   ce_keep_rate: 0.25
-  checkpoint_dir: rep_s1_m2_e6_e1_wiki_ru
+  checkpoint_dir: checkpoints/rep_s1_m2_e6_e1_wiki_ru
   checkpoint_interval: 1000
   checkpoint_keep_last: 2
   compile_model: false
