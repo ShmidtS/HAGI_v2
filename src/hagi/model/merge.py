@@ -1160,15 +1160,23 @@ class RecursiveF3HAGI(HAGI):
             raise ValueError("state_dict has no RecursiveF3HAGI provenance")
         if cfg.merge.mixer_type != "ternary_f3":
             raise ValueError("recursive state requires merge.mixer_type='ternary_f3'")
-        model = cls.__new__(cls)
-        nn.Module.__init__(model)
-        HAGI.__init__(model, cfg)
         from hagi.model.norms import BlockTreeNorm
 
+        # The leaf decomposition is resolved before the body is built: a
+        # root-mode cortex has to be constructed against the same leaf axis
+        # BlockTreeNorm/RecursiveBranchScale are, and that axis is merge
+        # geometry, not model geometry.
         parent_depth = cfg.merge.ternary_depth - 1
         leaf_hidden = cfg.merge.expert_hidden // (3**parent_depth)
         if leaf_hidden < 1 or leaf_hidden * (3**parent_depth) != cfg.merge.expert_hidden:
             raise ValueError("recursive checkpoint has invalid leaf geometry")
+        model = cls.__new__(cls)
+        nn.Module.__init__(model)
+        HAGI.__init__(
+            model,
+            cfg,
+            cortex_geometry=(3**cfg.merge.ternary_depth, leaf_hidden),
+        )
         for block in model.blocks:
             block.attn.attn_norm = BlockTreeNorm(
                 cfg.merge.ternary_depth, leaf_hidden, cfg.model.norm_eps
@@ -1448,7 +1456,12 @@ class RecursiveF3HAGI(HAGI):
         # modules. Keep the runtime config truthful after construction instead
         # of restoring a ternary flag that no longer describes these modules.
         model_cfg.model.ternary.enabled = False
-        super().__init__(model_cfg)
+        # The parent's cortex is built here, from the parent config, against
+        # the parent's own leaf decomposition. It is fresh zero-init state:
+        # ``cortex.*`` is still forbidden in the children, because the directed
+        # edges describe interactions between levels a child never had (see
+        # docs/PYRAMIDAL_CORTEX.md, "Merge semantics").
+        super().__init__(model_cfg, cortex_geometry=(3**target_depth, leaf_hidden))
 
         from hagi.model.norms import BlockTreeNorm
 
@@ -1492,8 +1505,14 @@ class RecursiveF3HAGI(HAGI):
 
         target_state = self.state_dict()
         target_keys = set(target_state)
+        # ``cortex.*`` is legitimate parent state: the side channel belongs to
+        # the level being created, starts zero-initialized, and is never
+        # inherited from a child. ``mixers.*`` and ``decision_head.*`` stay
+        # forbidden -- a recursive body has no cross-block mixer and no
+        # decision plane, so either key set would mean the parent config
+        # disagrees with the body this constructor assembles.
         forbidden_target = sorted(
-            key for key in target_keys if key.startswith("mixers.") or key.startswith("cortex.")
+            key for key in target_keys if key.startswith("mixers.")
             or key.startswith("decision_head.")
         )
         if forbidden_target:
@@ -1512,6 +1531,7 @@ class RecursiveF3HAGI(HAGI):
             for key in target_keys
             if key not in child_keys
             and ".adapters." not in key
+            and not key.startswith("cortex.")
             and key not in provenance_keys
         )
         if allowed_target_missing:

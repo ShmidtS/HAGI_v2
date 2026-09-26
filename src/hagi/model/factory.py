@@ -38,6 +38,19 @@ def build_model_for_config(cfg: Config, *, n_blocks: int | None = None) -> nn.Mo
     """
     merge = getattr(cfg, "merge", None)
     if merge is not None and getattr(merge, "enabled", False):
+        # The recursive ternary tree is a different body from a flat merge:
+        # its blocks carry BlockTreeNorm and RecursiveBranchScale over
+        # 3**ternary_leaf leaves, and it binds provenance buffers that
+        # MergedHAGI never writes. Dispatching it to MergedHAGI is what made
+        # every recursive config die at construction with
+        # "HAGI cannot instantiate merge.mixer_type='ternary_f3'" -- the tree
+        # existed, passed its design gates, and could not be built from a
+        # config, which is why no recursive measurement exists.
+        if getattr(merge, "mixer_type", None) == "ternary_f3":
+            from hagi.model.merge import RecursiveF3HAGI
+
+            return RecursiveF3HAGI(cfg)
+
         n_mixers = int(getattr(merge, "n_mixers", 1) or 1)
         if n_mixers <= 1:
             if getattr(merge, "scratch_block_norm", False):
