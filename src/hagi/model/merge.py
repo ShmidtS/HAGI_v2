@@ -1787,11 +1787,13 @@ def merge_experts(
             "concatenates per-head QK gains and sink_bias along the head axis, "
             "so every expert's heads have to appear in the joint."
         )
-    expert_ffn = ffn_width(m)
-    if expert_ffn * n != h or h % m.ffn.multiple_of != 0:
+    # ffn_width(m) is the JOINT's own SwiGLU width. What has to line up is the
+    # joint width against hidden_size, and hidden_size against multiple_of, so
+    # that each expert's slice is an exact multiple and cannot round up.
+    if ffn_width(m) != h or h % m.ffn.multiple_of != 0:
         raise ValueError(
-            f"ffn width {expert_ffn} x {n} experts = {expert_ffn * n} does not "
-            f"line up with hidden_size {h}; and hidden_size must be a multiple "
+            f"resolved ffn width {ffn_width(m)} does not match hidden_size {h} "
+            f"for a joint of {n} experts; and hidden_size must be a multiple "
             f"of ffn.multiple_of ({m.ffn.multiple_of}) so each expert's width "
             "is exact. A width that rounds up (e.g. 96 under multiple_of 64 "
             "becomes 128) silently widens the merged FFN."
