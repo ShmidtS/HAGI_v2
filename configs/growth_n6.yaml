@@ -44,7 +44,6 @@ lanes:
   - name: n6_replay
     experts:
       - configs/m2_e6_e1_wiki_ru.yaml
-      - configs/m2_e6_e2_web_en.yaml
     joint: configs/m2_e6_joint_s1234.yaml
     note: >
       Smoke lane for the supervisor itself: two experts and a joint config
