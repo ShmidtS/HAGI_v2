@@ -240,9 +240,27 @@ def main() -> int:
             device=device,
         )
     else:
-        model = HAGI(cfg).to(device)
-        if cfg.merge.enabled:
-            from hagi.model.merge import MergedHAGI, merge_experts
+        if cfg.merge.enabled and cfg.merge.mixer_type == "ternary_f3":
+            # Recursive ternary tree. Children are themselves trained bodies --
+            # leaves at depth 1, lifted parents deeper in. merge_recursive_f3
+            # fingerprints each child's config to prove the three share one
+            # architecture, so the config is read back from the checkpoint it
+            # was trained with rather than from this YAML: this YAML describes
+            # the parent, which is three times wider than any child.
+            from hagi.model.merge import merge_recursive_f3
+            from hagi.train.checkpoint import config_from_dict, load_payload
+
+            payloads = [
+                load_payload(p, str(device)) for p in cfg.merge.expert_checkpoints
+            ]
+            model = merge_recursive_f3(
+                cfg,
+                [pl["model"] for pl in payloads],
+                child_configs=[config_from_dict(pl["config"]) for pl in payloads],
+                drop_expert_mixers=False,
+            ).to(device)
+        elif cfg.merge.enabled:
+            from hagi.model.merge import merge_experts
 
             if cfg.merge.expert_checkpoints:
                 from hagi.train.checkpoint import load_payload
@@ -272,6 +290,8 @@ def main() -> int:
                 # The class choice lives in hagi.model.factory so the evaluator
                 # rebuilds the same architecture for a checkpoint written here.
                 model = build_model_for_config(cfg).to(device)
+        else:
+            model = HAGI(cfg).to(device)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",

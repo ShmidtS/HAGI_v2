@@ -330,6 +330,36 @@ class PyramidalCortexConfig:
     later boundary through positive ``link_strides`` offsets. No state survives
     a forward call or generation step.
 
+    Two orthogonal switches describe *where* the cortex writes and *how much*
+    it writes. Both default to the behavior the module has always had, so an
+    existing config computes identical numbers.
+
+    ``mode`` selects the width the side channel reads and writes:
+
+    * ``"dense"`` -- the whole residual stream. This is the flat-model role of
+      the cortex: the parent width is the whole width, so a full-width
+      additive term is exactly what the stream can carry.
+    * ``"root"`` -- only the tree's all-equal (root) mode, i.e. the mean over
+      the leaf axis of a recursive F3 body. The reconstructed term is
+      broadcast identically to every leaf, so it lies on the diagonal and
+      preserves the parent-preserving invariant. A dense cortex in a ternary
+      tree is rejected by :func:`validate_config`: its term differs between
+      leaves, ``BlockTreeNorm`` then normalizes each leaf by a different
+      statistic and the invariant breaks at step 0. See
+      ``docs/ARCHITECTURE_V2.md`` for the invariant argument.
+
+    ``gate`` selects how much of the reconstruction reaches the stream:
+
+    * ``"fixed"`` -- the constant ``residual_scale`` multiplier.
+    * ``"gumbel"`` -- ``residual_scale`` times one learnable scalar per
+      directed edge, drawn through a Gumbel-sigmoid while training and
+      hardened toward binary as the temperature anneals. Per-edge gating on a
+      cross-level residual injection is the mechanism of Cache-to-Cache
+      (arXiv:2510.03215), whose ablation credits the gate rather than the
+      additive channel (overwrite 20.70 -> +residual 44.88 -> +gate 47.95);
+      see ``docs/EXTERNAL_IDEAS.md``. The gate starts near closed and the
+      edges start zero-initialized, so a fresh cortex injects nothing.
+
     Attributes:
         enabled: build the model-global cortex side channel.
         num_levels: number of contiguous layer levels; must be between 2 and
@@ -338,6 +368,16 @@ class PyramidalCortexConfig:
         link_strides: positive, unique, sorted offsets from an earlier level.
             ``(1, 2)`` is the default adjacent-plus-skip highway.
         residual_scale: fixed multiplier on the reconstructed residual.
+        mode: ``"dense"`` (whole stream) or ``"root"`` (tree diagonal only).
+        gate: ``"fixed"`` (constant ``residual_scale``) or ``"gumbel"``
+            (per-edge annealed learnable scalar).
+        gate_temp_start: Gumbel-sigmoid temperature at the first cortex pass.
+        gate_temp_floor: temperature the schedule anneals to and the value
+            used at evaluation time, where the gate is a plain deterministic
+            sigmoid.
+        gate_temp_steps: length of the linear anneal, counted in cortex
+            passes. One optimizer step advances ``model.loop_depth`` passes,
+            so a ``loop_depth=2`` tree halves this in step terms.
     """
 
     enabled: bool = False
@@ -345,6 +385,11 @@ class PyramidalCortexConfig:
     rank: int = 64
     link_strides: tuple[int, ...] = (1, 2)
     residual_scale: float = 0.1
+    mode: str = "dense"
+    gate: str = "fixed"
+    gate_temp_start: float = 1.0
+    gate_temp_floor: float = 0.1
+    gate_temp_steps: int = 2000
 
 
 @dataclass
@@ -757,6 +802,13 @@ class MergeConfig:
 # default, so nothing changes unless a caller opts in.
 _TERNARY_LIFT_MODES = ("f3_tree", "parent_preserving")
 
+# Cortex write width and injection multiplier. ``dense``/``fixed`` are the
+# behavior the module has always had and stay the defaults; ``root`` is the
+# tree diagonal and ``gumbel`` the annealed per-edge gate. See
+# ``PyramidalCortexConfig`` and ``docs/ARCHITECTURE_V2.md``.
+CORTEX_MODES = ("dense", "root")
+CORTEX_GATES = ("fixed", "gumbel")
+
 
 @dataclass
 class InferenceConfig:
@@ -810,7 +862,7 @@ def layer_windows(cfg: ModelConfig) -> list[int]:
 
 
 
-def count_params(cfg: ModelConfig) -> dict[str, int]:
+def count_params(cfg: ModelConfig, *, cortex_width: int | None = None) -> dict[str, int]:
     """Analytic parameter count by group (no model instantiation).
 
     Separating embedding from body is the number that actually matters: a body
@@ -818,6 +870,15 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
     it trains. The V30 155.6M configuration spent 43% of its parameters on the
     262k-entry table and 88M on the body — it plateaued at ce ~5 and then
     diverged.
+
+    Args:
+        cfg: the model config to count.
+        cortex_width: width the cortex's ``down``/``up`` projections read and
+            write. ``None`` means ``hidden_size`` (dense mode). A root-mode
+            cortex in a recursive tree sees only one leaf, and this function
+            takes a :class:`ModelConfig`, so the caller resolves the leaf
+            width from the merge geometry and passes it here; without that the
+            analytic cortex group would over-count a root-mode tree config.
     """
     h, n = cfg.hidden_size, cfg.num_layers
     a = cfg.attention
@@ -858,6 +919,7 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
     cortex = 0
     cx = cfg.cortex
     if cx.enabled:
+        cw = h if cortex_width is None else int(cortex_width)
         source_levels = {
             level - stride
             for level in range(cx.num_levels)
@@ -876,10 +938,13 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
             if (source := target - stride) >= 0
         ]
         cortex = (
-            len(source_levels) * h * cx.rank
-            + len(target_levels) * cx.rank * h
+            len(source_levels) * cw * cx.rank
+            + len(target_levels) * cx.rank * cw
             + len(edges) * cx.rank * cx.rank
         )
+        if cx.gate == "gumbel":
+            # One scalar gate per directed edge.
+            cortex += len(edges)
     decision = h * cfg.decision.num_options if cfg.decision.enabled else 0
     return {
         "embedding": embed,
@@ -891,6 +956,49 @@ def count_params(cfg: ModelConfig) -> dict[str, int]:
         "total": embed + head + body + adapter + cortex + decision,
         "active_body": body + adapter + cortex + decision,
     }
+
+
+def cortex_write_width(cfg: Config) -> int:
+    """Return the width the cortex's ``down``/``up`` projections see.
+
+    A dense cortex writes the whole stream, so the width is
+    ``model.hidden_size``.  A root-mode cortex in a recursive ternary body
+    writes only the tree's all-equal mode, i.e. a single leaf, and the leaf
+    decomposition lives in ``merge`` geometry that :func:`count_params`
+    cannot see (it takes a :class:`ModelConfig`).  The caller resolves it
+    here, against the same decomposition ``BlockTreeNorm`` and
+    ``RecursiveBranchScale`` are built against:
+
+        n_leaves = 3 ** merge.ternary_depth
+        leaf_hidden = merge.expert_hidden // 3 ** (merge.ternary_depth - 1)
+
+    Raises:
+        ValueError: on a root-mode cortex in a recursive body whose leaf
+            geometry does not tile ``model.hidden_size`` exactly.
+    """
+    cx = cfg.model.cortex
+    if not cx.enabled or cx.mode != "root":
+        return cfg.model.hidden_size
+    mg = cfg.merge
+    if not mg.enabled or mg.mixer_type != "ternary_f3":
+        return cfg.model.hidden_size
+    depth = mg.ternary_depth
+    if type(depth) is not int or depth < 1:
+        raise ValueError(
+            f"cortex.mode='root' requires merge.ternary_depth >= 1, got {depth!r}"
+        )
+    leaf_hidden = mg.expert_hidden // 3 ** (depth - 1)
+    if leaf_hidden * 3 ** (depth - 1) != mg.expert_hidden:
+        raise ValueError(
+            f"merge.expert_hidden {mg.expert_hidden} is not divisible by "
+            f"3 ** (merge.ternary_depth - 1) = {3 ** (depth - 1)}"
+        )
+    if leaf_hidden * (3**depth) != cfg.model.hidden_size:
+        raise ValueError(
+            f"leaf geometry {3**depth} x {leaf_hidden} does not tile "
+            f"model.hidden_size {cfg.model.hidden_size}"
+        )
+    return leaf_hidden
 
 
 def auto_configure(
@@ -1263,6 +1371,14 @@ def validate_config(cfg: Config) -> None:
 
     cx = m.cortex
     if cx.enabled:
+        if cx.mode not in CORTEX_MODES:
+            raise ValueError(
+                f"model.cortex.mode must be one of {sorted(CORTEX_MODES)}, got {cx.mode!r}"
+            )
+        if cx.gate not in CORTEX_GATES:
+            raise ValueError(
+                f"model.cortex.gate must be one of {sorted(CORTEX_GATES)}, got {cx.gate!r}"
+            )
         if m.num_layers < 2 or not 2 <= cx.num_levels <= m.num_layers:
             raise ValueError(
                 "model.cortex.num_levels must be at least 2 and at most model.num_layers"
@@ -1282,6 +1398,27 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("model.cortex.link_strides must be smaller than num_levels")
         if not math.isfinite(cx.residual_scale) or cx.residual_scale <= 0.0:
             raise ValueError("model.cortex.residual_scale must be finite and positive")
+        if cx.gate == "gumbel":
+            # The anneal is only meaningful with a strictly positive floor: a
+            # zero temperature would make the eval-time sigmoid a hard step
+            # with no gradient path, and a start below the floor would run the
+            # schedule backwards.
+            for name in ("gate_temp_start", "gate_temp_floor"):
+                value = getattr(cx, name)
+                if type(value) is not float or not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"model.cortex.{name} must be a finite positive float, got {value!r}"
+                    )
+            if cx.gate_temp_start < cx.gate_temp_floor:
+                raise ValueError(
+                    "model.cortex.gate_temp_start must be >= gate_temp_floor "
+                    f"({cx.gate_temp_start} < {cx.gate_temp_floor})"
+                )
+            if type(cx.gate_temp_steps) is not int or cx.gate_temp_steps < 1:
+                raise ValueError(
+                    "model.cortex.gate_temp_steps must be a positive integer, "
+                    f"got {cx.gate_temp_steps!r}"
+                )
 
     dec = m.decision
     if type(dec.enabled) is not bool:
@@ -1353,8 +1490,25 @@ def validate_config(cfg: Config) -> None:
                 raise ValueError(
                     "ternary_f3 effective_sparse body does not use BitLinear FP32 masters"
                 )
-            if m.cortex.enabled or m.decision.enabled:
-                raise ValueError("ternary_f3 requires cortex and decision disabled")
+            if m.decision.enabled:
+                raise ValueError("ternary_f3 requires decision disabled")
+            if m.cortex.enabled and m.cortex.mode != "root":
+                # The fence is about the write width, not about the cortex.
+                # A dense term is not equal across leaves, so the next
+                # BlockTreeNorm normalizes each leaf by its own statistic and
+                # RecursiveBranchScale scales the leaves differently: the
+                # parent-preserving invariant (three identical children ->
+                # preserved logits) breaks at step 0. A root-mode term is
+                # broadcast identically to every leaf, so it rides the
+                # diagonal and the invariant survives. See
+                # docs/ARCHITECTURE_V2.md.
+                raise ValueError(
+                    "ternary_f3 allows model.cortex.mode='root' only: a dense "
+                    "cortex adds a full-width term at the level boundary, that "
+                    "term is not equal across leaves, and the per-leaf "
+                    "BlockTreeNorm/RecursiveBranchScale distortion destroys "
+                    "the parent-preserving leaf equality on the first step"
+                )
             if m.adapters.ttt_lora.enabled:
                 raise ValueError("ternary_f3 forbids model.adapters.ttt_lora")
             if m.hidden_size % 3:
@@ -1399,7 +1553,7 @@ def validate_config(cfg: Config) -> None:
 def describe(cfg: Config) -> str:
     """One-block human summary: shape, parameter split, and channel rate."""
     m = cfg.model
-    counts = count_params(m)
+    counts = count_params(m, cortex_width=cortex_write_width(cfg))
     windows = layer_windows(m)
     n_full = sum(1 for w in windows if w == 0)
     bits = math.log2(3) if m.ternary.enabled else 16.0

@@ -17,7 +17,13 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint_util
 from torch import nn
 
-from hagi.config import Config, count_params, ffn_width, layer_windows
+from hagi.config import (
+    Config,
+    count_params,
+    cortex_write_width,
+    ffn_width,
+    layer_windows,
+)
 from hagi.model.attention import AttentionConfig, build_attention_mask
 from hagi.model.block import Block
 from hagi.model.cortex import PyramidalCortex
@@ -37,7 +43,24 @@ class HAGI(nn.Module):
         cfg: top-level :class:`~hagi.config.Config`.
     """
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        cortex_geometry: tuple[int, int] | None = None,
+    ) -> None:
+        """Build the model.
+
+        Args:
+            cfg: top-level :class:`~hagi.config.Config`.
+            cortex_geometry: ``(n_leaves, leaf_hidden)`` leaf decomposition of
+                a recursive tree body, passed straight to the cortex.  A flat
+                model leaves it ``None``; :class:`RecursiveF3HAGI` supplies it,
+                because a root-mode cortex has to read and write against the
+                same leaf decomposition ``BlockTreeNorm`` and
+                ``RecursiveBranchScale`` are built against, and this
+                constructor cannot see the merge geometry on its own.
+        """
         super().__init__()
         if type(self) is HAGI and cfg.merge.mixer_type == "ternary_f3":
             raise ValueError(
@@ -128,8 +151,13 @@ class HAGI(nn.Module):
         # module is absent by default, so the baseline module tree and forward
         # remain unchanged. State is created per pass in _run_blocks, never
         # stored across tokens or generation calls.
+        n_leaves, leaf_hidden = cortex_geometry if cortex_geometry is not None else (None, None)
         self.cortex: PyramidalCortex | None = (
-            PyramidalCortex(m.num_layers, h, m.cortex) if m.cortex.enabled else None
+            PyramidalCortex(
+                m.num_layers, h, m.cortex, n_leaves=n_leaves, leaf_hidden=leaf_hidden
+            )
+            if m.cortex.enabled
+            else None
         )
         self.decision_head: DecisionHead | None = (
             DecisionHead(h, m.decision.num_options) if m.decision.enabled else None
@@ -155,7 +183,7 @@ class HAGI(nn.Module):
 
     def param_summary(self) -> dict[str, int]:
         """Analytic parameter counts by group (see :func:`~hagi.config.count_params`)."""
-        return count_params(self.cfg.model)
+        return count_params(self.cfg.model, cortex_width=cortex_write_width(self.cfg))
 
     def _attach_adapters(self, hidden_size: int) -> None:
         """Attach an opt-in residual adapter to every block.
