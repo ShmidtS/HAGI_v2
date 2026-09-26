@@ -1,5 +1,10 @@
 # N=24 at the same 241.3M: 24 experts of H=96 merged into a joint of H=2304.
 #
+# Heads are 24 * 3 = 72 query and 24 * 1 = 24 KV, not the 36/12 that N=6 and
+# N=12 happened to need. merge.py concatenates sink_bias and per-head QK gains
+# along the head axis, so the joint must declare as many heads as its experts
+# contribute -- N=12 only worked because 12 * 3 happened to equal 36.
+#
 # N=12 beat N=6 by 0.1049 nats at identical parameters, so merge count is the
 # lever. This lane doubles it again, 12 -> 24, holding the joint width, the
 # head geometry and the parameter count fixed. The experts are now only 6.5M
@@ -69,10 +74,10 @@ merge:
   n_experts: 24
 model:
   attention:
-    head_dim: 64
+    head_dim: 32
     max_seq_len: 4096
-    num_kv_heads: 12
-    num_query_heads: 36
+    num_kv_heads: 24
+    num_query_heads: 72
     qk_norm: true
     rope_theta: 10000.0
   embedding:
@@ -86,7 +91,7 @@ model:
     # 1536 here broke the merge: the concatenated expert FFNs are 6 * 384 =
     # 2304 wide, and the mixer refused (2304, 2304) against (1536, 2304).
     intermediate_size: 0
-    multiple_of: 64
+    multiple_of: 32
   head:
     ce_chunk_rows: 16384
     ce_save_logits: true

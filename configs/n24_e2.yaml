@@ -22,7 +22,7 @@ model:
     tie_lm_head: false
   ffn:
     expansion: 1.0
-    multiple_of: 64
+    multiple_of: 32
   head:
     ce_chunk_rows: 16384
     ce_save_logits: true
