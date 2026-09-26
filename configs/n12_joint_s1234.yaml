@@ -33,18 +33,18 @@ inference:
 merge:
   enabled: true
   expert_checkpoints:
-  - checkpoints/n12_e1/step-0003000.pt
-  - checkpoints/n12_e2/step-0003000.pt
-  - checkpoints/n12_e3/step-0003000.pt
-  - checkpoints/n12_e4/step-0003000.pt
-  - checkpoints/n12_e5/step-0003000.pt
-  - checkpoints/n12_e6/step-0003000.pt
-  - checkpoints/n12_e7/step-0003000.pt
-  - checkpoints/n12_e8/step-0003000.pt
-  - checkpoints/n12_e9/step-0003000.pt
-  - checkpoints/n12_e10/step-0003000.pt
-  - checkpoints/n12_e11/step-0003000.pt
-  - checkpoints/n12_e12/step-0003000.pt
+  - checkpoints/n12_e10_e3_math/step-0003000.pt
+  - checkpoints/n12_e11_e4_wiki_en/step-0003000.pt
+  - checkpoints/n12_e12_e5_tinystory/step-0003000.pt
+  - checkpoints/n12_e1_e1_wiki_ru/step-0003000.pt
+  - checkpoints/n12_e2_e2_web_en/step-0003000.pt
+  - checkpoints/n12_e3_e3_math/step-0003000.pt
+  - checkpoints/n12_e4_e4_wiki_en/step-0003000.pt
+  - checkpoints/n12_e5_e5_tinystory/step-0003000.pt
+  - checkpoints/n12_e6_e6_ru_mix/step-0003000.pt
+  - checkpoints/n12_e7_e7_code/step-0003000.pt
+  - checkpoints/n12_e8_e1_wiki_ru/step-0003000.pt
+  - checkpoints/n12_e9_e2_web_en/step-0003000.pt
   mixer_init_scale: 0.0
   n_experts: 12
 model:
