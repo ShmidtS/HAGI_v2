@@ -121,3 +121,4 @@ _archive/**/*.json
 /_audit_*.py
 /_audit_*.json
 /_cleanup.py
+logs/*.done
