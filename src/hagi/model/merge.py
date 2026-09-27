@@ -845,6 +845,14 @@ def _recursive_tree_norm_weights(
         raise ValueError("recursive norm assembly requires exactly three children")
     if target_depth < 1:
         raise ValueError("recursive target depth must be positive")
+    # ``BlockTreeNorm`` (norms.py:120) fixes ``inner_blocks = 3**(depth-1)``,
+    # so the assembled gains must have exactly that inner width -- not merely
+    # whatever width the children happened to carry.  Taking the children's
+    # width verbatim is right only while every level is a single lift apart:
+    # a depth-1 child has ``inner_blocks == 1`` and ``3 * 1 == 3**1``, so the
+    # two agree and the bug stays hidden.  From depth 3 on they diverge, and
+    # ``load_state_dict(strict=True)`` then rejects the whole parent.
+    target_inner = 3 ** (target_depth - 1)
     normalized: list[torch.Tensor] = []
     for weight in child_weights:
         if weight.ndim == 1:
@@ -859,7 +867,14 @@ def _recursive_tree_norm_weights(
         # A source depth-g norm contributes 3**g leaves to each new
         # top-level child.  Flatten its source hierarchy, then keep the three
         # target children as the first axis of the result.
-        normalized.append(weight.reshape(1, -1, weight.shape[-1]))
+        flat = weight.reshape(1, -1, weight.shape[-1])
+        if flat.shape[1] != target_inner:
+            raise ValueError(
+                f"recursive child norm contributes {flat.shape[1]} leaves per child, "
+                f"but target depth {target_depth} requires {target_inner} "
+                f"(3**{target_depth - 1}); the child is not one lift below the target"
+            )
+        normalized.append(flat)
     shapes = {tuple(weight.shape) for weight in normalized}
     if len(shapes) != 1:
         raise ValueError(f"recursive child norm shapes differ: {sorted(shapes)}")
@@ -1314,6 +1329,14 @@ class RecursiveF3HAGI(HAGI):
             train = data.get("train", {})
             train.get("data", {}).pop("seed", None)
             train.pop("checkpoint_dir", None)
+            # ``model.init_seed`` changes the initial values, not the shapes or
+            # the forward pass, so three leaves seeded differently are the same
+            # architecture. It is allowed to differ for the same reason
+            # ``data.seed`` is: leaves must not be the same model, and the
+            # measured effect of differing init seeds on leaf quality was
+            # +0.005 nats, i.e. inside the noise. Every shape that matters is
+            # checked separately by the geometry checks above.
+            data.get("model", {}).pop("init_seed", None)
             return json.dumps(
                 data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
             )
@@ -1351,6 +1374,14 @@ class RecursiveF3HAGI(HAGI):
 
         first = child_states[0]
         provenance_keys = set(self._PROVENANCE_KEYS)
+        # Whether the children are themselves lifted parents decides what they
+        # are allowed to be: a recursive child may carry a root cortex (that is
+        # what gives each level of a deep ladder its own cross-level channel),
+        # a plain leaf may not. The state is the authority here, not the
+        # config: a config can claim anything, the provenance buffers cannot.
+        child_is_recursive = all(
+            self.is_recursive_state(state) for state in child_states
+        )
         keys = set(first) - provenance_keys
         if not keys:
             raise ValueError("child state is empty")
@@ -1359,14 +1390,25 @@ class RecursiveF3HAGI(HAGI):
                 key
                 for key in state
                 if key.startswith("mixers.")
-                or key.startswith("cortex.")
                 or key.startswith("decision_head.")
                 or ".adapters." in key
                 or ".ttt_lora." in key
             )
+            # A recursive child's cortex is dropped, not inherited, but it must
+            # not be treated as a violation either: a deep ladder's
+            # intermediate levels are full parents and therefore carry one.
+            # The parent grows its own fresh zero-init cortex against ITS leaf
+            # decomposition further down, because a child's cortex is defined
+            # against its own n_leaves and would read the wrong leaves here.
+            child_cortex = sorted(key for key in state if key.startswith("cortex."))
             if forbidden:
                 raise ValueError(
                     f"recursive child contains forbidden state key: {forbidden}"
+                )
+            if child_cortex and not child_is_recursive:
+                raise ValueError(
+                    "recursive child contains cortex state but is not itself a "
+                    f"recursive parent: {child_cortex}"
                 )
         for state in child_states[1:]:
             if set(state) - provenance_keys != keys:
@@ -1397,8 +1439,35 @@ class RecursiveF3HAGI(HAGI):
             raise ValueError("recursive child config requires tie_lm_head=False")
         if child_m.embedding.conv_kernel != 1:
             raise ValueError("recursive child config requires embedding.conv_kernel=1")
-        if child_m.adapters.enabled or child_m.cortex.enabled or child_m.decision.enabled:
+        if child_m.adapters.enabled or child_m.decision.enabled:
             raise ValueError("recursive child config must disable adaptive child state")
+        if child_m.cortex.enabled:
+            # A recursive child is itself a parent, so it must be allowed to
+            # carry a root cortex: that is what gives every level of a deep
+            # ladder its own cross-level channel. The mode fence still
+            # applies -- a dense cortex term is not equal across leaves and
+            # would break the parent-preserving invariant at step 0 (see the
+            # validation note in config.py and docs/ARCHITECTURE_V2.md).
+            #
+            # The cortex is NOT inherited: `cortex.*` stays in the forbidden
+            # child key set above, and the parent grows its own fresh
+            # zero-init cortex against its own leaf decomposition. A child's
+            # cortex is defined against ITS n_leaves, so lifting it into a
+            # wider parent would mix up which leaves it was reading.
+            if not child_is_recursive:
+                raise ValueError(
+                    "recursive child config must disable adaptive child state: a "
+                    "non-recursive leaf cannot carry a cortex, because the "
+                    "directed edges describe interactions between levels a leaf "
+                    "never had"
+                )
+            if child_m.cortex.mode != "root":
+                raise ValueError(
+                    "recursive child cortex must use mode='root': a dense term "
+                    "is not equal across leaves, so the per-leaf BlockTreeNorm "
+                    "and RecursiveBranchScale distortion would break the "
+                    "parent-preserving leaf equality on the first step"
+                )
         if child_m.adapters.ttt_lora.enabled:
             raise ValueError("recursive child config must disable TTT-LoRA")
         if child_m.head.unigram_prior:
@@ -1494,6 +1563,13 @@ class RecursiveF3HAGI(HAGI):
         self.child_config_fingerprint = child_config_fingerprint
         self.logit_scale_source: float | None = None
         self.logit_scale_target: float | None = None
+        # How far the children's tables sat from their mean, per key. Reported
+        # after a shared-table lift so a caller can see whether the merge threw
+        # away anything: a large gap means the shared table is a compromise.
+        self.shared_table_gap: dict[str, float] = {}
+        self.require_identical_tables = bool(
+            getattr(cfg.merge, "require_identical_tables", False)
+        )
         self.transform_digest = self.target_tree.transform_digest
         self._register_provenance_buffers(
             child_config_fingerprint,
@@ -1517,6 +1593,8 @@ class RecursiveF3HAGI(HAGI):
         )
         if forbidden_target:
             raise ValueError(f"recursive target contains forbidden state keys: {forbidden_target}")
+        # Resolved once here, read again in the assembly loop below.
+        shared_vocab_tables = bool(getattr(cfg.merge, "shared_vocab_tables", False))
         assembled: dict[str, torch.Tensor] = dict(target_state)
         child_keys = keys
         missing = sorted(
@@ -1609,10 +1687,40 @@ class RecursiveF3HAGI(HAGI):
         for key in sorted(child_keys):
             if ".adapters." in key:
                 continue
+            if key.startswith("cortex."):
+                # Each level grows its own cortex, fresh zero-init, built
+                # against THIS level's leaf decomposition (n_leaves grows with
+                # ternary_depth while the cortex's own weight shapes do not --
+                # what changes is which leaves `_root_mode` averages over and
+                # which level `apply_boundary` publishes). So a child's cortex
+                # is not inherited and not block-diagonally lifted: it stays in
+                # `assembled` from `target_state`, which already holds the
+                # parent's own zero-init copy.
+                continue
             values = [state[key] for state in child_states]
             if key == "encoder.embedding.weight":
-                assembled[key] = torch.cat(values, dim=1)
+                assembled[key] = (
+                    self._shared_vocab_table(key, values)
+                    if shared_vocab_tables
+                    else torch.cat(values, dim=1)
+                )
             elif key == "head.projection.weight":
+                if shared_vocab_tables:
+                    # The block-diagonal path below scales each child block by
+                    # head_scale_i / head_scale_sum before concatenating. With a
+                    # shared table the same scale must be applied, otherwise the
+                    # shared and block-diagonal parents disagree by a constant
+                    # factor and the lift stops preserving the parent's output.
+                    scale = float(values[0].to(torch.float64).sum())
+                    total = sum(
+                        float(v.detach().to(torch.float64).sum()) for v in values
+                    )
+                    table = self._shared_vocab_table(key, values)
+                    with torch.no_grad():
+                        assembled[key] = (table.to(torch.float64) * (scale / total)).to(
+                            table.dtype
+                        )
+                    continue
                 # Oracle-approved receiver: the only receiver scale is
                 # ``s_target = sum(s_i) / sqrt(3)``.  The projection itself is
                 # C @ Q, where C concatenates gain-normalized child blocks.
@@ -1680,9 +1788,80 @@ class RecursiveF3HAGI(HAGI):
             else:
                 raise ValueError(f"unsupported recursive state key: {key}")
 
+        if shared_vocab_tables:
+            # The shared table is [V, leaf_hidden] while the parent's parameter
+            # is [V, parent_hidden]. Widen the STATE, not the module, so the
+            # strict load below still applies. The direction is (1,1,1): every
+            # leaf starts from the same table, and the lifted bodies are what
+            # make the branches differ. This is what removes 96% of the
+            # parent's table weights -- three copies become one.
+            # This lift is always ternary, so the parent is exactly three
+            # leaves wide no matter how deep the tree is: 3**parent_depth is
+            # the number of leaves in the WHOLE tree, not in this lift.
+            leaves = 3
+            for key in ("encoder.embedding.weight", "head.projection.weight"):
+                table = assembled[key]
+                width = table.shape[1] * leaves
+                with torch.no_grad():
+                    assembled[key] = (
+                        table.unsqueeze(1)
+                        .expand(table.shape[0], leaves, table.shape[1])
+                        .reshape(table.shape[0], width)
+                        .contiguous()
+                    )
         self.load_state_dict(assembled, strict=True)
         if self.logit_scale_source is None or self.logit_scale_target is None:
             raise ValueError("recursive assembly requires head.logit_scale")
+
+    def _shared_vocab_table(self, key: str, values: list[torch.Tensor]) -> torch.Tensor:
+        """Return the single ``[V, leaf_hidden]`` table every child agreed on.
+
+        A leaf's weights are almost entirely its two vocabulary tables: at
+        ``H=128`` the embedding and the head are 8.3M of 8.7M parameters, and
+        the body that actually holds the sequence logic is 0.39M. Lifting three
+        children block-diagonally therefore triples the table -- 96% of the
+        parent -- to obtain three COPIES of a table that is supposed to be
+        shared. With this flag the parent keeps one table and expands it along
+        (1,1,1), the direction the parent-preserving lift fixes, so the leaves
+        still start out equal and their divergence still comes from the lifted
+        bodies.
+
+        The table is the plain unweighted mean of the children's tables, which
+        is the choice made by Branch-Train-MiX (arXiv:2403.07816): that work
+        merges experts by "merges all non-FFN layers (embedding, attention,
+        normalization, and head) of experts by unweighted averaging and keeps
+        the FFNs separate". The earlier version of this function required the
+        tables to be byte-identical, which in practice never happens -- leaves
+        trained independently diverge (measured max|d| 0.149 on the embedding,
+        0.650 on the head) -- so it refused to build anything. A divergence
+        that exists in every real setting is not a bug to guard against, it is
+        the thing to average. ``require_identical_tables`` restores the strict
+        behaviour, and is what the ``SHARED_TABLE_FENCE`` attempt used.
+
+        Shape mismatches are still a hard error: averaging tables of different
+        widths has no meaning.
+        """
+        first = values[0]
+        for index, value in enumerate(values[1:], start=1):
+            if value.shape != first.shape:
+                raise ValueError(
+                    f"shared_vocab_tables: child {index} has {key} of shape "
+                    f"{tuple(value.shape)}, child 0 has {tuple(first.shape)}"
+                )
+        if self.require_identical_tables:
+            for index, value in enumerate(values[1:], start=1):
+                if not torch.equal(value, first):
+                    delta = float((value.to(torch.float64) - first.to(torch.float64)).abs().max())
+                    raise ValueError(
+                        f"shared_vocab_tables requires every child to carry the same "
+                        f"{key}, but child 0 and child {index} differ by {delta:.6f}."
+                    )
+            return first.clone()
+        mean = torch.stack([value.to(torch.float64) for value in values]).mean(dim=0)
+        self.shared_table_gap[key] = max(
+            float((value.to(torch.float64) - mean).abs().max()) for value in values
+        )
+        return mean.to(first.dtype)
 
     def _apply_mixers(self, h: torch.Tensor) -> torch.Tensor:
         return self.target_tree.apply_row(h)
@@ -1966,15 +2145,20 @@ def merge_experts(
             merged = _merge_1d(blocks)
         else:
             # Scalars (branch_scale, logit_scale): take the first expert's value.
-            # logit_scale must be divided by sqrt(N): the merged head projection
-            # is the column-concatenation of the experts' codebooks, so
-            # ``hidden @ weight.T`` sums N contributions of roughly equal
-            # magnitude. Without the 1/sqrt(N) the logits are ~Nx sharper and
-            # the output distribution collapses (too confident), which is why a
-            # freshly merged model scores poorly (AVG~9) before joint training.
-            # This mirrors grow.py's ``_fill_head`` (ref_scale / sqrt(N)).
+            # logit_scale must be divided by n, not sqrt(n): the merged head
+            # projection is the column-concatenation of the experts' codebooks,
+            # and a concat head SUMS the per-block contributions into each logit
+            # (block i only hits its own columns, but the row-wise dot products
+            # add across blocks). For n identical children the joint logits are
+            # therefore n x the leaf's, and dividing the scale by n restores the
+            # child's temperature exactly -- the measured invariant. The old
+            # sqrt(n) was a temperature artifact: sharper logits on an
+            # undertrained model lower CE for free (measured: concat of three
+            # IDENTICAL leaves "improved" CE from 10.06 to 9.90 with sqrt(n);
+            # with scale/n it stays at the leaf's level). See
+            # .omc/attempts/temperature_correction.md.
             if k.endswith("logit_scale"):
-                merged = blocks[0] / math.sqrt(n)
+                merged = blocks[0] / n
             else:
                 merged = blocks[0]
         if tuple(merged.shape) != tuple(target.shape):
