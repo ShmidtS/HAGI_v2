@@ -324,6 +324,28 @@ class LMHead(nn.Module):
         k = int(getattr(self.cfg, "sampled_softmax_k", 0) or 0)
         if k > 0:
             return self._loss_sampled(scaled, targets, bias, k)
+        if (
+            int(getattr(self.cfg, "fused_ce", 0) or 0)
+            and bias is None
+            and float(self.z_loss_weight) == 0.0
+        ):
+            # Fused-CE fast path. Measured on the leaf (N=32736, V=32768, bf16):
+            # the chunked custom Function costs ~283ms fwd+bwd while the plain
+            # full projection with PyTorch's fused cross_entropy kernel costs
+            # ~199ms -- the hand-rolled online LSE (max/exp/log in a Python
+            # chunk loop) is ~3x the cost of the projection matmul it wraps,
+            # and the fused kernel does the same reduction in one pass.
+            # Numerical cost: bf16 softmax noise, measured 0.028 nats on
+            # [4096, 32768]. VRAM: N*V*2 bytes extra (~2.1GB at N=32736),
+            # acceptable at leaf scale; the 1B config should keep the chunked
+            # path (its docstring cites 115GB runs). Z-loss and log_prior
+            # require the custom pass, so the fast path refuses them.
+            logits = torch.nn.functional.linear(scaled, self.weight)
+            ce = torch.nn.functional.cross_entropy(
+                logits, targets, reduction="mean"
+            )
+            zero = hidden.new_zeros((), dtype=torch.float32)
+            return ce, zero
         ce, z = _ChunkedCrossEntropy.apply(
             scaled,
             self.weight,
