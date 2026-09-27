@@ -16,6 +16,8 @@ model:
     conv_kernel: 1
   ternary:
     enabled: false
+  ffn:
+    expansion: 1.0
   head:
     unigram_prior: false
     sampled_proposal: uniform

@@ -62,6 +62,14 @@ def leaf_config(seed: int) -> dict:
             },
             # Leaves are effective-sparse, not ternary (merge.py:1393)
             "ternary": {"enabled": False},
+            # These leaves were TRAINED with expansion=1.0: their checkpoints
+            # record ffn.expansion=1.0, giving a 384-wide SwiGLU. The 8/3
+            # default would build a 1024-wide mixer instead, and the parent
+            # lift would then assemble three 384x384 blocks into a slot built
+            # for 3072. The raw-field fence at merge.py:1441 cannot see this:
+            # both configs spell "derive the width" as intermediate_size=0, so
+            # 0*3==0 passes while the resolved widths differ.
+            "ffn": {"expansion": 1.0},
             # unigram prior adds once, not per child (config.py:1482);
             # 'prior' proposal would require it, so proposal is uniform.
             "head": {"unigram_prior": False, "sampled_proposal": "uniform"},
@@ -107,6 +115,10 @@ def parent_config(with_cortex: bool) -> dict:
             },
             "embedding": {"tie_lm_head": False, "conv_kernel": 1},
             "ternary": {"enabled": False},
+            # Must match the children: the lift is block-diagonal per child
+            # width, so the parent mixer is 3 x child_width wide. See the leaf
+            # note on the same key.
+            "ffn": {"expansion": 1.0},
             "head": {"unigram_prior": False, "sampled_proposal": "uniform"},
             "cortex": {
                 "enabled": with_cortex,
@@ -136,7 +148,12 @@ def parent_config(with_cortex: bool) -> dict:
             ],
         },
         "train": {
-            "max_steps": 9000,
+            # 3000 joint steps: the same budget the leaves got. The tree arm
+            # and the flat control must share it, or the comparison is void --
+            # STATUS.md point 4 showed compute alone moves the score by 0.4855
+            # nats, more than the effect under test. At the measured ~3.2
+            # s/step that is ~2.7 h per arm, three arms total.
+            "max_steps": 3000,
             "checkpoint_interval": 1000,
             "precision": "bf16",
             "ternary_fp32_master": False,
@@ -196,7 +213,7 @@ def main() -> None:
     _dump(
         CONFIGS / "f3_eval_parent.yaml",
         eval_config(
-            with_cortex, ckpt="checkpoints/f3_parent_d1/step-0009000.pt"
+            with_cortex, ckpt="checkpoints/f3_parent_d1/step-0003000.pt"
         ),
     )
 
