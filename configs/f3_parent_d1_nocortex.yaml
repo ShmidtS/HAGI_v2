@@ -16,6 +16,8 @@ model:
     conv_kernel: 1
   ternary:
     enabled: false
+  ffn:
+    expansion: 1.0
   head:
     unigram_prior: false
     sampled_proposal: uniform
@@ -46,7 +48,7 @@ merge:
   - checkpoints/f3_leaf_s1002/step-0003000.pt
   - checkpoints/f3_leaf_s1003/step-0003000.pt
 train:
-  max_steps: 9000
+  max_steps: 3000
   checkpoint_interval: 1000
   precision: bf16
   ternary_fp32_master: false

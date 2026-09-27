@@ -105,7 +105,7 @@ def iter_batches(path: str, batch_docs: int, max_chars: int):
         yield batch
 
 
-def pack(name: str, source: str, args, encoder) -> dict:
+def pack(name: str, source: str, args, encoder, unigram: np.ndarray) -> dict:
     dest = Path(args.out_dir) / name / "shards"
     dest.mkdir(parents=True, exist_ok=True)
     for stale in dest.glob("*.bin"):
@@ -142,6 +142,11 @@ def pack(name: str, source: str, args, encoder) -> dict:
                     shard_rows = 0
                 # numpy's tofile avoids building one bytes object per document.
                 np.asarray(ids, dtype=np.int32).tofile(handle_out)
+                # Unigram counts are accumulated here, on the raw id space,
+                # because compact_vocab.py needs them to pick which ids survive
+                # the 262144 -> 32768 cut. Counting during packing avoids a
+                # second full pass over 12+ GB of shards.
+                np.add.at(unigram, np.asarray(ids, dtype=np.int64), 1)
                 shard_rows += n_tokens
                 shards[-1]["tokens"] = shard_rows
                 total_tokens += n_tokens
@@ -177,9 +182,16 @@ def main() -> None:
     ap.add_argument("--batch-docs", type=int, default=2000)
     ap.add_argument("--max-batch-chars", type=int, default=16_000_000)
     ap.add_argument("--only", nargs="*")
+    ap.add_argument(
+        "--vocab-size",
+        type=int,
+        default=262144,
+        help="size of the source id space, for the unigram table",
+    )
     args = ap.parse_args()
 
     encoder = build_encoder(args.tokenizer)
+    unigram = np.zeros(args.vocab_size, dtype=np.int64)
     want = set(args.only or [])
     for name, filename in SOURCES:
         if want and name not in want:
@@ -191,7 +203,7 @@ def main() -> None:
         size_gb = os.path.getsize(source) / 1e9
         print(f"packing {name} ({filename}, {size_gb:.2f} GB)", flush=True)
         try:
-            manifest = pack(name, source, args, encoder)
+            manifest = pack(name, source, args, encoder, unigram)
         except Exception as exc:
             print(f"  FAILED {type(exc).__name__}: {exc}", flush=True)
             continue
@@ -202,6 +214,15 @@ def main() -> None:
             f"in {manifest['elapsed_s']:.0f}s",
             flush=True,
         )
+
+    counts_path = Path(args.out_dir) / "unigram.npy"
+    np.save(counts_path, unigram)
+    live = int((unigram > 0).sum())
+    print(
+        f"\nunigram: {live:,} of {args.vocab_size:,} ids ever occur, "
+        f"{unigram.sum():,} tokens counted -> {counts_path}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
