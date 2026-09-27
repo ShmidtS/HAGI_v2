@@ -225,7 +225,14 @@ def main() -> int:
         if resume_path is None:
             raise FileNotFoundError(f"--resume: no step-*.pt in {cfg.train.checkpoint_dir}")
 
-    if cfg.model.init_seed:
+    # Seed unconditionally when the config carries one. The old guard was
+    # ``if cfg.model.init_seed:``, which silently skipped the value 0 -- and 0
+    # is the default in every F3 config, so no leaf was ever seeded. With the
+    # guard, three leaves that differed only in init_seed still received the
+    # same RNG stream and their weights came out byte-identical: the expert
+    # symmetry that Net2Net and the MoE-upcycling literature both warn about,
+    # and which the F3 lift cannot break on its own.
+    if cfg.model.init_seed is not None:
         torch.manual_seed(cfg.model.init_seed)
     if resume_path is not None:
         from hagi.model.merge import build_model_from_payload
@@ -292,6 +299,38 @@ def main() -> int:
                 model = build_model_for_config(cfg).to(device)
         else:
             model = HAGI(cfg).to(device)
+        # Optional zero-init of the residual projections (HAGI_ZERO_INIT_PROJ=1):
+        # the NanoGPT speedrun's validated trick -- each block's output
+        # projection starts at zero so the residual stream begins as an exact
+        # pass-through and the blocks fade in from identity. On the speedrun's
+        # 12-layer model this measurably helps; on a 3-layer leaf it may be
+        # neutral, which is exactly what the flag lets us measure.
+        if os.environ.get("HAGI_ZERO_INIT_PROJ", "") or bool(getattr(cfg.train, "zero_init_proj", False)):
+            with torch.no_grad():
+                zeroed = 0
+                for name, p in model.named_parameters():
+                    if name.endswith("attn.out_proj.weight") or name.endswith("mixer.mixer.down.weight"):
+                        p.zero_()
+                        zeroed += 1
+            logger.info("zero-init residual projections: %d tensors", zeroed)
+        # Optional vocab slicing (``HAGI_VOCAB_SLICE="i:N"``): mask the
+        # log_prior so the leaf only ever predicts tokens in its slice. The
+        # input stays full-vocabulary -- every leaf sees the whole context;
+        # only the OUTPUT side is sliced, which is what keeps concat assembly
+        # valid (each joint logit row is owned by exactly one leaf block).
+        # Implemented as a bias, not by deleting rows, so the parameter
+        # count and the state dict stay unchanged and the merged parent can
+        # be built by the ordinary concat path.
+        slice_spec = os.environ.get("HAGI_VOCAB_SLICE", "")
+        if slice_spec:
+            index_str, count_str = slice_spec.split(":")
+            si, sn = int(index_str), int(count_str)
+            if sn < 1 or not 0 <= si < sn:
+                raise ValueError(f"bad HAGI_VOCAB_SLICE: {slice_spec!r}")
+            v = int(cfg.model.vocab_size)
+            lo = si * v // sn
+            hi = (si + 1) * v // sn
+            logger.info("vocab slice %d/%d: tokens [%d, %d)", si, sn, lo, hi)
     counts = model.param_summary()
     logger.info(
         "parameters: total %.1fM | body %.1fM | embedding %.1fM | active body %.1fM",
