@@ -215,6 +215,7 @@ class HeadConfig:
     ce_save_logits: bool = False
     logit_scale_init: float = 0.0
     sampled_softmax_k: int = 0
+    fused_ce: bool = False
     sampled_proposal: str = "uniform"
     sampled_in_batch_fraction: float = 0.0
     logit_scale_max: float = 0.0
@@ -480,6 +481,8 @@ class MuonConfig:
     weight_decay: float = 0.1
     wd_cap: float = 2.0
     momentum_offload: bool = False
+    norm_rows: bool = False
+    mars_gamma: float = 0.0
 
 
 @dataclass
@@ -620,6 +623,7 @@ class TrainConfig:
     precision: str = "bf16"
     grad_checkpointing: bool = True
     compile_model: bool = False
+    zero_init_proj: bool = False
     # Variance in bf16 (fused kernel) instead of fp32. Measured 5x faster on
     # ROCm and numerically identical (max diff 0.0) at the value ranges seen
     # in training, so the safe default is the fast path. Set false to restore
@@ -787,6 +791,8 @@ class MergeConfig:
     mixer_init_scale: float = 0.0
     scratch_block_norm: bool = False
     freeze_experts: bool = False
+    shared_vocab_tables: bool = False
+    require_identical_tables: bool = False
     mixer_type: str = "hadamard"
     mixer_rank: int = 64
     mixer_hadamard_groups: list[int] = field(default_factory=list)
