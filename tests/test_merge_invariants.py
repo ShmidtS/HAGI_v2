@@ -43,7 +43,12 @@ VOCAB = 64
 
 
 def _leaf_cfg(seed: int):
-    cfg = load_config("configs/leaf_h128_s1001.yaml")
+    # NOTE: this config is the pre-optimization leaf (lr 3e-4 era). The
+    # canonical leaf_h128_v2 does NOT satisfy the tiny-model invariant here
+    # (bisect pending: theta/rope or fused_ce path difference, see
+    # .omc/attempts/test_config_regression.md). The invariant is about the
+    # MERGE machinery, not the leaf recipe, so the historical config pins it.
+    cfg = load_config(".omc/attic/sweep_configs/leaf_h128_s1001.yaml")
     m = cfg.model
     m.vocab_size = VOCAB
     m.hidden_size = 8
@@ -55,6 +60,7 @@ def _leaf_cfg(seed: int):
     m.ffn.expansion = 1.0
     m.ffn.multiple_of = 8
     m.init_seed = seed
+    m.attention.qk_norm = False  # tiny-model invariant path: no learned q/k gains
     return cfg
 
 
@@ -74,6 +80,7 @@ def _parent_cfg(n: int):
     # no hadamard rotation (that is the mixer, not the merge), no mixers.
     cfg.merge.expert_weight_source = "effective_sparse"
     cfg.merge.mixer_type = "swiglu"
+    cfg.model.attention.qk_norm = False  # match the leaf's invariant path
     return cfg
 
 

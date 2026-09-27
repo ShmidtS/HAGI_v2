@@ -1,0 +1,6 @@
+- [1] Variant A: hide data_manifest_sha256 via InitVar/private fields -> dataclass ctor rejected underscore names; 3 failed attempts
+- [2] SUPERVISOR REDIRECT: owner-side finalization of manifests, builders emit drafts only -> 173 recursive tests passed, ruff+compileall clean
+- [3] env: install declared gguf==0.19.0 -> 36 gguf/lora tests passed; full non-blocked suite 1020 passed / 15 failed
+- [4] runtime: scripts/recursive_growth.py --max-steps 1 synthetic -> decision=rejected, ce_regression=+0.00696, quality/security/production=false
+- [5] V1 invariants: PackedStream rejected negative/out-of-file offsets and candidate post-build contour mutation -> 239 related tests, then 1062 full tests passed
+- [6] runtime: preregistered synthetic seed 416114 -> macro CE -0.03612, worst-source +0.07462, decision=rejected; fail-closed preserved
