@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections.abc import Iterator
 
 import torch
@@ -270,6 +271,19 @@ class Trainer:
             ids = batch["input_ids"].to(device)
             targets = batch["targets"].to(device) if "targets" in batch else None
             base_mask = batch["loss_mask"].to(device) if "loss_mask" in batch else None
+            # Optional vocab slicing (HAGI_VOCAB_SLICE="i:N" from train.py):
+            # a sliced leaf only scores positions whose TARGET is inside its
+            # slice, so the loss never rewards it for predicting tokens owned
+            # by another leaf. Unlike masking the logits (which explodes the CE
+            # whenever an out-of-slice target appears), this only narrows what
+            # is learned, exactly like the pre-existing puncture mask. The
+            # INPUT stays full-vocabulary: every leaf still sees the whole
+            # context, which is what concat assembly requires.
+            slice_bounds = getattr(self, "slice_bounds", None)
+            if slice_bounds is not None and targets is not None:
+                lo, hi = slice_bounds
+                in_slice = (targets >= lo) & (targets < hi)
+                base_mask = in_slice if base_mask is None else base_mask & in_slice
             if targets is not None:
                 mask = puncture_loss_mask(
                     tuple(targets.shape),
@@ -545,6 +559,16 @@ def train(
 
     configure_runtime()
     trainer = Trainer(model, cfg, start_step)
+    # Vocab slicing (see scripts/train.py): only positions whose target is
+    # inside [lo, hi) are scored, so each leaf learns its own token slice.
+    slice_bounds = None
+    slice_spec = os.environ.get("HAGI_VOCAB_SLICE", "")
+    if slice_spec:
+        index_str, count_str = slice_spec.split(":")
+        si, sn = int(index_str), int(count_str)
+        v = int(cfg.model.vocab_size)
+        slice_bounds = (si * v // sn, (si + 1) * v // sn)
+    trainer.slice_bounds = slice_bounds
     if optimizer_state is not None:
         trainer.load_optimizer_state(optimizer_state)
 

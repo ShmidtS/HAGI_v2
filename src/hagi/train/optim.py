@@ -119,6 +119,7 @@ class Muon(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         wd_cap: float = 2.0,
         momentum_offload: bool = False,
+        mars_gamma: float = 0.0,
     ) -> None:
         super().__init__(
             params,
@@ -131,6 +132,7 @@ class Muon(torch.optim.Optimizer):
                 weight_decay=weight_decay,
                 wd_cap=wd_cap,
                 momentum_offload=momentum_offload,
+                mars_gamma=mars_gamma,
             ),
         )
 
@@ -147,6 +149,27 @@ class Muon(torch.optim.Optimizer):
                     raise ValueError(f"Muon requires 2D parameters, got shape {tuple(p.shape)}")
                 grad = p.grad
                 state = self.state[p]
+
+                # MARS variance reduction (arXiv 2412.14206, matrix form in
+                # MARS-M arXiv 2510.21800, official code AGI-Arena/MARS):
+                # the stochastic gradient is corrected toward the last-seen
+                # gradient direction, c_t = (g - last_grad)*factor + g, where
+                # factor = gamma*momentum/(1-momentum). The approximate form
+                # (``is_approx=True`` upstream) reuses the previous step's
+                # gradient as ``last_grad`` and needs NO extra backward pass.
+                # gamma=0 disables the correction and recovers plain Muon.
+                mars_gamma = group.get("mars_gamma", 0.0)
+                if mars_gamma > 0.0:
+                    last = state.get("last_grad")
+                    if last is None:
+                        last = torch.zeros_like(grad)
+                        state["last_grad"] = last
+                    factor = mars_gamma * momentum / (1.0 - momentum)
+                    grad = (grad - last).mul_(factor).add_(grad)
+                    norm = grad.norm()
+                    if norm > 1.0:
+                        grad = grad / norm
+                    state["last_grad"].zero_().add_(p.grad)
 
                 # Wide-output matrices see more gradient signal per row, so a
                 # single decay rate under-regularizes them relative to square ones.
@@ -178,7 +201,20 @@ class Muon(torch.optim.Optimizer):
                 # its matmuls are orders of magnitude slower on CPU.
                 # ``ns_steps`` here is the *target* for tall/wide matrices;
                 # ``newton_schulz`` raises square ones to 5 internally.
-                p.add_(newton_schulz(update, max(3, min(group["ns_steps"], 5)), group["ns_coeffs"]), alpha=-lr * fan_ratio)
+                ortho = newton_schulz(update, max(3, min(group["ns_steps"], 5)), group["ns_coeffs"])
+                if group.get("norm_rows", False):
+                    # NorMuon (arXiv 2505.04349): after orthogonalization the
+                    # ROW norms of the update are not equal even though every
+                    # singular value is 1 -- a row with a large 2-norm captures
+                    # more of the update than a small one, so neurons receive
+                    # uneven effective learning rates. RMS-normalizing each row
+                    # restores per-neuron isotropy on top of Muon's spectral
+                    # isotropy; the paper reports ~+11% efficiency over Muon at
+                    # 1.1B pretraining. Zero extra state; one extra reduction.
+                    ortho = ortho / ortho.norm(dim=1, keepdim=True).clamp_min(1e-15) * (
+                        ortho.shape[1] ** 0.5
+                    )
+                p.add_(ortho, alpha=-lr * fan_ratio)
 
 
 class HybridOptimizer:
@@ -295,9 +331,11 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
             weight_decay=tc.muon.weight_decay,
             wd_cap=tc.muon.wd_cap,
             momentum_offload=tc.muon.momentum_offload,
+            mars_gamma=tc.muon.mars_gamma,
         )
         for group in muon.param_groups:
             group["_muon"] = True
+            group["norm_rows"] = bool(tc.muon.norm_rows)
     else:
         muon = None
 
