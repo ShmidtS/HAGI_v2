@@ -273,3 +273,32 @@ def ensemble_delta_ce(S: torch.Tensor, n: int, cand_logits: torch.Tensor,
     ce_old = torch.logsumexp(m_old, -1) - m_old.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     ce_new = torch.logsumexp(m_new, -1) - m_new.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     return ce_new - ce_old
+
+
+def ls_scale_gram(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    """Ternary.lean lsScale_gram: functional LS scale, the global
+    optimum for ``||Xw - s*Xq||^2`` at a FIXED ternary pattern q.
+
+    Complete-the-square: the cross term zeroes exactly at
+    ``s* = (q^T H w) / (q^T H q)`` with ``H = X^T X`` the Gram of the
+    layer inputs; the remainder is a nonnegative square -- hence the
+    GLOBAL minimum (lsScale_gram_global). Degenerates to the proved
+    weight-space lsScale at ``H = I``. The refresh cycle
+    (q -> LS -> q -> LS ...) is block-coordinate descent: every step
+    is an exact minimization over its own variable, so the
+    functional error is monotone non-increasing.
+
+    Args:
+        q: the fixed ternary pattern, ``[out, in]``.
+        w: the master weight being quantized, ``[out, in]``.
+        H: layer input Gram matrix ``X^T X``, ``[in, in]`` (PSD).
+
+    Returns:
+        The per-row optimal scale ``[out, 1]`` (rows are independent).
+    """
+    if H.shape[0] != H.shape[1] or w.shape[-1] != H.shape[0]:
+        raise ValueError("shape mismatch: H must be [in,in], w/q [out,in]")
+    qH = q @ H                       # [out, in]
+    num = (qH * w).sum(-1, keepdim=True)     # q^T H w per row
+    den = (qH * q).sum(-1, keepdim=True).clamp_min(1e-12)  # q^T H q
+    return num / den

@@ -290,14 +290,44 @@ _PARENT_PRESERVING_TERNARY_SHA256 = (
 
 
 def parent_preserving_ternary_matrix() -> torch.Tensor:
-    """Return the canonical outer ternary lift ``Q(pi/2)`` for three parents.
+    """Return the canonical outer ternary lift for three parents.
 
     The matrix is orthogonal and fixes ``(1, 1, 1)``. Consequently, lifting
     three identical parent copies is the identity on their diagonal. This is
     a separate transform from :class:`TernaryF3Tree`, whose staged complex
     transform deliberately aggregates repeated branches instead.
+
+    Provenance (Lift.lean parentPreservingQ_cos_angle, round 19): tr = 2
+    gives cos(theta) = (tr-1)/2 = 1/2, so the GEOMETRIC Rodrigues angle
+    is pi/3 (60-degree rotation about (1,1,1)), not pi/2; the historical
+    ``Q(pi/2)`` name is a code PARAMETERIZATION convention, not the
+    geometric angle. Contrast-plane spectrum: eigenvalues e^{+-i pi/3}.
     """
     return torch.tensor(_PARENT_PRESERVING_TERNARY_Q, dtype=torch.float64)
+
+
+def mixer_q(theta: float) -> torch.Tensor:
+    """Lift.lean MixerParam (round 19): the one-parameter parent-preserving
+    mixer ``Q(theta) = P_root + R_theta * P_contrast``.
+
+    Identity on the root span ``(1,1,1)/sqrt(3)`` (constructive invariant,
+    mixerQ_root_fixed) and a 2D rotation by ``theta`` on the orthogonal
+    contrast plane (mixerQ_orthogonal: orthogonal for every theta). The
+    full orthogonal group fixing the root is exactly this family -- one
+    trainable parameter carries all of it (completeness, synthesis 10-11).
+    ``theta=0`` is the identity; ``theta=pi/3`` reproduces the canonical
+    parent-preserving lift above (cos(pi/3)=1/2, tr=2).
+    """
+    c, s = math.cos(theta), math.sin(theta)
+    # orthonormal basis: root + two contrast axes spanning x1+x2+x3=0
+    root = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64) / math.sqrt(3.0)
+    a = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64) / math.sqrt(2.0)
+    b = torch.tensor([1.0, 1.0, -2.0], dtype=torch.float64) / math.sqrt(6.0)
+    P = torch.stack([root, a, b], dim=1)          # columns: orthonormal
+    R = torch.tensor([[1.0, 0.0, 0.0],
+                      [0.0, c, -s],
+                      [0.0, s, c]], dtype=torch.float64)  # rotate (a,b) only
+    return P @ R @ P.T
 
 
 def parent_preserving_ternary_digest() -> str:
