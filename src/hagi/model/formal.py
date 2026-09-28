@@ -90,22 +90,37 @@ def kv_waterfill_bits(
     if n == 0 or total_bits == 0.0:
         return torch.zeros_like(c)
     log_c = torch.where(c > 0, c.log(), torch.full_like(c, -math.inf))
-    # b_i = (log c_i - log lambda) / kappa; budget fixes lambda:
-    # sum b_i = B  =>  (sum log c_i - n log lambda)/kappa = B.
     finite = torch.isfinite(log_c)
-    k = int(finite.sum())
-    if k == 0:
+    if not finite.any():
         # all-zero sensitivities: uniform split is optimal (all
         # marginal residuals equal at any allocation).
         return torch.full_like(c, total_bits / n)
-    s = float(log_c[finite].sum())
-    log_lambda = (s - kappa * total_bits) / k
-    b = (log_c - log_lambda) / kappa
-    # zero-sensitivity entries: their residual weight is 0 at any b;
-    # the theorem's infimum puts their bits at 0 (transfer to useful).
-    b = torch.where(finite, b, torch.zeros_like(b))
-    b = b.clamp_min(0)
-    return b
+    # KKT waterfilling with the NONNEGATIVITY constraint b_i >= 0:
+    # the naive closed form can assign negative bits to low-c
+    # entries; clamping them would VIOLATE the budget. The correct
+    # solution is the active-set iteration: drop entries whose
+    # closed-form allocation is negative, recompute the water level
+    # lambda on the remaining active set, repeat until stable. At
+    # the KKT point every active entry has c_i exp(-kappa b_i) =
+    # lambda and every dropped entry has c_i <= lambda (0 bits).
+    active = finite.clone()
+    b = torch.zeros_like(c)
+    for _ in range(n + 1):
+        k = int(active.sum())
+        if k == 0:
+            break
+        s = float(log_c[active].sum())
+        log_lambda = (s - kappa * total_bits) / k
+        cand = (log_c - log_lambda) / kappa
+        new_active = active & (cand > 0)
+        if bool((new_active == active).all()):
+            b = torch.where(active, cand, torch.zeros_like(c))
+            return b
+        active = new_active
+    b = torch.where(active, (log_c - (float(log_c[active].sum())
+                                     - kappa * total_bits) / int(active.sum())) / kappa,
+                    torch.zeros_like(c))
+    return b.clamp_min(0)
 
 
 def certified_gain(n: int, mean_ce: float, candidate_ce: float) -> float:
@@ -184,3 +199,77 @@ def saturated_threshold(g_inf: float, eps: float = 0.0021) -> float:
     if eps <= 0:
         raise ValueError("eps must be positive")
     return math.sqrt(max(g_inf, 0.0) / eps)
+
+
+def jensen_gap_accum(S: torch.Tensor, A: float, n: int) -> torch.Tensor:
+    """Streaming form of GapLaw's exact gap (synthesis §5): no need
+    to materialize ``[N, B, T, V]``.
+
+    Maintained per position (over the pool's N forwards):
+        S = sum_i z_i          (running logit sum)
+        A = sum_i LSE(z_i)     (running lse sum)
+
+    Then the exact gap is ``A/n - LSE(S/n)`` -- the targets-free
+    twoGap_cosh identity (identical to jensen_gap_lse, proven by the
+    same telescoping), computed with O(B*T*V) memory for ONE leaf at
+    a time instead of N.
+
+    Args:
+        S: ``[B, T, V]`` running logit sum over the pool.
+        A: running ``sum_i LSE(z_i)`` (scalar over positions if
+            pre-averaged; pass the per-position sum as a tensor of
+            shape [B, T] for per-position gaps).
+        n: the number of leaves accumulated so far.
+
+    Returns:
+        The exact Jensen gap (float or ``[B, T]`` per-position).
+    """
+    zbar = (S.double() if torch.is_tensor(S) else None)
+    lse_bar = torch.logsumexp(S.double() / n, dim=-1)
+    return A / n - lse_bar
+
+
+def ensemble_ce_logits(mean_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Synthesis §4: the exact merged-ensemble CE from logits alone.
+
+    The mean-logit ensemble's CE is ``LSE(m_N) - m_N[t]`` -- no wide
+    model, no merge_experts, no merged forward. With the running sum
+    ``S`` over the pool: ``m_N = S/N``.
+
+    Args:
+        mean_logits: ``[B, T, V]`` the pool's mean logits (m_N).
+        targets: ``[B, T]`` int64 next-token ids.
+
+    Returns:
+        Per-position CE ``[B, T]`` in float64.
+    """
+    m = mean_logits.double()
+    lse = torch.logsumexp(m, dim=-1)
+    return lse - m.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+
+def ensemble_delta_ce(S: torch.Tensor, n: int, cand_logits: torch.Tensor,
+                      targets: torch.Tensor) -> torch.Tensor:
+    """The EXACT candidate decision metric (synthesis §4+§6), from
+    one candidate forward -- no merge, no wide model.
+
+    m_{N+1} = (N*m_N + z_c)/(N+1); the decision quantity is
+    CE_{N+1} - CE_N, computed purely by lse algebra on the running
+    pool sum S (mean m_N = S/N) plus the candidate's logits.
+
+    Args:
+        S: ``[B, T, V]`` running pool logit sum.
+        n: current pool size N.
+        cand_logits: ``[B, T, V]`` the candidate's logits (same head
+            scale as the pool leaves).
+        targets: ``[B, T]`` int64 next-token ids.
+
+    Returns:
+        Per-position exact ``CE_{N+1} - CE_N`` (negative = the
+        candidate improves the ensemble).
+    """
+    m_old = S.double() / n
+    m_new = (S.double() + cand_logits.double()) / (n + 1)
+    ce_old = torch.logsumexp(m_old, -1) - m_old.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    ce_new = torch.logsumexp(m_new, -1) - m_new.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    return ce_new - ce_old
