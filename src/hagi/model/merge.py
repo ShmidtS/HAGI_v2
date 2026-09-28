@@ -745,10 +745,25 @@ class MergedHAGI(HAGI):
         # same as per-expert normalization).
         from hagi.model.norms import BlockRMSNorm
 
+        # Round 26: norm_block_dim selects LEAF-granularity norms from the
+        # config (the round-21 fix patched this only at merge_experts time,
+        # so checkpoints saved (9,128) but rebuild-from-YAML produced
+        # (3,384) and failed to load). 0 = expert granularity (historical
+        # flat-merge behavior).
+        nbd = int(getattr(cfg.merge, "norm_block_dim", 0) or 0)
+        if nbd > 0:
+            if h % nbd != 0:
+                raise ValueError(
+                    f"norm_block_dim {nbd} must divide hidden_size {h}"
+                )
+            norm_blocks, norm_dim = h // nbd, nbd
+        else:
+            norm_blocks, norm_dim = n, self.expert_hidden
+
         for block in self.blocks:
-            block.attn.attn_norm = BlockRMSNorm(n, self.expert_hidden, m.norm_eps)
-            block.mixer.norm = BlockRMSNorm(n, self.expert_hidden, m.norm_eps)
-        self.out_norm = BlockRMSNorm(n, self.expert_hidden, m.norm_eps)
+            block.attn.attn_norm = BlockRMSNorm(norm_blocks, norm_dim, m.norm_eps)
+            block.mixer.norm = BlockRMSNorm(norm_blocks, norm_dim, m.norm_eps)
+        self.out_norm = BlockRMSNorm(norm_blocks, norm_dim, m.norm_eps)
 
         # Re-attach opt-in adapters to the final merged blocks. The base HAGI
         # constructor already ran `_attach_adapters`, but MergedHAGI replaces
@@ -2056,17 +2071,21 @@ def merge_experts(
     # 384-wide block RMS is a DIFFERENT function than three 128-wide ones).
     # Detect the hierarchy from the experts' own norm shapes and rebuild
     # the joint BlockRMSNorms at leaf granularity.
-    _hier_norm = any(
-        any(
-            k.endswith(("attn_norm.weight", "mixer.norm.weight", "out_norm.weight"))
-            and v.ndim == 2
-            for k, v in st.items()
-        )
-        for st in expert_states
-    )
-    if _hier_norm:
-        leaf_dim = int(expert_states[0]["out_norm.weight"].shape[-1])
-        exp_blocks = int(expert_states[0]["out_norm.weight"].shape[0])
+    # Round 26: the leaf-granularity rebuild now lives in MergedHAGI's
+    # constructor (cfg.merge.norm_block_dim), so the checkpoint and the
+    # rebuild-from-YAML agree. The runtime detection below stays as a
+    # SAFETY NET for callers that build the config by hand without
+    # norm_block_dim: if the experts carry 2D leaf norms and the target
+    # does not match, rebuild at leaf granularity (the round-21 fix,
+    # kept because silent shape mismatch here violates the identity).
+    _expert_leaf = expert_states[0].get("out_norm.weight")
+    _target_norm = sd.get("out_norm.weight")
+    if (_expert_leaf is not None and _expert_leaf.ndim == 2
+            and _target_norm is not None
+            and tuple(_target_norm.shape) != (
+                n * _expert_leaf.shape[0], _expert_leaf.shape[1])):
+        leaf_dim = int(_expert_leaf.shape[-1])
+        exp_blocks = int(_expert_leaf.shape[0])
         from hagi.model.norms import BlockRMSNorm
 
         for block in model.blocks:

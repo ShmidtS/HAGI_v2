@@ -57,18 +57,12 @@ def build_model_for_config(cfg: Config, *, n_blocks: int | None = None) -> nn.Mo
                 "or merge_recursive_f3 (from three child states)"
             )
 
-        n_mixers = int(getattr(merge, "n_mixers", 1) or 1)
-        if n_mixers <= 1:
-            if getattr(merge, "scratch_block_norm", False):
-                from hagi.model.scratch_blocknorm import ScratchBlockNormHAGI
+        n_mixers = int(getattr(merge, "n_mixers", 1))
+        if getattr(merge, "scratch_block_norm", False):
+            from hagi.model.scratch_blocknorm import ScratchBlockNormHAGI
 
-                return ScratchBlockNormHAGI(
-                    cfg, n_blocks=n_blocks if n_blocks is not None else int(merge.n_experts)
-                )
-            from hagi.model.merge import MergedHAGI
-
-            return MergedHAGI(
-                cfg, n_mixers=1, mixer_init_scale=merge.mixer_init_scale
+            return ScratchBlockNormHAGI(
+                cfg, n_blocks=n_blocks if n_blocks is not None else int(merge.n_experts)
             )
         from hagi.model.merge import MergedHAGI
 

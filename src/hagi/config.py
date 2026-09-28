@@ -783,6 +783,21 @@ class MergeConfig:
     enabled: bool = False
     n_experts: int = 4
     expert_hidden: int = 128
+    # Leaf block width for the joint BlockRMSNorms (round 26): when set,
+    # the merged model normalizes at LEAF granularity -- n_blocks =
+    # hidden_size // norm_block_dim -- instead of expert granularity.
+    # Hierarchical merges (experts are themselves merged models) MUST
+    # set this to the leaf width (e.g. 128 for 384-wide experts built
+    # from 128-leaves); a (n, expert_hidden) block RMS is a DIFFERENT
+    # function than leaf-granular RMS (the round-21 identity violation
+    # came from exactly this). Default 0 = expert granularity (the
+    # historical behavior for flat leaf merges).
+    norm_block_dim: int = 0
+    # Round 26: the cross-block mixer count for merged models built from a
+    # config (factory); 0 means "1" (the historical default). Merged
+    # level-N priors that carry NO trained mixers (n_mixers=0 merges)
+    # must set n_mixers: 0 so a rebuild does not expect phantom mixers.
+    n_mixers: int = 0
     expert_weight_source: str = "ternary_master"
     ternary_depth: int = 0
     ternary_tree_schema_version: int = 1
