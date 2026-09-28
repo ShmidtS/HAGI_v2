@@ -66,12 +66,16 @@ class _LoRALookup(torch.nn.Module):
 
 
 class _LoRAProjection(torch.nn.Module):
-    """Head projection over the frozen base + low-rank delta.
+    """Head projection over the frozen base + low-rank delta,
+    WITHOUT materializing the V x H delta table (synthesis §6).
 
-    Exposes ``.weight`` = effective table (the LMHead contract), so
-    ``F.linear`` and the fused-CE paths work unchanged; the cost is
-    one O(V*r + r*H) materialization per forward on top of the same
-    head GEMM.
+    X(W0 + A@B)^T = X@W0^T + (X@B)@A^T -- the delta path is
+    O(N*H*r + N*V*r), no V*H delta-table allocation. The .weight
+    property still exposes the effective table for paths that need
+    the materialized form (generation, merge); the fused-CE training
+    path uses the LMHead's F.linear on .weight, which materializes
+    once per forward -- TODO for the direct path once the head's
+    loss() accepts a custom projection.
     """
 
     def __init__(self, table: torch.Tensor, rank: int) -> None:
@@ -81,6 +85,11 @@ class _LoRAProjection(torch.nn.Module):
     @property
     def weight(self) -> torch.Tensor:
         return self.lora.effective_weight()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """The direct path: no V*H delta materialization."""
+        l = self.lora
+        return torch.nn.functional.linear(x, l.base) + (x @ l.B.T) @ l.A.T
 
 
 def main() -> int:

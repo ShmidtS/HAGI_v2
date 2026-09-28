@@ -446,3 +446,89 @@ def gen_recursion_dead(rho: float, d: float, eps: float = 0.0021) -> bool:
     of the gap law falls under the floor eps (the same twoGap eps
     criterion as the ladder)."""
     return gen_gap_fixed_point(rho, d) < eps
+
+
+def two_gap_fast(p: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+    """GapLaw synthesis: the O(V) FACTORIZED two-leaf Jensen gap.
+
+    The cosh double sum factors exactly:
+        sum_{u,v} p_u p_v cosh(d_u - d_v)
+          = (sum_u p_u e^{d_u}) * (sum_v p_v e^{-d_v})
+    so gap = 0.5 * [log sum p_u e^{d_u} + log sum p_u e^{-d_u}]
+    -- O(V), no approximation (the O(V^2) form in the docstring
+    underestimated this). Verified against the direct cosh sum.
+
+    Args:
+        p: softmax of the midpoint logits, ``[..., V]``.
+        d: per-vocab deviations (z_A - z_B)/2, ``[..., V]``.
+
+    Returns:
+        The exact two-leaf gap ``[...]``.
+    """
+    pe = torch.logsumexp(d.double(), dim=-1) - torch.logsumexp(
+        (-d).double(), dim=-1)  # not it -- compute directly:
+    a = torch.logsumexp((d + p.clamp_min(1e-30).log()).double(), dim=-1)
+    b = torch.logsumexp((-d + p.clamp_min(1e-30).log()).double(), dim=-1)
+    return 0.5 * (a + b)
+
+
+def fisher_novelty(delta: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """The synthesis' expert-selection score: delta^T F delta.
+
+    F = diag(p) - p p^T is the softmax Hessian at the ensemble mean;
+    the score is the quadratic form of the candidate's deviation from
+    the pool mean -- the NEW information it carries, weighted by how
+    much the ensemble's output cares. Better than the 1-rho proxy:
+    a redundant expert (delta in the pool's span) scores low, an
+    independent direction scores high, regardless of standalone CE.
+    """
+    d = delta.double()
+    pp = p.double()
+    quad = (pp * d * d).sum(-1) - (pp * d).pow(2).sum(-1)
+    return quad
+
+
+def rank_budget_allocation(tail_scale: dict[str, tuple[float, float, int, int]],
+                           budget: float) -> dict[str, int]:
+    """RankBudget.lean with the SYNTHESIS CORRECTION (kappa factor).
+
+    Exponential-tail model E_j(r) = c_j * exp(-kappa_j * r), cost
+    r*(m_j + n_j). KKT equalizes the weighted marginal residuals
+    c_j*kappa_j*exp(-kappa_j*r_j) = lambda*(m_j+n_j), giving
+
+        r_j* = (log c_j + log kappa_j - log lambda - log(m_j+n_j)) / kappa_j
+
+    (the kappa multiplier in the numerator -- the round-25 synthesis
+    caught it missing). Active set: c_j*kappa_j > lambda*(m_j+n_j).
+
+    Args:
+        tail_scale: {name: (c_j, kappa_j, m_j, n_j)} per tensor.
+        budget: total rank-cost budget sum r_j (m_j + n_j) <= budget.
+
+    Returns:
+        {name: r_j*} (floats; floor at the call site).
+    """
+    if budget < 0:
+        raise ValueError("budget must be nonnegative")
+    items = list(tail_scale.items())
+    active = {k: v for k, v in items if v[0] * v[1] > 1e-30}
+    if not active or budget == 0.0:
+        return {k: 0.0 for k in tail_scale}
+    # binary-search lambda: sum r_j(lambda) = budget (monotone in lambda)
+    def total(lambda_):
+        s = 0.0
+        for k, (c, kap, m, n) in active.items():
+            lhs = c * kap
+            r = max(0.0, (math.log(lhs) - math.log(lambda_) - math.log(m + n)) / kap)
+            s += r * (m + n)
+        return s
+    lo, hi = 1e-12, 1e12
+    for _ in range(200):
+        mid = math.sqrt(lo * hi)
+        if total(mid) > budget:
+            lo = mid  # bigger lambda -> smaller ranks
+        else:
+            hi = mid
+    lam = math.sqrt(lo * hi)
+    return {k: max(0.0, (math.log(v[0] * v[1]) - math.log(lam) - math.log(v[2] + v[3])) / v[1])
+            if k in active else 0.0 for k, v in tail_scale.items()}
