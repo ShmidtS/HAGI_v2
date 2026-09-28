@@ -2047,6 +2047,34 @@ def merge_experts(
     )
     sd = model.state_dict()
 
+    # Hierarchical merge (round 21 bug): when the experts are THEMSELVES
+    # merged models, their block norms are 2D [expert_blocks, leaf_dim] and
+    # the joint must normalize at the LEAF block granularity, not the
+    # expert granularity -- the sibling normalizes its hidden stream in
+    # 128-wide blocks, so the merged stream must too ([n*expert_blocks,
+    # leaf_dim], e.g. 3 experts of (3,128) -> (9,128), NOT (3,384): a
+    # 384-wide block RMS is a DIFFERENT function than three 128-wide ones).
+    # Detect the hierarchy from the experts' own norm shapes and rebuild
+    # the joint BlockRMSNorms at leaf granularity.
+    _hier_norm = any(
+        any(
+            k.endswith(("attn_norm.weight", "mixer.norm.weight", "out_norm.weight"))
+            and v.ndim == 2
+            for k, v in st.items()
+        )
+        for st in expert_states
+    )
+    if _hier_norm:
+        leaf_dim = int(expert_states[0]["out_norm.weight"].shape[-1])
+        exp_blocks = int(expert_states[0]["out_norm.weight"].shape[0])
+        from hagi.model.norms import BlockRMSNorm
+
+        for block in model.blocks:
+            block.attn.attn_norm = BlockRMSNorm(n * exp_blocks, leaf_dim, m.norm_eps)
+            block.mixer.norm = BlockRMSNorm(n * exp_blocks, leaf_dim, m.norm_eps)
+        model.out_norm = BlockRMSNorm(n * exp_blocks, leaf_dim, m.norm_eps)
+        sd = model.state_dict()
+
     def _is_level_local_state(key: str) -> bool:
         return (
             key.startswith("cortex.")
@@ -2113,12 +2141,14 @@ def merge_experts(
             # Block-wise RMSNorm gains: [n_blocks, block_dim]. Stack the
             # experts' [block_dim] gains along the block axis. For a
             # hierarchical merge the experts are themselves merged models with
-            # 2D block norms [n_blocks, block_dim]; each expert's blocks must be
-            # flattened into a single contiguous block (its own hidden width)
-            # and stacked along the block axis, so the merged model's
-            # [n_experts, expert_hidden] norm applies per expert.
+            # 2D block norms [n_blocks, block_dim]; the joint normalizes at
+            # LEAF granularity (round-21 fix): each expert's 2D gains stack
+            # along the block axis -- n experts x (e_b, l_d) -> (n*e_b, l_d)
+            # -- so every leaf block keeps its own RMS, exactly as in the
+            # sibling model (a (e_b, n*l_d) 384-wide block RMS would be a
+            # DIFFERENT function than three 128-wide ones).
             if blocks[0].ndim == 2:
-                merged = torch.stack([b.reshape(-1) for b in blocks], dim=0)
+                merged = torch.cat(blocks, dim=0)
             else:
                 merged = torch.stack(blocks, dim=0)
         elif target.ndim == 2:
