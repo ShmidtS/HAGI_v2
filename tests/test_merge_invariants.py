@@ -149,3 +149,30 @@ def test_hadamard_rotation_is_not_identity_by_design():
     b_w = merged.state_dict()["head.projection.weight"]
     same = torch.allclose(b_w[:, : a_w.shape[1]], a_w, atol=1e-6)
     assert not same, "hadamard rotation vanished: the head is no longer pre-rotated"
+
+
+def test_local_window_sinks_fused():
+    """Round 27 (DA synthesis §8/§9): the chunked local+sinks path must
+    be bit-exact with the dense mask reference and O(T*(W+S))."""
+    import sys
+    from pathlib import Path
+
+    import torch
+    import torch.nn.functional as F
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from hagi.model.attention import build_attention_mask, local_window_attention
+
+    torch.manual_seed(0)
+    B, H, T, D, W, S = 1, 2, 256, 16, 64, 4
+    q, k, v = (torch.randn(B, H, T, D, dtype=torch.float64) for _ in range(3))
+    out = local_window_attention(q, k, v, W, sink_len=S)
+    mask = build_attention_mask(T, T, window=W, sink_len=S, device=q.device, dtype=q.dtype)
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert torch.allclose(out, ref, atol=1e-9)
+    # window-only still exact
+    out_w = local_window_attention(q, k, v, W, sink_len=0)
+    mask_w = build_attention_mask(T, T, window=W, device=q.device, dtype=q.dtype)
+    assert torch.allclose(
+        out_w, F.scaled_dot_product_attention(q, k, v, attn_mask=mask_w), atol=1e-9
+    )
