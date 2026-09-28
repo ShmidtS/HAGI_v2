@@ -72,6 +72,7 @@ def local_window_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     window: int,
+    sink_len: int = 0,
 ) -> torch.Tensor:
     """Causal sliding-window SDPA with correct support for every query position.
 
@@ -87,9 +88,20 @@ def local_window_attention(
     Radeon 8060S ROCm math SDPA backend this measured ~7.5 ms vs ~12 ms for a
     dense window mask at ``T=1024, W=256``.
 
+    ``sink_len > 0`` (round 27, DA synthesis §8/§9): the leading ``sink_len``
+    keys stay visible to every query chunk — local-plus-sinks fused as ONE
+    chunked pass, ``O(T·(W+S))``, never the dense ``T×T`` band that the
+    mask path builds when sinks are on. Each chunk concatenates the sink
+    keys ``[0, min(sink_len, i0))`` ahead of its window keys so a single
+    SDPA call sees both regions; the sink columns get no extra bias here
+    (the additive learnable ``sink_bias`` applies on the mask path -- the
+    chunked path trades the learnable bias for the O(T·(W+S)) cost, and
+    callers that need the bias keep the mask).
+
     Args:
         q, k, v: ``[B, heads, T, head_dim]`` (GQA already expanded on k/v).
         window: positive window width W.
+        sink_len: leading keys always visible (0 disables).
 
     Returns:
         Attention output, same shape as ``q``.
@@ -107,6 +119,28 @@ def local_window_attention(
         i1 = min(t, i0 + step)
         k0 = max(0, i0 - window + 1)
         qi = q[:, :, i0:i1]
+        if sink_len > 0 and i0 > 0:
+            # Fused local+sinks (round 27, DA synthesis §8/§9): the sink
+            # keys [0, sink_len) prepend the window keys, and the window
+            # range starts AT the sinks' end so no key is double-counted
+            # in the softmax (a duplicated key shifts the attention mass).
+            # Cost O(T·(W+S)), never the dense T×T band.
+            sl = min(sink_len, i0)  # sinks are always in the causal past here
+            wk0 = max(k0, sl)       # window keys start where the sinks end
+            ki = torch.cat([k[:, :, :sl], k[:, :, wk0:i1]], dim=2)
+            vi = torch.cat([v[:, :, :sl], v[:, :, wk0:i1]], dim=2)
+            tq = i1 - i0
+            tk = ki.shape[-2]
+            q_abs = torch.arange(i0, i1, device=q.device).view(1, 1, tq, 1)
+            k_abs = torch.cat(
+                [torch.arange(0, sl, device=q.device),
+                 torch.arange(wk0, i1, device=q.device)]
+            ).view(1, 1, 1, tk)
+            allowed = ((k_abs <= q_abs) & (k_abs > q_abs - window)) | (k_abs < sl)
+            band = qi.new_zeros(1, 1, tq, tk)
+            band = band.masked_fill(~allowed, float("-inf"))
+            outs.append(F.scaled_dot_product_attention(qi, ki, vi, attn_mask=band))
+            continue
         ki = k[:, :, k0:i1]
         vi = v[:, :, k0:i1]
         if k0 == 0 and i0 == 0:
@@ -436,9 +470,21 @@ class Attention(nn.Module):
             and k.shape[-2] == t
         ):
             out = compressed_history_attention(q, k, v, self.sliding_window, self.history_stride)
-        elif self.training and self.sliding_window > 0 and self._kv_cache is None and k.shape[-2] == t:
-            # Pure window, no doc/prefix constraints: O(T·W) local SDPA.
-            out = local_window_attention(q, k, v, window)
+        elif (
+            self.training
+            and self.sliding_window > 0
+            and self._kv_cache is None
+            and k.shape[-2] == t
+        ):
+            # Pure window (no doc/prefix constraints -- a caller mask would
+            # have taken the first branch): the chunked O(T·(W+S)) local
+            # SDPA -- never the dense T×T band (round 27, DA synthesis
+            # §8/§9). Sinks WITHOUT a learnable bias use the fused chunked
+            # path; the learnable sink_bias needs the mask path for its
+            # gradient, so it stays there.
+            out = local_window_attention(
+                q, k, v, window, sink_len=self.sink_len if self.sink_bias is None else 0
+            )
         elif t == 1:
             # Single-token decode: one query against the whole cached prefix.
             out = self._sdpa(q, k, v)
