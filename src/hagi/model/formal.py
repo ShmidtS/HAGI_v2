@@ -192,13 +192,58 @@ def saturated_threshold(g_inf: float, eps: float = 0.0021) -> float:
 
     Exchangeable leaves with total gap budget ``G_inf`` have
     increments ~ G_inf / N^2; growth stops paying when
-    ``G_inf / N^2 < eps``, i.e. ``N > sqrt(G_inf / eps)``. Replaces
-    the fitted TOL_GAP with a function of the measured pool
-    covariance (via G_inf) and the floor eps.
+    ``G_inf / N^2 < eps``. MODEL-BASED (the G_inf law itself is a
+    docstring-level model in GapLaw.lean, not a theorem).
+
+    Synthesis round-22 refinement: solving the model equation
+    exactly, N(N+1) > G_inf/eps, gives
+    ``N* = (-1 + sqrt(1 + 4*G_inf/eps)) / 2`` -- used here instead
+    of the cruder sqrt(G/eps) upper estimate. The measured form:
+    with the CURRENT gap G_N, the next-leaf increment is
+    G_N/(N^2-1); stop when that falls under the measurement noise
+    (eps_stop, adaptive -- see adaptive_eps).
     """
     if eps <= 0:
         raise ValueError("eps must be positive")
-    return math.sqrt(max(g_inf, 0.0) / eps)
+    return (math.sqrt(1.0 + 4.0 * max(g_inf, 0.0) / eps) - 1.0) / 2.0
+
+
+def next_leaf_gain(g_n: float, n: int) -> float:
+    """Synthesis round-22: the predicted NEXT-leaf gap increment
+    from the CURRENT measured gap, without knowing G_inf.
+
+    From the model G_N = G_inf(1 - 1/N): G_inf = G_N * N/(N-1), so
+    the next increment dG_N = G_inf/(N(N+1)) = G_N/(N^2 - 1).
+    Stop growing when this falls under the measurement noise.
+    """
+    if n < 2:
+        raise ValueError("n must be >= 2 (need a previous level)")
+    return g_n / (n * n - 1)
+
+
+def adaptive_eps(se_before: float, se_after: float, z: float = 1.96) -> float:
+    """Synthesis round-22 §30: the stop threshold IS the measurement
+    noise, not a global constant.
+
+    A gain is detectable only beyond the combined standard error of
+    the two measurements (before/after the candidate merge):
+    eps_stop = z * sqrt(se_before^2 + se_after^2). Below this, the
+    gate cannot distinguish growth from noise -- stop regardless
+    of the fixed EPS.
+    """
+    return z * math.sqrt(se_before * se_before + se_after * se_after)
+
+
+def merge_tax(ce_merged: float, ce_ensemble: float) -> float:
+    """Synthesis round-22 §27: the merge tax -- how much of the
+    algebraic ensemble gain the physical merge destroys.
+
+    tau = CE_merged - CE_ensemble. tau ~ 0: the merge architecture is
+    lossless (block-diag identity holds); tau > 0: the merge path
+    (mixer geometry, bf16, norm granularity) eats part of the gain.
+    Measured gen-1: 5.6742 - 5.6206 = 0.054.
+    """
+    return ce_merged - ce_ensemble
 
 
 def jensen_gap_accum(S: torch.Tensor, A: float, n: int) -> torch.Tensor:

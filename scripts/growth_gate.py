@@ -210,22 +210,29 @@ def main() -> int:
         # prefilter order and reserve 1-rho for the finalist stage.
         pool.sort(key=lambda p: p["ce"])
         finalists = pool[:max(1, args.ensemble_test_top)]
-        # exact dCE per finalist: one forward each, no merge (§4/§6)
+        # Synthesis §28: cache the pool's running logit sum S ONCE --
+        # M(N+1) forwards become N+M. S does not depend on the candidate.
         leaf_models = [_load_leaf(c, device)[0] for c in args.configs]
+        S_cache = []
+        with torch.no_grad():
+            for t, _w in wins:
+                ids = torch.from_numpy(t[:2048]).reshape(bs, seq)
+                x = ids[:, :-1].to(device)
+                S = None
+                for mm in leaf_models:
+                    z = _leaf_logits(mm, x).double()
+                    S = z if S is None else S + z
+                S_cache.append(S.cpu())  # [B,T,V] per window, float64
         for f in finalists:
             dces, comps = [], []
             with torch.no_grad():
-                for t, _w in wins:
+                for wi, (t, _w) in enumerate(wins):
                     ids = torch.from_numpy(t[:2048]).reshape(bs, seq)
                     x, y = ids[:, :-1].to(device), ids[:, 1:].to(device)
-                    S = None
-                    for mm in leaf_models:
-                        z = _leaf_logits(mm, x).double()
-                        S = z if S is None else S + z
+                    S = S_cache[wi].to(device)
                     zc = _leaf_logits(f["model"], x).double()
                     dces.append(float(ensemble_delta_ce(S, n, zc, y).mean()))
                     # complementarity proxy on this window
-                    d_pool = (S / n - zc)  # pool-mean minus candidate
                     comps.append(complementarity(zc.flatten()[:50_000],
                                                  (S / n).flatten()[:50_000]))
             f["ensemble_dce"] = float(np.mean(dces))
