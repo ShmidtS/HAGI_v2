@@ -1,0 +1,57 @@
+model:
+  vocab_size: 32768
+  hidden_size: 128
+  num_layers: 3
+  loop_depth: 1
+  init_seed: 6002
+  attention:
+    num_query_heads: 2
+    num_kv_heads: 1
+    head_dim: 64
+    rope_theta: 3000.0
+    max_seq_len: 4096
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  ternary:
+    enabled: false
+  ffn:
+    expansion: 1.0
+  head:
+    unigram_prior: false
+    sampled_proposal: uniform
+    fused_ce: true
+  cortex:
+    enabled: false
+  adapters:
+    enabled: false
+  decision:
+    enabled: false
+train:
+  max_steps: 800
+  checkpoint_interval: 400
+  precision: bf16
+  ternary_fp32_master: false
+  batch_size: 32
+  grad_accum_steps: 1
+  compile_model: true
+  learning_rate: 0.01
+  use_muon: true
+  zero_init_proj: true
+  adam:
+    weight_decay: 0.3
+  schedule:
+    warmup_steps: 40
+    decay_fraction: 0.2
+  checkpoint_dir: checkpoints/gleaf_s6002
+  data:
+    data_dir: data
+    seq_len: 1024
+    seed: 6202
+    weights:
+      edu: 0.4
+      slimpajama: 0.25
+      wikipedia_en: 0.1
+      wikipedia_ru: 0.08
+      oscar_ru: 0.07
+      openwebmath: 0.1
