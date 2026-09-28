@@ -1,33 +1,33 @@
-"""Growth gate v2: the executable self-development trigger,
-upgraded by the Lean program (Select/Concat/Ambig, lake build green).
+"""Growth gate v3: the self-development trigger, upgraded by the full
+Lean program (Select/Concat/Ambig/Grow + the synthesis review).
 
-Pre-quantified decision rules (all derived, no fitted constants):
+The synthesis (post-formalization audit) established the core
+distinction:
 
-- certifiedGain(N, M, c) = (M - c) / (N + 1): the certified new
-  mean-CE bound after adding a candidate with standalone CE c to a
-  pool of N leaves with mean-CE M (Select.lean newBound:
-  new bound = (N*M + c)/(N+1)). Computable BEFORE the step -- the
-  FGD U_t analogue.
-- SATURATED = certifiedGain(best candidate) < EPS: if the BEST
-  candidate (min c) cannot certify a gain, no candidate can
-  (grow_epsilon_stop) -- the GROW axis is exhausted; only the
-  EXHAUSTED axis (change the element's data) remains.
-- Speed stop (Ambig.lean consensus_no_gain): expected next-leaf
-  gain ~ (spread)^2 / (N(N+1)); stop when < EPS^2.
-- Candidate RANKING is certified only by certifiedGain (a bound),
-  never by standalone CE as the decision rule (Select.lean
-  selection_hurts: a better-standalone leaf can be strictly worse
-  in the ensemble). The pool decision needs an ensemble measure.
+    growth = capacity expansion (identity-preserving, free)
+           + information recombination (needs residual disagreement)
 
-EPS = 0.0021 is the measured floor (temperature_correction.md);
-tau = 2*atanh(EPS) is its logit form (Concat.lean C7).
+The Jensen gap -- mean(single CE) - merged CE on the SAME windows --
+is the direct measurement of "how much disagreement the ensemble is
+still averaging" (Concat.lean lse-Jensen: gap >= 0 always; Ambig.lean:
+gap = 0 at consensus). This replaces the top-2 ambiguity heuristic as
+the primary saturation signal: ambiguity is a proxy whose link to the
+gap is NOT proven; the gap itself is the theorem's quantity.
 
-Exit code 0 + JSON on stdout for automation.
+Candidate selection follows Select.lean literally:
+
+    standalone CE   -> cheap pre-filter (certifiedGain bound)
+    ensemble dCE    -> the DECISION metric: merge the finalist into the
+                       ladder and measure the real DeltaCE
+    (selection_hurts: best leaf != best addition to the ensemble)
+
+Exit code 0 + JSON on stdout.
 
 Usage:
     python scripts/growth_gate.py --configs configs/v3leaf_s800*.yaml \
-        [--candidate-configs extra_leaves.yaml ...] \
-        --prev-ambiguity 0.056 --prev-ce 4.49
+        [--candidate-configs extra.yaml ...] \
+        [--ensemble-test-top K] \
+        --prev-jensen-gap 0.34 --prev-ce 6.06
 """
 from __future__ import annotations
 
@@ -46,43 +46,50 @@ sys.path.insert(0, str(ROOT / "src"))
 from hagi.config import load_config  # noqa: E402
 from hagi.model.formal import certified_gain  # noqa: E402
 from hagi.model.merge import merge_experts  # noqa: E402
-from hagi.train.checkpoint import load_payload  # noqa: E402
+from hagi.model.model import HAGI  # noqa: E402
+from hagi.train.checkpoint import config_from_dict, load_payload  # noqa: E402
 from hagi.train.loop import configure_runtime  # noqa: E402
 
 EPS = 0.0021  # measured floor (temperature_correction.md); not magic
-TOL_AMB = 0.002  # ambiguity change below this = "flat"
+TOL_AMB = 0.002  # ambiguity change below this = "flat" (secondary)
 TOL_CE = 0.01   # CE change below this = "flat"
-
-# Select.lean: the canonical certified_gain lives in hagi.model.formal;
-# re-exported here for callers importing from growth_gate.
-certified_gain = certified_gain
+TOL_GAP = 0.005  # Jensen-gap change below this = "disagreement exhausted"
 
 
-def measure(configs: list[str]) -> dict:
-    configure_runtime()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    n = len(configs)
-    states, leaf_weights, leaf_cfg = [], None, None
-    for c in configs:
-        cc = load_config(c)
-        ck = Path(cc.train.checkpoint_dir) / "step-0000800.pt"
-        pl = load_payload(str(ck), "cpu")
-        states.append(pl["model"])
-        if leaf_cfg is None:
-            leaf_cfg = cc
-            leaf_weights = cc.train.data.weights
-            s0 = float(pl["model"]["head.logit_scale"])
-    # Build from the parent template (flat9_ft_m1 carries the right
-    # per-block norm geometry) instead of widening the leaf config:
-    # leaf configs have qk_norm weights whose merge needs the merged-
-    # model's BlockRMSNorm layout, which merge_experts derives from
-    # the config it is given -- the template has that geometry pinned.
-    cfg = load_config(str(ROOT / "configs/flat9_ft_m1.yaml"))
+def _windows(weights: dict) -> list[tuple[np.ndarray, float]]:
+    """Tail windows of every configured corpus (the shared yardstick)."""
+    out = []
+    for name, weight in weights.items():
+        p = ROOT / f"data/{name}.compact.bin"
+        if not p.is_file():
+            continue
+        total = p.stat().st_size // 4
+        with p.open("rb") as fh:
+            fh.seek((total - 2_000_000) * 4)
+            t = np.frombuffer(fh.read(300_000 * 4), dtype=np.uint32).astype(np.int64)
+        out.append((t, float(weight)))
+    return out
+
+
+def _eval(model, wins, device) -> float:
+    """Weighted exact CE over the shared windows."""
+    tot, ntok = 0.0, 0.0
+    with torch.no_grad():
+        for t, w in wins:
+            ids = torch.from_numpy(t[:2048]).reshape(4, 512)
+            x, y = ids[:, :-1].to(device), ids[:, 1:].to(device)
+            out = model(x, targets=y)
+            tot += float(out.ce) * y.numel() * w
+            ntok += y.numel() * w
+    return tot / ntok
+
+
+def _merged(cfg_template, leaf_cfg, states, n, device, s0):
+    """Build the flat-n merged ensemble (clean path: swiglu +
+    effective_sparse, no mixers, scale 1/n)."""
+    cfg = load_config(str(cfg_template))
     cfg.merge.mixer_type = "swiglu"
     cfg.merge.expert_weight_source = "effective_sparse"
-    # the template's attention block may differ from the leaves' recipe
-    # (rope_theta especially: leaves are theta-3000, a stale template
-    # theta silently breaks the merged forward). Pin the leaf geometry.
     cfg.model.attention.rope_theta = leaf_cfg.model.attention.rope_theta
     cfg.model.attention.head_dim = leaf_cfg.model.attention.head_dim
     cfg.model.attention.sink_len = leaf_cfg.model.attention.sink_len
@@ -93,144 +100,169 @@ def measure(configs: list[str]) -> dict:
     cfg.model.attention.num_query_heads = 2 * n
     cfg.model.attention.num_kv_heads = n
     cfg.merge.n_experts = n
-    cfg.train.data.weights = leaf_weights
     m = merge_experts(cfg, states, n_mixers=0).to(device).to(torch.bfloat16).eval()
-
-    # held-out windows: tail of every configured domain corpus
-    tot, ntok, amb, pos = 0.0, 0, 0, 0
     with torch.no_grad():
         m.head.logit_scale.fill_(s0 / n)
-        for name, weight in cfg.train.data.weights.items():
-            p = ROOT / f"data/{name}.compact.bin"
-            if not p.is_file():
-                continue
-            total = p.stat().st_size // 4
-            with p.open("rb") as fh:
-                fh.seek((total - 2_000_000) * 4)
-                T = np.frombuffer(fh.read(300_000 * 4), dtype=np.uint32).astype(np.int64)
-            for w in range(2):
-                ids = torch.from_numpy(T[w * 2048:(w + 1) * 2048]).reshape(4, 512)
-                x, y = ids[:, :-1].to(device), ids[:, 1:].to(device)
-                out = m(x, targets=y)
-                tot += float(out.ce) * y.numel() * weight
-                ntok += y.numel() * weight
-                probs = m.head.logits(out.hidden).float().softmax(-1)
-                top2 = probs.topk(2, dim=-1).values
-                amb += int(((top2[..., 0] - top2[..., 1]) < EPS).sum())
-                pos += y.numel()
+    return m
+
+
+def measure(configs: list[str], with_jensen: bool = True) -> dict:
+    """Merged CE + ambiguity + (optionally) the Jensen gap: the mean
+    single-leaf CE and the merged CE on the SAME windows; the gap is
+    the theorem's quantity (>= 0 by lse-Jensen; 0 at consensus)."""
+    configure_runtime()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    n = len(configs)
+    states, s0 = [], None
+    leaf_cfg = None
+    for c in configs:
+        cc = load_config(c)
+        pl = load_payload(str(Path(cc.train.checkpoint_dir) / "step-0000800.pt"), "cpu")
+        states.append(pl["model"])
+        if leaf_cfg is None:
+            leaf_cfg = cc
+            s0 = float(pl["model"]["head.logit_scale"])
+    wins = _windows(leaf_cfg.train.data.weights)
+    m = _merged(ROOT / "configs/flat9_ft_m1.yaml", leaf_cfg, states, n, device, s0)
+    ce_m = _eval(m, wins, device)
+    # ambiguity (secondary signal; kept for continuity with v1/v2 logs)
+    amb, pos = 0, 0
+    with torch.no_grad():
+        for t, _w in wins:
+            ids = torch.from_numpy(t[:2048]).reshape(4, 512)
+            x, y = ids[:, :-1].to(device), ids[:, 1:].to(device)
+            out = m(x, targets=y)
+            probs = m.head.logits(out.hidden).float().softmax(-1)
+            top2 = probs.topk(2, dim=-1).values
+            amb += int(((top2[..., 0] - top2[..., 1]) < EPS).sum())
+            pos += y.numel()
     del m
     torch.cuda.empty_cache()
-    return {"n_leaves": n, "ce": tot / ntok, "ambiguity": amb / pos,
-            "eps": EPS, "tau": 2 * math.atanh(EPS)}
+    res = {"n_leaves": n, "ce": ce_m, "ambiguity": amb / pos,
+           "eps": EPS, "tau": 2 * math.atanh(EPS)}
+    if not with_jensen:
+        return res
+    # Jensen gap: mean single CE on the SAME windows vs merged CE.
+    single_ces = []
+    for c in configs:
+        cc = load_config(c)
+        pl = load_payload(str(Path(cc.train.checkpoint_dir) / "step-0000800.pt"), "cpu")
+        mm = HAGI(config_from_dict(pl["config"])).to(device).to(torch.bfloat16).eval()
+        mm.load_state_dict(pl["model"], strict=True)
+        with torch.no_grad():
+            mm.head.logit_scale.data.fill_(float(pl["model"]["head.logit_scale"]))
+        single_ces.append(_eval(mm, wins, device))
+        del mm
+        torch.cuda.empty_cache()
+    res["mean_single_ce"] = float(np.mean(single_ces))
+    res["jensen_gap"] = res["mean_single_ce"] - ce_m
+    return res
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", nargs="+", required=True)
     ap.add_argument("--candidate-configs", nargs="+", default=None,
-                    help="pool candidates: single leaves, each is ranked "
-                         "by certifiedGain (a BOUND); if even the best "
-                         "cannot certify >= EPS, GROW is exhausted")
-    ap.add_argument("--prev-ambiguity", type=float, default=None,
-                    help="ambiguity of the previous ladder level")
+                    help="pool candidates: ranked by certifiedGain (pre-filter), "
+                         "then by the true ensemble dCE (decision metric)")
+    ap.add_argument("--ensemble-test-top", type=int, default=2,
+                    help="how many pre-filter finalists get the (expensive) "
+                         "true ensemble-dCE merge test")
+    ap.add_argument("--prev-ambiguity", type=float, default=None)
     ap.add_argument("--prev-ce", type=float, default=None)
+    ap.add_argument("--prev-jensen-gap", type=float, default=None,
+                    help="previous level's Jensen gap (primary saturation signal)")
     args = ap.parse_args()
 
     cur = measure(args.configs)
     result = {**cur}
-    verdict_extra = ""
+    note = []
 
-    # --- Pre-quantified GROW-axis check (Select.lean) ---
+    # --- Candidate selection (Select.lean: two-stage) ---
     if args.candidate_configs:
         n = cur["n_leaves"]
-        mean_ce = cur["ce"]
-        # NOTE: cur["ce"] is the merged-ensemble CE, which by
-        # ensemble_ce_le_mean_general is <= the pool's mean single-CE.
-        # Using it as M in certifiedGain is CONSERVATIVE (M smaller ->
-        # gain smaller), so a certified GROW verdict is sound.
-        cand_scores = {}
+        pool = []
         for c in args.candidate_configs:
             cc = load_config(c)
             ck = Path(cc.train.checkpoint_dir) / "step-0000800.pt"
             if not ck.is_file():
                 continue
-            from hagi.model.model import HAGI  # noqa: E402
-            from hagi.train.checkpoint import config_from_dict  # noqa: E402
             pl = load_payload(str(ck), "cpu")
             mm = HAGI(config_from_dict(pl["config"])).to(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            ).to(torch.bfloat16).eval()
+                "cuda" if torch.cuda.is_available() else "cpu").to(torch.bfloat16).eval()
             mm.load_state_dict(pl["model"], strict=True)
-            # cheap single-leaf CE on the same windows
-            tot_c, ntok_c = 0.0, 0
+            wins = _windows(cc.train.data.weights)
             with torch.no_grad():
-                mm.head.logit_scale.data.fill_(
-                    float(pl["model"]["head.logit_scale"]))
-                for name, weight in cc.train.data.weights.items():
-                    p = ROOT / f"data/{name}.compact.bin"
-                    if not p.is_file():
-                        continue
-                    total = p.stat().st_size // 4
-                    with p.open("rb") as fh:
-                        fh.seek((total - 2_000_000) * 4)
-                        T = np.frombuffer(fh.read(300_000 * 4),
-                                          dtype=np.uint32).astype(np.int64)
-                    dev = next(mm.parameters()).device
-                    ids = torch.from_numpy(T[:2048]).reshape(4, 512)
-                    x, y = ids[:, :-1].to(dev), ids[:, 1:].to(dev)
-                    out = mm(x, targets=y)
-                    tot_c += float(out.ce) * y.numel() * weight
-                    ntok_c += y.numel() * weight
-            cand_ce = tot_c / ntok_c
-            cand_scores[c] = {"ce": cand_ce,
-                               "certified_gain": certified_gain(n, mean_ce, cand_ce)}
+                mm.head.logit_scale.data.fill_(float(pl["model"]["head.logit_scale"]))
+            ce_c = _eval(mm, wins, "cuda" if torch.cuda.is_available() else "cpu")
+            pool.append({"config": c, "payload": pl, "ce": ce_c,
+                         "certified_gain": certified_gain(n, cur["mean_single_ce"], ce_c)})
             del mm
             torch.cuda.empty_cache()
-        result["candidates"] = cand_scores
-        best = min(cand_scores.values(), key=lambda s: s["ce"])
-        result["best_candidate_gain"] = best["certified_gain"]
-        if best["certified_gain"] < EPS:
-            verdict_extra = (
-                f"certified: even the best candidate (gain "
-                f"{best['certified_gain']:.4f} < eps {EPS}) cannot move the "
-                f"bound -- GROW axis exhausted (grow_epsilon_stop); only "
-                f"EXHAUSTED (data) remains")
+        # Stage 1 (pre-filter): certifiedGain bound, cheap.
+        pool.sort(key=lambda p: p["ce"])
+        finalists = pool[:max(1, args.ensemble_test_top)]
+        # Stage 2 (decision): the TRUE ensemble dCE for each finalist
+        # -- merge into the ladder, measure. selection_hurts makes this
+        # the only sound decision metric; standalone CE is a pre-filter.
+        leaf_cfg = load_config(args.configs[0])
+        base_states = [load_payload(
+            str(Path(load_config(c).train.checkpoint_dir) / "step-0000800.pt"), "cpu"
+        )["model"] for c in args.configs]
+        s0 = float(base_states[0]["head.logit_scale"])
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        wins = _windows(leaf_cfg.train.data.weights)
+        for f in finalists:
+            m = _merged(ROOT / "configs/flat9_ft_m1.yaml", leaf_cfg,
+                        base_states + [f["payload"]["model"]], n + 1, device, s0)
+            ce_new = _eval(m, wins, device)
+            f["ensemble_ce"] = ce_new
+            f["ensemble_dce"] = ce_new - cur["ce"]
+            del m
+            torch.cuda.empty_cache()
+        result["candidates"] = [
+            {k: v for k, v in f.items() if k not in ("payload",)} for f in pool]
+        best_ens = min(finalists, key=lambda f: f["ensemble_dce"])
+        result["best_candidate_ensemble_dce"] = best_ens["ensemble_dce"]
+        result["best_candidate_config"] = best_ens["config"]
+        if best_ens["ensemble_dce"] < -EPS:
+            note.append(
+                f"best candidate {Path(best_ens['config']).name} improves the "
+                f"ensemble by {-best_ens['ensemble_dce']:.4f} nats (true dCE) -- "
+                f"complementary leaf, GROW is real")
+        else:
+            note.append(
+                f"no finalist improves the ensemble (best true dCE "
+                f"{best_ens['ensemble_dce']:+.4f}) -- pool disagreement is "
+                f"exhausted; only EXHAUSTED (data) remains")
 
-    if args.prev_ambiguity is None:
+    # --- Saturation verdicts ---
+    if args.prev_ce is None:
         verdict = "BASELINE"
-        reason = "first level: record ce/ambiguity, compare at the next one"
+        reason = "first level: record ce/jensen_gap, compare at the next one"
     else:
-        d_amb = cur["ambiguity"] - args.prev_ambiguity
         d_ce = cur["ce"] - args.prev_ce
-        amb_flat = abs(d_amb) < TOL_AMB
-        ce_flat = abs(d_ce) < TOL_CE
-        if not amb_flat:
+        if args.prev_jensen_gap is not None:
+            d_gap = cur["jensen_gap"] - args.prev_jensen_gap
+        else:
+            d_gap = None
+        if d_gap is not None and abs(d_gap) < TOL_GAP and d_ce > -TOL_CE:
+            verdict, reason = "SATURATED-DISAGREEMENT", (
+                f"Jensen gap flat ({d_gap:+.4f}): the ensemble averages no new "
+                f"disagreement -- grow the ELEMENT (data), not the count")
+        elif d_ce < -TOL_CE:
             verdict, reason = "GROW", (
-                f"ambiguity {d_amb:+.4f}: variance reduction still paying, add leaves")
-        elif not ce_flat:
+                f"CE improving ({d_ce:+.4f}) with live gap "
+                f"({cur['jensen_gap']:.4f}): disagreement still paying")
+        elif d_ce > TOL_CE:
             verdict, reason = "SATURATED-AMBIGUITY", (
-                f"ambiguity flat ({d_amb:+.4f}) but CE {d_ce:+.4f}: residual error "
-                f"is systematic; improve the ELEMENT (data), not the count")
+                f"CE worsening ({d_ce:+.4f}): this level is past the optimum; "
+                f"select leaves or improve the element")
         else:
             verdict, reason = "EXHAUSTED", (
-                "both flat: this leaf recipe is done; change the element's data mix")
-    # speed stop (Ambig.lean): expected next-leaf gain ~ spread^2/(N(N+1))
-    spread = 0.0
-    result["speed_stop"] = None
-    if verdict == "GROW":
-        # spread proxy: ambiguity is the measured disagreement floor
-        spread = cur["ambiguity"]
-        speed = spread ** 2 / (cur["n_leaves"] * (cur["n_leaves"] + 1))
-        result["speed_stop"] = speed
-        if speed < EPS ** 2:
-            verdict, reason = "SATURATED-AMBIGUITY", (
-                f"speed stop: next-leaf expected gain {speed:.2e} < eps^2 "
-                f"{EPS**2:.2e} (consensus_no_gain) -- disagreement floor "
-                f"reached; improve the ELEMENT, not the count")
-    if verdict_extra:
-        reason = (reason + "; " + verdict_extra) if verdict == "GROW" else verdict_extra
-        if best["certified_gain"] < EPS and verdict == "GROW":
-            verdict = "SATURATED-AMBIGUITY"
+                "CE flat and gap flat: this leaf recipe is done; change the data mix")
+    if note:
+        reason = reason + "; " + "; ".join(note)
     print(json.dumps({**result, "verdict": verdict, "reason": reason}, indent=2))
     return 0
 
