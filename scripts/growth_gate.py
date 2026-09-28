@@ -44,6 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from hagi.config import load_config  # noqa: E402
+from hagi.model.formal import certified_gain  # noqa: E402
 from hagi.model.merge import merge_experts  # noqa: E402
 from hagi.train.checkpoint import load_payload  # noqa: E402
 from hagi.train.loop import configure_runtime  # noqa: E402
@@ -52,14 +53,9 @@ EPS = 0.0021  # measured floor (temperature_correction.md); not magic
 TOL_AMB = 0.002  # ambiguity change below this = "flat"
 TOL_CE = 0.01   # CE change below this = "flat"
 
-
-def certified_gain(n: int, mean_ce: float, cand_ce: float) -> float:
-    """Select.lean newBound: adding a candidate with standalone CE c
-    to a pool of N leaves with mean-CE M certifies the new bound
-    (N*M + c)/(N+1); the certified gain over the current bound M is
-    exactly (M - c)/(N+1). Monotone in c (certifiedGain_monotone),
-    so the BEST candidate certifies for all (grow_epsilon_stop)."""
-    return (mean_ce - cand_ce) / (n + 1)
+# Select.lean: the canonical certified_gain lives in hagi.model.formal;
+# re-exported here for callers importing from growth_gate.
+certified_gain = certified_gain
 
 
 def measure(configs: list[str]) -> dict:
