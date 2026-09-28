@@ -347,3 +347,102 @@ def ls_scale_gram(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor) -> torch.Te
     num = (qH * w).sum(-1, keepdim=True)     # q^T H w per row
     den = (qH * q).sum(-1, keepdim=True).clamp_min(1e-12)  # q^T H q
     return num / den
+
+
+def joint_lr_bound(grad_norms: dict[str, float], mix_grad_norm: float,
+                   smoothness: float, eps: float = 0.0021) -> float:
+    """Joint.lean jointStep_regression_bound: the DERIVED joint-step LR.
+
+    Any corpus's CE regression is bounded by
+    ``|lr| * ||g_c|| * ||g|| + (L/2) lr^2 ||g||^2`` (Cauchy-Schwarz on
+    the linear term + the smoothness bound on the quadratic one). The
+    joint LR is safe when the WORST corpus's bound stays under eps:
+
+        lr <= eps / (max_c ||g_c|| * ||g|| + (L/2) ||g||^2)
+
+    This replaces the empirical 0.001: the recipe's LR is now a
+    function of measured gradient norms and the floor eps.
+
+    Args:
+        grad_norms: per-corpus gradient norms {corpus: ||g_c||}.
+        mix_grad_norm: the mixture gradient norm ||g||.
+        smoothness: the loss smoothness L.
+        eps: the regression floor (default: the measured 0.0021).
+
+    Returns:
+        The derived safe LR (positive float).
+    """
+    if not grad_norms or mix_grad_norm <= 0 or smoothness <= 0:
+        raise ValueError("need non-empty grad_norms, positive ||g|| and L")
+    worst = max(grad_norms.values())
+    return eps / (worst * mix_grad_norm + 0.5 * smoothness * mix_grad_norm ** 2)
+
+
+def joint_conflict_lr(grad_c_dot_g: float, mix_grad_norm: float,
+                      smoothness: float) -> tuple[bool, float]:
+    """Joint.lean jointStep_conflict_regression: the conflict window.
+
+    If a corpus's gradient CONFLICTS with the mixture direction
+    (``<g_c, g> < 0``), that corpus MUST regress for every LR in
+    ``0 < lr < 2|<g_c, g>| / (L ||g||^2)`` -- first-order geometry, not
+    an optimization accident. No LR schedule can save it; only a
+    per-corpus guard or a proximal constraint can.
+
+    Returns:
+        (is_conflicted, conflict_window_upper): whether the corpus
+        conflicts, and the upper edge of the mandatory-regression LR
+        window.
+    """
+    if mix_grad_norm <= 0 or smoothness <= 0:
+        raise ValueError("need positive ||g|| and L")
+    conflicted = grad_c_dot_g < 0
+    window = 2 * abs(grad_c_dot_g) / (smoothness * mix_grad_norm ** 2)
+    return conflicted, window
+
+
+def trust_region_bound(grad_c_norm: float, radius: float,
+                       smoothness: float) -> float:
+    """Joint.lean trustRegion_bound: the proximal medicine.
+
+    A step within radius R of the prior worsens ANY corpus by at most
+    ``||g_c|| * R + (L/2) R^2`` -- regardless of direction. Ridge-to-
+    prior with lambda ~ ||g||/R makes the slimpajama catastrophe
+    impossible by construction.
+    """
+    if radius < 0 or smoothness <= 0:
+        raise ValueError("need radius >= 0 and L > 0")
+    return grad_c_norm * radius + 0.5 * smoothness * radius * radius
+
+
+def gen_gap_decay(g0: float, rho: float, d: float, t: int) -> float:
+    """GenCycle.lean genGap_decay: the recursion-death law.
+
+    If sibling disagreement evolves as ``G_{t+1} <= rho*G_t + D``
+    (0 <= rho < 1), then
+    ``G_t <= rho^t * G0 + D*(1-rho^t)/(1-rho)``; the fixed point is
+    ``D/(1-rho)``. The recursion is dead when the fixed point falls
+    under eps -- fresh leaves no longer diverge measurably, and only
+    the data axis (changing the corpus mix = the D field) remains.
+
+    Measured: gen0->gen1 gap 0.30 -> 0.036 implies rho ~ 0.12 at
+    D ~ 0; if specialization does not replenish D, gen-2 leaves will
+    be born at gap ~ 0.004 -- at the death threshold. Measuring D on
+    gen-2 leaves is the law's only unknown input.
+    """
+    if not (0 <= rho < 1) or t < 0:
+        raise ValueError("need 0 <= rho < 1 and t >= 0")
+    return rho ** t * g0 + d * (1 - rho ** t) / (1 - rho)
+
+
+def gen_gap_fixed_point(rho: float, d: float) -> float:
+    """The stationary point D/(1-rho): what the recursion converges to."""
+    if not (0 <= rho < 1):
+        raise ValueError("need 0 <= rho < 1")
+    return d / (1 - rho)
+
+
+def gen_recursion_dead(rho: float, d: float, eps: float = 0.0021) -> bool:
+    """The derived generational verdict: dead when the fixed point
+    of the gap law falls under the floor eps (the same twoGap eps
+    criterion as the ladder)."""
+    return gen_gap_fixed_point(rho, d) < eps
