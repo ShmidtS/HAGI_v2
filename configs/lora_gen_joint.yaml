@@ -32,6 +32,7 @@ train:
   max_steps: 1600
   checkpoint_interval: 800
   precision: bf16
+  grad_checkpointing: false
   ternary_fp32_master: false
   batch_size: 32
   grad_accum_steps: 1
