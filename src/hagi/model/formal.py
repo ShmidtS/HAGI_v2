@@ -118,3 +118,69 @@ def certified_gain(n: int, mean_ce: float, candidate_ce: float) -> float:
     best candidate certifies for all (grow_epsilon_stop).
     """
     return (mean_ce - candidate_ce) / (n + 1)
+
+
+def jensen_gap_lse(logits: torch.Tensor) -> torch.Tensor:
+    """GapLaw.lean twoGap_cosh: the EXACT Jensen gap, targets-free.
+
+    Per position: ``gap = mean_a lse(z_a) - lse(mean_a z_a)`` --
+    the targets cancel, so no CE pass over single leaves is needed
+    (O(N) forwards + one lse). For two leaves this equals the proved
+    cosh form ``0.5 * log sum_{u,v} p_u p_v cosh(d_u - d_v)`` with
+    ``d = (z_A - z_B)/2`` (verified analytically); the general-n
+    route is the same lse telescoping.
+
+    Args:
+        logits: ``[n, B, T, V]`` per-leaf logits (same scale).
+
+    Returns:
+        ``[B, T]`` per-position exact gap (nonnegative by
+        twoGap_nonneg; zero iff consensus, twoGap_zero_iff).
+    """
+    z = logits.double()
+    lse_a = torch.logsumexp(z, dim=-1)          # [n, B, T]
+    lse_bar = torch.logsumexp(z.mean(0), dim=-1)  # [B, T]
+    return lse_a.mean(0) - lse_bar
+
+
+def complementarity(delta_c: torch.Tensor, delta_pool: torch.Tensor) -> float:
+    """GapLaw P2 prescription: the candidate-selection metric.
+
+    The candidate's gap increment is governed by the cross-
+    covariance of its deviation ``delta_c`` with the pool's mean
+    deviation ``delta_pool``: positive correlation shrinks the
+    increment (redundant mass), zero/negative maximizes it
+    (independent delta-mass -- the formal side of Select.lean's
+    counterexample: a WORSE standalone leaf can be the BEST
+    addition because it carries more independent deviation mass).
+
+    Args:
+        delta_c: candidate deviations ``[D]`` (logits minus pool mean).
+        delta_pool: the pool's mean deviation ``[D]``.
+
+    Returns:
+        ``1 - corr(delta_c, delta_pool)`` in ``[0, 2]``; higher =
+        more complementary. Falls back to 1.0 (neutral) when either
+        side is degenerate (zero variance).
+    """
+    a = delta_c.double().flatten()
+    b = delta_pool.double().flatten()
+    va, vb = a.var(), b.var()
+    if va <= 0 or vb <= 0:
+        return 1.0
+    rho = float(((a - a.mean()) * (b - b.mean())).mean() / (va * vb).sqrt())
+    return 1.0 - rho
+
+
+def saturated_threshold(g_inf: float, eps: float = 0.0021) -> float:
+    """GapLaw P4 prescription: the DERIVED saturation size.
+
+    Exchangeable leaves with total gap budget ``G_inf`` have
+    increments ~ G_inf / N^2; growth stops paying when
+    ``G_inf / N^2 < eps``, i.e. ``N > sqrt(G_inf / eps)``. Replaces
+    the fitted TOL_GAP with a function of the measured pool
+    covariance (via G_inf) and the floor eps.
+    """
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+    return math.sqrt(max(g_inf, 0.0) / eps)

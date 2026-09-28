@@ -19,8 +19,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from hagi.model.formal import (  # noqa: E402
     certified_gain,
+    complementarity,
+    jensen_gap_lse,
     kv_waterfill_bits,
     mixer_invisible_condition,
+    saturated_threshold,
 )
 
 
@@ -97,3 +100,36 @@ if __name__ == "__main__":
             fn()
             print(f"ok {name}")
     print("all formal tests passed")
+
+
+def test_jensen_gap_lse_identity():
+    # The analytic case: leaves [2,0] and [0,2]; direct gap 0.43378.
+    zA = torch.tensor([[[[2.0, 0.0]]]])
+    zB = torch.tensor([[[[0.0, 2.0]]]])
+    g = jensen_gap_lse(torch.cat([zA, zB], dim=0))
+    assert abs(float(g) - 0.43378) < 1e-4
+    # twoGap_zero_iff: consensus (identical leaves) -> gap exactly 0.
+    g_cons = jensen_gap_lse(torch.stack([zA, zA], dim=0))
+    assert abs(float(g_cons)) < 1e-9
+
+
+def test_complementarity_order():
+    # Independent deviation mass beats correlated (Select.lean's
+    # counterexample in delta-terms: worse standalone, better addition).
+    torch.manual_seed(0)
+    d_pool = torch.randn(1000)
+    d_same = d_pool + 0.01 * torch.randn(1000)   # ~redundant
+    d_indep = torch.randn(1000)                  # independent mass
+    assert complementarity(d_indep, d_pool) > complementarity(d_same, d_pool)
+
+
+def test_saturated_threshold_derived():
+    # N* = sqrt(G_inf/eps); at the measured G=0.47, eps=0.0021 -> ~15
+    # (consistent with the measured ZCD plateau at N~9-16).
+    n_star = saturated_threshold(0.47)
+    assert 14 < n_star < 16
+    assert abs(saturated_threshold(0.0)) < 1e-9
+
+
+if __name__ == "__main__" and "jensen_gap_lse" in dir():
+    pass
