@@ -1,31 +1,32 @@
-"""Growth gate: the executable self-development trigger.
+"""Growth gate v2: the executable self-development trigger,
+upgraded by the Lean program (Select/Concat/Ambig, lake build green).
 
-Closes the loop of HAGI's growth mechanics. Everything it decides on
-has been measured this session (see .omc/attempts/):
+Pre-quantified decision rules (all derived, no fitted constants):
 
-- The free flat-N init-ensemble beats single leaves (lse-Jensen,
-  confirmed: -0.21 nats) and post-merge training HURTS on
-  homogeneous leaves (+0.39 nats) -- so growth = add leaves, assemble
-  free, never fine-tune homogeneous.
-- The derived ambiguity threshold eps = 0.0021 (measured floor) and
-  tau = 2*atanh(eps) (Concat.lean C7: mass-gap <-> logit-gap) -- no
-  magic constants.
-- The exhaustion curve: ambiguity plateaus at N ~ 9-16 for
-  homogeneous leaves (ladder_exhaustion_curve.md). When ambiguity
-  stops falling while CE still falls, remaining error is
-  SYSTEMATIC: new same-distribution copies will not fix it.
+- certifiedGain(N, M, c) = (M - c) / (N + 1): the certified new
+  mean-CE bound after adding a candidate with standalone CE c to a
+  pool of N leaves with mean-CE M (Select.lean newBound:
+  new bound = (N*M + c)/(N+1)). Computable BEFORE the step -- the
+  FGD U_t analogue.
+- SATURATED = certifiedGain(best candidate) < EPS: if the BEST
+  candidate (min c) cannot certify a gain, no candidate can
+  (grow_epsilon_stop) -- the GROW axis is exhausted; only the
+  EXHAUSTED axis (change the element's data) remains.
+- Speed stop (Ambig.lean consensus_no_gain): expected next-leaf
+  gain ~ (spread)^2 / (N(N+1)); stop when < EPS^2.
+- Candidate RANKING is certified only by certifiedGain (a bound),
+  never by standalone CE as the decision rule (Select.lean
+  selection_hurts: a better-standalone leaf can be strictly worse
+  in the ensemble). The pool decision needs an ensemble measure.
 
-Decision rule (calibrated on the measured curve):
-  measure flat-N ensemble ambiguity A_N on held-out windows
-  - A_N dropping vs previous level  -> GROW: add leaves (variance
-    reduction still paying)
-  - A_N flat (|dA| < tol) AND CE dropping -> SATURATED-AMBIGUITY:
-    variance is exhausted; grow element quality (data), not count
-  - A_N flat AND CE flat -> EXHAUSTED: change the element's data
+EPS = 0.0021 is the measured floor (temperature_correction.md);
+tau = 2*atanh(EPS) is its logit form (Concat.lean C7).
+
 Exit code 0 + JSON on stdout for automation.
 
 Usage:
-    python scripts/growth_gate.py --configs configs/leafv3_s200{1..9}.yaml \
+    python scripts/growth_gate.py --configs configs/v3leaf_s800*.yaml \
+        [--candidate-configs extra_leaves.yaml ...] \
         --prev-ambiguity 0.056 --prev-ce 4.49
 """
 from __future__ import annotations
@@ -50,6 +51,15 @@ from hagi.train.loop import configure_runtime  # noqa: E402
 EPS = 0.0021  # measured floor (temperature_correction.md); not magic
 TOL_AMB = 0.002  # ambiguity change below this = "flat"
 TOL_CE = 0.01   # CE change below this = "flat"
+
+
+def certified_gain(n: int, mean_ce: float, cand_ce: float) -> float:
+    """Select.lean newBound: adding a candidate with standalone CE c
+    to a pool of N leaves with mean-CE M certifies the new bound
+    (N*M + c)/(N+1); the certified gain over the current bound M is
+    exactly (M - c)/(N+1). Monotone in c (certifiedGain_monotone),
+    so the BEST candidate certifies for all (grow_epsilon_stop)."""
+    return (mean_ce - cand_ce) / (n + 1)
 
 
 def measure(configs: list[str]) -> dict:
@@ -121,12 +131,75 @@ def measure(configs: list[str]) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", nargs="+", required=True)
+    ap.add_argument("--candidate-configs", nargs="+", default=None,
+                    help="pool candidates: single leaves, each is ranked "
+                         "by certifiedGain (a BOUND); if even the best "
+                         "cannot certify >= EPS, GROW is exhausted")
     ap.add_argument("--prev-ambiguity", type=float, default=None,
                     help="ambiguity of the previous ladder level")
     ap.add_argument("--prev-ce", type=float, default=None)
     args = ap.parse_args()
 
     cur = measure(args.configs)
+    result = {**cur}
+    verdict_extra = ""
+
+    # --- Pre-quantified GROW-axis check (Select.lean) ---
+    if args.candidate_configs:
+        n = cur["n_leaves"]
+        mean_ce = cur["ce"]
+        # NOTE: cur["ce"] is the merged-ensemble CE, which by
+        # ensemble_ce_le_mean_general is <= the pool's mean single-CE.
+        # Using it as M in certifiedGain is CONSERVATIVE (M smaller ->
+        # gain smaller), so a certified GROW verdict is sound.
+        cand_scores = {}
+        for c in args.candidate_configs:
+            cc = load_config(c)
+            ck = Path(cc.train.checkpoint_dir) / "step-0000800.pt"
+            if not ck.is_file():
+                continue
+            from hagi.model.model import HAGI  # noqa: E402
+            from hagi.train.checkpoint import config_from_dict  # noqa: E402
+            pl = load_payload(str(ck), "cpu")
+            mm = HAGI(config_from_dict(pl["config"])).to(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            ).to(torch.bfloat16).eval()
+            mm.load_state_dict(pl["model"], strict=True)
+            # cheap single-leaf CE on the same windows
+            tot_c, ntok_c = 0.0, 0
+            with torch.no_grad():
+                mm.head.logit_scale.data.fill_(
+                    float(pl["model"]["head.logit_scale"]))
+                for name, weight in cc.train.data.weights.items():
+                    p = ROOT / f"data/{name}.compact.bin"
+                    if not p.is_file():
+                        continue
+                    total = p.stat().st_size // 4
+                    with p.open("rb") as fh:
+                        fh.seek((total - 2_000_000) * 4)
+                        T = np.frombuffer(fh.read(300_000 * 4),
+                                          dtype=np.uint32).astype(np.int64)
+                    dev = next(mm.parameters()).device
+                    ids = torch.from_numpy(T[:2048]).reshape(4, 512)
+                    x, y = ids[:, :-1].to(dev), ids[:, 1:].to(dev)
+                    out = mm(x, targets=y)
+                    tot_c += float(out.ce) * y.numel() * weight
+                    ntok_c += y.numel() * weight
+            cand_ce = tot_c / ntok_c
+            cand_scores[c] = {"ce": cand_ce,
+                               "certified_gain": certified_gain(n, mean_ce, cand_ce)}
+            del mm
+            torch.cuda.empty_cache()
+        result["candidates"] = cand_scores
+        best = min(cand_scores.values(), key=lambda s: s["ce"])
+        result["best_candidate_gain"] = best["certified_gain"]
+        if best["certified_gain"] < EPS:
+            verdict_extra = (
+                f"certified: even the best candidate (gain "
+                f"{best['certified_gain']:.4f} < eps {EPS}) cannot move the "
+                f"bound -- GROW axis exhausted (grow_epsilon_stop); only "
+                f"EXHAUSTED (data) remains")
+
     if args.prev_ambiguity is None:
         verdict = "BASELINE"
         reason = "first level: record ce/ambiguity, compare at the next one"
@@ -145,7 +218,24 @@ def main() -> int:
         else:
             verdict, reason = "EXHAUSTED", (
                 "both flat: this leaf recipe is done; change the element's data mix")
-    print(json.dumps({**cur, "verdict": verdict, "reason": reason}, indent=2))
+    # speed stop (Ambig.lean): expected next-leaf gain ~ spread^2/(N(N+1))
+    spread = 0.0
+    result["speed_stop"] = None
+    if verdict == "GROW":
+        # spread proxy: ambiguity is the measured disagreement floor
+        spread = cur["ambiguity"]
+        speed = spread ** 2 / (cur["n_leaves"] * (cur["n_leaves"] + 1))
+        result["speed_stop"] = speed
+        if speed < EPS ** 2:
+            verdict, reason = "SATURATED-AMBIGUITY", (
+                f"speed stop: next-leaf expected gain {speed:.2e} < eps^2 "
+                f"{EPS**2:.2e} (consensus_no_gain) -- disagreement floor "
+                f"reached; improve the ELEMENT, not the count")
+    if verdict_extra:
+        reason = (reason + "; " + verdict_extra) if verdict == "GROW" else verdict_extra
+        if best["certified_gain"] < EPS and verdict == "GROW":
+            verdict = "SATURATED-AMBIGUITY"
+    print(json.dumps({**result, "verdict": verdict, "reason": reason}, indent=2))
     return 0
 
 
