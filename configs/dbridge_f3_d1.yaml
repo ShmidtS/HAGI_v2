@@ -1,0 +1,93 @@
+model:
+  vocab_size: 32768
+  hidden_size: 384
+  num_layers: 3
+  loop_depth: 2
+  init_seed: 12101
+  attention:
+    num_query_heads: 6
+    num_kv_heads: 3
+    head_dim: 64
+    rope_theta: 3000.0
+    sink_len: 4
+    max_seq_len: 4096
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  ternary:
+    enabled: false
+  ffn:
+    expansion: 1.0
+  head:
+    unigram_prior: false
+    sampled_proposal: uniform
+    fused_ce: true
+  cortex:
+    enabled: true
+    num_levels: 3
+    rank: 64
+    link_strides:
+    - 1
+    - 2
+    residual_scale: 0.1
+    mode: root
+    gate: fixed
+    gate_temp_start: 1.0
+    gate_temp_floor: 0.1
+    gate_temp_steps: 2000
+  adapters:
+    enabled: false
+  decision:
+    enabled: false
+train:
+  max_steps: 1600
+  checkpoint_interval: 800
+  precision: bf16
+  grad_checkpointing: false
+  ternary_fp32_master: false
+  batch_size: 32
+  grad_accum_steps: 1
+  compile_model: false
+  learning_rate: 0.001
+  use_muon: true
+  zero_init_proj: true
+  adam:
+    weight_decay: 0.3
+  schedule:
+    warmup_steps: 20
+  checkpoint_dir: checkpoints/dbridge_f3_d1
+  init_from: ''
+  data:
+    data_dir: data
+    seq_len: 1024
+    seed: 13001
+    weights:
+      edu: 0.3571
+      python_instruct: 0.2232
+      wikipedia_en: 0.0893
+      wikipedia_ru: 0.0714
+      oscar_ru: 0.0625
+      openwebmath: 0.0893
+      tinystories: 0.0536
+      smoltalk: 0.0536
+merge:
+  enabled: true
+  norm_block_dim: 128
+  n_mixers: 1
+  mixer_type: ternary_f3
+  n_experts: 3
+  expert_hidden: 128
+  mixer_init_scale: 0.0
+  mixer_rank: 64
+  freeze_experts: false
+  expert_weight_source: effective_sparse
+  expert_checkpoints:
+  - checkpoints/dbridge_loop2_s1/step-0001600.pt
+  - checkpoints/dbridge_loop2_s2/step-0001600.pt
+  - checkpoints/dbridge_loop2_s3/step-0001600.pt
+  scratch_block_norm: false
+  shared_vocab_tables: false
+  require_identical_tables: false
+  ternary_depth: 1
+  ternary_lift_mode: f3_tree
+  ternary_tree_schema_version: 1
