@@ -692,3 +692,92 @@ def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> 
             best_obj = obj
             best = lam
     return best
+
+
+def domination_metrics(
+    grads: torch.Tensor, weights: torch.Tensor
+) -> dict[str, object]:
+    """Dominate.lean round 33: the domination law, as a computable scan.
+
+    Step-direction decomposition (domination_decompose): any step d
+    splits into the part aligned with the dominant gradient g_s and
+    the perpendicular remainder; the aligned part's effect on corpus i
+    is bounded by the dominant-minimum disagreement (domination_regression):
+    when d is aligned with g_s and <g_i, g_s> <= cos_min * ||g_i||*||g_s||,
+    then <g_i, d> <= (alignment fraction) * cos_min * ||g_i||*||d|| -- the
+    aligned contribution is NEGATIVE for cos_min < 0, and collateral
+    CE regression of non-dominated corpora is unavoidable at any lr
+    that moves the dominant corpus. The round-32 measurement
+    (slimpajama 94.8% share) is the canonical instance.
+
+    normalized_descent_preserved: normalizing contributions
+    (g_i / ||g_i||, equal w_i*||g_i||) keeps descent iff
+    <g_norm, g> > 0; the flip is quantified below as descent_ratio.
+
+    Args:
+        grads: [K, D] per-corpus gradients on one calibration batch.
+        weights: [K] mixture weights.
+
+    Returns:
+        dict with per-corpus shares, alignment cosines, the kappa
+        DOMINATED/SAFE verdict, and the normalized-descent flip check.
+    """
+    G = grads.double()
+    w = weights.double()
+    K = G.shape[0]
+    contrib = w[:, None] * G                      # [K, D]
+    norms = G.norm(dim=1)
+    mix = contrib.sum(0)
+    mix_norm = mix.norm()
+    tot = contrib.norm()
+    shares = (contrib.norm(dim=1) / tot) if tot > 0 else torch.zeros(K)
+    with torch.no_grad():
+        cos_to_mix = (
+            (G @ mix) / (norms * mix_norm).clamp_min(1e-30)
+        )
+    dom = int(torch.argmax(shares))
+    kappa = float(shares[dom])  # dominant share in [0, 1]
+    # disagreement of each corpus with the dominant gradient
+    cos_dom = (G @ G[dom]) / (norms * norms[dom]).clamp_min(1e-30)
+    # Full verdict (round-33 correction): harmful domination requires
+    # BOTH a dominant share AND disagreement of the rest with the
+    # dominant direction -- domination_regression's two conditions.
+    # Benign domination (consensus, high mean cos) is safe: the
+    # healthy round-32 swap dominated by weight but agreed in
+    # direction and the joint descended (5.43 -> 5.17).
+    others = [i for i in range(K) if i != dom]
+    mean_cos_dom = float(cos_dom[others].mean()) if others else 1.0
+    verdict = (
+        "DOMINATED"
+        if kappa >= 0.5 and mean_cos_dom < 0.5
+        else ("SAFE_CONSENSUS" if kappa >= 0.5 else "SAFE")
+    )
+    # normalized_descent_preserved check
+    gn = contrib / contrib.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    g_norm_mix = gn.sum(0)
+    descent_dot = float(torch.dot(g_norm_mix, mix))
+    descent_ratio = descent_dot / float(mix_norm) if mix_norm > 0 else 0.0
+    return {
+        "dominant": dom,
+        "kappa": kappa,
+        "verdict": verdict,
+        "shares": shares.tolist(),
+        "cos_to_mix": cos_to_mix.tolist(),
+        "cos_to_dominant": cos_dom.tolist(),
+        "mean_cos_dom": mean_cos_dom,
+        "normalized_descent_preserved": descent_dot > 0,
+        "normalized_descent_ratio": descent_ratio,
+    }
+
+
+def domination_threshold(shares: list[float]) -> float:
+    """Dominate.lean: the kappa threshold licensed by the regression bound.
+
+    The regression bound is vacuous unless the dominant share exceeds
+    the maximal perpendicular budget; empirically the flip in
+    normalized descent happens when one contribution outvotes the
+    sum of the rest. The scan verdict above uses the 0.5 share line
+    (one corpus owning more than the combined rest); both historical
+    points sit above it (0.948 and the softened guard ~0.6).
+    """
+    return max(shares) / max(sum(shares), 1e-30)
