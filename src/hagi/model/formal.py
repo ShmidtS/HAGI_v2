@@ -616,3 +616,79 @@ def compound_verdict_interval(alpha_lo: float, alpha_hi: float,
     if hi <= eps_c:
         return "FOLD"
     return "UNDECIDED"
+
+
+def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+    """SafeQP.lean round 32: the dual of the domain-safe joint step.
+
+    Primal: d* = argmin ||d - g||^2  s.t.  <g_i, d> >= -eps_i (each
+    corpus must not regress beyond its safety budget). SafeQP.lean:
+    the safe set (a finite intersection of closed halfspaces) is
+    closed, convex, and contains 0, so the projection exists and is
+    UNIQUE (strict convexity + compactness), and safeQP_noconflict:
+    with <g_i, g> >= -eps_i for all i the projection is INACTIVE and
+    d* = g -- the controller is invisible without conflicts.
+
+    Dual (reviewer's form): d* = g + sum_i lambda_i g_i with
+        lambda* = argmin_{lambda >= 0} 0.5*lambda' G lambda + lambda'(b + eps)
+    where G_ij = <g_i, g_j>, b_i = <g_i, g>. Descent guarantee
+    (complementary slackness): <g, d*> >= ||d*||^2 whenever eps >= 0,
+    so the step never climbs the mixture loss; ||g - d*|| <= ||g||
+    always (0 is safe).
+
+    Solved by active-set enumeration (K <= 8 corpora -> <= 256
+    subsets; each candidate solves a tiny equality system).
+
+    Args:
+        G: [K, K] Gram matrix of the per-corpus gradients (PSD).
+        b: [K] mixture-projections <g_i, g>.
+        eps: [K] per-corpus safety budgets (>= 0; 0 = no regression
+            allowed at the linear level).
+
+    Returns:
+        lambda*: [K] nonnegative multipliers.
+    """
+    G = G.double()
+    b = b.double()
+    eps = eps.double()
+    K = G.shape[0]
+    if G.shape != (K, K) or b.shape != (K,) or eps.shape != (K,):
+        raise ValueError("G must be [K,K], b and eps [K]")
+    if (eps < 0).any():
+        raise ValueError("safety budgets must be nonnegative")
+    c = b + eps
+    # candidate: lambda = 0 (always feasible; optimal when c >= 0)
+    best_obj = float((c.clamp_min(0) * 0).sum())  # obj at 0 = 0
+    best_obj = 0.0
+    best = torch.zeros(K, dtype=torch.float64)
+    if (c >= 0).all():
+        return best  # no conflict: the projection is inactive (noconflict)
+    # active-set enumeration
+    for mask in range(1, 1 << K):
+        idx = [i for i in range(K) if mask & (1 << i)]
+        A = G[idx][:, idx]
+        rhs = -c[idx]
+        if len(idx) == 1:
+            if A[0, 0] <= 1e-12:
+                continue
+            lam_A = rhs / A[0, 0]
+        else:
+            # solve G_AA lambda = -c_A; skip singular candidates
+            try:
+                lam_A = torch.linalg.solve(A, rhs)
+            except Exception:
+                continue
+        if (lam_A < -1e-9).any():
+            continue
+        lam = torch.zeros(K, dtype=torch.float64)
+        lam[idx] = lam_A
+        # feasibility of inactive constraints: (b + G*lam)_j + eps_j >= 0
+        resid = c + G @ lam
+        inactive = [i for i in range(K) if not (mask & (1 << i))]
+        if inactive and (resid[inactive] < -1e-9).any():
+            continue
+        obj = 0.5 * float(lam @ (G @ lam)) + float(lam @ c)
+        if obj < best_obj - 1e-12:
+            best_obj = obj
+            best = lam
+    return best
