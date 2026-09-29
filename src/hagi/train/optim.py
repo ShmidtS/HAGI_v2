@@ -229,10 +229,14 @@ class HybridOptimizer:
     whole model then rides AdamW and the Muon accessors become no-ops.
     """
 
-    def __init__(self, muon: Muon | None, adamw: torch.optim.AdamW) -> None:
+    def __init__(self, muon: Muon | None, adamw: torch.optim.AdamW,
+                 logit_scale: torch.Tensor | None = None,
+                 logit_scale_max: float = 0.0) -> None:
         self.muon = muon
         self.adamw = adamw
         self.param_groups = (muon.param_groups if muon else []) + adamw.param_groups
+        self._logit_scale = logit_scale
+        self._logit_scale_max = float(logit_scale_max)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self.muon is not None:
@@ -243,6 +247,17 @@ class HybridOptimizer:
         if self.muon is not None:
             self.muon.step()
         self.adamw.step()
+        # logit_scale_max enforcement: the config key existed since the
+        # head was written but nothing applied it (dead config tail, same
+        # class as merge.n_mixers in round 24). A fresh (non-init_from)
+        # receiver has no inherited scale and its gradient grows without
+        # bound (measured: rest-group norm 0.19 -> inf by step ~70 on
+        # scratch H=384 eager; every era-2 arm inherited a trained scale
+        # and never hit this). Hard clamp AFTER the optimizer step.
+        cap = self._logit_scale_max
+        if cap > 0 and self._logit_scale is not None:
+            with torch.no_grad():
+                self._logit_scale.clamp_(max=cap)
 
     def state_dict(self) -> dict:
         return {"muon": self.muon.state_dict() if self.muon else {}, "adamw": self.adamw.state_dict()}
@@ -374,7 +389,9 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     except (RuntimeError, TypeError, NotImplementedError):
         adamw = torch.optim.AdamW(groups, **kwargs, fused=False)
 
-    return HybridOptimizer(muon, adamw)
+    logit_scale = getattr(getattr(model, "head", None), "logit_scale", None)
+    cap = float(getattr(cfg.model.head, "logit_scale_max", 0.0) or 0.0)
+    return HybridOptimizer(muon, adamw, logit_scale=logit_scale, logit_scale_max=cap)
 
 
 def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:

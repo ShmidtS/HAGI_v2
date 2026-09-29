@@ -781,3 +781,48 @@ def domination_threshold(shares: list[float]) -> float:
     points sit above it (0.948 and the softened guard ~0.6).
     """
     return max(shares) / max(sum(shares), 1e-30)
+
+
+def growth_verdict(g_f: float, r_repr: float, eps_g: float, eps_r: float) -> str:
+    """Round 34 (Lean growth_verdict_table): the (G_F, R_repr) decision.
+
+    The four-regime table replacing the plateau-CE heuristic:
+
+    - G_F >= eps_g and R_repr <  eps_r -> "TTT/LORA": the current
+      architecture REPRESENTS the gradient well but free energy is high --
+      adapt within the model (LoRA/TTT), do not grow.
+    - G_F >= eps_g and R_repr >= eps_r -> "GROW": representation error is
+      the bottleneck -- expand the architecture (expert/rank/layer/mixer
+      by ComputeBudget argmax of DeltaG_F/DeltaC_j).
+    - G_F <  eps_g and R_repr <  eps_r -> "STOP": both low -- converged.
+    - G_F <  eps_g and R_repr >= eps_r -> "TEACHER_CHECK": low free
+      energy with high representation error is contradictory -- suspect
+      the teacher/reference, re-audit before growing.
+
+    Thresholds come from equilibrium_bracket noise scales: eps_g from the
+    ensemble KL noise bracket, eps_r from the gradient-projection noise.
+    """
+    high_g = g_f >= eps_g
+    high_r = r_repr >= eps_r
+    if high_g and not high_r:
+        return "TTT/LORA"
+    if high_g and high_r:
+        return "GROW"
+    if not high_g and not high_r:
+        return "STOP"
+    return "TEACHER_CHECK"
+
+
+def mechanism_marginal_value(delta_g_f: dict[str, float],
+                             delta_c: dict[str, float]) -> str:
+    """Round 34: j* = argmax DeltaG_F / DeltaC (ComputeBudget in the
+    free-energy currency). Measured channel values (era-2 ledgers):
+
+    - init (shared E0 prior):      DeltaG_F ~ 0.245 nat per leaf
+    - rank (LoRA r=16):            DeltaG_F ~ 0.196 nat, DeltaC tiny
+    - joint (movement channel):   DeltaG_F ~ 0.23 (canonical) / 0.35 (dbridge)
+
+    Returns the mechanism key with the best free-energy-per-compute ratio.
+    """
+    ratios = {k: delta_g_f[k] / max(delta_c[k], 1e-12) for k in delta_g_f}
+    return max(ratios, key=ratios.get)
