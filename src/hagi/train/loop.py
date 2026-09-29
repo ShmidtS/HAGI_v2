@@ -396,6 +396,32 @@ class Trainer:
                         )
                     )
             lm_weight = count.to(torch.float32) / total_tokens_normalized if output.lm_loss is not None else None
+            # NCEExact anchor (round 30, anchor_drift_bound): the periodic
+            # exact-CE gradient pins the sampled receiver's GLOBAL calibration
+            # (the sampled loss leaves the out-of-sample logits free to
+            # drift -- the round-28 collapse: exact 53 vs NCE 1.7). Computed
+            # BEFORE the main backward and added to the objective so ONE
+            # backward covers both.
+            anchor_w = float(getattr(cfg.train, "nce_anchor_weight", 0.0) or 0.0)
+            anchor_ce = None
+            if (
+                anchor_w > 0
+                and microbatch_index == 0
+                and exact_interval > 0
+                and self.step % exact_interval == 0
+                and batch["targets"] is not None
+            ):
+                flat_hidden = output.hidden.reshape(-1, output.hidden.shape[-1])
+                flat_targets = batch["targets"].reshape(-1)
+                rows = min(int(cfg.train.logging.exact_ce_rows), flat_targets.numel())
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(cfg.train.logging.exact_ce_seed) + self.step)
+                sample = torch.randperm(flat_targets.numel(), device=device, generator=generator)[:rows]
+                anchor_ce = model.head.exact_loss(
+                    flat_hidden.index_select(0, sample),
+                    flat_targets.index_select(0, sample),
+                )
+                self._anchor_ce_last = float(anchor_ce.detach())
             decision_weight = (
                 decision_count.to(torch.float32) / total_decisions_normalized
                 if output.decision_loss is not None
@@ -407,6 +433,8 @@ class Trainer:
             if output.decision_loss is not None:
                 weighted = float(cfg.model.decision.loss_weight) * output.decision_loss * decision_weight
                 objective = weighted if objective is None else objective + weighted
+            if anchor_ce is not None:
+                objective = (objective + anchor_w * anchor_ce) if objective is not None else anchor_w * anchor_ce
             if objective is not None:
                 objective.backward()
                 loss_sum = loss_sum + objective.detach().float()

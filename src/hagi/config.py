@@ -653,6 +653,12 @@ class TrainConfig:
     # +27% body tok/s at fixed L=6 (head is ~1/3 of step and linear in N).
     # 1.0 = score every token (legacy).
     ce_keep_rate: float = 1.0
+    # NCEExact anchor (round 30): weight of the periodic exact-CE
+    # gradient (every exact_ce_interval steps, on exact_ce_rows
+    # positions) that pins the sampled receiver's global calibration.
+    # 0 disables. Derived from anchor_drift_bound: the sampled loss
+    # alone leaves the out-of-sample logits free to drift.
+    nce_anchor_weight: float = 0.0
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
