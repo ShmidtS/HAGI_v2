@@ -826,3 +826,55 @@ def mechanism_marginal_value(delta_g_f: dict[str, float],
     """
     ratios = {k: delta_g_f[k] / max(delta_c[k], 1e-12) for k in delta_g_f}
     return max(ratios, key=ratios.get)
+
+
+def anova_split(hidden: torch.Tensor, n_leaves: int) -> dict[str, float]:
+    """F3Root.lean anova_split: the tree go/no-go number, one forward pass.
+
+    Decomposes the residual-stream energy into the root-accessible part
+    (the all-equal leaf mean -- the only component the root cortex and
+    the parent-preserving lift can see) and the leaf-variance part (the
+    specializations, invisible to the tree by construction:
+    root_no_leaf_signal). With x viewed as [N_leaves, hidden_leaf] per
+    position:
+
+        E_total = ||x||^2  =  ||mean||^2 * N  +  sum_i ||x_i - mean||^2
+
+    A high root share means the block-diagonal lift bound is cheap and
+    the F3 tree is promising; a high leaf-variance share (orthogonal
+    specializations) means flat merge keeps the advantage forever.
+
+    Args:
+        hidden: [..., n_leaves * leaf_hidden] stream tensor.
+        n_leaves: the leaf count of the prospective tree level.
+
+    Returns:
+        {"root_share": ..., "leaf_share": ..., "verdict": ...}
+    """
+    x = hidden.detach().float()
+    lead = x.shape[:-1]
+    leaf_h = x.shape[-1] // n_leaves
+    xl = x.reshape(*lead, n_leaves, leaf_h)
+    mean = xl.mean(dim=-2, keepdim=True)                 # [.., 1, leaf_h]
+    ss_root = float((mean * mean).sum() * n_leaves)
+    ss_leaf = float(((xl - mean) ** 2).sum())
+    tot = ss_root + ss_leaf
+    root_share = ss_root / tot if tot > 0 else 0.0
+    verdict = "TREE_PROMISING" if root_share >= 0.5 else "FLAT_ADVANTAGE"
+    return {"root_share": root_share, "leaf_share": 1.0 - root_share,
+            "verdict": verdict}
+
+
+def bf16_frozen_gain_check(param: torch.Tensor, grad_scale: float = 1e-4) -> bool:
+    """PreNorm.lean bf16_frozen_update: detect a silently frozen gain.
+
+    Above 1.0 the bf16 grid steps by 2^-7 = 0.0078125; an update whose
+    magnitude is below half the step rounds back to the current value and
+    the gain never moves again for the whole run. A 1D gain parameter
+    living in bf16 with gradient scale ~1e-4 is FROZEN by construction.
+    Every new 1D gain (norms, scales, gates, per-head QK gains) must
+    carry keep_fp32; this check audits an existing tensor.
+    """
+    if param.dtype != torch.bfloat16 or param.numel() != 1:
+        return False
+    return grad_scale < 2.0 ** -8 / 2.0
