@@ -373,7 +373,13 @@ def main() -> int:
         # may have a different geometry than the source (e.g. a fresh Hadamard
         # mixer initialized from a SwiGLU-merged prior). The body/embed/head
         # transfer; the mixers stay fresh so the Hadamard geometry is kept.
-        _, _ = load_model(path, model, str(device), skip_prefixes=("mixers.",))
+        # Also skip ``head.log_prior``: the unigram prior is a deterministic
+        # function of the corpus (unigram_path), not learned state -- a target
+        # that enables the prior rebuilds it from its own config, and a prior
+        # without it must not inherit a stale one (round-28 NCE A/B).
+        _, _ = load_model(
+            path, model, str(device), skip_prefixes=("mixers.", "head.log_prior")
+        )
         logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
     elif args.resume is not None:
         from hagi.train.checkpoint import load_model
