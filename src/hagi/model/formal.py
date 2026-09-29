@@ -532,3 +532,87 @@ def rank_budget_allocation(tail_scale: dict[str, tuple[float, float, int, int]],
     lam = math.sqrt(lo * hi)
     return {k: max(0.0, (math.log(v[0] * v[1]) - math.log(lam) - math.log(v[2] + v[3])) / v[1])
             if k in active else 0.0 for k, v in tail_scale.items()}
+
+
+def kl_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
+    """DField.lean kl_nonneg/kl_zero_iff_eq: KL(p||q) >= 0, zero iff p==q.
+
+    The D-field's base brick (route: log x <= x - 1, strict by exp's
+    strict convexity). Inputs are strictly-positive probability
+    vectors; zero-count guard (smoothing) is the caller's duty --
+    a zero q on a used token is a silent bias source (the NCE
+    proposal guard applies here too).
+    """
+    p = p.double()
+    q = q.double()
+    if p.shape != q.shape:
+        raise ValueError("p and q must have the same shape")
+    if (p <= 0).any() or (q <= 0).any():
+        raise ValueError("KL requires strictly positive distributions "
+                         "(smooth zero counts at the call site)")
+    if abs(float(p.sum()) - 1.0) > 1e-6 or abs(float(q.sum()) - 1.0) > 1e-6:
+        raise ValueError("p and q must be probability vectors")
+    return float((p * (p.log() - q.log())).sum())
+
+
+def d_field(corpus_dists: dict[str, torch.Tensor], weights: dict[str, float]) -> float:
+    """DField.lean: the data-field divergence D(w) = sum_i w_i KL(p_i || p_w).
+
+    The disagreement-replenishment model: how much NEW divergence the
+    corpus mix carries. Measurable WITHOUT training (one-time unigram
+    statistics). divField_zero_iff: D = 0 iff the corpora are clones --
+    the recursion can only die of data degeneration.
+
+    Args:
+        corpus_dists: {name: unigram distribution [V]} (strictly positive).
+        weights: {name: mix weight w_i}; normalized internally.
+    """
+    if set(corpus_dists) != set(weights):
+        raise ValueError("corpus_dists and weights must cover the same names")
+    s = sum(weights.values())
+    if s <= 0:
+        raise ValueError("weights must sum to a positive value")
+    w = {k: v / s for k, v in weights.items()}
+    p_mix = None
+    for k in w:
+        p = corpus_dists[k].double()
+        p_mix = w[k] * p if p_mix is None else p_mix + w[k] * p
+    return sum(w[k] * kl_divergence(corpus_dists[k], p_mix) for k in w)
+
+
+def conflict_signal(corpus_dist: torch.Tensor, mix_dist: torch.Tensor,
+                    corpus_ce: float, pool_ce: float) -> float:
+    """The double replacement signal (DField + Joint): a corpus is a
+    D-SINK when it is both (a) anomalous in distribution (large KL from
+    the mix -- its tokens barely overlap the blend) and (b) never
+    fitted (its CE stays far above the pool's). The measured
+    slimpajama case: cross-KL ~13 nats to EVERY sibling corpus (the
+    others pair at 0.3-5) and CE 13-17 vs the pool's ~4.5.
+    """
+    kl_val = kl_divergence(corpus_dist, mix_dist)
+    return kl_val * max(0.0, corpus_ce - pool_ce)
+
+
+def compound_verdict_interval(alpha_lo: float, alpha_hi: float,
+                             d_lo: float, d_hi: float,
+                             j_lo: float, j_hi: float,
+                             eps_c: float) -> str:
+    """Compound.lean compound_budget_interval / compound_fold_interval:
+    the interval-honest generational verdict.
+
+    With confidence intervals on (alpha, D, J):
+    - GROW: even the pessimistic end clears the threshold
+      (alpha_lo*D_lo + J_lo > eps_c).
+    - FOLD: even the optimistic end is under (alpha_hi*D_hi + J_hi <= eps_c).
+    - UNDECIDED: the confidence band straddles eps_c -- measure another
+      generation; do not flip a coin. The verdict is a statistical
+      decision, not a point comparison (for the noisy c = 0.18, 0.17,
+      -0.02 trajectory).
+    """
+    lo = alpha_lo * d_lo + j_lo
+    hi = alpha_hi * d_hi + j_hi
+    if lo > eps_c:
+        return "GROW"
+    if hi <= eps_c:
+        return "FOLD"
+    return "UNDECIDED"
