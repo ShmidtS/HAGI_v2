@@ -258,7 +258,7 @@ def _f3_row_apply(x: torch.Tensor, block_dim: int) -> torch.Tensor:
     lead = x.shape[:-1]
     pair_major = x.reshape(lead + (3, block_dim // 2, 2)).movedim(-3, -2)
     pair_major = pair_major.reshape(lead + (block_dim // 2, 6))
-    row_matrix = f3_real_column_matrix().transpose(0, 1).to(dtype=x.dtype)
+    row_matrix = f3_real_column_matrix().transpose(0, 1).to(device=x.device, dtype=x.dtype)
     y = pair_major @ row_matrix
     y = y.reshape(lead + (block_dim // 2, 3, 2)).movedim(-2, -3)
     return y.reshape(x.shape)
