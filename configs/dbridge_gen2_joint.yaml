@@ -39,7 +39,7 @@ train:
   compile_model: true
   learning_rate: 0.0003
   use_muon: true
-  zero_init_proj: true
+  zero_init_proj: false
   adam:
     weight_decay: 0.3
   schedule:

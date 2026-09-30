@@ -44,7 +44,7 @@ train:
     weight_decay: 0.3
   schedule:
     warmup_steps: 40
-  checkpoint_dir: checkpoints/dbridge_gen2_merged
+  checkpoint_dir: checkpoints/dbridge_gen2_merged_had
   init_from: ''
   data:
     data_dir: data
@@ -63,7 +63,7 @@ merge:
   enabled: true
   norm_block_dim: 128
   n_mixers: 1
-  mixer_type: swiglu
+  mixer_type: hadamard
   n_experts: 3
   expert_hidden: 384
   mixer_init_scale: 0.0
