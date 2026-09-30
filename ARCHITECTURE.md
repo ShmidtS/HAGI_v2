@@ -261,8 +261,8 @@ Prefill (один forward, KV-cache) + decode (single-position).
 
 ## 8. Конфигурация — `config.py`
 
-Все параметры конфигурации описаны dataclass'ами: `ModelConfig`
-(hidden, layers, rope, head_up, branch_clamp_ratio),
+Все параметры конфигурации описаны классами Python (dataclass):
+`ModelConfig` (hidden, layers, rope, head_up, branch_clamp_ratio),
 `AttentionConfig`, `EmbeddingConfig`, `FFNConfig`, `TernaryConfig`,
 `HeadConfig`, `TrainConfig` (learning rate, puncture, gram-scan,
 saturation, init_from), `MergeConfig` (n_experts, mixer_type,
