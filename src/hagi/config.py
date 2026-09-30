@@ -688,6 +688,14 @@ class TrainConfig:
     saturation_patience: int = 0
     saturation_tol: float = 0.01
     saturation_min_steps: int = 0
+    # Divergence guard: training stops once the running ce exceeds its own
+    # historical minimum by ``divergence_delta`` over ``divergence_patience``
+ # consecutive logged samples (after ``divergence_min_steps``). Catches the
+    # "fell then rose" instability without a human watching the log. Disabled
+    # when ``divergence_patience`` is 0.
+    divergence_patience: int = 0
+    divergence_delta: float = 0.15
+    divergence_min_steps: int = 0
     # Recursive-growth primitive: load weights from a checkpoint as an
     # *initialization* (step 0, fresh optimizer) rather than a resume. A
     # level-N expert starts from the merged level-(N-1) model (the shared

@@ -50,7 +50,7 @@ from hagi.config import Config, validate_config  # noqa: E402
 from hagi.data.artifacts import load_published_artifact, write_json_atomic  # noqa: E402
 from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.loop import Trainer  # noqa: E402
-from scripts.decision_plane_ab import _common_state, decision_metrics, load_common_state  # noqa: E402
+from scripts.decision_plane_ab import _common_state, decision_metrics, load_common_state  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 EXPECTED_ARTIFACT_ID = "banking77"
 EXPECTED_REVISION = "57ec275d8078af65b7731c2a98be812d844a6d6b"
