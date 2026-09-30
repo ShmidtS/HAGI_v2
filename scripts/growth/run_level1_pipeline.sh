@@ -59,7 +59,7 @@ fi
 
 # --- Step 3: merge 4 experts into H=9216 -----------------------------------
 log "merging 4 experts -> H=9216 (~1.018B)..."
-"$PY" scripts/merge_level1.py 2>&1 | tee "$LOG_DIR/merge_level1.log"
+"$PY" scripts/growth/merge_level1.py 2>&1 | tee "$LOG_DIR/merge_level1.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
   log "ERROR: merge_level1 failed"
   exit 1

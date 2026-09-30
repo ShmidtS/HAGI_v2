@@ -29,6 +29,12 @@ import numpy as np
 _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, '../../..'))
+for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from hagi.config import load_config  # noqa: E402
 from hagi.data.dataset import dataset_path  # noqa: E402
