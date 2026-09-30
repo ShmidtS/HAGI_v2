@@ -1,0 +1,270 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 50368b3..ab8d3e8 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -2537,6 +2537,9 @@ struct ggml_tensor * ggml_repeat(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a,
+         struct ggml_tensor  * b) {
++    if (!ggml_can_repeat(a, b)) {
++        fprintf(stderr, "GGML_DEBUG repeat: a ne=[%lld,%lld,%lld,%lld] b ne=[%lld,%lld,%lld,%lld]\n", (long long)a->ne[0], (long long)a->ne[1], (long long)a->ne[2], (long long)a->ne[3], (long long)b->ne[0], (long long)b->ne[1], (long long)b->ne[2], (long long)b->ne[3]);
++    }
+     GGML_ASSERT(ggml_can_repeat(a, b));
+ 
+     struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, b->ne);
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 2744857..478d34b 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -373,6 +373,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_FFN_DOWN_EXP,                           "blk.%d.ffn_down.%d" },
+     { LLM_TENSOR_FFN_UP_EXP,                             "blk.%d.ffn_up.%d" },
+     { LLM_TENSOR_FFN_GATE_EXPS,                          "blk.%d.ffn_gate_exps" },
++    { LLM_TENSOR_FFN_GATE_EXPS_B,                        "blk.%d.ffn_gate_exps_b" },
++    { LLM_TENSOR_FFN_UP_EXPS_B,                          "blk.%d.ffn_up_exps_b" },
++    { LLM_TENSOR_FFN_POD_P,                              "blk.%d.ffn_pod_p" },
++    { LLM_TENSOR_FFN_POD_MU,                             "blk.%d.ffn_pod_mu" },
+     { LLM_TENSOR_FFN_GATE_UP_EXPS,                       "blk.%d.ffn_gate_up_exps" },
+     { LLM_TENSOR_FFN_DOWN_EXPS,                          "blk.%d.ffn_down_exps" },
+     { LLM_TENSOR_FFN_UP_EXPS,                            "blk.%d.ffn_up_exps" },
+@@ -742,6 +746,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
++    {LLM_TENSOR_FFN_GATE_EXPS_B,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD_ID}},
++    {LLM_TENSOR_FFN_UP_EXPS_B,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD_ID}},
++    {LLM_TENSOR_FFN_POD_P,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_FFN_POD_MU,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SUB}},
+     {LLM_TENSOR_FFN_GATE_UP_EXPS,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_DOWN_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 72ce692..7dd1b19 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -400,6 +400,10 @@ enum llm_tensor {
+     LLM_TENSOR_FFN_DOWN_EXPS, // merged experts
+     LLM_TENSOR_FFN_GATE_EXPS,
+     LLM_TENSOR_FFN_UP_EXPS,
++    LLM_TENSOR_FFN_GATE_EXPS_B,
++    LLM_TENSOR_FFN_UP_EXPS_B,
++    LLM_TENSOR_FFN_POD_P,
++    LLM_TENSOR_FFN_POD_MU,
+     LLM_TENSOR_FFN_GATE_UP_EXPS,
+     LLM_TENSOR_FFN_DOWN_SHEXP,
+     LLM_TENSOR_FFN_GATE_SHEXP,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cfcb569..69b547a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -578,9 +578,14 @@ void llama_context::sched_reserve() {
+     // DeepSeek V4 resumed-prompt chunks use the compressed-attention decode
+     // graph, which is larger than the position-zero prefill graph.
+     if (model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1) {
+-        const llama_pos reserve_pos0 = std::min<llama_pos>(
++        llama_pos reserve_pos0 = std::min<llama_pos>(
+                 cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : n_tokens,
+                 std::max<uint32_t>(cparams.n_batch, 8u*n_tokens));
++        // DSV4 fix: compressed-KV cache covers n_ctx_seq positions only; clamp the
++        // worst-case reserve position so n_comp_visible <= n_comp_cache.
++        const llama_pos dsv4_cap = (llama_pos) cparams.n_ctx_seq > (llama_pos) n_tokens
++            ? (llama_pos) cparams.n_ctx_seq - (llama_pos) n_tokens : 0;
++        reserve_pos0 = std::min(reserve_pos0, dsv4_cap);
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
+                 model.hparams.no_alloc, nullptr, reserve_pos0);
+         if (!gf) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 21ec872..f3d3feb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1625,6 +1625,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     const float limit = hparams.swiglu_clamp_exp[il];
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
++                        if (hparams.swiglu_soft_knee > 0.0f) {
++                            // HAGI terni4 soft_lim(x, lim, knee):
++                            //   ax  = |x|;  y = ax if ax<=th else th + tail*tanh((ax-th)/tail)
++                            //   out = sgn(x) * y;   th = knee*lim, tail = lim - th
++                            const float th   = hparams.swiglu_soft_knee * limit;
++                            const float tail = limit - th;
++                            auto soft_lim = [&](ggml_tensor * x) {
++                                ggml_tensor * ax = ggml_abs(ctx0, x);
++                                ggml_tensor * kth = ggml_scale(ctx0, ggml_step(ctx0, ax), th);
++                                ggml_tensor * ktl = ggml_scale(ctx0, ggml_step(ctx0, ax), tail);
++                                ggml_tensor * sel = ggml_step(ctx0, ggml_sub(ctx0, ax, kth));
++                                ggml_tensor * t = ggml_div(ctx0, ggml_sub(ctx0, ax, kth), ktl);
++                                ggml_tensor * ysoft = ggml_add(ctx0, kth, ggml_mul(ctx0, ktl, ggml_tanh(ctx0, t)));
++                                ggml_tensor * y = ggml_add(ctx0, ax, ggml_mul(ctx0, sel, ggml_sub(ctx0, ysoft, ax)));
++                                return ggml_mul(ctx0, ggml_sgn(ctx0, x), y);
++                            };
++                            cur = soft_lim(cur);
++                            cb(cur, "ffn_moe_gate_softlim", il);
++
++                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
++                            cb(gate_act, "ffn_moe_silu", il);
++
++                            up = soft_lim(up);
++                            cb(up, "ffn_moe_up_softlim", il);
++
++                            cur = ggml_mul(ctx0, gate_act, up);
++                            cb(cur, "ffn_moe_swiglu_limited", il);
++                            break;
++                        }
+                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                         cb(cur, "ffn_moe_gate_clamped", il);
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index b45d541..c3dd5fb 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -237,6 +237,7 @@ struct llama_hparams {
+ 
+     // Step35: optional per-layer clamps for (Swi)GLU
+     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
++    float    swiglu_soft_knee = 0.0f; // HAGI terni4: >0 -> soft_lim(x, lim=swiglu_clamp_exp[il], knee=swiglu_soft_knee) instead of hard clamp
+     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
+ 
+     // this value n_pattern means that every nth layer is dense (i.e. non-SWA)
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index c0174d6..0bfe9c5 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -935,6 +935,17 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
+                 op_tensor = ggml_add(ctx, a, w);
+             } break;
++        case GGML_OP_SUB:
++            {
++                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 123);
++                ggml_tensor * b = ggml_repeat(ctx, w, a);
++                op_tensor = ggml_sub(ctx, a, b);
++            } break;
++        case GGML_OP_REPEAT:
++            {
++                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0] * 4, 123);
++                op_tensor = ggml_repeat(ctx, w, a);
++            } break;
+         case GGML_OP_ADD_ID:
+             {
+                 const int n_expert_used = hparams.n_expert_used;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index cfc2a97..ea89f05 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2049,6 +2049,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
+                 ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   hparams.hc_sinkhorn_iters);
+                 ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,              hparams.hc_eps);
+                 ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,           hparams.swiglu_clamp_exp, hparams.n_layer, false);
++                // HAGI terni4: soft-knee SwiGLU limit, GGUF key "<arch>.swiglu_soft_knee" (uint32 knee*100)
++                {
++                    uint32_t knee_x100 = 0;
++                    if (ml.get_key(ml.get_arch_name() + ".swiglu_soft_knee", knee_x100, false)) {
++                        hparams.swiglu_soft_knee = knee_x100 / 100.0f;
++                    }
++                }
+ 
+                 std::vector<uint32_t> compress_ratios;
+                 ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
+@@ -3282,6 +3289,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+ 
++                        // HAGI terni4 extras (all optional)
++                        layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_B, "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
++                        layer.ffn_up_exps_b   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_B,   "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
++                        layer.ffn_pod_p       = create_tensor(tn(LLM_TENSOR_FFN_POD_P,       "weight", i), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
++                        layer.ffn_pod_mu      = create_tensor(tn(LLM_TENSOR_FFN_POD_MU,      "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
++
+                         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+                         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
+                         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index d60b098..868f511 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -305,6 +305,10 @@ struct llama_layer {
+     struct ggml_tensor * ffn_up_exps_b     = nullptr;
+     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+ 
++    // ff MoE POD rotation (HAGI terni4): z = (x - mu) @ P before routed experts
++    struct ggml_tensor * ffn_pod_p  = nullptr;
++    struct ggml_tensor * ffn_pod_mu = nullptr;
++
+     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
+     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
+     struct ggml_tensor * ffn_down_exps_s   = nullptr;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 56af970..7db17d0 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "llama-impl.h"
+ 
+ #include "ggml-backend.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -1150,6 +1151,11 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
+                 const int64_t n_comp_before  = first_pos / compress_ratio;
+                 const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
+                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
++                if (n_comp_visible > n_comp_cache) {
++                    fprintf(stderr, "DSV4DBG il=%d ratio=%u pos=[%lld..%lld] n_tok=%u vis=%lld cache=%lld\n",
++                            il, (unsigned)compress_ratio, (long long)first_pos, (long long)last_pos,
++                            n_tokens, (long long)n_comp_visible, (long long)n_comp_cache);
++                }
+                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
+ 
+                 dsv4_decode_compressor dec = n_tokens == 1
+@@ -1338,22 +1344,45 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
+             cb(selected, "ffn_moe_hash_topk", il);
+         }
+ 
+-        ggml_tensor * moe_out = build_moe_ffn(cur,
+-                layer.ffn_gate_inp,
++        ggml_tensor * moe_in = cur;
++        if (layer.ffn_pod_p != nullptr) {
++            // HAGI terni4: routed experts operate in POD-rotated space: z = (x - mu) @ P
++            ggml_tensor * x2d  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
++            ggml_tensor * mu2d = ggml_reshape_2d(ctx0, layer.ffn_pod_mu, n_embd, 1);
++            ggml_tensor * xmu  = ggml_sub(ctx0, x2d, ggml_repeat(ctx0, mu2d, x2d));
++            moe_in = ggml_mul_mat(ctx0, layer.ffn_pod_p, xmu);
++            cb(moe_in, "ffn_pod_rotate", il);
++        }
++        // HAGI: router logits must come from the PRE-POD activations (x), while
++        // routed experts operate on POD-rotated z. Pass logits explicitly via
++        // probs_in so build_moe_ffn applies bias/sqrt(softplus)/topk itself.
++        ggml_tensor * moe_router_logits = nullptr;
++        if (layer.ffn_pod_p != nullptr && layer.ffn_gate_inp != nullptr) {
++            ggml_tensor * x2d_r = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
++            moe_router_logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, x2d_r); // [n_expert, n_tokens]
++            cb(moe_router_logits, "ffn_moe_logits_podsrc", il);
++        }
++        ggml_tensor * moe_out = build_moe_ffn(moe_in,
++                layer.ffn_pod_p != nullptr ? nullptr : layer.ffn_gate_inp,
++                nullptr,                /* gate_inp_b  */
+                 layer.ffn_up_exps,
++                layer.ffn_up_exps_b,
+                 layer.ffn_gate_exps,
++                layer.ffn_gate_exps_b,
+                 layer.ffn_down_exps,
++                nullptr,                /* down_exps_b */
+                 layer.ffn_exp_probs_b,
+                 n_expert, n_expert_used,
+                 LLM_FFN_SILU, hparams.expert_weights_norm,
+                 hparams.expert_weights_scale,
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+-                nullptr,
+-                nullptr,
+-                nullptr,
+-                nullptr,
+-                nullptr,
++                moe_router_logits,      /* probs_in: pre-bias logits from x (pre-POD) */
++                nullptr,                /* gate_up_exps */
++                nullptr,                /* gate_up_exps_b */
++                nullptr,                /* up_exps_s */
++                nullptr,                /* gate_exps_s */
++                nullptr,                /* down_exps_s */
+                 selected);
+         cb(moe_out, "ffn_moe_out", il);
+         ggml_tensor * ffn_shexp = build_ffn(cur,
