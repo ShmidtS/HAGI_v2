@@ -261,13 +261,14 @@ Prefill (один forward, KV-cache) + decode (single-position).
 
 ## 8. Конфигурация — `config.py`
 
-Dataclass-ручки: `ModelConfig` (hidden, layers, rope, head_up,
-branch_clamp_ratio), `AttentionConfig`, `EmbeddingConfig`, `FFNConfig`,
-`TernaryConfig`, `HeadConfig`, `TrainConfig` (lr, puncture, gram-scan,
+Все параметры конфигурации описаны dataclass'ами: `ModelConfig`
+(hidden, layers, rope, head_up, branch_clamp_ratio),
+`AttentionConfig`, `EmbeddingConfig`, `FFNConfig`, `TernaryConfig`,
+`HeadConfig`, `TrainConfig` (learning rate, puncture, gram-scan,
 saturation, init_from), `MergeConfig` (n_experts, mixer_type,
-mixer_rank, expert_checkpoints, drop_expert_mixers), `InferenceConfig`,
-`MuonConfig`/`AdamConfig`/`ScheduleConfig`, `DataConfig`,
-`LoggingConfig`.
+mixer_rank, expert_checkpoints, drop_expert_mixers),
+`InferenceConfig`, `MuonConfig`/`AdamConfig`/`ScheduleConfig`,
+`DataConfig`, `LoggingConfig`.
 
 - `load_config` — YAML + dotted overrides + `auto_configure`.
 - `validate_config` — fail-fast инварианты (включая merge-гарды).
