@@ -43,7 +43,7 @@ train:
   schedule:
     warmup_steps: 40
   checkpoint_dir: checkpoints/dbridge_loop2_s2
-  init_from: checkpoints/leafdat_2xcorp/step-0001600.pt
+  init_from: ''
   data:
     data_dir: data
     seq_len: 1024
