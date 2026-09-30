@@ -1,9 +1,0 @@
-=== ru (greedy) ===
-kцеркиff
-
-=== en (greedy) ===
- Ðµers
-
-=== math (greedy) ===
-
-
