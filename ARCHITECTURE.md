@@ -172,7 +172,7 @@ g+1 — рекурсивный цикл: 3 сиба → merge → joint → сн
   → сибы g2-s1..s3 (H=384, init_from gen1 joint, новые data-seed)
   → gen2 merged (H=1152, hadamard, clamp-8)
      + joint                                  [dbridge_gen2_merged_had_c8.yaml]
-  → TableLoRA r16 поверх                      [scripts/lora_gen2_joint_c8.py]
+  → TableLoRA r16 поверх                      [scripts/lora/lora_gen2_joint_c8.py]
   → (далее) gen-3 сибы от gen2 joint — та же схема
 ```
 
