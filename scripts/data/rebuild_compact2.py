@@ -13,6 +13,12 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, '../../..'))
+for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from compact_vocab import build_map, rewrite_stream  # noqa: E402
 
 data_dir = Path("data")

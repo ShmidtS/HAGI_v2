@@ -82,7 +82,16 @@ HAGI_v2/
 │       ├── self_improve.py   # opt-in self-improvement (gradient | rls)
 │       ├── ttt.py            # признаки → delta LoRA (anchored RLS)
 │       └── _rocm_fsdp_stub.py
-├── scripts/                  # CLI: train, merge, gate, аудиты, генерация
+├── scripts/                  # CLI, разбит по модулям:
+│   ├── train.py, infer.py, eval_domains.py, eval_holdout.py  # ядро
+│   ├── data/                 # подготовка корпусов (compact, pack, unigram)
+│   ├── growth/               # цикл роста (merge, gate, supervisor, f3)
+│   ├── lora/                 # ранговый канал (TableLoRA)
+│   ├── audits/               # измерительные сертификаты ручек
+│   ├── kernels/              # triton-кернелы HAGI
+│   ├── release/              # сборка/публикация релизов
+│   ├── dsv4/                 # трек сжатия DeepSeek-V4 (отдельная линия)
+│   └── research/             # исторические эксперименты (e3–e7, qwen, …)
 ├── configs/                  # YAML победной dbridge-линии (+фикстуры)
 ├── tests/                    # pytest (24)
 ├── data/                     # .compact.bin корпуса, mix.json, unigram
