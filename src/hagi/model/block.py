@@ -21,6 +21,7 @@ class Block(nn.Module):
         residual_scale: float = 1.0,
         init_orthogonal: bool = False,
         rope=None,
+        clamp_ratio: float = 2.0,
     ) -> None:
         super().__init__()
         self.attn = Attention(
@@ -31,6 +32,7 @@ class Block(nn.Module):
             residual_scale,
             init_orthogonal,
             rope=rope,
+            clamp_ratio=clamp_ratio,
         )
         self.mixer = mixer
         # Opt-in residual adapters (pyramid / TTT-LoRA). Only set by HAGI when
