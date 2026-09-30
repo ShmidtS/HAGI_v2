@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import solomonoff_model.model as M
+import solomonoff_model.model as M  # pyright: ignore[reportMissingImports]
 
 CFG = json.loads((Path.home() / "solomonoff" / "config.json").read_text())["learner"]
 WEIGHTS = Path.home() / "solomonoff" / "learner_1M.pth"
