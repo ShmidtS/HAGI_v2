@@ -1,5 +1,18 @@
 # HAGI
 
+**HAGI** is a **recursively growing ensemble language model**. Small
+trained experts (leaves) are combined by an exact function-preserving
+merge, communication is cheap (orthogonal transport plus a low-rank
+residual), and the cycle repeats generation after generation: 3
+siblings from a parent prior → ternary merge → short joint training →
+the parent becomes the prior of the next generation. At fixed compute,
+many narrow experts beat one wide from-scratch model (measured).
+
+Full architecture and code description: **[ARCHITECTURE.md](ARCHITECTURE.md)**
+(Russian; this summary is the English entry point).
+
+---
+
 **Рекурсивно растущий ансамблевый язык-модель (LM).** Маленькие обученные
 эксперты (листья) объединяются точным function-preserving слиянием,
 коммуникация — дешёвая (ортогональный транспорт + low-rank residual),
