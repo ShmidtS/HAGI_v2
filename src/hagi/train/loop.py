@@ -214,8 +214,13 @@ class Trainer:
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             try:
-                self.model = torch.compile(model, mode="default")
-                logger.info("torch.compile enabled (mode=default, mem-efficient SDPA)")
+                # max-autotune measured -3.7% vs default on the gen-2 LoRA
+                # step (1349 vs 1401 ms, round 51c); autotune cache persists
+                # so the ~80s warmup is one-time per shape/kernel set.
+                self.model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+                logger.info(
+                    "torch.compile enabled (mode=max-autotune-no-cudagraphs, mem-efficient SDPA)"
+                )
             except Exception as exc:
                 logger.warning("torch.compile failed (%s), continuing uncompiled", exc)
                 self.model = model
