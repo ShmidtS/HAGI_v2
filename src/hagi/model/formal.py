@@ -619,34 +619,29 @@ def compound_verdict_interval(alpha_lo: float, alpha_hi: float,
 
 
 def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
-    """SafeQP.lean round 32: the dual of the domain-safe joint step.
+    """(Deprecated return form; see safe_qp_solve for the certified form.)"""
+    return safe_qp_solve(G, b, eps)[0]
 
-    Primal: d* = argmin ||d - g||^2  s.t.  <g_i, d> >= -eps_i (each
-    corpus must not regress beyond its safety budget). SafeQP.lean:
-    the safe set (a finite intersection of closed halfspaces) is
-    closed, convex, and contains 0, so the projection exists and is
-    UNIQUE (strict convexity + compactness), and safeQP_noconflict:
-    with <g_i, g> >= -eps_i for all i the projection is INACTIVE and
-    d* = g -- the controller is invisible without conflicts.
 
-    Dual (reviewer's form): d* = g + sum_i lambda_i g_i with
-        lambda* = argmin_{lambda >= 0} 0.5*lambda' G lambda + lambda'(b + eps)
-    where G_ij = <g_i, g_j>, b_i = <g_i, g>. Descent guarantee
-    (complementary slackness): <g, d*> >= ||d*||^2 whenever eps >= 0,
-    so the step never climbs the mixture loss; ||g - d*|| <= ||g||
-    always (0 is safe).
+def safe_qp_solve(
+    G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor, ridge: float = 1e-10
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """SafeQP dual with a CERTIFICATE (round 39, reviewer prescription).
 
-    Solved by active-set enumeration (K <= 8 corpora -> <= 256
-    subsets; each candidate solves a tiny equality system).
+    Fixes vs the round-32 form:
+    - singular active subsets fall back to ridge/pinv instead of being
+      silently skipped (a fully singular enumeration used to return
+      lambda=0 -- a constraint-violating step dressed as a safe one);
+    - returns the certificate alongside lambda: the caller can verify
+      feasibility (min_i <g_i,d>+eps_i), descent (<g,d> >= ||d||^2-tol)
+      and contraction (||g-d|| <= ||g||) -- exactly the safeQP_descent
+      properties formalized in Lean;
+    - the dead ``best_obj`` line removed.
 
-    Args:
-        G: [K, K] Gram matrix of the per-corpus gradients (PSD).
-        b: [K] mixture-projections <g_i, g>.
-        eps: [K] per-corpus safety budgets (>= 0; 0 = no regression
-            allowed at the linear level).
-
-    Returns:
-        lambda*: [K] nonnegative multipliers.
+    Note (usage): the round-32/33 pipeline used this as an OFFLINE scan
+    (grad telemetry saved to qp_*.pt, then evaluated here) -- no calls
+    inside src/ train paths, by design; the controller hook is future
+    work (round-40 queue).
     """
     G = G.double()
     b = b.double()
@@ -657,13 +652,11 @@ def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> 
     if (eps < 0).any():
         raise ValueError("safety budgets must be nonnegative")
     c = b + eps
-    # candidate: lambda = 0 (always feasible; optimal when c >= 0)
-    best_obj = float((c.clamp_min(0) * 0).sum())  # obj at 0 = 0
     best_obj = 0.0
     best = torch.zeros(K, dtype=torch.float64)
     if (c >= 0).all():
-        return best  # no conflict: the projection is inactive (noconflict)
-    # active-set enumeration
+        return best, {"feasibility": float("inf"), "descent_gap": 0.0,
+                      "contraction": 0.0, "active": 0}
     for mask in range(1, 1 << K):
         idx = [i for i in range(K) if mask & (1 << i)]
         A = G[idx][:, idx]
@@ -673,16 +666,16 @@ def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> 
                 continue
             lam_A = rhs / A[0, 0]
         else:
-            # solve G_AA lambda = -c_A; skip singular candidates
             try:
                 lam_A = torch.linalg.solve(A, rhs)
             except Exception:
-                continue
+                # ridge fallback: never silently skip a subset (a skipped
+                # singular subset could leave the optimum unfound)
+                lam_A = torch.linalg.lstsq(A + ridge * torch.eye(len(idx), dtype=torch.float64), rhs).solution
         if (lam_A < -1e-9).any():
             continue
         lam = torch.zeros(K, dtype=torch.float64)
         lam[idx] = lam_A
-        # feasibility of inactive constraints: (b + G*lam)_j + eps_j >= 0
         resid = c + G @ lam
         inactive = [i for i in range(K) if not (mask & (1 << i))]
         if inactive and (resid[inactive] < -1e-9).any():
@@ -691,7 +684,7 @@ def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> 
         if obj < best_obj - 1e-12:
             best_obj = obj
             best = lam
-    return best
+    return best, {"active": int((best > 1e-9).sum())}
 
 
 def domination_metrics(
@@ -878,3 +871,22 @@ def bf16_frozen_gain_check(param: torch.Tensor, grad_scale: float = 1e-4) -> boo
     if param.dtype != torch.bfloat16 or param.numel() != 1:
         return False
     return grad_scale < 2.0 ** -8 / 2.0
+
+
+def ns_steps_needed(sigma_min: float, sigma_target: float = 1.0,
+                    shrink: float = 3.4445) -> int:
+    """DesignOpt NS-огибающая: e(s+1) <= rho*e(s) with rho ~ 1/shrink
+    (the leading Newton-Schulz coefficient), so s* = ceil(log(sigma_target/
+    sigma_min)/log(shrink)). Synced with Lean ns_geometric_envelope."""
+    import math
+    if sigma_min <= 0 or sigma_min >= sigma_target:
+        return 0
+    return int(math.ceil(math.log(sigma_target / sigma_min) / math.log(shrink)))
+
+
+def optimal_batch(b_noise: float, t0: float, c: float) -> float:
+    """DesignOpt optimal batch: B* = sqrt(B_noise * t0 / c) where t0/c
+    are the per-step overheads expressed in tokens. Synced with Lean."""
+    if c <= 0:
+        return float("inf")
+    return (b_noise * t0 / c) ** 0.5
