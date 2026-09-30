@@ -122,3 +122,4 @@ _archive/**/*.json
 /_audit_*.json
 /_cleanup.py
 logs/*.done
+_telemetry/
