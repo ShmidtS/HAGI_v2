@@ -47,12 +47,6 @@ def load_their_model(their_model_py: Path, cfg_path: Path, weights: Path, device
     pkg_dir = their_model_py.parent.parent
     if str(pkg_dir) not in sys.path:
         sys.path.insert(0, str(pkg_dir))
-import os
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.abspath(os.path.join(_HERE, '../../..'))
-for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
     for name in list(sys.modules):
         if name.startswith("solomonoff_model"):
             del sys.modules[name]
@@ -67,7 +61,6 @@ for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
     if any("lm_head" in k for k in missing):
         raise SystemExit(f"checkpoint does not fill lm_head: {missing[:5]}")
     return model.to(device).eval(), blob.get("round"), len(missing), len(unexpected)
-
 
 def bits_per_byte(model, data: np.ndarray, device: str, n_ctx: int = 1024,
                   windows: int = 24) -> float:

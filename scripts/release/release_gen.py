@@ -23,7 +23,7 @@ _REPO = os.path.abspath(os.path.join(_HERE, '../../..'))
 for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-import dsv4_generate_ttt as T  # noqa: E402
+import dsv4_generate_ttt as T  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 # Re-point the module's data roots at the release layout. Router tables ship
 # in routers.safetensors (not in the skeleton index); expert banks are the
@@ -131,7 +131,7 @@ def _patch():
                     and "--evolve" not in sys.argv)
     if fast_enabled:
         import collections
-        import triton_bank_kernels as tbk
+        import triton_bank_kernels as tbk  # pyright: ignore[reportMissingImports]
         from ternary_bank_kernels import k_h13t, trit_lut
 
         lut = trit_lut()

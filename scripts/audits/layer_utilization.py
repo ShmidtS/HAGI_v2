@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from lora_c8_deepen import build_stacked_prior
+from lora_c8_deepen import build_stacked_prior  # pyright: ignore[reportMissingImports]
 from hagi.train.loop import configure_runtime
 
 CORP = ["edu","python_instruct","wikipedia_en","wikipedia_ru","oscar_ru","openwebmath","tinystories","smoltalk"]

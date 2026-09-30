@@ -89,7 +89,7 @@ def build_layer_bank(L: int) -> bool:
 
 def build_routers() -> None:
     """Extract the per-layer router tables from the original snapshot."""
-    import dsv4_experts as de
+    import dsv4_experts as de  # pyright: ignore[reportMissingImports]
     out_fp = os.path.join(RELEASE, "routers.safetensors")
     if os.path.exists(out_fp):
         print("routers: exists - skip", flush=True)
@@ -143,7 +143,7 @@ def main():
     ap.add_argument("--skip-banks", action="store_true")
     args = ap.parse_args()
 
-    import dsv4_experts as de
+    import dsv4_experts as de  # pyright: ignore[reportMissingImports]
     SNAP = de.default_snapshot()
     os.makedirs(os.path.join(RELEASE, "layers"), exist_ok=True)
 

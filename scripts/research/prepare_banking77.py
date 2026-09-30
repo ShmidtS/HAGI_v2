@@ -49,7 +49,7 @@ from hagi.data.artifacts import (  # noqa: E402
     quarantine_jsonl,
     sha256_bytes,
 )
-from scripts.prepare_training_data import default_tokenizer  # noqa: E402
+from scripts.prepare_training_data import default_tokenizer  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 DEFAULT_EOS_ID = 1
 DEFAULT_VOCAB_SIZE = 262_144

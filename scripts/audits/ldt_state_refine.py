@@ -37,7 +37,7 @@ from hagi.model.norms import RMSNorm
 from hagi.train.loop import configure_runtime
 from pathlib import Path
 
-from lora_c8_deepen import build_stacked_prior
+from lora_c8_deepen import build_stacked_prior  # pyright: ignore[reportMissingImports]
 
 CORP = ["edu","python_instruct","wikipedia_en","wikipedia_ru","oscar_ru","openwebmath","tinystories","smoltalk"]
 W = [0.3571,0.2232,0.0893,0.0714,0.0625,0.0893,0.0536,0.0536]

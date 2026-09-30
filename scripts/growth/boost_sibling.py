@@ -41,7 +41,7 @@ for _p in (_HERE, os.path.join(_REPO, "scripts", "lora"), _REPO, os.path.join(_R
 import numpy as np
 import torch
 from hagi.train.loop import configure_runtime
-from lora_gen2_joint_c8 import build_lora_prior
+from lora_gen2_joint_c8 import build_lora_prior  # pyright: ignore[reportMissingImports]
 from pathlib import Path
 
 CORP = ["edu", "python_instruct", "wikipedia_en", "wikipedia_ru", "oscar_ru", "openwebmath", "tinystories", "smoltalk"]
@@ -135,6 +135,10 @@ def main() -> int:
         model = model.to("cuda")
         dl = build_dataloader(cfg, "data", start_offset=0)
         last = None
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from train import setup_logging
+        log_path = setup_logging(cfg.train.checkpoint_dir)
+        print(f"logging to {log_path}", flush=True)
         for metrics in train(model, dl, cfg, start_step=0):
             last = metrics
         print("done:", last)

@@ -717,6 +717,16 @@ def train(
     best_exact_ce: float | None = None
     no_improve_count = 0
 
+    # Divergence guard: stop once running ce rises ``divergence_delta`` above
+    # its own running minimum for ``divergence_patience`` consecutive logged
+    # samples. The round-54 boost-joint incident (ce 3.0 -> 4.0 at fixed lr)
+    # was caught by a human reading the log; this makes it a controller rule.
+    div_patience = int(cfg.train.divergence_patience)
+    div_delta = float(cfg.train.divergence_delta)
+    div_min_steps = int(cfg.train.divergence_min_steps)
+    min_run_ce: float | None = None
+    diverged_count = 0
+
     while trainer.step < cfg.train.max_steps:
         microbatches = []
         for _ in range(accum):
@@ -772,6 +782,29 @@ def train(
                         trainer.step,
                     )
                     break
+
+        # Divergence guard on the running ce (logged every interval, unlike
+        # exact_ce). Stops the run before divergence burns the remaining GPU
+        # budget; the last good checkpoint stays from checkpoint_interval.
+        if div_patience > 0 and "ce" in metrics and trainer.step >= div_min_steps:
+            run_ce = float(metrics["ce"])
+            if min_run_ce is None or run_ce < min_run_ce:
+                min_run_ce = run_ce
+                diverged_count = 0
+            elif run_ce > min_run_ce + div_delta:
+                diverged_count += 1
+                if diverged_count >= div_patience:
+                    logger.warning(
+                        "divergence: ce %.4f exceeds running min %.4f by >%.2f for %d samples; stopping at step %d",
+                        run_ce,
+                        min_run_ce,
+                        div_delta,
+                        div_patience,
+                        trainer.step,
+                    )
+                    break
+            else:
+                diverged_count = 0
 
         completed = step_index + 1
         if cfg.train.checkpoint_interval > 0 and completed % cfg.train.checkpoint_interval == 0:
