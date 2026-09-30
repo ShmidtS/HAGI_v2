@@ -27,6 +27,7 @@ model:
     enabled: false
   decision:
     enabled: false
+  branch_clamp_ratio: 8.0
 train:
   max_steps: 1600
   checkpoint_interval: 800
@@ -42,7 +43,7 @@ train:
     weight_decay: 0.3
   schedule:
     warmup_steps: 40
-  checkpoint_dir: checkpoints/dbridge_leaf_s1
+  checkpoint_dir: checkpoints/dbridge_leaf_s1_c8
   init_from: ''
   data:
     data_dir: data
