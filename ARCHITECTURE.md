@@ -7,20 +7,43 @@
 > Обязательно прочитай STATUS перед работой: значительная часть результатов
 > получена при сломанной конфигурации и уже перепроверяется.
 
-HAGI — это **тернарный RD-канальный каузальный языковой модуль** (BitNet
-b1.58). Модель трактуется как канал связи:
+HAGI — это **рекурсивно растущий ансамблевый LM**: маленькие
+обученные специалисты объединяются точно (function-preserving),
+коммуникация — дешёвая (ортогональный транспорт + low-rank
+residual), рост повторяется поколениями. Тело блока — BitNet-класс
+(тернарное квантование доступно, но ВЫКЛЮЧЕНО в победной линии).
+
+> **Честное разделение claims (round 40+):** рекорды сессии — это
+> growth/merge-эксперименты (Growth theorem): победная линия идёт
+> на dense-теле с `ternary.enabled: false`. Результаты по тернарному
+> телу (scale-invariance, 1.585 бит, absmean-инвариант) — отдельная
+> формализованная ветка (Growth+dense / Growth+ternary — не смешивать).
+
+**Победная линия (все рекорды эпохи-2):**
 
 ```
-tokens (+ опциональный фиксированный image/audio prefix)
-  -> source coder   (codebook + каузальный pulse-shaping фильтр)
-  -> ternary channel (L блоков, QK-нормализованный GQA + SwiGLU)
-  -> conditional head (shared-bank NCE, q = unigram source prior)
-  -> exact receiver  (полный алфавит для генерации и калибровки)
+8 корпусов (здоровая смесь)
+  -> листья H=128: pre-norm GQA + QK-norm + RoPE, SwiGLU (exp=1),
+     untied голова, fused CE, zero-init proj, 3 слоя, dense тело
+  -> block-diagonal merge (function-preserving, шаг-0 = ансамбль)
+  -> Hadamard-миксер + rank-64 residual (round 40: = SwiGLU при 12×
+     меньших параметрах)
+  -> joint-обучение, BranchScale clamp-8 (round 44: −0.016 ната
+     бесплатно, Lean branchscale_minmax)
+  -> поколение N+1: сибы от prior → merge → joint (рекурсия)
+  -> поверх: TableLoRA r16 (ранговый канал)
 ```
 
-Текущая версия — **V42** (`hagi-channel-v42`): полное каузальное внимание на
-всех слоях (W=0), T=512, punctured receiver. Исторические описания — в
-`docs/V41_ARCHITECTURE.md` и `docs/V42_ARCHITECTURE.md`.
+Выключено в победной линии (измерено/доказано не нужным на этом
+масштабе): ternary body, cortex, adapters, decision, unigram_prior,
+NCE (K_eff-вердикт), conv-фильтр (k=1), head_up (rank-контроль),
+рост батча (B_noise≈100 токенов), per-matrix NS (фикс 5 достаточен).
+
+Текущая версия — **V42** (`hagi-channel-v42`). Исторические описания
+— в `docs/V41_ARCHITECTURE.md` и `docs/V42_ARCHITECTURE.md`.
+Словарь по механизмам (не метафорам): «ternary» = BitNet-квантование
+весов; «TernaryF3Tree» = основание-3 DFT-микшер; «puncturing» =
+подвыборка токенов в loss.
 
 ---
 
