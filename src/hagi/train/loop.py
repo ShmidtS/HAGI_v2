@@ -34,6 +34,7 @@ from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
+from hagi.train.safeqp_controller import corpus_grad_gram
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,45 @@ class Trainer:
                 logger.warning("torch.compile failed (%s), continuing uncompiled", exc)
                 self.model = model
         self.optimizer = build_optimizer(model, cfg)
+        # Gradient-Gram scan state (log-only; see safeqp_controller docstring).
+        self._gram_samples: list[tuple[str, dict]] | None = None
+        self._gram_metrics_last: dict = {}
+
+    def _gram_scan_samples(self) -> list[tuple[str, dict]]:
+        """Lazily read one tail calibration window per configured corpus.
+
+        Windows are read from ``data/<name>.compact.bin`` tails (the same
+        last-2M convention as the gate), cached for the run. Kept tiny on
+        purpose: this is a measurement channel, not a data source.
+        """
+        if self._gram_samples is not None:
+            return self._gram_samples
+        import numpy as np
+
+        from pathlib import Path
+
+        tokens = int(self.cfg.train.gram_scan_tokens)
+        samples: list[tuple[str, dict]] = []
+        missing: list[str] = []
+        for name in self.cfg.train.gram_scan_corpora:
+            path = Path(self.cfg.train.data.data_dir) / f"{name}.compact.bin"
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+            total = path.stat().st_size // 4
+            with path.open("rb") as fh:
+                fh.seek(max(total - 2_000_000, 0) * 4)
+                raw = np.frombuffer(fh.read(tokens * 4 + 4), dtype=np.uint32).astype(np.int64)
+            ids = torch.from_numpy(raw[: tokens + 1])
+            samples.append(
+                (name, {"input_ids": ids[None, :-1], "targets": ids[None, 1:]})
+            )
+        if missing:
+            raise FileNotFoundError(
+                "gram_scan_corpora: missing corpus files: " + ", ".join(missing)
+            )
+        self._gram_samples = samples
+        return samples
 
     def load_optimizer_state(self, state: dict) -> None:
         self.optimizer.load_state_dict(state)
@@ -235,6 +275,40 @@ class Trainer:
         """
         if not microbatches:
             raise ValueError("train_step needs at least one microbatch")
+
+        model, cfg = self.model, self.cfg
+        # Gradient-Gram scan (Dominate.lean/SafeQP.lean, log-only): every
+        # gram_scan_interval steps, before the step's own gradients exist.
+        # Failures cost one log line, never the step; grads are zeroed after
+        # so the scan cannot leak into the update.
+        gram_metrics: dict = {}
+        interval = int(getattr(cfg.train, "gram_scan_interval", 0))
+        if interval > 0 and self.step % interval == 0:
+            try:
+                scan = corpus_grad_gram(
+                    model,
+                    self._gram_scan_samples(),
+                    device=next(model.parameters()).device,
+                    eps_rel=float(cfg.train.gram_scan_eps_rel),
+                )
+                self._gram_metrics_last = scan
+                gram_metrics = {
+                    "gram_min_cos": scan["min_cos"],
+                    "gram_conflicts": scan["n_conflicts"],
+                    "gram_domination": scan["domination_share"],
+                    "gram_active": int(scan.get("safe_qp_certificate", {}).get("active", 0)),
+                }
+                logger.info(
+                    "step %d gram-scan: min_cos=%.4f conflicts=%d domination=%.3f active=%d",
+                    self.step,
+                    scan["min_cos"],
+                    scan["n_conflicts"],
+                    scan["domination_share"],
+                    gram_metrics["gram_active"],
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+            except Exception as exc:  # measurement channel must not kill training
+                logger.warning("step %d gram-scan failed: %s", self.step, exc)
 
         model, cfg = self.model, self.cfg
         model.train()
@@ -519,6 +593,8 @@ class Trainer:
             "receiver": receiver,
             "update_applied": True,
         }
+        if gram_metrics:
+            metrics.update(gram_metrics)
         if receiver == "decision_only":
             metrics["lm_ce"] = None
         elif receiver == "conditional_nce":

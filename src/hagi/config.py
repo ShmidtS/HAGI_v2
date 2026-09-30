@@ -658,6 +658,16 @@ class TrainConfig:
     # 0 disables. Derived from anchor_drift_bound: the sampled loss
     # alone leaves the out-of-sample logits free to drift.
     nce_anchor_weight: float = 0.0
+    # Gradient-Gram scan (Dominate.lean/SafeQP.lean, reviewer round-5 p.2):
+    # every ``gram_scan_interval`` steps, per-corpus gradients on small tail
+    # calibration windows are measured (Gram, cos matrix, conflict flags and
+    # the SafeQP dual certificate when a conflict exists). LOG-ONLY: updates
+    # are never modified; the first deployment measures conflict prevalence
+    # at the current mix before any projection is allowed to act.
+    gram_scan_interval: int = 0  # 0 = disabled
+    gram_scan_corpora: list[str] = field(default_factory=list)
+    gram_scan_tokens: int = 1024
+    gram_scan_eps_rel: float = 0.0
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
