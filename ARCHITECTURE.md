@@ -1,361 +1,205 @@
-# HAGI — Архитектура проекта
+# HAGI — Архитектура
 
-Единый документ о структуре HAGI_v2: что делает модель, как устроен код,
-как устроен пайплайн рекурсивного роста и как всё связано между собой.
+Единый документ: как устроены модель, код и пайплайн рекурсивного роста
+в текущем состоянии. Версия **V42** (`hagi-channel-v42`, 4.2.0).
+Исторические результаты и rationale — в git history и `.omc/attempts/`.
 
-> **Текущее состояние проекта — в `STATUS.md`.** Здесь архитектура кода.
-> Обязательно прочитай STATUS перед работой: значительная часть результатов
-> получена при сломанной конфигурации и уже перепроверяется.
+HAGI — **рекурсивно растущий ансамблевый LM**. Маленькие обученные
+специалисты (листья) объединяются точно (function-preserving merge),
+коммуникация — дешёвая (ортогональный транспорт + low-rank residual),
+рост повторяется поколениями: сибы обучаются от prior'а-родителя,
+сливаются троично (3→1), joint-адаптируются, цикл повторяется.
 
-HAGI — это **рекурсивно растущий ансамблевый LM**: маленькие
-обученные специалисты объединяются точно (function-preserving),
-коммуникация — дешёвая (ортогональный транспорт + low-rank
-residual), рост повторяется поколениями. Тело блока — BitNet-класс
-(тернарное квантование доступно, но ВЫКЛЮЧЕНО в победной линии).
-
-> **Честное разделение claims (round 40+):** рекорды сессии — это
-> growth/merge-эксперименты (Growth theorem): победная линия идёт
-> на dense-теле с `ternary.enabled: false`. Результаты по тернарному
-> телу (scale-invariance, 1.585 бит, absmean-инвариант) — отдельная
-> формализованная ветка (Growth+dense / Growth+ternary — не смешивать).
-
-**Победная линия (все рекорды эпохи-2):**
+**Рекордная линия (mixed 8-corpora gate, exact CE):**
 
 ```
-8 корпусов (здоровая смесь)
-  -> листья H=128: pre-norm GQA + QK-norm + RoPE, SwiGLU (exp=1),
-     untied голова, fused CE, zero-init proj, 3 слоя, dense тело
-  -> block-diagonal merge (function-preserving, шаг-0 = ансамбль)
-  -> Hadamard-миксер + rank-64 residual (round 40: = SwiGLU при 12×
-     меньших параметрах)
-  -> joint-обучение, BranchScale clamp-8 (round 44: −0.016 ната
-     бесплатно, Lean branchscale_minmax)
-  -> поколение N+1: сибы от prior → merge → joint (рекурсия)
-  -> поверх: TableLoRA r16 (ранговый канал)
+8 корпусов (здоровая смесь, веса в mix.json)
+  → листья H=128 (dense тело, 3 слоя): pre-norm GQA + QK-norm + RoPE,
+     SwiGLU (exp=1), untied голова, fused CE, zero-init proj
+  → ТРОИЧНОЕ слияние 3 листа → родитель H=3·H_leaf
+     (block-diagonal, шаг-0 = ансамбль, off-diagonal нули)
+  → Hadamard-миксер (ортонормированный для любого N, rank-64 residual)
+  → joint-обучение; BranchScale clamp-8 per-layer
+  → поколение N+1: 3 сиба от joint-prior → merge → joint (рекурсия)
+  → поверх: TableLoRA r16 на embedding/head (ранговый канал)
 ```
 
-Выключено в победной линии (измерено/доказано не нужным на этом
+Линия роста — **троичное дерево 3→1 на каждом уровне** (не степени
+двойки): gen-1 = 3 листа H=128 → merged H=384; gen-2 = 3 сиба H=384 →
+merged H=1152; и т.д. Hadamard-трансформ строится для любого N:
+степень двойки — прямой Sylvester, иначе pad → первые N строк →
+QR-ортонормализация (см. `merge._hadamard_orthonormal`).
+
+Выключено в победной линии (измерено/доказано избыточным на этом
 масштабе): ternary body, cortex, adapters, decision, unigram_prior,
-NCE (K_eff-вердикт), conv-фильтр (k=1), head_up (rank-контроль),
-рост батча (B_noise≈100 токенов), per-matrix NS (фикс 5 достаточен).
+NCE-приёмник, conv-фильтр (k=1), head_up (rank-контроль), рост батча
+(B_noise ≈ 100 токенов), per-matrix NS (фикс 5 шагов достаточен),
+полный SwiGLU cross-mixer (hadamard равен при 12× меньших параметрах).
 
-Текущая версия — **V42** (`hagi-channel-v42`). Исторические описания
-— в `docs/V41_ARCHITECTURE.md` и `docs/V42_ARCHITECTURE.md`.
-Словарь по механизмам (не метафорам): «ternary» = BitNet-квантование
-весов; «TernaryF3Tree» = основание-3 DFT-микшер; «puncturing» =
-подвыборка токенов в loss.
+Словарь (механизмы, не метафоры): «ternary» = BitNet-квантование весов
+(доступно, выключено); «merge» = блочно-диагональная конкатенация;
+«puncturing» = подвыборка токенов в loss; «leaf/sib» = эксперт
+H=128 / потомок родителя; «joint» = короткое обучение после merge.
 
 ---
 
-## 1. Обзор структуры репозитория
+## 1. Структура репозитория
 
 ```
 HAGI_v2/
-├── src/hagi/                 # основной пакет
-│   ├── config.py             # все архитектурные конфиги + валидация
-│   ├── version.py            # версия и идентичность архитектуры
-│   ├── data/                 # пайплайн данных
-│   │   ├── dataset.py        # packed-corpus загрузчик
-│   │   ├── artifacts.py     # opt-in versioned manifests/acquisition boundary
-│   │   └── vocab_map.py      # маппинг компактного словаря
-│   ├── inference/
-│   │   └── generate.py       # авторегрессивная генерация с KV-cache
-│   ├── model/                # архитектура модели
+├── src/hagi/
+│   ├── config.py             # dataclass-конфиги + валидация + count_params
+│   ├── version.py            # V42, идентичность архитектуры
+│   ├── data/
+│   │   ├── dataset.py        # packed-corpus поток + смешанные окна
+│   │   ├── artifacts.py      # opt-in versioned manifests (граница приёмки)
+│   │   └── vocab_map.py      # маппинг compact↔исходного словаря
+│   ├── inference/generate.py # авторегрессионная генерация + KV-cache
+│   ├── model/
 │   │   ├── model.py          # HAGI (главный класс)
-│   │   ├── merge.py          # MergedHAGI + Hadamard/CrossMixer
-│   │   ├── ternary.py        # ternary STE и FP32-master/BF16 compute seam
-│   │   ├── cortex.py         # opt-in directed low-rank cross-level cortex
-│   │   ├── adaptive.py       # ownership boundary для trainable side-components
-│   │   ├── block.py          # трансформер-блок
+│   │   ├── merge.py          # MergedHAGI, Hadamard/CrossMixer, слияние
+│   │   ├── block.py          # трансформер-блок (pre-norm residual)
 │   │   ├── attention.py      # GQA + QK-norm + RoPE + windowing
-│   │   ├── embedding.py      # SourceEncoder (codebook + conv-фильтр)
-│   │   ├── ffn.py            # SwiGLU + BranchScale + linear
-│   │   ├── head.py           # LMHead (receiver)
+│   │   ├── embedding.py      # SourceEncoder (codebook + transmit filter)
+│   │   ├── ffn.py            # SwiGLU + BranchScale
+│   │   ├── head.py           # LMHead (receiver): fused CE, exact_loss
+│   │   ├── ternary.py        # BitLinear (b1.58), STE, step-cache
+│   │   ├── table_lora.py     # TableLoRA на embedding/head
 │   │   ├── norms.py          # RMSNorm / BlockRMSNorm / HeadNorm
 │   │   ├── rope.py           # 1D/2D RoPE
-│   │   ├── decision.py       # opt-in finite-option decision head
 │   │   ├── kv_cache.py       # KV-cache
-│   │   ├── outputs.py        # ModelOutput
-│   │   ├── ternary.py        # BitLinear (b1.58 квантование)
-│   │   └── multimodal.py     # мультимодальный мост (опционально)
+│   │   ├── cortex.py         # opt-in cross-level канал (выключен)
+│   │   ├── decision.py       # opt-in decision head (research-only)
+│   │   ├── multimodal.py     # Q-Former мост (выключен)
+│   │   └── outputs.py        # ModelOutput
 │   └── train/
-│       ├── loop.py           # тренировочный цикл
-│       ├── optim.py          # Muon + AdamW (HybridOptimizer)
-│       ├── checkpoint.py     # сохранение/загрузка чекпоинтов
-│       ├── self_improve.py   # opt-in онлайн-самоулучшение (gradient | rls)
-│       ├── ttt.py            # признаки → delta LoRA (anchored RLS, без генерации)
-│       └── _rocm_fsdp_stub.py# заглушка для ROCm Windows
-├── scripts/                  # CLI-скрипты
-├── configs/                  # YAML-конфиги
-├── docs/                     # историческая документация
-├── tests/                    # pytest-тесты
-├── data/                     # корпус (.bin, mix.json, unigram)
-├── checkpoints_*/            # чекпоинты (gitignored)
-├── logs/                     # логи обучения (gitignored)
-├── GROWING_HYPOTHESIS.md     # гипотеза рекурсивного роста
-├── AGENT_WORKLOG.md          # журнал работы агента
-├── BENCHMARKS.md             # результаты бенчмарков
-└── README.md                # краткое введение
+│       ├── loop.py           # Trainer: train_step, гейты, gram-scan
+│       ├── optim.py          # Muon + AdamW (HybridOptimizer), WSD
+│       ├── checkpoint.py     # формат 12, атомарная запись, lenient reload
+│       ├── safeqp_controller.py # per-corpus Gram-scan + SafeQP сертификат
+│       ├── self_improve.py   # opt-in self-improvement (gradient | rls)
+│       ├── ttt.py            # признаки → delta LoRA (anchored RLS)
+│       └── _rocm_fsdp_stub.py
+├── scripts/                  # CLI: train, merge, gate, аудиты, генерация
+├── configs/                  # YAML победной dbridge-линии (+фикстуры)
+├── tests/                    # pytest (24)
+├── data/                     # .compact.bin корпуса, mix.json, unigram
+├── checkpoints/              # вне git
+└── .omc/attempts/            # ledgers раундов (в git через add -f)
 ```
 
 ---
 
-## 2. Архитектура модели
+## 2. Модель
 
-### 2.1 Source coder — `model/embedding.py`
+### 2.1 SourceEncoder (`model/embedding.py`)
 
-`SourceEncoder` — кодирование токенов в пространство канала:
+Полная таблица `[V, H]` (не факторизуется: rank-r даёт информационный
+потолок). Transmit filter — каузальный depthwise Conv1d (k=1 в линии,
+т.е. выключен), несёт decode-state для инкрементальной генерации.
 
-- **Codebook** — полный `[V, H]`-таблица. Не факторизуется: rank-r
-  факторизация даёт жёсткий информационный потолок (измерено: 1.42 nats
-  остаточной KL при r=128 против 0.92 при r>=512). При `tie_lm_head=True`
-  таблица разделяется с LM-головой.
-- **Transmit filter** — каузальный depthwise Conv1d (pulse shaping). Смешивает
-  каждый символ с `k-1` предыдущими. Только left-pad: симметричный pad
-  протекает будущее в позицию t и ломает каузальность. Несёт decode-state для
-  инкрементальной генерации.
+### 2.2 Блок (`model/block.py`, `ffn.py`, `attention.py`)
 
-### 2.2 Ternary channel — `model/ternary.py`, `model/block.py`
+`x + attention(x)`, затем `x + ffn(x)`, оба pre-norm.
 
-- **BitLinear** — 2D-вес квантуется в `{-s, 0, +s}` (BitNet b1.58, 1.585
-  бит/вес). `s = mean(|W|, dim=1)` — per-output-channel масштаб. STE —
-  identity. Step-cache (OFDM coherence interval): квантованная карта
-  замораживается на один optimizer step.
-- **Block** — `x + attention(x)` затем `x + mixer(x)`, оба pre-norm.
-- **SwiGLU** — `down(silu(gate(x)) * up(x))`. `BranchScale` — обучаемый
-  ограниченный масштаб ветви (защита от роста нормы под Muon).
+- **Attention**: GQA, fused QKV-проекция, QK-norm (`HeadNorm`,
+  защита от насыщения softmax), RoPE. Полное внимание (W=0).
+- **FFN**: SwiGLU `down(silu(gate(x)) * up(x))`, expansion 1.
+- **BranchScale** — обучаемый per-branch масштаб с клампами
+  `[r/branch_clamp_ratio, r·ratio]`; `branch_clamp_ratio=8` в линии —
+  per-layer компенсация измеренной дисперсии ветвей.
 
-### 2.3 Attention — `model/attention.py`
+Тело dense (ternary доступен через `BitLinear`, в линии выключен).
 
-GQA-коррелятор с тремя информационно-теоретическими свойствами:
+### 2.3 LMHead (`model/head.py`)
 
-- **QK-norm** (`HeadNorm`) — ограничивает диапазон logits, не даёт softmax
-  насытиться (главная защита от дивергенции V30).
-- **Sliding window** — конечное состояние канала O(T·W); полные слои —
-  глобальные relay. В V42 W=0 (все слои полные).
-- **KV-cache** — замороженное состояние, декодирование O(T).
+Untied голова. Receiver gain (обучаемый скаляр), z-loss на
+нормализацию, chunked cross-entropy (logits блоками, `[N,V]` никогда
+не материализуется), `exact_loss` — точный CE для гейтов.
+`head_up` (up-projection) доступен, но в линии выключен.
 
-Fused QKV-проекция (одна матрица вместо трёх). Маски строятся один раз на
-размер окна и разделяются между слоями.
+### 2.4 KV-cache (`model/kv_cache.py`)
 
-### 2.4 Receiver — `model/head.py`
-
-`LMHead` — четыре ключевые идеи:
-
-- **Source prior** — фиксированный `log p_unigram` добавляется к logits.
-  Нулевой порядок кода бесплатен (~4.4 nats/token на инициализации).
-- **Receiver gain** — один обучаемый скаляр, инициализированный
-  `1/sqrt(H)`. Без него tied codebook даёт +41 logit на собственном токене и
-  уничтожает prior.
-- **z-loss** — штраф `logsumexp(logits)^2`, пиннит нормализацию у нуля.
-- **Chunked cross-entropy** — logits считаются блоками строк, никогда не
-  материализуется `[N, V]`. При `sampled_softmax_k > 0` — shared-bank NCE
-  (условный NCE против source prior).
-
-### 2.5 Pyramidal Cortex — `model/cortex.py`
-
-`PyramidalCortex` — opt-in, model-global side channel между непрерывными
-уровнями скрытых состояний. Он выключен по умолчанию и не является старым
-per-block `PyramidAdapter`. На границе каждого уровня публикуется low-rank
-summary; направленные adjacent/skip edges передают его только в следующие
-уровни. State живёт один pass (`loop_depth` начинает новый state), не переносится
-между токенами или generation steps и совместим с KV-decode.
-
-Links инициализируются нулями: untrained Cortex — точная no-op delta.
-Опционально `train.ternary_fp32_master=true` сохраняет FP32 masters для
-`BitLinear`, но effective ternary matmul остаётся в BF16; это training
-policy, а не физический packed storage. `freeze_base=True` оставляет
-trainable только adaptive-параметры Cortex и BlockAdapter.
-`self_improve(mode="rls")` обновляет только TTT-LoRA; для Cortex
-используется gradient path. Физические INT2/INT4/INT8/FP8 kernels не являются
-частью этого MVP; 4/8-bit поля Cortex runner — гипотетическая модель хранения,
-тогда как `ternary_precision_ab.py` измеряет live parameter/optimizer bytes.
-
-Полный контракт и bounded experiment gate: `docs/PYRAMIDAL_CORTEX.md` и
-`scripts/pyramidal_cortex_ab.py`.
-
-### 2.6 DecisionPlane — `model/decision.py`
-
-`model.decision.enabled=true` добавляет opt-in head над последней текстовой
-позицией после final norm/mixers. Он не изменяет LM logits. `ModelOutput`
-разделяет `lm_loss` и `decision_loss`; trainer нормализует их независимо.
-Поддерживаются mixed objective и отдельный pre-registered `decision_only`
-mechanism lane, причём metrics явно маркируют `receiver="decision_only"`.
-Decision head входит в `freeze_base`, не сливается из expert state и
-сохраняет full-vs-KV final-position parity. Трёхseedовый synthetic gate
-подтвердил mechanism, но не quality; статус — research-only.
-
-### 2.7 Мультимодальность — `model/multimodal.py`
-
-Опциональный Q-Former-подобный мост: сжимает любую модальность в фиксированное
-число `n_bridge_queries` токенов. Выключен в текущих конфигах.
+Декодирование O(T); `use_cache=False` — полный пересчёт (верификация).
 
 ---
 
-## 3. Блочно-диагональное слияние экспертов — `model/merge.py`
+## 3. Троичное слияние — `model/merge.py`
 
-Метод «train-many-small, merge-into-big»:
+Схема «train-many-small, merge-into-big», **N=3 на каждом уровне**:
 
-1. N маленьких экспертов обучаются до насыщения на N корпусах.
-2. Их скрытые пространства конкатенируются блочно-диагонально в одну широкую
-   модель: `W_Q = diag(W_Q^A, ..., W_Q^N)`.
-3. На шаге 0 модель — ровно N независимых экспертов (off-diagonal нули).
-4. Небольшое число cross-block mixer'ов (identity-init, gain 0) — единственные
-   новые связи; короткое joint-обучение учит блоки взаимодействовать.
+1. 3 эксперта (H=H_leaf) обучаются до насыщения (разные data-seed'ы,
+   общий prior у поколений ≥ 1).
+2. Скрытые пространства конкатенируются блочно-диагонально:
+   `W = diag(W_A, W_B, W_C)`; parent H = 3·H_leaf.
+3. Шаг 0 merged-модели — ровно ансамбль 3 экспертов (Jensen-выигрыш
+   бесплатно, off-diagonal нули, `logit_scale / 3`).
+4. Cross-block миксер — единственные новые связи; joint-обучение
+   короткое.
 
-### 3.1 `MergedHAGI`
+### 3.1 Миксеры
 
-- Encoder/out-norm/head — широкие (merged) версии.
-- Body-блоки — блочно-диагональная конкатенация экспертов.
-- Широкие RMSNorm заменяются на `BlockRMSNorm` (per-expert нормализация).
-- Per-head QK-gain (`per_head_qk=True`) — каждый блок сохраняет свой gain.
-- Тернарное квантование **включено** и на слитом теле. Ранее
-  `MergedHAGI.__init__` принудительно ставил `ternary.enabled = False` перед
-  сборкой модулей и восстанавливал флаг на объекте конфига в `finally`, то
-  есть модули строились как fp16, а сохранённый конфиг утверждал
-  `ternary.enabled: True`. Последствие: merged-рука обучалась и оценивалась
-  без rate-ограничения, а сравниваемый с ней baseline — под ним, и разрыв
-  0.56 нат был измерен не как слияние, а как слияние+снятое ограничение.
-  Аргумент «троичность не коммутирует с блочно-диагональным слиянием»
-  относится к точному воспроизведению экспертов в момент слияния, а не к
-  обучению уже слитого тела: после слияния строки оптимизируются, и
-  ограничение применяется к ним штатно.
+- **`HadamardMixer`** (по умолчанию): фиксированный ортонормальный
+  трансформ по оси экспертов + обучаемый low-rank residual (rank
+  `mixer_rank=64`). Для N=3 — pad→QR-ортонормализация (любое N).
+  На шаге 0 каждый блок видит нормированную сумму/разность остальных
+  за O(NH log N) FLOPs и ноль параметров транспорта.
+- **`CrossMixer`** (swiglu): полный SwiGLU H×2H — резервный путь,
+  равен по качеству при 12× параметров.
+- **Head pre-rotation**: при hadamard head-вес правомножается на Q,
+  чтобы шаг-0 logits совпадали с блочно-диагональным слиянием
+  (function-preserving инвариант `mixer_invisible_condition`).
 
-### 3.2 Mixer'ы
+### 3.2 Иерархический рост
 
-- **`CrossMixer`** (swiglu) — полный SwiGLU `H x 2H`, единственный
-  cross-block канал. `y = x + gain * down(silu(gate(x)) * up(x))`.
-- **`HadamardMixer`** (hadamard, по умолчанию) — фиксированный быстрый
-  Hadamard-трансформ по оси экспертов `(H_n/sqrt(n)) ⊗ I_H` плюс малый
-  обучаемый low-rank остаток (rank `mixer_rank`). На шаге 0 каждый блок видит
-  нормированную сумму/разность всех остальных — за O(NH log N) FLOPs и ноль
-  параметров. ~16x дешевле по параметрам и ~23% быстрее на шаг, с
-  идентичными step-0 logits (head pre-rotated).
+`drop_expert_mixers=True` — при слиянии merged-экспертов их миксеры
+сбрасываются, ставится свежий миксер следующего уровня. Родитель
+поколения g становится prior'ом (`train.init_from`) сибов поколения
+g+1 — рекурсивный цикл: 3 сиба → merge → joint → снова 3 сиба.
 
-### 3.3 Рекурсивный/локальный Hadamard
-
-`mixer_hadamard_groups: [2, 2]` задаёт рекурсивное дерево (16→4→1):
-`H = H_{g_k} ⊗ ... ⊗ H_{g_1}` (Kronecker-произведение per-level Hadamard).
-Каждый фактор ортонормален, произведение ортонормально. Для равномерных групп
-это равно глобальному `H_n` с точностью до перестановки каналов — разница в
-*порядке* sum/difference каналов, который решает, какие комбинации читаются
-как «крупномасштабные общие» vs «мелкомасштабные различия». Механизм готов к
-пайплайну роста 16→4→1, где каждый уровень несёт свой локальный mixer.
-
-**Head pre-rotation**: при Hadamard-mixer'е скрытый поток вращается на
-`Q = (H_n/sqrt(n)) ⊗ I_H`. Чтобы step-0 logits совпадали с блочно-диагональным
-слиянием, head-вес правомножается на `Q` (`hadamard_apply_2d`). Входной
-embedding НЕ вращается (он кормит первый блок, не head), кроме случая
-`tie_lm_head=True`, когда embedding и есть head.
-
-### 3.4 Иерархическое слияние
-
-`drop_expert_mixers=True` — при иерархическом слиянии эксперты сами являются
-`MergedHAGI` со своими mixer'ами, которые отбрасываются и заменяются свежим
-mixer'ом следующего уровня. `logit_scale` делится на `sqrt(N)` (широкая head
-суммирует N вкладов).
+Гард: `train.zero_init_proj ∧ merge.enabled` → ValueError (конфиг
+не пройдёт валидацию — zero-init уничтожает function-preserving шаг-0).
 
 ---
 
-## 4. Пайплайн рекурсивного роста
-
-### 4.0 Что исполняется фактически (важно)
-
-Описанное ниже «Level-0 / Level-1» — проектный замысел. **Фактически
-измеренное состояние другое**, и его нельзя перепутать:
-
-- **Реально работает и измерено:** M2-пайплайн. 3 доменных эксперта
-  (ru / en / mathcode) по H=384, 3000 шагов каждый, слияние в H=1152,
-  joint 9000 шагов. Измерено на 3 доменах: слияние даёт -1.99 нат против
-  scratch с равной архитектурой и бюджетом (см. `STATUS.md`).
-- **Никогда не исполнялось на реальном масштабе:** рекурсивный цикл из
-  `orchestrator/real_cycle.py`. Все его прогоны — hidden=8, 1 слой,
-  vocab 3060, 64 шага, CPU, метрика Banking77-CE. Это другая величина, чем
-  3-доменный exact CE из M2, поэтому цикл пока не может подтвердить или
-  опровергнуть результат M2.
-- **Готовится:** N=6 (6 экспертов по H=384 → H=2304), см.
-  `configs/m2_e6_*` и `configs/m2_e6_joint_s1234.yaml`.
-
-Лимиты, которые делали реальный масштаб невыразимым (`_MAX_STEPS = 64`,
-CPU-only гейт, `hidden_size = 8`), сняты в `real_cycle.py`.
-
-### 4.1 Проектный замысел
-
-Текущий пайплайн (level-1):
+## 4. Пайплайн роста (победная dbridge-линия)
 
 ```
-Level-0: 18 per-corpus экспертов (H=128) -> блочно-диагональное слияние -> H=2304
-Level-1: 4 эксперта (ru/en/math/instruct, H=2304) из общего prior
-         -> слияние с рекурсивным Hadamard [2,2] -> H=9216 (~1.018B)
-Joint:   короткое обучение, учит блоки взаимодействовать
+листья s1..s3 (H=128, seeds различны)         [configs/dbridge_leaf_s*.yaml]
+  → gen1 merged (H=384)  + joint 1600 шагов   [dbridge_gen1_merged/joint.yaml]
+  → сибы g2-s1..s3 (H=384, init_from gen1 joint, новые data-seed)
+  → gen2 merged (H=1152, hadamard, clamp-8)
+     + joint                                  [dbridge_gen2_merged_had_c8.yaml]
+  → TableLoRA r16 поверх                      [scripts/lora_gen2_joint_c8.py]
+  → (далее) gen-3 сибы от gen2 joint — та же схема
 ```
 
-### 4.1 Скрипты
+Гейт (verdict-протокол): 8 корпусов, weighted exact CE, tail-окна
+(−2M, 300k токенов), 2×1024 на корпус, сравниваются только
+идентичные окна. Смешанная оценка через `head.exact_loss`.
 
-| Скрипт | Назначение |
-|--------|-----------|
-| `scripts/train.py` | train / resume / init-from модели |
-| `scripts/merge_level1.py` | слияние 4 level-1 экспертов в H=9216 |
-| `scripts/merge_experts.py` | низкоуровневый CLI блочно-диагонального слияния |
-| `scripts/run_level1_pipeline.sh` | end-to-end драйвер level-1 |
-| `scripts/eval_domains.py` | per-domain exact CE / perplexity |
-| `scripts/infer.py` | интерактивный диалог |
-| `scripts/compact_vocab.py` | компактизация словаря |
-| `scripts/count_unigram.py` | подсчёт unigram-частот |
-| `scripts/preprocess_gemma.py` | raw .jsonl -> .bin |
-| `scripts/rebuild_compact2.py` | пересборка .compact2.bin |
-
-> Одноразовые bench/profile/smoke скрипты (`bench_train_step.py`,
-> `bench_sampled_head.py`, `breakdown.py`, `prof_step.py`, `smoke_real.py`)
-> были удалены в `0b5ef7f` как one-off: их выводы зафиксированы в
-> BENCHMARKS.md, воспроизводить их нечем и незачем.
-
-### 4.2 Конфиги
-
-- `configs/level0_merged_3.yaml` — level-0 merged.
-- `configs/level0_ab/*.yaml` — A/B срезы (ru_baseline, ru_sink).
-- `configs/level0_experts/expert_*.yaml` — level-0 эксперты по доменам.
-- `configs/level1/expert_*.yaml` — 4 level-1 эксперта (ru/en/math/instruct).
-
-> `configs/level0_merged.yaml` (H=2304, 18 экспертов) и
-> `configs/level1_merged.yaml` (H=9216) удалены в `8e32498` вместе с мёртвыми
-> конфигами v41–v45; merged-архитектура описана в разделе 3, а не файлом.
-
-### 4.3 Чекпоинты
-
-Каталоги чекпоинтов — выход тренировок, в git не входят (`checkpoints*/` в
-`.gitignore`) и на диске отсутствуют, пока не запущена тренировка:
-
-- `checkpoints_corpus/` — level-0 эксперты (по корпусам/срезам).
-- `checkpoints_level0_merged/` — level-0 merged.
-- `checkpoints_l1/` — level-1 эксперты (ru_general, en_general, math_code,
-  instruct).
-- `checkpoints_l1_merged/` — merged H=9216 + joint-обучение.
+Равный бюджет для всех рук: 1600 шагов joint ≈ 52M токенов;
+контроль scratch (равные FLOPs) проигрывает росту ~1 нат.
 
 ---
 
 ## 5. Данные — `data/dataset.py`
 
-**Packed-corpus пайплайн**: документы конкатенируются в плоский поток токенов
-и режутся на окна фиксированной длины без паддинга. Каждое окно несёт
-`doc_ids`, маска внимания блочно-диагональна по документам. Утилизация 0.41–0.80
-при T=512 против 0.10–0.43 при T=2048 у per-document схемы.
+Packed-corpus: документы конкатенируются в плоский поток, окна
+фиксированной длины без паддинга, `doc_ids` → блочно-диагональная
+маска внимания. Утилизация 0.41–0.80 против 0.10–0.43 у per-document.
 
-- `PackedStream` — memory-mapped поток, конечный (recursive-growth примитив:
-  следующий эксперт продолжает с `start_offset`).
-- `PackedMixDataset` — бесконечный итератор пропорционально-смешанных окон.
-- `load_mix` — per-source веса из `mix.json`.
-- `dataset_path` — предпочитает `.compact2.bin` > `.compact.bin` > `.bin`.
+- `PackedStream` — memory-mapped, конечный; следующий эксперт
+  продолжает с `start_offset` (примитив рекурсивного роста).
+- `PackedMixDataset` — бесконечные пропорционально-смешанные окна
+  (каждый шаг видит всю дистрибуцию корпусов).
+- `dataset_path`: `.compact2.bin` > `.compact.bin` > `.bin`;
+  compact-словарь 32768 (`vocab_map.npz` + gemma-токенизатор для
+  инференса-текста).
 
-Opt-in `data/artifacts.py` не меняет этот production interface. Он
-публикует новый dataset только после полного manifest/file-map,
-SHA-256, count/range и staging-time validation. Bounded acquisition и
-versioned preparation находятся в `scripts/prepare_training_data.py`;
-`scripts/prepare_banking77.py` публикует отдельно pinned Banking77 с
-preserved labels/provenance и little-endian EOS-packed token shards.
-`scripts/common_reference_eval.py` читает exact UTF-8 held-out text, не
-изменяя production loader. Детали и frontier verdict — в
-`docs/RESEARCH_FRONTIER.md`.
+8 корпусов и веса: edu .3571, python_instruct .2232, wikipedia_en
+.0893, wikipedia_ru .0714, oscar_ru .0625, openwebmath .0893,
+tinystories .0536, smoltalk .0536.
 
 ---
 
@@ -363,126 +207,102 @@ preserved labels/provenance и little-endian EOS-packed token shards.
 
 ### 6.1 `loop.py`
 
-Основной LM objective и опциональный decision auxiliary вычисляются
-один раз на microbatch. Gradient accumulation независимо нормализует
-scored LM tokens и decision rows. Ключевые наблюдаемые: `ce`
-(против unigram-энтропии 8.06 nats), `decision_loss`, `qk_gain`
-(индикатор насыщения softmax), `logit_scale` (рост gain'а receiver'а).
+Один forward на microbatch; gradient accumulation нормализует scored
+LM tokens. Ключевые наблюдаемые: `ce` (против unigram-энтропии 8.06
+nats), `qk_gain`, `logit_scale`, `exact_ce` (периодический точный CE).
 
-- `puncture_loss_mask` — erasure channel на supervision (ce_keep_rate).
-- `cast_model` — bf16 + fp32-гейны (`keep_fp32`) и optional FP32
-  `BitLinear` masters при BF16 effective matmul.
+- `puncture_loss_mask` — erasure channel на supervision
+  (`ce_keep_rate`).
 - `clip_gradients_by_group` — раздельный клип Muon/AdamW.
-- Decision rows используют отдельный denominator; пустой scored step
-  отклоняется, а pre-registered decision-only lane маркируется отдельно.
 - Saturation early-stop на exact_ce.
+- **Gram-scan** (`train.gram_scan_interval`): периодический
+  per-corpus градиентный скан (cos-матрица, доминация, конфликт-флаги,
+  SafeQP-сертификат) — log-only канал измерения конфликтов смеси.
 
 ### 6.2 `optim.py`
 
-- **Muon** — momentum SGD с Newton-Schulz ортогонализацией для 2D channel
-  весов (маркер `is_channel_weight`).
-- **AdamW** — для codebook, 1D gain'ов, bias'ов, router'ов.
-- `HybridOptimizer` — драйвер обоих как одного.
-- WSD schedule (warmup-stable-decay), inverse-sqrt stable.
+Muon (Newton–Schulz, ns_steps=5) для 2D channel-весов + AdamW для
+таблиц/гейнов; `HybridOptimizer` как один драйвер; WSD-schedule
+(warmup-stable-decay, inverse-sqrt stable). В fresh-руках H≥384:
+compile off, fused_ce off, z_loss 1e-4, Muon off, lr 1e-3;
+`logit_scale_max` кламп в optim.
 
 ### 6.3 `checkpoint.py`
 
-Формат 12. Строгая валидация схемы до применения (частично применённый load —
-самый дорогой сбой). Атомарная запись (temp + `os.replace`), ротация
-`keep_last`. `load_model` с `skip_prefixes` для свежих mixer'ов при
-рекурсивном росте.
+Формат 12. Строгая валидация схемы на live-конфигах; lenient reload
+для чекпоинтов с удалёнными полями (только путь перезагрузки).
+Атомарная запись (temp + os.replace), ротация keep_last.
 
-### 6.4 `self_improve.py`
+### 6.4 `safeqp_controller.py`
 
-Opt-in цикл «сыграл → оценил → обновился → переоценил». База заморожена
-(`train.adapt.freeze_base=True`), обучаются только адаптеры. Оба режима делят
-один транзакционный конверт: снимок параметров адаптеров (+ состояние
-оптимизатора там, где он есть) до шага, точный `KL(pre‖post)` на сгенерированных
-позициях, откат при нарушении границы, `trainer.step` восстанавливается в
-`finally` даже если сам откат упал.
+`corpus_grad_gram()` — пер-корпусные градиенты на tail-калибровке,
+Gram/cos/доминация, конфликт ⟺ ⟨g_i,ḡ⟩ < −ε‖g_i‖‖ḡ‖; при конфликте
+двойственное решение SafeQP с сертификатом descent. Обновления не
+меняет (log-only).
 
-- `mode="gradient"` (поведение по умолчанию) — траектория заново на каждой
-  итерации, обновление через `Trainer.train_step`.
-- `mode="rls"` — генерация **один раз** на весь цикл, далее замкнутая подгонка
-  `lora_B` из признаков (§6.5). Оптимизатор не создаётся вообще.
+### 6.5 `self_improve.py`, `ttt.py`
 
-### 6.5 `ttt.py` — признаки → delta LoRA
-
-Ускорение за счёт mapping параметров: второй генерации (ни self-critique, ни
-оценочного роллаута) нет. Один teacher-forced проход по уже известным токенам
-даёт точную локальную ошибку каждого блока, и якорный RLS подгоняет `lora_B`
-в замкнутом виде.
-
-Идентичность, на которой всё держится: `Block.forward` добавляет дельту
-адаптера к выходу блока (`x = x + adapter(mixer_input, x)`), поэтому
-`dL/d(delta) ≡ dL/d(block_output)` — это тождество, а не приближение. Цель —
-`-stream_frac · (rms_h / rms_g) · g`, то есть отрицательный градиент,
-перемасштабированный в долю от RMS потока (CE усредняется по позициям, поэтому
-сырой градиент ≈ 5.7e-5 от RMS потока и бессмысленен как шаг).
-
-- Алгоритм — якорные нормальные уравнения с честным holdout 1/5, как в
-  `scripts/qwen_ttt_lora.py:LowRankLoRA.rls_step` (тот модуль в зоне экспериментов
-  и не импортируется; ссылка — контракт, по образцу `model/adapters.py`).
-- Решение применяется только если оно уменьшает train-остаток.
-- `max_delta_rms_frac` — жёсткий потолок RMS дельты относительно потока.
-- Инварианты: база не тронута, `lora_A` заморожен, `TttStats.generations == 0`.
-- Harvest отделён от подгонки (`_harvest` / `rls_step`), потому что исключение
-  holdout нельзя доказать через модель: правка holdout-токенов меняет градиенты
-  **ранних** позиций (ранний выход читается как KV поздними).
-
-Измерено на tiny-модели (6 итераций × 5 сидов, `n_new_tokens=16`):
-форвардов на итерацию — градиентный 19.00 константа, rls `3 + 16/iters`
-(1.00x при iters=1 → 4.75x при iters=16, асимптота 19/3 = 6.33x);
-wallbacklock 114.1 → 91.5 ms/итер (1.25x — на крошечной CPU-модели доля
-генерации съедается оверхедом вызовов); снижение CE за цикл +4.6e-05 против
-+1.27e-02. Ускорение на реальном 27B не измерялось и не заявляется.
+Opt-in цикл «сыграл → оценил → обновился»; база заморожена, транзакционный
+конверт с KL-границей и откатом. `ttt.py` — замкнутая RLS-подгонка
+delta-LoRA из признаков (одна teacher-forced генерация, без второго
+роллаута). В победной линии не задействованы.
 
 ---
 
 ## 7. Генерация — `inference/generate.py`
 
-Prefill (один forward, заполняет KV-cache) + decode (single-position forward).
-`filter_logits` — repetition penalty → temperature → top-k → top-p (порядок
-важен). `use_cache=False` — полный пересчёт (O(T²), для верификации кэша).
+Prefill (один forward, KV-cache) + decode (single-position).
+`filter_logits`: repetition penalty → temperature → top-k → top-p.
+Текстовый мост: compact id → `vocab_map.npz` → gemma-токенизатор.
 
 ---
 
 ## 8. Конфигурация — `config.py`
 
-Все архитектурные ручки в dataclass'ах: `ModelConfig`, `AttentionConfig`,
-`SlidingWindowConfig`, `EmbeddingConfig`, `FFNConfig`, `TernaryConfig`,
-`HeadConfig`, `MultimodalConfig`, `TrainConfig`, `MergeConfig`,
-`InferenceConfig`, `MuonConfig`, `AdamConfig`, `ScheduleConfig`, `DataConfig`,
+Dataclass-ручки: `ModelConfig` (hidden, layers, rope, head_up,
+branch_clamp_ratio), `AttentionConfig`, `EmbeddingConfig`, `FFNConfig`,
+`TernaryConfig`, `HeadConfig`, `TrainConfig` (lr, puncture, gram-scan,
+saturation, init_from), `MergeConfig` (n_experts, mixer_type,
+mixer_rank, expert_checkpoints, drop_expert_mixers), `InferenceConfig`,
+`MuonConfig`/`AdamConfig`/`ScheduleConfig`, `DataConfig`,
 `LoggingConfig`.
 
-- `load_config` — YAML + dotted overrides + `auto_configure` (решение H/L из
-  body-бюджета).
-- `validate_config` — все структурные инварианты fail-fast (включая
-  `mixer_hadamard_groups`: степени двойки, произведение == n_experts).
-- `count_params` — аналитический подсчёт параметров по группам.
-- `describe` — одноблочное человекочитаемое резюме.
+- `load_config` — YAML + dotted overrides + `auto_configure`.
+- `validate_config` — fail-fast инварианты (включая merge-гарды).
+- `count_params` — аналитический подсчёт по группам.
+
+Живые конфиги (`configs/`): dbridge-линия (leaf s1–s3, gen1
+merged/joint, gen2 sib1–3/merged/joint/merged_had/merged_had_c8,
+loop2 s1–s3, f3_d1, scratch_h384, leaf_rank384) + фикстура
+`parent_h128_flat.yaml` (пиннинг merge-инварианта в тестах).
 
 ---
 
 ## 9. Тесты — `tests/`
 
-pytest-набор по модулям: `test_attention`, `test_checkpoint`, `test_config`,
-`test_dataset`, `test_embedding`, `test_generate`, `test_head`, `test_layers`,
-`test_loop`, `test_model`, `test_multimodal`, `test_optim`, `test_ternary`,
-`test_vocab_map`. Покрывают merge/hadamard/model/config пути.
+24 теста: merge-инварианты (шаг-0 = ансамбль, temperature),
+hadamard-ортогональность, formal-utils (safe_qp, ns, optimal_batch),
+safeqp-controller (конфликт/сертификат/чистые грады), config,
+checkpoint, dataset, attention, generate, head, vocab_map.
 
 ---
 
-## 10. Ключевые идеи (сводка)
+## 10. Ключевые принципы
 
-1. **Канал связи**: source coder → ternary channel → receiver. Квантование —
-   rate constraint, ошибка квантования — единственный шум.
-2. **Source prior** — бесплатный нулевой порядок кода (~4.4 nats/token).
-3. **QK-norm** — защита от насыщения softmax (главный фикс V30).
-4. **Packed corpus** — 2-9x эффективный throughput против per-document.
-5. **Блочно-диагональное слияние** — наследует N сформированных
-   специализированных подпространств вместо их открытия с нуля.
-6. **Hadamard mixer** — фиксированная sum/difference связь на шаге 0,
-   рекурсивная версия готова к 16→4→1 росту.
-7. **Recursive growth** — каждый уровень специализируется из общего prior
-   предыдущего уровня.
+1. **Покупать разнообразие, а не параметры**: при фиксированном
+   бюджете много узких экспертов > один широкий scratch (измерено;
+   формализация: GapLaw/Select).
+2. **Merge — центральный механизм**: блочно-диагональное слияние
+   наследует сформированные подпространства; коммуникация — поверх,
+   дёшево (ортогональный транспорт + low-rank).
+3. **Function-preserving инварианты обязательны**: любой новый миксер
+   сначала проверяется на шаг-0 тождество (head pre-rotation, гард
+   zero_init_proj).
+4. **Ручки из измерений**: ранги — из спектра, scales — из дисперсий,
+   NS — из σ-массы, batch — из B_noise; сертификаты (ρ_c, Gram-scan)
+   до GPU.
+5. **Отбор по diversity, не по standalone CE**: Fisher/Jensen-novelty
+   (лучший одиночный эксперт может быть худшим ансамблевым
+   дополнением — доказано контрпримером).
+6. **Иерархия каналов**: специализация → merge → дешёвая коммуникация
+   → joint → low-rank residual (LoRA) — в этом порядке.
