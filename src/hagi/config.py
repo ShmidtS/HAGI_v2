@@ -1109,18 +1109,24 @@ def auto_configure(
     return cfg
 
 
-def _apply_dict(obj: object, data: dict) -> None:
+def _apply_dict(obj: object, data: dict, *, lenient: bool = False) -> None:
     """Recursively overlay a plain dict onto a dataclass instance.
 
     Unknown keys are rejected rather than ignored: a silently dropped key in a
     training config is a multi-hour failure that looks like a modelling result.
+    ``lenient=True`` (checkpoint reload path) drops fields that were removed
+    from the config schema AFTER the checkpoint was written -- their removal
+    is already audited (round 45), and refusing to load a trained model over
+    a dead schema field would make every old checkpoint unreadable.
     """
     for key, value in data.items():
         if not hasattr(obj, key):
+            if lenient:
+                continue
             raise ValueError(f"unknown config key {key!r} for {type(obj).__name__}")
         current = getattr(obj, key)
         if hasattr(current, "__dataclass_fields__") and isinstance(value, dict):
-            _apply_dict(current, value)
+            _apply_dict(current, value, lenient=lenient)
         elif isinstance(current, tuple) and isinstance(value, list):
             setattr(obj, key, tuple(value))
         else:

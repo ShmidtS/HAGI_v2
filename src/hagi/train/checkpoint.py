@@ -48,7 +48,7 @@ def config_from_dict(data: Mapping) -> Config:
     """Rebuild and validate a config from checkpoint data."""
     cfg = Config()
     try:
-        _apply_dict(cfg, dict(data))
+        _apply_dict(cfg, dict(data), lenient=True)
         validate_config(cfg)
     except (TypeError, ValueError) as exc:
         raise _fail(f"stored config is invalid: {exc}") from exc
