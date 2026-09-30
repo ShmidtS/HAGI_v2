@@ -94,6 +94,7 @@ def load_model(
     model: nn.Module,
     device: str = "cpu",
     skip_prefixes: tuple[str, ...] = (),
+    lenient_config: bool = False,
 ) -> tuple[int, Config]:
     """Validate a checkpoint fully, then load its weights.
 
@@ -114,7 +115,14 @@ def load_model(
         ``(completed_steps, config)``.
     """
     state = load_payload(path, device)
-    cfg = config_from_dict(state["config"])
+    if lenient_config:
+        # init_from path: the stored config predates current validation rules
+        # (round-40 zero_init guard) but only the WEIGHTS are consumed as a
+        # prior; the caller's own validated config governs the run. Third
+        # occurrence of this failure -> controller rule (round 56).
+        cfg = Config()
+    else:
+        cfg = config_from_dict(state["config"])
 
     incoming = state["model"]
     current = model.state_dict()

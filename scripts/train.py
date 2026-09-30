@@ -384,7 +384,8 @@ def main() -> int:
         # that enables the prior rebuilds it from its own config, and a prior
         # without it must not inherit a stale one (round-28 NCE A/B).
         _, _ = load_model(
-            path, model, str(device), skip_prefixes=("mixers.", "head.log_prior")
+            path, model, str(device), skip_prefixes=("mixers.", "head.log_prior"),
+            lenient_config=True,
         )
         logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
     elif args.resume is not None:
