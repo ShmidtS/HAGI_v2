@@ -219,6 +219,10 @@ class HeadConfig:
     sampled_proposal: str = "uniform"
     sampled_in_batch_fraction: float = 0.0
     logit_scale_max: float = 0.0
+    head_up: int = 0
+    # Round-39 reviewer control: up-projection H->head_up before the untied
+    # projection, lifting the softmax-bottleneck rank ceiling from H to head_up.
+    # 0 = disabled (all historical configs).
 
 
 @dataclass

@@ -261,8 +261,16 @@ class LMHead(nn.Module):
             self.projection = None
         else:
             self._tied_ref = []
-            self.projection = nn.Linear(hidden_size, vocab_size, bias=False)
-            nn.init.normal_(self.projection.weight, std=hidden_size**-0.5)
+            head_in = hidden_size
+            self.up = None
+            if int(getattr(cfg, "head_up", 0) or 0) > 0:
+                # Round-39 rank-ceiling control: up-projection lifts the
+                # effective head rank from H to head_up (softmax bottleneck).
+                head_in = int(cfg.head_up)
+                self.up = nn.Linear(hidden_size, head_in, bias=False)
+                nn.init.normal_(self.up.weight, std=hidden_size**-0.5)
+            self.projection = nn.Linear(head_in, vocab_size, bias=False)
+            nn.init.normal_(self.projection.weight, std=head_in**-0.5)
 
         # One learnable receiver gain. See the module docstring: without it a tied
         # codebook starts with a ``H * init_std`` self-correlation outlier, which
@@ -290,12 +298,16 @@ class LMHead(nn.Module):
         """The effective ``[V, H]`` output projection."""
         return self._tied_ref[0] if self._tied_ref else self.projection.weight
 
+    def _eff_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the optional up-projection (rank-ceiling control)."""
+        return self.up(hidden) if self.up is not None else hidden
+
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Full logits for ``[..., H]`` — for generation and diagnostics only.
 
         Training must use :meth:`loss`, which never materializes ``[N, V]``.
         """
-        out = F.linear(hidden * self.logit_scale.to(hidden.dtype), self.weight)
+        out = F.linear(self._eff_hidden(hidden) * self.logit_scale.to(hidden.dtype), self.weight)
         if self.log_prior is not None:
             out = out + self.log_prior.to(out.dtype)
         return out
@@ -320,6 +332,7 @@ class LMHead(nn.Module):
         bias = self.log_prior.to(hidden.dtype) if self.log_prior is not None else None
         # The gain is applied outside the custom Function: autograd then routes a
         # gradient to it through this multiply, with no extra pass over [N, V].
+        hidden = self._eff_hidden(hidden)
         scaled = hidden * self.logit_scale.to(hidden.dtype)
         k = int(getattr(self.cfg, "sampled_softmax_k", 0) or 0)
         if k > 0:
@@ -366,6 +379,7 @@ class LMHead(nn.Module):
         if hidden.shape[0] == 0:
             return hidden.new_zeros((), dtype=torch.float32)
         bias = self.log_prior.to(hidden.dtype) if self.log_prior is not None else None
+        hidden = self._eff_hidden(hidden)
         scaled = hidden * self.logit_scale.to(hidden.dtype)
         ce, _ = _ChunkedCrossEntropy.apply(
             scaled,
