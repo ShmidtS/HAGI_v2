@@ -133,3 +133,43 @@ def test_saturated_threshold_derived():
 
 if __name__ == "__main__" and "jensen_gap_lse" in dir():
     pass
+
+
+def test_safe_qp_property_random():
+    """Property test (round 39): random grads incl. duplicates and zeros --
+    the certificate must hold: descent, contraction, feasibility."""
+    import torch
+    from hagi.model.formal import safe_qp_solve
+    torch.manual_seed(0)
+    for trial in range(50):
+        K, D = int(torch.randint(2, 8, (1,))), 24
+        G = torch.randn(K, D, dtype=torch.float64)
+        # adversarial: duplicates + zero rows
+        if trial % 3 == 0 and K > 2:
+            G[1] = G[0]            # duplicate corpus
+        if trial % 4 == 0 and K > 2:
+            G[K - 1] = 0.0         # zero gradient
+        w = torch.rand(K, dtype=torch.float64) + 0.05
+        mix = (w[:, None] * G).sum(0)
+        Gram = G @ G.T
+        b = G @ mix
+        eps = torch.rand(K, dtype=torch.float64) * (1e-6 if trial % 2 else 0.5)
+        lam, cert = safe_qp_solve(Gram, b, eps)
+        d = mix + (lam[:, None] * G).sum(0)
+        tol = 1e-6
+        # contraction always
+        assert float((mix - d).norm()) <= float(mix.norm()) + tol
+        # descent property <g,d> >= ||d||^2 - tol
+        assert float(mix @ d) >= float(d @ d) - 1e-4
+        # feasibility: <g_i, d> >= -eps_i - tol
+        worst = float((G @ d + eps).min())
+        assert worst >= -1e-4, f"trial {trial}: constraint violated ({worst})"
+
+
+def test_ns_steps_and_optimal_batch():
+    from hagi.model.formal import ns_steps_needed, optimal_batch
+    # sigma_min=1e-3 -> ceil(log(1e3)/log(3.4445)) ~ ceil(6.907/1.237) = 6
+    assert ns_steps_needed(1e-3) == 6
+    assert ns_steps_needed(3e-3) == 5
+    assert ns_steps_needed(1.0) == 0
+    assert abs(optimal_batch(1000.0, 0.05, 1e-6) - (1000*0.05/1e-6)**0.5) < 1e-6

@@ -306,6 +306,12 @@ def main() -> int:
         # 12-layer model this measurably helps; on a 3-layer leaf it may be
         # neutral, which is exactly what the flag lets us measure.
         if os.environ.get("HAGI_ZERO_INIT_PROJ", "") or bool(getattr(cfg.train, "zero_init_proj", False)):
+            if init_from is not None:
+                logger.warning(
+                    "train.zero_init_proj is a no-op with init_from: the "
+                    "prior's weights are loaded AFTER this zeroing (train.py "
+                    "init-from path) -- remove the flag or rely on the prior."
+                )
             with torch.no_grad():
                 zeroed = 0
                 for name, p in model.named_parameters():
