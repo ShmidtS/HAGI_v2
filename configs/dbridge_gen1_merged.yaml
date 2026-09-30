@@ -39,7 +39,7 @@ train:
   compile_model: true
   learning_rate: 0.01
   use_muon: true
-  zero_init_proj: true
+  zero_init_proj: false
   adam:
     weight_decay: 0.3
   schedule:
@@ -59,7 +59,6 @@ train:
       openwebmath: 0.0893
       tinystories: 0.0536
       smoltalk: 0.0536
-
 merge:
   enabled: true
   norm_block_dim: 128

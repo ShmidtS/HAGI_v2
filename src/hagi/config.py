@@ -1486,6 +1486,14 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("merge.ternary_tree_schema_version must be a positive integer")
         if mg.mixer_type not in {"swiglu", "hadamard", "ternary_f3"}:
             raise ValueError("merge.mixer_type must be 'swiglu', 'hadamard', or 'ternary_f3'")
+
+    if mg.enabled and t.zero_init_proj:
+        # merge builds a function-preserving model; zero-init destroys it
+        # (round-40 saga: step-0 CE 3.5583 -> 15.17). Fail fast at load time.
+        raise ValueError(
+            "train.zero_init_proj must be false when merge.enabled: the merge "
+            "is function-preserving and zero-init destroys it (round 40)"
+        )
         if mg.ternary_lift_mode != "f3_tree" and mg.mixer_type != "ternary_f3":
             raise ValueError(
                 "merge.ternary_lift_mode='parent_preserving' requires "
