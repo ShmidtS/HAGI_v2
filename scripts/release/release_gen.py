@@ -132,7 +132,7 @@ def _patch():
     if fast_enabled:
         import collections
         import triton_bank_kernels as tbk  # pyright: ignore[reportMissingImports]
-        from ternary_bank_kernels import k_h13t, trit_lut
+        from ternary_bank_kernels import k_h13t, trit_lut  # pyright: ignore[reportMissingImports]
 
         lut = trit_lut()
         PACK_MAX = int(os.environ.get("HAGI_PACK_MAX", "1600"))
@@ -220,7 +220,7 @@ def _patch():
         # --- fused mHC (hc_fused): the hc forward is ~45 tiny torch launches
         # (sinkhorn loop); one fused path cuts 5.2ms -> 0.33ms per site.
         # Decode only (S==1); prefill uses the reference module.
-        from hc_fused import HCFused
+        from hc_fused import HCFused  # pyright: ignore[reportMissingImports]
 
         _orig_setup = T.setup_model
 
