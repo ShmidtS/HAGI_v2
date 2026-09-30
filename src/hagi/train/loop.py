@@ -741,6 +741,12 @@ def train(
         metrics = trainer.train_step(microbatches)
 
         if step_index % max(1, cfg.train.logging.log_interval) == 0:
+            # Log independently of the consumer: generator-driven callers
+            # (scripts/lora/*) used to run silent for the whole run — the
+            # empty-log incident of round 51. logger writes to stderr, which
+            # launchers redirect alongside stdout, so progress is observable
+            # in the log file from the first interval on.
+            logger.info("%s", format_metrics(metrics))
             yield metrics
 
         # Saturation check on the exact_ce (the coding-cost SSOT). Only
