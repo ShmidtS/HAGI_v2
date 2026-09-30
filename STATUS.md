@@ -43,10 +43,9 @@ head_up-проекция (ранговый потолок не активен), 
 
 ## Очередь
 
-1. Gen-3: 3 сиба H=1152 от `gen2_merged_had_c8` joint → merge →
-   joint (movement-канал; затухание 0.35 → 0.19, ожидание ~0.1)
-2. LoRA-углубление (r=32/64) поверх рекорда (rank-канал)
-3. Gram-scan на первом joint-ранне (`train.gram_scan_interval: 200`,
+1. LoRA r=32 поверх рекорда (rank-канал; gen-3 отклонён round-50:
+   CycleDecay Δ₃ ≤ 0.024 < LoRA-выигрыш 0.043, Gittins 5×)
+2. Gram-scan на первом joint-ранне (`train.gram_scan_interval: 200`,
    log-only) — измерить частоту градиентных конфликтов корпусов;
    при > 0 — применить SafeQP-проекцию
 4. N*-адаптивность: число экспертов по Fisher/Jensen per wall-clock
