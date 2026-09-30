@@ -592,7 +592,6 @@ class LoggingConfig:
 
     log_interval: int = 10
     diag_interval: int = 100
-    diag_chunk_rows: int = 512
     exact_ce_interval: int = 0
     exact_ce_rows: int = 512
     exact_ce_seed: int = 1729
@@ -629,11 +628,6 @@ class TrainConfig:
     grad_checkpointing: bool = True
     compile_model: bool = False
     zero_init_proj: bool = False
-    # Variance in bf16 (fused kernel) instead of fp32. Measured 5x faster on
-    # ROCm and numerically identical (max diff 0.0) at the value ranges seen
-    # in training, so the safe default is the fast path. Set false to restore
-    # the fp32 accumulator.
-    fp32_norm: bool = False
     # Muon's Newton-Schulz orthogonalization costs ~29% of step time on this
     # ROCm build (measured 0.70s of 2.41s). BitNet b1.58 weights are ternary:
     # the quantizer reads only the sign pattern relative to row absmean, so the
@@ -823,6 +817,8 @@ class MergeConfig:
     mixer_rank: int = 64
     mixer_hadamard_groups: list[int] = field(default_factory=list)
     distill: bool = False
+    # FORWARD-DECLARED for the planned distill-into-compact channel (todo);
+    # no runtime consumer yet -- do not set in configs.
     distill_mode: str = "feature"
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
