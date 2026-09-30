@@ -1,24 +1,26 @@
 # HAGI
 
-**HAGI** is a **recursively growing ensemble language model**. Small
-trained experts (leaves) are combined by an exact function-preserving
-merge, communication is cheap (orthogonal transport plus a low-rank
-residual), and the cycle repeats generation after generation: 3
-siblings from a parent prior → ternary merge → short joint training →
-the parent becomes the prior of the next generation. At fixed compute,
-many narrow experts beat one wide from-scratch model (measured).
+**HAGI** is a **language model that grows in generations**. Train
+three small specialist models (leaves), merge them into one larger
+model exactly (at step 0 the merged model behaves identically to the
+ensemble of the three), add a cheap communication channel between
+the blocks, and briefly fine-tune. The result seeds three new
+specialists, and the cycle repeats: 3 leaves → merge → fine-tune →
+next generation. At fixed compute, many narrow specialists beat one
+wide from-scratch model (measured).
 
 Full architecture and code description: **[ARCHITECTURE.md](ARCHITECTURE.md)**
 (Russian; this summary is the English entry point).
 
 ---
 
-**Рекурсивно растущий ансамблевый язык-модель (LM).** Маленькие обученные
-эксперты (листья) объединяются точным function-preserving слиянием,
-коммуникация — дешёвая (ортогональный транспорт + low-rank residual),
-и цикл повторяется поколениями: 3 сиба от prior'а-родителя → троичное
-слияние → короткое joint-обучение → родитель становится prior'ом
-следующего поколения.
+**Языковая модель, растущая поколениями.** Обучаем три небольшие
+модели-специалиста (листья), объединяем их в одну большую точным
+слиянием (на первом шаге объединённая модель работает ровно как
+ансамбль трёх), добавляем дешёвую связь между блоками и дообучаем.
+Полученная модель становится отправной точкой для трёх новых
+специалистов — и цикл повторяется: 3 листа → слияние → дообучение →
+новое поколение.
 
 Полное описание архитектуры и кода — **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 Измеренные результаты и rationale раундов — git history + `.omc/attempts/`.
@@ -72,8 +74,10 @@ python -u scripts/train.py --config configs/dbridge_gen1_joint.yaml
 
 ## Принципы
 
-1. Покупать разнообразие, а не параметры: много узких экспертов >
-   один широкий scratch при равном бюджете (измерено).
+1. При равном бюджете вычислений три узких специалиста лучше
+   одного широкого «с нуля»: каждый учится на своём распределении
+   данных, а слияние объединяет их без потери качества (измерено:
+   выигрыш ~1 нат против обучения с нуля тем же бюджетом).
 2. Merge — центральный механизм; коммуникация поверх, дёшево.
 3. Function-preserving инварианты обязательны (шаг-0 тождество).
 4. Не подбирать гиперпараметры перебором — вычислять их из
