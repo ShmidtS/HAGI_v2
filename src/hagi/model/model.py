@@ -128,6 +128,7 @@ class HAGI(nn.Module):
                 use_ternary,
                 residual_scale,
                 init_ortho,
+                clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
             )
             self.blocks.append(
                 Block(
@@ -139,6 +140,7 @@ class HAGI(nn.Module):
                     residual_scale,
                     init_orthogonal=init_ortho,
                     rope=shared_rope,
+                    clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
                 )
             )
 

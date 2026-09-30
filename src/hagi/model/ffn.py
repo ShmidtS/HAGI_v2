@@ -185,6 +185,7 @@ class SwiGLU(nn.Module):
         use_ternary: bool = True,
         residual_scale: float = 1.0,
         init_orthogonal: bool = False,
+        clamp_ratio: float = 2.0,
     ) -> None:
         super().__init__()
         self.gate = linear(hidden_size, intermediate_size, use_ternary, init_orthogonal)
@@ -197,7 +198,7 @@ class SwiGLU(nn.Module):
                 self.down.weight.mul_(residual_scale)
         else:
             nn.init.normal_(self.down.weight, std=residual_scale / intermediate_size**0.5)
-        self.branch_scale = BranchScale(residual_scale)
+        self.branch_scale = BranchScale(residual_scale, clamp_ratio=clamp_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.down(F.silu(self.gate(x)) * self.up(x))
@@ -223,10 +224,11 @@ class FeedForward(nn.Module):
         use_ternary: bool = True,
         residual_scale: float = 1.0,
         init_orthogonal: bool = False,
+        clamp_ratio: float = 2.0,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(hidden_size, eps=norm_eps)
-        self.mixer = SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale, init_orthogonal)
+        self.mixer = SwiGLU(hidden_size, intermediate_size, use_ternary, residual_scale, init_orthogonal, clamp_ratio=clamp_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mixer(self.norm(x))

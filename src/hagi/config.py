@@ -413,6 +413,7 @@ class ModelConfig:
 
     vocab_size: int = 262144
     hidden_size: int = 1536
+    branch_clamp_ratio: float = 2.0  # BranchScale clamp [r/ratio, r*ratio]; round-43 audit: 5/7 scales pinned at the lower bound
     num_layers: int = 24
     # Weight-tied loop depth. Each of the ``num_layers`` unique blocks is applied
     # ``loop_depth`` times in sequence (Mobius / DeepLoop). Effective depth is

@@ -204,6 +204,7 @@ class Attention(nn.Module):
         residual_scale: float = 1.0,
         init_orthogonal: bool = False,
         rope: RotaryEmbedding | None = None,
+        clamp_ratio: float = 2.0,
     ) -> None:
         super().__init__()
         if hidden_size != cfg.num_heads * cfg.head_dim:
@@ -266,7 +267,7 @@ class Attention(nn.Module):
         self.sink_bias: torch.nn.Parameter | None = None
         if self.sink_len > 0:
             self.sink_bias = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.sink_len))
-        self.branch_scale = BranchScale(residual_scale)
+        self.branch_scale = BranchScale(residual_scale, clamp_ratio=clamp_ratio)
         self._kv_cache: KVCache | None = None
 
     def attach_cache(self, cache: KVCache) -> None:
