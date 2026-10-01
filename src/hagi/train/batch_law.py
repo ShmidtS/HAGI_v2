@@ -79,13 +79,15 @@ def speedup_vs_batch(
     overhead: float,
     per_sample: float,
 ) -> float:
-    """How much faster ``batch`` is than the uniform baseline.
+    """Speedup factor of the optimal batch over ``batch``, at least 1.
 
-    Useful for deciding whether a batch change is worth a run: the
-    ratio is bounded by ``1/(2 sqrt(B* t0/(c B_n)) + ...)`` and is
-    negligible once ``B >> B*``.
+    Returns ``T(batch) / T(B*)``. At ``batch = B*`` the ratio is exactly
+    1.0. Because the ratio is a fraction of the SLOWER time, small
+    batches score far below 1 (a batch of 1 can be thousands of times
+    slower) -- read it as "the optimal batch is N times faster", so
+    multiply by ``batch``-side time or invert if that reads better.
     """
     optimal = optimal_batch(token_budget, overhead, per_sample)
-    return step_time(optimal, token_budget, overhead, per_sample) / step_time(
-        batch, token_budget, overhead, per_sample
+    return step_time(batch, token_budget, overhead, per_sample) / step_time(
+        optimal, token_budget, overhead, per_sample
     )
