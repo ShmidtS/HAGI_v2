@@ -76,6 +76,10 @@ def _parent_cfg(n: int):
     cfg.model.ffn.expansion = 1.0
     cfg.model.ffn.multiple_of = 8
     cfg.merge.n_experts = n
+    # Exact-invariant overrides: sinks and loop re-application change the
+    # model FUNCTION, not the merge machinery, so pin them off here.
+    cfg.model.attention.sink_len = 0
+    cfg.model.loop_depth = 1
     # The exact-invariant path: no ternarization (children are plain Linear),
     # no hadamard rotation (that is the mixer, not the merge), no mixers.
     cfg.merge.expert_weight_source = "effective_sparse"

@@ -258,6 +258,7 @@ class LMHead(nn.Module):
             # entries at the 1B configuration. ``named_parameters`` *does*
             # deduplicate, which is why the parameter count would still look right.
             self._tied_ref = [tied_weight]
+            self.up = None
             self.projection = None
         else:
             self._tied_ref = []
