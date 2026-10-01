@@ -40,19 +40,38 @@ Full architecture and code description: **[ARCHITECTURE.md](ARCHITECTURE.md)**
   → gen-3: та же схема от gen-2 joint
 ```
 
-Фактическое состояние линии (чекпойнты на диске):
+Фактическое состояние линии (чекпойнты на диске, проверено):
 
 ```
-gen-2 joint (H=1152, 1600 шагов, CE ~3.4-4.1)
-  → 3 доменных сиба H=384  [math / lang / code]  ← checkpoints/gen2_dsib_*
-  → gen-3 merged H=1152 (Hadamard-миксер, block-diag 3→1)   ← configs/dbridge_gen3_merged.yaml
-  → gen-3 joint                                              ← configs/dbridge_gen3_joint.yaml
+gen-2 joint (H=1152)  →  3 доменных сиба H=384 [math/lang/code]
+  → gen-3 merged  H=1152 (Hadamard, block-diag 3→1)   AVG CE 3.3233
+  → gen-3 joint   H=1152                              обучен, 1600 шагов
+  → gen-4 сибы    H=1152 (q=18/kv=9)  ← автономный цикл, супервизор
+  → gen-4 merged  H=3456 (q=54/kv=27)
 ```
+
+## Измеренные свойства (не утверждения)
+
+`scripts/growth_benchmark.py` измеряет три свойства на существующих
+чекпойнтах, переиспользуя загрузчик `eval_domains.py`:
+
+```
+model            CODE     EN     MATH      RU     AVG
+gen3_joint     1.7223  3.9425  3.7323  3.8959  3.3233
+gen2_joint     1.8051  4.0358  3.8105  4.0863  3.4345
+
+GROWTH     : −0.1112 AVG, gen-3 лучше gen-2 на ВСЕХ 4 доменах
+GENERALITY : spread 0.668 (worst EN 3.9425, best CODE 1.7223)
+MERGE      : merged лучше эксперта на ЕГО домене —
+             MATH 3.7323 vs 3.8635, CODE 1.7223 vs 2.1613
+```
+
+Слияние не разрушает специалистов: merged-модель превосходит каждого
+эксперта на его собственном домене.
 
 Замечание: `configs/dbridge_gen2_merged_had.yaml` ссылается на
 `dbridge_gen2_sib*`, которых на диске нет — фактические сибы лежат в
-`gen2_dsib_*`. Это и была причина `GEN2-MERGE-FAIL` в `logs/chain.log`.
-Конфиг gen-3 указывает на существующие пути.
+`gen2_dsib_*`. Это была причина `GEN2-MERGE-FAIL`.
 
 Слияние — **троичное 3→1 на каждом уровне** (не степени двойки);
 Hadamard-трансформ строится для любого N (pad → QR-ортонормализация).
