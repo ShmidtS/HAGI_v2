@@ -21,6 +21,7 @@ meta.json
 .env
 /data/
 /.opencode/
+logs/
 
 # cargo install artifacts
 .crates.toml
