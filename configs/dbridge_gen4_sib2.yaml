@@ -1,12 +1,12 @@
 model:
   vocab_size: 32768
-  hidden_size: 384
+  hidden_size: 1152
   num_layers: 3
   loop_depth: 1
   init_seed: 12301
   attention:
-    num_query_heads: 6
-    num_kv_heads: 3
+    num_query_heads: 18
+    num_kv_heads: 9
     head_dim: 64
     rope_theta: 3000.0
     sink_len: 4
@@ -62,7 +62,7 @@ merge:
   n_mixers: 1
   mixer_type: swiglu
   n_experts: 3
-  expert_hidden: 128
+  expert_hidden: 384
   mixer_init_scale: 0.0
   mixer_rank: 64
   freeze_experts: false
