@@ -48,6 +48,22 @@ from safetensors import safe_open  # noqa: E402
 from hagi.config import ffn_width, load_config  # noqa: E402
 from hagi.train.checkpoint import CHECKPOINT_FORMAT_VERSION  # noqa: E402
 
+
+class _MultiShard:
+    """Tries each shard handle; get_tensor returns the first hit."""
+
+    def __init__(self, handles) -> None:
+        self.handles = handles
+
+    def get_tensor(self, key: str):
+        for h in self.handles:
+            try:
+                return h.get_tensor(key)
+            except Exception:
+                continue
+        raise KeyError(key)
+
+
 DEFAULT_SOURCE = Path(
     "~/.cache/huggingface/hub/models--google--gemma-4-E2B-it"
     "/snapshots/70af34e20bd4b7a91f0de6b22675850c43922a03"
@@ -106,7 +122,7 @@ class ForeignLeafImporter:
         self._declared_head_dim = 256
 
     # -- source access -------------------------------------------------
-    def _resolve_shard(self) -> Path:
+    def _resolve_shard(self) -> Path | dict[str, str]:
         if self.source.is_file():
             return self.source
         if not self.source.is_dir():
@@ -116,16 +132,17 @@ class ForeignLeafImporter:
             raise FileNotFoundError(f"no safetensors under {self.source}")
         if len(shards) == 1:
             return shards[0]
-        # A sharded checkpoint: pick the shard that actually holds the keys.
+        # A sharded checkpoint: build a key -> shard routing table from the
+        # index so every tensor (embeddings, blocks, head) is reachable.
         index = self.source / "model.safetensors.index.json"
         if not index.is_file():
             raise FileNotFoundError(
                 f"{self.source} has {len(shards)} shards but no index to route keys"
             )
-        raise FileNotFoundError(
-            "multi-shard source: pass --source pointing at the single shard "
-            "that holds embed_tokens, or a snapshot whose index maps them"
-        )
+        import json
+
+        mapping = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+        return {k: str(self.source / v) for k, v in mapping.items()}
 
     def _get(self, handle, key: str) -> torch.Tensor | None:
         try:
@@ -133,24 +150,47 @@ class ForeignLeafImporter:
         except Exception:
             return None
 
+    @staticmethod
+    def _open_shards(routing: dict[str, str]) -> tuple[list, set[str]]:
+        from collections import defaultdict
+
+        by_shard: dict[str, list[str]] = defaultdict(list)
+        for key, path in routing.items():
+            by_shard[path].append(key)
+        handles = [safe_open(p, framework="pt") for p in by_shard]
+        keys = set(routing.keys())
+        return handles, keys
+
     # -- assembly ------------------------------------------------------
     def build(self) -> dict[str, torch.Tensor]:
         shard = self._resolve_shard()
-        say(f"source shard: {shard.name}")
-        with safe_open(str(shard), framework="pt") as handle:
-            keys = set(handle.keys())
-            say(f"source tensors available: {len(keys)}")
-
-            prefix = self._language_prefix(keys)
-            say(f"language prefix: {prefix!r}")
-            embed = self._find_embedding(handle, keys, prefix)
-            head = self._find_head(handle, keys, prefix, embed)
-            self._write_embeddings(embed, head)
-            self._write_norms()
-            for index in range(self.layers):
-                self._write_block(handle, keys, prefix, index)
+        if isinstance(shard, dict):
+            say(f"multi-shard source: {len(set(shard.values()))} shards, routing table built")
+            paths = sorted(set(shard.values()))
+            handles = [safe_open(p, framework="pt") for p in paths]
+            try:
+                self._assemble(_MultiShard(handles), set(shard.keys()))
+            finally:
+                for h in handles:
+                    h.__exit__(None, None, None)
+        else:
+            say(f"source shard: {shard.name}")
+            with safe_open(str(shard), framework="pt") as handle:
+                keys = set(handle.keys())
+                self._assemble(handle, keys)
         self._verify()
         return self.state
+
+    def _assemble(self, handle, keys) -> None:
+        say(f"source tensors available: {len(keys)}")
+        prefix = self._language_prefix(keys)
+        say(f"language prefix: {prefix!r}")
+        embed = self._find_embedding(handle, keys, prefix)
+        head = self._find_head(handle, keys, prefix, embed)
+        self._write_embeddings(embed, head)
+        self._write_norms()
+        for index in range(self.layers):
+            self._write_block(handle, keys, prefix, index)
 
     def _language_prefix(self, keys: set[str]) -> str:
         for candidate in ("language_model.model.", "model.language_model.", "model."):
