@@ -1,0 +1,70 @@
+merge:
+  enabled: true
+  expert_hidden: 128
+  expert_weight_source: effective_sparse
+  freeze_experts: false
+  mixer_init_scale: 0.0
+  mixer_rank: 64
+  mixer_type: swiglu
+  n_experts: 3
+  n_mixers: 1
+  norm_block_dim: 128
+model:
+  adapters:
+    enabled: false
+  attention:
+    head_dim: 64
+    max_seq_len: 4096
+    num_kv_heads: 3
+    num_query_heads: 6
+    rope_theta: 3000.0
+    sink_len: 4
+  cortex:
+    enabled: false
+  decision:
+    enabled: false
+  embedding:
+    conv_kernel: 1
+    tie_lm_head: false
+  ffn:
+    expansion: 1.0
+  head:
+    fused_ce: true
+    sampled_proposal: uniform
+    unigram_prior: false
+  hidden_size: 384
+  init_seed: 12101
+  loop_depth: 1
+  num_layers: 3
+  ternary:
+    enabled: false
+  vocab_size: 32768
+train:
+  adam:
+    weight_decay: 0.3
+  batch_size: 32
+  checkpoint_dir: checkpoints/gen2_dsib_code
+  checkpoint_interval: 800
+  compile_model: true
+  data:
+    data_dir: data
+    seed: 12201
+    seq_len: 1024
+    weights:
+      python_instruct: 0.5
+      edu: 0.2
+      openwebmath: 0.1
+      smoltalk: 0.1
+      wikipedia_en: 0.1
+  grad_accum_steps: 1
+  grad_checkpointing: false
+  init_from: checkpoints/dbridge_gen1_joint/step-0001600.pt
+  learning_rate: 0.001
+  max_steps: 1600
+  precision: bf16
+  schedule:
+    warmup_steps: 40
+  ternary_fp32_master: false
+  use_muon: true
+  zero_init_proj: false
+  ce_keep_rate: 0.5
