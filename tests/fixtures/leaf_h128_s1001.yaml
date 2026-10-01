@@ -1,0 +1,8 @@
+model:
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  attention:
+    sink_len: 0
+  ternary:
+    enabled: false
