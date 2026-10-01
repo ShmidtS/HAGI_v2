@@ -35,6 +35,7 @@ from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
+from hagi.train.analytic_step import CurvatureProbe, select_step
 from hagi.train.safeqp_controller import corpus_grad_gram
 
 logger = logging.getLogger(__name__)
@@ -229,6 +230,100 @@ class Trainer:
         # Gradient-Gram scan state (log-only; see safeqp_controller docstring).
         self._gram_samples: list[tuple[str, dict]] | None = None
         self._gram_metrics_last: dict = {}
+        # Analytic step (RecursiveGrowth.lean optimal_step_unconstrained):
+        # measures the directional Lipschitz constant L so the step can be
+        # computed from curvature instead of read off the schedule.
+        self._curvature = CurvatureProbe(
+            refresh=int(getattr(cfg.train, "analytic_step_probe_interval", 50))
+        ) if getattr(cfg.train, "analytic_step", False) else None
+        self._analytic_step_last: dict = {}
+
+    def _apply_analytic_step(self, base_lr: float, loss_value: float) -> dict:
+        """Replace the schedule LR with the curvature-optimal step.
+
+        ``RecursiveGrowth.lean`` ``optimal_step_unconstrained``: the guaranteed
+        decrease ``g(eta) = eta*inner - L*||d||^2*eta^2/2`` is a concave
+        quadratic whose maximum is analytic, ``eta* = inner/(L*||d||^2)``. With
+        ``d = -g`` we get ``inner = -||g||^2 < 0``, so the raw gradient is NOT
+        the descent direction the theorem assumes -- we therefore use the
+        momentum-weighted direction the optimizer actually applies, whose
+        alignment with the gradient is measured, not assumed.
+
+        The step is clipped to ``1/L`` (``optimal_step_ge_recip``) and to
+        ``base_lr`` so it never exceeds the tuned baseline.
+
+        Returns the metrics dict (empty when the probe has no estimate yet).
+        """
+        params = [
+            p for g in self.optimizer.param_groups if not g.get("_muon")
+            for p in g["params"] if p.grad is not None
+        ]
+        grads = [p.grad.detach() for p in params]
+        if not params:
+            return {}
+
+        probe = self._curvature
+        smoothness = None
+
+        def loss_fn() -> float:
+            with torch.no_grad():
+                return loss_value
+
+        try:
+            smoothness = probe.estimate(loss_fn, params, grads)
+        except Exception as exc:  # a failed probe costs the step's LR, not the step
+            logger.warning("step %d: curvature probe failed: %s", self.step, exc)
+            return {}
+
+        # Direction the Adam group applies: momentum/nesterov lookahead where
+        # available, else the raw gradient. Its norm and alignment with g are
+        # what the theorem's inner and dn2 refer to.
+        direction = self._optimizer_direction(grads)
+        dn2 = sum(float(d.double().pow(2).sum()) for d in direction)
+        inner = sum(float((d * g).double().sum()) for d, g in zip(direction, grads))
+        if dn2 <= 0.0:
+            return {}
+
+        eta = select_step(
+            inner=inner,
+            dn2=dn2,
+            smoothness=smoothness,
+            base_lr=base_lr,
+            clip_to_lr=bool(getattr(self.cfg.train, "analytic_step_clip_lr", True)),
+        )
+        for g in self.optimizer.param_groups:
+            if not g.get("_muon"):
+                g["lr"] = eta
+        self._analytic_step_last = {
+            "analytic_eta": eta,
+            "analytic_L": smoothness,
+            "analytic_inner": inner,
+            "analytic_dn2": dn2,
+        }
+        return self._analytic_step_last
+
+    def _optimizer_direction(self, grads: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Reconstruct the direction the optimizer applies for non-Muon groups."""
+        params = {
+            id(p): p
+            for g in self.optimizer.param_groups if not g.get("_muon")
+            for p in g["params"]
+        }
+        direction: list[torch.Tensor] = []
+        for p, g in zip(
+            [p for g in self.optimizer.param_groups if not g.get("_muon")
+             for p in g["params"] if p.grad is not None],
+            grads,
+        ):
+            state = self.optimizer.state.get(params.get(id(p), p), {})
+            buf = state.get("momentum_buffer")
+            if buf is None:
+                direction.append(g)
+            elif bool(self.optimizer.param_groups[0].get("nesterov", True)):
+                direction.append(g + buf)
+            else:
+                direction.append(buf.clone())
+        return direction
 
     def _gram_scan_samples(self) -> list[tuple[str, dict]]:
         """Lazily read one tail calibration window per configured corpus.
@@ -557,6 +652,15 @@ class Trainer:
                     "rest_grad_norm": rest_norm,
                 }
         adam_lr, muon_lr = set_learning_rate(self.optimizer, self.step, cfg)
+        # Analytic step (optimal_step_unconstrained): when enabled, replace the
+        # schedule's Adam LR with eta* = <g,d>/(L*||d||^2) computed from the
+        # measured curvature. ``lr`` stays a CEILING, so the first deployment
+        # can never be more aggressive than the tuned baseline in one step.
+        analytic_metrics: dict = {}
+        if self._curvature is not None:
+            analytic_metrics = self._apply_analytic_step(
+                adam_lr, loss_sum / max(len(microbatches), 1)
+            )
         self.optimizer.step()
 
         if use_ternary_cache:
@@ -592,6 +696,7 @@ class Trainer:
             "rest_grad_norm": rest_norm,
             "lr": adam_lr,
             "muon_lr": muon_lr,
+            **analytic_metrics,
             "tokens": int(tokens_value),
             "n_decisions": int(decisions_value),
             "decision_loss": decision_value if decisions_value > 0 else None,

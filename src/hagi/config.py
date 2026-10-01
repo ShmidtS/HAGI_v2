@@ -697,6 +697,15 @@ class TrainConfig:
     gram_scan_corpora: list[str] = field(default_factory=list)
     gram_scan_tokens: int = 1024
     gram_scan_eps_rel: float = 0.0
+    # Analytic step (RecursiveGrowth.lean optimal_step_unconstrained, roadmap
+    # #1.3): replace the LR hyperparameter class with the curvature-optimal
+    # step eta* = <g,d>/(L*||d||^2). L is measured by a two-point probe on the
+    # live loss, amortized over ``analytic_step_probe_interval`` steps. The
+    # schedule LR remains a CEILING, so enabling this cannot make the first
+    # deployment more aggressive than the tuned baseline.
+    analytic_step: bool = False
+    analytic_step_probe_interval: int = 50
+    analytic_step_clip_lr: bool = True
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
