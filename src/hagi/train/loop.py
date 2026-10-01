@@ -36,6 +36,7 @@ from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 from hagi.train.analytic_step import CurvatureProbe, select_step
+from hagi.train.insight import run_insight_cycle
 from hagi.train.safeqp_controller import corpus_grad_gram
 
 logger = logging.getLogger(__name__)
@@ -972,6 +973,18 @@ def train(
 
         step_index = trainer.step
         metrics = trainer.train_step(microbatches)
+        # The insight cycle scores a fixed window so its KL guard is
+        # comparable across steps; reuse the current step's last microbatch
+        # (already on device, no extra transfer).
+        insight_batch = microbatches[-1] if microbatches else None
+        # The gate windows are read from disk as CPU tensors; the insight
+        # cycle indexes the model with them, so they must share its device.
+        model_device = next(model.parameters()).device
+        insight_windows = (
+            [(ids.to(model_device), tgt.to(model_device)) for ids, tgt in gate_batches[:-1]]
+            if gate_batches
+            else None
+        )
 
         if step_index % max(1, cfg.train.logging.log_interval) == 0:
             # Log independently of the consumer: generator-driven callers
@@ -988,6 +1001,44 @@ def train(
             gce = _gate_ce(model)
             logger.info("gate_ce step %d: %.4f", trainer.step, gce)
             metrics["gate_ce"] = gce
+
+        # Insight cycle (RLTL;DR internalization): the self-improvement
+        # channel. ``run_insight_cycle`` was implemented and unit-tested but
+        # never called from anywhere, so the mechanism existed only as a
+        # library -- nothing in a training run ever exercised it. Gated on
+        # ``cfg.insight.enabled`` plus its own interval, and it must fail
+        # soft: a rejected insight costs one interval, never the run.
+        insight_cfg = getattr(cfg.train, "insight", None)
+        if (
+            insight_cfg is not None
+            and getattr(insight_cfg, "enabled", False)
+            and insight_batch is not None
+            and insight_batch.get("targets") is not None
+        ):
+            interval = int(getattr(insight_cfg, "interval", 0) or 0)
+            if interval > 0 and trainer.step % interval == 0:
+                try:
+                    report = run_insight_cycle(
+                        model,
+                        insight_batch["input_ids"],
+                        insight_batch["targets"],
+                        insight_cfg,
+                        old_windows=insight_windows,
+                    )
+                    # A refused cycle returns a report without measurements
+                    # (e.g. the base is not frozen), so read the keys
+                    # defensively rather than coercing None to float.
+                    metrics["insight_applied"] = bool(report.get("applied", False))
+                    metrics["insight_kl"] = float(report.get("kl") or 0.0)
+                    logger.info(
+                        "step %d insight: applied=%s reason=%s kl=%.4f",
+                        trainer.step,
+                        report.get("applied", False),
+                        report.get("reason", "?"),
+                        float(report.get("kl") or 0.0),
+                    )
+                except Exception as exc:  # the channel is optional
+                    logger.warning("step %d insight cycle failed: %s", trainer.step, exc)
 
         # Saturation check on the exact_ce (the coding-cost SSOT). Only
         # evaluated when exact_ce is actually measured (exact_ce_interval>0).
