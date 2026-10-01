@@ -305,13 +305,21 @@ class Trainer:
         if dn2 <= 0.0:
             return {}
 
+        # Ceiling on the analytic step. Taken from the CONFIGURED base LR,
+        # never from the schedule's current value: during linear warmup the
+        # schedule returns exactly 0, and a ceiling of 0 would be skipped,
+        # letting the unclipped eta* through precisely when the step most
+        # needs the guard. That is what took the first A/B run to CE 21.2.
         eta = select_step(
             inner=inner,
             dn2=dn2,
             smoothness=smoothness,
-            base_lr=base_lr,
+            base_lr=float(self.cfg.train.learning_rate),
             clip_to_lr=bool(getattr(self.cfg.train, "analytic_step_clip_lr", True)),
         )
+        # Warmup still applies to the analytic step as a multiplier on the
+        # ceiling, so the first steps cannot be large even if eta* would be.
+        eta = min(eta, base_lr) if base_lr > 0.0 else 0.0
         for g in self.optimizer.param_groups:
             if not g.get("_muon"):
                 g["lr"] = eta
