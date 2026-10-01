@@ -45,8 +45,10 @@ def fold(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             continue
         if key.endswith(".lora.base"):
             root = key[: -len(".lora.base")]
-            A = state[root + ".lora.A"].float()
-            B = state[root + ".lora.B"].float()
+            if not root.endswith(".weight"):
+                root += ".weight"
+            A = state[root + ".lora.A"].float() if root + ".lora.A" in state else state[root[:-len(".weight")] + ".lora.A"].float()
+            B = state[root + ".lora.B"].float() if root + ".lora.B" in state else state[root[:-len(".weight")] + ".lora.B"].float()
             out[root] = state[key] + (A @ B)
             continue
         out[key] = tensor
