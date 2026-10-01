@@ -624,7 +624,8 @@ def safe_qp_multipliers(G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor) -> 
 
 
 def safe_qp_solve(
-    G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor, ridge: float = 1e-10
+    G: torch.Tensor, b: torch.Tensor, eps: torch.Tensor, ridge: float = 1e-10,
+    g_norm_sq: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """SafeQP dual with a CERTIFICATE (round 39, reviewer prescription).
 
@@ -684,7 +685,26 @@ def safe_qp_solve(
         if obj < best_obj - 1e-12:
             best_obj = obj
             best = lam
-    return best, {"active": int((best > 1e-9).sum())}
+    # Certificate for the returned dual point. KKT for min ||d-g||^2 s.t.
+    # <g_i, d> >= -eps_i gives d* = g + sum_i lam_i g_i, so feasibility is
+    # min_i (b + G lam + eps)_i — exactly the loop's residual at the returned
+    # point. Descent and contraction additionally need ||g||^2 (pass
+    # g_norm_sq when the caller holds the flat gradient); without it the keys
+    # are nan so a missing bound can never masquerade as a satisfied one.
+    cert = {"active": int((best > 1e-9).sum())}
+    cert["feasibility"] = float((b + G @ best + eps).min())
+    if g_norm_sq is not None:
+        lamGlam = float(best @ (G @ best))
+        descent = g_norm_sq + 2.0 * float(best @ b) + lamGlam  # ||d*||^2
+        align = g_norm_sq + float(best @ b)  # <g, d*>
+        cert["descent_gap"] = align - descent  # >= 0 iff ||d*||^2 <= <g,d*>
+        cert["contraction"] = math.sqrt(max(lamGlam, 0.0)) - math.sqrt(
+            max(g_norm_sq, 0.0)
+        )  # ||g - d*|| - ||g|| <= 0 must hold
+    else:
+        cert["descent_gap"] = float("nan")
+        cert["contraction"] = float("nan")
+    return best, cert
 
 
 def domination_metrics(
