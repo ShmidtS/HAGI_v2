@@ -140,18 +140,12 @@ class CurvatureProbe:
         with torch.no_grad():
             backup = [p.detach().clone() for p in params]
             try:
-                offset = 0
                 for p, g in zip(params, grads):
-                    n = p.numel()
-                    p.add_(g.reshape(-1)[offset : offset + n].view_as(p), alpha=-alpha)
-                    offset += n
+                    p.add_(g.reshape(-1)[: p.numel()].view_as(p), alpha=-alpha)
                 moved = float(loss_fn())
             finally:
-                offset = 0
                 for p, backup_p in zip(params, backup):
-                    n = p.numel()
                     p.copy_(backup_p)
-                    offset += n
                 del backup
 
         residual = abs(moved - base - inner)
