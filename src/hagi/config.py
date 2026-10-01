@@ -619,6 +619,28 @@ class AdaptConfig:
 
 
 @dataclass
+class InsightConfig:
+    """Insight-channel parameters (hagi.train.insight)."""
+
+    enabled: bool = False
+    # top-quantile per-token CE defines a "failure" position
+    fail_quantile: float = 0.9
+    # compressed correction length in tokens (paper: ~17)
+    max_tokens: int = 17
+    # SFT weight on the insight target positions
+    lambda_insight: float = 4.0
+    # exact full-vocab KL(p_post || p_pre) bound on the scored window
+    kl_bound: float = 0.05
+    # absolute CE floor: below this a position is not a failure
+    min_ce: float = 6.0
+    # SafeQP consolidation (R78 insight_consolidation_safe): project the
+    # insight gradient through formal.safe_qp_solve with a per-old-domain
+    # drift budget before stepping
+    safeqp: bool = False
+    drift_eps: float = 0.0
+
+
+@dataclass
 class TrainConfig:
     """Training hyperparameters.
 
@@ -717,6 +739,13 @@ class TrainConfig:
     # backward through the existing AdamW routing. The base model, tokenizer
     # and frozen artifacts remain byte-for-byte unchanged.
     adapt: AdaptConfig = field(default_factory=AdaptConfig)
+
+    # RLTL;DR-style insight channel (arXiv 2609.37633): failure → compressed
+    # correction → weighted SFT. Opt-in; see hagi.train.insight. The costly
+    # part of self-improvement is experience generation, not backprop — the
+    # channel exists so the controller can spend tokens on internalization
+    # only when a window measurably fails (top-quantile CE above min_ce).
+    insight: InsightConfig = field(default_factory=InsightConfig)
 
 
 @dataclass
