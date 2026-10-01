@@ -60,7 +60,10 @@ from typing import Any
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent
+# This file lives in scripts/growth/, so the repository root is three levels
+# up. Using scripts/ made every --plan, checkpoint_dir and cwd resolve to a
+# path that does not exist.
+ROOT = Path(__file__).resolve().parents[2]
 LEDGER = ROOT / "reports" / "growth_ledger.jsonl"
 LOG = logging.getLogger("growth")
 
