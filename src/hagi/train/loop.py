@@ -296,12 +296,21 @@ class Trainer:
         if smoothness is None or smoothness != smoothness:  # None or NaN
             return {}
 
-        # Direction the Adam group applies: momentum/nesterov lookahead where
-        # available, else the raw gradient. Its norm and alignment with g are
-        # what the theorem's inner and dn2 refer to.
+        # Direction the optimizer applies, and the alignment the theorem's
+        # ``inner = <g, d>`` refers to. The theorem assumes a DESCENT
+        # direction (``inner > 0``); AdamW's ``exp_avg`` can drift away
+        # from the current gradient and make ``inner`` negative, at which
+        # point the certified bound does not apply and eta* would be
+        # negative -- which silently zeroed the step and froze training
+        # late in a run (three A/B attempts). Falling back to the raw
+        # gradient direction restores ``inner = ||g||^2 > 0`` exactly.
         direction = self._optimizer_direction(params, grads)
         dn2 = sum(float(d.double().pow(2).sum()) for d in direction)
         inner = sum(float((d * g).double().sum()) for d, g in zip(direction, grads))
+        if inner <= 0.0:
+            direction = list(grads)
+            dn2 = sum(float(g.double().pow(2).sum()) for g in grads)
+            inner = dn2
         if dn2 <= 0.0:
             return {}
 
@@ -336,6 +345,29 @@ class Trainer:
             "analytic_dn2": dn2,
         }
         return self._analytic_step_last
+
+    def _analytic_direction(self, params: list[torch.Tensor],
+                            grads: list[torch.Tensor]) -> dict:
+        """Diagnose why a step is or is not being taken.
+
+        Three attempts at the analytic step all produced ``eta == 0`` late
+        in a run, which silently freezes training while the loss rises.
+        The two candidate causes are distinguishable and both matter:
+        ``inner <= 0`` means the optimizer direction is not aligned with
+        the gradient (the certificate's hypothesis fails), while
+        ``dn2 <= 0`` means the moment buffer has collapsed. Logged once
+        per probe so the next failure names itself.
+        """
+        direction = self._optimizer_direction(params, grads)
+        dn2 = sum(float(d.double().pow(2).sum()) for d in direction)
+        inner = sum(float((d * g).double().sum()) for d, g in zip(direction, grads))
+        grad2 = sum(float(g.double().pow(2).sum()) for g in grads)
+        if inner <= 0.0 or dn2 <= 0.0:
+            logger.info(
+                "step %d analytic: eta suppressed -- inner=%.6e dn2=%.6e ||g||^2=%.6e",
+                self.step, inner, dn2, grad2,
+            )
+        return {"inner": inner, "dn2": dn2, "grad2": grad2}
 
     def _optimizer_direction(
         self, params: list[torch.Tensor], grads: list[torch.Tensor]
