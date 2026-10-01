@@ -84,6 +84,21 @@ def test_select_step_respects_lr_ceiling() -> None:
     assert select_step(100.0, 1.0, 0.01, base_lr=3e-4) == pytest.approx(3e-4)
 
 
+def test_zero_ceiling_does_not_unlock_the_unclipped_step() -> None:
+    """Regression: a base_lr of 0 must not let the ceiling be skipped.
+
+    The first A/B run reached CE 21.2 because linear warmup returns
+    exactly 0 from the schedule, and the guard ``base_lr > 0`` skipped
+    the ceiling -- letting an unclipped eta* 700x the tuned LR through
+    at step 0. Callers must pass the configured base LR, but the
+    predicate itself is also documented here: 0 means "no step".
+    """
+    # A zero ceiling yields no step -- never the unclipped eta*.
+    assert select_step(1.0, 1.0, 4.541, base_lr=0.0, clip_to_lr=True) == 0.0
+    # And the configured ceiling binds regardless of warmup arithmetic.
+    assert select_step(1.0, 1.0, 4.541, base_lr=3e-4, clip_to_lr=True) == pytest.approx(3e-4)
+
+
 @pytest.mark.parametrize("bad", [(0.0, 1.0), (1.0, 0.0), (-1.0, 1.0)])
 def test_analytic_step_rejects_nonpositive_inputs(bad: tuple[float, float]) -> None:
     """The theorem assumes ``0 < L`` and ``0 < dn2``; the code must too."""

@@ -184,9 +184,10 @@ def select_step(
         dn2: ``||d||^2``.
         smoothness: ``L``.
         base_lr: when given and ``clip_to_lr``, the step never exceeds
-            this -- the historical LR acts as a ceiling during the
-            transition, so the change cannot make training more
-            aggressive than the tuned baseline in one step.
+            this. A base_lr of ZERO means "no step", not "no ceiling":
+            the linear warmup returns exactly 0 early in a run, and
+            treating that as an absent ceiling once let an eta* 700x the
+            tuned LR through on step 0.
         clip_to_lr: whether to apply the ``base_lr`` ceiling.
 
     Returns:
@@ -194,12 +195,16 @@ def select_step(
     """
     if dn2 <= 0.0 or smoothness <= 0.0:
         raise ValueError("select_step needs positive dn2 and smoothness")
+    if base_lr is not None and base_lr <= 0.0:
+        # Zero means take no step. Skipping the ceiling instead would let
+        # the unclipped eta* through exactly when the schedule is warming up.
+        return 0.0
     eta = analytic_step(inner, dn2, smoothness)
     # Certified directions get exactly 1/L (optimal_step_ge_recip).
     if inner >= dn2:
         eta = 1.0 / smoothness
     elif eta > 1.0 / smoothness:
         eta = 1.0 / smoothness
-    if clip_to_lr and base_lr is not None and base_lr > 0.0:
+    if clip_to_lr and base_lr is not None:
         eta = min(eta, base_lr)
     return max(eta, 0.0)
