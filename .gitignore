@@ -123,3 +123,4 @@ _archive/**/*.json
 /_cleanup.py
 logs/*.done
 _telemetry/
+_raw/
