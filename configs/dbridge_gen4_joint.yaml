@@ -1,12 +1,12 @@
 model:
   vocab_size: 32768
-  hidden_size: 1152
+  hidden_size: 3456
   num_layers: 3
   loop_depth: 1
   init_seed: 12101
   attention:
-    num_query_heads: 18
-    num_kv_heads: 9
+    num_query_heads: 54
+    num_kv_heads: 27
     head_dim: 64
     rope_theta: 3000.0
     sink_len: 4
