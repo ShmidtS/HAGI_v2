@@ -43,12 +43,13 @@ VOCAB = 64
 
 
 def _leaf_cfg(seed: int):
-    # NOTE: this config is the pre-optimization leaf (lr 3e-4 era). The
+    # NOTE: this config is the pre-optimization leaf (lr 3e-4 era;
+    # tests/fixtures copy — the .omc/attic original was never committed). The
     # canonical leaf_h128_v2 does NOT satisfy the tiny-model invariant here
     # (bisect pending: theta/rope or fused_ce path difference, see
     # .omc/attempts/test_config_regression.md). The invariant is about the
     # MERGE machinery, not the leaf recipe, so the historical config pins it.
-    cfg = load_config(".omc/attic/sweep_configs/leaf_h128_s1001.yaml")
+    cfg = load_config("tests/fixtures/leaf_h128_s1001.yaml")
     m = cfg.model
     m.vocab_size = VOCAB
     m.hidden_size = 8
