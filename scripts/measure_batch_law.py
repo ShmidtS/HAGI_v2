@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from hagi.config import load_config  # noqa: E402
 from hagi.model.factory import build_model_for_config  # noqa: E402
 from hagi.train.batch_law import optimal_batch, step_time  # noqa: E402
+from hagi.train.loop import cast_model  # noqa: E402
 
 
 def main() -> int:
@@ -43,7 +44,17 @@ def main() -> int:
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model_for_config(cfg).to(device)
+    model = build_model_for_config(cfg)
+    # The Trainer casts to the configured precision before the first step.
+    # Without this the probe times an fp32 eager model -- measured 22 s/step
+    # against the Trainer's 1.35 s -- and the resulting t0 would then justify
+    # a batch change for a model that never runs that way.
+    cast_model(
+        model,
+        cfg.train.precision,
+        ternary_fp32_master=bool(cfg.train.ternary_fp32_master),
+    )
+    model = model.to(device)
     model.train()
 
     vocab = int(cfg.model.vocab_size)
