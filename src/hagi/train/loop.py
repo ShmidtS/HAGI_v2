@@ -238,21 +238,29 @@ class Trainer:
         ) if getattr(cfg.train, "analytic_step", False) else None
         self._analytic_step_last: dict = {}
 
-    def _apply_analytic_step(self, base_lr: float, loss_value: float) -> dict:
+    def _apply_analytic_step(
+        self, base_lr: float, probe_batch: dict | None
+    ) -> dict:
         """Replace the schedule LR with the curvature-optimal step.
 
         ``RecursiveGrowth.lean`` ``optimal_step_unconstrained``: the guaranteed
         decrease ``g(eta) = eta*inner - L*||d||^2*eta^2/2`` is a concave
-        quadratic whose maximum is analytic, ``eta* = inner/(L*||d||^2)``. With
-        ``d = -g`` we get ``inner = -||g||^2 < 0``, so the raw gradient is NOT
-        the descent direction the theorem assumes -- we therefore use the
-        momentum-weighted direction the optimizer actually applies, whose
-        alignment with the gradient is measured, not assumed.
+        quadratic whose maximum is analytic, ``eta* = inner/(L*||d||^2)``.
+
+        ``L`` is measured by a two-point probe on ``probe_batch``: the
+        smoothness identity ``|f(theta+d) - f(theta) - <g,d>| <= (L/2)||d||^2``
+        solved for L. The probe displaces, measures, and restores -- the model
+        is left exactly as found, so a probe can never corrupt the update.
+
+        The direction is the momentum-weighted one the optimizer actually
+        applies, whose alignment with the gradient is MEASURED rather than
+        assumed: the raw gradient gives ``inner = -||g||^2 < 0``, which is not
+        the descent direction the theorem assumes.
 
         The step is clipped to ``1/L`` (``optimal_step_ge_recip``) and to
         ``base_lr`` so it never exceeds the tuned baseline.
 
-        Returns the metrics dict (empty when the probe has no estimate yet).
+        Returns the metrics dict (empty when no estimate is available yet).
         """
         params = [
             p for g in self.optimizer.param_groups if not g.get("_muon")
@@ -262,23 +270,36 @@ class Trainer:
         if not params:
             return {}
 
-        probe = self._curvature
-        smoothness = None
-
         def loss_fn() -> float:
+            """Loss on the probe batch at the CURRENT parameter values."""
+            if probe_batch is None:
+                return float("nan")
             with torch.no_grad():
-                return loss_value
+                out = self.model(
+                    probe_batch["input_ids"],
+                    probe_batch["targets"],
+                    doc_ids=probe_batch.get("doc_ids"),
+                    loss_mask=probe_batch.get("loss_mask"),
+                    images=probe_batch.get("images"),
+                    spectrograms=probe_batch.get("spectrograms"),
+                    decision_targets=probe_batch.get("decision_targets"),
+                    decision_mask=probe_batch.get("decision_mask"),
+                )
+                loss = out.lm_loss if out.lm_loss is not None else out.ce
+                return float(loss)
 
         try:
-            smoothness = probe.estimate(loss_fn, params, grads)
+            smoothness = self._curvature.estimate(loss_fn, params, grads)
         except Exception as exc:  # a failed probe costs the step's LR, not the step
             logger.warning("step %d: curvature probe failed: %s", self.step, exc)
+            return {}
+        if smoothness is None or smoothness != smoothness:  # None or NaN
             return {}
 
         # Direction the Adam group applies: momentum/nesterov lookahead where
         # available, else the raw gradient. Its norm and alignment with g are
         # what the theorem's inner and dn2 refer to.
-        direction = self._optimizer_direction(grads)
+        direction = self._optimizer_direction(params, grads)
         dn2 = sum(float(d.double().pow(2).sum()) for d in direction)
         inner = sum(float((d * g).double().sum()) for d, g in zip(direction, grads))
         if dn2 <= 0.0:
@@ -302,27 +323,27 @@ class Trainer:
         }
         return self._analytic_step_last
 
-    def _optimizer_direction(self, grads: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Reconstruct the direction the optimizer applies for non-Muon groups."""
-        params = {
-            id(p): p
-            for g in self.optimizer.param_groups if not g.get("_muon")
-            for p in g["params"]
-        }
+    def _optimizer_direction(
+        self, params: list[torch.Tensor], grads: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """The direction the optimizer actually applies, per parameter.
+
+        For AdamW that is the first-moment exponential moving average
+        (``exp_avg``): the bias-corrected update is proportional to it, so
+        it is the direction whose alignment with the current gradient the
+        descent certificate is about. Before the first step there is no
+        ``exp_avg`` and the direction is the raw gradient.
+        """
+        # HybridOptimizer is not an Optimizer: the per-parameter state for the
+        # non-Muon groups lives on the wrapped AdamW.
+        adam_state = self.optimizer.adamw.state
         direction: list[torch.Tensor] = []
-        for p, g in zip(
-            [p for g in self.optimizer.param_groups if not g.get("_muon")
-             for p in g["params"] if p.grad is not None],
-            grads,
-        ):
-            state = self.optimizer.state.get(params.get(id(p), p), {})
-            buf = state.get("momentum_buffer")
+        for p, g in zip(params, grads):
+            buf = adam_state.get(p, {}).get("exp_avg")
             if buf is None:
                 direction.append(g)
-            elif bool(self.optimizer.param_groups[0].get("nesterov", True)):
-                direction.append(g + buf)
             else:
-                direction.append(buf.clone())
+                direction.append(buf)
         return direction
 
     def _gram_scan_samples(self) -> list[tuple[str, dict]]:
@@ -659,7 +680,7 @@ class Trainer:
         analytic_metrics: dict = {}
         if self._curvature is not None:
             analytic_metrics = self._apply_analytic_step(
-                adam_lr, loss_sum / max(len(microbatches), 1)
+                adam_lr, prepared[0][0] if prepared else None
             )
         self.optimizer.step()
 
@@ -749,6 +770,9 @@ def format_metrics(metrics: dict) -> str:
     ):
         if key in metrics:
             parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+    if "analytic_eta" in metrics:
+        parts.append(f"eta={metrics['analytic_eta']:.3e}")
+        parts.append(f"L={metrics['analytic_L']:.3e}")
     parts.append(f"kl={metrics.get('kl', 0.0):.4f}")
     return " | ".join(parts)
 
