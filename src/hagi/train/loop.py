@@ -317,9 +317,15 @@ class Trainer:
             base_lr=float(self.cfg.train.learning_rate),
             clip_to_lr=bool(getattr(self.cfg.train, "analytic_step_clip_lr", True)),
         )
-        # Warmup still applies to the analytic step as a multiplier on the
-        # ceiling, so the first steps cannot be large even if eta* would be.
-        eta = min(eta, base_lr) if base_lr > 0.0 else 0.0
+        # The analytic step replaces the schedule's LR outright, so it is
+        # clipped against the CONFIGURED base LR (see above) and the warmup
+        # ramp is applied on top of that ceiling by ratio, not by absolute
+        # value: reusing the schedule's own number here zeroed eta
+        # permanently under inverse-sqrt (from step ~190) and froze training
+        # while the loss rose.
+        warmup = int(getattr(self.cfg.train.schedule, "warmup_steps", 0))
+        if warmup > 0 and self.step < warmup:
+            eta *= self.step / warmup
         for g in self.optimizer.param_groups:
             if not g.get("_muon"):
                 g["lr"] = eta
