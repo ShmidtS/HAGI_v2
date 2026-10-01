@@ -40,6 +40,20 @@ Full architecture and code description: **[ARCHITECTURE.md](ARCHITECTURE.md)**
   → gen-3: та же схема от gen-2 joint
 ```
 
+Фактическое состояние линии (чекпойнты на диске):
+
+```
+gen-2 joint (H=1152, 1600 шагов, CE ~3.4-4.1)
+  → 3 доменных сиба H=384  [math / lang / code]  ← checkpoints/gen2_dsib_*
+  → gen-3 merged H=1152 (Hadamard-миксер, block-diag 3→1)   ← configs/dbridge_gen3_merged.yaml
+  → gen-3 joint                                              ← configs/dbridge_gen3_joint.yaml
+```
+
+Замечание: `configs/dbridge_gen2_merged_had.yaml` ссылается на
+`dbridge_gen2_sib*`, которых на диске нет — фактические сибы лежат в
+`gen2_dsib_*`. Это и была причина `GEN2-MERGE-FAIL` в `logs/chain.log`.
+Конфиг gen-3 указывает на существующие пути.
+
 Слияние — **троичное 3→1 на каждом уровне** (не степени двойки);
 Hadamard-трансформ строится для любого N (pad → QR-ортонормализация).
 Шаг-0 merged-модели — ровно ансамбль экспертов (Jensen-выигрыш бесплатно),
@@ -61,7 +75,37 @@ python -u scripts/train.py --config configs/dbridge_gen1_joint.yaml
 # см. протокол в ARCHITECTURE.md §4
 ```
 
-Тесты: `python -X utf8 -m pytest tests -q` (24 passed).
+Тесты: `python -X utf8 -m pytest tests -q` (79 passed).
+
+## Формализация: что портировано в код
+
+Ядро — `ShmidtS/primes` (486 теорем, 0 `sorry`/`axiom`, Lean 4.32).
+Каждый модуль ниже исполняет формулу доказанной теоремы и помечен её именем.
+
+| Модуль | Теорема | Что заменяет |
+|---|---|---|
+| `train/analytic_step.py` | `optimal_step_unconstrained` | η\* = ⟨g,d⟩/(L‖d‖²) вместо `lr` |
+| `train/stochastic_safeqp.py` | R92 `minibatch_inner_concentration` | полные градиенты → минибатчи с явным ε |
+| `train/batch_law.py` | `amgm_equality` + `amgm_uniqueness` | подбор батча: B\* = √(Bₙt₀/c) |
+| `train/hedge.py` | `router_regret_bound`, `gating_tail_bound` | η = √(2lnK/T), min k по хвосту |
+| `train/controller_policy.py` | `ratio_dominance` | поиск разбивок бюджета |
+| `train/growth_law.py` | `capability_takeoff_counted` | счётчики роста |
+| `train/insight_currency.py` | `insight_kl_descent`, `tldr_drift_null` | раздельные метрики CE/KL |
+| `train/data_axis.py` | `diversity_floor_strict_pos` | симуляция пола → замкнутая сумма |
+
+**Честные отрицательные результаты** (`.omc/attempts/`, не задеплоены):
+
+- `analytic_step` — порт корректен (3 теоремы, 19 тестов), но на
+  реальном A/B проиграл baseline на **+1.02 CE**. Глобальная проба L
+  растёт монотонно (4.5 → 19 → 500), отслеживая самое крутое
+  направление, а не среднее. Флаг `analytic_step` остаётся `False`.
+- `batch_law` — измерено `t₀ = −8.8` мс, т.е. фиксированного overhead
+  практически нет: `grad_accum_steps=1` во всех конфигах, амортизировать
+  нечего. Согласуется с п.4 принципов ниже (шум исчезает на ~100 токенах).
+- `LeanMachineLearning/LML` — учебник по вероятности (MarkovKernels,
+  Martingales); применимых оптимизационных теорем нет.
+  `lean-dojo/TorchLean` богат (`CROWN`/`Lyapunov`/`DirectedBackward`),
+  но это верификация, а не ускорение.
 
 ## Стек
 
