@@ -28,6 +28,7 @@ from collections.abc import Iterator
 
 import torch
 from torch import nn
+from pathlib import Path
 
 from hagi.config import Config
 from hagi.model.adaptive import freeze_base_in_place
@@ -727,6 +728,48 @@ def train(
     min_run_ce: float | None = None
     diverged_count = 0
 
+    # Fixed-window gate evaluation (round 61): deterministic tail-window
+    # batch per corpus, captured lazily on first use, weighted with the
+    # canonical corpus weights. A STABLE control signal -- unlike the running
+    # ce, which drifts with the data stream (round-54 false-alarm lesson).
+    gate_interval = int(cfg.train.logging.gate_eval_interval)
+    gate_batches: list | None = None
+
+    def _gate_ce(model) -> float:
+        import numpy as np  # local: only needed when the gate is enabled
+        nonlocal gate_batches
+        if gate_batches is None:
+            gate_batches = []
+            weights = []
+            data_dir = Path(cfg.train.data.data_dir)
+            for name, w in sorted((cfg.train.data.weights or {}).items()):
+                p = data_dir / f"{name}.compact.bin"
+                if not p.exists():
+                    continue
+                total = p.stat().st_size // 4
+                start = max(0, total - 2_000_000)
+                with p.open("rb") as fh:
+                    fh.seek(start * 4)
+                    T = np.frombuffer(fh.read(2048 * 4), dtype=np.uint32).astype(np.int64)
+                ids = torch.from_numpy(T[:2048]).reshape(2, 1024)
+                gate_batches.append((ids[:, :-1], ids[:, 1:]))
+                weights.append(float(w))
+            wsum = sum(weights) or 1.0
+            weights = [w / wsum for w in weights]
+            gate_batches.append(weights)
+        weights = gate_batches[-1]
+        model.eval()
+        total = 0.0
+        with torch.no_grad():
+            for (x, y), w in zip(gate_batches[:-1], weights):
+                x = x.to(next(model.parameters()).device)
+                y = y.to(x.device)
+                o = model(x, y)
+                f = o.hidden.reshape(-1, o.hidden.shape[-1])
+                total += w * float(model.head.exact_loss(f, y.reshape(-1)))
+        model.train()
+        return total
+
     while trainer.step < cfg.train.max_steps:
         microbatches = []
         for _ in range(accum):
@@ -764,6 +807,13 @@ def train(
             logger.info("%s", format_metrics(metrics))
             yield metrics
 
+        # Fixed-window gate CE: the STABLE control signal for divergence and
+        # saturation diagnosis (and for the T* fit -- traininfer_critical).
+        if gate_interval > 0 and trainer.step % gate_interval == 0:
+            gce = _gate_ce(model)
+            logger.info("gate_ce step %d: %.4f", trainer.step, gce)
+            metrics["gate_ce"] = gce
+
         # Saturation check on the exact_ce (the coding-cost SSOT). Only
         # evaluated when exact_ce is actually measured (exact_ce_interval>0).
         if patience > 0 and "exact_ce" in metrics and trainer.step >= min_steps:
@@ -786,8 +836,9 @@ def train(
         # Divergence guard on the running ce (logged every interval, unlike
         # exact_ce). Stops the run before divergence burns the remaining GPU
         # budget; the last good checkpoint stays from checkpoint_interval.
-        if div_patience > 0 and "ce" in metrics and trainer.step >= div_min_steps:
-            run_ce = float(metrics["ce"])
+        div_key = "gate_ce" if gate_interval > 0 and "gate_ce" in metrics else "ce"
+        if div_patience > 0 and div_key in metrics and trainer.step >= div_min_steps:
+            run_ce = float(metrics[div_key])
             if min_run_ce is None or run_ce < min_run_ce:
                 min_run_ce = run_ce
                 diverged_count = 0

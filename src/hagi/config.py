@@ -595,6 +595,13 @@ class LoggingConfig:
     exact_ce_interval: int = 0
     exact_ce_rows: int = 512
     exact_ce_seed: int = 1729
+    # Fixed-window gate CE, logged every ``gate_eval_interval`` steps on a
+    # deterministic tail-window batch (the canonical 2x1024-per-corpus gate).
+    # Unlike exact_ce (measured on the *current* training batch, which drifts
+    # with the stream), this is a STABLE control signal: divergence/saturation
+    # diagnosis must use it, not the running ce (the round-54 false-alarm
+    # lesson). 0 = disabled.
+    gate_eval_interval: int = 0
 
 
 @dataclass
