@@ -623,10 +623,20 @@ class InsightConfig:
     """Insight-channel parameters (hagi.train.insight)."""
 
     enabled: bool = False
+    # Steps between insight cycles. The channel costs one extra forward and
+    # (when it passes the gate) one adapter step, so it runs on an interval
+    # rather than every step. 0 disables the cadence even when enabled.
+    interval: int = 0
     # top-quantile per-token CE defines a "failure" position
     fail_quantile: float = 0.9
     # compressed correction length in tokens (paper: ~17)
     max_tokens: int = 17
+    # Hard cap on insights per cycle. The SFT loss materialises a
+    # [rows, len, V] logit tensor; on a fresh model every position is a
+    # failure (ce = ln V), so an uncapped window yields ~1024 rows and
+    # ~139 GB of logits -- an unrecoverable HIP launch failure. The list
+    # is sorted by span CE descending, so the cap keeps the hottest spans.
+    max_rows: int = 32
     # SFT weight on the insight target positions
     lambda_insight: float = 4.0
     # exact full-vocab KL(p_post || p_pre) bound on the scored window

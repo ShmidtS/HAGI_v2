@@ -71,6 +71,7 @@ def extract_insights(
     input_ids: torch.Tensor,
     targets: torch.Tensor,
     cfg,
+    max_rows: int = 32,
 ) -> list[Insight]:
     """Select hard spans (top-quantile CE above ``min_ce``) as insights.
 
@@ -78,6 +79,16 @@ def extract_insights(
     the ground-truth continuation after the run's first token, truncated
     to ``max_tokens``.     The ``min_ce`` floor makes a quantile of an
     already-easy window invent nothing.
+
+    Args:
+        max_rows: hard cap on the returned insights. Without it the row
+            count is unbounded and ``insight_sft_loss`` materialises a
+            ``[rows, len, V]`` logit tensor -- on a fresh model every
+            position exceeds ``min_ce`` (ce = ln V), so a 32x1024 window
+            yields 1024 rows and 139 GB of logits, which fails a HIP
+            launch on any GPU. The cap keeps the HOTTEST spans (the list
+            is sorted by span CE, descending), so the signal is preserved
+            and only the tail is dropped.
     """
     if input_ids.ndim == 1:
         input_ids = input_ids.unsqueeze(0)
@@ -111,7 +122,7 @@ def extract_insights(
                     )
                 run_start = None
     insights.sort(key=lambda i: i.span_ce, reverse=True)
-    return insights
+    return insights[: max_rows]
 
 
 def insight_sft_loss(
@@ -197,12 +208,26 @@ def run_insight_cycle(
         input_ids = input_ids.unsqueeze(0)
     if targets.ndim == 1:
         targets = targets.unsqueeze(0)
+    # The caller may hand over windows read from disk (CPU) while the model
+    # lives on the GPU; index_select inside the model then fails on a device
+    # mismatch. Coerce here so every entry point works, not just the ones
+    # that happen to pass device-resident tensors.
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    targets = targets.to(device)
+    if old_windows:
+        old_windows = [
+            (ids.to(device), tgt.to(device)) for ids, tgt in old_windows
+        ]
     with torch.no_grad():
         pre_logp = _log_probs(model, input_ids)
         pre_ce = float(
             (-pre_logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).mean()
         )
-    insights = extract_insights(model, input_ids, targets, cfg)
+    insights = extract_insights(
+        model, input_ids, targets, cfg,
+        max_rows=int(getattr(cfg, "max_rows", 32)),
+    )
     report = {
         "pre_ce": pre_ce,
         "post_ce": None,

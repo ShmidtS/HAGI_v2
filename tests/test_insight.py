@@ -79,6 +79,35 @@ def test_extract_respects_quantile_floor_and_length():
     assert extract_insights(model, w["input_ids"], w["targets"], cfg_hi) == []
 
 
+def test_extract_is_capped_and_keeps_the_hottest_spans():
+    """Regression: an uncapped window OOMs the SFT step.
+
+    insight_sft_loss materialises a [rows, len, V] logit tensor. On a
+    fresh model ce = ln V everywhere, so the DEFAULT fail_quantile=0.9
+    marks the top decile of every position as hard. Those are scattered,
+    so run-merging yields hundreds of separate spans, and 32 rows x 1024
+    positions of full-vocabulary logits is tens of GB -- the HIP launch
+    fails unrecoverably. The cap keeps the HOTTEST spans, since the list
+    is sorted by span CE descending.
+    """
+    torch.manual_seed(0)
+    model = HAGI(_tiny_cfg())
+    model.eval()
+    w = _window(7, t=600)
+    cfg = InsightConfig(fail_quantile=0.9, max_tokens=5, min_ce=0.0)
+
+    uncapped = extract_insights(model, w["input_ids"], w["targets"], cfg, max_rows=10**9)
+    assert len(uncapped) > 8, "fixture must produce more spans than the cap"
+
+    capped = extract_insights(model, w["input_ids"], w["targets"], cfg, max_rows=8)
+    assert len(capped) == 8
+    # Sorted by span CE descending, and the same spans the uncapped call
+    # would have produced first -- only the tail is dropped.
+    assert [i.span_ce for i in capped] == sorted(
+        (i.span_ce for i in uncapped[:8]), reverse=True
+    )
+
+
 def test_insight_loss_finite_and_weighted():
     torch.manual_seed(0)
     model = HAGI(_tiny_cfg())
