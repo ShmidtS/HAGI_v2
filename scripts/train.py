@@ -287,6 +287,13 @@ def main() -> int:
                     # (they have no ``mixers.*`` keys).
                     drop_expert_mixers=True,
                 ).to(device)
+                # Step-0 checkpoint: the joint configs of the winning line load
+                # ``step-0000000.pt`` — the exact merged state (the Jensen
+                # step-0 identity) BEFORE any training. Saving it here keeps
+                # the merge artifact even if the merged run is interrupted.
+                from hagi.train.checkpoint import save_checkpoint
+
+                save_checkpoint(model, cfg, 0, cfg.train.checkpoint_dir)
             else:
                 # No expert checkpoints configured: build the merged body from the
                 # current (random) weights so the machinery is exercised. With
