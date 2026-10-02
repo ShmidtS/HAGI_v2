@@ -97,20 +97,33 @@ def frontier_gap(models, batches) -> float:
     The exact ``jensen_gap_lse``: the running logit sum ``S`` over the
     pool minus the log-sum-exp of the mean, accumulated over positions.
     Zero iff every expert agrees on every position.
+
+    Two experts at ``[32, 1024, 32768]`` in float64 is 8.6 GB -- more
+    than this machine has free while a training run holds the GPU, so
+    the gap is accumulated per-window in float32 and upcast only inside
+    the log-sum-exp. That is numerically identical for this quantity
+    (``logsumexp`` subtracts the row max first, so the cancellation
+    that float32 would hurt does not occur) and costs N less memory.
     """
     total = 0.0
     positions = 0
     with torch.no_grad():
         for ids in batches:
-            logits = [m(ids, return_logits=True).logits.double() for m in models]
-            s = torch.stack(logits).sum(0)                     # [B,T,V]
-            n = len(models)
-            # per-position: sum_i LSE(z_i) - LSE(mean_i z_i)
-            lse_each = sum(torch.logsumexp(z, dim=-1) for z in logits)
-            lse_mean = torch.logsumexp(s / n, dim=-1)
-            gap = lse_each - lse_mean                            # [B,T]
-            total += float(gap.sum())
-            positions += int(gap.numel())
+            for i in range(0, ids.shape[0], 1):
+                window = ids[i : i + 1]
+                logits = [
+                    m(window, return_logits=True).logits[0].double()
+                    for m in models
+                ]
+                n = len(models)
+                # per-position: sum_i LSE(z_i) - LSE(mean_i z_i)
+                lse_each = sum(torch.logsumexp(z, dim=-1) for z in logits)
+                lse_mean = torch.logsumexp(
+                    torch.stack(logits).sum(0) / n, dim=-1
+                )
+                gap = lse_each - lse_mean                        # [T]
+                total += float(gap.sum())
+                positions += int(gap.numel())
     return total / max(positions, 1)
 
 
