@@ -205,12 +205,30 @@ def run(cmd: list[str], log_path: Path, timeout: int) -> int:
             env=dict(os.environ),
         )
         try:
-            return proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            # Poll rather than ``proc.wait()``. On Windows a killed child
+            # can leave ``wait()`` blocked on a handle that never closes, and
+            # the supervisor was observed stuck in State: S for minutes after
+            # the training process was long gone -- which silently ended the
+            # autonomous cycle with nothing in the log saying so. A poll loop
+            # with a bounded sleep cannot wedge, and the timeout is enforced
+            # here rather than by an unbounded wait.
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    return proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() > deadline:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            LOG.error("child did not reap after kill")
+                        LOG.error("timeout after %ss: %s", timeout, " ".join(cmd))
+                        return 124
+        except Exception as exc:                      # pragma: no cover
             proc.kill()
-            proc.wait()
-            LOG.error("timeout after %ss: %s", timeout, " ".join(cmd))
-            return 124
+            LOG.error("run failed: %s (%s)", " ".join(cmd), exc)
+            return 125
 
 
 def latest_checkpoint(directory: Path) -> Path | None:
