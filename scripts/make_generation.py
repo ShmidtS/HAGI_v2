@@ -95,10 +95,17 @@ def main() -> int:
     ap.add_argument("--head-dim", type=int, default=64)
     ap.add_argument(
         "--learning-rate", type=float, default=None,
-        help="sibling learning rate. MUST be given explicitly: it is not "
-             "scale-free, so inheriting the template's value across a width "
-             "change is what made gen-4 sib3 diverge (CE 4.07 -> 46.18 at "
-             "H=1152 with a rate tuned for H=384).",
+        help="sibling learning rate. Defaults to --lr-scale / parent_width. "
+             "The product H*lr is what the project actually measured as "
+             "stable: gen-2 siblings at H=384/lr=1e-3 (H*lr=0.384) and "
+             "gen-3 joint at H=1152/lr=3e-4 (0.346) both trained stably, "
+             "while gen-4 siblings at H=1152/lr=1e-3 (1.152) diverged -- "
+             "sib3 to ce 74 and sib2 degraded to a 5.49 tail mean. So the "
+             "rate is NOT scale-free and must be set from the width.",
+    )
+    ap.add_argument(
+        "--lr-scale", type=float, default=0.35,
+        help="target H*lr product; the sibling rate is lr_scale/width",
     )
     ap.add_argument("--parent-joint", required=True,
                     help="checkpoint the siblings init from")
@@ -126,6 +133,17 @@ def main() -> int:
     sib_width = args.parent_width
     merged_width = args.parent_width * args.n_experts
     expert_hidden = sib_width // args.n_experts
+    # The rate follows the width from the measured stable band.
+    sib_lr = (
+        args.learning_rate
+        if args.learning_rate is not None
+        else args.lr_scale / sib_width
+    )
+    print(
+        f"sibling lr = {sib_lr:.3e} "
+        f"(H*lr = {sib_width * sib_lr:.3f}; stable band measured 0.35-0.38, "
+        f"diverged at 1.15)"
+    )
 
     tmpl_sib = yaml.safe_load((ROOT / args.template_sibling).read_text(encoding="utf-8"))
     tmpl_merged = yaml.safe_load((ROOT / args.template_merged).read_text(encoding="utf-8"))
@@ -140,8 +158,7 @@ def main() -> int:
         _set(cfg, "merge.expert_hidden", expert_hidden)
         cfg["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_sib_{name}"
         cfg["train"]["init_from"] = args.parent_joint
-        if args.learning_rate is not None:
-            cfg["train"]["learning_rate"] = args.learning_rate
+        cfg["train"]["learning_rate"] = sib_lr
         cfg["train"]["data"]["seed"] = int(seed)
         weights: dict[str, float] = {}
         for item in mix.split(","):
