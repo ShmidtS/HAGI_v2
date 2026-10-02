@@ -83,7 +83,7 @@ Hadamard-трансформ строится для любого N (pad → QR-�
 ```bash
 pip install -e .
 
-# лист (эксперт H=128)
+# лист (эксперт)
 python -u scripts/train.py --config configs/dbridge_leaf_s1.yaml
 
 # слияние 3 экспертов (gen-1)
@@ -94,7 +94,45 @@ python -u scripts/train.py --config configs/dbridge_gen1_joint.yaml
 # см. протокол в ARCHITECTURE.md §4
 ```
 
-Тесты: `python -X utf8 -m pytest tests -q` (79 passed).
+## Автономный цикл роста
+
+Не редактируйте конфиги следующего поколения вручную — геометрия
+наследуется, а не выводится, и два запуска gen-4 подряд падали именно
+на этом. Генерируйте поколение и проверяйте инварианты до запуска:
+
+```bash
+# 1. сгенерировать поколение (проверит q*head_dim == hidden_size)
+python scripts/make_generation.py --parent-width 1152 --generation 5 \
+    --n-experts 3 --head-dim 64 --learning-rate 0.0003 \
+    --parent-joint checkpoints/dbridge_gen3_joint/step-0001600.pt \
+    --template-sibling configs/dbridge_gen4_sib1.yaml \
+    --template-merged configs/dbridge_gen4_merged.yaml \
+    --template-joint configs/dbridge_gen4_joint.yaml \
+    --mixes math=13001=openwebmath:0.45,edu:0.25 \
+            lang=13002=wikipedia_ru:0.30,oscar_ru:0.20,edu:0.20 \
+            code=13003=python_instruct:0.50,edu:0.20 \
+    --merge-checkpoint-step 1600 --write
+
+# 2. прогнать цикл: 3 эксперта → слияние → joint → оценка
+python scripts/growth/growth_supervisor.py --plan configs/growth_gen5.yaml \
+    --device cuda --max-lanes 1
+
+# 3. измерить рост / универсальность / качество слияния
+python scripts/growth_benchmark.py \
+    --gen  gen5_joint=configs/dbridge_gen5_joint.yaml=<ckpt> \
+    --prev gen3_joint=configs/dbridge_gen3_joint.yaml=<ckpt> \
+    --expert math=configs/...=<ckpt>   # по одному на эксперта
+```
+
+`--learning-rate` обязателен: значение **не масштабно-инвариантно**.
+gen-4 sib3 унаследовал 1e-3 от шаблона, настроенного на H=384, и при
+H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
+
+Супервизор отказывается принимать разошедшийся чекпойнт (`converged()`),
+включая путь «все попытки исчерпаны» — иначе разрушенный эксперт
+попадёт в слияние.
+
+Тесты: `python -X utf8 -m pytest tests -q` (98 passed).
 
 ## Формализация: что портировано в код
 
