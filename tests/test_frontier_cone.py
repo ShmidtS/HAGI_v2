@@ -27,6 +27,7 @@ from hagi.train.frontier_cone import (
     cone_threshold,
     diagnose,
     frontier_ratio,
+    gamma_is_derived_from_frontier,
     regime,
     settled_gain,
 )
@@ -76,15 +77,61 @@ def test_the_cone_is_the_alpha_over_gamma_line():
 def test_the_projects_own_measurements_are_outside_the_cone():
     """The regime this project is actually in, pinned as a fact.
 
-    D = 18.25 nats, C = 3.3, gamma = 0.002 -> D/C = 5.53 against a
-    boundary of alpha/gamma = 50. So R107's cone does NOT hold, and
-    R104's converse caps capability. Recording it here means a future
-    improvement has something to compare against.
+    D = 18.25 nats, C = 3.3, gamma = 0.002 -> ratio 0.1106, so R107's
+    cone does not hold and R104's converse caps capability.
+
+    The number is what it is, but see
+    ``test_a_gamma_derived_from_the_frontier_makes_the_cone_vacuous``:
+    this verdict is a restatement of ``G >= alpha*C`` and says nothing
+    about the frontier. It is recorded because a future improvement
+    needs a number to beat, not because it discriminates.
     """
     assert cone_holds(0.1, 0.002, 3.3, 18.25) is False
     assert frontier_ratio(0.1, 0.002, 3.3, 18.25) == pytest.approx(
         0.1106, abs=1e-3
     )
+
+
+def test_a_gamma_derived_from_the_frontier_makes_the_cone_vacuous():
+    """``gamma = G/D`` cancels ``D`` out of the cone entirely.
+
+    ``(D/C)/(alpha/(G/D)) == G/(alpha*C)`` for EVERY frontier. So a
+    gamma measured as G/D makes the cone test unable to distinguish a
+    large frontier from a small one, and the measured D = 8.90 nats is
+    irrelevant to the verdict -- which is why re-measuring it changed
+    nothing. The real content of the test is ``G >= alpha*C``.
+    """
+    alpha, capability, gain = 0.1, 3.3, 0.0365
+    ratios = []
+    for frontier in (1.0, 8.9034, 18.25, 1000.0):
+        gamma = gain / frontier
+        assert gamma_is_derived_from_frontier(gamma, gain, frontier) is True
+        ratios.append(frontier_ratio(alpha, gamma, capability, frontier))
+    assert all(abs(r - ratios[0]) < 1e-9 for r in ratios)
+    assert ratios[0] == pytest.approx(gain / (alpha * capability))
+
+
+def test_an_independently_measured_gamma_does_discriminate():
+    """The contrast: a gamma NOT taken from D responds to D.
+
+    Two frontiers with the same independently measured gamma give
+    different ratios, which is the behaviour that makes the cone worth
+    testing at all.
+    """
+    alpha, gamma, capability = 0.1, 0.0075, 3.3
+    # 0.0075 is NOT 0.0365/D for any plausible D -- deliberately
+    # different from the project's 0.002 so the provenance check is
+    # testing independence rather than re-deriving the same number.
+    assert gamma_is_derived_from_frontier(gamma, 0.0365, 18.25) is False
+    assert gamma_is_derived_from_frontier(gamma, 0.0365, 8.9034) is False
+    near = frontier_ratio(alpha, gamma, capability, 50.0)
+    far = frontier_ratio(alpha, gamma, capability, 10.0)
+    assert near > far
+
+
+def test_the_provenance_check_rejects_a_non_positive_frontier():
+    with pytest.raises(ValueError):
+        gamma_is_derived_from_frontier(0.002, 0.0365, 0.0)
 
 
 def test_the_ratio_is_one_on_the_boundary():
