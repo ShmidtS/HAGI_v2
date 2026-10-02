@@ -132,7 +132,7 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 включая путь «все попытки исчерпаны» — иначе разрушенный эксперт
 попадёт в слияние.
 
-Тесты: `python -X utf8 -m pytest tests -q` (176 passed).
+Тесты: `python -X utf8 -m pytest tests -q` (325 passed).
 
 ## Формализация: что портировано в код
 
@@ -151,6 +151,10 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 | `train/controller_policy.py` | `ratio_dominance` | поиск разбивок бюджета |
 | `train/insight_currency.py` | `insight_kl_descent`, `tldr_drift_null` | раздельные метрики CE/KL |
 | `train/data_axis.py` | `diversity_floor_strict_pos` | симуляция пола → замкнутая сумма |
+| `train/synthetic_pretrain.py` | R99 `synth_investment_dominates` | `dT·c_step > C_synth` — один замер вместо вкуса |
+| `train/discovery_ppt.py` | R98 `pptTarget_isProbability`, `mh_stationary`, `truncation_bias` | `p₀` R95, вычислимый ДО сэмплирования |
+| `train/spectral.py` | R100 `proj_residual_identity`, `three_stage_error_budget` | ошибка сжатия раскладывается на именованные члены |
+| `train/factorized_merge.py` | R101 `routed_eval_exact`, `factorized_budget` | merge как `C + R_i` с измеримой ценой `(1/N)Σδᵢ` |
 
 **Измеренные следствия, а не обещания:**
 
@@ -172,6 +176,14 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 - `batch_law` — измерено `t₀ = −8.8` мс, т.е. фиксированного overhead
   практически нет: `grad_accum_steps=1` во всех конфигах, амортизировать
   нечего. Согласуется с п.4 принципов ниже (шум исчезает на ~100 токенах).
+- `factorized_merge` (R101) — арифметика верна, **посылка не выполняется**.
+  `scripts/measure_shared_core.py` на трёх gen-2 экспертах: cosine между
+  экспертами 0.986–0.991 (почти одинаковы — идеальный случай для общего
+  ядра), но 90% энергии остатка `W_i − C` требуют **83%** спектра
+  (317/384 компонент). Низкого ранга нет: отклонения размазаны по всем
+  направлениям. Факторизация сохранила бы `V·d + 3·64·(V+d)` параметров
+  и реконструировала бы **хуже**, чем просто хранить трёх экспертов.
+  Порт корректен, посылка не satisfied — не задеплоен.
 - `LeanMachineLearning/LML` — учебник по вероятности (MarkovKernels,
   Martingales); применимых оптимизационных теорем нет.
   `lean-dojo/TorchLean` богат (`CROWN`/`Lyapunov`/`DirectedBackward`),
