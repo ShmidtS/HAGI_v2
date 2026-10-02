@@ -132,7 +132,7 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 включая путь «все попытки исчерпаны» — иначе разрушенный эксперт
 попадёт в слияние.
 
-Тесты: `python -X utf8 -m pytest tests -q` (98 passed).
+Тесты: `python -X utf8 -m pytest tests -q` (176 passed).
 
 ## Формализация: что портировано в код
 
@@ -143,12 +143,25 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 |---|---|---|
 | `train/analytic_step.py` | `optimal_step_unconstrained` | η\* = ⟨g,d⟩/(L‖d‖²) вместо `lr` |
 | `train/stochastic_safeqp.py` | R92 `minibatch_inner_concentration` | полные градиенты → минибатчи с явным ε |
+| `train/adaptive_safeqp.py` | R97 (covering-number) | ε для адаптивно выбранного `d*(ω)` |
+| `train/anytime_budget.py` | R93 (неравенство Вилля) | δ на каждый шаг → один δ на горизонт |
+| `train/growth_law.py` | R95/R96 `success_count_lower`, `takeoff_time_form` | вероятностный takeoff из измеренных полей |
 | `train/batch_law.py` | `amgm_equality` + `amgm_uniqueness` | подбор батча: B\* = √(Bₙt₀/c) |
 | `train/hedge.py` | `router_regret_bound`, `gating_tail_bound` | η = √(2lnK/T), min k по хвосту |
 | `train/controller_policy.py` | `ratio_dominance` | поиск разбивок бюджета |
-| `train/growth_law.py` | `capability_takeoff_counted` | счётчики роста |
 | `train/insight_currency.py` | `insight_kl_descent`, `tldr_drift_null` | раздельные метрики CE/KL |
 | `train/data_axis.py` | `diversity_floor_strict_pos` | симуляция пола → замкнутая сумма |
+
+**Измеренные следствия, а не обещания:**
+
+- R93: при δ=0.05 наивное правило тратит 20 за 400 шагов (бюджет
+  превышен в 400 раз); геометрическое — не более 0.05 при T=1, 100
+  и 10⁶.
+- R95: 10x ёмкости — 95 циклов при p₀=0.3 против 16 при p₀=0.9.
+  Поднимать частоту успехов выгоднее, чем размер выигрыша.
+- R97: адаптивный выбор направления стоит 4.3x фиксированного запаса
+  при n=16 и **35x при n=1152** (наша ширина). Цена указана явно,
+  `eps_dir` выбирается арифметически, а не на глаз.
 
 **Честные отрицательные результаты** (`.omc/attempts/`, не задеплоены):
 
