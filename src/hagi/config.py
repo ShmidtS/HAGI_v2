@@ -897,6 +897,12 @@ class MergeConfig:
     mixer_type: str = "hadamard"
     mixer_rank: int = 64
     mixer_hadamard_groups: list[int] = field(default_factory=list)
+    # Generation-antisymmetric mixer (GAM, R104/R107): the fresh merge's
+    # rank channel is re-randomized and its input factors are Gram-Schmidt
+    # orthogonalized against the accumulated previous-generation factor
+    # spaces, and the gain alternates sign with the cycle index. 0 (default)
+    # disables the mechanism entirely (the historical behavior).
+    mixer_gen_phase: int = 0
     distill: bool = False
     # FORWARD-DECLARED for the planned distill-into-compact channel (todo);
     # no runtime consumer yet -- do not set in configs.
