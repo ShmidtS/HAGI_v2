@@ -132,7 +132,7 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 включая путь «все попытки исчерпаны» — иначе разрушенный эксперт
 попадёт в слияние.
 
-Тесты: `python -X utf8 -m pytest tests -q` (493 passed).
+Тесты: `python -X utf8 -m pytest tests -q` (576 passed).
 
 ## Формализация: что портировано в код
 
@@ -158,6 +158,8 @@ H=1152 разошёлся (CE 4.07 → 74.77), выйдя с кодом 0.
 | `train/takeoff_window.py` | R102 `growth_state_takeoff_window`, `noisy_cycle_step` | фиксированный gain даёт **конечный** takeoff; `κ√n·s/2` |
 | `train/ternary_exact.py` | R103 `ternary_split_bound`, `quant_energy_bridge_saturation` | хвост насыщения измеряется, а не предполагается |
 | `train/gain_renewal.py` | R104 `renewal_feeds_takeoff`, `bounded_frontier_no_sustained_growth` | sustained growth ⟺ фронтир масштабируется |
+| `train/growth_potential.py` | R91 `growth_cycle_potential` | `Φ = energy + protectedRisk`, четыре стадии одной суммой |
+| `train/routing_optimal.py` | R94 `topk_routing_optimal`, `geometric_pool_identity_nonneg` | top-k оптимален; пулинг стоит `−log Z ≥ 0` |
 
 **Измеренные следствия, а не обещания:**
 
