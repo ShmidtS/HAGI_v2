@@ -93,6 +93,13 @@ def main() -> int:
     ap.add_argument("--generation", type=int, required=True)
     ap.add_argument("--n-experts", type=int, default=3)
     ap.add_argument("--head-dim", type=int, default=64)
+    ap.add_argument(
+        "--learning-rate", type=float, default=None,
+        help="sibling learning rate. MUST be given explicitly: it is not "
+             "scale-free, so inheriting the template's value across a width "
+             "change is what made gen-4 sib3 diverge (CE 4.07 -> 46.18 at "
+             "H=1152 with a rate tuned for H=384).",
+    )
     ap.add_argument("--parent-joint", required=True,
                     help="checkpoint the siblings init from")
     ap.add_argument("--template-sibling", required=True)
@@ -133,6 +140,8 @@ def main() -> int:
         _set(cfg, "merge.expert_hidden", expert_hidden)
         cfg["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_sib_{name}"
         cfg["train"]["init_from"] = args.parent_joint
+        if args.learning_rate is not None:
+            cfg["train"]["learning_rate"] = args.learning_rate
         cfg["train"]["data"]["seed"] = int(seed)
         weights: dict[str, float] = {}
         for item in mix.split(","):

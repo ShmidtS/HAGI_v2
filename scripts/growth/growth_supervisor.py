@@ -45,9 +45,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
-import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, '../../..'))
 for _p in (_HERE, _REPO, os.path.join(_REPO, 'src')):
@@ -174,7 +174,59 @@ def checkpoint_dir_of(config: Path) -> Path:
     return ROOT / str(cfg["train"]["checkpoint_dir"])
 
 
-def train_phase(config: Path, log_path: Path, device: str, attempts: int) -> Path | None:
+def converged(log_path: Path, ceiling: float = 6.0) -> tuple[bool, str]:
+    """Did the run finish converged, or did it diverge?
+
+    A run can exit 0 having diverged: the gen-4 sib3 log shows CE climbing
+    4.07 -> 5.61 -> 12.19 -> 29.06 over steps 1230..1330 while training
+    continued to completion. Accepting that checkpoint would poison the
+    merge, because a diverged expert contributes its divergence to all
+    three downstream branches. Exit status alone cannot see this; only the
+    loss curve can.
+
+    The test is the last recorded CE against ``ceiling`` -- a per-token
+    cross-entropy of 6 is already far past useful on a 32768 vocabulary
+    (ln V = 10.4 is uniform). A run with no parsable CE lines is treated as
+    converged, since a short or freshly resumed run may log nothing.
+    """
+    if not log_path.exists():
+        return True, "no log"
+    ce: list[float] = []
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                # The value may be a number OR nan/inf: a diverged run
+                # reports "ce=nan", which must not be read as "no number
+                # here" and therefore as convergence.
+                m = re.search(r"\|\s*ce=(nan|inf|-inf|[\d.eE+-]+)", line, re.I)
+                if m:
+                    try:
+                        value = float(m.group(1))
+                    except ValueError:
+                        continue
+                    ce.append(value)
+    except OSError as exc:
+        LOG.warning("cannot read %s: %s", log_path, exc)
+        return True, "unreadable"
+    if not ce:
+        return True, "no ce lines"
+    last = ce[-1]
+    if last != last:  # NaN
+        return False, "final ce is nan"
+    if last in (float("inf"), float("-inf")):
+        return False, f"final ce={last}"
+    if last > ceiling:
+        return False, f"final ce={last:.4f} exceeds {ceiling}"
+    return True, f"final ce={last:.4f}"
+
+
+def train_phase(
+    config: Path,
+    log_path: Path,
+    device: str,
+    attempts: int,
+    max_ce: float = 6.0,
+) -> Path | None:
     """Train (or resume) one config. Returns the final checkpoint, or None.
 
     Each attempt resumes from whatever is on disk, so a crash costs at most one
@@ -199,8 +251,18 @@ def train_phase(config: Path, log_path: Path, device: str, attempts: int) -> Pat
         code = run(cmd, log_path, timeout=60 * 60 * 24)
         ckpt = latest_checkpoint(out)
         if code == 0 and ckpt is not None:
-            LOG.info("train ok: %s -> %s", config.name, ckpt.name)
-            return ckpt
+            ok, why = converged(log_path, max_ce)
+            if ok:
+                LOG.info("train ok: %s -> %s (%s)", config.name, ckpt.name, why)
+                return ckpt
+            # The run exited 0 but diverged. Do NOT resume it: the next
+            # attempt would continue from the diverged checkpoint. Refuse the
+            # lane instead -- a diverged expert must never reach the merge.
+            LOG.error(
+                "diverged despite exit 0: %s -> %s (%s); refusing the checkpoint",
+                config.name, ckpt.name, why,
+            )
+            return None
         LOG.warning("train attempt %d/%d failed (exit %s)", attempt, attempts, code)
         if ckpt is None:
             LOG.error("no checkpoint on disk after failure; giving up on %s", config)
