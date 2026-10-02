@@ -221,6 +221,40 @@ def latest_checkpoint(directory: Path) -> Path | None:
     return steps[-1] if steps else None
 
 
+def log_tail(log_path: Path, lines: int = 3) -> str:
+    """The last few lines of a training log, or "" if unreadable."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    return "\n".join(text.rstrip().splitlines()[-lines:])
+
+
+# Markers a real failure leaves behind. Their absence is what tells a
+# killed process from a crash: a crash prints one of these, a kill just
+# stops.
+_FAILURE_MARKERS = (
+    "Traceback (most recent call last)",
+    "Error",
+    "error:",
+    "CUDA out of memory",
+    "HIP error",
+    "AssertionError",
+    "RuntimeError",
+    "ValueError",
+)
+
+
+def looks_like_exception(tail: str) -> bool:
+    """Does this log tail show a real failure rather than a silent stop?
+
+    Used to tell the two apart in ``train_phase``: a child killed by
+    another process leaves no traceback and exits non-zero, which looks
+    identical to a trainer crash unless you check for the marker.
+    """
+    return any(m in tail for m in _FAILURE_MARKERS)
+
+
 def checkpoint_dir_of(config: Path) -> Path:
     cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
     return ROOT / str(cfg["train"]["checkpoint_dir"])
@@ -344,6 +378,20 @@ def train_phase(
             )
             return None
         LOG.warning("train attempt %d/%d failed (exit %s)", attempt, attempts, code)
+        # A silent death is the common case on this hardware and it is NOT a
+        # training problem, so it must not be reported as one. Two supervisors
+        # racing for the same GPU produced exactly this: the child was killed
+        # mid-run, the log simply stops, and the retry loop cannot tell that
+        # apart from a crash in the trainer. Naming the distinction here is
+        # what stops the next occurrence from being debugged from scratch.
+        tail = log_tail(log_path, lines=3)
+        if code != 0 and not looks_like_exception(tail):
+            LOG.warning(
+                "attempt %d exited %s with no traceback in %s -- the process "
+                "was killed rather than failing. Most likely another training "
+                "process holds the GPU; check for a duplicate supervisor.",
+                attempt, code, log_path.name,
+            )
         if ckpt is None:
             LOG.error("no checkpoint on disk after failure; giving up on %s", config)
             return None
