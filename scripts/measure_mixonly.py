@@ -119,10 +119,22 @@ def main() -> int:
     base = gain_of(Path(init))
     print()
     print(f"gain {base:+.6f} -> {last:+.6f}   (delta {last - base:+.6f})")
+    print()
+    print("about the LEARNED SCALAR, not the channel:")
+    print("  'the channel deactivated' overstates it. The merge's")
+    print("  cross-expert path is mostly the FIXED orthonormal Hadamard")
+    print("  (measure_channel_split.py: the learned branch is ~1/3 of")
+    print("  the fixed path before this scalar and <1% after it), so")
+    print("  what this measures is the learned CORRECTION's drift.")
     if abs(last) < abs(base):
-        print("VERDICT: the channel DEACTIVATED toward zero with the experts frozen.")
+        print()
+        print("VERDICT: the learned correction shrank toward zero with the")
+        print("         experts frozen -- the same direction joint")
+        print("         training drives it, so the joint phase is not what")
+        print("         causes it.")
     else:
-        print("VERDICT: the channel GREW with the experts frozen.")
+        print()
+        print("VERDICT: the learned correction GREW with the experts frozen.")
     return 0
 
 
