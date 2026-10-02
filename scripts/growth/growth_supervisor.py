@@ -267,6 +267,14 @@ def train_phase(
         if ckpt is None:
             LOG.error("no checkpoint on disk after failure; giving up on %s", config)
             return None
+    # Every attempt is spent. The checkpoint on disk is whatever the LAST
+    # attempt left behind, which on gen-4 was a diverged one -- so it must be
+    # judged, not returned. Returning it unconditionally is how a destroyed
+    # expert reaches the merge.
+    ok, why = converged(log_path, max_ce)
+    if not ok:
+        LOG.error("all attempts spent and the run diverged: %s (%s)", config.name, why)
+        return None
     return latest_checkpoint(out)
 
 

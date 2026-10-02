@@ -89,3 +89,56 @@ def test_ignores_non_ce_numbers(tmp_path: Path):
         "weight rate: 16.000 bits/weight -> body 0.048 GB",
     ])
     assert converged(p)[0]
+
+
+def test_exhausted_attempts_still_judge_the_checkpoint(tmp_path: Path, monkeypatch):
+    """Regression: the exhausted-attempts path must not return blindly.
+
+    gen-4's sib3 diverged and still reached the merge, because when all
+    attempts are spent the function returned ``latest_checkpoint(out)``
+    with no convergence check. A destroyed expert must never be handed
+    on just because the retry budget ran out.
+    """
+    import growth_supervisor as gs
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "train:\n  checkpoint_dir: checkpoints/does_not_matter\n", encoding="utf-8"
+    )
+    ckpt = tmp_path / "step-0001600.pt"
+    ckpt.write_bytes(b"x")
+    out = tmp_path / "ckpts"
+    out.mkdir()
+    (out / "step-0001600.pt").write_bytes(b"x")
+
+    log = _log(tmp_path, "diverged_attempts.log", [
+        "2026-01-01 | step 1400 | ce=60.4560 | bpt=90.0",
+        "2026-01-01 | step 1590 | ce=53.9990 | bpt=70.0",
+    ])
+
+    monkeypatch.setattr(gs, "ROOT", tmp_path)
+    monkeypatch.setattr(gs, "latest_checkpoint", lambda d: ckpt)
+    monkeypatch.setattr(gs, "run", lambda *a, **k: 1)  # every attempt fails
+
+    assert gs.train_phase(cfg, log, "cuda", attempts=2, max_ce=6.0) is None
+
+
+def test_exhausted_attempts_return_a_converged_checkpoint(tmp_path: Path, monkeypatch):
+    """The same path still yields the checkpoint when the run is healthy."""
+    import growth_supervisor as gs
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "train:\n  checkpoint_dir: checkpoints/does_not_matter\n", encoding="utf-8"
+    )
+    ckpt = tmp_path / "step-0001600.pt"
+    ckpt.write_bytes(b"x")
+    log = _log(tmp_path, "ok_attempts.log", [
+        "2026-01-01 | step 1590 | ce=3.2995 | bpt=4.7",
+    ])
+
+    monkeypatch.setattr(gs, "ROOT", tmp_path)
+    monkeypatch.setattr(gs, "latest_checkpoint", lambda d: ckpt)
+    monkeypatch.setattr(gs, "run", lambda *a, **k: 1)
+
+    assert gs.train_phase(cfg, log, "cuda", attempts=2, max_ce=6.0) == ckpt
