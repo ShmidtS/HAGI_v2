@@ -73,6 +73,58 @@ LOG = logging.getLogger("growth")
 DEFAULT_TOTAL_MARGIN = 0.05
 DEFAULT_DOMAIN_MARGIN = 0.25
 
+# --- R93: anytime-valid confidence budget for the acceptance gate --------
+#
+# The gate above runs ONCE PER LANE, and a plan can have many lanes. A
+# fixed ``domain_margin`` per comparison spends ``delta`` every time, so
+# over n lanes the nominal budget is ``n * delta`` -- which is what made
+# E3 in the working notes: 400 checks at delta=0.05 need a budget of 20,
+# i.e. 400x more than declared.
+#
+# R93 (Ville's inequality) gives the schedule that does not. Spending
+#
+#     delta_t = delta_0 * rho^t,   delta_0 / (1 - rho) <= delta
+#
+# bounds the probability that ANY certificate up to T ever fails, from ONE
+# global delta, uniformly in T. Since the lane index is exactly the
+# comparison index t, the same formula applies verbatim here.
+#
+# The consequence for the gate is concrete: the FIRST lane is judged with
+# the full budget and a wide margin, and later lanes are judged tighter,
+# because by then the incumbent is well established and evidence has
+# accumulated. Under a fixed margin the early lanes -- the ones that
+# actually decide whether growth is real -- got no more statistical power
+# than the fiftieth.
+DEFAULT_GATE_DELTA = 0.05
+DEFAULT_GATE_DECAY = 0.5
+
+
+def anytime_margin(base: float, lane: int, total_delta: float,
+                   decay: float) -> float:
+    """The acceptance margin for lane ``t`` under the R93 schedule.
+
+    Args:
+        base: the margin used at ``t = 0`` (the widest, from the CLI).
+        lane: the zero-based comparison index ``t``.
+        total_delta: the global budget for the whole horizon.
+        decay: ``rho`` in ``(0, 1)``.
+
+    Returns:
+        The margin for this lane, scaled by ``(1 - rho) rho^t``.
+
+    Raises:
+        ValueError: on a non-positive base or a ``decay`` outside
+            ``(0, 1)``, rather than silently reverting to the fixed
+            margin and hiding a misconfigured budget.
+    """
+    if base <= 0.0:
+        raise ValueError("base margin must be positive")
+    if not 0.0 < decay < 1.0:
+        raise ValueError("decay (rho) must lie in (0, 1)")
+    if total_delta <= 0.0:
+        raise ValueError("total_delta must be positive")
+    return base * (1.0 - decay) * (decay ** lane)
+
 
 @dataclass
 class Lane:
@@ -345,6 +397,9 @@ def decide(
     incumbent: dict | None,
     total_margin: float,
     domain_margin: float,
+    lane: int = 0,
+    total_delta: float = DEFAULT_GATE_DELTA,
+    decay: float = DEFAULT_GATE_DECAY,
 ) -> Verdict:
     """Accept the candidate unless it is clearly worse than the incumbent.
 
@@ -352,7 +407,15 @@ def decide(
     a single domain worse by more than ``domain_margin``. The margins are wide
     on purpose -- held-out exact CE carries roughly 0.2 nats of seed noise at
     this scale, and a tight rule would turn noise into decisions.
+
+    ``lane`` indexes the comparison within the run and tightens both margins
+    via the R93 anytime schedule (:func:`anytime_margin`). The geometric
+    factors sum to at most ``total_delta`` over ANY number of lanes, so an
+    unbounded run no longer multiplies the error budget by its length. Pass
+    ``lane=0`` to get exactly the previous fixed-margin behaviour.
     """
+    total_margin = anytime_margin(total_margin, lane, total_delta, decay)
+    domain_margin = anytime_margin(domain_margin, lane, total_delta, decay)
     cand_mean = mean_ce(candidate)
     if cand_mean is None:
         return Verdict(False, "candidate produced no scored domain", None, None)
@@ -491,6 +554,17 @@ def main() -> int:
     ap.add_argument("--total-margin", type=float, default=DEFAULT_TOTAL_MARGIN)
     ap.add_argument("--domain-margin", type=float, default=DEFAULT_DOMAIN_MARGIN)
     ap.add_argument(
+        "--gate-delta", type=float, default=DEFAULT_GATE_DELTA,
+        help="R93: total error budget for ALL acceptance gates in the run. "
+             "The per-gate margin is drawn from the geometric schedule "
+             "delta_t = delta_0 rho^t, whose infinite sum is <= delta, so "
+             "the budget does not grow with the number of lanes.",
+    )
+    ap.add_argument(
+        "--gate-decay", type=float, default=DEFAULT_GATE_DECAY,
+        help="R93: rho in (0,1). Smaller tightens later gates faster.",
+    )
+    ap.add_argument(
         "--merge-k", type=int, default=1,
         help="merge configurations to screen per lane (1 = current behaviour)",
     )
@@ -513,6 +587,11 @@ def main() -> int:
     incumbent: dict | None = None
     incumbent_name: str | None = None
     accepted = 0
+    # R93 comparison index: how many gates this run has already ruled on.
+    # It counts every reached gate, not just accepted lanes, because a
+    # rejected candidate consumes budget too -- that is the whole point of
+    # the anytime schedule rather than a per-lane fixed margin.
+    checks = 0
 
     for lane in lanes:
         started = time.time()
@@ -547,7 +626,12 @@ def main() -> int:
                 if report is None:
                     append_ledger({"lane": lane.name, "phase": "eval_failed", "at": started})
                 else:
-                    verdict = decide(report, incumbent, args.total_margin, args.domain_margin)
+                    verdict = decide(
+                        report, incumbent, args.total_margin,
+                        args.domain_margin, lane=checks,
+                        total_delta=args.gate_delta, decay=args.gate_decay,
+                    )
+                    checks += 1
                     append_ledger({
                         "lane": lane.name,
                         "phase": "evaluated",
