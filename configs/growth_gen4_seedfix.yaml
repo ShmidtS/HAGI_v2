@@ -1,0 +1,30 @@
+# gen-4 lane: three domain siblings -> ternary merge -> joint.
+#
+# The siblings differ by CORPUS MIX, not only by seed. Round 67 measured
+# that siblings drawn from one mix converge to the same function plus
+# additive noise (CE of the orthogonal residual = ln V), which closes the
+# data axis; the gen-2 domain siblings that made gen-3 work differ by mix
+# (math / lang / code), and this lane copies that structure.
+#
+# init_from is gen-3 joint, so the lane continues the line rather than
+# restarting it. The supervisor resumes any checkpoint already on disk,
+# so this plan is idempotent: a kill costs one interval, not the lane.
+#
+# Run:
+#   python scripts/growth/growth_supervisor.py --plan configs/growth_gen4.yaml \
+#       --device cuda --max-lanes 1
+lanes:
+  - name: gen4_seedfix
+    experts:
+      - configs/dbridge_gen4_sib_math.yaml
+      - configs/dbridge_gen4_sib_lang.yaml
+      - configs/dbridge_gen4_sib_code.yaml
+    joint: configs/dbridge_gen4_merged.yaml
+    # The merge's expert list must point at the sibling checkpoint dirs
+    # this lane actually produces, so gen4_merged is generated from the
+    # same sibling paths rather than hand-edited.
+    merge_config: configs/dbridge_gen4_merged.yaml
+    domains:
+      - math
+      - lang
+      - code

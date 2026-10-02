@@ -29,15 +29,15 @@ model:
   decision:
     enabled: false
 train:
-  max_steps: 1600
-  checkpoint_interval: 800
+  max_steps: 1300
+  checkpoint_interval: 1300
   precision: bf16
   grad_checkpointing: false
   ternary_fp32_master: false
   batch_size: 32
   grad_accum_steps: 1
   compile_model: true
-  learning_rate: 0.001
+  learning_rate: 0.0003
   use_muon: true
   zero_init_proj: false
   adam:
@@ -71,6 +71,6 @@ merge:
   freeze_experts: false
   expert_weight_source: effective_sparse
   expert_checkpoints:
-  - checkpoints/dbridge_gen4_sib1/step-0001600.pt
-  - checkpoints/dbridge_gen4_sib2/step-0001600.pt
-  - checkpoints/dbridge_gen4_sib3/step-0001600.pt
+  - checkpoints/dbridge_gen4_sib_math/step-0001300.pt
+  - checkpoints/dbridge_gen4_sib_lang/step-0001300.pt
+  - checkpoints/dbridge_gen4_sib_code/step-0001300.pt

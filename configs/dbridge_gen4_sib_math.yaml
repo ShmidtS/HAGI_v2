@@ -1,12 +1,12 @@
 model:
   vocab_size: 32768
-  hidden_size: 3456
+  hidden_size: 1152
   num_layers: 3
   loop_depth: 1
-  init_seed: 12101
+  init_seed: 12301
   attention:
-    num_query_heads: 54
-    num_kv_heads: 27
+    num_query_heads: 18
+    num_kv_heads: 9
     head_dim: 64
     rope_theta: 3000.0
     sink_len: 4
@@ -43,27 +43,24 @@ train:
   adam:
     weight_decay: 0.3
   schedule:
-    warmup_steps: 20
-  checkpoint_dir: checkpoints/dbridge_gen4_joint
-  init_from: checkpoints/dbridge_gen4_merged/step-0001300.pt
+    warmup_steps: 40
+  checkpoint_dir: checkpoints/dbridge_gen4_sib_math
+  init_from: checkpoints/dbridge_gen3_joint/step-0001600.pt
   data:
     data_dir: data
     seq_len: 1024
-    seed: 13804
+    seed: 13801
     weights:
-      edu: 0.3571
-      python_instruct: 0.2232
-      wikipedia_en: 0.0893
-      wikipedia_ru: 0.0714
-      oscar_ru: 0.0625
-      openwebmath: 0.0893
-      tinystories: 0.0536
-      smoltalk: 0.0536
+      openwebmath: 0.45
+      edu: 0.25
+      wikipedia_en: 0.1
+      python_instruct: 0.1
+      tinystories: 0.1
 merge:
   enabled: true
   norm_block_dim: 128
   n_mixers: 1
-  mixer_type: hadamard
+  mixer_type: swiglu
   n_experts: 3
   expert_hidden: 384
   mixer_init_scale: 0.0
