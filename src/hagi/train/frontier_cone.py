@@ -108,6 +108,19 @@ def frontier_ratio(alpha: float, gamma: float, capability: float,
     frontier (new domain, synthetic data, discovery) while there is
     still capability left to protect.
 
+    **This ratio is only meaningful for an INDEPENDENTLY measured
+    gamma.** If ``gamma`` was computed as ``G/D`` -- which is how this
+    project obtained ``gamma = 0.002`` -- then ``D`` cancels exactly and
+
+        (D/C) / (alpha/(G/D))  ==  G / (alpha * C)
+
+    for every ``D``. The frontier value becomes irrelevant to the
+    verdict, and the cone degenerates into the restatement ``G >= alpha*C``.
+    :func:`gamma_is_derived_from_frontier` checks for exactly that, and
+    it returned True for this project. A caller passing a derived gamma
+    here is running a test that cannot fail for the reason it looks like
+    it is testing.
+
     Returns:
         The ratio; ``inf`` when capability is zero.
 
@@ -121,6 +134,31 @@ def frontier_ratio(alpha: float, gamma: float, capability: float,
     if capability == 0.0:
         return math.inf
     return (frontier / capability) / (alpha / gamma)
+
+
+def gamma_is_derived_from_frontier(gamma: float, gain: float,
+                                  frontier: float) -> bool:
+    """Is this ``gamma`` just ``G/D`` written down? Then the cone is vacuous.
+
+    The check is exact equality to within float noise, so it fires only
+    when the provenance is genuinely ``gamma = G/D`` and not on a value
+    that merely happens to be close.
+
+    Args:
+        gamma: the harvest rate being tested.
+        gain: the realised gain ``G``.
+        frontier: the measured ``D_t``.
+
+    Returns:
+        True when ``gamma`` is ``G/D``. A True verdict means
+        :func:`frontier_ratio` carries no information about ``D`` and the
+        cone test must be run with an independently measured ``gamma``
+        -- e.g. a per-step harvest rate taken at two different
+        frontiers and regressed -- or not at all.
+    """
+    if frontier <= 0.0:
+        raise ValueError("frontier must be positive to check provenance")
+    return abs(gamma - gain / frontier) <= 1e-12 * max(1.0, abs(gamma))
 
 
 def cone_step(
