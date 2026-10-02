@@ -369,33 +369,16 @@ def main() -> int:
 
     start_step = 0
     optimizer_state = None
-    # --init-from takes precedence; otherwise fall back to the config's
-    # train.init_from (the recursive-growth shared prior).
-    init_from = args.init_from or (cfg.train.init_from or None)
-    if init_from is not None:
-        # Load weights as an *initialization*, not a resume: completed_steps
-        # resets to 0 and the optimizer starts fresh. This is the recursive
-        # growth primitive — a level-N expert starts from the merged level-(N-1)
-        # model (the shared prior) and specializes on its own domain.
-        from hagi.train.checkpoint import load_model
-
-        path = init_from
-        if not Path(path).exists():
-            raise FileNotFoundError(f"--init-from: no checkpoint at {path}")
-        # Skip the cross-expert mixers (``mixers.*``): the target model's mixers
-        # may have a different geometry than the source (e.g. a fresh Hadamard
-        # mixer initialized from a SwiGLU-merged prior). The body/embed/head
-        # transfer; the mixers stay fresh so the Hadamard geometry is kept.
-        # Also skip ``head.log_prior``: the unigram prior is a deterministic
-        # function of the corpus (unigram_path), not learned state -- a target
-        # that enables the prior rebuilds it from its own config, and a prior
-        # without it must not inherit a stale one (round-28 NCE A/B).
-        _, _ = load_model(
-            path, model, str(device), skip_prefixes=("mixers.", "head.log_prior"),
-            lenient_config=True,
-        )
-        logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
-    elif args.resume is not None:
+    # --resume takes precedence over any initialization. A resume continues a
+    # run; an initialization starts a new one. The two are not alternatives at
+    # the same priority: a config that sets train.init_from (every sibling
+    # config does, to inherit the parent's shared prior) would otherwise
+    # SILENTLY swallow --resume, and the supervisor -- which resumes from
+    # whatever checkpoint is on disk -- would discard every trained step and
+    # restart from the parent. Observed on gen-4: a checkpoint at step 1300
+    # was on disk, the supervisor correctly passed --resume, and the run
+    # reported "initialized weights from ... (fresh optimizer, step 0)".
+    if args.resume is not None:
         from hagi.train.checkpoint import load_model
 
         path = resume_path
@@ -410,6 +393,33 @@ def main() -> int:
             start_step,
             "yes" if optimizer_state else "no — expect a loss spike",
         )
+    else:
+        # --init-from takes precedence; otherwise fall back to the config's
+        # train.init_from (the recursive-growth shared prior).
+        init_from = args.init_from or (cfg.train.init_from or None)
+        if init_from is not None:
+            # Load weights as an *initialization*, not a resume: completed_steps
+            # resets to 0 and the optimizer starts fresh. This is the recursive
+            # growth primitive — a level-N expert starts from the merged level-(N-1)
+            # model (the shared prior) and specializes on its own domain.
+            from hagi.train.checkpoint import load_model
+
+            path = init_from
+            if not Path(path).exists():
+                raise FileNotFoundError(f"--init-from: no checkpoint at {path}")
+            # Skip the cross-expert mixers (``mixers.*``): the target model's mixers
+            # may have a different geometry than the source (e.g. a fresh Hadamard
+            # mixer initialized from a SwiGLU-merged prior). The body/embed/head
+            # transfer; the mixers stay fresh so the Hadamard geometry is kept.
+            # Also skip ``head.log_prior``: the unigram prior is a deterministic
+            # function of the corpus (unigram_path), not learned state -- a target
+            # that enables the prior rebuilds it from its own config, and a prior
+            # without it must not inherit a stale one (round-28 NCE A/B).
+            _, _ = load_model(
+                path, model, str(device), skip_prefixes=("mixers.", "head.log_prior"),
+                lenient_config=True,
+            )
+            logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
 
     if args.dry_run:
         return dry_run(model, cfg, device)
