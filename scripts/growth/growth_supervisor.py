@@ -498,6 +498,61 @@ def data_axis_advice(gain: float, stall_threshold: float = STALL_GAIN) -> str:
     )
 
 
+# --- R104: the frontier ceiling, as a stopping detector ------------------
+
+def frontier_ceiling_advice(
+    gain: float,
+    frontier: float,
+    alpha: float,
+    gamma: float,
+    stall_threshold: float = STALL_GAIN,
+) -> str:
+    """``bounded_frontier_no_sustained_growth`` applied to a verdict.
+
+    R104's converse: with the gain an exact harvest of usable
+    disagreement and a BOUNDED frontier ``D_t <= Dbar``, capability is
+    capped forever at ``γ·Dbar/α``. So a growth loop watching a flat
+    frontier is not merely not improving -- it is provably unable to,
+    and no further merge of the same experts can raise the ceiling.
+
+    That makes this a detector rather than a hope. The supervisor knows
+    the measured gain of each comparison; when it also knows the frontier
+    (the disagreement between the experts being merged) it can say
+    whether the loop is anywhere near its ceiling.
+
+    The frontier is passed in rather than inferred: this supervisor
+    measures CE, and pretending CE spread is disagreement would be a
+    category error. A caller with no frontier measurement gets no
+    ceiling claim, which is the honest default.
+
+    Args:
+        gain: the measured gain of this comparison.
+        frontier: the measured usable disagreement ``D_t``.
+        alpha: the gate parameter.
+        gamma: the harvest rate.
+        stall_threshold: the gain below which the merge axis is stalled.
+
+    Returns:
+        A short annotation, empty when there is nothing to add.
+    """
+    if frontier <= 0.0 or alpha <= 0.0 or gamma <= 0.0:
+        return ""
+    from hagi.train.gain_renewal import sustained_growth_possible
+
+    ceiling = sustained_growth_possible(alpha, gamma, frontier)
+    if gain > stall_threshold:
+        # Growth is real, but say whether the ceiling is close.
+        return (f" [frontier {frontier:.4f} caps capability at "
+                f"{ceiling:.4f}]")
+    return (
+        f" [stalled AND frontier-capped: D={frontier:.4f} implies "
+        f"C <= {ceiling:.4f} for every future generation "
+        f"(bounded_frontier_no_sustained_growth) -- the loop is at its "
+        f"ceiling, so another merge cannot help; widen the frontier "
+        f"(new domain, synthetic data, discovery) instead]"
+    )
+
+
 def append_ledger(row: dict[str, Any]) -> None:
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a", encoding="utf-8") as fh:
