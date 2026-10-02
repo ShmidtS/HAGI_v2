@@ -136,7 +136,12 @@ def dry_run(model, cfg, device: torch.device) -> int:
     if without_grad:
         logger.error("parameters received no gradient: %s", without_grad[:20])
         return 1
-    logger.info("all %d trainable parameters received gradient", sum(1 for _ in model.parameters()))
+    trainable = [p for _, p in model.named_parameters() if p.requires_grad]
+    if not trainable:
+        logger.error("no trainable parameters; the run cannot train")
+        return 1
+    logger.info("all %d trainable parameter tensors received gradient "
+                "(of %d total)", len(trainable), len(list(model.parameters())))
 
     if device.type == "cuda":
         logger.info("peak VRAM: %.3f GB", torch.cuda.max_memory_allocated() / 1e9)
