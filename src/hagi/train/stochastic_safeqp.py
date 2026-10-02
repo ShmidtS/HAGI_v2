@@ -48,6 +48,27 @@ from __future__ import annotations
 import math
 
 
+def anytime_delta(total_delta: float, decay: float, step: int) -> float:
+    """``delta_t`` from the R93 geometric schedule, for one step.
+
+    Wiring ``anytime_budget`` into the SafeQP margin: pass this instead
+    of a fixed ``delta`` and the union bound stays valid for the whole
+    run on ONE budget. A fixed per-step delta of 0.05 needs ``T * 0.05``
+    over T steps -- vacuous by step 400.
+
+    Args:
+        total_delta: the global budget for the entire horizon.
+        decay: ``rho`` in ``(0, 1)``.
+        step: the non-negative step index.
+
+    Returns:
+        The confidence level to spend at this step.
+    """
+    from hagi.train.anytime_budget import admissible_schedule, step_budget
+
+    return step_budget(admissible_schedule(total_delta, decay), decay, step)
+
+
 def noise_epsilon(
     noise_bound: float,
     d_norm: float,

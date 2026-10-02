@@ -648,6 +648,14 @@ class InsightConfig:
     # drift budget before stepping
     safeqp: bool = False
     drift_eps: float = 0.0
+    # Anytime-valid confidence budget (R93, Ville). When set, the
+    # per-cycle delta is drawn from the geometric schedule
+    # delta_t = delta_0 * rho^t with delta_0 = delta * (1 - rho), which
+    # spends at most `delta` over ANY horizon. A fixed per-cycle delta
+    # instead needs T * delta and goes vacuous after a few hundred
+    # cycles; at delta=0.05 that is already 400x the budget at step 400.
+    anytime_delta: float = 0.0
+    anytime_decay: float = 0.9
 
 
 @dataclass
