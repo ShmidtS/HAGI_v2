@@ -174,8 +174,12 @@ def checkpoint_dir_of(config: Path) -> Path:
     return ROOT / str(cfg["train"]["checkpoint_dir"])
 
 
-def converged(log_path: Path, ceiling: float = 6.0) -> tuple[bool, str]:
-    """Did the run finish converged, or did it diverge?
+def converged(
+    log_path: Path,
+    ceiling: float = 6.0,
+    max_regression: float = 1.0,
+) -> tuple[bool, str]:
+    """Did the run finish converged, or did it degrade?
 
     A run can exit 0 having diverged: the gen-4 sib3 log shows CE climbing
     4.07 -> 5.61 -> 12.19 -> 29.06 over steps 1230..1330 while training
@@ -184,10 +188,20 @@ def converged(log_path: Path, ceiling: float = 6.0) -> tuple[bool, str]:
     three downstream branches. Exit status alone cannot see this; only the
     loss curve can.
 
-    The test is the last recorded CE against ``ceiling`` -- a per-token
-    cross-entropy of 6 is already far past useful on a 32768 vocabulary
-    (ln V = 10.4 is uniform). A run with no parsable CE lines is treated as
-    converged, since a short or freshly resumed run may log nothing.
+    Two tests, because the two observed failures look different:
+
+    ``ceiling`` on the FINAL ce
+        catches the outright blow-up (sib3, final ce 46).
+
+    ``max_regression`` on the TAIL mean against the BEST window mean
+        catches slow degradation, which a final-value ceiling misses: gen-4
+        sib2 ended at ce 5.15 -- under the 6.0 ceiling -- after sliding from
+        a best-window mean of 3.56 to a tail mean of 5.49. That is a
+        damaged expert with no single alarming number.
+
+    A run with too few lines to form both windows is judged on the
+    ceiling alone: freshly resumed or very short runs legitimately log
+    little, and refusing them would break the resume path.
     """
     if not log_path.exists():
         return True, "no log"
@@ -201,10 +215,9 @@ def converged(log_path: Path, ceiling: float = 6.0) -> tuple[bool, str]:
                 m = re.search(r"\|\s*ce=(nan|inf|-inf|[\d.eE+-]+)", line, re.I)
                 if m:
                     try:
-                        value = float(m.group(1))
+                        ce.append(float(m.group(1)))
                     except ValueError:
                         continue
-                    ce.append(value)
     except OSError as exc:
         LOG.warning("cannot read %s: %s", log_path, exc)
         return True, "unreadable"
@@ -217,6 +230,21 @@ def converged(log_path: Path, ceiling: float = 6.0) -> tuple[bool, str]:
         return False, f"final ce={last}"
     if last > ceiling:
         return False, f"final ce={last:.4f} exceeds {ceiling}"
+
+    # Degradation test over a sliding window of logged steps.
+    window = max(3, min(10, len(ce) // 4))
+    if len(ce) >= 2 * window:
+        best = min(
+            sum(ce[i : i + window]) / window
+            for i in range(len(ce) - window + 1)
+        )
+        tail = sum(ce[-window:]) / window
+        if tail - best > max_regression:
+            return False, (
+                f"tail mean {tail:.4f} regressed {tail - best:.4f} "
+                f"beyond {max_regression} from the best window {best:.4f}"
+            )
+        return True, f"final ce={last:.4f}, tail {tail:.4f} vs best {best:.4f}"
     return True, f"final ce={last:.4f}"
 
 

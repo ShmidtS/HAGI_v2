@@ -91,6 +91,40 @@ def test_ignores_non_ce_numbers(tmp_path: Path):
     assert converged(p)[0]
 
 
+def test_slow_degradation_is_caught_without_a_high_final_value(tmp_path: Path):
+    """The gen-4 sib2 shape: ends UNDER the ceiling, but sliding.
+
+    Its final ce was 5.15 against a 6.0 ceiling, so a value-only test
+    would accept a damaged expert. The tail mean had regressed 1.89 from
+    the best window -- that is what this catches.
+    """
+    lines = [f"2026-01-01 | step {i} | ce={3.5 + 0.002 * i} | bpt=5.0"
+             for i in range(40)]          # 3.50 -> 3.58, healthy
+    lines += [f"2026-01-01 | step {i} | ce={3.6 + 0.09 * (i - 40)} | bpt=5.0"
+              for i in range(40, 60)]     # climbs to ~5.4, tail mean well past 3.5
+    p = _log(tmp_path, "degrading.log", lines)
+    ok, why = converged(p, ceiling=6.0, max_regression=1.0)
+    assert not ok
+    assert "regressed" in why
+
+
+def test_stable_run_is_accepted_by_the_degradation_test(tmp_path: Path):
+    lines = [f"2026-01-01 | step {i} | ce={3.3 + 0.05 * (i % 5)} | bpt=5.0"
+             for i in range(60)]
+    p = _log(tmp_path, "stable.log", lines)
+    ok, why = converged(p, ceiling=6.0, max_regression=1.0)
+    assert ok, why
+
+
+def test_a_short_run_is_judged_on_the_ceiling_alone(tmp_path: Path):
+    """Too few lines for two windows must not fail the resume path."""
+    p = _log(tmp_path, "short.log", [
+        "2026-01-01 | step 0 | ce=10.3973 | bpt=15.0",
+        "2026-01-01 | step 10 | ce=4.1 | bpt=5.0",
+    ])
+    assert converged(p, ceiling=6.0)[0]
+
+
 def test_exhausted_attempts_still_judge_the_checkpoint(tmp_path: Path, monkeypatch):
     """Regression: the exhausted-attempts path must not return blindly.
 
