@@ -43,9 +43,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
+
+# Measured unigram entropy of this corpus, in nats/token. This is the
+# honest "knows only token frequencies" floor: src/hagi/model/head.py
+# records it as 8.06 against ln V = 10.40 for the 32768 vocabulary.
+UNIGRAM_CE = 8.06
 
 ROOT = Path(__file__).resolve().parents[1]
 EVAL = ROOT / "scripts" / "eval_domains.py"
@@ -82,11 +88,75 @@ def evaluate(config: str, checkpoint: str, batches: int, device: str) -> dict:
     return domains
 
 
+def universality(d: dict, floor_ce: float = UNIGRAM_CE) -> dict:
+    """Turn "GENERAL" from a self-assessment into a number.
+
+    Spread alone is gameable: a model can have a small spread while being
+    uniformly bad, which is not generality, it is uniform incompetence.
+    So the number is the gap between the model's WORST domain and a floor:
+    the CE of a model that knows only unigram frequencies.
+
+    The floor is the MEASURED unigram entropy of this corpus (8.06 nats),
+    not ``ln V`` (10.40). That distinction matters and was got wrong the
+    first time: with ``ln V`` as the floor every model this project has
+    trained still collapses, because the floor has to sit ABOVE the
+    model's scores for the ratio to mean anything. The unigram floor is
+    the honest "knows nothing but token frequencies" level -- a model
+    scoring worse than that on some domain has learned less than a lookup
+    table.
+
+        universality = (floor - worst) / (floor - best)
+
+    Note the direction: a trained model scores BELOW the floor, so both
+    numerators are ``floor - ce``, not ``ce - floor``. Written the other
+    way round the denominator goes negative and the metric silently reads
+    0.0 for every good model, which is a metric that cannot fail and so
+    measures nothing.
+
+    ``1.0`` means every domain is as good as the best one; ``0.0`` means
+    the worst domain is no better than unigram frequencies.
+
+    Read it as a RATIO and not as a quality score. Being a ratio, it has
+    a documented counter-intuitive case: DEGRADING THE BEST DOMAIN can
+    RAISE it, because ``F - best`` shrinks in the denominator faster than
+    ``F - worst`` shrinks in the numerator. A model that got uniformly
+    worse can therefore look more general here. That is why ``avg`` is
+    reported next to it and why the two are never read separately.
+    ``tests/test_universality.py`` pins this behaviour so it cannot drift.
+
+    Args:
+        d: per-domain CEs including ``AVG``.
+        floor_ce: the no-knowledge floor; defaults to the measured
+            unigram entropy of this corpus.
+
+    Returns:
+        ``{"universality", "worst_ce", "best_ce", "floor_ce", "n_domains"}``.
+    """
+    values = [v for k, v in d.items() if k != "AVG"]
+    best, worst = min(values), max(values)
+    floor = floor_ce
+    span = floor - best
+    if span <= 0.0:
+        # Even the BEST domain is at or worse than unigram frequencies:
+        # there is nothing to be general about, and dividing would invent
+        # a number.
+        u = 0.0
+    else:
+        u = (floor - worst) / span
+    return {
+        "universality": max(0.0, min(1.0, u)),
+        "worst_ce": worst,
+        "best_ce": best,
+        "floor_ce": floor,
+        "n_domains": len(values),
+    }
+
+
 def report(name: str, d: dict) -> dict:
     values = [v for k, v in d.items() if k != "AVG"]
     best, worst = min(values), max(values)
     avg = d.get("AVG", sum(values) / len(values))
-    return {
+    out = {
         "model": name,
         "domains": d,
         "avg": avg,
@@ -96,6 +166,8 @@ def report(name: str, d: dict) -> dict:
         # concentrated in one domain.
         "domain_spread": (worst - best) / avg if avg else float("nan"),
     }
+    out.update(universality(d))
+    return out
 
 
 def main() -> int:
@@ -173,9 +245,11 @@ def main() -> int:
 
     # Generality.
     spread = merged["domain_spread"]
-    print(f"GENERALITY: worst/best spread {spread:.3f} "
-          f"(worst {merged['worst_domain_ce']:.4f}, best {merged['best_domain_ce']:.4f}); "
-          f"0 means every domain is equally good")
+    print(f"GENERALITY: universality {merged['universality']:.4f} "
+          f"(1 = every domain as good as the best one, 0 = worst domain no "
+          f"better than unigram frequencies at {merged['floor_ce']:.2f}); "
+          f"worst {merged['worst_domain_ce']:.4f}, best {merged['best_domain_ce']:.4f}, "
+          f"spread {spread:.3f} over {merged['n_domains']} domains")
 
     # Merge fidelity. Domain names are matched case-insensitively: the eval
     # prints them upper-case (MATH, CODE) while callers naturally write them
