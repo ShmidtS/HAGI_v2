@@ -644,6 +644,7 @@ class HadamardMixer(nn.Module):
         residual_scale: float = 1.0,
         mixer_init_scale: float = 0.0,
         group_sizes: list[int] | None = None,
+        gen_phase: int = 0,
     ) -> None:
         super().__init__()
         if hidden_size % n_blocks:
@@ -675,7 +676,15 @@ class HadamardMixer(nn.Module):
         nn.init.normal_(self.down.weight, std=residual_scale / rank**0.5)
         self.branch_scale = BranchScale(residual_scale)
         self.keep_fp32 = True
-        self.gain = nn.Parameter(torch.tensor(float(mixer_init_scale)))
+        # GAM (R104/R107): the gain's SIGN alternates with the generation
+        # index, so consecutive merges inject their fresh rank channel with
+        # opposite phase -- the trainable part is antisymmetric across
+        # cycles even before training moves it. gen_phase=0 keeps the
+        # historical plain init.
+        scale = float(mixer_init_scale)
+        if gen_phase:
+            scale = -scale if (gen_phase % 2 == 0) else scale
+        self.gain = nn.Parameter(torch.tensor(scale))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The fixed Hadamard is applied to the residual stream ``x`` itself
@@ -794,6 +803,7 @@ class MergedHAGI(HAGI):
                         residual_scale=residual_scale,
                         mixer_init_scale=mixer_init_scale,
                         group_sizes=group_sizes,
+                        gen_phase=int(getattr(cfg.merge, "mixer_gen_phase", 0) or 0),
                     )
                     for _ in range(n_mixers)
                 ]
@@ -2301,6 +2311,68 @@ def merge_experts(
                 f"merged shape {tuple(merged.shape)} != target {tuple(target.shape)} for {k!r}"
             )
         sd[k] = merged
+
+    # GAM (R104/R107): make the fresh merge's rank channel PRODUCTION rather
+    # than correction. The measured failure (measure_channel_split.py): 99.6%
+    # of cross-expert communication is the fixed Hadamard, identical across
+    # generations, so generations t and t+1 are the same model and no frontier
+    # can be produced. The fix has two parts, both applied only when
+    # ``mixer_gen_phase >= 1`` is set on the merge config:
+    #
+    # (1) RE-RANDOMIZE the new mixer's rank factors with a seed derived from
+    #     the cycle index -- each merge draws a FRESH random subspace instead
+    #     of inheriting the constructor's default draw;
+    # (2) GRAM-SCHMIDT the new factors against every previous generation's
+    #     factors, harvested from the experts' own mixers (the experts ARE
+    #     the previous cycle's merged models when merging hierarchically).
+    #     The new channel is then exactly orthogonal to everything the
+    #     previous cycles could already express -- an increment, not a
+    #     rewrite. With zero projections the step-0 identity still holds
+    #     because the gain still starts at (sign-flipped) mixer_init_scale.
+    gen_phase = int(getattr(cfg.merge, "mixer_gen_phase", 0) or 0)
+    if gen_phase >= 1 and str(getattr(cfg.merge, "mixer_type", "swiglu")) == "hadamard":
+        mixer_rank = int(getattr(cfg.merge, "mixer_rank", 64))
+        # (1) fresh draw per cycle
+        gen = torch.Generator().manual_seed(10_000 + 7919 * gen_phase)
+        for i in range(len(model.mixers)):
+            gate_w = torch.empty(mixer_rank, h).normal_(0.0, h**-0.5, generator=gen)
+            up_w = torch.empty(mixer_rank, h).normal_(0.0, h**-0.5, generator=gen)
+            down_w = torch.empty(h, mixer_rank).normal_(0.0, 1.0 / mixer_rank**0.5, generator=gen)
+            # (2) Gram-Schmidt against previous generations' factors, row by
+            # row: each new row loses its projection onto every accumulated
+            # row, then is re-normalized. The history is harvested from the
+            # experts' own mixer factors when their width matches the joint
+            # (flat re-merge); a hierarchical merge drops expert mixers
+            # (drop_expert_mixers) and re-draws at the joint width, where
+            # width-mismatched factors are skipped -- the fresh draw itself
+            # is already near-orthogonal to a random previous draw
+            # (E[cos] ~ 1/sqrt(h)).
+            history: list[torch.Tensor] = []
+            for st in expert_states:
+                for k in ("mixers.0.gate.weight", "mixers.0.up.weight"):
+                    prev = st.get(k)
+                    if prev is not None and prev.ndim == 2 and prev.shape[1] == h:
+                        history.append(prev.to(torch.float32))
+            if history:
+                basis = torch.cat(history, dim=0)  # [S, h]
+                basis = basis / basis.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+                def _orthogonalize(rows: torch.Tensor) -> torch.Tensor:
+                    r = rows.to(torch.float32)
+                    for j in range(r.shape[0]):
+                        r[j] -= (r[j] @ basis.T) @ basis
+                    norm = r.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                    return r / norm
+
+                gate_w = _orthogonalize(gate_w)
+                up_w = _orthogonalize(up_w)
+                # Renormalize to the constructor's scale so the channel's
+                # initial magnitude matches the historical init.
+                gate_w = gate_w * (h**-0.5)
+                up_w = up_w * (h**-0.5)
+            sd[f"mixers.{i}.gate.weight"] = gate_w.to(sd[f"mixers.{i}.gate.weight"].dtype)
+            sd[f"mixers.{i}.up.weight"] = up_w.to(sd[f"mixers.{i}.up.weight"].dtype)
+            sd[f"mixers.{i}.down.weight"] = down_w.to(sd[f"mixers.{i}.down.weight"].dtype)
 
     # With a Hadamard mixer the hidden stream is rotated by
     # ``Q = (H_n/sqrt(n)) ⊗ I_H`` at the mixer. The head projection is
