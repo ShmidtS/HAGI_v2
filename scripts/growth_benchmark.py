@@ -233,6 +233,22 @@ def main() -> int:
 
     print()
     print("=== verdicts ===")
+
+    # Transfer on the HELD-OUT domains. These corpora appear in no
+    # training mix, so their CE measures transfer rather than
+    # memorisation. Reported separately and never folded into AVG,
+    # because a "general" claim computed over training domains only is
+    # not evidence of generality.
+    held = sorted(k for k in merged["domains"]
+                  if k.upper().startswith("HELD"))
+    if held:
+        print("TRANSFER (held-out corpora, never trained on):")
+        for r in results:
+            cells = "  ".join(f"{k}={r['domains'][k]:.4f}" for k in held
+                              if k in r["domains"])
+            print(f"  {r['model'].ljust(16)}{cells}")
+        print()
+
     # Growth.
     if len(results) > 1:
         prev = results[1]
