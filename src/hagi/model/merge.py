@@ -805,6 +805,62 @@ class MergedHAGI(HAGI):
                     for _ in range(n_mixers)
                 ]
             )
+        # ``freeze_experts``: train ONLY the cross-block mixers. The option
+        # was declared and documented in the config for the whole life of
+        # this file and never implemented -- grep found the field and its
+        # docstring and nothing else -- so a config setting it silently
+        # trained everything anyway.
+        #
+        # It is the clean A/B for the gen-3 finding that the mixer's
+        # trainable gain DECAYED toward zero during joint training: with the
+        # experts frozen the mixer is the only degree of freedom, so a gain
+        # that grows here is evidence the channel pays when it is the only
+        # thing that can change.
+        if bool(getattr(cfg.merge, "freeze_experts", False)):
+            self._freeze_all_but_mixers()
+
+    def _freeze_all_but_mixers(self) -> None:
+        """Freeze every parameter except the cross-block mixers' own.
+
+        ``merge.freeze_experts``: the "train only the Cross-Expert Mixer"
+        mode. Two properties matter and are asserted here rather than
+        assumed, because a silent no-op is what this option was:
+
+        - the mixers' parameters must remain trainable, or freezing them
+          too would leave the run with nothing to optimise;
+        - the number of parameters left trainable must be SMALL relative
+          to the total, or the mode is not doing what it says.
+
+        Raises:
+            ValueError: if freezing would leave nothing trainable, or if
+                the surviving parameter set is not mixer-only.
+        """
+        mixer_params: set[str] = set()
+        for i, mixer in enumerate(self.mixers):
+            for name, p in mixer.named_parameters():
+                mixer_params.add(f"mixers.{i}.{name}")
+        total = 0
+        for name, p in self.named_parameters():
+            total += p.numel()
+            if name in mixer_params:
+                continue
+            p.requires_grad_(False)
+        trainable = sum(
+            p.numel() for n, p in self.named_parameters() if p.requires_grad
+        )
+        if trainable == 0:
+            raise ValueError(
+                "freeze_experts left no trainable parameters; the model "
+                "would not train at all"
+            )
+        if trainable >= total:
+            raise ValueError(
+                "freeze_experts froze nothing: every parameter is still "
+                "trainable, so the option is a no-op"
+            )
+        self.trainable_params = trainable
+        self.total_params = total
+
 
     def _apply_mixers(self, h: torch.Tensor) -> torch.Tensor:
         """Run the cross-block mixers on the normalized residual stream.
