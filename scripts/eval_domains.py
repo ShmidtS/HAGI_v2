@@ -41,6 +41,12 @@ DOMAINS: dict[str, dict[str, float]] = {
     "EN": {"edu": 1.0, "slimpajama": 1.0, "wikipedia_en": 1.0},
     "MATH": {"openwebmath": 1.0},
     "CODE": {"python_instruct": 1.0},
+    # HELD-OUT. Neither corpus appears in any dbridge_* training mix, so a
+    # score here measures transfer rather than memorisation. Without a
+    # held-out domain the "general" claim rests only on training domains,
+    # which is exactly the evidence the project already had.
+    "HELD_MATH": {"camelmath": 1.0},
+    "HELD_CHAT": {"openhermes": 1.0},
 }
 
 
