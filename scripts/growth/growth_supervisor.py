@@ -444,9 +444,57 @@ def decide(
     if regressed:
         detail = ", ".join(f"{k} {v:+.4f}" for k, v in sorted(regressed.items()))
         return Verdict(False, f"domain regression: {detail}", inc_mean, cand_mean, deltas)
+    gain = inc_mean - cand_mean          # > 0 means the candidate is better
     return Verdict(
-        True, f"mean CE {cand_mean - inc_mean:+.4f} within margin",
+        True, f"mean CE {-gain:+.4f} within margin"
+              + data_axis_advice(gain),
         inc_mean, cand_mean, deltas,
+    )
+
+
+# --- the data axis: what to do when growth stalls (data_axis.py, §4) ----
+
+# Below this gain the merge axis is dead -- the candidate is not worse,
+# but it is not better either, so the same action will not help again.
+# The value is expressed in NATS and derived from the margins above: a
+# gain smaller than the gate's own resolution is indistinguishable from
+# zero at this noise level (~0.2 nats on held-out exact CE).
+STALL_GAIN = DEFAULT_DOMAIN_MARGIN
+
+
+def data_axis_advice(gain: float, stall_threshold: float = STALL_GAIN) -> str:
+    """The §4 response to a stalled merge axis, as a ledger annotation.
+
+    ``liveness_data_axis``: the loop cannot freeze while EITHER axis is
+    alive, and when the certified gain goes to zero the honest response
+    is not to retry the same action but to inject fresh INDEPENDENT data,
+    so that the diversity floor ``D_T > 0`` becomes strictly positive
+    again.
+
+    This is advice, not an action: the supervisor records what the state
+    calls for, and a human or the next plan acts on it. Recording it
+    matters because "the run kept going but nothing improved" is
+    otherwise indistinguishable in the ledger from "the run is working".
+
+    The independence requirement is the point. A same-domain corpus does
+    not satisfy it -- the round-66/67 measurement showed sibling residual
+    CE at ln V, i.e. pure noise, from more of the same distribution. The
+    criterion is on ``inj - xi``, not on raw volume.
+
+    Args:
+        gain: ``incumbent_mean - candidate_mean``, positive when better.
+        stall_threshold: the gain below which the merge axis counts as
+            stalled.
+
+    Returns:
+        A short annotation, empty when growth is real.
+    """
+    if gain > stall_threshold:
+        return ""
+    return (
+        f" [stalled: gain {gain:+.4f} <= {stall_threshold:.4f}; per "
+        f"liveness_data_axis, retrying the same action cannot help -- "
+        f"inject data from a distribution the model has NOT seen]"
     )
 
 
