@@ -72,6 +72,6 @@ merge:
   freeze_experts: false
   expert_weight_source: effective_sparse
   expert_checkpoints:
-  - checkpoints/dbridge_gen5_sib_math/step-0001300.pt
-  - checkpoints/dbridge_gen5_sib_lang/step-0001300.pt
-  - checkpoints/dbridge_gen5_sib_code/step-0001300.pt
+  - checkpoints/dbridge_gen4_sib_math/step-0001300.pt
+  - checkpoints/dbridge_gen4_sib_lang/step-0001300.pt
+  - checkpoints/dbridge_gen4_sib_code/step-0001300.pt
