@@ -29,7 +29,7 @@ model:
   decision:
     enabled: false
 train:
-  max_steps: 1600
+  max_steps: 1300
   checkpoint_interval: 800
   precision: bf16
   grad_checkpointing: false
@@ -66,11 +66,12 @@ merge:
   mixer_type: hadamard
   n_experts: 3
   expert_hidden: 384
-  mixer_init_scale: 0.0
+  mixer_init_scale: 0.1
+  mixer_gen_phase: 5
   mixer_rank: 64
   freeze_experts: false
   expert_weight_source: effective_sparse
   expert_checkpoints:
-  - checkpoints/dbridge_gen5_sib_math/step-0001600.pt
-  - checkpoints/dbridge_gen5_sib_lang/step-0001600.pt
-  - checkpoints/dbridge_gen5_sib_code/step-0001600.pt
+  - checkpoints/dbridge_gen5_sib_math/step-0001300.pt
+  - checkpoints/dbridge_gen5_sib_lang/step-0001300.pt
+  - checkpoints/dbridge_gen5_sib_code/step-0001300.pt

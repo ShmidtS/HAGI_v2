@@ -29,7 +29,7 @@ model:
   decision:
     enabled: false
 train:
-  max_steps: 1600
+  max_steps: 1300
   checkpoint_interval: 800
   precision: bf16
   grad_checkpointing: false
@@ -45,11 +45,11 @@ train:
   schedule:
     warmup_steps: 40
   checkpoint_dir: checkpoints/dbridge_gen5_sib_lang
-  init_from: checkpoints/dbridge_gen3_joint/step-0001600.pt
+  init_from: checkpoints/dbridge_gen4_joint/step-0001300.pt
   data:
     data_dir: data
     seq_len: 1024
-    seed: 13002
+    seed: 13712
     weights:
       wikipedia_ru: 0.3
       oscar_ru: 0.2

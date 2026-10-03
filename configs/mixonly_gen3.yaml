@@ -30,7 +30,7 @@ model:
     enabled: false
 train:
   max_steps: 800
-  checkpoint_interval: 800
+  checkpoint_interval: 100
   precision: bf16
   grad_checkpointing: false
   ternary_fp32_master: false
@@ -49,7 +49,7 @@ train:
   data:
     data_dir: data
     seq_len: 1024
-    seed: 12801
+    seed: 13703
     weights:
       edu: 0.3571
       python_instruct: 0.2232
