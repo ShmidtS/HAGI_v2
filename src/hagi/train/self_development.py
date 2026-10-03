@@ -232,3 +232,55 @@ def closed_loop_floor(c0: float, n: int, p0: float, delta: float,
     """
     s_floor = adaptive_success_floor(n, p0, delta)
     return c0 * math.exp(alpha * s_floor - leak_total)
+
+
+# ----------------------------------------------------------------------
+# R127: martingale (history-dependent) success concentration
+# ----------------------------------------------------------------------
+
+def azuma_success_floor(n: int, p0: float, delta: float) -> float:
+    """``adaptive_success_azuma`` (R127, theorem E of the audit).
+
+    The deterministic-adaptive self-improvement loop: the next
+    candidate is a function of the WHOLE history (no
+    fresh-randomness-per-cycle as R121 required). Successes
+    S_t(prefix) in [0, 1] with conditional floors
+    E[S_t | prefix] >= p0 at EVERY prefix give, with probability
+    ``>= 1 - delta``:
+
+        sum_t S_t >= n*p0 - sqrt(2*n*log(1/delta))
+
+    Scale sqrt(2*log(1/delta)) vs R121's sqrt(log(1/delta)/2) --
+    the price of dropping iid-style freshness: a factor-2 gap in
+    the deviation term. Use this floor when the controller is
+    deterministic-adaptive (HAGI cycles are).
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not 0.0 < delta < 1.0:
+        raise ValueError("delta must lie in (0, 1)")
+    return n * p0 - math.sqrt(2.0 * n * math.log(1.0 / delta))
+
+
+def cycles_to_level(delta_gain: float, p0_hat: float, delta: float) -> int:
+    """Number of cycles to reach a level (ALGORITHMS.md sec 12).
+
+    ``n >= (Delta + log(1/delta)*2/Delta) / p0_hat`` -- solves
+    the Azuma floor n*p0 - sqrt(2n*log(1/delta)) >= Delta for n.
+    Returns ceil of the larger root.
+    """
+    if delta_gain <= 0.0:
+        raise ValueError("delta_gain must be > 0")
+    if not 0.0 < p0_hat <= 1.0:
+        raise ValueError("p0_hat must lie in (0, 1]")
+    L = math.log(1.0 / delta)
+    # n*p0 - Delta >= sqrt(2nL)  <=>  n^2 p0^2 - 2n(p0 Delta + 2L) + Delta^2 >= 0
+    # larger root (smaller is below the floor's crossing):
+    a = p0_hat * p0_hat
+    b = -(2.0 * (p0_hat * delta_gain + 2.0 * L))
+    c = delta_gain * delta_gain
+    disc = b * b - 4.0 * a * c
+    if disc <= 0.0:
+        raise ValueError("no feasible n: floor never reaches the level")
+    n = (-b + math.sqrt(disc)) / (2.0 * a)
+    return math.ceil(n)
