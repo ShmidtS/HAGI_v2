@@ -30,7 +30,7 @@ model:
     enabled: false
 train:
   max_steps: 1300
-  checkpoint_interval: 1300
+  checkpoint_interval: 400
   precision: bf16
   grad_checkpointing: false
   ternary_fp32_master: false

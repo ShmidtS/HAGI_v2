@@ -125,3 +125,6 @@ _archive/**/*.json
 logs/*.done
 _telemetry/
 _raw/
+
+# рабочий список формализации, не для коммитов
+FORMALIZATION_TODO.md
