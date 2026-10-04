@@ -1047,13 +1047,19 @@ def train(
                 metrics["collapse_margin"] = collapse_state["margin"]
                 metrics["collapse_floor"] = collapse_state["floor"]
                 metrics["collapse_kl"] = collapse_state["kl_model_data"]
-                if collapse_state["collapsed"]:
-                    logger.warning(
-                        "step %d COLLAPSE ALARM: gate margin %.4f below the Pinsker floor %.4f",
-                        trainer.step,
-                        collapse_state["margin"],
-                        collapse_state["floor"],
-                    )
+                # log every pass: the alarm RATE is the quantity to
+                # measure before this may gate anything (gram-scan
+                # discipline) -- a warning-only channel would leave the
+                # healthy passes uncounted.
+                logger.info(
+                    "step %d collapse: h_model=%.4f floor=%.4f margin=%.4f kl=%.4f%s",
+                    trainer.step,
+                    collapse_state["floor"] + collapse_state["margin"],
+                    collapse_state["floor"],
+                    collapse_state["margin"],
+                    collapse_state["kl_model_data"],
+                    " ALARM" if collapse_state["collapsed"] else "",
+                )
 
         # Insight cycle (RLTL;DR internalization): the self-improvement
         # channel. ``run_insight_cycle`` was implemented and unit-tested but
