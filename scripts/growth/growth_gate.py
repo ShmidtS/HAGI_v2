@@ -56,6 +56,8 @@ from hagi.model.formal import (  # noqa: E402
 from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.checkpoint import config_from_dict, load_payload  # noqa: E402
 from hagi.train.loop import configure_runtime  # noqa: E402
+from hagi.train.merge_price import merge_gate as t2_merge_gate  # noqa: E402
+from hagi.train.merge_price import sigma_gram  # noqa: E402
 
 EPS = 0.0021  # measured floor (temperature_correction.md); not magic
 TOL_AMB = 0.002  # ambiguity change below this = "flat" (secondary)
@@ -123,6 +125,14 @@ def measure(configs: list[str], with_jensen: bool = True) -> dict:
     bs, seq = 4, 512
     # accumulate over windows: per-window S/A, then weighted-average
     gap_acc, ce_acc, ntok_w = [], [], []
+    # T2 merge-price accumulator: diagonal-Fisher surrogate of Th.1
+    # price_i = 0.5 * E_pos[ sum_v pbar_v (1-pbar_v) (z_i - zbar)_v^2 ]
+    # where pbar = softmax(mean logits). The full Th.1 sigma is the
+    # Hessian w.r.t. WEIGHTS; at the logit layer the CE Hessian is
+    # approximately diag(p(1-p)), which is the standard diagonal-Fisher
+    # surrogate and keeps the gate O(N*B*T*V) elementwise -- no V x V
+    # gram. Averaged over windows at the end.
+    price_acc: list[torch.Tensor] = []
     with torch.no_grad():
         for t, _w in wins:
             S = None
@@ -130,6 +140,7 @@ def measure(configs: list[str], with_jensen: bool = True) -> dict:
             ces = []
             ids = torch.from_numpy(t[:2048]).reshape(bs, seq)
             x, y = ids[:, :-1].to(device), ids[:, 1:].to(device)
+            leaf_z: list[torch.Tensor] = []
             for mm in leaf_models:
                 z = _leaf_logits(mm, x).double()  # [B,T,V]
                 lse = torch.logsumexp(z, -1)      # [B,T]
@@ -137,18 +148,41 @@ def measure(configs: list[str], with_jensen: bool = True) -> dict:
                 ces.append(float(-(lp.gather(-1, y.unsqueeze(-1))).mean()))
                 S = z if S is None else S + z
                 A = lse if A is None else A + lse
+                leaf_z.append(z)
             gap = jensen_gap_accum(S, A, n)          # [B,T] exact
             from hagi.model.formal import ensemble_ce_logits
             ce = ensemble_ce_logits(S / n, y)         # [B,T] exact
             gap_acc.append(float(gap.mean()))
             ce_acc.append(float(ce.mean()))
             ntok_w.append(1)
+            # T2 prices (diagonal-Fisher form): [N] per-window
+            mean_z = S / n
+            pbar = torch.softmax(mean_z, dim=-1)
+            fisher = pbar * (1.0 - pbar)             # [B,T,V]
+            devs = torch.stack(leaf_z) - mean_z      # [N,B,T,V]
+            price_acc.append(
+                0.5 * (fisher * devs.pow(2)).sum(dim=-1).mean(dim=(1, 2))
+            )
     for mm in leaf_models:
         del mm
     torch.cuda.empty_cache()
     res = {"n_leaves": n, "ce": float(np.mean(ce_acc)),
            "jensen_gap": float(np.mean(gap_acc)), "eps": EPS,
            "tau": 2 * math.atanh(EPS)}
+    # T2 merge prices (Th.1 diagonal-Fisher form): mean over windows
+    prices = torch.stack(price_acc).mean(dim=0).tolist()  # [N]
+    res["merge_prices"] = prices
+    res["merge_price_mean"] = float(np.mean(prices))
+    # T2 gate verdict: twoGap (the Jensen gap IS the ensemble
+    # disagreement gain) must cover the mean Th.1 price. Compression
+    # cost kappa*sqrt(n)*s/2 applies to the TERNARY body only; the
+    # dense dbridge line has s = 0, so the gate is exact for it.
+    try:
+        res["merge_gate_pass"] = bool(
+            t2_merge_gate(res["jensen_gap"], prices, kappa=0.05, s=0.0)
+        )
+    except ValueError:
+        res["merge_gate_pass"] = None  # two_gap <= 0: nothing to decide
     # ambiguity (secondary continuity signal) needs the merged probs:
     # p = softmax(S/n); keep the last window's S for it.
     amb, pos = 0, 0
