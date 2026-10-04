@@ -86,6 +86,12 @@ def test_anti_aligned_windows_conflict_with_certificate():
     # the conflicted corpus is the small one, and its multiplier is positive
     assert out["safe_qp_lambda"][2] > 0.0
     assert all(p.grad is None for p in model.parameters())
+    # T4 kappa telemetry: the certificate now carries kappa = ||d*||^2/||g||^2
+    # (fraction of gradient kept by the projection); in [0, 1] here since
+    # the projection only ever removes components
+    kappa = out["safe_qp_certificate"]["kappa"]
+    assert isinstance(kappa, float)
+    assert 0.0 <= kappa <= 1.0 + 1e-9
 
 
 def test_uniform_weights_domination_range():

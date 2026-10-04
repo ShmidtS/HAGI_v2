@@ -701,6 +701,10 @@ def safe_qp_solve(
         cert["contraction"] = math.sqrt(max(lamGlam, 0.0)) - math.sqrt(
             max(g_norm_sq, 0.0)
         )  # ||g - d*|| - ||g|| <= 0 must hold
+        # T4 (R147, 2606.29521): kappa_t = ||d*||^2/||g||^2 — the fraction of
+        # the gradient KEPT by the projection; the PL-rate factor is
+        # 1 - mu*kappa/L. Needs g_norm_sq > 0 to be meaningful.
+        cert["kappa"] = descent / g_norm_sq if g_norm_sq > 0.0 else float("nan")
     else:
         cert["descent_gap"] = float("nan")
         cert["contraction"] = float("nan")

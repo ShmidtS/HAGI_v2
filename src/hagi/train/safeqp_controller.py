@@ -120,9 +120,12 @@ def corpus_grad_gram(
         "domination_share": float((norms * norms * w * k).max() / max(float((norms * norms * w * k).sum()), 1e-30)),
     }
     if bool(conflicts.any()):
-        lam, cert = safe_qp_solve(gram, b, eps)
+        lam, cert = safe_qp_solve(gram, b, eps, g_norm_sq=float(mean_norm**2))
         result["safe_qp_lambda"] = lam.tolist()
         result["safe_qp_certificate"] = cert
+        # T4 kappa telemetry: fraction of gradient kept by the projection
+        if "kappa" in cert:
+            result["kappa"] = cert["kappa"]
     for g in grads:
         del g
     return result
