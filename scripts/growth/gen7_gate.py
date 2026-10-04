@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts" / "growth"))
 
 from hagi.config import load_config  # noqa: E402
-from hagi.model.formal import growth_verdict, safe_qp_solve  # noqa: E402
+from hagi.model.formal import growth_verdict  # noqa: E402
 from hagi.model.merge import MergedHAGI  # noqa: E402
 from hagi.model.model import HAGI  # noqa: E402
 from hagi.train.checkpoint import config_from_dict, load_payload  # noqa: E402
