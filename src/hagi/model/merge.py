@@ -829,6 +829,36 @@ class MergedHAGI(HAGI):
         if bool(getattr(cfg.merge, "freeze_experts", False)):
             self._freeze_all_but_mixers()
 
+    @torch.no_grad()
+    def diagnostics(self) -> dict[str, float]:
+        """Base diagnostics plus the mixer-channel split (§7.2 item 3).
+
+        Logging ``gain`` alone misdiagnoses the channel (2607.16568 Exact
+        Network Surgery, Table 3): the gate and the residual branch are
+        anti-correlated, so a gate closing to 0 can accompany a branch
+        growing 45x in norm -- ranking by |gain| without ||R|| gives the
+        REVERSE order. The merged model therefore reports the learned
+        branch's Frobenius norm next to the scalar, and their product as
+        the effective learned-channel magnitude:
+
+        * ``mixer_gain`` -- the scalar gate;
+        * ``mixer_resid_norm`` -- ||down||_F * ||gate||_F * ||up||_F, the
+          learned branch's capacity to change the stream;
+        * ``mixer_effective`` -- |gain| * resid_norm, what actually flows.
+        """
+        stats = super().diagnostics()
+        for i, mixer in enumerate(self.mixers):
+            gain = float(mixer.gain)
+            resid = float(
+                mixer.down.weight.norm()
+                * mixer.gate.weight.norm()
+                * mixer.up.weight.norm()
+            )
+            stats[f"mixers/{i}/gain"] = gain
+            stats[f"mixers/{i}/resid_norm"] = resid
+            stats[f"mixers/{i}/effective"] = abs(gain) * resid
+        return stats
+
     def _freeze_all_but_mixers(self) -> None:
         """Freeze every parameter except the cross-block mixers' own.
 
