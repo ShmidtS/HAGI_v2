@@ -343,3 +343,80 @@ def collapse_risk(nu: float, delta: float, h_data: float,
         raise ValueError("delta must be non-negative")
     floor = entropy_floor(nu, delta, h_data)
     return h_current - floor, delta / nu
+
+
+def _binary_entropy(tau: float) -> float:
+    """``h2(t) = -t log t - (1-t) log(1-t)`` in nats, ``h2(0)=h2(1)=0``."""
+    if not 0.0 <= tau <= 1.0:
+        raise ValueError("tau must be in [0, 1]")
+    if tau in (0.0, 1.0):
+        return 0.0
+    return -tau * math.log(tau) - (1.0 - tau) * math.log(1.0 - tau)
+
+
+def tv_distance(p: list[float], q: list[float]) -> float:
+    """``TV(p, q) = L1/2`` -- the total variation distance.
+
+    Raises:
+        ValueError: on a shape mismatch.
+    """
+    if len(p) != len(q):
+        raise ValueError("p and q must have the same support")
+    return 0.5 * sum(abs(a - b) for a, b in zip(p, q))
+
+
+def pinsker_tv_bound(kl: float) -> float:
+    """``tau <= sqrt(KL/2)`` -- Pinsker, the KL-to-TV link.
+
+    Raises:
+        ValueError: on a negative ``kl``.
+    """
+    if kl < 0.0:
+        raise ValueError("kl must be non-negative")
+    return math.sqrt(kl / 2.0)
+
+
+def entropy_tv_modulus(tau: float, v: int) -> float:
+    """T5: the exact Lipschitz modulus of entropy in TV.
+
+    ``|H(p) - H(q)| <= tau*log(V-1) + h2(tau)`` at ``tau = TV(p, q)``
+    (Ho-Yeung sharp bound): the worst case moves ``tau`` of mass onto
+    one coordinate, ``p = (1-tau, tau/(V-1), ...)``, ``q`` degenerate.
+
+    Raises:
+        ValueError: on ``tau`` outside ``[0, 1]`` or ``v < 2``.
+    """
+    if v <= 1:
+        raise ValueError("alphabet size must be >= 2")
+    return tau * math.log(v - 1) + _binary_entropy(tau)
+
+
+def pinsker_floor_correction(kl: float, v: int) -> float:
+    """T5: the sub-linear correction replacing the refuted ``hcert``.
+
+    The linear tradeoff ``KL <= delta => H(q) >= H(m) - delta`` is
+    FALSE (refuted above), but entropy IS Lipschitz in TV with the
+    exact sub-linear modulus, and Pinsker ties TV to KL. So a
+    delta-KL step DOES preserve entropy -- at rate
+    ``sqrt(delta/2)*log(V-1) + h2(sqrt(delta/2))``, not ``delta``.
+    Feeding this in place of ``delta`` makes the R108 floor hold
+    WITHOUT the explicit ``hcert`` hypothesis (plan T5; the Lean side
+    stays flagged open, this port verifies the numerics).
+
+    Raises:
+        ValueError: as :func:`entropy_tv_modulus` / :func:`pinsker_tv_bound`.
+    """
+    return entropy_tv_modulus(pinsker_tv_bound(kl), v)
+
+
+def corrected_entropy_floor(nu: float, kl: float, v: int,
+                            h_data: float) -> float:
+    """The R108 floor with ``hcert`` replaced by the Pinsker correction.
+
+    ``H_floor = h_data - pinsker_floor_correction(kl, v) / nu`` -- the
+    collapse floor under only the honest ``KL <= kl`` per-step premise.
+
+    Raises:
+        ValueError: as :func:`entropy_floor` / :func:`pinsker_floor_correction`.
+    """
+    return entropy_floor(nu, pinsker_floor_correction(kl, v), h_data)
