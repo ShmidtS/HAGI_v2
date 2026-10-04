@@ -420,3 +420,49 @@ def corrected_entropy_floor(nu: float, kl: float, v: int,
         ValueError: as :func:`entropy_floor` / :func:`pinsker_floor_correction`.
     """
     return entropy_floor(nu, pinsker_floor_correction(kl, v), h_data)
+
+
+def gate_collapse_report(ce: float, h_model: float, h_data: float,
+                         v: int, nu: float = 1.0) -> dict:
+    """T5 live monitor: a model's gate-window entropy vs the Pinsker floor.
+
+    The train loop has no distillation teacher -- but every gate pass
+    already measures ``CE`` and can measure the model's predictive
+    entropy ``H_model`` on the SAME fixed windows, and the windows'
+    own empirical entropy ``H_data``. Those three suffice for the
+    honest R108/T5 form: fresh-data mass ``nu = 1`` (each SGD step
+    sees entirely new data, the freshest mix possible) and the KL
+    premise measured, not assumed:
+
+        KL(data || model) = CE - H_data        (identity on the window)
+
+    so the floor is ``H_data - pinsker_floor_correction(CE - H_data, v)``
+    and the margin ``H_model - floor`` is the distance to collapse:
+    negative means the model's output distribution sits BELOW the
+    floor the honest theory guarantees -- the collapse alarm.
+
+    Returns:
+        Dict with ``kl_model_data``, ``floor``, ``margin``, ``collapsed``.
+
+    Raises:
+        ValueError: as :func:`corrected_entropy_floor`; on a negative
+            ``kl`` estimate (``ce < h_data`` by more than float dust --
+            impossible for a true CE, so it flags a broken measurement).
+    """
+    kl = ce - h_data
+    if kl < -1e-6:
+        raise ValueError(f"ce < h_data ({ce} < {h_data}): CE cannot be below the window entropy")
+    kl = max(kl, 0.0)
+    # Pinsker's TV <= sqrt(KL/2) exceeds 1 at KL > 2, where it stops
+    # carrying information (TV <= 1 always). Cap the correction at the
+    # tau=1 modulus, log(V-1): the honest saturated bound for a model
+    # that far from the window distribution (early training).
+    correction = pinsker_floor_correction(min(kl, 2.0), v)
+    floor = entropy_floor(nu, correction, h_data)
+    margin = h_model - floor
+    return {
+        "kl_model_data": kl,
+        "floor": floor,
+        "margin": margin,
+        "collapsed": bool(margin < 0.0),
+    }
