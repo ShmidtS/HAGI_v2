@@ -820,7 +820,10 @@ def growth_verdict(g_f: float, r_repr: float, eps_g: float, eps_r: float) -> str
     ensemble KL noise bracket, eps_r from the gradient-projection noise.
     """
     high_g = g_f >= eps_g
-    high_r = r_repr >= eps_r
+    # Lean boundary: verdict_ttt takes R <= eps, verdict_grow takes
+    # eps < R -- strict on R, so R == eps falls to TTT (the cheaper
+    # mechanism wins ties), matching the theorem hypotheses exactly.
+    high_r = r_repr > eps_r
     if high_g and not high_r:
         return "TTT/LORA"
     if high_g and high_r:
