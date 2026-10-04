@@ -191,18 +191,55 @@ def main() -> int:
     kl_expert = per_expert / max(n_pos, 1) / max(len(experts), 1)
     print(f"\n  disagreement D = {d:.4f} nats")
     print(f"  mean KL(expert || merged) = {kl_expert:.4f} nats")
+
+    # T3 channel efficiency eta = (CE_leafmean - CE_student)/twoGap: the
+    # fraction of the ensemble's disagreement gain the merged model
+    # actually carries. Needs the third CE: the STUDENT's own CE on the
+    # same windows (per_expert above is KL(expert||merged), NOT CE).
+    eta = None
+    try:
+        from hagi.train.distill_transfer import channel_efficiency
+        leaf_nll_sum, student_nll_sum = 0.0, 0.0
+        ens_nll_sum = 0.0
+        with torch.no_grad():
+            for batch_ids in batches:
+                for i in range(batch_ids.shape[0]):
+                    w_ids = batch_ids[i : i + 1]
+                    e = torch.stack(
+                        [m(w_ids, return_logits=True).logits[0].double()
+                         for m in experts]
+                    )
+                    mm = merged_model(w_ids, return_logits=True).logits[0].double()
+                    # T3 triple: leaf-mean / ensemble / student NLL on this
+                    # window, gathered at the target token -- additive sums.
+                    # targets [T-1, 1]: e/logits[0] already dropped the
+                    # batch axis, so 2D gathers need a 2D index and the
+                    # leaf gather expands it across the expert axis.
+                    y = w_ids[:, 1:].reshape(-1, 1)          # [T-1, 1]
+                    lp_leaf = torch.log_softmax(e, dim=-1)  # [n, T-1, V]
+                    lp_ens = torch.log_softmax(e.mean(0), dim=-1)
+                    lp_mm = torch.log_softmax(mm, dim=-1)
+                    yl = y.expand(e.shape[0], -1, -1)       # [n, T-1, 1]
+                    leaf_nll_sum += float(-lp_leaf.gather(-1, yl).mean(0).sum())
+                    ens_nll_sum += float(-lp_ens.gather(-1, y).sum())
+                    student_nll_sum += float(-lp_mm.gather(-1, y).sum())
+        eta = channel_efficiency(
+            leaf_nll_sum / max(n_pos, 1),
+            student_nll_sum / max(n_pos, 1),
+            ens_nll_sum / max(n_pos, 1),
+        )
+    except ValueError as exc:
+        # twoGap <= 0: the experts agree, the distill channel has
+        # nothing to carry -- the honest report, not a failure.
+        print(f"  eta NOT REPORTED -- {exc}")
+    if eta is not None:
+        print(f"  channel efficiency eta = {eta:.4f} "
+              "(T3: fraction of twoGap the merge carries; <0 degraded, >1 beat the ensemble)")
     print()
     print("  gamma (harvest) = G/D compares the merged model's gain on")
     print("  held-out against this D. The KL above is what the merge")
     print("  fails to carry per token: a LARGE KL against a LARGE D is")
     print("  the case where disagreement exists and is not transferred --")
-    print("  the 9x shortfall the R104 gate needs closed.")
-    return 0
-    print()
-    print("  gamma (harvest) = G/D compares the merged model's gain on")
-    print("  held-out against this D. The KL above is the loss the merge")
-    print("  incurs per token: a LARGE KL with a LARGE D is the case")
-    print("  where disagreement exists and is not transferred -- exactly")
     print("  the 9x shortfall the R104 gate needs closed.")
     return 0
 
