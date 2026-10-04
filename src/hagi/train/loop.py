@@ -815,6 +815,12 @@ def format_metrics(metrics: dict) -> str:
     ):
         if key in metrics:
             parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+    # §7.2 item 3: the mixer gate alone misdiagnoses the channel
+    # (anti-correlated gate/branch, 2607.16568) — log ||R|| next to gain.
+    mixer_keys = sorted(k for k in metrics if k.startswith("mixers/"))
+    for key in mixer_keys[:3]:
+        name = key.split("/")[-1]
+        parts.append(f"{name}={metrics[key]:.3e}")
     if "analytic_eta" in metrics:
         parts.append(f"eta={metrics['analytic_eta']:.3e}")
         parts.append(f"L={metrics['analytic_L']:.3e}")
