@@ -914,6 +914,11 @@ def train(
     # ce, which drifts with the data stream (round-54 false-alarm lesson).
     gate_interval = int(cfg.train.logging.gate_eval_interval)
     gate_batches: list | None = None
+    # T5 collapse monitor state: H_data is window-fixed (computed once on
+    # first gate pass); the per-pass report (floor/margin/collapsed) rides
+    # in ``metrics`` and the state dict, log-only -- never a stop condition
+    # until its alarm rate is measured (the gram-scan discipline).
+    collapse_state: dict = {"h_data": None}
 
     def _gate_ce(model) -> float:
         import numpy as np  # local: only needed when the gate is enabled
@@ -940,6 +945,22 @@ def train(
         weights = gate_batches[-1]
         model.eval()
         total = 0.0
+        # T5 collapse monitor (Pinsker floor, R108 honest form): the gate
+        # windows are fixed, so their empirical entropy H_data is computed
+        # ONCE here; the model's predictive entropy is measured in the same
+        # eval pass. KL(data||model) = CE - H_data on the window, and the
+        # floor is H_data - pinsker_floor_correction(KL, V) at nu=1 (each
+        # SGD step sees entirely fresh data -- the R108 recurrence's best
+        # case). Margin < 0 = output distribution below the collapse floor.
+        if collapse_state["h_data"] is None:
+            hd = 0.0
+            for (_, y), w in zip(gate_batches[:-1], weights):
+                c = torch.bincount(y.reshape(-1), minlength=int(cfg.model.vocab_size))
+                p = c.float() / max(1, c.sum())
+                nz = p[p > 0]
+                hd += w * float(-(nz * nz.log()).sum())
+            collapse_state["h_data"] = hd
+        h_model = 0.0
         with torch.no_grad():
             for (x, y), w in zip(gate_batches[:-1], weights):
                 x = x.to(next(model.parameters()).device)
@@ -947,7 +968,23 @@ def train(
                 o = model(x, y)
                 f = o.hidden.reshape(-1, o.hidden.shape[-1])
                 total += w * float(model.head.exact_loss(f, y.reshape(-1)))
+                # predictive entropy, chunked over rows to bound [N, V]
+                hm = 0.0
+                for i in range(0, f.shape[0], 256):
+                    z = model.head.logits(f[i:i + 256]).float()
+                    lp = torch.log_softmax(z, dim=-1)
+                    hm -= float((lp.exp() * lp).sum())  # E[-log p] > 0
+                h_model += w * (hm / f.shape[0])
         model.train()
+        try:
+            from hagi.train.distill_recursion import gate_collapse_report
+            report = gate_collapse_report(
+                total, h_model, collapse_state["h_data"],
+                int(cfg.model.vocab_size),
+            )
+            collapse_state.update(report)
+        except Exception as exc:  # monitor must not kill the gate
+            logger.warning("gate collapse monitor failed: %s", exc)
         return total
 
     while trainer.step < cfg.train.max_steps:
@@ -1005,6 +1042,18 @@ def train(
             gce = _gate_ce(model)
             logger.info("gate_ce step %d: %.4f", trainer.step, gce)
             metrics["gate_ce"] = gce
+            # T5 monitor: margin to the Pinsker collapse floor, log-only
+            if collapse_state.get("floor") is not None:
+                metrics["collapse_margin"] = collapse_state["margin"]
+                metrics["collapse_floor"] = collapse_state["floor"]
+                metrics["collapse_kl"] = collapse_state["kl_model_data"]
+                if collapse_state["collapsed"]:
+                    logger.warning(
+                        "step %d COLLAPSE ALARM: gate margin %.4f below the Pinsker floor %.4f",
+                        trainer.step,
+                        collapse_state["margin"],
+                        collapse_state["floor"],
+                    )
 
         # Insight cycle (RLTL;DR internalization): the self-improvement
         # channel. ``run_insight_cycle`` was implemented and unit-tested but
