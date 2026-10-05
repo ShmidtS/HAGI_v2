@@ -44,6 +44,11 @@ train:
     weight_decay: 0.3
   schedule:
     warmup_steps: 20
+  saturation_patience: 8
+  saturation_tol: 0.01
+  saturation_min_steps: 200
+  logging:
+    gate_eval_interval: 50
   checkpoint_dir: checkpoints/dbridge_gen7_joint
   init_from: checkpoints/dbridge_gen7_merged/step-0001300.pt
   data:
