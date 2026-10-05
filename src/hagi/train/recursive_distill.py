@@ -200,3 +200,45 @@ def cycle_report(
             else ("STOP_LEAK" if gate["stop"] else "CONTINUE")
         ),
     }
+
+
+def harvest_accounting_identity(
+    harvests: list[float], d0: float, d_n: float
+) -> bool:
+    """``harvest_accounting_identity`` (addendum): sum h_t == D_0 - D_n.
+
+    The field pays unit for unit (``D_{t+1} = D_t - h_t``): the total
+    harvested gain telescopes to the field's total drop. ALL certified
+    gain comes from the field, nothing else. Runtime check: the measured
+    harvests and the measured field endpoints must satisfy the identity
+    to tolerance -- a violation means the ledger's "gain" is not coming
+    from the field (two clocks disagreeing).
+    """
+    return abs(math.fsum(harvests) - (d0 - d_n)) <= 1e-9 * max(1.0, abs(d0))
+
+
+def greedy_horizon_optimal(gamma: float, d0: float, n: int) -> dict[str, float]:
+    """``greedy_horizon_optimal`` (addendum): the certified harvest ceiling.
+
+    ANY schedule respecting ``h_t <= gamma*D_t`` harvests at most
+    ``D_0*(1-(1-gamma)^n)`` by step n; the GREEDY schedule (extract the
+    max every cycle) achieves it, and its residual field is exactly
+    ``(1-gamma)^n * D_0`` -- which meets the ``exhausted_when``
+    criterion. Runtime reading: this is the CEILING the ledger compares
+    the measured cumulative gain against. Reaching it means the
+    recursion runs greedy-optimal; staying far below while the field
+    stays high means the cycles underharvest (distill slack eating the
+    extractable gain, corpus too narrow).
+
+    Raises:
+        ValueError: on ``gamma`` outside (0, 1], negative ``d0`` or
+            negative ``n``.
+    """
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be in (0, 1]")
+    if d0 < 0.0:
+        raise ValueError("D_0 must be non-negative")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    residual = (1.0 - gamma) ** n * d0
+    return {"ceiling": d0 - residual, "residual_field": residual}
