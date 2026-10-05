@@ -117,6 +117,11 @@ def main() -> int:
                     help="one per sibling, e.g. math=12901=openwebmath:0.45,edu:0.25")
     ap.add_argument("--merge-checkpoint-step", type=int, default=0,
                     help="if > 0, merged init_from this step of the merge dir")
+    ap.add_argument("--distill-alpha", type=float, default=0.5,
+                    help="KD blend in the distill stage objective "
+                         "(loss = (1-a)*ce + a*kd; FreeEnergy.lean P2c)")
+    ap.add_argument("--distill-temperature", type=float, default=1.0,
+                    help="KD temperature in the distill stage")
     ap.add_argument("--write", action="store_true")
     args = ap.parse_args()
 
@@ -224,6 +229,32 @@ def main() -> int:
     if not ok:
         raise SystemExit(f"joint: {why}")
     made.append((ROOT / f"configs/dbridge_gen{gen}_joint.yaml", joint))
+
+    # --- distill (reverse recursion, RecursiveDistill.lean) --------------
+    # The COMPRESS half of the cycle: a compact student (H = the sib width)
+    # distilled from the generation's own joint (3H). The cycle then repeats
+    # with the distillate as the next generation's parent: the model grows
+    # DENSITY at fixed width instead of parameters. For gen7 the student
+    # inits from gen6_joint (the previous generation's compact model); for
+    # gen8+ the parent-joint arg IS the previous distillate.
+    distill = scale(tmpl_joint, sib_width, args.head_dim)
+    _set(distill, "merge.enabled", False)
+    _set(distill, "merge.n_experts", 0)
+    _set(distill, "merge.expert_hidden", 0)
+    _set(distill, "merge.distill", True)
+    _set(distill, "merge.distill_teacher",
+         f"checkpoints/dbridge_gen{gen}_joint/best.pt")
+    _set(distill, "merge.distill_alpha", args.distill_alpha)
+    _set(distill, "merge.distill_temperature", args.distill_temperature)
+    distill["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_distill"
+    distill["train"]["init_from"] = args.parent_joint
+    distill["train"]["learning_rate"] = sib_lr
+    distill["model"]["init_seed"] = 12000 + 100 * gen + 9
+    distill["train"]["data"]["seed"] = 13000 + 100 * gen + 9
+    ok, why = geometry_ok(distill)
+    if not ok:
+        raise SystemExit(f"distill: {why}")
+    made.append((ROOT / f"configs/dbridge_gen{gen}_distill.yaml", distill))
 
     print(f"gen{gen}: siblings H={sib_width} (q={sib_width // args.head_dim}, "
           f"kv={max(1, (sib_width // args.head_dim) // 2)}), "

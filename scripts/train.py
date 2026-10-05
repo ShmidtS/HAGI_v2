@@ -357,6 +357,18 @@ def main() -> int:
         counts["embedding"] / 1e6,
         counts["active_body"] / 1e6,
     )
+    # Hard training-memory budget (user directive 2026-10-05): the joint
+    # H=10368 model is 2614.5M params and the training-memory ceiling of
+    # this machine; anything larger OOMs mid-run, hours in. The reverse
+    # recursion (distill into an H=3456 student) exists precisely to grow
+    # DENSITY below this line. Env override is for tests only.
+    max_params = int(os.environ.get("HAGI_MAX_TRAIN_PARAMS", "2614500000"))
+    if counts["total"] > max_params:
+        raise SystemExit(
+            f"model has {counts['total'] / 1e6:.1f}M parameters, over the "
+            f"training budget {max_params / 1e6:.1f}M (HAGI_MAX_TRAIN_PARAMS); "
+            "refusing to start a run that will OOM"
+        )
 
     # "Train only the Cross-Expert Mixer" mode: freeze every parameter except
     # the cross-block mixers. The experts' weights stay frozen; only the mixer
