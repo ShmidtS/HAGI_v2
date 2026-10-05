@@ -35,6 +35,7 @@ from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.analytic_step import CurvatureProbe, select_step
+from hagi.train.distill import logit_kl
 from hagi.train.insight import run_insight_cycle
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 from hagi.train.safeqp_controller import corpus_grad_gram
@@ -107,6 +108,98 @@ def configure_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+
+
+def _build_distill_teacher(
+    cfg: Config, device: str
+) -> tuple[nn.Module | None, str]:
+    """Load the frozen external teacher for the reverse-recursion channel.
+
+    ``cfg.merge.distill_teacher`` holds a checkpoint path (the
+    forward-declared field's "external teacher" reading): the payload's
+    own config is used to rebuild the model, so the teacher's geometry
+    (e.g. the gen7 joint at H=10368) can differ from the student's
+    (H=3456) -- the whole point of distilling into a compact student.
+    Eval mode + requires_grad_(False): the teacher NEVER receives
+    gradient and never changes the module it mirrors.
+    """
+    path = cfg.merge.distill_teacher
+    if cfg.merge.distill and (path is None or path == "self" or path == ""):
+        raise ValueError(
+            "merge.distill=True requires merge.distill_teacher to be a "
+            "checkpoint path (the 'self' router-weighted teacher has no "
+            "consumer yet)"
+        )
+    if not cfg.merge.distill:
+        return None, ""
+    from hagi.model.merge import build_model_from_payload
+    from hagi.train.checkpoint import config_from_dict, load_payload
+
+    payload = load_payload(path, device)
+    teacher_cfg = config_from_dict(payload["config"])
+    # n_mixers must come from the TEACHER's own config: build_model_from_payload
+    # strict-loads the state, and a mixer-count mismatch would fail the load.
+    n_mixers = int(getattr(teacher_cfg.merge, "n_mixers", 1))
+    teacher = build_model_from_payload(
+        teacher_cfg,
+        payload["model"],
+        n_mixers=n_mixers,
+        mixer_init_scale=teacher_cfg.merge.mixer_init_scale,
+        device=device,
+    )
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher, path
+
+
+def _distill_teacher_logit_target(
+    teacher: nn.Module,
+    input_ids: torch.Tensor,
+    targets: torch.Tensor | None,
+    doc_ids: torch.Tensor | None,
+    loss_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Teacher's per-position log-probabilities, no gradient.
+
+    A compact student head (H=3456) learning a wide teacher's (H=10368)
+    full logit vector is wasteful: the target is the teacher's DISTRIBUTION,
+    and a distribution needs only log-probabilities. The [N, V] float64
+    matrix of :func:`forward_kl_teacher` would be 2M x 32768 x 8B = 512MB
+    per microbatch; log-probs are the same information at the same cost,
+    but the KL can then be computed against the student's own softmax
+    without ever materializing a teacher-side mixture over the full vocab
+    in float64.
+    """
+    with torch.no_grad():
+        out = teacher(input_ids, targets, doc_ids=doc_ids)
+        hidden = out.hidden.detach()
+        z = teacher.head.logits(hidden).float()
+        if loss_mask is not None:
+            keep = loss_mask.reshape(-1)
+            z = z.reshape(-1, z.shape[-1])[keep]
+        return torch.log_softmax(z, dim=-1).detach()
+
+
+def _student_logits_masked(
+    model: nn.Module, hidden: torch.Tensor, loss_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """Student's logits on the SAME masked rows as the teacher target.
+
+    Rows align with :func:`_distill_teacher_logit_target` by construction
+    (same boolean flat mask, same order). Gradient flows through ``hidden``
+    into the student's body and head -- the whole point of the channel; only
+    the teacher side is frozen. ``head.logits`` (not ``head.loss``) because
+    the KD target is a full distribution: both sides pay the same [N, V].
+    """
+    if loss_mask is not None:
+        keep = loss_mask.reshape(-1)
+        hidden = hidden.reshape(-1, hidden.shape[-1])[keep]
+    # float32: the model runs bf16 (cast_model) and log_softmax in bf16 has
+    # ~1e-2 error per element -- larger than a small true KL, which showed up
+    # as a NEGATIVE logged kd on the smoke test. The KD objective needs the
+    # precision; the cost is one cast on [N, V].
+    return model.head.logits(hidden).float()
 
 
 def cast_model(model: nn.Module, precision: str, *, ternary_fp32_master: bool = False) -> None:
@@ -207,6 +300,24 @@ class Trainer:
                 "train.adapt.freeze_base=True requires model.adapters.enabled=True, "
                 "model.cortex.enabled=True, or model.decision.enabled=True"
                 " (no adaptive parameters exist to optimize when all are disabled)"
+            )
+        # Reverse-recursion channel (RecursiveDistill.lean): a frozen external
+        # teacher (the previous generation's joint, any geometry) supervises the
+        # compact student on the SAME corpus states. The license is the token-KL
+        # decomposition (FreeEnergy.lean P1b): the reverse KL splits over tokens
+        # exactly on visited states -- no off-policy correction needed.
+        device = next(model.parameters()).device
+        self._teacher, self.teacher_path = _build_distill_teacher(cfg, str(device))
+        self._distill_alpha = (
+            float(cfg.merge.distill_alpha) if self._teacher is not None else 0.0
+        )
+        self._distill_temperature = float(cfg.merge.distill_temperature)
+        if self._teacher is not None:
+            logger.info(
+                "distill teacher: %s (alpha=%.3f T=%.2f)",
+                self.teacher_path,
+                self._distill_alpha,
+                self._distill_temperature,
             )
         if getattr(cfg.train, "compile_model", False):
             # ROCm flash-attention backward breaks torch.compile (a fake/meta
@@ -587,6 +698,7 @@ class Trainer:
         loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         z_sum = torch.zeros((), device=device, dtype=torch.float32)
         decision_sum = torch.zeros((), device=device, dtype=torch.float32)
+        kd_sum = torch.zeros((), device=device, dtype=torch.float32)
         exact_ce_value: float | None = None
         exact_interval = int(cfg.train.logging.exact_ce_interval)
         for microbatch_index, ((batch, count, decision_count),) in enumerate(
@@ -668,9 +780,41 @@ class Trainer:
                 if output.decision_loss is not None
                 else None
             )
+            # Reverse-recursion channel (FreeEnergy.lean token_kl_decomposition
+            # P1b): the teacher's distribution on the SAME corpus states the
+            # student visits, added to the objective. The target is log-probs
+            # (already masked), so the student-side KL runs on the SAME masked
+            # rows via its own softmax -- no full-vocab teacher-side mixture.
+            kd_term = None
+            if (
+                self._teacher is not None
+                and self._distill_alpha > 0.0
+                and batch["targets"] is not None
+            ):
+                log_q = _distill_teacher_logit_target(
+                    self._teacher,
+                    batch["input_ids"],
+                    batch["targets"],
+                    batch["doc_ids"],
+                    batch["loss_mask"],
+                )
+                s_logits = _student_logits_masked(
+                    model, output.hidden, batch["loss_mask"]
+                )
+                kd_term = (
+                    logit_kl(s_logits, log_q, temperature=self._distill_temperature)
+                    * lm_weight
+                )
+                kd_sum = kd_sum + kd_term.detach().float()
             objective = None
             if output.lm_loss is not None:
                 objective = output.lm_loss * lm_weight
+                if kd_term is not None:
+                    # FreeEnergy.lean two-mode objective (P2c): a convex blend
+                    # of data-CE (mode-covering) and teacher-KL (consensus
+                    # extraction) on the LM component ONLY -- decision rows and
+                    # the NCE anchor keep their pre-existing weights.
+                    objective = (1.0 - self._distill_alpha) * objective + self._distill_alpha * kd_term
             if output.decision_loss is not None:
                 weighted = float(cfg.model.decision.loss_weight) * output.decision_loss * decision_weight
                 objective = weighted if objective is None else objective + weighted
@@ -772,6 +916,9 @@ class Trainer:
         }
         if gram_metrics:
             metrics.update(gram_metrics)
+        if self._teacher is not None:
+            metrics["kd"] = float(kd_sum)
+            metrics["kd_alpha"] = self._distill_alpha
         if receiver == "decision_only":
             metrics["lm_ce"] = None
         elif receiver == "conditional_nce":
@@ -824,6 +971,8 @@ def format_metrics(metrics: dict) -> str:
     if "analytic_eta" in metrics:
         parts.append(f"eta={metrics['analytic_eta']:.3e}")
         parts.append(f"L={metrics['analytic_L']:.3e}")
+    if "kd" in metrics:
+        parts.append(f"kd={metrics['kd']:.4f}")
     parts.append(f"kl={metrics.get('kl', 0.0):.4f}")
     return " | ".join(parts)
 
