@@ -1,12 +1,12 @@
 model:
   vocab_size: 32768
-  hidden_size: 10368
+  hidden_size: 3456
   num_layers: 3
   loop_depth: 1
-  init_seed: 12101
+  init_seed: 12709
   attention:
-    num_query_heads: 162
-    num_kv_heads: 81
+    num_query_heads: 54
+    num_kv_heads: 27
     head_dim: 64
     rope_theta: 3000.0
     sink_len: 4
@@ -37,7 +37,7 @@ train:
   batch_size: 32
   grad_accum_steps: 1
   compile_model: true
-  learning_rate: 0.0001
+  learning_rate: 0.00010127314814814815
   use_muon: true
   zero_init_proj: false
   adam:
@@ -49,12 +49,12 @@ train:
   saturation_min_steps: 200
   logging:
     gate_eval_interval: 50
-  checkpoint_dir: checkpoints/dbridge_gen7_joint
-  init_from: checkpoints/dbridge_gen7_merged/step-0000800.pt
+  checkpoint_dir: checkpoints/dbridge_gen7_distill
+  init_from: checkpoints/dbridge_gen6_joint/step-0001300.pt
   data:
     data_dir: data
     seq_len: 1024
-    seed: 13907
+    seed: 13709
     weights:
       edu: 0.3179
       python_instruct: 0.1631
@@ -66,13 +66,17 @@ train:
       tinystories: 0.0477
       smoltalk: 0.0477
 merge:
-  enabled: true
+  enabled: false
   norm_block_dim: 128
   n_mixers: 1
   mixer_type: hadamard
-  n_experts: 3
-  expert_hidden: 1152
+  n_experts: 0
+  expert_hidden: 0
   mixer_init_scale: 0.0
   mixer_rank: 64
   freeze_experts: false
   expert_weight_source: effective_sparse
+  distill: true
+  distill_teacher: checkpoints/dbridge_gen7_joint/best.pt
+  distill_alpha: 0.5
+  distill_temperature: 1.0
