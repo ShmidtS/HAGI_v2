@@ -50,7 +50,7 @@ train:
   logging:
     gate_eval_interval: 50
   checkpoint_dir: checkpoints/dbridge_gen7_joint
-  init_from: checkpoints/dbridge_gen7_merged/step-0001300.pt
+  init_from: checkpoints/dbridge_gen7_merged/step-0000800.pt
   data:
     data_dir: data
     seq_len: 1024

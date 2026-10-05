@@ -16,7 +16,10 @@ log "pipeline start (pid $$)"
 
 run_stage() { # name config ckpt out
   local name="$1" config="$2" ckpt="$3" out="$4"
-  if [ -f "$ckpt" ]; then
+  # A stage is complete when EITHER marker exists: the full-horizon
+  # step-0001300.pt, or best.pt written by the saturation stop (a run
+  # that stopped early on plateau legitimately has no final ckpt).
+  if [ -f "$ckpt" ] || [ -f "$(dirname "$ckpt")/best.pt" ]; then
     log "$name: already complete ($ckpt)"
     return 0
   fi
@@ -33,7 +36,7 @@ run_stage() { # name config ckpt out
   "$PY" scripts/train.py --config "$config" "${resume_args[@]}" >> "$out" 2>&1
   local rc=$?
   log "$name: exit=$rc"
-  if [ $rc -ne 0 ] || [ ! -f "$ckpt" ]; then
+  if [ $rc -ne 0 ] || { [ ! -f "$ckpt" ] && [ ! -f "$(dirname "$ckpt")/best.pt" ]; }; then
     log "$name FATAL (rc=$rc, ckpt=$([ -f "$ckpt" ] && echo present || echo missing))"
     exit 1
   fi
@@ -66,6 +69,21 @@ run_stage "joint" configs/dbridge_gen7_joint.yaml \
 log "running eval_domains on gen7 joint"
 "$PY" scripts/eval_domains.py --config configs/dbridge_gen7_joint.yaml \
   --resume checkpoints/dbridge_gen7_joint/best.pt >> logs/gen7_joint_eval.log 2>&1 || \
+  log "eval failed (non-fatal)"
+
+# 8. distill: the COMPRESS half (RecursiveDistill.lean) — compact student
+# H=3456 distilled from the generation's own joint (3H). The cycle repeats
+# with the distillate as the next generation's parent: the model grows
+# DENSITY at fixed width instead of parameters. delta = gate CE student vs
+# teacher feeds cycle_report (leak gate / exhaustion); c = deep-200 vs the
+# previous distillate (gen6_joint §AT baseline) certifies growth.
+run_stage "distill" configs/dbridge_gen7_distill.yaml \
+  checkpoints/dbridge_gen7_distill/step-0001300.pt logs/gen7_distill.log
+
+# 9. eval by domains on the distillate
+log "running eval_domains on gen7 distill"
+"$PY" scripts/eval_domains.py --config configs/dbridge_gen7_distill.yaml \
+  --resume checkpoints/dbridge_gen7_distill/best.pt >> logs/gen7_distill_eval.log 2>&1 || \
   log "eval failed (non-fatal)"
 
 log "pipeline complete"
