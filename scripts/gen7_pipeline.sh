@@ -20,8 +20,17 @@ run_stage() { # name config ckpt out
     log "$name: already complete ($ckpt)"
     return 0
   fi
+  # Auto-resume: a crashed stage restarts from its latest step-*.pt
+  # (with optimizer state) instead of from scratch. train.py gives
+  # --resume precedence over any init_from, and a missing-latest is
+  # simply a fresh start -- no branching needed here.
+  local resume_args=()
+  if ls "$(dirname "$ckpt")"/step-*.pt >/dev/null 2>&1; then
+    resume_args=(--resume)
+    log "$name: partial run found, resuming from latest"
+  fi
   log "$name: launching ($config)"
-  "$PY" scripts/train.py --config "$config" >> "$out" 2>&1
+  "$PY" scripts/train.py --config "$config" "${resume_args[@]}" >> "$out" 2>&1
   local rc=$?
   log "$name: exit=$rc"
   if [ $rc -ne 0 ] || [ ! -f "$ckpt" ]; then
@@ -56,7 +65,7 @@ run_stage "joint" configs/dbridge_gen7_joint.yaml \
 # 7. eval by domains on gen7 joint
 log "running eval_domains on gen7 joint"
 "$PY" scripts/eval_domains.py --config configs/dbridge_gen7_joint.yaml \
-  --resume checkpoints/dbridge_gen7_joint/step-0001300.pt >> logs/gen7_joint_eval.log 2>&1 || \
+  --resume checkpoints/dbridge_gen7_joint/best.pt >> logs/gen7_joint_eval.log 2>&1 || \
   log "eval failed (non-fatal)"
 
 log "pipeline complete"

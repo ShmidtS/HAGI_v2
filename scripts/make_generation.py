@@ -22,7 +22,7 @@ Usage::
     python scripts/make_generation.py --parent-width 1152 \
         --generation 4 --n-experts 3 --head-dim 64 \
         --parent-joint checkpoints/dbridge_gen3_joint/step-0001600.pt \
-        --template-sibling configs/dbridge_gen4_sib1.yaml
+        --template-sibling configs/dbridge_gen7_sib_chat.yaml
 """
 
 from __future__ import annotations
@@ -109,9 +109,9 @@ def main() -> int:
     )
     ap.add_argument("--parent-joint", required=True,
                     help="checkpoint the siblings init from")
-    ap.add_argument("--template-sibling", required=True)
-    ap.add_argument("--template-merged", required=True)
-    ap.add_argument("--template-joint", required=True)
+    ap.add_argument("--template-sibling", default="configs/cycle.yaml")
+    ap.add_argument("--template-merged", default="configs/cycle.yaml")
+    ap.add_argument("--template-joint", default="configs/cycle.yaml")
     ap.add_argument("--mixes", nargs="+", required=True,
                     metavar="NAME=SEED=CORPUS:WEIGHT,...",
                     help="one per sibling, e.g. math=12901=openwebmath:0.45,edu:0.25")
@@ -149,16 +149,24 @@ def main() -> int:
     tmpl_merged = yaml.safe_load((ROOT / args.template_merged).read_text(encoding="utf-8"))
     tmpl_joint = yaml.safe_load((ROOT / args.template_joint).read_text(encoding="utf-8"))
 
+    # Stage-specific fields layered on the shared cycle template. The
+    # template is the SSOT for everything the three stages share
+    # (saturation, gate cadence, checkpointing); only what DIFFERS is
+    # written here, so a policy change lands in all stages at once.
     made: list[tuple[Path, dict]] = []
 
     # --- siblings -------------------------------------------------------
     for spec in args.mixes:
         name, seed, mix = spec.split("=")
+        idx = args.mixes.index(spec)
         cfg = scale(tmpl_sib, sib_width, args.head_dim)
         _set(cfg, "merge.expert_hidden", expert_hidden)
+        _set(cfg, "merge.mixer_type", "swiglu")
+        _set(cfg, "merge.mixer_init_scale", 0.0)
         cfg["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_sib_{name}"
         cfg["train"]["init_from"] = args.parent_joint
         cfg["train"]["learning_rate"] = sib_lr
+        cfg["model"]["init_seed"] = 12000 + 100 * gen + idx
         cfg["train"]["data"]["seed"] = int(seed)
         weights: dict[str, float] = {}
         for item in mix.split(","):
@@ -177,8 +185,15 @@ def main() -> int:
     merged = scale(tmpl_merged, merged_width, args.head_dim)
     _set(merged, "merge.expert_hidden", expert_hidden)
     _set(merged, "merge.n_experts", args.n_experts)
+    _set(merged, "merge.mixer_type", "hadamard")
+    _set(merged, "merge.mixer_init_scale", 0.1)
+    _set(merged, "merge.mixer_gen_phase", args.generation)
     merged["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_merged"
     merged["train"]["init_from"] = ""
+    merged["model"]["init_seed"] = 12000 + 100 * gen + 1
+    merged["train"]["data"]["seed"] = 12000 + 100 * gen + 7
+    merged["train"]["learning_rate"] = 1e-4
+    merged["train"]["schedule"]["warmup_steps"] = 20
     step = args.merge_checkpoint_step or 0
     merged["merge"]["expert_checkpoints"] = [
         f"checkpoints/dbridge_gen{gen}_sib_{spec.split('=')[0]}/step-{step:07d}.pt"
@@ -193,11 +208,17 @@ def main() -> int:
     joint = scale(tmpl_joint, merged_width, args.head_dim)
     _set(joint, "merge.expert_hidden", expert_hidden)
     _set(joint, "merge.n_experts", args.n_experts)
+    _set(joint, "merge.mixer_type", "hadamard")
+    _set(joint, "merge.mixer_init_scale", 0.0)
     joint["train"]["checkpoint_dir"] = f"checkpoints/dbridge_gen{gen}_joint"
+    joint["model"]["init_seed"] = 12000 + 100 * gen + 7
+    joint["train"]["schedule"]["warmup_steps"] = 20
+    joint["train"]["learning_rate"] = 1e-4
+    joint["train"]["data"]["seed"] = 13000 + 100 * gen + 7
     joint["train"]["init_from"] = (
         f"checkpoints/dbridge_gen{gen}_merged/step-{args.merge_checkpoint_step:07d}.pt"
         if args.merge_checkpoint_step
-        else f"checkpoints/dbridge_gen{gen}_merged/step-0000000.pt"
+        else f"checkpoints/dbridge_gen{gen}_merged/best.pt"
     )
     ok, why = geometry_ok(joint)
     if not ok:

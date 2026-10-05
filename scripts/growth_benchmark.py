@@ -172,7 +172,7 @@ def report(name: str, d: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", default="configs/dbridge_gen3_joint.yaml")
+    ap.add_argument("--config", default="configs/dbridge_gen6_joint.yaml")
     ap.add_argument(
         "--gen", required=True, metavar="NAME=CONFIG=PATH",
         help="current generation: name, the config that BUILDS it, and its checkpoint",

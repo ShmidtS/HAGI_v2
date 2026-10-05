@@ -1,0 +1,106 @@
+# Универсальный конфиг merge-цикла поколения (gen8+).
+#
+# Один файл описывает ВЕСЬ цикл обучения: 3 сиба -> merged (GAM) ->
+# joint. Три отдельных конфига на поколение дрейфовали независимо
+# (checkpoint_interval 1300 у сибов и 800 у merged -- правка в одном
+# файле не попадала в остальные); make_generation.py теперь копирует
+# СЮДА и подставляет только стейдж-специфику.
+#
+# Наследуется (одинаково во всех стейджах):
+#   геометрия q*head_dim == H, vocab, слои, bf16+Muon, wd 0.3,
+#   saturation-стоп по gate_ce, best.pt-чекпойнты, ширина окна 1024.
+#
+# Стейдж-параметризация (подставляет make_generation.py):
+#   сибы    H=parent_width,  init_from=parent joint,   swiglu-миксер,
+#           lr=lr_scale/H, домен-микс на сиб
+#   merged  H=3*parent,      expert_checkpoints=сибы,   hadamard-миксер
+#           mixer_gen_phase=N (свежая фаза), init_scale 0.1
+#   joint   H=3*parent,      init_from=merged best,     init_scale 0.0
+#
+# Откуда значения: см. make_generation.py (lr из стабильной полосы
+# H*lr 0.35-0.38, расходимость на 1.15) и FORMALIZATION_TODO §6.
+
+model:
+  vocab_size: 32768
+  num_layers: 3
+  loop_depth: 1
+  attention:
+    head_dim: 64
+    rope_theta: 3000.0
+    sink_len: 4
+    max_seq_len: 4096
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  ternary:
+    enabled: false
+  ffn:
+    expansion: 1.0
+  head:
+    unigram_prior: false
+    sampled_proposal: uniform
+    fused_ce: true
+  cortex:
+    enabled: false
+  adapters:
+    enabled: false
+  decision:
+    enabled: false
+
+train:
+  max_steps: 1300
+  precision: bf16
+  grad_checkpointing: false
+  ternary_fp32_master: false
+  batch_size: 32
+  grad_accum_steps: 1
+  compile_model: true
+  use_muon: true
+  zero_init_proj: false
+  adam:
+    weight_decay: 0.3
+  schedule:
+    warmup_steps: 40
+  # Насыщение: сигнал -- фиксированное окно gate_ce (стабильный
+  # контроль, урок round-54; running ce дрейфует со стримом данных).
+  # Новый рекорд -> best.pt; patience сэмплов без улучшения на tol ->
+  # стоп. Ранний минимум плато merged (шаги 190-290) иначе горит
+  # впустую до 1300.
+  saturation_patience: 8
+  saturation_tol: 0.01
+  saturation_min_steps: 200
+  logging:
+    log_interval: 10
+    diag_interval: 100
+    gate_eval_interval: 50
+  # Ротация step-*.pt для resume; best.pt вне ротации (артефакт
+  # "что шипить", не точка продолжения).
+  checkpoint_interval: 400
+  checkpoint_keep_last: 3
+  divergence_patience: 3
+  divergence_delta: 0.15
+  divergence_min_steps: 150
+  data:
+    data_dir: data
+    seq_len: 1024
+    # Канонический joint-микс (унаследуют merged/joint; сибы
+    # перезаписывают доменным миксом через --mixes).
+    weights:
+      edu: 0.3179
+      python_instruct: 0.1631
+      wikipedia_en: 0.0796
+      wikipedia_ru: 0.0637
+      oscar_ru: 0.0557
+      openwebmath: 0.0796
+      slimpajama: 0.145
+      tinystories: 0.0477
+      smoltalk: 0.0477
+
+merge:
+  enabled: true
+  norm_block_dim: 128
+  n_mixers: 1
+  n_experts: 3
+  mixer_rank: 64
+  freeze_experts: false
+  expert_weight_source: effective_sparse
