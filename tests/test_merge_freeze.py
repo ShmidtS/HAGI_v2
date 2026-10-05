@@ -39,7 +39,7 @@ def build(config: str):
 
 def test_the_default_leaves_everything_trainable():
     """The common path must be untouched by the new code."""
-    _, m = build("dbridge_gen3_joint.yaml")
+    _, m = build("dbridge_gen6_joint.yaml")
     assert all(p.requires_grad for _, p in m.named_parameters())
 
 

@@ -85,7 +85,7 @@ def split(ckpt: str, config: str, seed: int = 0) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config", default="configs/mixonly_gen3.yaml")
+    ap.add_argument("--config", default="configs/dbridge_gen7_merged.yaml")
     args = ap.parse_args()
 
     d = split(args.ckpt, args.config)

@@ -27,9 +27,9 @@ eval_domains.
 Usage:
     python scripts/growth/gen7_gate.py \
         --student configs/dbridge_gen6_joint.yaml \
-        --experts sib1=configs/dbridge_gen4_fresh_sib1.yaml \
-                  lang=configs/dbridge_gen4_sib_lang.yaml \
-                  code=configs/dbridge_gen4_sib_code.yaml
+        --experts chat=configs/dbridge_gen7_sib_chat.yaml \
+                  lang=configs/dbridge_gen7_sib_lang.yaml \
+                  math=configs/dbridge_gen7_sib_math.yaml
 """
 from __future__ import annotations
 

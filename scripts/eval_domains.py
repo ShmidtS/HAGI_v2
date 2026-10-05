@@ -105,7 +105,7 @@ def eval_domain(model: torch.nn.Module, cfg, domain: str, batches: int, device) 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint on per-domain corpora")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--resume", required=True, help="checkpoint step-*.pt path")
+    parser.add_argument("--resume", required=True, help="checkpoint path (step-*.pt or best.pt)")
     parser.add_argument("--batches", type=int, default=20)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
