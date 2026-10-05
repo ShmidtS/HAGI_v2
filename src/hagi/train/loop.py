@@ -25,18 +25,18 @@ import logging
 import math
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import torch
 from torch import nn
-from pathlib import Path
 
 from hagi.config import Config
 from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
-from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 from hagi.train.analytic_step import CurvatureProbe, select_step
 from hagi.train.insight import run_insight_cycle
+from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 from hagi.train.safeqp_controller import corpus_grad_gram
 
 logger = logging.getLogger(__name__)
@@ -400,9 +400,9 @@ class Trainer:
         """
         if self._gram_samples is not None:
             return self._gram_samples
-        import numpy as np
-
         from pathlib import Path
+
+        import numpy as np
 
         tokens = int(self.cfg.train.gram_scan_tokens)
         samples: list[tuple[str, dict]] = []
@@ -892,10 +892,15 @@ def train(
     # Saturation early-stop: track the best exact_ce and stop once it has not
     # improved by more than ``saturation_tol`` over ``saturation_patience``
     # logged samples. This is the method's "saturate" step made concrete.
+    # The signal is the FIXED-WINDOW gate_ce when available (stable control,
+    # round-54 lesson), else exact_ce. On every new best the model is saved
+    # to ``best.pt`` -- the step-interval checkpoints answer "where can we
+    # resume", best.pt answers "what do we ship" (they are different
+    # questions once the curve stops being monotone).
     patience = int(cfg.train.saturation_patience)
     tol = float(cfg.train.saturation_tol)
     min_steps = int(cfg.train.saturation_min_steps)
-    best_exact_ce: float | None = None
+    best_ce: float | None = None
     no_improve_count = 0
 
     # Divergence guard: stop once running ce rises ``divergence_delta`` above
@@ -1099,19 +1104,38 @@ def train(
                 except Exception as exc:  # the channel is optional
                     logger.warning("step %d insight cycle failed: %s", trainer.step, exc)
 
-        # Saturation check on the exact_ce (the coding-cost SSOT). Only
-        # evaluated when exact_ce is actually measured (exact_ce_interval>0).
-        if patience > 0 and "exact_ce" in metrics and trainer.step >= min_steps:
-            ce = float(metrics["exact_ce"])
-            if best_exact_ce is None or ce < best_exact_ce - tol:
-                best_exact_ce = ce
+        # Saturation check + best-checkpoint save. Signal priority:
+        # gate_ce (fixed window, stable) > exact_ce (current batch).
+        # The best.pt write happens AT the record -- a checkpoint taken
+        # later (interval or final) captures a worse model.
+        sat_signal = None
+        if gate_interval > 0 and "gate_ce" in metrics:
+            sat_signal = float(metrics["gate_ce"])
+        elif "exact_ce" in metrics:
+            sat_signal = float(metrics["exact_ce"])
+        if patience > 0 and sat_signal is not None and trainer.step >= min_steps:
+            if best_ce is None or sat_signal < best_ce - tol:
+                best_ce = sat_signal
                 no_improve_count = 0
+                if trainer.step > 0:
+                    save_checkpoint(
+                        model,
+                        cfg,
+                        trainer.step,
+                        cfg.train.checkpoint_dir,
+                        cfg.train.checkpoint_keep_last,
+                        optimizer=trainer.optimizer,
+                        name="best.pt",
+                    )
+                    logger.info(
+                        "new best gate_ce %.4f at step %d -> best.pt", sat_signal, trainer.step
+                    )
             else:
                 no_improve_count += 1
                 if no_improve_count >= patience:
                     logger.info(
-                        "saturation: exact_ce %.4f not improved by %.4f over %d samples; stopping at step %d",
-                        ce,
+                        "saturation: control ce %.4f not improved by %.4f over %d samples; stopping at step %d",
+                        sat_signal,
                         tol,
                         patience,
                         trainer.step,
