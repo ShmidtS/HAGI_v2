@@ -86,4 +86,27 @@ log "running eval_domains on gen7 distill"
   --resume checkpoints/dbridge_gen7_distill/best.pt >> logs/gen7_distill_eval.log 2>&1 || \
   log "eval failed (non-fatal)"
 
+# 10. delta: the bridge slack = gate CE of the student MINUS gate CE of
+# the teacher, on the SAME canonical windows (gate_score.py reproduces
+# the in-run gate exactly, so the two numbers are comparable).
+log "measuring cycle delta (gate CE student vs teacher)"
+T_GATE=$("$PY" scripts/gate_score.py --config configs/dbridge_gen7_joint.yaml \
+  --ckpt checkpoints/dbridge_gen7_joint/best.pt 2>/dev/null | sed 's/.*gate_ce=//')
+S_GATE=$("$PY" scripts/gate_score.py --config configs/dbridge_gen7_distill.yaml \
+  --ckpt checkpoints/dbridge_gen7_distill/best.pt 2>/dev/null | sed 's/.*gate_ce=//')
+log "teacher_gate=$T_GATE student_gate=$S_GATE"
+
+# 11. gain: deep-200 certification of the distillate against the gen6
+# baseline the certify script carries (EN/HELD_CHAT/MATH/CODE/...).
+log "deep-200 certify on gen7 distill"
+"$PY" scripts/growth/deep200_certify.py --log logs/gen7_distill_eval.log >> logs/gen7_distill_certify.log 2>&1 || \
+  log "deep200 certify failed (non-fatal)"
+
+# 12. cycle verdict: append (delta, gain) to the ledger and obey the
+# cycle_report verdict (CONTINUE / STOP_LEAK / EXHAUSTED).
+# NOTE: gain must be read from the certify log -- plug the certified
+# AVG improvement over the gen6 baseline in manually once the log is
+# written; the gate refuses to guess.
+log "cycle_gate pending manual gain (see logs/gen7_distill_certify.log)"
+
 log "pipeline complete"
