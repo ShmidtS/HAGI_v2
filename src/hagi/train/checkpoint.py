@@ -181,6 +181,7 @@ def save_checkpoint(
     directory: str | Path,
     keep_last: int = 3,
     optimizer=None,
+    name: str | None = None,
 ) -> Path:
     """Write a checkpoint atomically and rotate old ones.
 
@@ -197,6 +198,10 @@ def save_checkpoint(
         optimizer: when given, its state is stored so a resume keeps Muon
             momentum and AdamW second moments. Without it a resume restarts the
             optimizer cold, which shows up as a loss spike.
+        name: explicit file name (e.g. ``best.pt``). Named checkpoints are
+            NOT part of the step-* rotation -- ``best.pt`` survives pruning
+            and is invisible to ``latest_checkpoint`` (resume stays on the
+            step axis; best is an artifact, not a continuation point).
 
     Returns:
         The written path.
@@ -208,7 +213,7 @@ def save_checkpoint(
 
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    target = root / f"step-{completed_steps:07d}.pt"
+    target = root / (name if name is not None else f"step-{completed_steps:07d}.pt")
 
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -229,8 +234,9 @@ def save_checkpoint(
         temp_path.unlink(missing_ok=True)
     logger.info("checkpoint saved: %s", target)
 
-    existing = sorted(root.glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-")))
-    for old in existing[:-keep_last]:
-        old.unlink()
-        logger.info("checkpoint pruned: %s", old)
+    if name is None:
+        existing = sorted(root.glob("step-*.pt"), key=lambda p: int(p.stem.removeprefix("step-")))
+        for old in existing[:-keep_last]:
+            old.unlink()
+            logger.info("checkpoint pruned: %s", old)
     return target
