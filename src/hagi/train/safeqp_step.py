@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import math
 
-
 # --- R105: the derived safe step ----------------------------------------
 
 
@@ -338,3 +337,69 @@ def pairwise_constant_is_halved(
         for i in range(n) for j in range(n) if i != j
     )
     return abs(gap) > claimed + 1e-9, gap, claimed
+
+
+def logit_range_scale(logits: list[float], tau: float) -> list[float]:
+    """``logitRange_scale`` (MacroCycleV2.lean R175): R(d/tau) = R(d)/tau.
+
+    Temperature division scales the logit range LINEARLY, so the PoE
+    second-order slack ``R^2/8`` contracts QUADRATICALLY: an expert
+    whose measured range ``R`` overshoots the certified admission
+    threshold ``R_bar`` is repaired exactly to the boundary by
+    ``tau = R/R_bar`` (``variance_gate_normalize``).
+
+    Raises:
+        ValueError: on a non-positive temperature.
+    """
+    if tau <= 0.0:
+        raise ValueError("tau must be positive")
+    return [z / tau for z in logits]
+
+
+def variance_gate_tau(logits: list[float], r_bar: float) -> float:
+    """``variance_gate_normalize``: the exact repair temperature.
+
+    For a range overshoot ``R >= R_bar``, ``tau = R/R_bar`` lands the
+    expert's range exactly on ``R_bar`` and its PoE slack exactly on
+    ``R_bar^2/8`` -- the admission boundary. In-range experts return
+    ``tau = 1`` (pass through unchanged).
+
+    Raises:
+        ValueError: on a non-positive threshold or an empty logit list.
+    """
+    if r_bar <= 0.0:
+        raise ValueError("r_bar must be positive")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    r = max(logits) - min(logits)
+    if r <= r_bar:
+        return 1.0
+    return r / r_bar
+
+
+def expert_gate_tau(
+    expert_logits: list[list[float]], weights: list[float], r_bar: float
+) -> list[float]:
+    """Admission temperatures for every expert in a merge.
+
+    The merge admission uses the R106 CENTERED spread ``R_i`` (deviation
+    of expert i's logits from the weighted pool mean) -- the measurable
+    the PoE bound is actually stated in, not the raw max-min. Experts
+    within ``R_bar`` keep ``tau = 1``; an overshooting expert gets
+    ``tau_i = R_i / R_bar`` so its post-scaling spread is exactly
+    ``R_bar`` and its PoE slack exactly ``R_bar^2/8``.
+
+    Returns:
+        One temperature per expert, aligned with the input order.
+
+    Raises:
+        ValueError: as :func:`expert_spread` / :func:`variance_gate_tau`.
+    """
+    return [
+        variance_gate_tau(
+            [z - sum(w * row[j] for w, row in zip(weights, expert_logits))
+             for j, z in enumerate(row)],
+            r_bar,
+        )
+        for row in expert_logits
+    ]
