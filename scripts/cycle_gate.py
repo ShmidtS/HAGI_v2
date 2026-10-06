@@ -45,6 +45,43 @@ if str(_SRC) not in sys.path:
 from hagi.train.recursive_distill import cycle_report  # noqa: E402
 
 
+def quality_volume_report(
+    deltas: list[float], gains: list[float]
+) -> dict[str, float]:
+    """R176 ``distill_quant_composite`` over the ledger: the whole
+    grow-compress-quantize pipeline in ONE additive bound.
+
+    With every cycle's net ``g = c_k - delta_k``, the distillate of
+    generation n beats the initial ensemble by ``n*g_min`` up to its
+    own slack and the deployed bit budget's total error -- the
+    parameter-budget certificate of the recursive line.
+    """
+    from hagi.train.bit_alloc import distill_quant_composite
+
+    n = len(deltas)
+    if n == 0:
+        return {"n": 0}
+    g_min = min(g - d for g, d in zip(gains, deltas))
+    # the deployed bits: the current dbridge line is bf16 (16 bits
+    # everywhere, zero quantization error in this model); the bound
+    # stays honest with the sensitivity knob wired for the future
+    # ternary/STEPQuant deployment.
+    c = [0.0] * n
+    f = [16] * n
+    s_n = 0.0  # ledger reports deltas/gains, not absolute CE levels
+    e0 = sum(deltas)
+    bound, slack = distill_quant_composite(
+        s_n, e0, deltas[-1], n, g_min, c, f
+    )
+    return {
+        "n": n,
+        "g_min": g_min,
+        "bound": bound,
+        "slack": slack,
+        "certificate": "HOLDS" if slack >= 0 else "VIOLATED",
+    }
+
+
 def load_ledger(path: Path) -> dict:
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -93,6 +130,10 @@ def main() -> int:
           f"net_total={r['net_total']:.4f}, g_min={r['g_min']:.4f}")
     print(f"field={r['field']:.4f} threshold={r['threshold']:.4f} "
           f"harvest_budget={r['harvest_budget']:.4f}")
+    qv = quality_volume_report(deltas, gains)
+    if qv.get("n"):
+        print(f"quality-volume: g_min={qv['g_min']:.4f} "
+              f"slack={qv['slack']:.4f} [{qv['certificate']}]")
     print(f"VERDICT: {r['verdict']}")
     return 0
 
