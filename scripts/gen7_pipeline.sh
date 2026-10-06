@@ -56,10 +56,14 @@ run_stage "merged_gam7" configs/dbridge_gen7_merged.yaml \
   checkpoints/dbridge_gen7_merged/step-0001300.pt logs/gen7_merged.log
 
 # 5. channel split on merged step-0 (GAM health at init)
-log "channel_split on gen7 merged step-0"
-"$PY" scripts/measure_channel_split.py --ckpt checkpoints/dbridge_gen7_merged/step-0000000.pt \
-  --config configs/dbridge_gen7_merged.yaml >> logs/gen7_channel_split.log 2>&1 || \
-  log "channel split failed (non-fatal)"
+if [ -s logs/gen7_channel_split.log ]; then
+  log "channel_split: already measured (logs/gen7_channel_split.log)"
+else
+  log "channel_split on gen7 merged step-0"
+  "$PY" scripts/measure_channel_split.py --ckpt checkpoints/dbridge_gen7_merged/step-0000000.pt \
+    --config configs/dbridge_gen7_merged.yaml >> logs/gen7_channel_split.log 2>&1 || \
+    log "channel split failed (non-fatal)"
+fi
 
 # 6. joint
 run_stage "joint" configs/dbridge_gen7_joint.yaml \

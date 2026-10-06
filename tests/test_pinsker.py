@@ -16,7 +16,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from hagi.train.distill_recursion import (  # noqa: E402
+    abs_log_sub_le,
     corrected_entropy_floor,
+    entropy_lipschitz_smooth,
     entropy_tv_modulus,
     pinsker_floor_correction,
     pinsker_tv_bound,
@@ -111,3 +113,78 @@ class TestCorrectedEntropyFloor:
         f = corrected_entropy_floor(0.1, 0.1, 32768, 6.5)
         assert math.isfinite(f)
         assert f < 6.5
+
+
+class TestSmoothFannes:
+    """R157 part 2: smooth Fannes — линейный по TV bound на интерьере."""
+
+    def test_log_increment_bound_holds(self):
+        # |log a - log b| <= |a-b|/min(a,b) на сериях пар
+        for a, b in ((0.5, 2.0), (0.01, 0.02), (3.0, 3.1), (1.0, 1.0)):
+            assert abs_log_sub_le(a, b) >= -1e-12
+
+    def test_log_increment_nonpositive_args_raise(self):
+        for bad in ((0.0, 1.0), (1.0, -2.0)):
+            with pytest.raises(ValueError):
+                abs_log_sub_le(*bad)
+
+    def test_smooth_bound_holds_on_interior_pairs(self):
+        # граница доминирует |H(p)-H(q)| на δ-интерьере
+        delta = 0.05
+        p = [0.5, 0.3, 0.2]
+        q = [0.4, 0.4, 0.2]
+        assert entropy_lipschitz_smooth(p, q, delta) >= -1e-12
+
+    def test_smooth_domain_errors(self):
+        # δ вне (0,1], разные длины, пустые входы, масса ниже δ
+        with pytest.raises(ValueError):
+            entropy_lipschitz_smooth([0.5, 0.5], [0.5, 0.5], 0.0)
+        with pytest.raises(ValueError):
+            entropy_lipschitz_smooth([0.5, 0.5], [0.5, 0.5], 1.5)
+        with pytest.raises(ValueError):
+            entropy_lipschitz_smooth([0.5, 0.5], [0.5], 0.01)
+        with pytest.raises(ValueError):
+            entropy_lipschitz_smooth([], [], 0.01)
+        with pytest.raises(ValueError):
+            # масса 0.01 < delta 0.05: вне сертифицированного интерьеры
+            entropy_lipschitz_smooth([0.99, 0.01], [0.5, 0.5], 0.05)
+
+
+class TestSmoothFannesVsModulus:
+    def test_smooth_linear_dominates_on_interior(self):
+        # на δ-интерьере обе границы работают; smooth-константа явная
+        delta = 0.05
+        p = [0.5, 0.3, 0.2]
+        q = [0.4, 0.4, 0.2]
+        const = 2.0 / delta + 2.0 * math.log(1.0 / delta)
+        bound = const * tv_distance(p, q)
+        gap = abs(shannon_entropy(p) - shannon_entropy(q))
+        assert bound >= gap - 1e-12
+        # Ho-Yeung тоже доминирует (V=3: log(V-1)=log 2)
+        assert entropy_tv_modulus(tv_distance(p, q), 3) >= gap - 1e-12
+
+    def test_smooth_slack_nonnegative_across_interior_grid(self):
+        # сетка δ-интерьорных пар: slack >= 0 всюду
+        import random
+        rng = random.Random(7)
+        delta = 0.05
+        for _ in range(50):
+            a = [rng.uniform(delta, 1.0) for _ in range(4)]
+            s = sum(a)
+            p = [x / s for x in a]
+            b = [rng.uniform(delta, 50.0) for _ in range(4)]
+            t = sum(b)
+            q = [x / t for x in b]
+            # нормировка могла увести массу ниже δ — проверяем домен
+            if min(p + q) < delta:
+                continue
+            assert entropy_lipschitz_smooth(p, q, delta) >= -1e-9
+
+    def test_smooth_slack_grows_with_delta(self):
+        # чем меньше δ (ближе к границе), тем больше константа — тем
+        # слабее (щедрее) граница; при том же TV slack больше
+        p = [0.5, 0.3, 0.2]
+        q = [0.4, 0.4, 0.2]
+        slack_05 = entropy_lipschitz_smooth(p, q, 0.05)
+        slack_10 = entropy_lipschitz_smooth(p, q, 0.10)
+        assert slack_05 > slack_10

@@ -466,3 +466,60 @@ def gate_collapse_report(ce: float, h_model: float, h_data: float,
         "margin": margin,
         "collapsed": bool(margin < 0.0),
     }
+
+
+def abs_log_sub_le(a: float, b: float) -> float:
+    """``abs_log_sub_le``: ``|log a - log b| <= |a - b| / min(a, b)``.
+
+    The mean-value bound for log on positives — the engine of the
+    smooth-Fannes decomposition.
+
+    Returns:
+        The slack of the inequality (non-negative when it holds).
+
+    Raises:
+        ValueError: on non-positive ``a`` or ``b``.
+    """
+    if a <= 0.0 or b <= 0.0:
+        raise ValueError("log arguments must be positive")
+    return abs(a - b) / min(a, b) - abs(math.log(a) - math.log(b))
+
+
+def entropy_lipschitz_smooth(
+    p: list[float], q: list[float], delta: float
+) -> float:
+    """``entropy_lipschitz_smooth`` (R157 part 2): SMOOTH FANNES.
+
+    On the delta-interior of the simplex (every mass >= delta) entropy
+    is Lipschitz in total variation with the EXPLICIT constant:
+
+        |H(p) - H(q)| <= (2/delta + 2*log(1/delta)) * TV(p, q)
+
+    — linear in TV where :func:`entropy_tv_modulus` (Ho-Yeung) is
+    sub-linear but boundary-singular. Together the two cover the
+    Fannes program except the singular h2 term (honest boundary,
+    unchanged from the Lean module).
+
+    Returns:
+        The slack of the bound: ``bound - |H(p)-H(q)|`` (non-negative
+        when the certificate holds on this pair).
+
+    Raises:
+        ValueError: on a shape mismatch, a bad delta, an empty input,
+            or a mass below delta (outside the certified interior).
+    """
+    if len(p) != len(q):
+        raise ValueError("p and q must have the same support")
+    if not p:
+        raise ValueError("distributions must be non-empty")
+    if delta <= 0.0 or delta > 1.0:
+        raise ValueError("delta must lie in (0, 1]")
+    for pv, qv in zip(p, q):
+        if pv < delta or qv < delta:
+            raise ValueError(
+                f"mass {min(pv, qv):.3g} below delta={delta}: "
+                "outside the certified simplex interior"
+            )
+    const = 2.0 / delta + 2.0 * math.log(1.0 / delta)
+    gap = abs(shannon_entropy(p) - shannon_entropy(q))
+    return const * tv_distance(p, q) - gap
