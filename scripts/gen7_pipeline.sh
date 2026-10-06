@@ -69,9 +69,11 @@ fi
 run_stage "joint" configs/dbridge_gen7_joint.yaml \
   checkpoints/dbridge_gen7_joint/step-0001300.pt logs/gen7_joint.log
 
-# 7. eval by domains on gen7 joint
-log "running eval_domains on gen7 joint"
-"$PY" scripts/eval_domains.py --config configs/dbridge_gen7_joint.yaml \
+# 7. eval by domains on gen7 joint — deep-200 protocol (§AT): the
+# certify stage compares against a 200-batch baseline, so the eval
+# must run at the same batch count or the numbers are not comparable.
+log "running eval_domains on gen7 joint (deep-200)"
+"$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_joint.yaml \
   --resume checkpoints/dbridge_gen7_joint/best.pt >> logs/gen7_joint_eval.log 2>&1 || \
   log "eval failed (non-fatal)"
 
@@ -84,9 +86,10 @@ log "running eval_domains on gen7 joint"
 run_stage "distill" configs/dbridge_gen7_distill.yaml \
   checkpoints/dbridge_gen7_distill/step-0001300.pt logs/gen7_distill.log
 
-# 9. eval by domains on the distillate
-log "running eval_domains on gen7 distill"
-"$PY" scripts/eval_domains.py --config configs/dbridge_gen7_distill.yaml \
+# 9. eval by domains on the distillate — deep-200 protocol, same
+# reason as stage 7 (certify comparability).
+log "running eval_domains on gen7 distill (deep-200)"
+"$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_distill.yaml \
   --resume checkpoints/dbridge_gen7_distill/best.pt >> logs/gen7_distill_eval.log 2>&1 || \
   log "eval failed (non-fatal)"
 
