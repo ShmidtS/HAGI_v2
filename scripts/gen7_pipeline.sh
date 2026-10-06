@@ -72,10 +72,15 @@ run_stage "joint" configs/dbridge_gen7_joint.yaml \
 # 7. eval by domains on gen7 joint — deep-200 protocol (§AT): the
 # certify stage compares against a 200-batch baseline, so the eval
 # must run at the same batch count or the numbers are not comparable.
-log "running eval_domains on gen7 joint (deep-200)"
-"$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_joint.yaml \
-  --resume checkpoints/dbridge_gen7_joint/best.pt >> logs/gen7_joint_eval.log 2>&1 || \
-  log "eval failed (non-fatal)"
+if grep -q "AVG" logs/gen7_joint_eval.log 2>/dev/null && \
+   grep -q "(200 batches" logs/gen7_joint_eval.log 2>/dev/null; then
+  log "joint eval: already complete (logs/gen7_joint_eval.log)"
+else
+  log "running eval_domains on gen7 joint (deep-200)"
+  "$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_joint.yaml \
+    --resume checkpoints/dbridge_gen7_joint/best.pt >> logs/gen7_joint_eval.log 2>&1 || \
+    log "eval failed (non-fatal)"
+fi
 
 # 8. distill: the COMPRESS half (RecursiveDistill.lean) — compact student
 # H=3456 distilled from the generation's own joint (3H). The cycle repeats
@@ -88,10 +93,15 @@ run_stage "distill" configs/dbridge_gen7_distill.yaml \
 
 # 9. eval by domains on the distillate — deep-200 protocol, same
 # reason as stage 7 (certify comparability).
-log "running eval_domains on gen7 distill (deep-200)"
-"$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_distill.yaml \
-  --resume checkpoints/dbridge_gen7_distill/best.pt >> logs/gen7_distill_eval.log 2>&1 || \
-  log "eval failed (non-fatal)"
+if grep -q "AVG" logs/gen7_distill_eval.log 2>/dev/null && \
+   grep -q "(200 batches" logs/gen7_distill_eval.log 2>/dev/null; then
+  log "distill eval: already complete (logs/gen7_distill_eval.log)"
+else
+  log "running eval_domains on gen7 distill (deep-200)"
+  "$PY" scripts/eval_domains.py --batches 200 --config configs/dbridge_gen7_distill.yaml \
+    --resume checkpoints/dbridge_gen7_distill/best.pt >> logs/gen7_distill_eval.log 2>&1 || \
+    log "eval failed (non-fatal)"
+fi
 
 # 10. delta: the bridge slack = gate CE of the student MINUS gate CE of
 # the teacher, on the SAME canonical windows (gate_score.py reproduces
