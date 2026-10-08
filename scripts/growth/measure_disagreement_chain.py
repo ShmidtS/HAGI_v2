@@ -239,6 +239,25 @@ def verdict(alphas: dict[str, float | None], gamma_req: float, gamma_meas: float
         out["ignition_gate"] = (
             (ge is not None and 0 < ge <= ceiling) if ceiling > 0 else False
         )
+    # R252 NonlinearCone: concave gain G = gamma*sqrt(k*C). Per-step
+    # sqrt increment c0 = gamma*sqrt(k)/(2 + gamma*sqrt(k)/sqrt(C0));
+    # polynomial takeoff C_T >= (sqrt(C0) + c0*T)^2 — no exogenous
+    # ceiling needed. Predicted capability doubling horizon T2x =
+    # sqrt(C0)*(sqrt(2)-1)/c0.
+    ge = out.get("gamma_eff")
+    if ge is not None and k is not None and k > 0 and ge > 0:
+        sqrt_c0_arg = k * gamma_meas if gamma_meas > 0 else k * ge
+        C0 = sqrt_c0_arg / ge / ge if ge > 0 else 0.0  # k*C = (gamma^2 * C)
+        sqrtC0 = math.sqrt(max(C0, 0.0))
+        denom = 2.0 + ge * math.sqrt(k) / sqrtC0 if sqrtC0 > 0 else None
+        if denom:
+            c0 = ge * math.sqrt(k) / denom
+            out["sqrt_cone"] = {
+                "c0": c0,
+                "sqrt_C0": sqrtC0,
+                "T_2x_capability": sqrtC0 * (math.sqrt(2) - 1) / c0 if c0 > 0 else None,
+                "takeoff": "quadratic (R252): C_T >= (sqrt(C0)+c0*T)^2",
+            }
     return out
 
 
