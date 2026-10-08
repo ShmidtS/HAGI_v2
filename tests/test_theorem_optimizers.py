@@ -18,11 +18,6 @@ from hagi.train.analytic_step import (
     guaranteed_descent,
     select_step,
 )
-from hagi.train.controller_policy import (
-    Candidate,
-    certified_gain,
-    select_action,
-)
 from hagi.train.hedge import (
     hedge_potential,
     hedge_weights,
@@ -186,53 +181,3 @@ def test_minimal_topk_is_minimal_and_within_budget() -> None:
             assert float((s[k - 1 :] ** 2).sum()) > eps
 
 
-# --- ControllerPolicy.lean ---------------------------------------------
-
-
-def test_budget_allocation_dominance() -> None:
-    """Concentrating the budget beats EVERY split allocation."""
-    random.seed(5)
-    for _ in range(2000):
-        K = random.randint(1, 5)
-        cands = [
-            Candidate(
-                name=random.choice(["merge", "joint", "prune"]),
-                gain=random.uniform(0.0, 10.0),
-                cost=random.uniform(0.1, 10.0),
-            )
-            for _ in range(K)
-        ]
-        budget = random.uniform(0.0, 100.0)
-        best = select_action(cands)
-        if best is None:
-            continue
-        concentrated = best.gain * (budget / best.cost)
-        # ratio_dominance: no single alternative action beats it.
-        for c in cands:
-            assert c.gain * (budget / c.cost) <= concentrated + 1e-9
-        # budget_allocation_dominance: no split allocation beats it.
-        for _ in range(20):
-            alloc = [random.uniform(0.0, budget) for _ in cands]
-            if sum(a * c.cost for a, c in zip(alloc, cands)) > budget:
-                continue
-            assert sum(c.gain * a for c, a in zip(cands, alloc)) <= concentrated + 1e-9
-
-
-def test_select_action_prefers_the_best_ratio() -> None:
-    cands = [Candidate("merge", 8.0, 2.0), Candidate("joint", 3.0, 1.0)]
-    assert select_action(cands).name == "merge"
-    assert certified_gain(cands, 10.0) == pytest.approx(40.0)
-
-
-def test_select_action_refuses_without_certified_progress() -> None:
-    """All ratios <= 0 means no action certifies progress: do nothing."""
-    cands = [Candidate("merge", 0.0, 1.0), Candidate("joint", -1.0, 2.0)]
-    assert select_action(cands) is None
-    assert certified_gain(cands, 100.0) == 0.0
-
-
-def test_candidate_rejects_nonpositive_cost() -> None:
-    with pytest.raises(ValueError):
-        Candidate("merge", 1.0, 0.0)
-    with pytest.raises(ValueError):
-        Candidate("merge", math.inf, 1.0)

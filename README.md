@@ -195,24 +195,22 @@ L2-дистиллят      → дистилл → студент 384  (fresh, q6
 |---|---|---|
 | `train/analytic_step.py` | `optimal_step_unconstrained` | η\* = ⟨g,d⟩/(L‖d‖²) вместо `lr` |
 | `train/stochastic_safeqp.py` | R92 `minibatch_inner_concentration` | полные градиенты → минибатчи с явным ε |
-| `train/adaptive_safeqp.py` | R97 (covering-number) | ε для адаптивно выбранного `d*(ω)` |
 | `train/anytime_budget.py` | R93 (неравенство Вилля) | δ на каждый шаг → один δ на горизонт |
 | `train/growth_law.py` | R95/R96 `success_count_lower`, `takeoff_time_form` | вероятностный takeoff из измеренных полей |
-| `train/batch_law.py` | `amgm_equality` + `amgm_uniqueness` | подбор батча: B\* = √(Bₙt₀/c) |
 | `train/hedge.py` | `router_regret_bound`, `gating_tail_bound` | η = √(2lnK/T), min k по хвосту |
-| `train/controller_policy.py` | `ratio_dominance` | поиск разбивок бюджета |
-| `train/insight_currency.py` | `insight_kl_descent`, `tldr_drift_null` | раздельные метрики CE/KL |
 | `train/data_axis.py` | `diversity_floor_strict_pos` | симуляция пола → замкнутая сумма |
-| `train/synthetic_pretrain.py` | R99 `synth_investment_dominates` | `dT·c_step > C_synth` — один замер вместо вкуса |
-| `train/discovery_ppt.py` | R98 `pptTarget_isProbability`, `mh_stationary`, `truncation_bias` | `p₀` R95, вычислимый ДО сэмплирования |
 | `train/spectral.py` | R100 `proj_residual_identity`, `three_stage_error_budget` | ошибка сжатия раскладывается на именованные члены |
-| `train/factorized_merge.py` | R101 `routed_eval_exact`, `factorized_budget` | merge как `C + R_i` с измеримой ценой `(1/N)Σδᵢ` |
 | `train/takeoff_window.py` | R102 `growth_state_takeoff_window`, `noisy_cycle_step` | фиксированный gain даёт **конечный** takeoff; `κ√n·s/2` |
 | `train/ternary_exact.py` | R103 `ternary_split_bound`, `quant_energy_bridge_saturation` | хвост насыщения измеряется, а не предполагается |
 | `train/gain_renewal.py` | R104 `renewal_feeds_takeoff`, `bounded_frontier_no_sustained_growth` | sustained growth ⟺ фронтир масштабируется |
-| `train/growth_potential.py` | R91 `growth_cycle_potential` | `Φ = energy + protectedRisk`, четыре стадии одной суммой |
 | `train/routing_optimal.py` | R94 `topk_routing_optimal`, `geometric_pool_identity_nonneg` | top-k оптимален; пулинг стоит `−log Z ≥ 0` |
 | `train/safeqp_step.py` | R105 `safeqp_eta_max`, R106 `poe_logZ_second_order` | **производный** безопасный LR; ошибка PoE-пулинга ≤ `R²/8` |
+
+Модули с отрицательным результатом и теоретические порты без
+продакшн-потребителя (adaptive_safeqp, batch_law, controller_policy,
+insight_currency, synthetic_pretrain, discovery_ppt, factorized_merge,
+growth_potential, universality, thermo_layer, streaming_gpm и др.)
+перенесены в `_raw/attic/` вместе со своими тестами — история в git.
 
 **Измеренные следствия, а не обещания:**
 
@@ -231,10 +229,10 @@ L2-дистиллят      → дистилл → студент 384  (fresh, q6
   реальном A/B проиграл baseline на **+1.02 CE**. Глобальная проба L
   растёт монотонно (4.5 → 19 → 500), отслеживая самое крутое
   направление, а не среднее. Флаг `analytic_step` остаётся `False`.
-- `batch_law` — измерено `t₀ = −8.8` мс, т.е. фиксированного overhead
+- `batch_law` (в attic) — измерено `t₀ = −8.8` мс, т.е. фиксированного overhead
   практически нет: `grad_accum_steps=1` во всех конфигах, амортизировать
   нечего. Согласуется с п.4 принципов ниже (шум исчезает на ~100 токенах).
-- `factorized_merge` (R101) — арифметика верна, **посылка не выполняется**.
+- `factorized_merge` (R101, в attic) — арифметика верна, **посылка не выполняется**.
   Общее ядро не существует: эксперты почти идентичны (cos 0.986–0.991),
   но 90% энергии остатка `W_i − C` требуют **83%** спектра.
   `scripts/measure_shared_core.py` на трёх gen-2 экспертах: cosine между
@@ -446,11 +444,25 @@ freeze_experts src/hagi` находил ровно два совпадения: 
 ## Стек
 
 - Python 3.13, PyTorch (ROCm/HIP), AMD iGPU
-- `src/hagi/` — модель, merge, обучение, инференс (см. ARCHITECTURE.md §1)
-- `scripts/` — CLI: train/merge/gate-аудиты/генерация; `dsv4_*` —
-  отдельный экспериментальный трек сжатия DeepSeek-V4 (не часть линии HAGI)
-- `configs/` — YAML победной линии (dbridge_*) + тестовая фикстура
+- `src/hagi/model/` — модель и слияние: `model`, `merge` (R242-R244
+  latent merge поверх — `latent_merge`), `attention`, `rope`,
+  `ternary` (b1.58), `cortex`, `formal`, `multimodal`, `adaptive`,
+  `scratch_blocknorm` и вспомогательные блоки
+- `src/hagi/train/` — живой рантайм: `loop`, `optim`, `checkpoint`,
+  `saturation`, `merge_price`, `distill`/`distill_transfer`/
+  `distill_recursion`/`recursive_distill`, `disagreement_distill` (§17),
+  `safeqp_*` (step/controller/gpm/pl/stochastic), `analytic_step`,
+  `certified_controller`, `hedge`, `growth_law`, `spectral`,
+  `self_improve`, `self_development` и др. (полный список — в дереве)
+- `src/hagi/orchestrator/` — real_cycle/recursive/gates (потребители:
+  growth_supervisor, merge в `model/merge.py`)
+- `src/hagi/inference/` — `generate`, `hedge_router`
+- `scripts/` — CLI: train/merge/gate-аудиты/генерация; `growth/` —
+  F3-конвейер и supervisor
+- `configs/` — YAML победной линии + тестовая фикстура
 - `data/` — компактные корпуса (32768 словарь), mix.json
+- `_raw/attic/` — снятые с рантайма модули и их тесты (git-история
+  сохранена; на диске, вне git)
 
 ## Принципы
 
