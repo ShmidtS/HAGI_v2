@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -201,15 +202,44 @@ def _probe_batch(cfg, seq_len: int = 1024) -> dict:
     return {"input_ids": ids[:, :-1], "targets": ids[:, 1:]}
 
 
-def verdict(alphas: dict[str, float | None], gamma_req: float, gamma_meas: float) -> dict:
-    """deficit_localizes: any alpha below the geometric share is a culprit."""
-    measured = {k: v for k, v in alphas.items() if v is not None}
-    if not measured or gamma_req <= 0.0 or gamma_meas <= 0.0:
-        return {"geometric_share": None, "below_share": []}
-    rho = gamma_meas / gamma_req
-    share = rho ** (1.0 / max(1, len(measured)))
-    below = sorted(k for k, v in measured.items() if v < share)
-    return {"geometric_share": share, "below_share": below}
+def verdict(alphas: dict[str, float | None], gamma_req: float, gamma_meas: float,
+            beta_floor: float = 0.4, kappa: float = 1.0,
+            rho: float = 0.5, cbeta: float | None = None, k: float | None = None) -> dict:
+    """hcert + ignition gate (R249/R250/R251).
+
+    hcert: ALL four alpha stages clear the beta floor (beta^4 enters
+    gamma_eff). deficit_localizes: any alpha below the geometric share
+    is a culprit. Two-sided cone: gamma_eff must ALSO sit inside the
+    ignition interval (0, min(rho/k, (beta_C-(1-rho)k)/k^2)] — a rate
+    above the ceiling breaks cone conservation, not just below.
+    """
+    measured = {kk: v for kk, v in alphas.items() if v is not None}
+    out: dict = {"geometric_share": None, "below_share": []}
+    if measured:
+        share = (gamma_meas / gamma_req) ** (1.0 / max(1, len(measured))) \
+            if gamma_req > 0 and gamma_meas > 0 else None
+        if share is not None:
+            out["geometric_share"] = share
+            out["below_share"] = sorted(kk for kk, v in measured.items() if v < share)
+    # R250 hcert: all measured stages >= beta floor
+    out["beta_floor"] = beta_floor
+    out["hcert_pass"] = all(v >= beta_floor for v in measured.values()) \
+        if measured else None
+    # R251: gamma_eff = beta^4 * kappa (four stage floors x frontier share)
+    floors = [v for v in measured.values()]
+    beta4 = float(math.prod(floors)) if len(floors) == 4 else None
+    out["gamma_eff"] = beta4 * kappa if beta4 is not None else None
+    # R251 ignition interval (0, min(rho/k, (cbeta-(1-rho)k)/k^2)]
+    if k is not None and k > 0 and 0 < rho < 1:
+        _cb = cbeta if cbeta is not None else beta_floor
+        ceiling = min(rho / k, (_cb - (1 - rho) * k) / k ** 2) \
+            if _cb > (1 - rho) * k else 0.0
+        out["ignition_ceiling"] = ceiling
+        ge = out["gamma_eff"]
+        out["ignition_gate"] = (
+            (ge is not None and 0 < ge <= ceiling) if ceiling > 0 else False
+        )
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +256,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="measured gain (flagged empirical anchor)")
     p.add_argument("--evala", default=None, help="eval CE JSON for A (alpha_cap)")
     p.add_argument("--evalb", default=None, help="eval CE JSON for B (alpha_cap)")
+    p.add_argument("--beta-floor", type=float, default=0.4,
+                   help="R250 hcert floor: all four alphas must clear it")
+    p.add_argument("--kappa", type=float, default=1.0,
+                   help="diversity-tracks frontier share in gamma_eff")
+    p.add_argument("--cone-rho", type=float, default=0.5,
+                   help="R251 cone support parameter rho")
+    p.add_argument("--cone-k", type=float, default=None,
+                   help="R251 increment scale k (disables gate if unset)")
     p.add_argument("-o", "--out", default=None, help="write JSON here")
     args = p.parse_args(argv)
 
@@ -313,6 +351,10 @@ def main(argv: list[str] | None = None) -> int:
         },
         args.gamma_req,
         args.gamma_meas,
+        beta_floor=args.beta_floor,
+        kappa=args.kappa,
+        rho=args.cone_rho,
+        k=args.cone_k,
     )
     result.update(v)
     result["gamma_req"] = args.gamma_req
