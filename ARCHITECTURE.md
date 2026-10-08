@@ -93,7 +93,7 @@ HAGI_v2/
 │   ├── dsv4/                 # трек сжатия DeepSeek-V4 (отдельная линия)
 │   └── research/             # исторические эксперименты (e3–e7, qwen, …)
 ├── configs/                  # YAML победной dbridge-линии (+фикстуры)
-├── tests/                    # pytest (24)
+├── tests/                    # pytest (953)
 ├── data/                     # .compact.bin корпуса, mix.json, unigram
 ├── checkpoints/              # вне git
 └── .omc/attempts/            # ledgers раундов (в git через add -f)
@@ -292,10 +292,11 @@ loop2 s1–s3, f3_d1, scratch_h384, leaf_rank384) + фикстура
 
 ## 9. Тесты — `tests/`
 
-24 теста: merge-инварианты (шаг-0 = ансамбль, temperature),
+953 теста: merge-инварианты (шаг-0 = ансамбль, temperature),
 hadamard-ортогональность, formal-utils (safe_qp, ns, optimal_batch),
-safeqp-controller (конфликт/сертификат/чистые грады), config,
-checkpoint, dataset, attention, generate, head, vocab_map.
+safeqp-controller (конфликт/сертификат/чистые грады), certified-step
+(gate/step/''-пути), config, checkpoint, dataset, attention, generate,
+head, vocab_map, distill-канал, resume-precedence, супервизорные гварды.
 
 ---
 
