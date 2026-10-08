@@ -21,11 +21,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+_SRC = ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+# §9 decision core: the 2-eps rule lives in ONE place
+# (hagi.train.certified_controller); this script delegates to it.
+from hagi.train.certified_controller import certified_ab  # noqa: E402
 
 # gen6_joint deep-200 baseline (SSAT, logs/gen6_deep200_baseline)
 BASELINE = {
@@ -54,10 +62,16 @@ def parse_log(text: str) -> dict[str, float]:
 
 
 def verdict(delta: float, eps: float) -> str:
-    # delta = base - new: positive = CE improved.
-    if delta > 2 * eps:
+    # Delegate the §9 2-eps rule to certified_controller.certified_ab.
+    # n = inf: the per-domain CE values here come from one fixed-length
+    # eval, so no sample-size claim is made (the Hoeffding n is reported
+    # separately). The historical asymmetry -- regression certified at
+    # eps, improvement at 2*eps -- is preserved via reject_margin.
+    v = certified_ab(0.0, math.inf, -delta, math.inf,
+                     eps=eps, delta=0.05, reject_margin=eps)
+    if v.verdict == "ACCEPT":
         return "IMPROVED (certified)"
-    if delta < -eps:
+    if v.verdict == "REJECT":
         return "REGRESSION (certified)"
     return "noise"
 

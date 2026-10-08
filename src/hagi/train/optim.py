@@ -298,6 +298,38 @@ def _supports_fused_adamw(params: list[nn.Parameter]) -> bool:
     )
 
 
+def reset_adam_first_moments(optimizer: object) -> int:
+    """Zero Adam first moments (``exp_avg``) everywhere; touch nothing else.
+
+    Consolidation-segment reset (§23 stage [5b], ``OptimizerStage.lean``
+    ``gain_chain_opt`` / ``any_stage_kills_gain``): the measured Adam first
+    moment ALIGNS teacher updates (cos > 0.83 with preserved state) and
+    therefore GASES teacher-disagreement in update space (eta_opt ↓). A
+    first-moment reset makes that alignment ≈ 0, so the disagreement the
+    consolidation stage is supposed to transport survives the optimizer
+    bottleneck. Second moments (``exp_avg_sq``) and Muon state are
+    deliberately untouched: the reset is the β₁ = 0 experiment, not a
+    fresh optimizer.
+
+    Args:
+        optimizer: a :class:`HybridOptimizer`, a torch AdamW, or any
+            optimizer whose per-parameter state dicts may hold ``exp_avg``.
+
+    Returns:
+        Number of first-moment buffers cleared.
+    """
+    adam = getattr(optimizer, "adamw", None)
+    if adam is None:
+        adam = optimizer
+    cleared = 0
+    for state in adam.state.values():
+        buf = state.get("exp_avg") if isinstance(state, dict) else None
+        if buf is not None:
+            buf.zero_()
+            cleared += 1
+    return cleared
+
+
 def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     """Partition parameters and construct both optimizers.
 
