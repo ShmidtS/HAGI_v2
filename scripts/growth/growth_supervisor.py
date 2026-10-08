@@ -955,9 +955,7 @@ def make_distill_config(parent_config: Path, out_path: Path) -> Path:
     * when the config lists ``distill.teachers``: enable the reverse-
       recursion channel (``merge.distill: true``, first listed teacher
       in ``merge.distill_teacher`` -- the training loop consumes exactly
-      one) and set the disagreement token-selection quantile
-      (``merge.distill_disagreement_quantile: 0.95``, Bregman-slice,
-      ``disagreement_distill``).
+      one).
 
     Pure data derivation: writing the file does NOT launch training.
     """
@@ -970,7 +968,6 @@ def make_distill_config(parent_config: Path, out_path: Path) -> Path:
     if teachers:
         merge["distill"] = True
         merge["distill_teacher"] = str(teachers[0])
-        merge["distill_disagreement_quantile"] = 0.95
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
