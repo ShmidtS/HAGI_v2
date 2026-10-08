@@ -1269,7 +1269,30 @@ def main() -> int:
                     stop_note = theory_stop_check(lane, verdict)
                     if stop_note:
                         log_phase(cc.GrowthPhase.STOP_CONTINUE, lane.name, stop_note)
+                        append_ledger({
+                            "lane": lane.name, "phase": "evaluated",
+                            "theory_phase": "GATE", "incumbent": incumbent_name,
+                            "report": f"reports/growth_{lane.name}.json",
+                            "elapsed_s": round(time.time() - started, 1),
+                            **verdict.to_json(),
+                            **{"stop_condition": stop_note},
+                        })
+                        # §0 step 6 HARD stop (audit P1-2): consensus +
+                        # inj <= xi means retrying cannot help — the loop
+                        # must terminate, not annotate.
+                        LOG.info("stop_condition MET on lane %s — halting the growth loop", lane.name)
+                        return 0
                     leak_note = distill_leak_check(lane)
+                    if leak_note and "STOP" in leak_note:
+                        append_ledger({
+                            "lane": lane.name, "phase": "evaluated",
+                            "distill_leak_gate": leak_note,
+                            "report": f"reports/growth_{lane.name}.json",
+                        })
+                        # R134 HARD stop (audit P1-3): delta_k >= c_k —
+                        # the distillation recursion no longer pays.
+                        LOG.info("distill_leak_gate STOP on lane %s — halting", lane.name)
+                        return 0
                     ignite = ignition_gate_check(
                         lane, ROOT / f"logs/growth_{lane.name}_joint.log"
                     )
