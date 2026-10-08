@@ -102,7 +102,6 @@ def test_make_distill_config_derives_from_parent(tmp_path) -> None:
     assert raw["train"]["init_from"] == "checkpoints/gen7_joint/best.pt"
     assert raw["merge"]["distill"] is True
     assert raw["merge"]["distill_teacher"] == "ck/joint/best.pt"
-    assert raw["merge"]["distill_disagreement_quantile"] == 0.95
     # the advisory top-level section is consumed, not copied (load_config
     # would reject an unknown key)
     assert "distill" not in raw
@@ -116,7 +115,6 @@ def test_make_distill_config_without_teachers_keeps_kd_off(tmp_path) -> None:
     made = gs.make_distill_config(parent, tmp_path / "d.yaml")
     raw = yaml.safe_load(made.read_text(encoding="utf-8"))
     assert not raw["merge"].get("distill")
-    assert not raw["merge"].get("distill_disagreement_quantile")
 
 
 def _report(mean: float) -> dict:

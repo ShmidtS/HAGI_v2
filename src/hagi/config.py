@@ -948,7 +948,6 @@ class MergeConfig:
     # Consumed by the distill lane config derivation
     # (growth_supervisor.make_distill_config); the training-loop consumer
     # is forward-declared alongside distill_mode.
-    distill_disagreement_quantile: float = 0.0
 
 
 # Outer ternary lifts available to the recursive ``ternary_f3`` body. The
