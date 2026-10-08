@@ -134,8 +134,10 @@ def test_a_stalled_verdict_reaches_the_ledger_reason():
     inc = report(A=3.00)
     cand = report(A=3.00)              # identical: zero gain
     v = gs.decide(cand, inc, 0.05, 0.25, lane=0)
-    assert v.accepted is True          # not worse, so accepted
-    assert "stalled" in v.reason       # but flagged as no progress
+    # §9 strict (audit P1-1): no certified gain -> the incumbent stands;
+    # the stall note rides the reject reason.
+    assert v.accepted is False
+    assert "uncertified" in v.reason
 
 
 def test_an_improving_verdict_reason_has_no_stall_note():

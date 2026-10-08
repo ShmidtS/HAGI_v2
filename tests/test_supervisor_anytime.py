@@ -115,20 +115,17 @@ def test_a_bad_budget_does_not_fall_back_to_the_fixed_margin():
 # --- the gate actually uses it ------------------------------------------
 
 
-def test_an_early_gate_accepts_what_a_late_gate_would_reject():
-    """The behaviour that makes this useful: early lanes get the wide net.
-
-    A candidate 0.005 nats worse is inside lane 0's margin (0.025), lane
-    2's (0.00625) and outside lane 3's (0.003125). So the same candidate
-    is accepted early and rejected late -- which is what "spend the budget
-    where the decision matters" means: the first lanes decide whether
-    growth is real, the later ones merely confirm it.
+def test_a_within_margin_candidate_is_rejected_everywhere():
+    """§9 strict (audit P1-1): a candidate that is NOT BETTER is never
+    accepted, at any lane — the old not-worse-on-margin acceptance was
+    the forbidden leak. Early lanes are wider only for CERTIFIED gains
+    (the adaptive eps), not for tolerable regressions.
     """
     cand = report(A=3.005)          # slightly worse
     inc = report(A=3.000)
     verdicts = [gs.decide(cand, inc, 0.05, 0.25, lane=t).accepted
                 for t in range(6)]
-    assert verdicts == [True, True, True, False, False, False]
+    assert verdicts == [False] * 6
 
 
 def test_a_regression_larger_than_the_first_margin_is_caught_immediately():
