@@ -724,6 +724,30 @@ class TrainConfig:
     analytic_step: bool = False
     analytic_step_probe_interval: int = 50
     analytic_step_clip_lr: bool = True
+    # Certified step (SafeQP.lean safeQP_descent + R105 safeqp_eta_max):
+    # the SafeQP projection stops being telemetry and starts governing the
+    # update. Two modes:
+    #   "gate"  -- before every optimizer.step(), the optimizer's own
+    #              direction is checked against the per-corpus budgets on
+    #              calibration windows; a violating step is VETOED (skip),
+    #              and the LR is capped by the R105 derived rate.
+    #   "step"  -- certified_joint: the optimizer step is REPLACED by the
+    #              explicit certified direction d* = g + sum lam_i g_i at
+    #              the R105 derived rate. No Muon/AdamW preconditioning
+    #              inside the step: the theory is about the REAL d, and
+    #              Muon changes it (Muon stays available in experimental
+    #              runs by leaving this empty).
+    # Calibration gradients are refreshed every ``certified_interval``
+    # steps (K forward+backward passes on small tail windows); between
+    # refreshes the cached per-corpus directions are reused.
+    certified_step: str = ""  # "" | "gate" | "step"
+    certified_interval: int = 50
+    certified_corpora: list[str] = field(default_factory=list)
+    certified_tokens: int = 1024
+    # direction-conflict budget, same rel-cos form as gram_scan_eps_rel
+    certified_eps_rel: float = 0.0
+    # per-domain per-step regression budget (nats) for the R105 eta window
+    certified_eps_nats: float = 0.02
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
@@ -1404,6 +1428,33 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("train.ce_keep_rate must be in (0, 1]")
     if t.ce_keep_mode not in {"bernoulli", "stride"}:
         raise ValueError("train.ce_keep_mode must be 'bernoulli' or 'stride'")
+    # Certified step (SafeQP.lean acting controller): the mode must name one
+    # of the two licenses, a mode needs corpora to calibrate against, and it
+    # replaces LR semantics like the analytic step -- the two cannot both
+    # drive the same step.
+    if t.certified_step not in {"", "gate", "step"}:
+        raise ValueError(
+            "train.certified_step must be '', 'gate' or 'step', got "
+            f"{t.certified_step!r}"
+        )
+    if t.certified_step:
+        if not t.certified_corpora:
+            raise ValueError(
+                "train.certified_step requires train.certified_corpora"
+            )
+        if t.certified_interval < 1:
+            raise ValueError("train.certified_interval must be >= 1")
+        if t.certified_tokens < 1:
+            raise ValueError("train.certified_tokens must be >= 1")
+        if t.certified_eps_rel < 0.0:
+            raise ValueError("train.certified_eps_rel must be non-negative")
+        if t.certified_eps_nats < 0.0:
+            raise ValueError("train.certified_eps_nats must be non-negative")
+        if t.analytic_step:
+            raise ValueError(
+                "train.certified_step replaces the LR like "
+                "train.analytic_step; the two cannot both drive the step"
+            )
     if not 0.0 < t.muon.wd_cap <= 8.0:
         raise ValueError("muon.wd_cap must be in (0, 8]")
     if len(t.muon.ns_coeffs) != 3:

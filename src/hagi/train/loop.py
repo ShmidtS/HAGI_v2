@@ -347,6 +347,285 @@ class Trainer:
             refresh=int(getattr(cfg.train, "analytic_step_probe_interval", 50))
         ) if getattr(cfg.train, "analytic_step", False) else None
         self._analytic_step_last: dict = {}
+        # Certified step (SafeQP.lean acting controller, the "round-40" hook
+        # safe_qp_solve's docstring reserved): per-corpus calibration
+        # gradients refreshed every certified_interval steps; between
+        # refreshes the cached CPU fp32 vectors are reused. None until the
+        # first refresh -- the "" path never touches it.
+        self._certified_mode = str(getattr(cfg.train, "certified_step", "") or "")
+        self._certified: dict | None = None
+
+    def _certified_samples(self) -> list[tuple[str, dict]]:
+        """Tail calibration windows per certified corpus (gram-scan twin).
+
+        Same last-2M tail convention and caching as ``_gram_scan_samples``;
+        kept a separate method and cache so the two channels cannot alias
+        each other's corpora lists.
+        """
+        from pathlib import Path
+
+        import numpy as np
+
+        tokens = int(self.cfg.train.certified_tokens)
+        samples: list[tuple[str, dict]] = []
+        missing: list[str] = []
+        for name in self.cfg.train.certified_corpora:
+            path = Path(self.cfg.train.data.data_dir) / f"{name}.compact.bin"
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+            total = path.stat().st_size // 4
+            with path.open("rb") as fh:
+                fh.seek(max(total - 2_000_000, 0) * 4)
+                raw = np.frombuffer(fh.read(tokens * 4 + 4), dtype=np.uint32).astype(np.int64)
+            ids = torch.from_numpy(raw[: tokens + 1])
+            samples.append(
+                (name, {"input_ids": ids[None, :-1], "targets": ids[None, 1:]})
+            )
+        if missing:
+            raise FileNotFoundError(
+                "certified_corpora: missing corpus files: " + ", ".join(missing)
+            )
+        return samples
+
+    def _refresh_certified(self, device: torch.device) -> None:
+        """Recompute per-corpus calibration gradients + curvature (R105 L_i).
+
+        K forward+backward passes on small tail windows, gradients flattened
+        in ``model.parameters()`` order to fp64 CPU vectors (the convention
+        ``_flat_grad`` in safeqp_controller established: never bf16 dots).
+        Curvature L_i per corpus via the same two-point identity the analytic
+        step probe uses, measured on the corpus's own window -- the theorem's
+        hypothesis is per-domain smoothness, not a shared minimum.
+        """
+        from hagi.train.safeqp_controller import _flat_grad
+
+        params = list(self.model.parameters())
+        grads_by_corpus: dict[str, torch.Tensor] = {}
+        curvature: dict[str, float] = {}
+        model_was_training = self.model.training
+        self.model.eval()
+        try:
+            for name, batch in self._certified_samples():
+                self.optimizer.zero_grad(set_to_none=True)
+                out = self.model(
+                    batch["input_ids"].to(device), batch["targets"].to(device)
+                )
+                loss = out.lm_loss if out.lm_loss is not None else out.ce
+                if loss is None:
+                    raise ValueError(f"certified corpus {name}: no lm loss")
+                loss.backward()
+                flat = _flat_grad(self.model, device)
+                if flat is None:
+                    raise ValueError(f"certified corpus {name}: no gradients")
+                grads_by_corpus[name] = flat.to("cpu", torch.float64)
+                # Two-point smoothness on the corpus window at -g: the
+                # CurvatureProbe running max keeps L_i an upper bound.
+                live = [p for p in params if p.grad is not None]
+                live_grads = [p.grad.detach() for p in live]
+                dn2 = sum(float(g.double().pow(2).sum()) for g in live_grads)
+                if dn2 > 0.0:
+                    probe = CurvatureProbe(
+                        refresh=1, floor=1e-6, max_cap=1e6
+                    )
+                    probe._l = curvature.get(name)
+
+                    def corpus_loss() -> float:
+                        with torch.no_grad():
+                            o = self.model(
+                                batch["input_ids"].to(device),
+                                batch["targets"].to(device),
+                            )
+                            v = o.lm_loss if o.lm_loss is not None else o.ce
+                            return float(v)
+
+                    curvature[name] = probe.estimate(
+                        corpus_loss, live, live_grads
+                    )
+                elif name not in curvature:
+                    curvature[name] = 1e-6
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+            if model_was_training:
+                self.model.train()
+        if not grads_by_corpus:
+            raise ValueError("certified refresh produced no corpus gradients")
+        self._certified = {"grads": grads_by_corpus, "curvature": curvature}
+
+    def _certified_inner_products(
+        self, direction: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> tuple[dict[str, float], float]:
+        """``<g_i, d>`` per corpus and ``||d||^2`` in fp64 on CPU."""
+        grads = self._certified["grads"]
+        # Flatten d in model.parameters() order — the same order the
+        # calibration gradients were flattened in. Only parameters with a
+        # gradient at calibration time appear in flat; the live direction
+        # covers the same set here because both come from the same model.
+        parts = [d.detach().reshape(-1).double() for d in direction]
+        flat_d = torch.cat(parts)
+        dn2 = float(flat_d.dot(flat_d))
+        inner = {
+            name: float(flat_d.dot(g)) for name, g in grads.items()
+        }
+        return inner, dn2
+
+    def _apply_certified_gate(
+        self, adam_lr: float
+    ) -> dict:
+        """Gate mode: veto or LR-cap the optimizer's own step (R105).
+
+        Feasibility of the optimizer direction d against every calibration
+        corpus: ``<g_i, d> >= -eps_i`` with ``eps_i = eps_rel*||g_i||*||d||``.
+        A violation VETOES the step (skip, like the non-finite guard); a
+        feasible step is capped at the R105 derived rate
+        ``eta_max(margins, inner, L_i, ||d||^2)``, never above the schedule.
+        """
+        import math as _math
+
+        from hagi.train.safeqp_step import eta_max, no_domain_regresses
+
+        params = [
+            p for g in self.optimizer.param_groups if not g.get("_muon")
+            for p in g["params"] if p.grad is not None
+        ]
+        grads = [p.grad.detach() for p in params]
+        # AdamW direction is exp_avg (the update actually applied); Muon's
+        # applied direction lives inside Muon.step, so the gate checks the
+        # raw gradient there and reports the gap.
+        direction = self._optimizer_direction(params, grads)
+        inner, dn2 = self._certified_inner_products(direction, params)
+        corpus_norms = {
+            n: float(g.dot(g)) for n, g in self._certified["grads"].items()
+        }
+        eps_rel = float(self.cfg.train.certified_eps_rel)
+        eps_nats = float(self.cfg.train.certified_eps_nats)
+        margins: dict[str, float] = {}
+        feasibility: dict[str, float] = {}
+        for n, ip in inner.items():
+            eps_i = eps_rel * _math.sqrt(corpus_norms[n] * dn2)
+            margins[n] = eps_nats
+            feasibility[n] = ip + eps_i
+        worst = min(feasibility, key=lambda k: feasibility[k])
+        if feasibility[worst] < 0.0:
+            logger.info(
+                "step %d certified-gate: VETO (corpus %s, <g_i,d>+eps=%.3e)",
+                self.step, worst, feasibility[worst],
+            )
+            return {"certified_vetoed": 1, "certified_binding": worst}
+        curvature = dict(self._certified["curvature"])
+        cap = eta_max(margins, inner, curvature, dn2)
+        eta = min(adam_lr, cap)
+        if cap <= 0.0:
+            logger.info(
+                "step %d certified-gate: VETO (window empty, binding=%s)",
+                self.step, worst,
+            )
+            return {"certified_vetoed": 1, "certified_binding": worst}
+        if eta < adam_lr:
+            for g in self.optimizer.param_groups:
+                if not g.get("_muon"):
+                    g["lr"] = eta
+        # Verify the bound's conclusion rather than trust it.
+        if not no_domain_regresses(margins, inner, curvature, dn2, eta):
+            logger.warning(
+                "step %d certified-gate: R105 window check failed at eta=%.3e",
+                self.step, eta,
+            )
+            return {"certified_vetoed": 1, "certified_binding": worst}
+        return {
+            "certified_eta": eta,
+            "certified_cap": cap,
+            "certified_binding": min(
+                margins, key=lambda k: 2.0 * (margins[k] + inner[k])
+                / (curvature[k] * dn2)
+            ),
+            "certified_muon_checked": 0,
+        }
+
+    def _apply_certified_step(self, adam_lr: float) -> dict:
+        """Step mode: replace the optimizer step by the certified d*.
+
+        ``d* = g + sum_i lam_i g_i`` (SafeQP.lean KKT dual), applied at the
+        R105 derived rate capped by the schedule. Preconditioning is bypassed
+        inside the step -- the theory is about the REAL direction; Muon
+        changes it. Momentum state stays fresh via a zero-LR optimizer step,
+        which is the identity on parameters for Muon (``p.add_(ortho,
+        alpha=-lr)`` with lr=0) and AdamW (lr=0 applies no param change and
+        no decoupled weight decay).
+        """
+        from hagi.model.formal import safe_qp_solve
+        from hagi.train.safeqp_step import eta_max, no_domain_regresses
+
+        corpus = self._certified["grads"]
+        names = list(corpus.keys())
+        # Live mixture gradient g over EVERY parameter with a gradient,
+        # flattened in model.parameters() order -- the same convention the
+        # calibration flat used, so g and g_i align index-for-index.
+        param_order = {id(p): i for i, p in enumerate(self.model.parameters())}
+        all_params = [
+            p for p in self.model.parameters() if p.grad is not None
+        ]
+        all_params.sort(key=lambda p: param_order[id(p)])
+        flat_g = torch.cat(
+            [p.grad.detach().reshape(-1).double() for p in all_params]
+        )
+        gmat = torch.stack([corpus[n] for n in names])          # [K, P]
+        b = gmat @ flat_g                                       # [K]
+        gn = float(flat_g.dot(flat_g))
+        if gn <= 0.0:
+            return {}
+        eps_rel = float(self.cfg.train.certified_eps_rel)
+        eps = eps_rel * gmat.norm(dim=1) * (gn ** 0.5)
+        lam, cert = safe_qp_solve(gmat @ gmat.T, b, eps, g_norm_sq=gn)
+        d_star = flat_g + lam @ gmat
+        dn2 = float(d_star.dot(d_star))
+        if dn2 <= 0.0:
+            return {}
+        inner = {n: float(gmat[i].dot(d_star)) for i, n in enumerate(names)}
+        margins = {n: float(self.cfg.train.certified_eps_nats) for n in names}
+        curvature = dict(self._certified["curvature"])
+        cap = eta_max(margins, inner, curvature, dn2)
+        eta = min(adam_lr, cap)
+        if cap <= 0.0 or eta <= 0.0:
+            logger.info(
+                "step %d certified-step: VETO (window empty, cap=%.3e)", self.step, cap
+            )
+            return {"certified_vetoed": 1}
+        if not no_domain_regresses(margins, inner, curvature, dn2, eta):
+            logger.warning(
+                "step %d certified-step: R105 window check failed at eta=%.3e",
+                self.step, eta,
+            )
+            return {"certified_vetoed": 1}
+        # Fresh momentum at zero LR (identity on parameters), then apply
+        # theta <- theta - eta * d* eagerly.
+        saved_lrs = [g["lr"] for g in self.optimizer.param_groups]
+        try:
+            for g in self.optimizer.param_groups:
+                g["lr"] = 0.0
+            self.optimizer.step()
+        finally:
+            for g, lr in zip(self.optimizer.param_groups, saved_lrs):
+                g["lr"] = lr
+        offset = 0
+        with torch.no_grad():
+            for p in all_params:
+                n = p.numel()
+                p.add_(
+                    d_star[offset : offset + n].view_as(p).to(
+                        dtype=p.dtype, device=p.device
+                    ),
+                    alpha=-eta,
+                )
+                offset += n
+        return {
+            "certified_eta": eta,
+            "certified_cap": cap,
+            "certified_active": int((lam > 1e-9).sum()),
+            "certified_kappa": cert.get("kappa", float("nan")),
+            "certified_descent_gap": cert.get("descent_gap", float("nan")),
+            "certified_feasibility": cert.get("feasibility", float("nan")),
+        }
 
     def _apply_analytic_step(
         self, base_lr: float, probe_batch: dict | None
@@ -588,7 +867,26 @@ class Trainer:
             except Exception as exc:  # measurement channel must not kill training
                 logger.warning("step %d gram-scan failed: %s", self.step, exc)
 
-        model, cfg = self.model, self.cfg
+        # Certified step (SafeQP.lean acting controller): the projection
+        # graduates from telemetry to governing the update. The calibration
+        # refresh runs BEFORE the step's own gradients exist (the gram-scan
+        # slot) -- it takes over the grad buffers -- and is then reused for
+        # certified_interval steps. Gate mode vetoes/caps the optimizer's
+        # own step after the backward; step mode replaces it by d*.
+        certified_metrics: dict = {}
+        if self._certified_mode:
+            try:
+                if (
+                    self._certified is None
+                    or (self.step % int(self.cfg.train.certified_interval) == 0
+                        and self.step > 0)
+                ):
+                    self._refresh_certified(
+                        next(model.parameters()).device
+                    )
+            except Exception as exc:  # telemetry-grade safety: never kill the step
+                logger.warning("step %d certified refresh failed: %s", self.step, exc)
+                self._certified = None
         model.train()
         device = next(model.parameters()).device
         self.optimizer.zero_grad(set_to_none=True)
@@ -871,6 +1169,30 @@ class Trainer:
             analytic_metrics = self._apply_analytic_step(
                 adam_lr, prepared[0][0] if prepared else None
             )
+        # Certified step acts on the step's own gradients now: the refresh
+        # already ran pre-backward. Gate mode vetoes/caps the optimizer's
+        # own step; step mode replaces it by d* entirely.
+        if self._certified_mode and self._certified is not None:
+            try:
+                if self._certified_mode == "gate":
+                    certified_metrics = self._apply_certified_gate(adam_lr)
+                else:
+                    certified_metrics = self._apply_certified_step(adam_lr)
+                if certified_metrics.get("certified_vetoed"):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if use_ternary_cache:
+                        clear_ternary_weights(model)
+                    return {
+                        "step": self.step,
+                        "update_applied": False,
+                        "grad_norm": body_norm,
+                        "body_grad_norm": body_norm,
+                        "rest_grad_norm": rest_norm,
+                        **certified_metrics,
+                    }
+            except Exception as exc:  # telemetry-grade safety: never kill the step
+                logger.warning("step %d certified-step failed: %s", self.step, exc)
+                certified_metrics = {}
         self.optimizer.step()
 
         if use_ternary_cache:
@@ -916,6 +1238,8 @@ class Trainer:
         }
         if gram_metrics:
             metrics.update(gram_metrics)
+        if certified_metrics:
+            metrics.update(certified_metrics)
         if self._teacher is not None:
             metrics["kd"] = float(kd_sum)
             metrics["kd_alpha"] = self._distill_alpha
