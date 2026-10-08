@@ -101,10 +101,8 @@ def main() -> None:
             )
         merged[k] = (W_shared + Ur.double() @ Vr.double().T).float()
         # P0-2: serialize the R_expert contrast fibers (never compressed)
-        fibers[k] = [
-            {"dU": c["dU"].float(), "dV": c["dV"].float(), "V": c["V"].float()}
-            for c in rc["contrast_fibers"]
-        ]
+        # exact ResidualSplit bookkeeping: root + contrast[i] == expert
+        fibers[k] = [m.float() for m in rc["contrast_matrices"]]
         d_out, d_in = W_shared.shape
         r = Ur.shape[1]
         total_bits += math.log2(3) * (d_out + d_in) * r + 16 * (d_out + d_in + r)
