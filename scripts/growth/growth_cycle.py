@@ -117,6 +117,31 @@ def main() -> int:
             return 1
         ft_ckpt = cands[-1]
 
+    # 3b. WSqD cooldown (R254): a short polish at batch x4 / lr 0.4x after
+    # the ft phase — the decay tail is a CONSTANT noise cost, so the polish
+    # is nearly free; best.pt may or may not beat the ft best.
+    cd_dir = ROOT / f"checkpoints/gen{g}_cooldown"
+    if not (cd_dir / "best.pt").exists():
+        cd_cfg = ROOT / f"configs/gen{g}_cooldown.yaml"
+        base = (ROOT / args.ft_config).read_text(encoding="utf-8")
+        cd_cfg.write_text(
+            base.replace(f"init_from: checkpoints/gen{g}_root/root.pt",
+                         f"init_from: {ft_ckpt}")
+                .replace("grad_accum_steps: 1", "grad_accum_steps: 4")
+                .replace("learning_rate: 0.0002", "learning_rate: 0.00008")
+                .replace("max_steps: 600", "max_steps: 200"),
+            encoding="utf-8")
+        sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
+            "--config", str(cd_cfg.relative_to(ROOT)),
+            "--checkpoint-dir", str(cd_dir),
+            "--log-dir", str(cd_dir / "logs")], cd_dir / "cycle.log")
+    cd_ckpt = cd_dir / "best.pt"
+    if cd_ckpt.exists():
+        cd_ce = avg_ce(args.common_config, str(cd_ckpt))
+        entry_extra = {"cooldown_ce": cd_ce}
+    else:
+        entry_extra = {}
+
     # 4. certified accept ----------------------------------------------------
     inc_ce = avg_ce(args.common_config, args.root)
     new_ce = avg_ce(args.common_config, str(ft_ckpt))
@@ -124,6 +149,7 @@ def main() -> int:
         print("eval failed — halting (no uncertified growth)")
         return 1
     entry = {"gen": g, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             **entry_extra,
              "incumbent": args.root, "incumbent_ce": inc_ce,
              "merged_ce": avg_ce(args.common_config, str(gen_root / "root.pt")),
              "ft_ce": new_ce, "delta": inc_ce - new_ce}
