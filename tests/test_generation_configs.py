@@ -92,7 +92,7 @@ def test_every_shipped_generation_config_is_consistent():
     """Regression guard on the real configs, not just synthetic ones."""
     root = Path(__file__).resolve().parents[1]
     checked = 0
-    for path in sorted(root.glob("configs/dbridge_gen*_*.yaml")):
+    for path in sorted(root.glob("configs/*.yaml")):
         cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(cfg, dict) or "model" not in cfg:
             continue
@@ -102,4 +102,4 @@ def test_every_shipped_generation_config_is_consistent():
         ok, why = geometry_ok(cfg)
         assert ok, f"{path.name}: {why}"
         checked += 1
-    assert checked >= 5, f"expected the gen-3/gen-4 configs, found {checked}"
+    assert checked >= 3, f"expected the live generation configs, found {checked}"

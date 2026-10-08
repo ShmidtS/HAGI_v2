@@ -28,7 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = ROOT / "scripts" / "train.py"
 
-CFG = "configs/dbridge_gen4_sib_math.yaml"
+CFG = "configs/latent_leaf_math.yaml"
 CKPT = "checkpoints/dbridge_gen4_sib_math/step-0001300.pt"
 
 

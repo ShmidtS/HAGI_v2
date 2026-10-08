@@ -39,12 +39,12 @@ def build(config: str):
 
 def test_the_default_leaves_everything_trainable():
     """The common path must be untouched by the new code."""
-    _, m = build("dbridge_gen6_joint.yaml")
+    _, m = build("../tests/fixtures/fixture_joint.yaml")
     assert all(p.requires_grad for _, p in m.named_parameters())
 
 
 def test_freezing_leaves_only_the_mixers_trainable():
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     trainable = {n for n, p in m.named_parameters() if p.requires_grad}
     assert trainable
     for n in trainable:
@@ -53,12 +53,12 @@ def test_freezing_leaves_only_the_mixers_trainable():
 
 def test_the_mixer_gain_stays_trainable():
     """The parameter the whole question is about."""
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     assert m.mixers[0].gain.requires_grad
 
 
 def test_the_experts_are_actually_frozen():
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     # the embedding is the biggest tensor and must not move
     emb = m.encoder.embedding.weight
     assert emb.requires_grad is False
@@ -66,13 +66,13 @@ def test_the_experts_are_actually_frozen():
 
 def test_freezing_removes_the_bulk_of_the_parameters():
     """The mode is only meaningful if it removes almost everything."""
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     frac = m.trainable_params / m.total_params
     assert frac < 0.01, f"only {frac:.2%} frozen -- not a mixer-only mode"
 
 
 def test_the_reported_counts_match_the_parameters():
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     trainable = sum(p.numel() for _, p in m.named_parameters()
                     if p.requires_grad)
     total = sum(p.numel() for _, p in m.named_parameters())
@@ -85,7 +85,7 @@ def test_the_reported_counts_match_the_parameters():
 
 def test_a_model_without_mixers_is_refused():
     """Freezing everything must be an error, not a run that cannot train."""
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     m.mixers = torch.nn.ModuleList()
     with pytest.raises(ValueError, match="no trainable parameters"):
         m._freeze_all_but_mixers()
@@ -93,7 +93,7 @@ def test_a_model_without_mixers_is_refused():
 
 def test_the_mode_reports_rather_than_assumes():
     """The caller can see what was frozen without walking named_parameters."""
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     assert hasattr(m, "trainable_params")
     assert m.trainable_params < m.total_params
 
@@ -103,7 +103,7 @@ def test_the_mode_reports_rather_than_assumes():
 
 def test_a_frozen_model_still_runs_forward():
     """Freezing is about gradients, not about the computation."""
-    _, m = build("mixonly_gen3.yaml")
+    _, m = build("../tests/fixtures/fixture_mixonly.yaml")
     ids = torch.randint(0, 32768, (2, 16))
     with torch.no_grad():
         out = m(ids, return_logits=True)
