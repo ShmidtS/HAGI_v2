@@ -1,0 +1,82 @@
+# Fresh latent-line leaf 3: CODE domain (R66 sib-on-domain).
+model:
+  vocab_size: 32768
+  hidden_size: 128
+  num_layers: 3
+  loop_depth: 2
+  init_seed: 15101
+  attention:
+    num_query_heads: 2
+    num_kv_heads: 1
+    head_dim: 64
+    rope_theta: 3000.0
+    sink_len: 4
+    max_seq_len: 4096
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  ternary:
+    enabled: false
+  ffn:
+    expansion: 1.0
+  head:
+    unigram_prior: false
+    z_loss_weight: 0.003
+    logit_scale_max: 0.3
+    sampled_proposal: uniform
+    fused_ce: true
+  cortex:
+    enabled: false
+  adapters:
+    enabled: false
+  decision:
+    enabled: false
+merge:
+  enabled: false
+  norm_block_dim: 128
+  n_mixers: 1
+  mixer_type: hadamard
+  n_experts: 0
+  expert_hidden: 0
+  mixer_init_scale: 0.0
+  mixer_rank: 64
+  freeze_experts: false
+  expert_weight_source: effective_sparse
+  distill: false
+train:
+  init_from: checkpoints/gen8_root_ft/best.pt
+  max_steps: 800
+  checkpoint_interval: 400
+  checkpoint_keep_last: 3
+  precision: bf16
+  grad_checkpointing: false
+  ternary_fp32_master: false
+  batch_size: 32
+  grad_accum_steps: 1
+  compile_model: true
+  learning_rate: 0.0004
+  use_muon: true
+  zero_init_proj: false
+  adam:
+    weight_decay: 0.3
+  schedule:
+    warmup_steps: 200
+  saturation_patience: 8
+  saturation_tol: 0.01
+  saturation_min_steps: 200
+  divergence_patience: 6
+  divergence_delta: 0.3
+  divergence_min_steps: 150
+  logging:
+    log_interval: 10
+    diag_interval: 100
+    gate_eval_interval: 50
+  checkpoint_dir: checkpoints/gen9_leaf_code
+  data:
+    data_dir: data
+    seq_len: 1024
+    seed: 15813
+    weights:
+      python_instruct: 0.60
+      edu: 0.20
+      slimpajama: 0.20
