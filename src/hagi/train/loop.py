@@ -1714,7 +1714,11 @@ def train(
             sat_signal = float(metrics["gate_ce"])
         elif "exact_ce" in metrics:
             sat_signal = float(metrics["exact_ce"])
-        if patience > 0 and sat_signal is not None and trainer.step >= min_steps:
+        if patience > 0 and sat_signal is not None:
+            # NOTE: best.pt tracking starts at step 1, NOT min_steps — a
+            # divergence guard firing shortly after min_steps otherwise
+            # leaves NO best.pt at all (observed on gen2/gen3 runs: the
+            # running-min was set before min_steps and never re-armed).
             if best_ce is None or sat_signal < best_ce - tol:
                 best_ce = sat_signal
                 no_improve_count = 0
