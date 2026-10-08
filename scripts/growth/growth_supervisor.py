@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -98,6 +99,21 @@ DEFAULT_DOMAIN_MARGIN = 0.25
 DEFAULT_GATE_DELTA = 0.05
 DEFAULT_GATE_DECAY = 0.5
 
+# --- §0/§9: the certified controller this driver delegates its decisions to.
+#
+# The verdict below used to be "not worse than the incumbent by a fixed
+# margin" and candidates were screened by standalone CE. ALGORITHMS.md §1
+# forbids the latter (``selection_hurts``: standalone CE ranking can
+# strictly degrade the ensemble) and §9 replaces the former with the
+# certified 2-eps Hoeffding rule. The driver keeps its working parts
+# (lane loading, subprocess driving, resume, Windows-safe wait) and
+# routes every DECISION through ``hagi.train.certified_controller``.
+from hagi.train import certified_controller as cc
+
+# Effective sample size of one held-out eval when the report does not
+# record it (eval_holdout.py is driven with --batches 200).
+DEFAULT_EVAL_N = 200
+
 
 def anytime_margin(base: float, lane: int, total_delta: float,
                    decay: float) -> float:
@@ -128,11 +144,17 @@ def anytime_margin(base: float, lane: int, total_delta: float,
 
 @dataclass
 class Lane:
-    """One candidate: N experts merged into one joint model."""
+    """One candidate: N experts merged into one joint model.
+
+    ``lane_type == "distill"`` marks a §17 distill lane: no experts are
+    trained, the joint config named by ``joint_config`` is the PARENT
+    whose distill config is derived by :func:`make_distill_config`.
+    """
 
     name: str
     expert_configs: list[str]
     joint_config: str
+    lane_type: str = "growth"
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -170,18 +192,24 @@ def load_plan(path: Path) -> list[Lane]:
         raise ValueError(f"{path}: expected a non-empty list of lanes")
     lanes: list[Lane] = []
     for i, item in enumerate(raw):
-        for key in ("name", "experts", "joint"):
+        for key in ("name", "joint"):
             if key not in item:
                 raise ValueError(f"{path}: lane {i} is missing '{key}'")
+        lane_type = str(item.get("type", "growth"))
+        if lane_type not in ("growth", "distill"):
+            raise ValueError(f"{path}: lane {i} has unknown type {lane_type!r}")
+        if lane_type == "growth" and "experts" not in item:
+            raise ValueError(f"{path}: lane {i} is missing 'experts'")
         lanes.append(
             Lane(
                 name=str(item["name"]),
-                expert_configs=[str(p) for p in item["experts"]],
+                expert_configs=[str(p) for p in item.get("experts", [])],
                 joint_config=str(item["joint"]),
+                lane_type=lane_type,
                 meta={
                     k: v
                     for k, v in item.items()
-                    if k not in ("name", "experts", "joint")
+                    if k not in ("name", "experts", "joint", "type")
                 },
             )
         )
@@ -263,6 +291,38 @@ _FAILURE_MARKERS = (
 )
 
 
+_CE_LINE_RE = re.compile(r"\|\s*ce=(nan|inf|-inf|[\d.eE+-]+)", re.I)
+
+
+def parse_ce_series(log_path: Path) -> list[float]:
+    """The logged per-step cross-entropy series of a training log.
+
+    The same parsing :func:`converged` does, kept as its own function so
+    the ignition gate can read the trajectory without re-implementing
+    the regex (and without duplicating the nan/inf handling: those
+    lines are skipped here, not read as numbers).
+    """
+    if not log_path.exists():
+        return []
+    ce: list[float] = []
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = _CE_LINE_RE.search(line)
+                if m:
+                    try:
+                        v = float(m.group(1))
+                    except ValueError:
+                        continue
+                    # nan/inf carry no trajectory information; the
+                    # ignition gate needs finite steps only.
+                    if math.isfinite(v):
+                        ce.append(v)
+    except OSError:
+        return []
+    return ce
+
+
 def looks_like_exception(tail: str) -> bool:
     """Does this log tail show a real failure rather than a silent stop?
 
@@ -316,7 +376,7 @@ def converged(
                 # The value may be a number OR nan/inf: a diverged run
                 # reports "ce=nan", which must not be read as "no number
                 # here" and therefore as convergence.
-                m = re.search(r"\|\s*ce=(nan|inf|-inf|[\d.eE+-]+)", line, re.I)
+                m = _CE_LINE_RE.search(line)
                 if m:
                     try:
                         ce.append(float(m.group(1)))
@@ -458,6 +518,22 @@ def mean_ce(report: dict) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def report_n(report: dict | None) -> int:
+    """Effective sample size of an eval report, for the §9 premise.
+
+    ``eval_holdout.py`` scores a fixed number of batches; the report may
+    carry it (``n_eval`` or ``batches``). The default matches the
+    supervisor's own ``--batches 200`` invocation.
+    """
+    if not isinstance(report, dict):
+        return DEFAULT_EVAL_N
+    for key in ("n_eval", "batches"):
+        v = report.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+    return DEFAULT_EVAL_N
+
+
 def decide(
     candidate: dict,
     incumbent: dict | None,
@@ -467,18 +543,25 @@ def decide(
     total_delta: float = DEFAULT_GATE_DELTA,
     decay: float = DEFAULT_GATE_DECAY,
 ) -> Verdict:
-    """Accept the candidate unless it is clearly worse than the incumbent.
+    """Decide the lane via the §9 certified A/B rule, legacy rule as fallback.
 
-    Rejects on: a missing mean, a mean worse by more than ``total_margin``, or
-    a single domain worse by more than ``domain_margin``. The margins are wide
-    on purpose -- held-out exact CE carries roughly 0.2 nats of seed noise at
-    this scale, and a tight rule would turn noise into decisions.
+    The DECISION routes through ``certified_controller.certified_ab``
+    (ALGORITHMS.md §9): accept the candidate iff
+    ``CE_incumbent - CE_candidate > 2*eps`` with ``n >= log(2/delta_t)/
+    (2 eps^2)``, where ``eps`` is half the lane's anytime margin (so the
+    certified boundary coincides with the historical one) and ``delta_t``
+    is this lane's spend from the R93 schedule.
+
+    A single 200-batch eval usually sits below the Hoeffding threshold
+    at these eps, so the certified verdict is often UNDECIDED -- the
+    comparison lacks the evidence §9 demands. In that case the verdict
+    falls back to the historical not-worse-on-margin rule (including the
+    per-domain regression guard), which is strictly weaker and never
+    contradicts a certified verdict. A certified REJECT, however, is
+    final: the fallback cannot rescue a certified regression.
 
     ``lane`` indexes the comparison within the run and tightens both margins
-    via the R93 anytime schedule (:func:`anytime_margin`). The geometric
-    factors sum to at most ``total_delta`` over ANY number of lanes, so an
-    unbounded run no longer multiplies the error budget by its length. Pass
-    ``lane=0`` to get exactly the previous fixed-margin behaviour.
+    via the R93 anytime schedule (:func:`anytime_margin`).
     """
     total_margin = anytime_margin(total_margin, lane, total_delta, decay)
     domain_margin = anytime_margin(domain_margin, lane, total_delta, decay)
@@ -503,8 +586,33 @@ def decide(
         if isinstance(other, dict) and isinstance(other.get("exact_ce"), (int, float)):
             deltas[name] = float(dom["exact_ce"]) - float(other["exact_ce"])
 
+    # --- §9 decision path -------------------------------------------------
+    # eps = margin/2 makes the certified 2*eps band coincide with the
+    # historical margin, so certification can only REJECT or CONFIRM,
+    # never widen, the old acceptance boundary.
+    delta_t = total_delta * (1.0 - decay) * (decay ** lane)
+    cert = cc.certified_ab(
+        inc_mean, report_n(incumbent), cand_mean, report_n(candidate),
+        eps=total_margin / 2.0, delta=delta_t,
+    )
+    if cert.accepted:
+        gain = inc_mean - cand_mean
+        return Verdict(
+            True, f"certified accept (§9): {cert.reason}"
+                  + data_axis_advice(gain),
+            inc_mean, cand_mean, deltas,
+        )
+    if cert.rejected:
+        return Verdict(
+            False, f"certified reject (§9): {cert.reason}",
+            inc_mean, cand_mean, deltas,
+        )
+    # UNDECIDED: no certified evidence either way; fall back to the
+    # weaker not-worse-on-margin rule (the documented pre-filter).
+
     if cand_mean - inc_mean > total_margin:
-        return Verdict(False, f"mean CE worse by {cand_mean - inc_mean:+.4f}",
+        return Verdict(False, f"mean CE worse by {cand_mean - inc_mean:+.4f}"
+                              f" [uncertified at n={cert.n}, need {cert.n_required}]",
                        inc_mean, cand_mean, deltas)
     regressed = {k: v for k, v in deltas.items() if v > domain_margin}
     if regressed:
@@ -512,7 +620,7 @@ def decide(
         return Verdict(False, f"domain regression: {detail}", inc_mean, cand_mean, deltas)
     gain = inc_mean - cand_mean          # > 0 means the candidate is better
     return Verdict(
-        True, f"mean CE {-gain:+.4f} within margin"
+        True, f"mean CE {-gain:+.4f} within margin (uncertified: {cert.reason})"
               + data_axis_advice(gain),
         inc_mean, cand_mean, deltas,
     )
@@ -625,6 +733,276 @@ def append_ledger(row: dict[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+# --- §23: theory-phase annotations (log-only) ---------------------------
+
+def log_phase(phase: str, lane: str, detail: str = "") -> None:
+    """Emit one canonical §23 phase line so the log/ledger record which
+    theory phase each stage of the cycle is in. Log-only by design."""
+    line = cc.phase_log_line(phase, lane, detail)
+    LOG.info("%s", line)
+    return line
+
+
+def theory_stop_check(lane: Lane, verdict: Verdict | None) -> str:
+    """§0 step 6 as an annotation: STOP iff consensus AND inj <= xi [R80].
+
+    The supervisor does not stop autonomously on this (the plan bounds the
+    run), but the ledger records whether the two-axis stop condition is
+    met: ``consensus`` is read from the verdict (a stalled or uncertified
+    gain means the merge axis has converged to noise), and ``inj``/``xi``
+    come from lane meta when a plan supplies them, defaulting to the
+    conservative ``inj = 0`` (no fresh-data injection measured).
+    """
+    consensus = verdict is not None and (
+        not verdict.accepted or "stalled" in verdict.reason
+    )
+    inj = float(lane.meta.get("inj", 0.0))
+    xi = float(lane.meta.get("xi", 0.0))
+    stop = cc.stop_condition(consensus, inj, xi)
+    if stop:
+        return ("stop_condition MET (consensus + inj<=xi, R80): an honest "
+                "stop -- retrying the same action cannot help; inject data")
+    return ""
+
+
+def distill_leak_check(lane: Lane) -> str | None:
+    """§17 distill_leak_gate as an annotation, when the lane distills.
+
+    A lane only carries distillation measurements if its plan meta has
+    ``distill_cycle_gain`` (c_k) and ``distill_slack`` (delta_k); without
+    both there is nothing to gate and None is returned.
+    """
+    c = lane.meta.get("distill_cycle_gain")
+    d = lane.meta.get("distill_slack")
+    if c is None or d is None:
+        return None
+    continue_ = cc.leak_gate(float(c), float(d))
+    log_phase(cc.GrowthPhase.DISTILL, lane.name,
+              f"c_k={c} delta_k={d}")
+    if continue_:
+        return "distill_leak_gate: c_k - delta_k still pays; recursion may continue"
+    return ("distill_leak_gate: delta >= c -- STOP the recursion (R134); "
+            "do not force further distillation cycles")
+
+
+# --- §10/§13: ignition / saturation / takeoff-window gates (advisory) ---
+#
+# These call the ALREADY-PORTED theory modules (saturation.py,
+# ratio_takeoff.py, takeoff_window.py) on MEASURED inputs. The verdict
+# stays non-destructive: gates advise, ``certified_ab`` decides (the
+# §9 gate in decide()).
+#
+# Measurement model (documented, honest):
+# * capability proxy  C_t = exp(-ce_t)  from the joint training log --
+#   CE drop IS capability gain on the same scale, and exp keeps C
+#   strictly positive as the ratio dynamics require;
+# * data-field proxy  D_t = (C_{t+1} - C_t) / gamma  -- inverted from
+#   the §10 dynamics C' = C + gamma*D, so D is the usable frontier
+#   the step actually harvested;
+# * rho_hat / beta_hat -- least-squares fit of D' = rho*D + beta*C
+#   (xi = 0 form) on the trajectory, UNLESS the lane meta supplies
+#   measured values (``rho``, ``beta``), which always win over the fit.
+#
+# Required lane-meta inputs: ``gamma`` and ``k`` (cone parameters).
+# Optional: ``rho``, ``beta`` (overrides), ``xi`` (friction, default 0),
+# ``alpha`` (takeoff-window gate), ``Cstar``/``sigma`` (saturation PL
+# window). Anything missing that a gate needs -> that gate is skipped;
+# if the REQUIRED pair is missing the whole check logs
+# ``phase=IGNITE inputs_missing`` and returns None (no crash).
+
+
+def _fit_frontier_dynamics(
+    capability: list[float], gamma: float
+) -> tuple[float, float] | None:
+    """Least-squares fit of ``D' = rho*D + beta*C`` on the trajectory.
+
+    Returns ``(rho_hat, beta_hat)`` or None when the trajectory is too
+    short (needs >= 3 points, i.e. two transitions) or degenerate (all
+    D equal -- nothing to regress on).
+    """
+    d = [(capability[t + 1] - capability[t]) / gamma
+         for t in range(len(capability) - 1)]
+    if len(d) < 2:
+        return None
+    # regress d[1:] on (d[:-1], capability[1:-1])
+    xs = list(zip(d[:-1], capability[1:-1]))
+    y = d[1:]
+    n = float(len(y))
+    sx = [sum(r[i] for r in xs) for i in (0, 1)]
+    sy = sum(y)
+    sxx = sum(r[0] * r[0] for r in xs)
+    sxy = sum(r[0] * v for r, v in zip(xs, y))
+    denom = n * sxx - sx[0] * sx[0]
+    if abs(denom) < 1e-12:
+        return None
+    rho_hat = (n * sxy - sx[0] * sy) / denom
+    # beta from the residual mean: y - rho*x0 = beta*C
+    beta_hat = (sy - rho_hat * sx[0]) / sx[1] if sx[1] != 0.0 else 0.0
+    return rho_hat, beta_hat
+
+
+def ignition_gate_check(
+    lane: Lane,
+    joint_log: Path,
+) -> dict[str, Any] | None:
+    """§10/§13 gates on the measured joint trajectory (advisory only).
+
+    Calls ``ratio_takeoff.bifurcation_verdict``,
+    ``saturation.lifecycle_verdict`` and ``takeoff_window.takeoff_window``
+    on inputs measured from the training log, and returns the advice as
+    a dict for the ledger. ``None` + a logged ``phase=IGNITE
+    inputs_missing`` line means the inputs are not available and the
+    gates are skipped -- never a crash, never a verdict.
+    """
+    from hagi.train.ratio_takeoff import bifurcation_verdict
+    from hagi.train.saturation import lifecycle_verdict
+    from hagi.train.takeoff_window import takeoff_window
+
+    gamma = lane.meta.get("gamma")
+    k = lane.meta.get("k")
+    ce = parse_ce_series(joint_log)
+    if gamma is None or k is None or len(ce) < 3:
+        log_phase(cc.GrowthPhase.IGNITE, lane.name, "inputs_missing")
+        return None
+    gamma = float(gamma)
+    k = float(k)
+    xi = float(lane.meta.get("xi", 0.0))
+
+    capability = [math.exp(-x) for x in ce if math.isfinite(x)]
+    if len(capability) < 3:
+        log_phase(cc.GrowthPhase.IGNITE, lane.name, "inputs_missing")
+        return None
+
+    fit = _fit_frontier_dynamics(capability, gamma)
+    if fit is None:
+        log_phase(cc.GrowthPhase.IGNITE, lane.name, "inputs_missing")
+        return None
+    rho_hat, beta_hat = fit
+    if "rho" in lane.meta:
+        rho_hat = float(lane.meta["rho"])
+    if "beta" in lane.meta:
+        beta_hat = float(lane.meta["beta"])
+
+    out: dict[str, Any] = {
+        "rho_hat": round(rho_hat, 6),
+        "beta_hat": round(beta_hat, 6),
+        "C_final": round(capability[-1], 6),
+    }
+
+    bif = bifurcation_verdict(beta_hat, rho_hat, gamma, k,
+                              C=capability[-1], xi=xi)
+    out["bifurcation"] = bif.value
+    advice = {
+        "grow": "cone holds: continue the cycle (one-sided (1+gamma*k)^T "
+                "certificate, R124)",
+        "decay": "beta=0 and rho<1: frontier decays geometrically -- do NOT "
+                 "cycle; wait for data injection (frontier_decay_no_growth)",
+        "inject": "production below the ignition threshold: grow the data "
+                  "axis (fresh independent corpora), not more cycles",
+    }[bif.value]
+    out["advice"] = advice
+
+    cstar = lane.meta.get("Cstar")
+    sigma = lane.meta.get("sigma")
+    if cstar is not None and sigma is not None:
+        lc = lifecycle_verdict(beta_hat, rho_hat, gamma, k,
+                               capability[-1],
+                               Cstar=float(cstar), sigma=float(sigma),
+                               xi=xi)
+        out["lifecycle"] = lc.value
+
+    alpha = lane.meta.get("alpha")
+    if alpha is not None:
+        gains = [capability[t + 1] - capability[t]
+                 for t in range(len(capability) - 1)]
+        mean_gain = sum(gains) / len(gains)
+        if mean_gain > 0.0:
+            w = takeoff_window(float(alpha), capability[0], mean_gain)
+            out["takeoff_window"] = {
+                "max_successes": round(w.max_successes, 4),
+                "certified_factor_bound": round(w.certified_factor_bound, 4),
+            }
+    log_phase(cc.GrowthPhase.IGNITE, lane.name,
+              f"{bif.value} beta_hat={beta_hat:.4g} rho_hat={rho_hat:.4g}")
+    return out
+
+
+# --- §17 / R134: the distill cycle as a supervisor lane type --------------
+
+
+def make_distill_config(parent_config: Path, out_path: Path) -> Path:
+    """Derive a distill-lane config from a joint (parent) config.
+
+    Mirrors how ``make_generation.py`` derives the distill stage, KISS:
+    copy the parent YAML, then
+
+    * ``train.checkpoint_dir``  -> ``<parent_dir>_distill``
+    * ``train.init_from``       -> ``<parent_dir>/best.pt`` (the joint)
+    * when the config lists ``distill.teachers``: enable the reverse-
+      recursion channel (``merge.distill: true``, first listed teacher
+      in ``merge.distill_teacher`` -- the training loop consumes exactly
+      one) and set the disagreement token-selection quantile
+      (``merge.distill_disagreement_quantile: 0.95``, Bregman-slice,
+      ``disagreement_distill``).
+
+    Pure data derivation: writing the file does NOT launch training.
+    """
+    raw = yaml.safe_load(parent_config.read_text(encoding="utf-8"))
+    ckpt_dir = str(raw["train"]["checkpoint_dir"])
+    raw["train"]["checkpoint_dir"] = f"{ckpt_dir}_distill"
+    raw["train"]["init_from"] = f"{ckpt_dir}/best.pt"
+    merge = raw.setdefault("merge", {})
+    teachers = (raw.pop("distill", None) or {}).get("teachers")
+    if teachers:
+        merge["distill"] = True
+        merge["distill_teacher"] = str(teachers[0])
+        merge["distill_disagreement_quantile"] = 0.95
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return out_path
+
+
+def distill_leak_from_evals(
+    lane: Lane,
+    student_report: dict | None,
+    teacher_report: dict | None,
+    incumbent_report: dict | None,
+) -> dict[str, Any] | None:
+    """§17 leak gate on MEASURED evals: c_k vs delta_k.
+
+    ``delta_k`` (the single-cycle bridge slack) is the student's CE above
+    its teacher's; ``c_k`` (the cycle gain) comes from lane meta when a
+    plan supplies it, else from the incumbent comparison
+    ``incumbent_ce - teacher_ce``. Missing inputs -> None (logged as
+    inputs_missing by the caller), never a crash.
+    """
+    student_ce = mean_ce(student_report) if student_report else None
+    teacher_ce = mean_ce(teacher_report) if teacher_report else None
+    c = lane.meta.get("distill_cycle_gain")
+    if c is None and incumbent_report is not None:
+        inc_ce = mean_ce(incumbent_report)
+        if inc_ce is not None and teacher_ce is not None:
+            c = inc_ce - teacher_ce
+    if student_ce is None or teacher_ce is None or c is None:
+        return None
+    delta = student_ce - teacher_ce
+    continue_ = cc.leak_gate(float(c), delta)
+    return {
+        "c_k": round(float(c), 6),
+        "delta_k": round(delta, 6),
+        "continue_recursion": continue_,
+        "note": (
+            "distill_leak_gate: c_k - delta_k still pays; recursion may continue"
+            if continue_ else
+            "distill_leak_gate: delta_k >= c_k -- STOP the recursion (R134); "
+            "do not force further distillation cycles"
+        ),
+    }
+
+
 def prune(keep: int, rows: list[Path]) -> None:
     """Keep the newest ``keep`` checkpoints per directory, delete the rest.
 
@@ -705,7 +1083,28 @@ def screen_candidates(
     if not usable:
         LOG.warning("no candidate scored; falling back to the base config")
         return joint_config, scored
+    # §1 ``selection_hurts``: standalone CE ranking is NOT an ensemble
+    # criterion and can strictly degrade the ensemble. It is kept ONLY as
+    # a cheap pre-filter; the DECISION is the §9 certified gate in
+    # decide(). Screen scores within the certification band are marked
+    # undecided so a wrong pick stays visible in the ledger.
     best = min(usable, key=lambda s: s["screen_exact_ce"])
+    sorted_usable = sorted(usable, key=lambda s: s["screen_exact_ce"])
+    if len(sorted_usable) > 1:
+        second = sorted_usable[1]
+        cert = cc.certified_ab(
+            second["screen_exact_ce"], DEFAULT_EVAL_N,
+            best["screen_exact_ce"], DEFAULT_EVAL_N,
+            eps=0.05, delta=0.05,
+        )
+        for s in usable:
+            s["screen_certified"] = not cert.undecided
+        if cert.undecided:
+            LOG.warning(
+                "screen top-2 not 2eps-separable (§9: %s) -- the pick is a "
+                "prior, not evidence; the §9 gate in decide() rules",
+                cert.reason,
+            )
     LOG.info("screen winner: %s (%.4f)", best["label"], best["screen_exact_ce"])
     return (
         joint_config.with_name(f"{joint_config.stem}__{best['label']}.yaml"),
@@ -764,10 +1163,56 @@ def main() -> int:
 
     for lane in lanes:
         started = time.time()
-        LOG.info("=== lane %s ===", lane.name)
+        LOG.info("=== lane %s (type=%s) ===", lane.name, lane.lane_type)
         checkpoints: list[Path] = []
 
+        if lane.lane_type == "distill":
+            parent = ROOT / lane.joint_config
+            derived = make_distill_config(
+                parent,
+                parent.with_name(parent.stem + "__distill.yaml"),
+            )
+            log_phase(cc.GrowthPhase.DISTILL, lane.name,
+                      f"config derived: {derived.name} (training NOT auto-launched "
+                      "by derivation; run the lane to train)")
+            ckpt = train_phase(
+                derived, ROOT / f"logs/growth_{lane.name}_distill.log",
+                args.device, args.attempts,
+            )
+            if ckpt is None:
+                append_ledger({"lane": lane.name, "phase": "distill_failed",
+                               "config": str(derived), "at": started})
+                continue
+            report = evaluate(
+                derived, ckpt,
+                ROOT / f"reports/growth_{lane.name}_distill.json", args.device,
+            )
+            teacher_report_path = lane.meta.get("teacher_report")
+            teacher_report = None
+            if teacher_report_path and (ROOT / teacher_report_path).is_file():
+                teacher_report = json.loads(
+                    (ROOT / teacher_report_path).read_text(encoding="utf-8"))
+            elif incumbent is not None:
+                teacher_report = incumbent
+            leak = distill_leak_from_evals(lane, report, teacher_report, incumbent)
+            if leak is None:
+                log_phase(cc.GrowthPhase.DISTILL, lane.name, "inputs_missing")
+            else:
+                log_phase(cc.GrowthPhase.DISTILL, lane.name, leak["note"])
+            append_ledger({
+                "lane": lane.name,
+                "phase": "distill_evaluated",
+                "theory_phase": "DISTILL",
+                "config": str(derived),
+                "report": f"reports/growth_{lane.name}_distill.json",
+                "elapsed_s": round(time.time() - started, 1),
+                **({"distill_leak_gate": leak} if leak else {}),
+            })
+            prune(args.keep, [ckpt])
+            continue
+
         for cfg_name in lane.expert_configs:
+            log_phase(cc.GrowthPhase.DISCOVER, lane.name, cfg_name)
             cfg = ROOT / cfg_name
             ckpt = train_phase(cfg, ROOT / f"logs/growth_{lane.name}_{Path(cfg_name).stem}.log",
                               args.device, args.attempts)
@@ -778,16 +1223,21 @@ def main() -> int:
                 break
             checkpoints.append(ckpt)
         else:
+            log_phase(cc.GrowthPhase.SELECT, lane.name,
+                      f"merge_k={args.merge_k} (screen = cheap pre-filter only, "
+                      "decision is the §9 certified gate)")
             joint = ROOT / lane.joint_config
             joint, screens = screen_candidates(
                 joint, args.device, args.attempts, k=args.merge_k
             )
+            log_phase(cc.GrowthPhase.CONSOLIDATE, lane.name, Path(joint).name)
             ckpt = train_phase(joint, ROOT / f"logs/growth_{lane.name}_joint.log",
                               args.device, args.attempts)
             if ckpt is None:
                 LOG.error("lane %s: joint failed", lane.name)
                 append_ledger({"lane": lane.name, "phase": "joint_failed", "at": started})
             else:
+                log_phase(cc.GrowthPhase.MEASURE, lane.name, "eval_holdout 200 batches")
                 report = evaluate(
                     joint, ckpt,
                     ROOT / f"reports/growth_{lane.name}.json", args.device,
@@ -795,20 +1245,32 @@ def main() -> int:
                 if report is None:
                     append_ledger({"lane": lane.name, "phase": "eval_failed", "at": started})
                 else:
+                    log_phase(cc.GrowthPhase.GATE, lane.name, "§9 certified_ab 2eps rule")
                     verdict = decide(
                         report, incumbent, args.total_margin,
                         args.domain_margin, lane=checks,
                         total_delta=args.gate_delta, decay=args.gate_decay,
                     )
                     checks += 1
+                    stop_note = theory_stop_check(lane, verdict)
+                    if stop_note:
+                        log_phase(cc.GrowthPhase.STOP_CONTINUE, lane.name, stop_note)
+                    leak_note = distill_leak_check(lane)
+                    ignite = ignition_gate_check(
+                        lane, ROOT / f"logs/growth_{lane.name}_joint.log"
+                    )
                     append_ledger({
                         "lane": lane.name,
                         "phase": "evaluated",
+                        "theory_phase": "GATE",
                         "merge_screen": screens,
                         "incumbent": incumbent_name,
                         "report": f"reports/growth_{lane.name}.json",
                         "elapsed_s": round(time.time() - started, 1),
                         **verdict.to_json(),
+                        **({"stop_condition": stop_note} if stop_note else {}),
+                        **({"distill_leak_gate": leak_note} if leak_note else {}),
+                        **({"ignition_gate": ignite} if ignite else {}),
                     })
                     LOG.info("lane %s: accepted=%s (%s)", lane.name, verdict.accepted, verdict.reason)
                     if verdict.accepted:
