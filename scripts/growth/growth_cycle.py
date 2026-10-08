@@ -145,6 +145,13 @@ def main() -> int:
     # 4. certified accept ----------------------------------------------------
     inc_ce = avg_ce(args.common_config, args.root)
     new_ce = avg_ce(args.common_config, str(ft_ckpt))
+    # The candidate is the BEST of ft / cooldown (R254: the cooldown is
+    # part of the generation's polish; judging the ft alone understates
+    # the generation — observed on gen-13: ft 5.381, cooldown 5.319).
+    cand_ckpt = ft_ckpt
+    if entry_extra.get("cooldown_ce") is not None and             entry_extra["cooldown_ce"] < new_ce:
+        cand_ckpt = cd_ckpt
+        new_ce = entry_extra["cooldown_ce"]
     if inc_ce is None or new_ce is None:
         print("eval failed — halting (no uncertified growth)")
         return 1
@@ -152,7 +159,8 @@ def main() -> int:
              **entry_extra,
              "incumbent": args.root, "incumbent_ce": inc_ce,
              "merged_ce": avg_ce(args.common_config, str(gen_root / "root.pt")),
-             "ft_ce": new_ce, "delta": inc_ce - new_ce}
+             "ft_ce": new_ce, "candidate": str(cand_ckpt),
+             "delta": inc_ce - new_ce}
     # §9 conservative: the generation ships only on a strict improvement
     # beyond eval noise (2-eps band approximated by 0.02 nats at n=10
     # batches/domain); ties and regressions halt the cycle.
