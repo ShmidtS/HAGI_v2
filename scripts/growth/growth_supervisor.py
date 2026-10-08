@@ -589,12 +589,29 @@ def decide(
     # --- §9 decision path -------------------------------------------------
     # eps = margin/2 makes the certified 2*eps band coincide with the
     # historical margin, so certification can only REJECT or CONFIRM,
-    # never widen, the old acceptance boundary.
+    # never widen, the old acceptance boundary. When the fixed-eps rule
+    # is UNDECIDED purely for sample-size, try the ADAPTIVE eps the
+    # sample actually supports (n_certifiable = the largest eps whose
+    # Hoeffding n fits the data): a large measured delta with small n
+    # can still certify at a wider band (the anytime spirit of R93 —
+    # the guarantee degrades gracefully, it does not vanish).
     delta_t = total_delta * (1.0 - decay) * (decay ** lane)
     cert = cc.certified_ab(
         inc_mean, report_n(incumbent), cand_mean, report_n(candidate),
         eps=total_margin / 2.0, delta=delta_t,
     )
+    n_avail = min(report_n(incumbent), report_n(candidate))
+    if not cert.accepted and not cert.rejected and n_avail > 0:
+        import math as _math
+        d = inc_mean - cand_mean
+        # largest eps certifiable at n_avail: eps_c = sqrt(log(2/delta)/(2n))
+        eps_c = (_math.sqrt(_math.log(2.0 / delta_t) / (2.0 * n_avail)) * 1.02
+                if delta_t < 1 else float("inf"))
+        if eps_c < _math.inf and abs(d) > 2.0 * eps_c:
+            cert = cc.certified_ab(
+                inc_mean, report_n(incumbent), cand_mean, report_n(candidate),
+                eps=eps_c, delta=delta_t,
+            )
     if cert.accepted:
         gain = inc_mean - cand_mean
         return Verdict(
@@ -607,24 +624,21 @@ def decide(
             False, f"certified reject (§9): {cert.reason}",
             inc_mean, cand_mean, deltas,
         )
-    # UNDECIDED: no certified evidence either way; fall back to the
-    # weaker not-worse-on-margin rule (the documented pre-filter).
-
-    if cand_mean - inc_mean > total_margin:
-        return Verdict(False, f"mean CE worse by {cand_mean - inc_mean:+.4f}"
-                              f" [uncertified at n={cert.n}, need {cert.n_required}]",
-                       inc_mean, cand_mean, deltas)
+    # UNDECIDED: no certified evidence either way. THEORY (audit P1-1,
+    # §9): an UNDECIDED comparison must NOT accept through the legacy
+    # not-worse rule — that leaks the forbidden decision path. The
+    # conservative theory-correct default: REJECT (the incumbent
+    # stands); the legacy rule survives only as the *reason text* for
+    # the retro-log.
     regressed = {k: v for k, v in deltas.items() if v > domain_margin}
-    if regressed:
-        detail = ", ".join(f"{k} {v:+.4f}" for k, v in sorted(regressed.items()))
-        return Verdict(False, f"domain regression: {detail}", inc_mean, cand_mean, deltas)
-    gain = inc_mean - cand_mean          # > 0 means the candidate is better
-    return Verdict(
-        True, f"mean CE {-gain:+.4f} within margin (uncertified: {cert.reason})"
-              + data_axis_advice(gain),
-        inc_mean, cand_mean, deltas,
+    why = (
+        f"domain regression: "
+        + ", ".join(f"{k} {v:+.4f}" for k, v in sorted(regressed.items()))
+        if regressed
+        else f"mean CE {cand_mean - inc_mean:+.4f} (uncertified at n={cert.n}, "
+             f"need {cert.n_required}) — incumbent stands"
     )
-
+    return Verdict(False, why, inc_mean, cand_mean, deltas)
 
 # --- the data axis: what to do when growth stalls (data_axis.py, §4) ----
 

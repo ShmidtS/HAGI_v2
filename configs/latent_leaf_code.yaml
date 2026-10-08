@@ -21,8 +21,8 @@ model:
     expansion: 1.0
   head:
     unigram_prior: false
-    z_loss_weight: 0.001
-    logit_scale_max: 0.4
+    z_loss_weight: 0.003
+    logit_scale_max: 0.3
     sampled_proposal: uniform
     fused_ce: true
   cortex:
@@ -53,7 +53,7 @@ train:
   batch_size: 32
   grad_accum_steps: 1
   compile_model: true
-  learning_rate: 0.0005
+  learning_rate: 0.0004
   use_muon: true
   zero_init_proj: false
   adam:
@@ -74,7 +74,7 @@ train:
   data:
     data_dir: data
     seq_len: 1024
-    seed: 15113
+    seed: 15813
     weights:
       python_instruct: 0.60
       edu: 0.20
