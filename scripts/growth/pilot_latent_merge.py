@@ -19,6 +19,7 @@ Implements the R242-R244 pipeline on real checkpoints, THEORY-CORRECT
 Output: root.pt (same width), fibers.pt (contrast fibers per expert),
 META.txt with the BPW report (FactorizedBPW arithmetic).
 """
+import json
 import math
 import sys
 from pathlib import Path
@@ -70,6 +71,7 @@ def main() -> None:
     # plain same-origin mean (valid basis-wise); factorizable ones go
     # through the latent pipeline below.
     merged = {k: sum(sd[k].float() for sd in sds) / len(sds) for k in sds[0]}
+    noise_stats = {"n_pairs": 0, "cos_sum": 0.0, "coherent_energy": 0.0}
     fibers: dict[str, list] = {}
     total_bits = 0.0
     total_d2 = 0.0
@@ -109,6 +111,23 @@ def main() -> None:
         # P0-2: serialize the R_expert contrast fibers (never compressed)
         # exact ResidualSplit bookkeeping: root + contrast[i] == expert
         fibers[k] = [m.float() for m in rc["contrast_matrices"]]
+        # R255 NoiseDisentangle: split the disagreement by cross-expert
+        # GEOMETRY. Noise is pairwise-orthogonal (mean |cos(d_i,d_j)| ~ 0,
+        # averaging kills it 1/N); useful disagreement is coherent (lives
+        # in the aligned fiber basis). Track both energies per tensor.
+        dl = [sd[k].double().flatten() - W_shared.flatten() for sd in sds]
+        n_exp = len(dl)
+        coses = []
+        for i in range(n_exp):
+            for j in range(i + 1, n_exp):
+                num = float(torch.dot(dl[i], dl[j]))
+                den = float(dl[i].norm() * dl[j].norm()) + 1e-30
+                coses.append(abs(num) / den)
+        noise_stats["n_pairs"] += len(coses)
+        noise_stats["cos_sum"] += sum(coses)
+        noise_stats["coherent_energy"] += float(
+            sum(c for c in coses)
+        ) * float(dl[0].norm() ** 2) / max(len(coses), 1)
         d_out, d_in = W_shared.shape
         r = Ur.shape[1]
         total_bits += math.log2(3) * (d_out + d_in) * r + 16 * (d_out + d_in + r)
@@ -133,6 +152,18 @@ def main() -> None:
         "contrast_fibers: saved (R_expert, ResidualSplit)\n",
         encoding="utf-8",
     )
+    mean_cos = noise_stats["cos_sum"] / max(noise_stats["n_pairs"], 1)
+    (OUT / "noise_report.json").write_text(json.dumps({
+        "r255_mean_abs_cos": round(mean_cos, 6),
+        "n_pairs": noise_stats["n_pairs"],
+        "interpretation": (
+            "coherent (useful disagreement dominates -> fibers carry signal)"
+            if mean_cos > 0.2 else
+            "near-orthogonal (noise dominates -> averaging denoises 1/N, "
+            "fibers near-empty; joint ft is the gain carrier)"
+        ),
+    }, indent=2), encoding="utf-8")
+    print(f"R255 mean|cos| of expert deltas: {mean_cos:.4f}")
     print(f"merged tensors: {len(keys)} of {len(sds[0])}")
     print(f"BPW (factorized branch): {bpw:.4f}")
     print(f"fibers saved: {len(fibers)} tensors x {len(LEAVES)} experts")
