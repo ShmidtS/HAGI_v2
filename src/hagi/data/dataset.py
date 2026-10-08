@@ -262,9 +262,14 @@ class PackedMixDataset(IterableDataset):
             window = streams[active[idx]].next_window()
             if window is None:
                 continue
+            # Source tag for domain-level telemetry (TokenWeightBias.lean
+            # [4b]): each packed window comes from exactly ONE source, so the
+            # tag identifies the domain unambiguously. Consumers read it with
+            # .get(); the collated form is a list[str] of length B.
+            source = names[active[idx]]
             input_ids = torch.from_numpy(window[:-1])
             targets = torch.from_numpy(window[1:])
-            item = {"input_ids": input_ids, "targets": targets}
+            item = {"input_ids": input_ids, "targets": targets, "source": source}
             if not self.cross_doc_attention:
                 # A new document starts after each EOS, so the running count of
                 # EOS tokens to the left is the document index. Computed on the

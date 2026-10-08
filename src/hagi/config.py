@@ -751,6 +751,14 @@ class TrainConfig:
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
+    # Consolidation segments (§23 stage [5b], OptimizerStage.lean
+    # gain_chain_opt / any_stage_kills_gain): every ``gate_eval_interval``
+    # steps (the existing saturation/gate cadence — no new knob) reset the
+    # Adam first moments. The measured exp_avg aligns teacher updates
+    # (cos > 0.83) and gases teacher-disagreement; the reset is the
+    # β₁ = 0 / first-moment-reset experiment on the consolidation segment.
+    # Requires logging.gate_eval_interval > 0; default off = zero change.
+    consolidation_segments: bool = False
     muon: MuonConfig = field(default_factory=MuonConfig)
     adam: AdamConfig = field(default_factory=AdamConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -934,6 +942,13 @@ class MergeConfig:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     distill_teacher: str = "self"
+    # §17 Bregman-slice token selection (disagreement_distill): when > 0,
+    # distill only on tokens whose mean pairwise teacher JS exceeds this
+    # batch quantile. 0 (default) disables -- the historical uniform KD.
+    # Consumed by the distill lane config derivation
+    # (growth_supervisor.make_distill_config); the training-loop consumer
+    # is forward-declared alongside distill_mode.
+    distill_disagreement_quantile: float = 0.0
 
 
 # Outer ternary lifts available to the recursive ``ternary_f3`` body. The
@@ -963,6 +978,24 @@ class InferenceConfig:
 
 
 @dataclass
+class RouterConfig:
+    """§6 inference router switches (Hedge + tail budget).
+
+    ``hedge`` (default OFF) enables the Hedge router over ensemble
+    leaves at generation time. HONEST SKIP NOTE: the merged model
+    (``MergedHAGI``) does not expose per-leaf logits -- the block-
+    diagonal body feeds ONE wide head -- and computing them would need
+    K extra head+tail forwards per token, which the flag refuses to do
+    silently. When enabled but per-leaf logits are unavailable, the
+    router (``hagi.inference.hedge_router``) logs a skip note and falls
+    back to the merged head's logits unchanged.
+    """
+
+    hedge: bool = False
+    eps_route: float = 0.01
+
+
+@dataclass
 class Config:
     """Top-level configuration."""
 
@@ -970,6 +1003,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    router: RouterConfig = field(default_factory=RouterConfig)
 
 
 def _round_up(value: int, multiple: int) -> int:

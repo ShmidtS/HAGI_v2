@@ -43,6 +43,76 @@ from hagi.train.safeqp_controller import corpus_grad_gram
 logger = logging.getLogger(__name__)
 
 
+def token_weight_decomposition(samples: list[tuple[float, float]]) -> dict:
+    """Exact token-weighting bias identity (TokenWeightBias.lean
+    ``token_weight_decomposition``, Eq. 5):
+
+        (Σ T_i g_i) / (Σ T_i) = ḡ + Cov(T, g) / T̄
+
+    A finite identity, no asymptotics: the token-weighted mean equals the
+    plain domain mean plus the covariance bias. Equal prompt counts do NOT
+    certify equal domain weights; only zero Cov(T, g) does
+    (``zero_bias_iff_uncorrelated``). Pure measurement — the caller never
+    changes actual weighting on the strength of this number.
+
+    Args:
+        samples: observed ``(T_i, g_i)`` pairs (token counts and gradient
+            norms per domain over the accumulation window).
+
+    Returns:
+        Dict with ``weighted_mean``, ``mean``, ``cov_Tg_over_Tbar`` and the
+        raw pieces; empty when fewer than two samples or ΣT = 0.
+    """
+    n = len(samples)
+    if n < 2:
+        return {}
+    total_t = sum(t for t, _ in samples)
+    if total_t <= 0:
+        return {}
+    t_bar = total_t / n
+    g_bar = sum(g for _, g in samples) / n
+    cov = sum((t - t_bar) * (g - g_bar) for t, g in samples) / n
+    weighted = sum(t * g for t, g in samples) / total_t
+    return {
+        "weighted_mean": weighted,
+        "mean": g_bar,
+        "cov_Tg_over_Tbar": cov / t_bar,
+        "cov_Tg": cov,
+        "T_bar": t_bar,
+        "n_domains": n,
+    }
+
+
+class TokenWeightBiasMeter:
+    """Accumulates per-domain ``(T_i, g_i)`` over a logging window.
+
+    §23 stage [4b]: per step, each domain's scored token count is summed into
+    ``T_i`` and the step's AdamW-group gradient norm (the group the optimizer
+    chain of OptimizerStage.lean is about) is averaged into ``g_i`` for every
+    domain that contributed a microbatch that step. :meth:`take` then evaluates
+    the exact ``token_weight_decomposition`` identity on those samples.
+    """
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, float] = {}
+        self._grad_acc: dict[str, list[float]] = {}
+
+    def add(self, domain: str, tokens: float, grad_norm: float) -> None:
+        self._tokens[domain] = self._tokens.get(domain, 0.0) + float(tokens)
+        self._grad_acc.setdefault(domain, []).append(float(grad_norm))
+
+    def take(self) -> dict:
+        samples = [
+            (self._tokens[d], sum(gs) / len(gs))
+            for d, gs in self._grad_acc.items()
+            if self._tokens.get(d, 0.0) > 0
+        ]
+        result = token_weight_decomposition(samples)
+        self._tokens.clear()
+        self._grad_acc.clear()
+        return result
+
+
 def puncture_loss_mask(
     shape: tuple[int, ...],
     *,
@@ -917,6 +987,7 @@ class Trainer:
         prepared: list[tuple[dict, torch.Tensor, torch.Tensor]] = []
         token_counts: list[torch.Tensor] = []
         decision_counts: list[torch.Tensor] = []
+        domain_tokens: dict[str, int] = {}
         for batch in microbatches:
             ids = batch["input_ids"].to(device)
             targets = batch["targets"].to(device) if "targets" in batch else None
@@ -967,6 +1038,22 @@ class Trainer:
                 decision_count = torch.zeros((), device=device, dtype=torch.int64)
             token_counts.append(count)
             decision_counts.append(decision_count)
+            # [4b] telemetry: per-domain scored token counts. Each packed
+            # window is one source; the collated "source" field is list[str]
+            # of length B (or a bare str for unbatched items). Untagged
+            # batches (tests, decision-only) contribute nothing.
+            srcs = batch.get("source")
+            if srcs is not None:
+                if isinstance(srcs, str):
+                    domain_tokens[srcs] = domain_tokens.get(srcs, 0) + int(count)
+                elif isinstance(srcs, (list, tuple)) and targets is not None:
+                    if mask is not None:
+                        rows = mask.sum(dim=1).tolist()
+                    else:
+                        rows = [targets.shape[1]] * targets.shape[0]
+                    for src, rc in zip(srcs, rows):
+                        if isinstance(src, str):
+                            domain_tokens[src] = domain_tokens.get(src, 0) + int(rc)
             prepared.append(
                 (
                     {
@@ -1230,6 +1317,7 @@ class Trainer:
             "muon_lr": muon_lr,
             **analytic_metrics,
             "tokens": int(tokens_value),
+            "domain_tokens": domain_tokens,
             "n_decisions": int(decisions_value),
             "decision_loss": decision_value if decisions_value > 0 else None,
             "ce_keep_rate": keep_rate,
@@ -1392,6 +1480,10 @@ def train(
     # ce, which drifts with the data stream (round-54 false-alarm lesson).
     gate_interval = int(cfg.train.logging.gate_eval_interval)
     gate_batches: list | None = None
+    # [4b] token-weight bias telemetry (TokenWeightBias.lean
+    # token_weight_decomposition): per-domain (T_i, g_i) over each logging
+    # window; log-only, the actual weighting is never modified.
+    bias_meter = TokenWeightBiasMeter()
     # T5 collapse monitor state: H_data is window-fixed (computed once on
     # first gate pass); the per-pass report (floor/margin/collapsed) rides
     # in ``metrics`` and the state dict, log-only -- never a stop condition
@@ -1513,6 +1605,42 @@ def train(
             # in the log file from the first interval on.
             logger.info("%s", format_metrics(metrics))
             yield metrics
+
+        # [4b]: evaluate the exact identity on the window's (T_i, g_i)
+        # samples. g_i is the step's AdamW-group (rest) pre-clip gradient
+        # norm — the group the OptimizerStage chain is about — averaged over
+        # the steps each domain contributed. Pure instrumentation.
+        if metrics.get("update_applied", True) and metrics.get("domain_tokens"):
+            gnorm = metrics.get("rest_grad_norm")
+            if isinstance(gnorm, float) and math.isfinite(gnorm):
+                for domain, toks in metrics["domain_tokens"].items():
+                    bias_meter.add(domain, toks, gnorm)
+            if step_index % max(1, cfg.train.logging.log_interval) == 0:
+                bias = bias_meter.take()
+                if bias:
+                    metrics["token_weight_bias"] = bias
+                    logger.info(
+                        "token_weight_bias: cov_Tg_over_Tbar=%.6e (domain drift)",
+                        bias["cov_Tg_over_Tbar"],
+                    )
+
+        # Consolidation segment boundary (§23 [5b], OptimizerStage.lean
+        # gain_chain_opt / any_stage_kills_gain): at the existing gate
+        # cadence, reset the Adam first moments. The measured exp_avg
+        # aligns teacher updates and gases teacher-disagreement; the reset
+        # is the prescribed β₁=0 regime on the consolidation segment.
+        if (
+            bool(getattr(cfg.train, "consolidation_segments", False))
+            and gate_interval > 0
+            and trainer.step % gate_interval == 0
+            and trainer.step > 0
+        ):
+            from hagi.train.optim import reset_adam_first_moments
+
+            reset_adam_first_moments(trainer.optimizer)
+            logger.info(
+                "consolidation reset: step=%d (beta1 state cleared)", trainer.step
+            )
 
         # Fixed-window gate CE: the STABLE control signal for divergence and
         # saturation diagnosis (and for the T* fit -- traininfer_critical).
