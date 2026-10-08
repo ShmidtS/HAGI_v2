@@ -40,10 +40,18 @@ def _config_sets_init_from() -> bool:
 
 
 def _run_dry(args: list[str]) -> str:
+    # The child writes em-dashes (logging) and a cp1251 host locale (the
+    # default on a Windows box without PYTHONIOENCODING/utf-8 mode) would
+    # encode them outside UTF-8, crashing the text-mode reader thread and
+    # leaving out.stderr=None. Pin the child to UTF-8 both ways.
+    import os
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     out = subprocess.run(
         [sys.executable, str(TRAIN), "--config", CFG, *args,
          "--device", "cpu", "--dry-run"],
-        cwd=ROOT, capture_output=True, text=True, timeout=600,
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=600, env=env,
     )
     return out.stdout + out.stderr
 
