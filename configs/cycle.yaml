@@ -50,7 +50,10 @@ model:
 train:
   max_steps: 1300
   precision: bf16
-  grad_checkpointing: false
+  # Включено (2026-10-08): стационарный по ширине цикл §17/R134 —
+  # merged/joint 10368 впритык к VRAM; град-чекпойнтинг режет пик
+  # активаций (~ценой ~30% времени) и даёт запас на весь цикл.
+  grad_checkpointing: true
   ternary_fp32_master: false
   batch_size: 32
   grad_accum_steps: 1
