@@ -38,15 +38,21 @@ from hagi.model.latent_merge import (  # noqa: E402
 from hagi.train.merge_price import merge_gate  # noqa: E402
 from hagi.train.checkpoint import CHECKPOINT_FORMAT_VERSION  # noqa: E402
 
-LEAVES = [
+import argparse
+_ap = argparse.ArgumentParser(add_help=False)
+_ap.add_argument("--leaves", nargs="+", default=[
     "checkpoints/latent_leaf_math/best.pt",
     "checkpoints/latent_leaf_lang/best.pt",
     "checkpoints/latent_leaf_code/best.pt",
-]
-SHARED_INIT = "checkpoints/latent_shared_init/init.pt"
+])
+_ap.add_argument("--shared-init", default="checkpoints/latent_shared_init/init.pt")
+_ap.add_argument("--out", default=None)
+_args, _ = _ap.parse_known_args()
+LEAVES = _args.leaves
+SHARED_INIT = _args.shared_init
+OUT = Path(_args.out) if _args.out else ROOT / "checkpoints" / "latent_gen1_root"
 ENERGY = 0.98
 ROOT_ENERGY = 0.99
-OUT = ROOT / "checkpoints" / "latent_gen1_root"
 
 
 def is_factorizable(name: str, t: torch.Tensor) -> bool:
