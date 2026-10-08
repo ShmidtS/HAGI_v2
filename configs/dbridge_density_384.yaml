@@ -1,0 +1,93 @@
+# L3 density ladder (§17/R134 reverse): teacher = L2 distillate (1152),
+# student at the historical gen1 width H=384 (q6/kv3). No same-width
+# prior checkpoint exists on disk -> fresh init; the teacher signal is
+# the only source (Hagi.Data/Distill: the distillable gap is exactly
+# KL(p_E || p_theta), nothing measured forbids an H=384 student there).
+model:
+  vocab_size: 32768
+  hidden_size: 384
+  num_layers: 3
+  loop_depth: 1
+  init_seed: 14712
+  attention:
+    num_query_heads: 6
+    num_kv_heads: 3
+    head_dim: 64
+    rope_theta: 3000.0
+    sink_len: 4
+    max_seq_len: 4096
+  embedding:
+    tie_lm_head: false
+    conv_kernel: 1
+  ternary:
+    enabled: false
+  ffn:
+    expansion: 1.0
+  head:
+    unigram_prior: false
+    sampled_proposal: uniform
+    fused_ce: true
+  cortex:
+    enabled: false
+  adapters:
+    enabled: false
+  decision:
+    enabled: false
+train:
+  max_steps: 1300
+  checkpoint_interval: 400
+  checkpoint_keep_last: 3
+  precision: bf16
+  grad_checkpointing: false
+  ternary_fp32_master: false
+  batch_size: 32
+  grad_accum_steps: 1
+  compile_model: true
+  # lr from the stable band H*lr 0.35-0.38: 0.35/384
+  learning_rate: 0.0009114583333333334
+  use_muon: true
+  zero_init_proj: false
+  adam:
+    weight_decay: 0.3
+  schedule:
+    warmup_steps: 40
+  saturation_patience: 8
+  saturation_tol: 0.01
+  saturation_min_steps: 200
+  divergence_patience: 3
+  divergence_delta: 0.15
+  divergence_min_steps: 150
+  logging:
+    log_interval: 10
+    diag_interval: 100
+    gate_eval_interval: 50
+  checkpoint_dir: checkpoints/dbridge_density_384
+  data:
+    data_dir: data
+    seq_len: 1024
+    seed: 14712
+    weights:
+      edu: 0.3179
+      python_instruct: 0.1631
+      wikipedia_en: 0.0796
+      wikipedia_ru: 0.0637
+      oscar_ru: 0.0557
+      openwebmath: 0.0796
+      slimpajama: 0.145
+      tinystories: 0.0477
+      smoltalk: 0.0477
+merge:
+  enabled: false
+  norm_block_dim: 128
+  n_mixers: 1
+  mixer_type: hadamard
+  n_experts: 0
+  expert_hidden: 0
+  mixer_init_scale: 0.0
+  mixer_rank: 64
+  freeze_experts: false
+  expert_weight_source: effective_sparse
+  distill: true
+  distill_teacher: checkpoints/dbridge_density_1152/best.pt
+  distill_alpha: 0.5
+  distill_temperature: 1.0
