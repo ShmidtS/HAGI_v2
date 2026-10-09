@@ -485,3 +485,33 @@ freeze_experts src/hagi` находил ровно два совпадения: 
 5. Отбор кандидатов по diversity (Fisher/Jensen), не по standalone CE.
 6. Иерархия каналов: специализация → merge → коммуникация → joint →
    low-rank residual.
+
+## Growth ladder (autonomous, certified)
+
+Same-origin leaves -> gated latent merge (R242/R243, merge_gate §3)
+-> joint fine-tune -> WSqD cooldown (R254) -> §9 certified accept.
+Drivers: `scripts/growth/growth_cycle.py` (one generation),
+`run_ladder.py` (multi-generation, halts on the first
+non-certified generation). Ladder log:
+`checkpoints/growth_ladder.jsonl`.
+
+| stage | AVG exact CE (common protocol) |
+|---|---|
+| gen-1 leaves (mean) | 7.74 |
+| gen-1 ft root | 6.690 |
+| gen-3 ft | 5.911 |
+| gen-6 | 5.663 |
+| gen-11 + halt | 5.415 |
+| + WSqD cooldown | 5.385 |
+| gen-13 (4 experts) | 5.319 |
+| gen-16 (6 experts, +0.016 < margin) | 5.304* |
+
+*rejected by the 0.02 §9 margin — the honest incumbent is 5.319.
+
+Floor analysis (R255): late-generation disagreement is
+near-orthogonal noise (mean|cos| ~ 0.1); averaging denoises 1/N,
+the joint-ft contraction converts the residue, and the floor
+r/(1-kappa) is reached. Batch-64 leaves NaN on the iGPU — the
+noise floor is hardware-bound. Next architectural lever per
+theory: latent-rank growth (R242 sub-1-BPW) — wider H is
+forbidden.
