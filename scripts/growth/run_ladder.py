@@ -25,7 +25,18 @@ def incumbent_root(before_gen: int) -> str | None:
     entries = [json.loads(l) for l in
                LADDER.read_text(encoding="utf-8").strip().splitlines()]
     acc = [e for e in entries if e.get("accepted") and e["gen"] < before_gen]
-    return f"checkpoints/gen{acc[-1]['gen']}_root_ft/best.pt" if acc else None
+    if not acc:
+        return None
+    # The TRUE incumbent is the accepted candidate (may be a cooldown
+    # checkpoint, not the ft best) — reading the ladder's candidate field,
+    # not a filename pattern. gen-14 was judged against the wrong root
+    # before this fix.
+    e = acc[-1]
+    cand = e.get("candidate")
+    if cand:
+        p = Path(cand)
+        return str(p.relative_to(ROOT)) if p.is_absolute() else cand
+    return f"checkpoints/gen{e['gen']}_root_ft/best.pt"
 
 
 def derive(gen: int, root_ckpt: str) -> None:
