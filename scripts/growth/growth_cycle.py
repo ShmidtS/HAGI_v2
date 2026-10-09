@@ -36,11 +36,12 @@ ROOT = Path(__file__).resolve().parents[2]
 LADDER = ROOT / "checkpoints" / "growth_ladder.jsonl"
 
 
-def consumed_offset() -> int:
-    """Tokens consumed by the corpus so far (fresh-data injection: the
-    next generation reads FURTHER, not the same batches from 0 —
-    stop_condition's 'inject data' lever)."""
-    p = ROOT / "checkpoints" / "consumed.json"
+def consumed_offset(leaf_dir: Path) -> int:
+    """Per-leaf fresh-data injection: the next generation of the SAME
+    mix continues where the previous leaf stopped (its own consumed.json
+    — the global one is meaningless across different mixes). Falls back
+    to 0 on the first generation."""
+    p = leaf_dir / "consumed.json"
     if p.exists():
         try:
             return int(json.loads(p.read_text(encoding="utf-8"))["consumed_tokens"])
@@ -92,10 +93,18 @@ def main() -> int:
             print(f"[gen{g}] leaf {d}: best.pt exists — skip")
             continue
         cfg = args.leaf_config.format(d=d)
-        rc = sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
-                 "--config", cfg, "--checkpoint-dir", str(leaf_dir),
-                 "--log-dir", str(leaf_dir / "logs"),
-                 "--start-offset", str(consumed_offset())], leaf_dir / "cycle.log")
+        def _leaf_run(offset: int) -> int:
+            return sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
+                       "--config", cfg, "--checkpoint-dir", str(leaf_dir),
+                       "--log-dir", str(leaf_dir / "logs"),
+                       "--start-offset", str(offset)], leaf_dir / "cycle.log")
+
+        rc = _leaf_run(consumed_offset(leaf_dir))
+        if rc != 0 and (leaf_dir / "best.pt").exists() is False and                 "exceeds sealed budget" in (leaf_dir / "cycle.log").read_text(encoding="utf-8", errors="replace")[-4000:]:
+            # The mix's sealed budget is smaller than the cumulative offset
+            # (the corpus was already wrapped): restart the generation's
+            # leaf from 0 — the wrap means the data is exhausted anyway.
+            rc = _leaf_run(0)
         if rc != 0:
             print(f"[gen{g}] leaf {d} FAILED rc={rc} — halting")
             return rc

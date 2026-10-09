@@ -28,7 +28,11 @@ model:
   cortex:
     enabled: false
   adapters:
-    enabled: false
+    enabled: true
+    ttt_lora:
+      enabled: true
+      rank: 32
+      alpha: 16.0
   decision:
     enabled: false
 merge:
