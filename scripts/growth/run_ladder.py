@@ -75,7 +75,8 @@ def main() -> int:
              "--root", root_ckpt,
              "--leaf-config", f"configs/gen{gen}_leaf_{{d}}.yaml",
              "--ft-config", f"configs/gen{gen}_root_ft.yaml",
-             "--common-config", f"configs/gen{gen}_root_ft.yaml"],
+             "--common-config", f"configs/gen{gen}_root_ft.yaml",
+             "--domains", *args.domains],
             cwd=str(ROOT)).returncode
         if rc != 0 or not accepted_last():
             print(f"ladder halted at gen {gen} (rc={rc})")
