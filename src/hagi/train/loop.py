@@ -1472,6 +1472,7 @@ def train(
     div_delta = float(cfg.train.divergence_delta)
     div_min_steps = int(cfg.train.divergence_min_steps)
     min_run_ce: float | None = None
+    last_gate_ce: float | None = None
     diverged_count = 0
 
     # Fixed-window gate evaluation (round 61): deterministic tail-window
@@ -1747,12 +1748,36 @@ def train(
                     )
                     break
 
-        # Divergence guard on the running ce (logged every interval, unlike
-        # exact_ce). Stops the run before divergence burns the remaining GPU
-        # budget; the last good checkpoint stays from checkpoint_interval.
-        div_key = "gate_ce" if gate_interval > 0 and "gate_ce" in metrics else "ce"
-        if div_patience > 0 and div_key in metrics and trainer.step >= div_min_steps:
-            run_ce = float(metrics[div_key])
+        # Divergence guard on the GATE CE (fixed window, stable) — never the
+        # per-batch "ce": on a multi-domain mix the batch CE swings >0.3 nats
+        # batch-to-batch (RU vs smoltalk), and the guard misfires ~step 180-
+        # 210 killing healthy runs (observed on gen22-27 ft runs). metrics
+        # only carries gate_ce on gate steps; carry it forward between them.
+        div_key = "gate_ce" if gate_interval > 0 else "ce"
+        if "gate_ce" in metrics:
+            last_gate_ce = float(metrics["gate_ce"])
+        if div_patience > 0 and div_key == "gate_ce" and last_gate_ce is not None:
+            if div_min_steps <= trainer.step:
+                run_ce = last_gate_ce
+                if min_run_ce is None or run_ce < min_run_ce:
+                    min_run_ce = run_ce
+                    diverged_count = 0
+                elif run_ce > min_run_ce + div_delta:
+                    diverged_count += 1
+                    if diverged_count >= div_patience:
+                        logger.warning(
+                            "divergence: gate_ce %.4f exceeds running min %.4f by >%.2f for %d samples; stopping at step %d",
+                            run_ce,
+                            min_run_ce,
+                            div_delta,
+                            div_patience,
+                            trainer.step,
+                        )
+                        break
+                else:
+                    diverged_count = 0
+        elif div_patience > 0 and div_key == "ce" and "ce" in metrics and trainer.step >= div_min_steps:
+            run_ce = float(metrics["ce"])
             if min_run_ce is None or run_ce < min_run_ce:
                 min_run_ce = run_ce
                 diverged_count = 0
