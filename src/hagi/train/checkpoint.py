@@ -137,8 +137,17 @@ def load_model(
             f"{type(model).__name__!r}; rebuild with build_model_from_payload"
         )
     if skip_prefixes:
-        incoming = {k: v for k, v in incoming.items() if not k.startswith(skip_prefixes)}
-        current = {k: v for k, v in current.items() if not k.startswith(skip_prefixes)}
+        # A prefix matches with startswith; an entry wrapped in dots (e.g.
+        # ``".adapters."``) matches ANYWHERE in the key — the rank-growth
+        # path (R242): a target that enables adapters the source never had
+        # keeps its fresh zero-initialized contour while the base transfers.
+        def _skip(k: str) -> bool:
+            return k.startswith(skip_prefixes) or any(
+                p in k for p in skip_prefixes if p.startswith(".") and p.endswith(".")
+            )
+
+        incoming = {k: v for k, v in incoming.items() if not _skip(k)}
+        current = {k: v for k, v in current.items() if not _skip(k)}
     missing = sorted(set(current) - set(incoming))
     unexpected = sorted(set(incoming) - set(current))
     if missing or unexpected:
