@@ -432,8 +432,12 @@ def main() -> int:
             # function of the corpus (unigram_path), not learned state -- a target
             # that enables the prior rebuilds it from its own config, and a prior
             # without it must not inherit a stale one (round-28 NCE A/B).
+            # ``.adapters.`` keys too when the TARGET enables adapters the
+            # source never had (rank growth, R242): the zero-initialized
+            # adapter contour stays fresh and the base body transfers.
             _, _ = load_model(
-                path, model, str(device), skip_prefixes=("mixers.", "head.log_prior"),
+                path, model, str(device),
+                skip_prefixes=("mixers.", "head.log_prior", ".adapters."),
                 lenient_config=True,
             )
             logger.info("initialized weights from %s (fresh optimizer, step 0)", path)
