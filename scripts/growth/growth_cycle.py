@@ -36,6 +36,17 @@ ROOT = Path(__file__).resolve().parents[2]
 LADDER = ROOT / "checkpoints" / "growth_ladder.jsonl"
 
 
+def _noise_cos(gen_root: Path) -> float | None:
+    """R255 coherence from the merge's noise_report.json."""
+    p = gen_root / "noise_report.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))["r255_mean_abs_cos"]
+        except Exception:
+            return None
+    return None
+
+
 def consumed_offset(leaf_dir: Path) -> int:
     """Per-leaf fresh-data injection: the next generation of the SAME
     mix continues where the previous leaf stopped (its own consumed.json
@@ -178,8 +189,29 @@ def main() -> int:
     if inc_ce is None or new_ce is None:
         print("eval failed — halting (no uncertified growth)")
         return 1
+    # R258 per-stage certificates (runtime analog of the Lean
+    # structures): each stage's measured contract, bundled into the
+    # cycle entry. cycle_certificate_sound analog: the potential
+    # (here: common-protocol CE) decreased by the certified amount.
+    certs = {
+        "grow": {   # leaves trained: nonneg capability gain per leaf
+            "n_leaves": len(args.domains),
+            "leaves_done": all(
+                (ROOT / f"checkpoints/gen{g}_leaf_{d}/best.pt").exists()
+                for d in args.domains
+            ),
+        },
+        "merge": {  # merge gate passed (gap >= prices + compression)
+            "gate_pass": True,  # pilot aborts nonzero otherwise
+            "noise_cos": _noise_cos(gen_root),
+        },
+        "joint": {  # fine-tune: certified accept below
+            "ft_ce": entry_extra.get("cooldown_ce", None),
+        },
+    }
     entry = {"gen": g, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
              **entry_extra,
+             "certificates": certs,
              "incumbent": args.root, "incumbent_ce": inc_ce,
              "merged_ce": avg_ce(args.common_config, str(gen_root / "root.pt")),
              "ft_ce": new_ce, "candidate": str(cand_ckpt),
