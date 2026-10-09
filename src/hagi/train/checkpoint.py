@@ -154,11 +154,33 @@ def load_model(
         raise _fail(
             f"state_dict does not match the model: missing {missing[:8]}, unexpected {unexpected[:8]}"
         )
-    mismatched = [
-        f"{name}: checkpoint {tuple(incoming[name].shape)} vs model {tuple(current[name].shape)}"
-        for name in current
-        if incoming[name].shape != current[name].shape
-    ]
+    # R242 rank growth: a lora_B whose checkpoint rank is SMALLER than the
+    # model's is zero-PADDED (the old contour transfers exactly, the new
+    # directions start at zero — capacity grows, behavior unchanged at
+    # step 0). lora_A shrinks row-wise symmetrically (A is [r, H]).
+    mismatched = []
+    for name in current:
+        ci, cu = incoming.get(name), current[name]
+        if ci.shape == cu.shape:
+            continue
+        if (
+            name.endswith("lora_B") and ci.shape[0] == cu.shape[0]
+            and ci.shape[1] < cu.shape[1]
+        ):
+            pad = torch.zeros_like(cu)
+            pad[:, : ci.shape[1]] = ci
+            incoming[name] = pad
+        elif (
+            name.endswith("lora_A") and ci.shape[0] < cu.shape[0]
+            and ci.shape[1] == cu.shape[1]
+        ):
+            pad = torch.zeros_like(cu)
+            pad[: ci.shape[0], :] = ci
+            incoming[name] = pad
+        else:
+            mismatched.append(
+                f"{name}: checkpoint {tuple(ci.shape)} vs model {tuple(cu.shape)}"
+            )
     if mismatched:
         raise _fail(f"tensor shapes differ: {mismatched[:8]}")
 
