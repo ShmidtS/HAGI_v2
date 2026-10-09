@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LADDER = ROOT / "checkpoints" / "growth_ladder.jsonl"
-DOMAINS = ["math", "lang", "code"]
+DOMAINS = ["math", "code", "ru", "enedu", "enweb", "enwiki"]
 
 
 def incumbent_root(before_gen: int) -> str | None:
@@ -39,15 +39,15 @@ def incumbent_root(before_gen: int) -> str | None:
     return f"checkpoints/gen{e['gen']}_root_ft/best.pt"
 
 
-def derive(gen: int, root_ckpt: str) -> None:
+def derive(gen: int, root_ckpt: str, domains: list[str]) -> None:
     prev = gen - 1
-    for d in DOMAINS:
+    for d in domains:
         s = (ROOT / f"configs/gen{prev}_leaf_{d}.yaml").read_text(encoding="utf-8")
-        s = re.sub(r"init_from:.*", f"init_from: {root_ckpt}", s, count=1)
-        s = re.sub(r"checkpoint_dir:.*", f"checkpoint_dir: checkpoints/gen{gen}_leaf_{d}", s, count=1)
+        s = re.sub(r"init_from:.*", lambda _m: f"init_from: {root_ckpt}", s, count=1)
+        s = re.sub(r"checkpoint_dir:.*", lambda _m: f"checkpoint_dir: checkpoints/gen{gen}_leaf_{d}", s, count=1)
         (ROOT / f"configs/gen{gen}_leaf_{d}.yaml").write_text(s, encoding="utf-8")
     s = (ROOT / f"configs/gen{prev}_root_ft.yaml").read_text(encoding="utf-8")
-    s = re.sub(r"init_from: checkpoints/\S+", f"init_from: checkpoints/gen{gen}_root/root.pt", s, count=1)
+    s = re.sub(r"init_from: checkpoints/\S+", lambda _m: f"init_from: checkpoints/gen{gen}_root/root.pt", s, count=1)
     (ROOT / f"configs/gen{gen}_root_ft.yaml").write_text(s, encoding="utf-8")
 
 
@@ -59,6 +59,7 @@ def accepted_last() -> bool:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--from-gen", type=int, required=True)
+    p.add_argument("--domains", nargs="+", default=DOMAINS)
     p.add_argument("--max-gen", type=int, default=99)
     args = p.parse_args()
     gen = args.from_gen
@@ -67,13 +68,14 @@ def main() -> int:
         if root_ckpt is None:
             print("no incumbent root — cannot start")
             return 1
-        derive(gen, root_ckpt)
+        derive(gen, root_ckpt, args.domains)
         rc = subprocess.run(
             [sys.executable, "-X", "utf8", "-u",
              "scripts/growth/growth_cycle.py", "--gen", str(gen),
              "--root", root_ckpt,
              "--leaf-config", f"configs/gen{gen}_leaf_{{d}}.yaml",
-             "--ft-config", f"configs/gen{gen}_root_ft.yaml"],
+             "--ft-config", f"configs/gen{gen}_root_ft.yaml",
+             "--common-config", f"configs/gen{gen}_root_ft.yaml"],
             cwd=str(ROOT)).returncode
         if rc != 0 or not accepted_last():
             print(f"ladder halted at gen {gen} (rc={rc})")
