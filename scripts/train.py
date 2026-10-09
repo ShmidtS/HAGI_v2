@@ -435,9 +435,18 @@ def main() -> int:
             # ``.adapters.`` keys too when the TARGET enables adapters the
             # source never had (rank growth, R242): the zero-initialized
             # adapter contour stays fresh and the base body transfers.
+            from hagi.train.checkpoint import load_payload
+            _has_adapters = any(
+                ".adapters." in k
+                for k in load_payload(path, "cpu").get("model", {})
+            )
+            _skip = ("mixers.", "head.log_prior")
+            if not _has_adapters:
+                # rank growth (R242): fresh contour for a target with
+                # adapters the source never had
+                _skip = _skip + (".adapters.",)
             _, _ = load_model(
-                path, model, str(device),
-                skip_prefixes=("mixers.", "head.log_prior", ".adapters."),
+                path, model, str(device), skip_prefixes=_skip,
                 lenient_config=True,
             )
             logger.info("initialized weights from %s (fresh optimizer, step 0)", path)

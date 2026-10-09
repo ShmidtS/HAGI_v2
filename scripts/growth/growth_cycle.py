@@ -36,6 +36,19 @@ ROOT = Path(__file__).resolve().parents[2]
 LADDER = ROOT / "checkpoints" / "growth_ladder.jsonl"
 
 
+def consumed_offset() -> int:
+    """Tokens consumed by the corpus so far (fresh-data injection: the
+    next generation reads FURTHER, not the same batches from 0 —
+    stop_condition's 'inject data' lever)."""
+    p = ROOT / "checkpoints" / "consumed.json"
+    if p.exists():
+        try:
+            return int(json.loads(p.read_text(encoding="utf-8"))["consumed_tokens"])
+        except Exception:
+            return 0
+    return 0
+
+
 def sh(cmd: list[str], log: Path) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
@@ -81,7 +94,8 @@ def main() -> int:
         cfg = args.leaf_config.format(d=d)
         rc = sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
                  "--config", cfg, "--checkpoint-dir", str(leaf_dir),
-                 "--log-dir", str(leaf_dir / "logs")], leaf_dir / "cycle.log")
+                 "--log-dir", str(leaf_dir / "logs"),
+                 "--start-offset", str(consumed_offset())], leaf_dir / "cycle.log")
         if rc != 0:
             print(f"[gen{g}] leaf {d} FAILED rc={rc} — halting")
             return rc
