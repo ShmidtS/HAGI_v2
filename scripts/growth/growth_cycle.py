@@ -62,6 +62,25 @@ def consumed_offset(leaf_dir: Path) -> int:
     return 0
 
 
+def _logit_twoGap(gen: int, domains: list[str]) -> float | None:
+    """Mean pairwise formula-exact logit twoGap of this generation's
+    leaves (math domain, 1 batch, CPU). Advisory certificate — never
+    blocks the cycle. Returns None on any failure."""
+    import subprocess as _sp
+    r = _sp.run(
+        [sys.executable, "-X", "utf8", "-u",
+         str(ROOT / "scripts/growth/measure_logit_twogap.py"),
+         "--gen", str(gen), "--domains", *domains,
+         "--batches", "1", "--domain", "math", "--device", "cpu"],
+        capture_output=True, text=True, cwd=str(ROOT))
+    try:
+        import json as _json
+        d = _json.loads(r.stdout[r.stdout.index("{"):])
+        return d.get("ensemble_mean_twoGap")
+    except Exception:
+        return None
+
+
 def _fiber_ce(config: str, root_pt: str, fibers_pt: str,
               batches: int = 30) -> float | None:
     """AVG exact CE of the R255 fiber ensemble (root + fibers, logit-mean
@@ -265,6 +284,12 @@ def main() -> int:
         "merge": {  # merge gate passed (gap >= prices + compression)
             "gate_pass": True,  # pilot aborts nonzero otherwise
             "noise_cos": _noise_cos(gen_root),
+            # R258-style formula-exact merge certificate: the Lean
+            # GapLaw twoGap (½·log ΣΣ p_u p_v cosh(d_u−d_v), measured
+            # on leaf logits via the O(V) factorization). This is the
+            # THEORY quantity; the weight-level gate proxy above stays
+            # the abort condition. None if leaves are unavailable.
+            "logit_twoGap": _logit_twoGap(g, args.domains),
         },
         "joint": {  # fine-tune: certified accept below
             "ft_ce": entry_extra.get("cooldown_ce", None),
