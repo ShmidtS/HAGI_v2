@@ -45,6 +45,45 @@ from hagi.config import AdaptersConfig, PyramidAdapterConfig, TttLoraConfig
 from hagi.model.adaptive import AdaptiveComponent
 
 
+def _nested_lora_basis(
+    hidden_size: int, rank: int, generator: torch.Generator
+) -> torch.Tensor:
+    """NESTED LoRA basis: ``A(r) = Q_full[:, :r]`` from ONE full basis.
+
+    Measured lesson (gen-34): the legacy ``_qr_orthonormal(hidden, r)``
+    draws ``randn(hidden, r)``, and draws of different width from the
+    same seed share NO columns — so the r=32 and r=64 bases were not
+    nested and cross-rank loading of ``lora_B`` was meaningless
+    (silent garbage; see ``.omc/attempts/gen34-rank-growth.md``).
+
+    Here the full basis ``Q [hidden, hidden]`` is built ONCE per seed as
+    ``QR([anchor | randn])`` where ``anchor`` is the legacy r=32 basis
+    (already orthonormal, so QR keeps it verbatim as the leading block).
+    Consequences:
+
+    * ``rank == 32`` reproduces the legacy basis EXACTLY — every
+      existing checkpoint of this line loads bit-compatibly;
+    * ``rank > 32`` strictly EXTENDS it: ``A(64)[:, :32] == A(32)``,
+      so rank growth is function-preserving (with the alpha/r scaling
+      compensated on load, see ``train/checkpoint.py``).
+    """
+    anchor_r = min(32, hidden_size)
+    anchor = _qr_orthonormal(hidden_size, min(rank, anchor_r), generator) \
+        if rank <= anchor_r else _qr_orthonormal(hidden_size, anchor_r, generator)
+    if rank <= anchor_r:
+        return anchor
+    extra = torch.randn(
+        hidden_size, hidden_size - anchor_r, generator=generator, dtype=torch.float32
+    )
+    full = torch.cat([anchor, extra], dim=1)
+    q, _ = torch.linalg.qr(full)
+    # The leading anchor block is already orthonormal: restore it verbatim
+    # in case the QR convention flipped signs on it.
+    q = q.clone()
+    q[:, :anchor_r] = anchor
+    return q[:, :rank]
+
+
 def _qr_orthonormal(
     rows: int,
     cols: int,
@@ -214,7 +253,7 @@ class TttLoraAdapter(nn.Module):
         # A[Fin, r] orthonormal (Fin >= r for the analysis projection).
         self.register_buffer(
             "lora_A",
-            _qr_orthonormal(hidden_size, self.r, generator),
+            _nested_lora_basis(hidden_size, self.r, generator),
             persistent=False,
         )
         # B[Fout, r] with Fout == hidden_size. PEFT layout:

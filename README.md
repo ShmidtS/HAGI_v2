@@ -94,34 +94,24 @@ python -u scripts/train.py --config configs/dbridge_gen1_joint.yaml
 # см. протокол в ARCHITECTURE.md §4
 ```
 
-## Автономный цикл роста
+## Автономный цикл роста (текущий)
 
-Не редактируйте конфиги следующего поколения вручную — геометрия
-наследуется, а не выводится, и два запуска gen-4 подряд падали именно
-на этом. Генерируйте поколение и проверяйте инварианты до запуска:
+Конфиги поколений НЕ живут в `configs/` и не редактируются руками —
+их генерирует SSOT-билдер `scripts/growth/gen_configs.py` (один шаблон
++ пер-доменные overrides: миксы, регуляризация, бюджеты шагов, схема
+seed'ов) прямо в `checkpoints/gen<N>/configs/`. `configs/` сокращён
+до 8 живых файлов (cycle, dbridge, latent-шаблоны, фикстура).
 
 ```bash
-# 1. сгенерировать поколение (проверит q*head_dim == hidden_size)
-python scripts/make_generation.py --parent-width 1152 --generation 5 \
-    --n-experts 3 --head-dim 64 --learning-rate 0.0003 \
-    --parent-joint checkpoints/dbridge_gen3_joint/step-0001600.pt \
-    --template-sibling configs/dbridge_gen4_sib1.yaml \
-    --template-merged configs/dbridge_gen4_merged.yaml \
-    --template-joint configs/dbridge_gen4_joint.yaml \
-    --mixes math=13001=openwebmath:0.45,edu:0.25 \
-            lang=13002=wikipedia_ru:0.30,oscar_ru:0.20,edu:0.20 \
-            code=13003=python_instruct:0.50,edu:0.20 \
-    --merge-checkpoint-step 1600 --write
+# 1. сгенерировать конфиги поколения (в checkpoints/gen41/configs/)
+python scripts/growth/gen_configs.py --gen 41     --root checkpoints/gen39_root_ft/best.pt --seed-base 46
 
-# 2. прогнать цикл: 3 эксперта → слияние → joint → оценка
-python scripts/growth/growth_supervisor.py --plan configs/growth_gen5.yaml \
-    --device cuda --max-lanes 1
+# 2. одно поколение: 6 листьев → latent merge → root ft → cooldown →
+#    §9 certified A/B (останов, если не сертифицировано)
+python -X utf8 -u scripts/growth/growth_cycle.py --gen 41     --root checkpoints/gen39_root_ft/best.pt     --leaf-config "checkpoints/gen41/configs/leaf_{d}.yaml"     --ft-config checkpoints/gen41/configs/root_ft.yaml     --common-config checkpoints/gen41/configs/root_ft.yaml     --domains math code ru enedu enweb enwiki
 
-# 3. измерить рост / универсальность / качество слияния
-python scripts/growth_benchmark.py \
-    --gen  gen5_joint=configs/dbridge_gen5_joint.yaml=<ckpt> \
-    --prev gen3_joint=configs/dbridge_gen3_joint.yaml=<ckpt> \
-    --expert math=configs/...=<ckpt>   # по одному на эксперта
+# 3. мульти-поколенно (сам делает п.1-2 и останавливается на отказе гейта)
+python -X utf8 scripts/growth/run_ladder.py --from-gen 41
 ```
 
 `--learning-rate` обязателен: значение **не масштабно-инвариантно**.
@@ -194,22 +184,25 @@ L2-дистиллят      → дистилл → студент 384  (fresh, q6
 | Модуль | Теорема | Что заменяет |
 |---|---|---|
 | `train/analytic_step.py` | `optimal_step_unconstrained` | η\* = ⟨g,d⟩/(L‖d‖²) вместо `lr` |
-| `train/stochastic_safeqp.py` | R92 `minibatch_inner_concentration` | полные градиенты → минибатчи с явным ε |
-| `train/anytime_budget.py` | R93 (неравенство Вилля) | δ на каждый шаг → один δ на горизонт |
-| `train/growth_law.py` | R95/R96 `success_count_lower`, `takeoff_time_form` | вероятностный takeoff из измеренных полей |
 | `train/hedge.py` | `router_regret_bound`, `gating_tail_bound` | η = √(2lnK/T), min k по хвосту |
-| `train/data_axis.py` | `diversity_floor_strict_pos` | симуляция пола → замкнутая сумма |
 | `train/spectral.py` | R100 `proj_residual_identity`, `three_stage_error_budget` | ошибка сжатия раскладывается на именованные члены |
 | `train/takeoff_window.py` | R102 `growth_state_takeoff_window`, `noisy_cycle_step` | фиксированный gain даёт **конечный** takeoff; `κ√n·s/2` |
-| `train/ternary_exact.py` | R103 `ternary_split_bound`, `quant_energy_bridge_saturation` | хвост насыщения измеряется, а не предполагается |
 | `train/gain_renewal.py` | R104 `renewal_feeds_takeoff`, `bounded_frontier_no_sustained_growth` | sustained growth ⟺ фронтир масштабируется |
-| `train/routing_optimal.py` | R94 `topk_routing_optimal`, `geometric_pool_identity_nonneg` | top-k оптимален; пулинг стоит `−log Z ≥ 0` |
 | `train/safeqp_step.py` | R105 `safeqp_eta_max`, R106 `poe_logZ_second_order` | **производный** безопасный LR; ошибка PoE-пулинга ≤ `R²/8` |
+
+(Порты R92–R94, R95/R96, R103 — stochastic_safeqp, anytime_budget,
+growth_law, data_axis, ternary_exact, routing_optimal — перенесены в
+`_raw/attic/`, см. ниже.)
 
 Модули с отрицательным результатом и теоретические порты без
 продакшн-потребителя (adaptive_safeqp, batch_law, controller_policy,
 insight_currency, synthetic_pretrain, discovery_ppt, factorized_merge,
-growth_potential, universality, thermo_layer, streaming_gpm и др.)
+growth_potential, universality, thermo_layer, streaming_gpm, а также
+anytime_budget/stochastic_safeqp — сертифицированный anytime-гейт
+живёт в growth_supervisor.anytime_margin, data_axis — совет
+liveness_data_axis в супервизоре, frontier_cone, growth_law,
+routing_optimal, safeqp_gpm, safeqp_pl, ternary_exact, trust_region,
+orchestrator/external_eval, orchestrator/mechanism_gate)
 перенесены в `_raw/attic/` вместе со своими тестами — история в git.
 
 **Измеренные следствия, а не обещания:**
@@ -451,9 +444,10 @@ freeze_experts src/hagi` находил ровно два совпадения: 
 - `src/hagi/train/` — живой рантайм: `loop`, `optim`, `checkpoint`,
   `saturation`, `merge_price`, `distill`/`distill_transfer`/
   `distill_recursion`/`recursive_distill`, `disagreement_distill` (§17),
-  `safeqp_*` (step/controller/gpm/pl/stochastic), `analytic_step`,
-  `certified_controller`, `hedge`, `growth_law`, `spectral`,
-  `self_improve`, `self_development` и др. (полный список — в дереве)
+  `safeqp_*` (step/controller), `analytic_step`,
+  `certified_controller`, `hedge`, `spectral`,
+  `self_improve`, `self_development` и др. (полный список — в дереве;
+  снятые порты — в `_raw/attic/`)
 - `src/hagi/orchestrator/` — real_cycle/recursive/gates (потребители:
   growth_supervisor, merge в `model/merge.py`)
 - `src/hagi/inference/` — `generate`, `hedge_router`
@@ -505,8 +499,24 @@ non-certified generation). Ladder log:
 | + WSqD cooldown | 5.385 |
 | gen-13 (4 experts) | 5.319 |
 | gen-16 (6 experts, +0.016 < margin) | 5.304* |
+| gen-28..32 (fresh seeds + WSqD) | 4.9147 |
+| gen-34 (r64, broken cross-rank load) | 5.093→fixed — NOT certified |
+| gen-35 (nested r64, +0.0186 < margin) | 4.8961* |
+| gen-37 (nested r64, seeds 19xxx) | **4.8346** (accepted, +0.080) |
+| gen-38 (seeds 21xxx, −0.007) | rejected — incumbent gen-37 |
 
-*rejected by the 0.02 §9 margin — the honest incumbent is 5.319.
+*rejected by the 0.02 §9 margin — the honest incumbent is gen-37
+(4.8346).
+
+Rank-growth seam fixed (2026-10-10): lora_A bases are now NESTED
+(`_nested_lora_basis`: r32 bit-compatible with the whole line,
+A(64)[:, :32] == A(32)), cross-rank load compensates alpha/r —
+rank growth is function-preserving (regression-tested; the gen-34
+incident: non-nested bases silently disabled the incumbent's adapters
+and fabricated a +0.179 delta). r96 merge-gate REJECTED (theory §3:
+twoGap does not pay the factorization price) — r64 is the working
+rank. Single-generation deltas under ~2× margin are seed noise
+(gen-35 +0.019 vs gen-37 +0.080 at identical levers).
 
 Floor analysis (R255): late-generation disagreement is
 near-orthogonal noise (mean|cos| ~ 0.1); averaging denoises 1/N,

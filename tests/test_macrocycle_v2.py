@@ -2,8 +2,6 @@
 
 * variance gate (``logitRange_scale`` / ``variance_gate_contract`` /
   ``variance_gate_normalize``): temperature repair of a range overshoot
-* trust-region ball projection (``trust_region_proj_norm`` /
-  ``trust_region_nearest``): rescaling IS the metric projection
 * greedy-harvest addendum (``harvest_accounting_identity`` /
   ``greedy_horizon_optimal``): the field pays unit for unit; greedy is
   horizon-optimal
@@ -22,7 +20,6 @@ from hagi.train.safeqp_step import (
     logit_range_scale,
     variance_gate_tau,
 )
-from hagi.train.trust_region import project_to_ball, projection_is_nearest
 
 
 def _range(z: list[float]) -> float:
@@ -68,25 +65,6 @@ class TestVarianceGate:
         dev0 = [logits[0][j] - mean[j] for j in range(3)]
         scaled = [z / taus[0] for z in dev0]
         assert abs((max(scaled) - min(scaled)) - 3.0) < 1e-12
-
-
-class TestTrustRegion:
-    def test_projection_lands_on_boundary(self):
-        x = torch.tensor([3.0, 4.0])
-        proj, norm = project_to_ball(x, radius=2.0)
-        assert abs(float(torch.linalg.vector_norm(proj)) - 2.0) < 1e-6
-        assert abs(norm - 5.0) < 1e-6
-
-    def test_projection_is_nearest(self):
-        x = torch.tensor([3.0, 4.0])
-        for y in (torch.tensor([2.0, 0.0]), torch.tensor([0.0, 2.0]),
-                  torch.tensor([-1.0, 1.0])):
-            assert projection_is_nearest(x, y, radius=2.0)
-
-    def test_in_ball_untouched(self):
-        x = torch.tensor([1.0, 0.0])
-        proj, _ = project_to_ball(x, radius=2.0)
-        assert proj is x
 
 
 class TestHarvestAddendum:

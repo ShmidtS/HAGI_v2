@@ -29,6 +29,7 @@ import argparse
 import json
 import subprocess
 import sys
+import re
 import time
 from pathlib import Path
 
@@ -156,8 +157,12 @@ def main() -> int:
     # is nearly free; best.pt may or may not beat the ft best.
     cd_dir = ROOT / f"checkpoints/gen{g}_cooldown"
     if not (cd_dir / "best.pt").exists():
-        cd_cfg = ROOT / f"configs/gen{g}_cooldown.yaml"
+        # Configs live with the generation (no configs/ proliferation):
+        # the cooldown config is derived from the ft config into the
+        # generation's own checkpoint dir.
+        cd_cfg = cd_dir / "cooldown.yaml"
         base = (ROOT / args.ft_config).read_text(encoding="utf-8")
+        cd_cfg.parent.mkdir(parents=True, exist_ok=True)
         cd_cfg.write_text(
             base.replace(f"init_from: checkpoints/gen{g}_root/root.pt",
                          f"init_from: {ft_ckpt}")
@@ -166,7 +171,7 @@ def main() -> int:
                 .replace("max_steps: 600", "max_steps: 200"),
             encoding="utf-8")
         sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
-            "--config", str(cd_cfg.relative_to(ROOT)),
+            "--config", str(cd_cfg),
             "--checkpoint-dir", str(cd_dir),
             "--log-dir", str(cd_dir / "logs")], cd_dir / "cycle.log")
     cd_ckpt = cd_dir / "best.pt"
@@ -177,7 +182,22 @@ def main() -> int:
         entry_extra = {}
 
     # 4. certified accept ----------------------------------------------------
-    inc_ce = avg_ce(args.common_config, args.root)
+    # The incumbent is evaluated under ITS OWN generation's config:
+    # adapter rank/basis belong to the checkpoint's generation (the QR
+    # basis is rank-dependent — gen-34 lesson: evaluating a rank-32
+    # incumbent under a rank-64 config disables its adapters and
+    # fabricates delta). Data windows stay comparable because every
+    # generation's config carries the same data.seed lineage; the eval
+    # seed is pinned per-config and identical across the ladder.
+    m = re.search(r"gen(\d+)_", str(args.root))
+    inc_cfg = args.common_config
+    if m:
+        for cand in (f"checkpoints/gen{m.group(1)}/configs/root_ft.yaml",
+                     f"configs/gen{m.group(1)}_root_ft.yaml"):
+            if (ROOT / cand).exists():
+                inc_cfg = cand
+                break
+    inc_ce = avg_ce(inc_cfg, args.root)
     new_ce = avg_ce(args.common_config, str(ft_ckpt))
     # The candidate is the BEST of ft / cooldown (R254: the cooldown is
     # part of the generation's polish; judging the ft alone understates

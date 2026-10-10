@@ -78,6 +78,15 @@ def main() -> None:
 
     for k in keys:
         W_shared = shared[k].double()
+        # Rank-growth seam (R242): leaves may carry WIDER adapter factors
+        # than the shared prior (rank 32 -> 64). Zero-pad the shared
+        # factor's trailing (latent) axis to the leaf width: a zero column
+        # means "no shared component in that rank direction", so the
+        # padded tensor represents the same function.
+        leaf_w = max(sd[k].shape[-1] for sd in sds)
+        if W_shared.ndim == 2 and W_shared.shape[-1] < leaf_w and W_shared.shape[0] == sds[0][k].shape[0]:
+            pad = W_shared.new_zeros(W_shared.shape[0], leaf_w - W_shared.shape[1])
+            W_shared = torch.cat([W_shared, pad], dim=1)
         facts = [factorize_delta(sd[k].double(), W_shared, energy=ENERGY) for sd in sds]
         al = latent_align(facts)
         rc = root_contrast_merge(al, W_shared)
