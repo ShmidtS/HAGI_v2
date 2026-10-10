@@ -39,16 +39,20 @@ def incumbent_root(before_gen: int) -> str | None:
     return f"checkpoints/gen{e['gen']}_root_ft/best.pt"
 
 
-def derive(gen: int, root_ckpt: str, domains: list[str]) -> None:
-    prev = gen - 1
-    for d in domains:
-        s = (ROOT / f"configs/gen{prev}_leaf_{d}.yaml").read_text(encoding="utf-8")
-        s = re.sub(r"init_from:.*", lambda _m: f"init_from: {root_ckpt}", s, count=1)
-        s = re.sub(r"checkpoint_dir:.*", lambda _m: f"checkpoint_dir: checkpoints/gen{gen}_leaf_{d}", s, count=1)
-        (ROOT / f"configs/gen{gen}_leaf_{d}.yaml").write_text(s, encoding="utf-8")
-    s = (ROOT / f"configs/gen{prev}_root_ft.yaml").read_text(encoding="utf-8")
-    s = re.sub(r"init_from: checkpoints/\S+", lambda _m: f"init_from: checkpoints/gen{gen}_root/root.pt", s, count=1)
-    (ROOT / f"configs/gen{gen}_root_ft.yaml").write_text(s, encoding="utf-8")
+def derive(gen: int, root_ckpt: str, domains: list[str],
+           seed_base: int | None = None) -> dict:
+    """Materialize gen-N configs via the SSOT builder (gen_configs.py).
+
+    Configs live in ``checkpoints/gen<N>/configs/`` — NOT in configs/:
+    no per-generation YAML proliferation. ``seed_base`` defaults to
+    ``gen + 5`` (e.g. gen 41 -> 46 -> seeds 461xx), a fresh family per
+    generation; pass explicitly to retry a generation with a new family.
+    """
+    from gen_configs import write_generation
+    if seed_base is None:
+        seed_base = gen + 5
+    return write_generation(gen, root_ckpt, seed_base,
+                            domains=domains)
 
 
 def accepted_last() -> bool:
@@ -69,13 +73,14 @@ def main() -> int:
             print("no incumbent root — cannot start")
             return 1
         derive(gen, root_ckpt, args.domains)
+        cfg_dir = f"checkpoints/gen{gen}/configs"
         rc = subprocess.run(
             [sys.executable, "-X", "utf8", "-u",
              "scripts/growth/growth_cycle.py", "--gen", str(gen),
              "--root", root_ckpt,
-             "--leaf-config", f"configs/gen{gen}_leaf_{{d}}.yaml",
-             "--ft-config", f"configs/gen{gen}_root_ft.yaml",
-             "--common-config", f"configs/gen{gen}_root_ft.yaml",
+             "--leaf-config", f"{cfg_dir}/leaf_{{d}}.yaml",
+             "--ft-config", f"{cfg_dir}/root_ft.yaml",
+             "--common-config", f"{cfg_dir}/root_ft.yaml",
              "--domains", *args.domains],
             cwd=str(ROOT)).returncode
         if rc != 0 or not accepted_last():

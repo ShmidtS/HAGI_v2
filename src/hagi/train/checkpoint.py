@@ -158,22 +158,35 @@ def load_model(
     # model's is zero-PADDED (the old contour transfers exactly, the new
     # directions start at zero — capacity grows, behavior unchanged at
     # step 0). lora_A shrinks row-wise symmetrically (A is [r, H]).
+    # The module's scaling is alpha/r (adapters.py): after padding,
+    # scaling drops by r_new/r_old, so the transferred lora_A rows are
+    # multiplied by r_new/r_old to keep the delta EXACTLY equal
+    # (function-preserving rank growth — measured lesson gen-34: without
+    # the compensation the incumbent evaluated 5.093 instead of 4.9147
+    # and the ladder logged a fictitious +0.179 delta).
+    # R242 rank growth — NESTED bases (gen-34 lesson): lora_A is now
+    # built from ONE full basis (``_nested_lora_basis``: A(64)[:, :32] ==
+    # A(32), rank 32 bit-compatible with the legacy line), so growing the
+    # rank CAN transfer the learned contour exactly: zero-pad lora_B's
+    # latent axis and scale the transferred block by r_new/r_old to
+    # compensate the module's alpha/r scaling. (Before gen-34 the bases
+    # were NOT nested — randn(hidden, r) draws share no columns across
+    # widths — and this padding silently loaded garbage; the incumbent
+    # evaluated 5.09 instead of 4.91 and the ladder logged a fictitious
+    # +0.179. ``.omc/attempts/gen34-rank-growth.md``.)
     mismatched = []
     for name in current:
         ci, cu = incoming.get(name), current[name]
         if ci.shape == cu.shape:
             continue
-        if (
-            name.endswith("lora_B") and ci.shape[0] == cu.shape[0]
-            and ci.shape[1] < cu.shape[1]
-        ):
+        if (name.endswith("lora_B") and ci.shape[0] == cu.shape[0]
+                and ci.shape[1] < cu.shape[1]):
+            ratio = cu.shape[1] / ci.shape[1]
             pad = torch.zeros_like(cu)
-            pad[:, : ci.shape[1]] = ci
+            pad[:, : ci.shape[1]] = ci * ratio
             incoming[name] = pad
-        elif (
-            name.endswith("lora_A") and ci.shape[0] < cu.shape[0]
-            and ci.shape[1] == cu.shape[1]
-        ):
+        elif (name.endswith("lora_A") and ci.shape[0] < cu.shape[0]
+                and ci.shape[1] == cu.shape[1]):
             pad = torch.zeros_like(cu)
             pad[: ci.shape[0], :] = ci
             incoming[name] = pad
