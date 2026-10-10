@@ -62,6 +62,35 @@ def consumed_offset(leaf_dir: Path) -> int:
     return 0
 
 
+def _fiber_ce(config: str, root_pt: str, fibers_pt: str,
+              batches: int = 30) -> float | None:
+    """AVG exact CE of the R255 fiber ensemble (root + fibers, logit-mean
+    over the reconstructed experts). Returns None on any failure — the
+    fiber arm is an ADDITIONAL candidate, never a blocker."""
+    if not (ROOT / fibers_pt).exists():
+        return None
+    import re as _re
+    r = subprocess.run(
+        [sys.executable, "-X", "utf8", "-u",
+         str(ROOT / "scripts/growth/eval_fiber_ensemble.py"),
+         "--config", config, "--root", root_pt, "--fibers", fibers_pt,
+         "--batches", str(batches), "--device", "cuda"],
+        capture_output=True, text=True, cwd=str(ROOT))
+    m = None
+    for m in _re.finditer(r"\{.*\}", r.stdout, _re.S):
+        pass  # keep the LAST JSON blob (the per-domain report)
+    if m is None:
+        return None
+    try:
+        import json as _json
+        d = _json.loads(m.group(0))
+        rows = d.get("domains") or d.get("results") or []
+        ces = [x["exact_ce"] for x in rows if "exact_ce" in x]
+        return sum(ces) / len(ces) if ces else None
+    except Exception:
+        return None
+
+
 def sh(cmd: list[str], log: Path) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
@@ -71,7 +100,7 @@ def sh(cmd: list[str], log: Path) -> int:
                               cwd=str(ROOT)).returncode
 
 
-def avg_ce(config: str, ckpt: str, batches: int = 10) -> float | None:
+def avg_ce(config: str, ckpt: str, batches: int = 30) -> float | None:
     """Common-protocol AVG exact CE of a checkpoint (None on failure)."""
     out = ROOT / "checkpoints" / "_cycle_eval.json"
     r = subprocess.run(
@@ -206,6 +235,18 @@ def main() -> int:
     if entry_extra.get("cooldown_ce") is not None and             entry_extra["cooldown_ce"] < new_ce:
         cand_ckpt = cd_ckpt
         new_ce = entry_extra["cooldown_ce"]
+    # R255 fiber arm (Oracle review item 1): the merge-point fiber
+    # ensemble (root.pt + fibers.pt, logit-mean over reconstructed
+    # experts) recovers the ensemble Jensen gain the flat root drops.
+    # Measured gen-40: +0.174 AVG over flat root.pt (all 6 domains,
+    # including both held-out). The candidate = best of THREE arms; a
+    # fiber candidate ships as (root.pt, fibers.pt) pair.
+    fiber_ce = _fiber_ce(args.common_config, str(gen_root / "root.pt"),
+                         str(gen_root / "fibers.pt"))
+    entry_extra["fiber_ce"] = fiber_ce
+    if fiber_ce is not None and fiber_ce < new_ce:
+        cand_ckpt = gen_root / "root.pt"   # + fibers.pt alongside
+        new_ce = fiber_ce
     if inc_ce is None or new_ce is None:
         print("eval failed — halting (no uncertified growth)")
         return 1
@@ -239,6 +280,10 @@ def main() -> int:
     # §9 conservative: the generation ships only on a strict improvement
     # beyond eval noise (2-eps band approximated by 0.02 nats at n=10
     # batches/domain); ties and regressions halt the cycle.
+    # Margin scales with the measured eval noise (Oracle review, item 5;
+    # gen-40 attempts ledger: same-checkpoint re-eval swung ~0.07 at
+    # batches=10 on the iGPU). 30 batches cut the swing ~sqrt(3); the
+    # margin remains 0.02 but the eval behind it is 3x deeper.
     margin = 0.02
     entry["accepted"] = bool(entry["delta"] > margin)
     with LADDER.open("a", encoding="utf-8") as fh:
