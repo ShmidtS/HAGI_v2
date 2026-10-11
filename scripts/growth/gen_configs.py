@@ -24,6 +24,8 @@ same generation (fresh-data injection, R104 stop_condition).
 """
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -269,7 +271,18 @@ def write_generation(
     out.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
     for d in domains:
-        c = _DOMAIN[d]
+        # Ladder EXPANSION lanes: ``math2``/``code2``/... are extra
+        # leaves on the SAME corpus/mix as the base domain but with a
+        # fresh seed family (R255: the noise floor deepens linearly in
+        # N; R66: domain disagreement stays positive on fresh data
+        # offsets). Offsets +2xx keep them disjoint from every lane.
+        m = re.match(r"^(\w+?)(\d)$", d)
+        if m and m.group(1) in _DOMAIN and d not in _DOMAIN:
+            c = dict(_DOMAIN[m.group(1)])
+            c["init_off"] += 200
+            c["data_off"] += 200
+        else:
+            c = _DOMAIN[d]
         tau_line = (
             f"    inverse_sqrt_tau: {c['tau']}\n" if c["tau"] else ""
         )

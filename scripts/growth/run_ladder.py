@@ -65,14 +65,28 @@ def main() -> int:
     p.add_argument("--from-gen", type=int, required=True)
     p.add_argument("--domains", nargs="+", default=DOMAINS)
     p.add_argument("--max-gen", type=int, default=99)
+    p.add_argument("--expand-after", type=int, default=2,
+                   help="consecutive rejections before EXPANDING the "
+                        "ladder with extra fresh-seed lanes (R255: the "
+                        "noise floor deepens linearly in N)")
+    p.add_argument("--expand-lanes", nargs="+",
+                   default=["math2", "code2"],
+                   help="expansion lane suffixes (base domains reused "
+                        "with a disjoint seed family)")
+    p.add_argument("--hard-stop", type=int, default=4,
+                   help="consecutive rejections after expansion that "
+                        "halt for good (honest floor)")
     args = p.parse_args()
     gen = args.from_gen
+    domains = list(args.domains)
+    rejects = 0
+    expanded = False
     while gen <= args.max_gen:
         root_ckpt = incumbent_root(gen)
         if root_ckpt is None:
             print("no incumbent root — cannot start")
             return 1
-        derive(gen, root_ckpt, args.domains)
+        derive(gen, root_ckpt, domains)
         cfg_dir = f"checkpoints/gen{gen}/configs"
         rc = subprocess.run(
             [sys.executable, "-X", "utf8", "-u",
@@ -81,11 +95,28 @@ def main() -> int:
              "--leaf-config", f"{cfg_dir}/leaf_{{d}}.yaml",
              "--ft-config", f"{cfg_dir}/root_ft.yaml",
              "--common-config", f"{cfg_dir}/root_ft.yaml",
-             "--domains", *args.domains],
+             "--domains", *domains],
             cwd=str(ROOT)).returncode
-        if rc != 0 or not accepted_last():
-            print(f"ladder halted at gen {gen} (rc={rc})")
+        if rc == 0 and accepted_last():
+            rejects = 0
+            gen += 1
+            continue
+        rejects += 1
+        if not expanded and rejects >= args.expand_after:
+            domains = domains + [d for d in args.expand_lanes
+                                 if d not in domains]
+            expanded = True
+            rejects = 0
+            print(f"[ladder] {args.expand_after} rejections — EXPANDING "
+                  f"to {len(domains)} leaves: {domains} (R255 N-floor)")
+            gen += 1
+            continue
+        if expanded and rejects >= args.hard_stop:
+            print(f"ladder halted at gen {gen} (rc={rc}): floor even "
+                  f"after expansion — honest stop")
             return rc or 0
+        print(f"[ladder] gen {gen} rejected ({rejects} consecutive) — "
+              f"fresh-seed retry")
         gen += 1
     return 0
 
