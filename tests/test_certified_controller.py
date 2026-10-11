@@ -211,3 +211,41 @@ def test_phase_log_line_names_the_phase():
     assert "[phase GATE]" in line and "lane=gen8" in line
     with pytest.raises(ValueError):
         cc.phase_log_line("NOT_A_PHASE", "x")
+
+
+# --- §AW: certified_argmax (CertifiedArgmax / tie_ambiguity) --------------
+
+
+def test_certified_argmax_single_positive_action_is_certified():
+    acts = [cc.Action("merge", gamma=3.0, cost=1.0)]
+    chosen, meta = cc.certified_argmax(acts, eps_gamma=0.1)
+    assert chosen is acts[0] and meta["verdict"] == "CERTIFIED"
+
+
+def test_certified_argmax_gap_clears_bracket():
+    acts = [cc.Action("a", gamma=3.0, cost=1.0),   # ratio 3.0
+            cc.Action("b", gamma=1.0, cost=1.0)]   # ratio 1.0
+    chosen, meta = cc.certified_argmax(acts, eps_gamma=0.5)  # 2*eps=1.0 < 2.0
+    assert chosen is acts[0] and meta["verdict"] == "CERTIFIED"
+    assert meta["gap"] == 2.0 and meta["threshold"] == 1.0
+
+
+def test_certified_argmax_ambiguous_inside_bracket():
+    acts = [cc.Action("a", gamma=3.0, cost=1.0),   # ratio 3.0
+            cc.Action("b", gamma=2.8, cost=1.0)]   # ratio 2.8
+    chosen, meta = cc.certified_argmax(acts, eps_gamma=0.2)  # 2*eps=0.4 > 0.2
+    assert chosen is None and meta["verdict"] == "AMBIGUOUS"
+
+
+def test_certified_argmax_no_positive_action():
+    chosen, meta = cc.certified_argmax(
+        [cc.Action("a", gamma=-1.0, cost=1.0)], eps_gamma=0.1)
+    assert chosen is None and meta["verdict"] == "NO_POSITIVE_ACTION"
+
+
+def test_certified_argmax_excludes_non_positive_from_ranking():
+    acts = [cc.Action("a", gamma=3.0, cost=1.0),
+            cc.Action("dead", gamma=-5.0, cost=1.0)]
+    chosen, meta = cc.certified_argmax(acts, eps_gamma=0.1)
+    # only one positive action -> no tie possible
+    assert chosen is acts[0] and meta["verdict"] == "CERTIFIED"

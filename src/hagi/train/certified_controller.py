@@ -166,6 +166,46 @@ def select_action(actions: list[Action], budget: float | None = None) -> Action 
     return best
 
 
+def certified_argmax(
+    actions: list[Action], eps_gamma: float, budget: float | None = None
+) -> tuple[Action | None, dict]:
+    """§AW argmax Gamma/K with the 2*eps_Gamma certification bracket.
+
+    ``CertifiedArgmax`` + ``tie_ambiguity`` (Lean Budget/CertifiedArgmax):
+    selecting the argmax over measured Gammas is legitimate ONLY when
+    the top1-top2 ratio gap exceeds 2*eps_Gamma, where eps_Gamma is the
+    measurement uncertainty of Gamma (split-half bracket). Inside the
+    bracket the choice is a tie in disguise -- acting on it would be
+    noise-chasing, so the honest verdict is AMBIGUOUS (return None).
+
+    Returns (chosen, meta): chosen is None when nothing is
+    certified-positive or the bracket is not cleared; meta records the
+    bracket audit trail (ratios, gap, 2*eps_gamma, verdict).
+    """
+    meta: dict = {"eps_gamma": eps_gamma}
+    ranked = sorted(
+        (a for a in actions if a.gamma > 0.0 and a.cost > 0.0
+         and (budget is None or a.cost <= budget)),
+        key=lambda a: a.ratio,
+        reverse=True,
+    )
+    meta["ratios"] = [round(a.ratio, 6) for a in ranked]
+    if not ranked:
+        meta["verdict"] = "NO_POSITIVE_ACTION"
+        return None, meta
+    if len(ranked) == 1:
+        meta["verdict"] = "CERTIFIED"  # single positive action: no tie
+        return ranked[0], meta
+    gap = ranked[0].ratio - ranked[1].ratio
+    meta["gap"] = round(gap, 6)
+    meta["threshold"] = 2.0 * eps_gamma
+    if gap > 2.0 * eps_gamma:
+        meta["verdict"] = "CERTIFIED"
+        return ranked[0], meta
+    meta["verdict"] = "AMBIGUOUS"  # tie_ambiguity: inside the bracket
+    return None, meta
+
+
 # --- §9: certified A/B comparison (Hoeffding premise, R114/R118) ----------
 
 
