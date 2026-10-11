@@ -25,8 +25,17 @@ N узких листов-специалистов (общий prior — кор�
   → joint fine-tune корня (root_ft, 600 шагов)
   → WSqD cooldown (R254): batch ×4 / lr 0.4× / 200 шагов — хвост
     затухания стоит константу, полировка почти бесплатна
-  → §9 certified accept: кандидат (лучший из ft/cooldown) заменяет
-    инкамбента только при выигрыше > margin 0.02
+  → §1 селектор ДЕЙСТВИЙ (2026-10-11): перед каждым поколением
+    certified_controller.estimate_actions/select_action — argmax Γ/K
+    из измерений прошлой генерации (Γ_merge = logit_twoGap, Γ_grow =
+    принятая delta); нет certified-positive действий = E_dev исчерпан
+    (R223) — останов со сменой рычага, не «ещё раз так же»
+  → blocking twoGap-гейт: точный logit-twoGap ≤ 0 = консенсус
+    (GapLaw.twoGap_zero_iff) — раунд исчерпан до ft
+  → §9 certified accept: certified_ab, eps = √(log(2/δ)/(2n)) из
+    фактического n (δ=0.05); UNDECIDED при delta>0 углубляет eval
+    30→150 батчей (deep-200 наследие); кандидат = лучший из
+    ft/cooldown/fiber, замена только по ACCEPT
 ```
 
 Лестница (checkpoints/growth_ladder.jsonl, common-protocol AVG CE):
@@ -109,7 +118,11 @@ HAGI_v2/
 ├── tests/                    # pytest (562)
 ├── data/                     # .compact.bin корпуса, mix.json, boost_*
 ├── checkpoints/              # вне git; growth_ladder.jsonl — журнал
-├── _raw/attic/               # снятые с рантайма модули + тесты (git-история)
+├── _raw/attic/               # снятые с рантайма модули + тесты (git-история);
+│                             # 2026-10-11: + scripts/ — gen7-эпоха (pipeline,
+│                             #   gate, fold/lora-rank), заменённые SSOT
+│                             #   конфигураторы, level-1 пайплайн, F3-эпоха,
+│                             #   oneoff-вердикты (14 файлов)
 └── .omc/attempts/            # ledgers раундов
 ```
 

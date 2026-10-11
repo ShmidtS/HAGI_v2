@@ -32,6 +32,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 DOMAINS: list[str] = ["math", "code", "ru", "enedu", "enweb", "enwiki"]
 
+# 2026-10-11 frontier injection (§4 liveness_data_axis): two FRESH
+# independent domains — books (Gutenberg prose) and sci (PubMed
+# abstracts, measured 10% unk against the frozen 32k vocab — biomedical
+# lexicon outside the old corpora's head; the domain carries novelty
+# exactly where the incumbent has never been). Add via run_ladder
+# --domains ... books sci once the ladder's next cycle starts.
+NEW_DOMAINS: list[str] = ["books", "sci"]
+
 # Per-domain overrides (measured winning-line values).
 #   weights          — data mix (fresh-data lever lives here)
 #   z_loss / scale   — head regularization (code is noisier: 0.003/0.3)
@@ -69,6 +77,16 @@ _DOMAIN: dict[str, dict] = {
         weights={"wikipedia_en": 1.0},
         z_loss=0.001, scale=0.4, max_steps=800, lr=0.0005, tau=None,
         init_off=117, data_off=112,
+    ),
+    "books": dict(
+        weights={"books": 0.85, "slimpajama": 0.15},
+        z_loss=0.001, scale=0.4, max_steps=800, lr=0.0004, tau=None,
+        init_off=118, data_off=112,
+    ),
+    "sci": dict(
+        weights={"sci": 0.70, "edu": 0.30},
+        z_loss=0.003, scale=0.3, max_steps=800, lr=0.0004, tau=None,
+        init_off=119, data_off=112,
     ),
 }
 

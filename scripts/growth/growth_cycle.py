@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import re
@@ -79,6 +80,70 @@ def _logit_twoGap(gen: int, domains: list[str]) -> float | None:
         return d.get("ensemble_mean_twoGap")
     except Exception:
         return None
+
+
+def _last_ladder_entry() -> dict | None:
+    """Last line of growth_ladder.jsonl (None if empty)."""
+    if not LADDER.exists():
+        return None
+    lines = LADDER.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if line:
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
+    return None
+
+
+def _select_next_action(gen: int, domains: list[str]) -> dict:
+    """§0/§1 action selector: argmax Gamma_i/K_i from MEASURED quantities
+    of the previous generation (ratio_dominance R86 — concentrating the
+    budget on the argmax Gamma/K dominates any split).
+
+    Measurements (all from the last ladder entry, i.e. already-paid
+    observations — no extra compute):
+      - merge:  Gamma = logit_twoGap (GapLaw, exact Lean identity);
+                K = last generation wall-clock seconds.
+      - grow_leaf: Gamma = last accepted delta (capability gain);
+                K = last generation wall-clock seconds.
+      - distill: c_k/delta_k are not measured yet -> action omitted
+        (estimate_actions skips missing keys — honest, not guessed).
+
+    Returns the decision record; the caller logs it. When the certified
+    argmax is not the default merge cycle, the cycle HALTS with the
+    diagnosis — principle 6: a rejected/exhausted lever is SWITCHED,
+    not retried (the actual switch is a human/new-data decision).
+    """
+    from hagi.train.certified_controller import estimate_actions, select_action
+    last = _last_ladder_entry()
+    meas: dict = {}
+    meta: dict = {"gen": gen}
+    if last is not None:
+        certs = last.get("certificates", {})
+        two_gap = certs.get("merge", {}).get("logit_twoGap")
+        if two_gap is not None:
+            meas["two_gap"] = float(two_gap)
+            meas["merge_cost"] = 1.0  # cost unmeasured -> Gamma ranking
+            meta["two_gap"] = two_gap
+        delta = last.get("delta")
+        if delta is not None and delta > 0:
+            meas["g_new"] = float(delta)
+            meas["grow_cost"] = 1.0
+            meta["g_new"] = delta
+    actions = estimate_actions(meas)
+    chosen = select_action(actions)
+    meta["actions"] = [{"name": a.name, "gamma": a.gamma,
+                        "cost": a.cost, "ratio": a.ratio} for a in actions]
+    meta["chosen"] = chosen.name if chosen else None
+    # §AW (CertifiedArgmax): the argmax is CERTIFIED only when the
+    # top1-top2 ratio gap exceeds 2*eps_Gamma; eps_Gamma is not yet
+    # measured (split-half) — log the raw gap so the bracket can be
+    # audited once it is. gap <= 0 means a single positive action.
+    ratios = sorted((a.ratio for a in actions), reverse=True)
+    meta["argmax_gap"] = (ratios[0] - ratios[1]) if len(ratios) > 1 else None
+    return meta
 
 
 def _fiber_ce(config: str, root_pt: str, fibers_pt: str,
@@ -145,6 +210,18 @@ def main() -> int:
     p.add_argument("--common-config", default="configs/latent_leaf_math.yaml")
     args = p.parse_args()
     g = args.gen
+
+    # §0/§1 action selector (R86 ratio_dominance): argmax Gamma_i/K_i
+    # from the previous generation's MEASURED certificates. No
+    # certified-positive action at all == E_dev exhausted (R223
+    # round_exhausted) -> the lever must be switched (data/rank), not
+    # retried; the cycle refuses to burn compute on an unviable round.
+    selector = _select_next_action(g, args.domains)
+    print(f"[gen{g}] §1 selector: {json.dumps(selector)}")
+    if selector["chosen"] is None:
+        print(f"[gen{g}] no certified-positive action (E_dev exhausted, "
+              "R223) — switch the lever (fresh data / rank), halting")
+        return 0
 
     # 1. leaves ------------------------------------------------------------
     for d in args.domains:
@@ -274,6 +351,7 @@ def main() -> int:
     # cycle entry. cycle_certificate_sound analog: the potential
     # (here: common-protocol CE) decreased by the certified amount.
     certs = {
+        "selector": selector,  # §0/§1 argmax Gamma/K decision (pre-cycle)
         "grow": {   # leaves trained: nonneg capability gain per leaf
             "n_leaves": len(args.domains),
             "leaves_done": all(
@@ -281,14 +359,14 @@ def main() -> int:
                 for d in args.domains
             ),
         },
-        "merge": {  # merge gate passed (gap >= prices + compression)
-            "gate_pass": True,  # pilot aborts nonzero otherwise
+        "merge": {  # merge gate: weight-level prices (pilot aborts
+            # nonzero) + the EXACT Lean GapLaw certificate (logit twoGap).
+            # BLOCKING (theory §3 + GapLaw.twoGap_zero_iff): twoGap = 0
+            # iff consensus — an ensemble of agreeing leaves has ZERO
+            # merge gain, the round is exhausted (R223 round_exhausted):
+            # fine-tune would burn compute on an unviable round.
+            "gate_pass": True,  # pilot aborted nonzero otherwise
             "noise_cos": _noise_cos(gen_root),
-            # R258-style formula-exact merge certificate: the Lean
-            # GapLaw twoGap (½·log ΣΣ p_u p_v cosh(d_u−d_v), measured
-            # on leaf logits via the O(V) factorization). This is the
-            # THEORY quantity; the weight-level gate proxy above stays
-            # the abort condition. None if leaves are unavailable.
             "logit_twoGap": _logit_twoGap(g, args.domains),
         },
         "joint": {  # fine-tune: certified accept below
@@ -302,20 +380,55 @@ def main() -> int:
              "merged_ce": avg_ce(args.common_config, str(gen_root / "root.pt")),
              "ft_ce": new_ce, "candidate": str(cand_ckpt),
              "delta": inc_ce - new_ce}
-    # §9 conservative: the generation ships only on a strict improvement
-    # beyond eval noise (2-eps band approximated by 0.02 nats at n=10
-    # batches/domain); ties and regressions halt the cycle.
-    # Margin scales with the measured eval noise (Oracle review, item 5;
-    # gen-40 attempts ledger: same-checkpoint re-eval swung ~0.07 at
-    # batches=10 on the iGPU). 30 batches cut the swing ~sqrt(3); the
-    # margin remains 0.02 but the eval behind it is 3x deeper.
-    margin = 0.02
-    entry["accepted"] = bool(entry["delta"] > margin)
+    # Blocking exact-merge certificate (GapLaw.twoGap_zero_iff): a
+    # zero/negative exact twoGap = consensus = ZERO ensemble gain
+    # (R223 round_exhausted) — the accept below cannot certify growth.
+    two_gap_exact = certs["merge"]["logit_twoGap"]
+    if two_gap_exact is not None and two_gap_exact <= 0.0:
+        certs["merge"]["gate_pass"] = False
+        entry["accepted"] = False
+        with LADDER.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        print(f"[gen{g}] exact twoGap = {two_gap_exact:.4f} <= 0 (consensus, "
+              "GapLaw.twoGap_zero_iff / R223) — round exhausted, halting")
+        return 0
+    # §9 certified accept (THEORY-EXACT, R114/R118): accept iff
+    # delta > 2*eps at n >= log(2/delta)/(2 eps^2). The eval samples
+    # n = batches * n_domains batches; eps is DERIVED from the actual
+    # sample size at delta=0.05 (the deep-200 protocol anchor: n=200
+    # -> eps~=0.096), so the margin is never a hand-tuned constant.
+    # UNDECIDED with a positive observed delta = not enough evidence:
+    # DEEPEN the eval once (batches 30 -> 150, the deep-200 heritage)
+    # and re-decide; still UNDECIDED/REJECT halts — uncertified growth
+    # is not growth.
+    from hagi.train.certified_controller import certified_ab, hoeffding_n
+    n_eval = 30 * len(args.domains)  # batches per domain * domains
+    eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
+    verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
+                           eps=eps_cert, delta=0.05)
+    if verdict.undecided and entry["delta"] > 0:
+        print(f"[gen{g}] UNDECIDED at n={n_eval} (2*eps={2*eps_cert:.4f}) "
+              "— deepening the eval (deep-200 protocol)")
+        inc_ce_d = avg_ce(inc_cfg, args.root, batches=150)
+        new_ce_d = avg_ce(args.common_config, str(cand_ckpt), batches=150)
+        if inc_ce_d is not None and new_ce_d is not None:
+            inc_ce, new_ce = inc_ce_d, new_ce_d
+            entry["incumbent_ce"], entry["ft_ce"] = inc_ce, new_ce
+            entry["delta"] = inc_ce - new_ce
+            n_eval = 150 * len(args.domains)
+            eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
+            verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
+                                   eps=eps_cert, delta=0.05)
+    entry["accept_eps"] = round(eps_cert, 4)
+    entry["accept_n"] = n_eval
+    entry["accept_required_n"] = hoeffding_n(eps_cert, 0.05)
+    entry["accepted"] = verdict.accepted
     with LADDER.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry) + "\n")
     print(json.dumps(entry, indent=2))
     if not entry["accepted"]:
-        print(f"[gen{g}] NOT certified (delta {entry['delta']:+.4f} <= {margin}) "
+        print(f"[gen{g}] NOT certified ({verdict.verdict}, delta {entry['delta']:+.4f} "
+              f"vs 2*eps={2*eps_cert:.4f} at n={n_eval}) "
               "— cycle halts; incumbent stands (§9)")
         return 0
     print(f"[gen{g}] accepted: next gen uses {ft_ckpt}")

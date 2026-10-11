@@ -152,7 +152,10 @@ def insight_sft_loss(
         inp, tgt = seq[:-1], seq[1:]
         k = ins.insight_ids.numel()
         w = torch.ones(inp.shape[0], device=device)
-        w[-(k - 1) :] = lam if k > 1 else w[-1:]
+        # weight ALL k insight-target positions with lambda (the first is
+        # predicted from pure context — the internalization itself; the
+        # old `w[-(k-1):]` no-op'd/missed it at k == 1, audit finding 6)
+        w[-k:] = lam
         rows.append((inp, tgt, w))
     max_len = max(r[0].shape[0] for r in rows)
 
