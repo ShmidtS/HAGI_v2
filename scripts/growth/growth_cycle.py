@@ -63,23 +63,36 @@ def consumed_offset(leaf_dir: Path) -> int:
     return 0
 
 
-def _logit_twoGap(gen: int, domains: list[str]) -> float | None:
-    """Mean pairwise formula-exact logit twoGap of this generation's
-    leaves (math domain, 1 batch, CPU). Advisory certificate — never
-    blocks the cycle. Returns None on any failure."""
+def _logit_twoGap(gen: int, domains: list[str]) -> tuple[float, float] | None:
+    """Formula-exact logit twoGap of this generation's leaves
+    (math domain, 1 batch, CPU) with the §AW split-half bracket:
+    measured twice on disjoint eval samples (seeds 15111/15112),
+    eps_gamma = |a-b|/2 is the measurement uncertainty of Gamma.
+    Returns (mean, eps_gamma); None on any failure (advisory —
+    never blocks the cycle)."""
     import subprocess as _sp
-    r = _sp.run(
-        [sys.executable, "-X", "utf8", "-u",
-         str(ROOT / "scripts/growth/measure_logit_twogap.py"),
-         "--gen", str(gen), "--domains", *domains,
-         "--batches", "1", "--domain", "math", "--device", "cpu"],
-        capture_output=True, text=True, cwd=str(ROOT))
-    try:
-        import json as _json
-        d = _json.loads(r.stdout[r.stdout.index("{"):])
-        return d.get("ensemble_mean_twoGap")
-    except Exception:
+    vals: list[float] = []
+    for seed in (15111, 15112):
+        r = _sp.run(
+            [sys.executable, "-X", "utf8", "-u",
+             str(ROOT / "scripts/growth/measure_logit_twogap.py"),
+             "--gen", str(gen), "--domains", *domains,
+             "--batches", "1", "--domain", "math", "--device", "cpu",
+             "--seed", str(seed)],
+            capture_output=True, text=True, cwd=str(ROOT))
+        try:
+            import json as _json
+            d = _json.loads(r.stdout[r.stdout.index("{"):])
+            v = d.get("ensemble_mean_twoGap")
+            if v is not None:
+                vals.append(float(v))
+        except Exception:
+            continue
+    if not vals:
         return None
+    if len(vals) == 1:  # one half failed: value without a bracket
+        return vals[0], float("nan")
+    return (vals[0] + vals[1]) / 2.0, abs(vals[0] - vals[1]) / 2.0
 
 
 def _last_ladder_entry() -> dict | None:
@@ -116,7 +129,9 @@ def _select_next_action(gen: int, domains: list[str]) -> dict:
     diagnosis — principle 6: a rejected/exhausted lever is SWITCHED,
     not retried (the actual switch is a human/new-data decision).
     """
-    from hagi.train.certified_controller import estimate_actions, select_action
+    from hagi.train.certified_controller import (
+        certified_argmax, estimate_actions,
+    )
     last = _last_ladder_entry()
     meas: dict = {}
     meta: dict = {"gen": gen}
@@ -127,20 +142,25 @@ def _select_next_action(gen: int, domains: list[str]) -> dict:
             meas["two_gap"] = float(two_gap)
             meas["merge_cost"] = 1.0  # cost unmeasured -> Gamma ranking
             meta["two_gap"] = two_gap
+        eps_gamma = certs.get("merge", {}).get("eps_gamma")
         delta = last.get("delta")
         if delta is not None and delta > 0:
             meas["g_new"] = float(delta)
             meas["grow_cost"] = 1.0
             meta["g_new"] = delta
     actions = estimate_actions(meas)
-    chosen = select_action(actions)
+    # §AW (CertifiedArgmax + tie_ambiguity): the argmax over MEASURED
+    # Gammas is legitimate only when top1-top2 ratio gap > 2*eps_gamma
+    # (split-half bracket, gen<N> certificates.merge.eps_gamma). Inside
+    # the bracket the choice is AMBIGUOUS -> halt with the diagnosis
+    # instead of acting on noise.
+    chosen, aw_meta = certified_argmax(
+        actions, float(eps_gamma) if eps_gamma is not None else 0.0)
     meta["actions"] = [{"name": a.name, "gamma": a.gamma,
                         "cost": a.cost, "ratio": a.ratio} for a in actions]
     meta["chosen"] = chosen.name if chosen else None
-    # §AW (CertifiedArgmax): the argmax is CERTIFIED only when the
-    # top1-top2 ratio gap exceeds 2*eps_Gamma; eps_Gamma is not yet
-    # measured (split-half) — log the raw gap so the bracket can be
-    # audited once it is. gap <= 0 means a single positive action.
+    meta["aw"] = aw_meta
+    # back-compat audit field: raw top1-top2 ratio gap
     ratios = sorted((a.ratio for a in actions), reverse=True)
     meta["argmax_gap"] = (ratios[0] - ratios[1]) if len(ratios) > 1 else None
     return meta
@@ -219,8 +239,15 @@ def main() -> int:
     selector = _select_next_action(g, args.domains)
     print(f"[gen{g}] §1 selector: {json.dumps(selector)}")
     if selector["chosen"] is None:
-        print(f"[gen{g}] no certified-positive action (E_dev exhausted, "
-              "R223) — switch the lever (fresh data / rank), halting")
+        aw = selector.get("aw", {})
+        if aw.get("verdict") == "AMBIGUOUS":
+            print(f"[gen{g}] §AMBIGUOUS argmax (tie_ambiguity): top1-top2 "
+                  f"ratio gap {aw.get('gap')} <= 2*eps_gamma "
+                  f"{aw.get('threshold')} — selection would act on "
+                  "noise, halting")
+        else:
+            print(f"[gen{g}] no certified-positive action (E_dev exhausted, "
+                  "R223) — switch the lever (fresh data / rank), halting")
         return 0
 
     # 1. leaves ------------------------------------------------------------
@@ -367,12 +394,21 @@ def main() -> int:
             # fine-tune would burn compute on an unviable round.
             "gate_pass": True,  # pilot aborted nonzero otherwise
             "noise_cos": _noise_cos(gen_root),
-            "logit_twoGap": _logit_twoGap(g, args.domains),
+            "logit_twoGap": None,  # filled below (value + eps bracket)
         },
         "joint": {  # fine-tune: certified accept below
             "ft_ce": entry_extra.get("cooldown_ce", None),
         },
     }
+    # §AW split-half bracket: measure twoGap on two disjoint eval
+    # halves; eps_gamma feeds certified_argmax (CertifiedArgmax /
+    # tie_ambiguity: argmax is legit only when top1-top2 > 2*eps_gamma).
+    _tg = _logit_twoGap(g, args.domains)
+    if _tg is not None:
+        certs["merge"]["logit_twoGap"] = _tg[0]
+        if _tg[1] == _tg[1]:  # not NaN
+            certs["merge"]["eps_gamma"] = _tg[1]
+    two_gap_exact = certs["merge"]["logit_twoGap"]
     entry = {"gen": g, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
              **entry_extra,
              "certificates": certs,
@@ -398,27 +434,49 @@ def main() -> int:
     # sample size at delta=0.05 (the deep-200 protocol anchor: n=200
     # -> eps~=0.096), so the margin is never a hand-tuned constant.
     # UNDECIDED with a positive observed delta = not enough evidence:
-    # DEEPEN the eval once (batches 30 -> 150, the deep-200 heritage)
-    # and re-decide; still UNDECIDED/REJECT halts — uncertified growth
-    # is not growth.
+    # DEEPEN the eval (deep-200 heritage). Adaptive ladder
+    # 30 -> 150 -> 600 -> 2400 batches/domain: eps shrinks as 1/sqrt(n)
+    # (n = batches * n_domains), so each rung certifies deltas of
+    # ~2*eps; a persistent positive-but-small delta keeps deepening
+    # until certified or the cap — REJECT with delta>0 never fires,
+    # so the loop is finite by construction. Inference-only cost.
     from hagi.train.certified_controller import certified_ab, hoeffding_n
     n_eval = 30 * len(args.domains)  # batches per domain * domains
     eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
     verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
                            eps=eps_cert, delta=0.05)
-    if verdict.undecided and entry["delta"] > 0:
-        print(f"[gen{g}] UNDECIDED at n={n_eval} (2*eps={2*eps_cert:.4f}) "
-              "— deepening the eval (deep-200 protocol)")
-        inc_ce_d = avg_ce(inc_cfg, args.root, batches=150)
-        new_ce_d = avg_ce(args.common_config, str(cand_ckpt), batches=150)
-        if inc_ce_d is not None and new_ce_d is not None:
-            inc_ce, new_ce = inc_ce_d, new_ce_d
-            entry["incumbent_ce"], entry["ft_ce"] = inc_ce, new_ce
-            entry["delta"] = inc_ce - new_ce
-            n_eval = 150 * len(args.domains)
-            eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
-            verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
-                                   eps=eps_cert, delta=0.05)
+    prev_delta = None
+    for deep_batches in (150, 600, 2400):
+        if not (verdict.undecided and entry["delta"] > 0):
+            break
+        eps_next = math.sqrt(math.log(2.0 / 0.05)
+                             / (2.0 * deep_batches * len(args.domains)))
+        # noise-chase guard: a delta that did not GROW between rungs
+        # while staying below the next rung's certification margin is
+        # a noise floor, not a pending certificate — deepening further
+        # burns GPU for an estimate that will not move (measured
+        # gen51: +0.0112@240 -> +0.0022@1200 -> +0.0022@4800).
+        if (prev_delta is not None and entry["delta"] <= prev_delta
+                and entry["delta"] < 2.0 * eps_next):
+            print(f"[gen{g}] delta {entry['delta']:+.4f} flat below the "
+                  f"next margin {2*eps_next:.4f} — noise floor, "
+                  "stopping the deepening (honest reject)")
+            break
+        prev_delta = entry["delta"]
+        print(f"[gen{g}] UNDECIDED at n={n_eval} (2*eps={2*eps_cert:.4f}, "
+              f"delta={entry['delta']:+.4f}) — deepening the eval to "
+              f"{deep_batches} batches/domain (adaptive deep-200)")
+        inc_ce_d = avg_ce(inc_cfg, args.root, batches=deep_batches)
+        new_ce_d = avg_ce(args.common_config, str(cand_ckpt), batches=deep_batches)
+        if inc_ce_d is None or new_ce_d is None:
+            break
+        inc_ce, new_ce = inc_ce_d, new_ce_d
+        entry["incumbent_ce"], entry["ft_ce"] = inc_ce, new_ce
+        entry["delta"] = inc_ce - new_ce
+        n_eval = deep_batches * len(args.domains)
+        eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
+        verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
+                               eps=eps_cert, delta=0.05)
     entry["accept_eps"] = round(eps_cert, 4)
     entry["accept_n"] = n_eval
     entry["accept_required_n"] = hoeffding_n(eps_cert, 0.05)

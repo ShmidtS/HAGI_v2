@@ -48,8 +48,15 @@ DOMAIN_MIX = {
 
 
 @torch.no_grad()
-def measure(gen: int, domains: list[str], cdir: str, batches: int,
-            device: str, domain: str) -> dict:
+def measure(
+    gen: int,
+    domains: list[str],
+    config_dir: str,
+    batches: int = 2,
+    device: str = "cpu",
+    domain: str = "math",
+    seed: int = 15111,
+) -> dict:
     pairs = []
     for d in domains:
         ck = Path(f"checkpoints/gen{gen}_leaf_{d}/best.pt")
@@ -64,7 +71,7 @@ def measure(gen: int, domains: list[str], cdir: str, batches: int,
     mix = load_mix(dc.data_dir, DOMAIN_MIX.get(domain, {"edu": 1.0}))
     dataset = PackedMixDataset(
         data_dir=dc.data_dir, seq_len=dc.seq_len,
-        eos_token_id=dc.eos_token_id, weights=mix, seed=15111,
+        eos_token_id=dc.eos_token_id,         weights=mix, seed=seed,
         cross_doc_attention=dc.cross_doc_attention)
     loader = DataLoader(dataset, batch_size=cfg0.train.batch_size,
                         num_workers=0, drop_last=True)
@@ -109,9 +116,12 @@ def main() -> int:
     p.add_argument("--domain", default="math")
     p.add_argument("--batches", type=int, default=2)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--seed", type=int, default=15111,
+                   help="dataset seed; split-half bracket uses two seeds")
     a = p.parse_args()
     cdir = a.config_dir or f"checkpoints/gen{a.gen}/configs"
-    out = measure(a.gen, a.domains, cdir, a.batches, a.device, a.domain)
+    out = measure(a.gen, a.domains, cdir, a.batches, a.device, a.domain,
+                  a.seed)
     print(json.dumps(out, indent=2))
     return 0
 
