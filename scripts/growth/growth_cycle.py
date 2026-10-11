@@ -138,11 +138,21 @@ def _select_next_action(gen: int, domains: list[str]) -> dict:
     if last is not None:
         certs = last.get("certificates", {})
         two_gap = certs.get("merge", {}).get("logit_twoGap")
+        eps_gamma = certs.get("merge", {}).get("eps_gamma")
+        last_gen = last.get("gen")
+        if two_gap is None and last_gen is not None:
+            # Backfill: the last generation's twoGap is missing (older
+            # entry or a measurement failure) but its leaves may still
+            # be on disk — measure NOW instead of silently dropping the
+            # merge action (a missing Gamma is not a zero Gamma).
+            fresh = _logit_twoGap(int(last_gen), domains)
+            if fresh is not None:
+                two_gap, eps_gamma = fresh
+                meta["two_gap_remeasured"] = True
         if two_gap is not None:
             meas["two_gap"] = float(two_gap)
             meas["merge_cost"] = 1.0  # cost unmeasured -> Gamma ranking
             meta["two_gap"] = two_gap
-        eps_gamma = certs.get("merge", {}).get("eps_gamma")
         delta = last.get("delta")
         if delta is not None and delta > 0:
             meas["g_new"] = float(delta)
