@@ -236,24 +236,32 @@ def reconstruct_expert(merged: dict, i: int) -> torch.Tensor:
 
 
 def spectral_compress(
-    root_factors: tuple[torch.Tensor, torch.Tensor], energy: float = 0.95
+    root_delta: torch.Tensor, energy: float = 0.95
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Truncate the root rank by spectral energy of the merged factors.
+    """Truncate the root rank by spectral energy of the MEAN PRODUCT.
 
     This is the R_quant compression of ResidualSplit — the COMPRESSIBLE
-    residual (the root), never the contrast fibers. Re-truncates the root
-    product ``U Vᵀ`` to the smallest rank retaining an ``energy`` fraction,
-    using the same R100 spectrum measurement as :func:`factorize_delta`.
+    residual (the root), never the contrast fibers. Truncates the exact
+    merged delta ``mean_i(U'_i V'_iᵀ) = root_matrix − W_shared`` — NOT the
+    factor-mean product ``mean(U')·mean(V')ᵀ`` (the two differ by the
+    cross terms ``(U'_i − mean U')(V'_i − mean V')ᵀ``; compressing the
+    factor-mean loses them — the 2.66-vs-5.04 bug the pilot worked
+    around). Re-truncation uses the same R100 spectrum measurement as
+    :func:`factorize_delta`.
+
+    Args:
+        root_delta: the exact merged root delta matrix
+            ``mean_i(U'_i V'_iᵀ)`` (``[m, n]``).
 
     Returns:
         New ``(U_r, V_r)`` with singular values folded into ``U_r``.
     """
-    U, V = root_factors
-    M = U.double() @ V.double().T
-    Qu, S, Vh = torch.linalg.svd(M, full_matrices=False)
+    if root_delta.ndim != 2:
+        raise ValueError("spectral_compress needs a 2D matrix")
+    Qu, S, Vh = torch.linalg.svd(root_delta.double(), full_matrices=False)
     r = _spectral_rank(S, energy)
-    Ur = (Qu[:, :r] * S[:r]).to(dtype=U.dtype)
-    Vr = Vh[:r, :].T.contiguous().to(dtype=V.dtype)
+    Ur = (Qu[:, :r] * S[:r]).to(dtype=root_delta.dtype)
+    Vr = Vh[:r, :].T.contiguous().to(dtype=root_delta.dtype)
     return Ur, Vr
 
 
@@ -414,7 +422,10 @@ def merge_fixed_width(
         ]
         aligned = latent_align([(U, V) for U, V, _ in factors])
         merged = root_contrast_merge(aligned, shared)
-        U_r, V_r = spectral_compress(merged["root_factors"], energy=root_energy)
+        # compress the EXACT mean product (root_matrix − W_shared), not
+        # the factor-mean product (cross-term bug, audit finding #4)
+        root_delta = merged["root_matrix"].double() - shared.double()
+        U_r, V_r = spectral_compress(root_delta, energy=root_energy)
         root_state[key] = merged["root_matrix"]
         root_factors[key] = (U_r, V_r)
         contrast_fibers[key] = merged["contrast_fibers"]

@@ -654,8 +654,26 @@ class Trainer:
         inner = {n: float(gmat[i].dot(d_star)) for i, n in enumerate(names)}
         margins = {n: float(self.cfg.train.certified_eps_nats) for n in names}
         curvature = dict(self._certified["curvature"])
+        # §2 THEORY-EXACT analytic rate (SafeQP.lean / ALGORITHMS §2):
+        #   eta* = <g0, d*> / (L · ||d*||^2)
+        # — analytic, not a hyperparameter; the guarantee needs
+        # ||d*||^2 <= <g0,d*> (safeQP_descent). L = the worst measured
+        # domain curvature (conservative). The R105 window stays as an
+        # UPPER cap (safety belt), and the schedule caps from above.
+        g0_inner = float(flat_g.dot(d_star))
+        L_eff = max(curvature.values()) if curvature else 0.0
+        eta_star = (
+            g0_inner / (L_eff * dn2)
+            if L_eff > 0.0 and g0_inner > 0.0 else 0.0
+        )
+        if g0_inner < dn2:
+            # descent-gap certificate violated (||d*||^2 <= <g0,d*>
+            # required): fall back to the R105 window alone
+            eta_star = 0.0
         cap = eta_max(margins, inner, curvature, dn2)
         eta = min(adam_lr, cap)
+        if eta_star > 0.0:
+            eta = min(eta, eta_star)
         if cap <= 0.0 or eta <= 0.0:
             logger.info(
                 "step %d certified-step: VETO (window empty, cap=%.3e)", self.step, cap
@@ -691,6 +709,7 @@ class Trainer:
         return {
             "certified_eta": eta,
             "certified_cap": cap,
+            "certified_eta_star": eta_star,
             "certified_active": int((lam > 1e-9).sum()),
             "certified_kappa": cert.get("kappa", float("nan")),
             "certified_descent_gap": cert.get("descent_gap", float("nan")),

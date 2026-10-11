@@ -150,14 +150,15 @@ def test_spectral_compress_energy_and_rank() -> None:
     gen = torch.Generator().manual_seed(7)
     d, r = 32, 10
     # Decaying spectrum: each component carries 1/2 of the previous one.
+    # New API: the input is the EXACT merged root delta matrix (the mean
+    # product), not a factor tuple — the cross-term fix.
     U = _orthonormal(d, r, gen)
     V = torch.randn(d, r, generator=gen, dtype=torch.float64)
     scales = 2.0 ** (-torch.arange(r, dtype=torch.float64))
-    root_factors = (U * scales, V)
-    full = root_factors[0] @ root_factors[1].T
-    total = float(full.pow(2).sum())
+    root_delta = (U * scales) @ V.T
+    total = float(root_delta.pow(2).sum())
     for energy in (0.5, 0.9, 1.0):
-        Uc, Vc = spectral_compress(root_factors, energy=energy)
+        Uc, Vc = spectral_compress(root_delta, energy=energy)
         rank = int(Uc.shape[1])
         assert 1 <= rank <= r
         kept = float((Uc @ Vc.T).pow(2).sum())
