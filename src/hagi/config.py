@@ -485,6 +485,15 @@ class MuonConfig:
     ns_coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
     weight_decay: float = 0.1
     wd_cap: float = 2.0
+    # R366 grokking-расписание (§7b): если grokking_T задан, weight_decay
+    # ВЫЧИСЛЯЕТСЯ из целевого времени генерализации T* по теореме
+    # (grokking_weight_decay), а не подбирается. Три поля задаются
+    # вместе (validate_config, fail-fast): grokking_T (T* в шагах),
+    # grokking_r0 (текущий остаток r0, напр. generalization gap),
+    # grokking_eps (целевой порог ε). None → фиксированный weight_decay.
+    grokking_T: int | None = None
+    grokking_r0: float | None = None
+    grokking_eps: float | None = None
     momentum_offload: bool = False
     norm_rows: bool = False
     mars_gamma: float = 0.0
@@ -1489,6 +1498,22 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("muon.wd_cap must be in (0, 8]")
     if len(t.muon.ns_coeffs) != 3:
         raise ValueError("muon.ns_coeffs must hold exactly 3 coefficients")
+    # R366 grokking-расписание: все три поля вместе; phase-safety
+    # η·λ ≤ 1 проверяется самой grokking_lambda (fail-fast).
+    _gk = (t.muon.grokking_T, t.muon.grokking_r0, t.muon.grokking_eps)
+    if any(v is not None for v in _gk) and not all(v is not None for v in _gk):
+        raise ValueError(
+            "muon.grokking_T/r0/eps must be set TOGETHER (R366: derived "
+            "weight decay needs T*, r0 and eps)"
+        )
+    if t.muon.grokking_T is not None:
+        from hagi.train.grokking_schedule import grokking_lambda
+        # η в теореме — эффективный шаг тела; на этой линии lr-полоса
+        # H·lr 0.35–0.38 при H=128 даёт η ≈ muon.lr (см. ARCHITECTURE §6.2).
+        grokking_lambda(
+            t.muon.grokking_r0, t.muon.grokking_eps, t.muon.lr,
+            float(t.muon.grokking_T),
+        )
 
     mm = m.multimodal
     if mm.enabled:

@@ -189,6 +189,7 @@ L2-дистиллят      → дистилл → студент 384  (fresh, q6
 | `train/takeoff_window.py` | R102 `growth_state_takeoff_window`, `noisy_cycle_step` | фиксированный gain даёт **конечный** takeoff; `κ√n·s/2` |
 | `train/gain_renewal.py` | R104 `renewal_feeds_takeoff`, `bounded_frontier_no_sustained_growth` | sustained growth ⟺ фронтир масштабируется |
 | `train/safeqp_step.py` | R105 `safeqp_eta_max`, R106 `poe_logZ_second_order` | **производный** безопасный LR; ошибка PoE-пулинга ≤ `R²/8` |
+| `train/grokking_schedule.py` | R366 `grokking_threshold_time` | λ = ln(r₀/ε)/(η·T*) — weight decay выведен из целевого времени генерализации, а не подобран (§7b) |
 
 (Порты R92–R94, R95/R96, R103 — stochastic_safeqp, anytime_budget,
 growth_law, data_axis, ternary_exact, routing_optimal — перенесены в
