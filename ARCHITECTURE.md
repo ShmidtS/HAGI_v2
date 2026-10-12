@@ -134,6 +134,13 @@ HAGI_v2/
 └── .omc/attempts/            # ledgers раундов
 ```
 
+**Чистка 2026-10-12** (attic, обратимо, AST-граф импортов от live-корней
+scripts/growth+train+eval): bit_alloc, recursive_distill, hedge +
+hedge_router (SKIP-цепочка), self_development оставлен (кросс-
+потребитель в тестах saturation), scripts/cycle_gate.py — модули без
+runtime-потребителя; тести перенесены рядом (test_hedge.py,
+собирается из attic через sys.path).
+
 **Чистка 2026-10-10** (attic, обратимо, история в git): anytime_budget
 и stochastic_safeqp (anytime-гейт живёт в
 `growth_supervisor.anytime_margin`), data_axis (совет — в супервизоре),

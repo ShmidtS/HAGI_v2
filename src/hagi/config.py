@@ -980,14 +980,11 @@ class InferenceConfig:
 class RouterConfig:
     """§6 inference router switches (Hedge + tail budget).
 
-    ``hedge`` (default OFF) enables the Hedge router over ensemble
-    leaves at generation time. HONEST SKIP NOTE: the merged model
-    (``MergedHAGI``) does not expose per-leaf logits -- the block-
-    diagonal body feeds ONE wide head -- and computing them would need
-    K extra head+tail forwards per token, which the flag refuses to do
-    silently. When enabled but per-leaf logits are unavailable, the
-    router (``hagi.inference.hedge_router``) logs a skip note and falls
-    back to the merged head's logits unchanged.
+    HONEST STATUS: the Hedge router module
+    (``hagi.inference.hedge_router``) was moved to ``_raw/attic/``
+    (consumer audit 2026-10-12: zero live callers -- MergedHAGI does
+    not expose per-leaf logits). The ``hedge`` field is kept only for
+    YAML/checkpoint config compatibility and is inert.
     """
 
     hedge: bool = False
