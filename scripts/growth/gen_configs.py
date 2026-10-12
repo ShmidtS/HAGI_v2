@@ -358,7 +358,7 @@ if __name__ == "__main__":
     ap.add_argument("--root", required=True, help="incumbent root checkpoint")
     ap.add_argument("--seed-base", type=int, required=True,
                     help="seed family, e.g. 24 -> seeds 241xx")
-    ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--rank", type=int, default=128)
     args = ap.parse_args()
     for name, p in write_generation(args.gen, args.root, args.seed_base,
                                     args.rank).items():
