@@ -66,8 +66,48 @@ def _spectral_rank(values: torch.Tensor, energy: float) -> int:
     return rank_from_spectrum(v, total, (1.0 - energy) * total)
 
 
+def mdl_rank(svals: torch.Tensor, lam: float, c: float) -> int:
+    """MDL-optimal rank (R304/R305, first-order criterion).
+
+    Theory (primes R304 ``mdlErr_antitone``/``mdlJ_argmin_exists``,
+    R305 ``mdlErr_step``: err k − err(k+1) = σ_k²): the MDL functional
+    J(k) = err(k) + λ·c·k stops growing rank at the first k where the
+    next singular value's QUALITY STEP no longer pays its DESCRIPTION
+    COST -- σ_{k+1}² ≤ λ·c (λ in weight² units per parameter, c = the
+    number of parameters one rank costs).
+
+    Args:
+        svals: singular values σ_1 ≥ σ_2 ≥ ... (any shape, flattened).
+        lam: MDL price per parameter, in the SAME (weight²) units as σ².
+        c: parameters per rank (e.g. m + n + 1 for a rank-1 factor pair
+           plus a scale).
+
+    Returns:
+        The optimal rank r in ``[1, len(svals)]``. With ``lam <= 0`` the
+        criterion never stops before the spectrum is exhausted (lossless).
+    """
+    if lam < 0.0:
+        raise ValueError(f"lam must be >= 0, got {lam}")
+    if c <= 0.0:
+        raise ValueError(f"c must be > 0, got {c}")
+    v = svals.double().flatten()
+    n = v.numel()
+    if n == 0:
+        return 0
+    budget = lam * c
+    # first k (1-based) with σ_{k+1}² ≤ budget; rank = that k
+    tail = v.pow(2)
+    below = (tail <= budget).nonzero()
+    if below.numel() == 0:
+        return n
+    k = int(below[0].item())  # index of first σ² inside the budget
+    return max(1, k)  # rank 0 (total truncation) is never chosen: the
+    # first singular value always carries the merged disagreement
+
+
 def factorize_delta(
-    W: torch.Tensor, W_shared: torch.Tensor, energy: float = 0.9
+    W: torch.Tensor, W_shared: torch.Tensor, energy: float = 0.9,
+    mdl: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Thin SVD of the expert disagreement ``ΔW = W - W_shared``.
 
@@ -79,7 +119,12 @@ def factorize_delta(
     Args:
         W: expert weight ``[m, n]``.
         W_shared: shared (root) weight, same shape.
-        energy: retained-energy fraction in ``(0, 1]``.
+        energy: retained-energy fraction in ``(0, 1]`` (empirical
+            threshold; used only when ``mdl`` is None).
+        mdl: ``(lam, c)`` -- use the CERTIFIED first-order MDL criterion
+            σ_{k+1}² ≤ lam·c (R304/R305) instead of the empirical energy
+            threshold. ``lam`` must be in weight² units; the CE-nats
+            bridge (h_emp_L, open A6) is the caller's responsibility.
 
     Returns:
         ``(U [m, r], V [n, r], svals [r])`` in ``W``'s dtype; the SVD itself
@@ -91,7 +136,10 @@ def factorize_delta(
         raise ValueError("factorize_delta needs 2D weights")
     delta = (W.double() - W_shared.double())
     U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
-    r = _spectral_rank(S, energy)
+    if mdl is not None:
+        r = mdl_rank(S, mdl[0], mdl[1])
+    else:
+        r = _spectral_rank(S, energy)
     Ur = U[:, :r] * S[:r]
     Vr = Vh[:r, :].T.contiguous()
     return Ur.to(dtype=W.dtype), Vr.to(dtype=W.dtype), S[:r].to(dtype=W.dtype)

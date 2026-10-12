@@ -229,3 +229,54 @@ def test_merge_fixed_width_two_identical_experts() -> None:
     merged = merge_fixed_width([e0, e1], shared, energy=1.0, root_energy=1.0)
     err = float((merged.root_state_dict["w"] - W).norm())
     assert err < 1e-4 * float(W.norm())
+
+
+# --- R304/R305: MDL first-order rank criterion (mdl_rank) ------------------
+
+
+def test_mdl_rank_stops_where_step_below_budget():
+    import torch
+    from hagi.model.latent_merge import mdl_rank
+    s = torch.tensor([3.0, 2.0, 1.0, 0.5, 0.1])
+    # sigma^2 = [9, 4, 1, 0.25, 0.01]; lam*c = 0.5 -> first sigma^2 <= 0.5
+    # is 0.25 at index 3 -> k = 3, rank 3
+    assert mdl_rank(s, lam=0.5, c=1.0) == 3
+
+
+def test_mdl_rank_zero_budget_lossless():
+    import torch
+    from hagi.model.latent_merge import mdl_rank
+    s = torch.tensor([3.0, 2.0, 1.0])
+    assert mdl_rank(s, lam=0.0, c=1.0) == 3
+
+
+def test_mdl_rank_min_rank_one():
+    import torch
+    from hagi.model.latent_merge import mdl_rank
+    # even an all-tiny spectrum keeps rank 1 (merged disagreement survives)
+    assert mdl_rank(torch.tensor([0.01, 0.001]), lam=10.0, c=1.0) == 1
+
+
+def test_mdl_rank_matches_j_optimum():
+    import torch
+    from hagi.model.latent_merge import mdl_rank
+    # J(k) = err(k) + lam*c*k with err(k) = sum_{i>k} sigma_i^2 (Eckart-Young)
+    s = torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0, 0.5])
+    lam, c = 4.0, 2.0  # cost per rank = 8
+    sq = s.pow(2).tolist()
+    r_star = mdl_rank(s, lam, c)
+    errs = [sum(sq[k:]) for k in range(len(sq) + 1)]  # err(k), k = 0..n
+    js = [errs[k] + lam * c * k for k in range(len(sq) + 1)]
+    assert js[r_star] == min(js), (js, r_star)
+
+
+def test_factorize_delta_mdl_mode():
+    import torch
+    from hagi.model.latent_merge import factorize_delta
+    W = torch.zeros(16, 16)
+    W[0, 0] = 4.0   # sigma = 4
+    W[1, 1] = 1.0   # sigma = 1
+    Ws = torch.zeros(16, 16)
+    U, V, s = factorize_delta(W, Ws, mdl=(0.5, 16 + 16 + 1))
+    # sigma_2^2 = 1.0 > 0.5*33 = 16.5? no: 1.0 <= 16.5 -> rank 1
+    assert U.shape[1] == 1 and s.numel() == 1
