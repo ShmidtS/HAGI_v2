@@ -36,8 +36,12 @@ DOMAINS: list[str] = ["math", "code", "ru", "enedu", "enweb", "enwiki"]
 # independent domains — books (Gutenberg prose) and sci (PubMed
 # abstracts, measured 10% unk against the frozen 32k vocab — biomedical
 # lexicon outside the old corpora's head; the domain carries novelty
-# exactly where the incumbent has never been). Add via run_ladder
-# --domains ... books sci once the ladder's next cycle starts.
+# exactly where the incumbent has never been). LIVE since gen45+:
+# gen51 ACCEPTED (+0.035 certified at n=19200) — the first growth after
+# 7 rejected generations. gen52–56 regressed: 800-step leaves eat only
+# ~10M tokens of the ~500M-token books corpus, so the axis is NOT
+# exhausted — the leaf budget is. Since gen58 books/sci leaves train
+# 2400 steps (saturation-stop still guards best.pt).
 NEW_DOMAINS: list[str] = ["books", "sci"]
 
 # Per-domain overrides (measured winning-line values).
@@ -80,12 +84,12 @@ _DOMAIN: dict[str, dict] = {
     ),
     "books": dict(
         weights={"books": 0.85, "slimpajama": 0.15},
-        z_loss=0.001, scale=0.4, max_steps=800, lr=0.0004, tau=None,
+        z_loss=0.001, scale=0.4, max_steps=2400, lr=0.0004, tau=None,
         init_off=118, data_off=112,
     ),
     "sci": dict(
         weights={"sci": 0.70, "edu": 0.30},
-        z_loss=0.003, scale=0.3, max_steps=800, lr=0.0004, tau=None,
+        z_loss=0.003, scale=0.3, max_steps=2400, lr=0.0004, tau=None,
         init_off=119, data_off=112,
     ),
 }
