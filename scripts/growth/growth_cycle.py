@@ -156,7 +156,11 @@ def _select_next_action(gen: int, domains: list[str]) -> dict:
         delta = last.get("delta")
         if delta is not None and delta > 0:
             meas["g_new"] = float(delta)
-            meas["grow_cost"] = 1.0
+            # grow_cost stays UNMEASURED (defaults to 0.0): estimate_actions
+            # SUBTRACTS it from Gamma in gain units (test_certified_controller:
+            # 0.50-0.15), so a placeholder in nats would flip the sign and
+            # fake "E_dev exhausted" (the gen52-56 halt artifact). K for
+            # ranking = grow_exec_cost (wall-clock, unmeasured -> 1.0).
             meta["g_new"] = delta
     actions = estimate_actions(meas)
     # §AW (CertifiedArgmax + tie_ambiguity): the argmax over MEASURED
