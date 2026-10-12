@@ -284,7 +284,7 @@ def write_generation(
     gen: int,
     root_ckpt: str,
     seed_base: int,
-    rank: int = 64,
+    rank: int = 128,
     domains: list[str] | None = None,
     out_dir: Path | None = None,
 ) -> dict[str, Path]:
