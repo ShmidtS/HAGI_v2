@@ -234,8 +234,13 @@ merge:
   distill: false
 train:
   init_from: {root_ckpt}
-  max_steps: 600
-  checkpoint_interval: 400
+  # R361 lever: joint-integration budget scales with leaf count
+  # (gen41 era: 600 steps for 6 leaves; 10 leaves under-budgeted —
+  # gen52-60 all rejected). joint_stage: descent per step is capped,
+  # more experts to integrate needs more steps. Certified gate
+  # protects: only ACCEPT beats the incumbent.
+  max_steps: {ft_steps}
+  checkpoint_interval: {ft_interval}
   checkpoint_keep_last: 3
   precision: bf16
   grad_checkpointing: false
@@ -250,7 +255,7 @@ train:
   adam:
     weight_decay: 0.3
   schedule:
-    warmup_steps: 200
+    warmup_steps: {ft_warmup}
     inverse_sqrt_tau: 300
   saturation_patience: 8
   saturation_tol: 0.01
@@ -327,10 +332,15 @@ def write_generation(
         "edu": 0.2, "slimpajama": 0.15, "openwebmath": 0.25,
         "oscar_ru": 0.1, "wikipedia_ru": 0.1, "python_instruct": 0.2,
     }
+    # R361: warmup = 1/6 of budget (was 200/600 = 1/3 at 6-leaf era)
+    ft_steps = 100 * len(domains)
+    ft_warmup = max(100, ft_steps // 6)
+    ft_interval = max(200, ft_steps // 3)
     s = ROOT_FT_TEMPLATE.format(
         gen=gen, rank=rank,
         root_ckpt=f"checkpoints/gen{gen}_root/root.pt",
         ft_dir=f"checkpoints/gen{gen}_root_ft",
+        ft_steps=ft_steps, ft_warmup=ft_warmup, ft_interval=ft_interval,
         data_seed=15111,  # pinned: the ladder's common eval/train seed
         weights_block=_weights_block(root_mix),
     )
