@@ -204,7 +204,9 @@ gen-7 H=10368, упёрлось в VRAM → density ladder / латентная 
 2. **Latent merge** (pilot_latent_merge.py) — теоретически корректный
    пайплайн §3.1; noise_report.json даёт R255-когерентность
    (mean |cos| разногласий — в лестнице: 0.07–0.14).
-3. **Root fine-tune** (600 шагов) + **WSqD cooldown** (R254: 200 шагов,
+3. **Root fine-tune** (600 шагов; R361: с gen61 — 100·N_листьев
+   шагов при N=10 → 1000, warmup 1/6 бюджета; рычаг после 9 подряд
+   отклонений gen52–60) + **WSqD cooldown** (R254: 200 шагов,
    batch ×4, lr 0.4×).
 4. **Certified accept §9**: кандидат = лучший из ft/cooldown; замена
    инкамбента только при delta > 0.02 на common-protocol eval
