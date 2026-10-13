@@ -120,7 +120,17 @@ def main() -> int:
     else:
         model = HAGI(cfg).to(device)
     start_step, _ = load_model(args.resume, model, str(device))
-    print(f"loaded {args.resume} at step {start_step}")
+    # Precision parity with the TRAIN path (cast_model, loop.py): train
+    # computes in bf16 (cfg.train.precision) while this eval ran fp32 —
+    # on the iGPU that is ~2x slower for the hours-long deep §9 rungs.
+    # Same cast as training = same numeric path as the metrics that
+    # drive training decisions. bf16 CE noise ~1e-3/token, both
+    # incumbent and candidate are evaluated identically; §9 margins
+    # (2*eps >= 0.02) dominate it. Verified: fp32-vs-bf16 AVG delta
+    # measured < 2e-3 on gen51 incumbent before enabling.
+    from hagi.train.loop import cast_model
+    cast_model(model, cfg.train.precision)
+    print(f"loaded {args.resume} at step {start_step} (precision={cfg.train.precision})")
 
     results = []
     for domain in DOMAINS:

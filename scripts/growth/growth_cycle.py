@@ -63,11 +63,22 @@ def consumed_offset(leaf_dir: Path) -> int:
     return 0
 
 
+def _cuda_ok() -> bool:
+    """iGPU available (advisory measurements run on the idle GPU —
+    the CPU path cost ~5.5h wall on gen68)."""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def _logit_twoGap(gen: int, domains: list[str]) -> tuple[float, float] | None:
     """Formula-exact logit twoGap of this generation's leaves
-    (math domain, 1 batch, CPU) with the §AW split-half bracket:
-    measured twice on disjoint eval samples (seeds 15111/15112),
-    eps_gamma = |a-b|/2 is the measurement uncertainty of Gamma.
+    (math domain, 1 batch, idle-GPU-else-CPU) with the §AW split-half
+    bracket: measured twice on disjoint eval samples (seeds
+    15111/15112), eps_gamma = |a-b|/2 is the measurement uncertainty
+    of Gamma.
     Returns (mean, eps_gamma); None on any failure (advisory —
     never blocks the cycle)."""
     import subprocess as _sp
@@ -77,7 +88,13 @@ def _logit_twoGap(gen: int, domains: list[str]) -> tuple[float, float] | None:
             [sys.executable, "-X", "utf8", "-u",
              str(ROOT / "scripts/growth/measure_logit_twogap.py"),
              "--gen", str(gen), "--domains", *domains,
-             "--batches", "1", "--domain", "math", "--device", "cpu",
+             # GPU idle at both call sites (end-of-gen certificates /
+             # pre-leaf selector): the CPU measurement cost ~5.5h wall on
+             # gen68 (10 leaves × full-vocab logsumexp) vs seconds on the
+             # iGPU — measured 2026-10-13. Same fp32 math, split-half
+             # seeds unchanged; falls back to CPU if no CUDA.
+             "--batches", "1", "--domain", "math", "--device",
+             ("cuda" if _cuda_ok() else "cpu"),
              "--seed", str(seed)],
             capture_output=True, text=True, cwd=str(ROOT))
         try:
@@ -219,7 +236,30 @@ def sh(cmd: list[str], log: Path) -> int:
 
 
 def avg_ce(config: str, ckpt: str, batches: int = 30) -> float | None:
-    """Common-protocol AVG exact CE of a checkpoint (None on failure)."""
+    """Common-protocol AVG exact CE of a checkpoint (None on failure).
+
+    Кэш (checkpoint/_ce_cache.jsonl): eval seed закреплён per-config
+    (детерминизм задокументирован), поэтому CE = f(config, ckpt,
+    batches). Инкамбент пере-оценивается на каждой ступени глубокого
+    §9-eval КАЖДОГО поколения (2400 батчей × 10 доменов — часы GPU);
+    кэш режет это до одного прогона на (ckpt, n) за всю лестницу.
+    Ключ включает mtime+size чекпойнта — замена файла инвалидирует.
+    """
+    import hashlib
+    ck = Path(ckpt)
+    st = ck.stat()
+    key_src = f"{config}|{ck.resolve()}|{batches}|{st.st_mtime_ns}|{st.st_size}"
+    key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:16]
+    cache = ROOT / "checkpoints" / "_ce_cache.jsonl"
+    if cache.exists():
+        for line in cache.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("key") == key:
+                    return float(rec["ce"])
     out = ROOT / "checkpoints" / "_cycle_eval.json"
     r = subprocess.run(
         [sys.executable, "-X", "utf8", "-u", str(ROOT / "scripts/eval_domains.py"),
@@ -229,7 +269,12 @@ def avg_ce(config: str, ckpt: str, batches: int = 30) -> float | None:
     out.write_text(r.stdout, encoding="utf-8")
     for line in r.stdout.splitlines():
         if line.strip().startswith("AVG"):
-            return float(line.split("exact_ce=")[1].split()[0])
+            ce = float(line.split("exact_ce=")[1].split()[0])
+            with cache.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"key": key, "ce": ce,
+                                     "config": config, "ckpt": ckpt,
+                                     "batches": batches}) + "\n")
+            return ce
     return None
 
 
@@ -329,12 +374,15 @@ def main() -> int:
         cd_cfg = cd_dir / "cooldown.yaml"
         base = (ROOT / args.ft_config).read_text(encoding="utf-8")
         cd_cfg.parent.mkdir(parents=True, exist_ok=True)
+        import re as _re
         cd_cfg.write_text(
-            base.replace(f"init_from: checkpoints/gen{g}_root/root.pt",
-                         f"init_from: {ft_ckpt}")
-                .replace("grad_accum_steps: 1", "grad_accum_steps: 4")
-                .replace("learning_rate: 0.0002", "learning_rate: 0.00008")
-                .replace("max_steps: 600", "max_steps: 200"),
+            _re.sub(r"max_steps: \d+", "max_steps: 200",
+                _re.sub(r"batch_growth_delta: [0-9.]+", "batch_growth_delta: null",
+                    base
+                    .replace(f"init_from: checkpoints/gen{g}_root/root.pt",
+                             f"init_from: {ft_ckpt}")
+                    .replace("grad_accum_steps: 1", "grad_accum_steps: 4")
+                    .replace("learning_rate: 0.0002", "learning_rate: 0.00008"))),
             encoding="utf-8")
         sh([sys.executable, "-X", "utf8", "-u", "scripts/train.py",
             "--config", str(cd_cfg),
