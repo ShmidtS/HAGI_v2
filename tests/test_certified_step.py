@@ -64,6 +64,11 @@ def _certified_trainer(mode: str, corpora: list[str], tmp_path, **over):
     base.update(over)
     c = _cfg(**base)
     c.train.data.data_dir = str(data_dir)
+    # Zero warmup so step 0 runs at the configured LR: with the default
+    # warmup_steps=2000 the schedule LR at step 0 is exactly 0, the gate
+    # applies a legitimate zero-LR step (warmup), and "applied => eta>0"
+    # fails / the step mode always silently takes the veto branch.
+    c.train.schedule.warmup_steps = 0
     validate_config(c)
     model = build_model_for_config(c)
     return Trainer(model, c, 0)
