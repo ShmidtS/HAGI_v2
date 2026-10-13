@@ -678,6 +678,15 @@ class TrainConfig:
     max_steps: int = 200000
     batch_size: int = 8
     grad_accum_steps: int = 4
+    # R371 growing-batch расписание (§plan growing-batch family): если
+    # batch_growth_delta задан, эффективный batch растёт геометрически
+    # accum(t) = grad_accum_steps · δ^t (кап — batch_growth_cap, ОБЯЗАТЕЛЕН
+    # при delta: δ^t растёт быстро и съедает память/латентность).
+    # Теорема growing_batch_stabilized: при δ > 1/ρ (ρ = 1 − ηL)
+    # стохастический хвост гаснет на скорости контракции — WSqD-полировка
+    # R254 (фикс ×4) выведена из теоремы, а не подобрана. None → фикс.
+    batch_growth_delta: float | None = None
+    batch_growth_cap: int | None = None
     learning_rate: float = 3e-4
     max_grad_norm: float = 1.0
     precision: str = "bf16"
@@ -1366,6 +1375,21 @@ def validate_config(cfg: Config) -> None:
     positive_int("model.attention.head_dim", a.head_dim, 512)
     positive_int("train.batch_size", t.batch_size, 4096)
     positive_int("train.grad_accum_steps", t.grad_accum_steps, 1024)
+    # R371 growing-batch: delta ≥ 1 (теорема) и cap обязателен при delta
+    # (δ^t растёт неограниченно — без капа шаг раздуется до OOM).
+    if t.batch_growth_delta is not None:
+        if t.batch_growth_delta < 1.0:
+            raise ValueError(
+                f"train.batch_growth_delta must be >= 1 (R371 theorem), "
+                f"got {t.batch_growth_delta}")
+        if t.batch_growth_cap is None:
+            raise ValueError(
+                "train.batch_growth_cap is REQUIRED when batch_growth_delta "
+                "is set (delta^t grows unbounded — OOM guard, R371)")
+        if t.batch_growth_cap < t.grad_accum_steps:
+            raise ValueError(
+                f"train.batch_growth_cap ({t.batch_growth_cap}) must be >= "
+                f"grad_accum_steps ({t.grad_accum_steps})")
     positive_int("train.data.seq_len", t.data.seq_len, 1 << 20)
 
     if a.num_query_heads * a.head_dim != m.hidden_size:
