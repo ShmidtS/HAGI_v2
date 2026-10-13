@@ -802,6 +802,16 @@ class TrainConfig:
     divergence_patience: int = 0
     divergence_delta: float = 0.15
     divergence_min_steps: int = 0
+    # Liveness two-axis stop (Unified/Liveness.lean, liveness_two_axis;
+    # contrapositive of certified_controller.stop_condition): stop only
+    # when BOTH axes are frozen — the energy axis (control CE not
+    # decreasing) AND the data/growth axis (grad-norm injection signal
+    # flat). While either axis is alive, training continues. Disabled
+    # when ``liveness_window`` is 0.
+    liveness_window: int = 0
+    liveness_energy_tol: float = 0.005
+    liveness_growth_tol: float = 1e-4
+    liveness_min_steps: int = 0
     # Recursive-growth primitive: load weights from a checkpoint as an
     # *initialization* (step 0, fresh optimizer) rather than a resume. A
     # level-N expert starts from the merged level-(N-1) model (the shared
@@ -1390,6 +1400,16 @@ def validate_config(cfg: Config) -> None:
             raise ValueError(
                 f"train.batch_growth_cap ({t.batch_growth_cap}) must be >= "
                 f"grad_accum_steps ({t.grad_accum_steps})")
+    # Liveness two-axis (Unified/Liveness.lean): window ≥ 10 when enabled.
+    if t.liveness_window < 0:
+        raise ValueError("train.liveness_window must be >= 0")
+    if t.liveness_window > 0:
+        if t.liveness_window < 10:
+            raise ValueError(
+                f"train.liveness_window must be >= 10 when enabled, got {t.liveness_window}")
+        if t.liveness_energy_tol <= 0 or t.liveness_growth_tol <= 0:
+            raise ValueError(
+                "train.liveness_energy_tol and train.liveness_growth_tol must be > 0")
     positive_int("train.data.seq_len", t.data.seq_len, 1 << 20)
 
     if a.num_query_heads * a.head_dim != m.hidden_size:

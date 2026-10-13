@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -161,6 +162,27 @@ def puncture_loss_mask(
     if base is not None:
         keep = keep & base.bool().to(device=device)
     return keep
+
+
+def liveness_two_axis_frozen(
+    energy: list[float], growth: list[float], energy_tol: float, growth_tol: float
+) -> bool:
+    """Liveness two-axis freeze test (Unified/Liveness.lean,
+    contrapositive of ``liveness_two_axis``).
+
+    ``energy`` — control-CE samples over the window (energy axis);
+    ``growth`` — grad-norm samples (data-injection axis proxy).
+    The energy axis is alive when CE decreased by more than
+    ``energy_tol`` across the window; the growth axis is alive when
+    the injection signal varied by more than ``growth_tol``. Frozen
+    means BOTH axes dead — the honest stop. While either axis is
+    alive the loop must continue (one useful action exists).
+    """
+    if len(energy) < 2 or len(growth) < 2:
+        return False
+    energy_alive = energy[0] - energy[-1] > energy_tol
+    growth_alive = max(growth) - min(growth) > growth_tol
+    return not (energy_alive or growth_alive)
 
 
 def configure_runtime() -> None:
@@ -1514,6 +1536,18 @@ def train(
     last_gate_ce: float | None = None
     diverged_count = 0
 
+    # Liveness two-axis stop (Unified/Liveness.lean liveness_two_axis,
+    # contrapositive of certified_controller.stop_condition): stop only
+    # when BOTH axes are frozen — energy (control CE flat) AND data/growth
+    # (grad-norm injection signal flat). While either axis is alive the
+    # loop continues. Disabled when liveness_window is 0.
+    live_window = int(cfg.train.liveness_window)
+    live_energy_tol = float(cfg.train.liveness_energy_tol)
+    live_growth_tol = float(cfg.train.liveness_growth_tol)
+    live_min_steps = int(cfg.train.liveness_min_steps)
+    live_energy_buf: deque[float] = deque(maxlen=max(live_window, 1))
+    live_growth_buf: deque[float] = deque(maxlen=max(live_window, 1))
+
     # Fixed-window gate evaluation (round 61): deterministic tail-window
     # batch per corpus, captured lazily on first use, weighted with the
     # canonical corpus weights. A STABLE control signal -- unlike the running
@@ -1789,6 +1823,33 @@ def train(
                         trainer.step,
                     )
                     break
+
+        # Liveness two-axis (Unified/Liveness.lean): freeze = BOTH axes
+        # dead (energy flat AND injection signal flat) over the window.
+        # Either axis alive -> continue (a useful action exists).
+        if live_window > 0 and sat_signal is not None:
+            live_energy_buf.append(sat_signal)
+            grad_signal = metrics.get("grad_norm")
+            if grad_signal is not None:
+                live_growth_buf.append(float(grad_signal))
+            if (
+                trainer.step >= live_min_steps
+                and len(live_energy_buf) == live_window
+                and len(live_growth_buf) == live_window
+                and liveness_two_axis_frozen(
+                    list(live_energy_buf), list(live_growth_buf),
+                    live_energy_tol, live_growth_tol,
+                )
+            ):
+                logger.info(
+                    "liveness_two_axis_frozen: energy ce %.4f->%.4f (tol %.4f) and "
+                    "grad-norm %.4f..%.4f (tol %.4f) both flat over %d samples; "
+                    "stopping at step %d",
+                    live_energy_buf[0], live_energy_buf[-1], live_energy_tol,
+                    min(live_growth_buf), max(live_growth_buf), live_growth_tol,
+                    live_window, trainer.step,
+                )
+                break
 
         # Divergence guard on the GATE CE (fixed window, stable) — never the
         # per-batch "ce": on a multi-domain mix the batch CE swings >0.3 nats
