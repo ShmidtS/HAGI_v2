@@ -1443,6 +1443,23 @@ def train(
         trainer.load_optimizer_state(optimizer_state)
 
     accum = cfg.train.grad_accum_steps
+    # R371 growing-batch (§plan growing-batch family): эффективный batch
+    # растёт геометрически accum(t) = base·δ^t (кап). Теорема
+    # growing_batch_stabilized: при δ > 1/ρ стохастический хвост гаснет
+    # на скорости контракции — полировка хвоста выведена, не подобрана
+    # (WSqD R254 → R371). None → фикс (наследие).
+    _bgd = cfg.train.batch_growth_delta
+    _bg_cap = cfg.train.batch_growth_cap
+    if _bgd is not None:
+        from hagi.train.growing_batch import growing_accum
+        _tokens_used = 0  # actual tokens (growing accum ≠ base·step)
+
+        def _accum_at(step: int) -> int:
+            return growing_accum(cfg.train.grad_accum_steps, _bgd,
+                                 step, _bg_cap)
+    else:
+        def _accum_at(step: int) -> int:
+            return accum
 
     def _write_consumed() -> None:
         """Record how many tokens this expert consumed, for the next expert's
@@ -1451,7 +1468,10 @@ def train(
         """
         import json
         from pathlib import Path
-        consumed = start_offset + trainer.step * cfg.train.batch_size * cfg.train.data.seq_len * accum
+        if _bgd is not None:
+            consumed = start_offset + _tokens_used
+        else:
+            consumed = start_offset + trainer.step * cfg.train.batch_size * cfg.train.data.seq_len * accum
         # The pipeline's ``_consumed`` reads the cumulative offset from the
         # corpus root (the parent of the slice dir), so that file must stay
         # where it is. It was, however, the ONLY record of what a run
@@ -1578,6 +1598,7 @@ def train(
         return total
 
     while trainer.step < cfg.train.max_steps:
+        accum = _accum_at(trainer.step)  # R371: growing-batch (или фикс)
         microbatches = []
         for _ in range(accum):
             try:
@@ -1603,6 +1624,8 @@ def train(
                 return
 
         step_index = trainer.step
+        if _bgd is not None:
+            _tokens_used += accum * cfg.train.batch_size * cfg.train.data.seq_len
         metrics = trainer.train_step(microbatches)
         # The insight cycle scores a fixed window so its KL guard is
         # comparable across steps; reuse the current step's last microbatch

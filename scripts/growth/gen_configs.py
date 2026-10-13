@@ -247,6 +247,16 @@ train:
   ternary_fp32_master: false
   batch_size: 32
   grad_accum_steps: 1
+  # R371 growing-batch (growing_batch_stabilized, порт 2026-10-13):
+  # ft gen62/63 останавливался divergence-гвардом на шагах 255-305 —
+  # train CE шумит ±0.3 при accum=1 (32768 ток/шаг), gate_ce ловит
+  # перелёты. Геометрический рост эффективного батча гасит шумовой
+  # хвост на скорости контракции: 1.0055^1000 ≈ 220 -> кап 16
+  # (достигается к шагу ~510; WSqD-эмпирика ×4 перекрыта с запасом).
+  # К концу ft шум/4, ранняя фаза остаётся быстрой. η не трогаем
+  # (кап 1/L, ALGORITHMS §2); расписание выведено, не подобрано.
+  batch_growth_delta: 1.0055
+  batch_growth_cap: 16
   compile_model: true
   # lr band H*lr 0.35-0.38
   learning_rate: 0.0002
