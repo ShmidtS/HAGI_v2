@@ -917,3 +917,35 @@ def optimal_batch(b_noise: float, t0: float, c: float) -> float:
     if c <= 0:
         return float("inf")
     return (b_noise * t0 / c) ** 0.5
+
+
+def freedman_tail_low(delta: float, V: float, b: float) -> float:
+    """Probability/Freedman ``freedman_tail_low``: adaptive tail bound.
+
+    P[sum X <= -delta] <= exp(-delta^2 / (2*(V + b*delta/3))) where V
+    is the predictable quadratic variation of the martingale and b the
+    per-step range. Strictly stronger than Azuma's exp(-delta^2/(2n))
+    whenever V < n (use as the accept-gate tail in place of the
+    fixed-n form; see also certified_controller.hoeffding_n).
+    """
+    if delta <= 0 or V < 0 or b <= 0:
+        raise ValueError("need delta > 0, V >= 0, b > 0")
+    return math.exp(-(delta * delta) / (2.0 * (V + b * delta / 3.0)))
+
+
+def eckart_young_frobenius_error(
+    singular_values: torch.Tensor, k: int,
+) -> torch.Tensor:
+    """Spectral ``eckart_young_frobenius``: optimal truncation residual.
+
+    Returns the Frobenius norm of the best rank-k approximation
+    residual, sqrt(sum_{i>k} s_i^2) for singular values sorted in
+    descending order (the theorem's optimality certificate: no rank-k
+    approximation does better in Frobenius norm).
+    """
+    if singular_values.ndim != 1:
+        raise ValueError("expected a 1-D singular value vector")
+    if not 0 <= k <= singular_values.numel():
+        raise ValueError(f"k={k} out of range")
+    s_sorted = torch.sort(singular_values, descending=True).values
+    return torch.sqrt(torch.sum(s_sorted[k:] ** 2))

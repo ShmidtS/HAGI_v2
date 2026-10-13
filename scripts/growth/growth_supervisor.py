@@ -1050,6 +1050,7 @@ def screen_candidates(
     from hagi.orchestrator.merge_select import (
         enumerate_candidates,
         screen_steps_for,
+        select_screened,
         write_candidate_config,
     )
 
@@ -1097,26 +1098,33 @@ def screen_candidates(
     # §1 ``selection_hurts``: standalone CE ranking is NOT an ensemble
     # criterion and can strictly degrade the ensemble. It is kept ONLY as
     # a cheap pre-filter; the DECISION is the §9 certified gate in
-    # decide(). Screen scores within the certification band are marked
-    # undecided so a wrong pick stays visible in the ledger.
-    best = min(usable, key=lambda s: s["screen_exact_ce"])
-    sorted_usable = sorted(usable, key=lambda s: s["screen_exact_ce"])
-    if len(sorted_usable) > 1:
-        second = sorted_usable[1]
-        cert = cc.certified_ab(
-            second["screen_exact_ce"], DEFAULT_EVAL_N,
-            best["screen_exact_ce"], DEFAULT_EVAL_N,
-            eps=0.05, delta=0.05,
+    # hagi.orchestrator.merge_select.select_screened (certified gap of
+    # the screen winner against the incumbent proxy, i.e. the base
+    # mixer_init_scale=0.0 configuration). UNDECIDED keeps the incumbent
+    # (documented not-worse fallback) so the forbidden standalone-CE
+    # decision path cannot leak through here.
+    incumbent_label = next(
+        (c.label for c in candidates if c.mixer_init_scale == 0.0), None
+    )
+    best, sel_meta = select_screened(
+        scored, incumbent_label=incumbent_label,
+        eps=0.05, delta=0.05, eval_n=DEFAULT_EVAL_N,
+    )
+    for s in scored:
+        s["screen_certified"] = (
+            sel_meta.get("verdict") == "ACCEPT"
+            and s["label"] == best["label"]
         )
-        for s in usable:
-            s["screen_certified"] = not cert.undecided
-        if cert.undecided:
-            LOG.warning(
-                "screen top-2 not 2eps-separable (§9: %s) -- the pick is a "
-                "prior, not evidence; the §9 gate in decide() rules",
-                cert.reason,
-            )
+    LOG.info("screen decision: %s (%s)", sel_meta.get("decision"), sel_meta.get("reason", ""))
+    if best["label"] != min(usable, key=lambda s: s["screen_exact_ce"])["label"]:
+        LOG.warning(
+            "screen argmin %s NOT certified over incumbent %s (§9: %s) -- "
+            "keeping the incumbent (not-worse fallback)",
+            min(usable, key=lambda s: s["screen_exact_ce"])["label"],
+            incumbent_label, sel_meta.get("reason", ""),
+        )
     LOG.info("screen winner: %s (%.4f)", best["label"], best["screen_exact_ce"])
+    scored.append({"label": "_select_meta", **sel_meta})
     return (
         joint_config.with_name(f"{joint_config.stem}__{best['label']}.yaml"),
         scored,

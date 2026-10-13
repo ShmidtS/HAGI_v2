@@ -347,3 +347,22 @@ R258 runtime-сертификаты.
 `consumed.json` при growth несёт фактический интеграл токенов.
 None → фиксированный accum (наследие). Модуль:
 `src/hagi/train/growing_batch.py` (паттерн R366 grokking_schedule).
+
+## Liveness two-axis стоп + certificate-telescope (порт 2026-10-13)
+
+- `train/loop.py::liveness_two_axis_frozen` (Unified/Liveness.lean,
+  контрапозиция `liveness_two_axis`): честный стоп только когда ОБЕ
+  оси мертвы — энергия (контрольный CE плоский) И инъекция
+  (grad-norm сигнал плоский) — внутри окна `train.liveness_window`
+  (default 0 = off, как saturation/divergence). Тест:
+  test_liveness_stop.py.
+- `train/stage_telescope.py` (System/GrowthState.lean
+  `stage_certificate_telescope`/`termination_from_telescope`):
+  каждое ПРИНЯТОЕ поколение пишет StageCertificate в
+  `checkpoints/stage_telescope.jsonl`
+  (run_ladder.record_stage_certificate); континуитет цепочки с
+  шум-допуском 2ε (Hoeffding); backfill из истории лестницы: 22
+  сертификата gen4–51 (реальный разрыв 0.03 на gen11→13 — смена
+  протокола эвал, честная телеметрия). Φ-бухгалтерия поперёк
+  поколений больше не подразумевается — проверяется. Тест:
+  test_stage_telescope.py.

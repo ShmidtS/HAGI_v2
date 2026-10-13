@@ -60,6 +60,31 @@ def accepted_last() -> bool:
     return bool(last.get("accepted"))
 
 
+def record_stage_certificate() -> int | None:
+    """§0 certificate-telescope: append the accepted generation's
+    StageCertificate to checkpoints/stage_telescope.jsonl (one chain
+    entry per ACCEPTED generation — rejected generations keep the
+    incumbent, no stage). Returns the generation number, or None when
+    the entry could not be certified from the ladder record.
+    """
+    from hagi.train.stage_telescope import (
+        certificate_from_ladder_entry, append_certificate,
+        load_ledger, telescope_bound,
+    )
+    last = json.loads(LADDER.read_text(encoding="utf-8").strip().splitlines()[-1])
+    cert = certificate_from_ladder_entry(last)
+    if cert is None:
+        return None
+    # contiguity vs the previous accepted stage: eval-noise allowance
+    # 2*accept_eps (Hoeffding) — explicit, not hidden.
+    tol = 2.0 * float(last.get("accept_eps") or 0.0)
+    chain = load_ledger(ROOT / "checkpoints")
+    if chain:
+        telescope_bound(chain + [cert], contiguity_tol=max(tol, 1e-9))
+    append_certificate(ROOT / "checkpoints", cert)
+    return cert.generation
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--from-gen", type=int, required=True)
@@ -98,6 +123,10 @@ def main() -> int:
              "--domains", *domains],
             cwd=str(ROOT)).returncode
         if rc == 0 and accepted_last():
+            gen_done = record_stage_certificate()
+            if gen_done is not None:
+                print(f"[ladder] gen {gen_done}: stage certificate appended "
+                      f"(§0 telescope)")
             rejects = 0
             gen += 1
             continue
