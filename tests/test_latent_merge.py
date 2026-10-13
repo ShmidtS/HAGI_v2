@@ -280,3 +280,31 @@ def test_factorize_delta_mdl_mode():
     U, V, s = factorize_delta(W, Ws, mdl=(0.5, 16 + 16 + 1))
     # sigma_2^2 = 1.0 > 0.5*33 = 16.5? no: 1.0 <= 16.5 -> rank 1
     assert U.shape[1] == 1 and s.numel() == 1
+
+
+def test_merge_gate_coherent_experts_violates_and_fallback_is_mean():
+    """Policy regression (Pesticide): coherent lora_B-like tensors
+    (twoGap below the truncation prices, gen64-66 root cause) must
+    (a) FAIL the per-tensor merge gate — the factorized pipeline does
+    not pay for itself — and (b) be handled by the same-origin-mean
+    fallback in pilot_latent_merge (no compression -> zero CE price),
+    NOT by aborting the whole generation. Oracle 2026-10-12."""
+    from hagi.train.merge_price import merge_gate
+    # Coherent experts: small common delta around the prior (lora_B is
+    # zero-init in fresh leaves; TTT leaves it nearly unchanged).
+    torch.manual_seed(0)
+    W = torch.randn(128, 64, dtype=torch.float64)
+    common = 0.01 * torch.randn(128, 64, dtype=torch.float64)
+    experts = [W + common + 0.0001 * torch.randn(128, 64, dtype=torch.float64)
+               for _ in range(3)]
+    W_mean = sum(experts) / len(experts)
+    two_gap = float(sum((e - W_mean).norm() for e in experts) / len(experts))
+    # 2%-truncation residual of each leaf (energy=0.98 pipeline price)
+    prices = [0.02 * float((e - W).norm()) for e in experts]
+    s = 1e-15  # full-rank SVD reconstruction residual (measured gen64-66)
+    assert not merge_gate(two_gap, prices, kappa=0.05, s=s, n=128), (
+        "coherent tensors must violate the gate — if this flips, the "
+        "fallback path in pilot_latent_merge is dead code")
+    # The fallback: same-origin mean is exact (zero compression price)
+    # — the established non-factorizable path.
+    assert torch.allclose(W_mean, W + common, atol=1e-3)  # mean-noise ~ N(0,1e-4/√3)
