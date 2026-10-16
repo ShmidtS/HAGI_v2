@@ -190,6 +190,18 @@ def _select_next_action(
     last = _last_ladder_entry()
     meas: dict = {}
     meta: dict = {"gen": gen}
+    eps_gamma = None  # cold start: no bracket yet — see bootstrap below
+    if last is None:
+        # Cold start (2026-10-16 from-scratch ladder): the very first
+        # generation has no measured Gammas by construction — the cycle
+        # IS the bootstrap (grow leaves from the seed root prior, merge
+        # them). Honest default: merge action with an explicit
+        # bootstrap marker; no fake Gamma is recorded.
+        meta["bootstrap"] = True
+        meta["chosen"] = "merge"
+        meta["aw"] = {"verdict": "BOOTSTRAP",
+                      "note": "first generation: no prior measurements"}
+        return meta
     if last is not None:
         certs = last.get("certificates", {})
         two_gap = certs.get("merge", {}).get("logit_twoGap")
