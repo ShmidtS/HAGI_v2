@@ -299,6 +299,36 @@ def _select_next_action(
     # back-compat audit field: raw top1-top2 ratio gap
     ratios = sorted((a.ratio for a in actions), reverse=True)
     meta["argmax_gap"] = (ratios[0] - ratios[1]) if len(ratios) > 1 else None
+    # R530 gamma-deficit verdict (Growth/GammaDeficit.lean, port
+    # 2026-10-16): honest takeoff requires a mixer-harvest budget
+    # gamma >= alpha * C* / Dbar. Measured premises from the selector's
+    # own quantities: C* = grow_leaf Gamma (capability target rate),
+    # Dbar = twoGap (diversity proxy — the disagreement the mixer can
+    # harvest), gamma = grow_leaf Gamma / twoGap as the realized harvest
+    # coefficient, alpha = the grow gate fraction 0.5. Advisory
+    # annotation (non-blocking): a deficit verdict means the only lever
+    # is disagreement_distill / fresh diversity, not tuning.
+    try:
+        from hagi.train.certified_controller import (
+            gamma_deficit_no_takeoff,
+        )
+        grow_g = next((a.gamma for a in actions
+                       if a.name == "grow_leaf"), None)
+        merge_g = next((a.gamma for a in actions
+                        if a.name == "merge"), None)
+        if grow_g is not None and merge_g and merge_g > 0:
+            alpha_gate = 0.5
+            gamma_real = grow_g / merge_g
+            deficit, gamma_req = gamma_deficit_no_takeoff(
+                gamma_real, alpha_gate, c_star=grow_g, d_bar=merge_g)
+            meta["gamma_deficit"] = {
+                "gamma": round(gamma_real, 4),
+                "gamma_required": round(gamma_req, 4),
+                "deficit": deficit,
+                "ceiling": round(gamma_real * merge_g / alpha_gate, 4),
+            }
+    except Exception as exc:  # telemetry only
+        meta["gamma_deficit"] = {"error": repr(exc)}
     return meta
 
 
@@ -428,6 +458,10 @@ def main() -> int:
                    help="config template; {{d}} is the domain")
     p.add_argument("--ft-config", default="configs/gen4_root_ft.yaml")
     p.add_argument("--common-config", default="configs/latent_leaf_math.yaml")
+    p.add_argument("--anytime-horizon", type=int, default=100,
+                   help="R525 anytime validity: per-generation level "
+                        "delta = 0.05/horizon (union bound over the "
+                        "ladder's generations; 0 disables)")
     p.add_argument("--thermostat-t0", type=float, default=None,
                    help="R388 thermostat: enable with T0 (explore/exploit "
                         "circuit; delta = last accepted A/B delta)")
@@ -694,15 +728,25 @@ def main() -> int:
     # until certified or the cap — REJECT with delta>0 never fires,
     # so the loop is finite by construction. Inference-only cost.
     from hagi.train.certified_controller import certified_ab, hoeffding_n
+    # R525 anytime validity (CertifiedEstimator.lean, port 2026-10-16):
+    # a gate evaluated at EVERY generation with a fixed level alpha
+    # inflates the family-wise false-accept mass T-fold. The uniform
+    # level over the ladder horizon is delta_gen = alpha / T (the
+    # R523 union bound behind anytime_safe_threshold). Enabled by
+    # default (--anytime-horizon 0 turns it off).
+    level = (0.05 / args.anytime_horizon
+             if args.anytime_horizon and args.anytime_horizon > 0
+             else 0.05)
+    entry["accept_level"] = level
     n_eval = 30 * len(args.domains)  # batches per domain * domains
-    eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
+    eps_cert = math.sqrt(math.log(2.0 / level) / (2.0 * n_eval))
     verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
-                           eps=eps_cert, delta=0.05)
+                           eps=eps_cert, delta=level)
     prev_delta = None
     for deep_batches in (150, 600, 2400):
         if not (verdict.undecided and entry["delta"] > 0):
             break
-        eps_next = math.sqrt(math.log(2.0 / 0.05)
+        eps_next = math.sqrt(math.log(2.0 / level)
                              / (2.0 * deep_batches * len(args.domains)))
         # noise-chase guard: a delta that did not GROW between rungs
         # while staying below the next rung's certification margin is
@@ -727,12 +771,12 @@ def main() -> int:
         entry["incumbent_ce"], entry["ft_ce"] = inc_ce, new_ce
         entry["delta"] = inc_ce - new_ce
         n_eval = deep_batches * len(args.domains)
-        eps_cert = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n_eval))
+        eps_cert = math.sqrt(math.log(2.0 / level) / (2.0 * n_eval))
         verdict = certified_ab(inc_ce, n_eval, new_ce, n_eval,
-                               eps=eps_cert, delta=0.05)
+                               eps=eps_cert, delta=level)
     entry["accept_eps"] = round(eps_cert, 4)
     entry["accept_n"] = n_eval
-    entry["accept_required_n"] = hoeffding_n(eps_cert, 0.05)
+    entry["accept_required_n"] = hoeffding_n(eps_cert, level)
     entry["accepted"] = verdict.accepted
     with LADDER.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry) + "\n")
