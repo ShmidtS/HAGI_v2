@@ -37,6 +37,11 @@ __all__ = [
     "exhausted_check",
     "merge_gate_admission",
     "phase_log_line",
+    "anytime_safe_threshold",
+    "anytime_accept_gate",
+    "gamma_min_for_target",
+    "gamma_ceiling",
+    "gamma_deficit_no_takeoff",
 ]
 
 # Action names of the §1 loop.
@@ -252,7 +257,12 @@ def hoeffding_n(eps: float, delta: float) -> int:
         raise ValueError("eps must be positive")
     if not 0.0 < delta < 1.0:
         raise ValueError("delta must lie in (0, 1)")
-    return math.ceil(math.log(2.0 / delta) / (2.0 * eps * eps))
+    raw = math.log(2.0 / delta) / (2.0 * eps * eps)
+    # Relative-tolerance ceil: when eps was derived from n exactly
+    # (eps = sqrt(log(2/delta)/(2n))), floating noise in raw must not
+    # push the requirement to n+1 — that froze the ladder at gen51
+    # (accept_n=14400 vs required 14401 on every generation 52-86).
+    return math.ceil(raw - 1e-9 * max(1.0, abs(raw)))
 
 
 def certified_ab(
@@ -406,3 +416,97 @@ def phase_log_line(phase: str, lane: str, detail: str = "") -> str:
     if detail:
         line += f" {detail}"
     return line
+
+
+# --- Anytime-valid accept band (R523–R525, R528) --------------------------
+# Port 2026-10-16: Probability/CertifiedEstimator.lean (anytime_safe_threshold)
+# + Budget/AnytimeCondensation.lean. Closes the THEORY_MAP open item
+# "anytime-validity in the accept gate": a gate evaluated at EVERY round t
+# with a fixed threshold alpha-inflates; the uniform level alpha over T
+# rounds requires the anytime band u = sqrt(2 sigma^2 ln(T/alpha)).
+
+
+def anytime_safe_threshold(sigma2: float, T: int, alpha: float) -> float:
+    """u = sqrt(2 sigma^2 ln(T/alpha)) — the anytime-safe band [R525].
+
+    ``anytime_safe_threshold`` (CertifiedEstimator.lean): for a
+    sub-Gaussian (CGF-bounded, parameter sigma2) statistic checked at
+    every t < T, the uniform failure level alpha is controlled by the
+    threshold u — versus the naive per-round band which inflates the
+    total failure mass T-fold. Premises: sigma2 > 0 is the MEASURED
+    (h_emp_) variance proxy of the gated statistic, T >= 1 the number of
+    checks the gate will make, alpha in (0, 1) the total level.
+    """
+    if sigma2 <= 0.0:
+        raise ValueError("sigma2 must be positive")
+    if T < 1:
+        raise ValueError("T must be >= 1")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    return math.sqrt(2.0 * sigma2 * math.log(T / alpha))
+
+
+def anytime_accept_gate(
+    delta: float, sigma2: float, T: int, alpha: float
+) -> tuple[bool, float]:
+    """Anytime accept gate: |delta| must clear the R525 band.
+
+    Composes ``anytime_safe_threshold`` with the accept decision: a
+    measured improvement delta is certified only when delta > u, where u
+    is the uniform band over T upcoming gate evaluations. Returns
+    (accept, u) so callers log the physical threshold they cleared.
+    """
+    u = anytime_safe_threshold(sigma2, T, alpha)
+    return delta > u, u
+
+
+# --- Gamma-budget of the mixer (R530, Growth/GammaDeficit.lean) -----------
+
+
+def gamma_min_for_target(alpha: float, c_star: float, d_bar: float) -> float:
+    """gamma >= alpha * C* / Dbar — the minimal harvest coefficient
+    [R530 ``gamma_min_for_target``].
+
+    If the frontier gate (alpha * C_t <= G_t) is to drive capability to
+    the target C* while diversity stays bounded by Dbar, then gamma >=
+    alpha * C* / Dbar is FORCED. Below it the ceiling gamma*Dbar/alpha
+    is strictly under C* and no schedule can reach the target.
+    """
+    if alpha <= 0.0:
+        raise ValueError("alpha must be positive")
+    if c_star <= 0.0:
+        raise ValueError("c_star must be positive")
+    if d_bar <= 0.0:
+        raise ValueError("d_bar must be positive")
+    return alpha * c_star / d_bar
+
+
+def gamma_ceiling(gamma: float, d_bar: float, alpha: float) -> float:
+    """gamma * Dbar / alpha — the capability ceiling under the gate
+    [R530 ``gamma_deficit_no_takeoff``].
+
+    Under G_t <= gamma * D_t and D_t <= Dbar, capability NEVER exceeds
+    gamma * Dbar / alpha, at any time step — the certified no-takeoff
+    ceiling used as the honest upper bound when the gamma budget is in
+    deficit.
+    """
+    if alpha <= 0.0:
+        raise ValueError("alpha must be positive")
+    if gamma <= 0.0:
+        raise ValueError("gamma must be positive")
+    if d_bar <= 0.0:
+        raise ValueError("d_bar must be positive")
+    return gamma * d_bar / alpha
+
+
+def gamma_deficit_no_takeoff(
+    gamma: float, alpha: float, c_star: float, d_bar: float
+) -> tuple[bool, float]:
+    """gamma-deficit verdict: honest takeoff requires a gamma budget
+    [R530]. Returns (deficit, required_gamma); deficit is True when
+    gamma * Dbar < alpha * C*, i.e. the ceiling sits strictly below the
+    target — no schedule, LR or batch trick recovers it; only raising
+    gamma (disagreement distill / fresh diversity) does.
+    """
+    req = gamma_min_for_target(alpha, c_star, d_bar)
+    return gamma < req, req

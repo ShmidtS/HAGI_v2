@@ -949,3 +949,53 @@ def eckart_young_frobenius_error(
         raise ValueError(f"k={k} out of range")
     s_sorted = torch.sort(singular_values, descending=True).values
     return torch.sqrt(torch.sum(s_sorted[k:] ** 2))
+
+
+# --- Thermo-condensation certificates (R522/R527/R528, 2026-10-16) -------
+# C:\primes\Hagi\Ensemble\ThermoPrune.lean (condensation_budget),
+# Budget\ThermoCondensation.lean (condensation_epsilon_to_gap),
+# Budget\AnytimeCondensation.lean (anytime_condensation).
+# Pure math: no torch tensors involved.
+
+
+def condensation_budget_cost(deviation: float) -> float:
+    """CE cost of a scaffold rebuild <= M^2 / 4 [R522
+    ``condensation_budget``].
+
+    If the logit deviations d_v of the live scaffold stay within a
+    delta-neighborhood (|d_u - d_v| <= M for all pairs), rebuilding
+    (merge/prune) the ensemble costs at most M^2/4 in CE — the
+    "1.5% scaffold" certificate: the thermal bulk can be cut and the
+    scaffold re-laid inside a known CE budget.
+    """
+    if deviation < 0.0:
+        raise ValueError("deviation must be nonnegative")
+    return deviation * deviation / 4.0
+
+
+def condensation_allowed_deviation(eps: float) -> float:
+    """The inverse interface: a CE budget eps buys a scaffold deviation
+    delta = 2*sqrt(eps) [R527 ``condensation_epsilon_to_gap``]."""
+    if eps <= 0.0:
+        raise ValueError("eps must be positive")
+    return 2.0 * math.sqrt(eps)
+
+
+def anytime_condensation_cost(sigma2: float, T: int, alpha: float) -> float:
+    """Anytime-certified condensation budget: <= 2*sigma^2*ln(T/alpha)
+    CE [R528 ``anytime_condensation``].
+
+    When the scaffold statistic g is sub-Gaussian (CGF parameter
+    sigma^2, h_emp_ measured) and the anytime bad-set is empty (an
+    event of probability >= 1-alpha by the R525 threshold
+    sqrt(2 sigma^2 ln(T/alpha))), a softmax-scaffold rebuild under the
+    deviation d = g - mu costs at most 2*sigma^2*ln(T/alpha): the
+    alpha-monitored rebuild is certified without retraining.
+    """
+    if sigma2 <= 0.0:
+        raise ValueError("sigma2 must be positive")
+    if T < 1:
+        raise ValueError("T must be >= 1")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    return 2.0 * sigma2 * math.log(T / alpha)

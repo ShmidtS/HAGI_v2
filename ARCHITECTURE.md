@@ -348,6 +348,35 @@ R258 runtime-сертификаты.
 None → фиксированный accum (наследие). Модуль:
 `src/hagi/train/growing_batch.py` (паттерн R366 grokking_schedule).
 
+## Порты теории 2026-10-13 (раунд 2): MemoryCycle / Muon / ModeState
+
+- `train/memory_cycle.py` (Unified/MemoryCycle + Growth/MemoryController
+  R271–R273): LiveDelta rank-1 память, admission-контроллер
+  (novelty ∧ certified gain; шум вдали от ключей не допускается —
+  новизна ≠ полезность), консолидация с Коши-бюджетом
+  frob(eff−eff') ≤ k·Σᵢ εᵢ и границей качества L·√(k·Σε).
+  Standalone; интеграция в ранговый рост адаптеров — отдельный
+  раунд (смена живой линии — только через A/B).
+- `train/optim.py`: `muon_eta_max_stable` (MuonStableLR: η_max =
+  (2/λ)·(Σσ/m), среднее сингулярное ≤ σ_max — консервативен) и
+  `min_ns_iterations` (NewtonPolar R380: сертифицированный минимум
+  итераций |x−1| ≤ 2((x₀−1)/2)^{2^T}; σ_max ≥ 3 — вне бассейна,
+  fail-fast). Обе опциональны (opt-in), дефолтная политика не изменилась.
+- `train/gen_telemetry.py` (Generalization/ModeState): Qgen-вектор
+  5 проб (h_emp_G), Φ_HAGI с Q-пламенем, mode-drop гейт,
+  парето-выбор чекпоинтов (строго положительные веса).
+- `train/thermostat.py` (Growth/Thermostat R387–R388 — замыкание
+  термодинамического контура): расписание T_t = T₀·α^t,
+  законная остановка эксплорации N = ⌈ln(δ/(T₀·ln(1/θ)))/ln α⌉
+  (e^{−δ/T_t} ≤ θ — закон Гиббса вместо эвристики), фазы
+  EXPLORE/EXPLOIT, admission-скейл T_t/T₀. δ — измеряемый
+  зазор (  certified A/B delta). Интегрировано в селектор (opt-in):
+  `growth_cycle.py --thermostat-t0/--thermostat-alpha/--thermostat-theta/
+  --thermostat-start-gen` — фаза и горизонт пишутся в selector-мету
+  каждого поколения; при EXPLOIT цикл останавливается по закону
+  (§Thermostat halt, честный стоп в семействе E_dev exhausted /
+  AMBIGUOUS). Тесты: test_thermostat.py, test_thermostat_gate.py.
+
 ## Liveness two-axis стоп + certificate-telescope (порт 2026-10-13)
 
 - `train/loop.py::liveness_two_axis_frozen` (Unified/Liveness.lean,
@@ -366,3 +395,61 @@ None → фиксированный accum (наследие). Модуль:
   протокола эвал, честная телеметрия). Φ-бухгалтерия поперёк
   поколений больше не подразумевается — проверяется. Тест:
   test_stage_telescope.py.
+
+## Depth-7 линия (2026-10-15, gen87+)
+
+- **hoeffding_n roundtrip-фикс**: eps, выведенный из n, теперь
+  сертифицирует на n (rel-tolerance ceil). До фикса float-шум в ceil
+  давал n_req = n+1 → вечный UNDECIDED: лестница была заморожена
+  gen52–86 при фактически сертифицированных дельтах (gen80/86:
+  delta 0.068–0.072 ≫ 2eps 0.023 при n=14400). Регрессия:
+  tests/test_certified_controller.py (gen80 case).
+- **Function-preserving depth growth** (`model/depth_grow.py`):
+  num_layers 3 → 7 добавлением identity-блоков (зануление
+  attn.out_proj и mixer.down новых слоёв; loRA-B/адаптеры новых
+  слоёв zero-init по построению). Нюанс: residual_scale — не только
+  init, но и runtime clamp-центр BranchScale → старые слои хранят
+  исходный residual_scale через config-маркер
+  `model.grown_from_layers` (восстанавливается в
+  checkpoint.load_model). Паритет логитов бит-в-бит, тест
+  test_depth_grow.py + --parity-batch в scripts/growth/depth_grow.py.
+- Incumbent gen51_cooldown → gen51_depth7 (сертификат-нейтрально,
+  паритет доказан); gen_configs SSOT: num_layers 3 → 7;
+  run_ladder --root-override. gen87+ листья обучаются на 7-слойном
+  теле (эффективная глубина 7·loop_depth).
+
+## Волна порта R510–R530 (2026-10-16, primes обновлены 2026-10-16)
+
+Порт свежей волны формализации (GibbsFluctuations / CertifiedEstimator /
+ThermoPrune / ThermoCondensation / AnytimeCondensation / TopLevel /
+GammaDeficit) в чистое ядро — по канону проекта: чистые функции,
+посылки h_emp_ в docstring, тест на формулу.
+
+- **Anytime accept-гейт (R525, закрытие открытого пункта THEORY_MAP)**:
+  `certified_controller.anytime_safe_threshold(σ², T, α) = √(2σ²ln(T/α))`
+  + `anytime_accept_gate` — гейт, оцениваемый в каждом раунде, больше
+  не α-инфлирует: uniform-уровень α над T проверками требует anytime
+  полосы u. Радиус конденсации = u, стоимость rebuild = u².
+- **Risk-терминация телескопа (R529)**:
+  `stage_telescope.risk_budget_termination` — T ≤ (Φ₀ − φmin + R)/ε;
+  risk-спенд входит в горизонт линейно (сильнее и честнее прежней
+  равномерной формы eps−r в знаменателе).
+- **γ-бюджет миксера (R530, закрытие «γ-дефицит mixer.gain→0»)**:
+  `gamma_min_for_target(α, C*, D̄) = αC*/D̄`, `gamma_ceiling`,
+  `gamma_deficit_no_takeoff` — сертифицированный вердикт: при
+  γ·D̄ < α·C* потолок capability γ·D̄/α и НИКАКОЙ schedule его не
+  пробивает; выход только через рост γ (disagreement_distill) или
+  diversity D̄.
+- **Thermostat variance-stop (R498/R510–R512)**: Var_{p_T}(E) ≤
+  Δ²(n−1)e^{−δ/T}; аналитическая температура останова
+  T ≤ δ/ln(Δ²(n−1)/ε) и число шагов k+1 ≥ ln(Δ²(n−1)/ε) на графике
+  T_k = δ/(k+1) — вторая ось термостата после R387–R388 (exploration
+  stop): теперь обе оси останавливаются по закону, а не по эвристике.
+- **Термо-конденсация (R522/R527/R528)**:
+  `formal.condensation_budget_cost(M) = M²/4`,
+  `condensation_allowed_deviation(ε) = 2√ε`,
+  `anytime_condensation_cost(σ², T, α) = 2σ²ln(T/α)` — «знание в
+  ≤1,5% каркаса, отрезаемого и перестраиваемого за ε» теперь
+  числовой интерфейс для prune/rebuild-решений.
+
+Тесты: tests/test_primes_wave_r510.py (17); полная батарея 684 passed.

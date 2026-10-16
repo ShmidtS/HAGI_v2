@@ -164,3 +164,43 @@ def rebuild_from_ladder(ladder_path: Path, root: Path) -> int:
         for c in certs:
             fh.write(json.dumps(asdict(c)) + "\n")
     return len(certs)
+
+
+def risk_budget_termination(
+    certs: list[StageCertificate], phi_min: float, eps: float, R: float
+) -> float:
+    """risk_budget_termination (Unified/TopLevel.lean, R529):
+    T <= (Phi_0 - phi_min + R) / eps.
+
+    Stronger and more honest than ``termination_bound``: risk spend
+    enters the horizon numerator LINEARLY instead of shrinking the
+    per-step margin. Premises (the theorem's): every decrease >= eps,
+    the TOTAL risk spend <= R >= 0, phi_min <= after(T-1), and the chain
+    is sound+contiguous (checked here, same tolerance policy as
+    ``telescope_bound`` — exact by default). Violations raise
+    ValueError: the caller mis-declared the ladder, not the law.
+    """
+    if not certs:
+        raise ValueError("empty chain")
+    if eps <= 0.0:
+        raise ValueError(f"eps ({eps}) must be positive")
+    if R < 0.0:
+        raise ValueError(f"risk budget R ({R}) must be nonnegative")
+    for c in certs:
+        if c.decrease < eps:
+            raise ValueError(
+                f"gen {c.generation} decrease {c.decrease} < eps {eps}"
+            )
+    if sum(c.risk_spend for c in certs) > R:
+        raise ValueError(
+            f"total risk spend exceeds budget R = {R}"
+        )
+    # telescope_bound re-checks soundness and contiguity
+    bound = telescope_bound(certs)
+    assert bound is not None  # certs non-empty
+    last_after = max(certs, key=lambda c: c.generation).after
+    if phi_min > last_after:
+        raise ValueError(
+            f"floor violated: phi_min {phi_min} > last after {last_after}"
+        )
+    return (certs[0].before - phi_min + R) / eps
