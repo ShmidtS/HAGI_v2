@@ -80,7 +80,24 @@ def record_stage_certificate() -> int | None:
     tol = 2.0 * float(last.get("accept_eps") or 0.0)
     chain = load_ledger(ROOT / "checkpoints")
     if chain:
-        telescope_bound(chain + [cert], contiguity_tol=max(tol, 1e-9))
+        try:
+            telescope_bound(chain + [cert], contiguity_tol=max(tol, 1e-9))
+        except ValueError as exc:
+            if "discontinuity" not in str(exc):
+                raise
+            # Protocol switch (e.g. the 2026-10-16 depth-7 root-override
+            # with embedded-config incumbent eval): contiguity is only
+            # defined WITHIN one eval protocol, so the telescope starts a
+            # fresh chain segment — the old one is archived, never
+            # silently merged across the protocol boundary.
+            ledger = ROOT / "checkpoints" / "stage_telescope.jsonl"
+            archive = ROOT / "checkpoints" / (
+                f"stage_telescope_archive_gen{chain[-1].generation}.jsonl")
+            print(f"[ladder] telescope chain break ({exc}); archiving "
+                  f"the old segment to {archive.name} and starting a "
+                  f"fresh chain at gen {cert.generation} "
+                  f"(eval-protocol switch — contiguity is intra-protocol)")
+            ledger.rename(archive)
     append_certificate(ROOT / "checkpoints", cert)
     return cert.generation
 
