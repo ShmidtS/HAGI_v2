@@ -654,6 +654,15 @@ def main() -> int:
                 inc_cfg = cand
                 break
     inc_ce = avg_ce(str(inc_cfg), args.root)
+    if inc_ce is None and inc_cfg != args.common_config:
+        # Embedded-config eval failed (stale embedded dict: e.g. the
+        # seed_root checkpoint carries adapter weights its embedded
+        # config no longer enables — "eval failed" halted the
+        # from-scratch ladder gens 1-2). Fall back to the generation's
+        # protocol config before declaring failure; record what was
+        # actually used — honest telemetry, not a silent guess.
+        entry_extra["inc_eval_cfg_fallback"] = str(args.common_config)
+        inc_ce = avg_ce(str(args.common_config), args.root)
     new_ce = avg_ce(args.common_config, str(ft_ckpt))
     # The candidate is the BEST of ft / cooldown (R254: the cooldown is
     # part of the generation's polish; judging the ft alone understates
