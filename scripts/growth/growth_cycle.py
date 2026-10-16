@@ -127,7 +127,45 @@ def _last_ladder_entry() -> dict | None:
     return None
 
 
-def _select_next_action(gen: int, domains: list[str]) -> dict:
+def _thermostat_gate(
+    gen: int,
+    last_delta: float | None,
+    t0: float, alpha: float, theta: float, start_gen: int,
+) -> dict:
+    """R388 thermostat gate: exploration stops BY LAW when the Gibbs
+    competitor mass e^{-delta/T_t} <= theta (T_t = T0*alpha^t,
+    t = gen - start_gen). ``last_delta`` is the measured (h_emp_)
+    certified A/B delta — the energy gap between the incumbent and
+    the candidate ensemble. Returns the phase record for the selector
+    meta; ``phase == EXPLOIT`` means: no further leaf exploration is
+    lawful — switch to consolidation/cooldown levers (honest stop,
+    same family as E_dev exhausted / AMBIGUOUS)."""
+    from hagi.train import thermostat as th
+
+    if last_delta is None or last_delta <= 0:
+        return {"active": False,
+                "reason": "delta unmeasured (no accepted generation yet)"}
+    cfg = th.ThermostatConfig(t0=t0, alpha=alpha, theta=theta)
+    t = max(0, gen - start_gen)
+    ph, mass = th.phase(cfg, last_delta, t)
+    n = th.stop_horizon(cfg, last_delta)
+    return {
+        "active": True,
+        "t": t,
+        "delta": last_delta,
+        "temperature": th.temperature(cfg, t),
+        "competitor_mass": mass,
+        "theta": theta,
+        "horizon": n,
+        "phase": ph.value,
+    }
+
+
+def _select_next_action(
+    gen: int,
+    domains: list[str],
+    thermostat_cfg: tuple[float, float, float, int] | None = None,
+) -> dict:
     """§0/§1 action selector: argmax Gamma_i/K_i from MEASURED quantities
     of the previous generation (ratio_dominance R86 — concentrating the
     budget on the argmax Gamma/K dominates any split).
@@ -190,7 +228,74 @@ def _select_next_action(gen: int, domains: list[str]) -> dict:
     meta["actions"] = [{"name": a.name, "gamma": a.gamma,
                         "cost": a.cost, "ratio": a.ratio} for a in actions]
     meta["chosen"] = chosen.name if chosen else None
+    # R433-R444 hedge re-weighting: the argmax over PREDICTED Gamma must
+    # answer to the REALIZED losses (18 merge rejections in a row at
+    # gen63-80 while two_gap stayed ~3.7 = the Gamma premise is
+    # empirically broken for the end-to-end cycle). MWU weights
+    # w_a ∝ exp(-eta* L_a) with L_a = per-action realized generation
+    # losses (rejected generation = 1, accepted = 0); eta* = ln n /
+    # (2<ell> - ell_min) is DERIVED (R443/R444), not tuned. When the
+    # hedge distribution no longer favours the argmax action, the
+    # selector records the switch signal (the cycle halts with the
+    # diagnosis — a rejected lever is SWITCHED, not retried).
+    try:
+        from hagi.train.mwu import eta_star
+        entries = [json.loads(l) for l in
+                   LADDER.read_text(encoding="utf-8").strip().splitlines()]
+        # realized loss per chosen action over the recorded history
+        # realized losses count only EXECUTED rounds (an entry with
+        # cooldown_ce measured = the generation actually ran) and only
+        # since the last lane expansion (a new data regime is a new
+        # game: R255 fresh-seed lanes must get an unprejudiced trial).
+        state_p = ROOT / "checkpoints" / "ladder_state.json"
+        exp_gen = -1
+        if state_p.exists():
+            try:
+                _state = json.loads(state_p.read_text(encoding="utf-8"))
+                # mwu_from_gen: first generation whose verdicts come from a
+                # trustworthy accept gate. Losses recorded before it were
+                # produced by a broken measurement instrument (the gen52-86
+                # hoeffding ceil off-by-one froze every verdict at UNDECIDED)
+                # and must not falsify the merge-Gamma premise.
+                exp_gen = int(_state.get("mwu_from_gen", _state.get("expansion_gen", -1)))
+            except (ValueError, OSError):
+                exp_gen = -1
+        losses: dict[str, list[float]] = {}
+        for e in entries:
+            if e.get("gen", 0) <= exp_gen:
+                continue
+            c = e.get("certificates", {}).get("selector", {})
+            act = c.get("chosen")
+            if act is None or "cooldown_ce" not in e:
+                continue  # selector-halt no-op: not a played round
+            losses.setdefault(act, []).append(0.0 if e.get("accepted") else 1.0)
+        names = sorted({a.name for a in actions} | set(losses))
+        if len(names) > 1:
+            seqs = [losses.get(nm, [0.0]) for nm in names]
+            flat = [sum(s) / max(len(s), 1) for s in seqs]
+            try:
+                eta = float(eta_star(flat))
+            except ValueError:
+                eta = 1.0
+            import math as _math
+            wts = [_math.exp(-eta * sum(losses.get(nm, [0.0])))
+                   for nm in names]
+            tot = sum(wts)
+            hedge = {nm: round(wt / tot, 4)
+                     for nm, wt in zip(names, wts)}
+            meta["hedge"] = {"eta": round(eta, 4), "weights": hedge}
+            top_hedge = max(hedge, key=hedge.get)
+            if chosen is not None and top_hedge != chosen.name \
+                    and hedge[top_hedge] > 0.5:
+                meta["hedge"]["switch_signal"] = top_hedge
+    except Exception as exc:  # telemetry only — never block selection
+        meta["hedge"] = {"error": repr(exc)}
     meta["aw"] = aw_meta
+    # R388 thermostat (opt-in): lawful exploration-stop circuit
+    if thermostat_cfg is not None:
+        meta["thermostat"] = _thermostat_gate(
+            gen, last.get("delta") if last is not None else None,
+            *thermostat_cfg)
     # back-compat audit field: raw top1-top2 ratio gap
     ratios = sorted((a.ratio for a in actions), reverse=True)
     meta["argmax_gap"] = (ratios[0] - ratios[1]) if len(ratios) > 1 else None
@@ -287,6 +392,13 @@ def main() -> int:
                    help="config template; {{d}} is the domain")
     p.add_argument("--ft-config", default="configs/gen4_root_ft.yaml")
     p.add_argument("--common-config", default="configs/latent_leaf_math.yaml")
+    p.add_argument("--thermostat-t0", type=float, default=None,
+                   help="R388 thermostat: enable with T0 (explore/exploit "
+                        "circuit; delta = last accepted A/B delta)")
+    p.add_argument("--thermostat-alpha", type=float, default=0.9)
+    p.add_argument("--thermostat-theta", type=float, default=0.05)
+    p.add_argument("--thermostat-start-gen", type=int, default=None,
+                   help="generation index where cooling starts (default: this gen)")
     args = p.parse_args()
     g = args.gen
 
@@ -295,7 +407,13 @@ def main() -> int:
     # certified-positive action at all == E_dev exhausted (R223
     # round_exhausted) -> the lever must be switched (data/rank), not
     # retried; the cycle refuses to burn compute on an unviable round.
-    selector = _select_next_action(g, args.domains)
+    thermostat_cfg = None
+    if args.thermostat_t0 is not None:
+        thermostat_cfg = (args.thermostat_t0, args.thermostat_alpha,
+                          args.thermostat_theta,
+                          args.thermostat_start_gen
+                          if args.thermostat_start_gen is not None else g)
+    selector = _select_next_action(g, args.domains, thermostat_cfg)
     print(f"[gen{g}] §1 selector: {json.dumps(selector)}")
     if selector["chosen"] is None:
         aw = selector.get("aw", {})
@@ -307,6 +425,36 @@ def main() -> int:
         else:
             print(f"[gen{g}] no certified-positive action (E_dev exhausted, "
                   "R223) — switch the lever (fresh data / rank), halting")
+        return 0
+
+    # R388 thermostat (opt-in): exploration exhausted BY LAW — the
+    # Gibbs competitor mass dropped below theta, further leaf growth
+    # would burn compute on an annealed-out lever. Honest stop, same
+    # family as E_dev exhausted / AMBIGUOUS.
+    th_state = (selector.get("thermostat") or {})
+    if th_state.get("active") and th_state.get("phase") == "exploit":
+        print(f"[gen{g}] §Thermostat R388: exploration exhausted by law "
+              f"(competitor_mass {th_state['competitor_mass']:.4g} <= "
+              f"theta {th_state['theta']}, T={th_state['temperature']:.4g}, "
+              f"horizon N={th_state['horizon']}) — switch to "
+              "consolidation/cooldown levers, halting")
+        return 0
+
+    # R433-R444 hedge switch (MWU/hedge, realized-loss reweighting):
+    # when the exponential-weights distribution over actions no longer
+    # favours the argmax pick (merge lost 25+ generations in a row at
+    # gen56-80 while its PREDICTED Gamma stayed ~3.7 — the Gamma
+    # premise is empirically broken), the lever is SWITCHED, not
+    # retried. Honest halt with the diagnosis; the switch itself is
+    # a human/new-data decision (fresh lanes, new rank, distill).
+    hedge = selector.get("hedge") or {}
+    if "switch_signal" in hedge:
+        print(f"[gen{g}] §MWU R433-R444 switch: argmax '{selector['chosen']}' "
+              f"but hedge weights {hedge['weights']} (eta={hedge['eta']}) "
+              f"favour '{hedge['switch_signal']}' — the merge Gamma "
+              "premise is falsified by the realized rejection ledger, "
+              "halting (switch the lever: expand lanes / new data / "
+              "distill, do not re-merge)")
         return 0
 
     # 1. leaves ------------------------------------------------------------

@@ -93,6 +93,66 @@ def newton_schulz(
     return x.to(grad.dtype)
 
 
+def min_ns_iterations(sigma_max: float, eps: float) -> int:
+    """Certified minimum Newton–Schulz iterations (Step/NewtonPolar.lean,
+    R380 ``newton_polar_convergence``).
+
+    The polar iteration x ↦ (x+x⁻¹)/2 converges with the exact quadratic
+    certificate |x_T − 1| ≤ 2·((x₀−1)/2)^{2^T}. Applied to the largest
+    singular value σ_max of the (unit-norm) gradient, the smallest T with
+    2·((σ_max−1)/2)^{2^T} ≤ ε is a certified floor on the iterations that
+    can reach ε-orthogonality — computed, not tuned (h_emp_ input: σ_max
+    is measured per step).
+
+    Note: the runtime quintic NS is a different (faster-basin) polynomial,
+    so this floor is a conservative certificate for the *polar* iteration;
+    consumers use it as an analytic lower bound/health check, never to
+    shrink the live ns_steps below the measured practice without A/B.
+    """
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+    if sigma_max < 1.0:
+        raise ValueError("sigma_max is at least 1 after unit normalization")
+    if sigma_max >= 3.0:
+        # polar basin is x₀ ∈ [1, 3) (NewtonPolar convergence premise);
+        # σ_max ≥ 3 never satisfies the certificate — refuse, don't lie
+        raise ValueError(
+            "sigma_max >= 3: outside the polar-iteration convergence basin"
+        )
+    if 2.0 * ((sigma_max - 1.0) / 2.0) <= eps:
+        return 0
+    # 2·((s−1)/2)^{2^T} ≤ eps  ⟺  2^T ≥ ln(eps/2)/ln((s−1)/2)
+    import math
+
+    r = (sigma_max - 1.0) / 2.0
+    need = math.log(eps / 2.0) / math.log(r)  # both logs negative
+    return int(math.ceil(math.log2(need)))
+
+
+def muon_eta_max_stable(
+    grad: "torch.Tensor", ortho: "torch.Tensor", lam_curv: float
+) -> float:
+    """Analytic stable Muon lr cap (Step/MuonStableLR.lean,
+    ``muon_stable_step``).
+
+    η_max = (2/λ)·(Σσᵢ/m): the polar contract ⟨G, O⟩_F = Σσᵢ (O the polar
+    factor — the NS-orthogonalized update is its runtime approximation)
+    with ‖O‖²_F = m gives the AVERAGE singular-value scale, not the max
+    (``muon_avg_not_max``: Σσ/m ≤ σ_max — the cap is conservative).
+
+    h_emp_ premises: λ_curv (λ_max curvature estimate) is a measured
+    argument; the NS output standing in for the exact polar factor is an
+    approximation contract.
+    """
+    if lam_curv <= 0:
+        raise ValueError("lam_curv must be positive")
+    m = min(grad.shape)
+    sum_sigma = float((grad.float() * ortho.float()).sum())
+    if sum_sigma < 0:
+        raise ValueError("polar contract violated: ⟨G,O⟩ < 0")
+    return 2.0 * (sum_sigma / m) / lam_curv
+
+
 class Muon(torch.optim.Optimizer):
     """Momentum SGD with Newton-Schulz orthogonalized updates.
 
@@ -426,7 +486,10 @@ def build_optimizer(model: nn.Module, cfg: Config) -> HybridOptimizer:
     return HybridOptimizer(muon, adamw, logit_scale=logit_scale, logit_scale_max=cap)
 
 
-def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:
+def learning_rate_at(
+    step: int, base_lr: float, cfg: Config,
+    loss_gap: float | None = None,
+) -> float:
     """Warmup - stable - decay schedule value at ``step``.
 
     Three phases:
@@ -445,6 +508,17 @@ def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:
     s = cfg.train.schedule
     total = cfg.train.max_steps
     if step < s.warmup_steps:
+        if getattr(s, "adaptive_warmup", False) and loss_gap is not None:
+            # WarmupSchedule.warmupEta: rate scales with the measured
+            # suboptimality Delta_t — the ramp is DERIVED, not hand-set.
+            # Normalized so the end of warmup still reaches base_lr.
+            k = min(step / max(s.warmup_steps, 1), 1.0)
+            eta = warmup_eta(
+                max(loss_gap, 1e-9), c=float(getattr(
+                    s, "adaptive_warmup_c", 0.5)))
+            # cap the derived rate by the linear ramp times 2 (safety
+            # belt: the (rho,K0,Krho) premise is measured, not proven)
+            return base_lr * min(2.0 * k, eta)
         return base_lr * step / max(s.warmup_steps, 1)
 
     decay_start = int(total * (1.0 - s.decay_fraction))
@@ -462,14 +536,17 @@ def learning_rate_at(step: int, base_lr: float, cfg: Config) -> float:
     return base_lr * max(level, s.min_lr_ratio)
 
 
-def set_learning_rate(optimizer: HybridOptimizer, step: int, cfg: Config) -> tuple[float, float]:
+def set_learning_rate(
+    optimizer: HybridOptimizer, step: int, cfg: Config,
+    loss_gap: float | None = None,
+) -> tuple[float, float]:
     """Apply the schedule to both base rates. Returns ``(adam_lr, muon_lr)``.
 
     The body group carries a ``body_lr_scale`` multiplier (AdamConfig), so its
     effective LR tracks the schedule at ``base * scale`` rather than ``base``.
     """
-    adam_lr = learning_rate_at(step, cfg.train.learning_rate, cfg)
-    muon_lr = learning_rate_at(step, cfg.train.muon.lr, cfg)
+    adam_lr = learning_rate_at(step, cfg.train.learning_rate, cfg, loss_gap)
+    muon_lr = learning_rate_at(step, cfg.train.muon.lr, cfg, loss_gap)
     body_scale = float(cfg.train.adam.body_lr_scale)
     for group in optimizer.param_groups:
         if group.get("_muon"):
@@ -479,3 +556,55 @@ def set_learning_rate(optimizer: HybridOptimizer, step: int, cfg: Config) -> tup
         else:
             group["lr"] = adam_lr
     return adam_lr, muon_lr
+
+
+# --- Theory-derived optimizer primitives (2026-10-14) --------------------
+# Ports C:\primes\Hagi\Step\{WarmupSchedule,ArmijoAcceptance,WeightDecay}.lean.
+
+
+def warmup_eta(
+    delta: float, c: float = 0.5, k0: float = 1.0,
+    k_rho: float = 1.0, rho: float = 1.0,
+) -> float:
+    """Adaptive warmup learning rate — `WarmupSchedule.warmupEta`
+    (arXiv:2509.07972, Theorem 1 core):
+        η_t = c·min{1/K₀, Δ_t^{−ρ}/(3^ρ·K_ρ)}
+    where Δ_t is the MEASURED suboptimality (current loss − running
+    floor) and (ρ, K₀, K_ρ)-smoothness is the h_emp_ premise.
+    Monotone in Δ (`warmup_eta_monotone`): as the loss gap shrinks
+    the rate rises — warmup is DERIVED, not a hand ramp. The
+    telescope bound `warmup_telescope_bound` guarantees some step
+    with g_t²·Ση ≤ 2Δ₀; `warmup_beats_constant`: T·η₀ ≤ Ση_t."""
+    if delta <= 0.0:
+        # no measured gap: fall back to the K₀ branch (the safe cap)
+        return c / k0
+    return c * min(1.0 / k0, delta ** (-rho) / ((3.0 ** rho) * k_rho))
+
+
+def armijo_accept(
+    j_old: float, j_new: float, g_dot_d: float, d_norm_sq: float,
+    alpha: float, c1: float = 0.1, lipschitz_l: float = 0.0,
+) -> tuple[bool, float]:
+    """Sufficient-decrease step acceptance — `ArmijoAcceptance.
+    armijo_sufficient_decrease`: with the direction premise
+    ⟪g,d⟫ ≤ −c₁‖d‖² and smoothness, the step is accepted when
+        J(θ+αd) ≤ J(θ) − (c₁ − Lα/2)·α·‖d‖².
+    Returns (accepted, required_decrease). The caller supplies the
+    measured direction quality g_dot_d; if the premise fails
+    (g_dot_d > −c₁‖d‖²) the gate cannot certify — accepted=False."""
+    required = (c1 - lipschitz_l * alpha / 2.0) * alpha * d_norm_sq
+    if g_dot_d > -c1 * d_norm_sq:
+        return False, required
+    return (j_new <= j_old - required), required
+
+
+def wd_norm_bound(grad_bound_g: float, lam: float) -> float:
+    """Weight-norm ceiling under weight decay — `WeightDecay.
+    wd_norm_bound`: with the recursion w_{t+1} = (1−ηλ)w_t − ηg_t,
+    bounded gradients ‖g‖ ≤ G and ηλ ≤ 1:
+        ‖w_t‖ ≤ max(‖w₀‖, G/λ).
+    G/λ is the steady-state ceiling — a monitoring bound, not a
+    constraint (violations mean the measured G is wrong)."""
+    if lam <= 0.0:
+        raise ValueError("weight decay lam must be positive")
+    return grad_bound_g / lam

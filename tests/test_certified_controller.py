@@ -94,6 +94,27 @@ def test_hoeffding_n_matches_the_formula():
         math.ceil(math.log(2 / 0.05) / (2 * 0.5 ** 2))
 
 
+def test_hoeffding_n_roundtrip_eps_from_n():
+    """Regression (gen52-86 freeze): eps derived from n must certify at n.
+
+    growth_cycle computes eps_cert = sqrt(log(2/delta)/(2*n)) and then
+    hoeffding_n(eps_cert) must return n, not n+1 (float noise in the
+    ceil froze every generation after gen51 in UNDECIDED).
+    """
+    import math as _m
+    for n in (180, 900, 9_000, 14_400):
+        eps = _m.sqrt(_m.log(2.0 / 0.05) / (2.0 * n))
+        assert cc.hoeffding_n(eps, 0.05) == n
+
+
+def test_certified_ab_accepts_gen80_case_after_roundtrip_fix():
+    """Real ladder data (gen80/gen86): delta 0.068-0.072 at n=14400."""
+    n = 14_400
+    eps = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n))
+    v = cc.certified_ab(4.7353, n, 4.6672, n, eps=eps, delta=0.05)
+    assert v.accepted, (v.verdict, v.detail)
+
+
 def test_certified_ab_accepts_a_clear_improvement_with_enough_n():
     v = cc.certified_ab(3.00, 10_000, 2.80, 10_000, eps=0.05, delta=0.05)
     assert v.accepted and not v.undecided

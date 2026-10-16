@@ -317,3 +317,69 @@ def is_orthogonal_projector(p: torch.Tensor) -> bool:
         torch.allclose(q @ q, q, atol=1e-12)
         and torch.allclose(q, q.T, atol=1e-12)
     )
+
+# --- SpectralProjector / RankGrowth / SparseStep0 (R-port, 2026-10-14) ----
+# Ports C:\primes\Hagi\Spectral\SpectralProjector.lean (spectralProj,
+# spectral_tail_energy full-family form), Hagi\Spectral\RankGrowth.lean
+# (rank_orthogonal_growth) and Hagi\Sparsity\SparseStep0.lean (sparse_step0).
+
+def spectral_projector(u: torch.Tensor, keep_idx) -> torch.Tensor:
+    """P = U_keep·U_keepᵀ, the orthogonal projector onto the kept subset
+    of an orthonormal family — `SpectralProjector.spectralProj`
+    (idempotent + self-adjoint: `spectralProj_idempotent`).
+
+    ``u``: (d, K) matrix of K orthonormal columns; ``keep_idx``: indices
+    of the kept directions."""
+    uk = u[:, list(keep_idx)].double()
+    return uk @ uk.T
+
+
+def spectral_tail_energy_split(coeffs: torch.Tensor, keep_mask: torch.Tensor
+                               ) -> tuple[float, float]:
+    """Exact kept/tail energy split of coefficients in an orthonormal
+    basis: tail = Σ_{i∉s} c_i², kept + tail == total —
+    `SpectralProjector.spectral_tail_energy` (complement-sum identity)."""
+    c2 = coeffs.double().pow(2)
+    mask = keep_mask.bool()
+    kept = float(c2[mask].sum())
+    tail = float(c2[~mask].sum())
+    return kept, tail
+
+
+def orthogonal_growth_ok(m: torch.Tensor, new_rows: torch.Tensor,
+                         tol: float = 1e-6) -> bool:
+    """Growth-certificate predicate: the k new rows are (up to ``tol``)
+    orthogonal to the row space of ``M`` and linearly independent, so the
+    stacked rank is EXACTLY rank(M) + k —
+    `RankGrowth.rank_orthogonal_growth` (dormant orthogonal directions;
+    capacity grows while the old function is untouched)."""
+    m = m.double()
+    r = new_rows.double()
+    # orthogonality to row(M): projections onto row-space basis ~ 0
+    _, _, vt = torch.linalg.svd(m, full_matrices=False)
+    proj = r @ vt.T  # (k, rank) coefficients in the row basis
+    rank_m = int(vt.shape[0])
+    if proj.abs().max() > tol:
+        return False
+    # linear independence of the new rows
+    if int(torch.linalg.matrix_rank(r, tol=tol)) != r.shape[0]:
+        return False
+    stacked = torch.cat([m, r], dim=0)
+    return int(torch.linalg.matrix_rank(stacked, tol=tol)) == rank_m + r.shape[0]
+
+
+def rank_orthogonal_growth(m: torch.Tensor, new_rows: torch.Tensor) -> int:
+    """rank(stackRows M R) for the orthogonal-growth case —
+    `RankGrowth.rank_orthogonal_growth` returns rank(M) + k exactly;
+    this measures the stacked rank (checker: :func:`orthogonal_growth_ok`)."""
+    stacked = torch.cat([m.double(), new_rows.double()], dim=0)
+    return int(torch.linalg.matrix_rank(stacked))
+
+
+def sparse_step0_ok(coeffs: torch.Tensor, keep_mask: torch.Tensor,
+                    tol: float) -> bool:
+    """Sparse step-0 gate: routed-out tail energy < tol² ⇒ the sparse
+    merge approximates the dense merge within ``tol`` —
+    `SparseStep0.sparse_step0` (via `gating_tail_bound`)."""
+    _kept, tail = spectral_tail_energy_split(coeffs, keep_mask)
+    return tail < tol * tol
