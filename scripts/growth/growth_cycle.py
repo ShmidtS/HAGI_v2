@@ -302,6 +302,42 @@ def _select_next_action(
     return meta
 
 
+def _ckpt_embedded_config_yaml(ckpt: str) -> Path | None:
+    """Materialize the checkpoint's EMBEDDED config as a temp YAML.
+
+    Fix for the depth-7 root-override freeze (2026-10-16): deriving
+    the incumbent's eval config from the gen id in --root guesses the
+    ARCHITECTURE (gen51 -> 3-layer config) and crashes on a grown
+    checkpoint (gen51_depth7 -> 7 layers) with an empty-subprocess
+    "eval failed" — the ladder halted gens 87-89 on this. The
+    checkpoint carries its true config (format_version >= 12 embeds
+    it); the embedded one is also the honest protocol (it is the mix
+    the incumbent actually trained under; verified identical domain
+    weights to the current generation's config). Returns None when
+    the checkpoint has no embedded config (legacy) — callers fall
+    back to the old gen-id guess.
+    """
+    import hashlib
+    import torch
+    try:
+        ck = torch.load(str(ROOT / ckpt if not Path(ckpt).is_absolute()
+                            else ckpt),
+                        map_location="cpu", weights_only=False)
+        cfg_dict = ck.get("config") if isinstance(ck, dict) else None
+        if not cfg_dict:
+            return None
+    except Exception:
+        return None
+    import yaml
+    digest = hashlib.sha256(
+        json.dumps(cfg_dict, sort_keys=True).encode()).hexdigest()[:16]
+    out = ROOT / "checkpoints" / f"_eval_cfg_{digest}.yaml"
+    if not out.exists():
+        out.write_text(yaml.safe_dump(cfg_dict, sort_keys=True),
+                       encoding="utf-8")
+    return out
+
+
 def _fiber_ce(config: str, root_pt: str, fibers_pt: str,
               batches: int = 30) -> float | None:
     """AVG exact CE of the R255 fiber ensemble (root + fibers, logit-mean
@@ -552,14 +588,21 @@ def main() -> int:
     # generation's config carries the same data.seed lineage; the eval
     # seed is pinned per-config and identical across the ladder.
     m = re.search(r"gen(\d+)_", str(args.root))
-    inc_cfg = args.common_config
-    if m:
+    # Architecture-true incumbent config: prefer the checkpoint's
+    # EMBEDDED config (correct for depth-grown / overridden roots —
+    # the gen-id guess loads a mismatched architecture and kills the
+    # eval subprocess with empty stdout, freezing the ladder);
+    # fall back to the gen-id guess for legacy checkpoints without
+    # an embedded config.
+    inc_cfg = (_ckpt_embedded_config_yaml(args.root)
+               or args.common_config)
+    if inc_cfg is args.common_config and m:
         for cand in (f"checkpoints/gen{m.group(1)}/configs/root_ft.yaml",
                      f"configs/gen{m.group(1)}_root_ft.yaml"):
             if (ROOT / cand).exists():
                 inc_cfg = cand
                 break
-    inc_ce = avg_ce(inc_cfg, args.root)
+    inc_ce = avg_ce(str(inc_cfg), args.root)
     new_ce = avg_ce(args.common_config, str(ft_ckpt))
     # The candidate is the BEST of ft / cooldown (R254: the cooldown is
     # part of the generation's polish; judging the ft alone understates
