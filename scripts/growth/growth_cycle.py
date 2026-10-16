@@ -201,6 +201,11 @@ def _select_next_action(
         meta["chosen"] = "merge"
         meta["aw"] = {"verdict": "BOOTSTRAP",
                       "note": "first generation: no prior measurements"}
+        # R388 thermostat contract still holds at bootstrap: the gate
+        # record must be present when opted-in (delta is unmeasured on
+        # the very first generation -> honest inactive record).
+        if thermostat_cfg is not None:
+            meta["thermostat"] = _thermostat_gate(gen, None, *thermostat_cfg)
         return meta
     if last is not None:
         certs = last.get("certificates", {})
