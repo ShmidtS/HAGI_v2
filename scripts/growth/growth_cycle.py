@@ -413,7 +413,7 @@ def avg_ce(config: str, ckpt: str, batches: int = 30) -> float | None:
             ce = float(line.split("exact_ce=")[1].split()[0])
             with cache.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"key": key, "ce": ce,
-                                     "config": config, "ckpt": ckpt,
+                                     "config": str(config), "ckpt": str(ckpt),
                                      "batches": batches}) + "\n")
             return ce
     return None
