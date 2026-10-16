@@ -36,7 +36,11 @@
 - ~~anytime-валидность в accept-гейте~~ — ЗАКРЫТО 2026-10-16
   (R525 `anytime_safe_threshold` →
   `certified_controller.anytime_accept_gate`, волна R510–R530);
-- certificate-telescope в `orchestrator/real_cycle.py`;
+- ~~certificate-telescope в `orchestrator/real_cycle.py`~~ — ЗАКРЫТО
+  2026-10-16: каждое ACCEPTED поколение синтетической рекурсии пишет
+  StageCertificate в stage_telescope.jsonl
+  (`real_cycle._record_telescope_certificate`;
+  tests/test_real_cycle_telescope.py);
 - h_emp_grow/smooth/lip измерители в Core (см. FORMALIZATION_TODO);
 - anytime Freedman M∧V (Вилль-форма под variance-adaptive порог) —
   следующая после R528 ступень CertifiedEstimator.

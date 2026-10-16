@@ -922,7 +922,7 @@ def run_bounded_cycle(
         raise ValueError("stale explicit request does not match committed lineage")
     build_root = root / "build" / selected_request.generation_id
     evaluate = evaluator or (lambda context: path_only_evaluator(context, device=device))
-    return run_generation(
+    result = run_generation(
         selected_request,
         store,
         lambda context: _build_child(
@@ -934,6 +934,54 @@ def run_bounded_cycle(
         evaluate,
         owner_id=OWNER_ID,
     )
+    _record_telescope_certificate(root, selected_request, result)
+    return result
+
+
+def _record_telescope_certificate(
+    root: Path, request: "GenerationRequest", result: "GenerationResult"
+) -> None:
+    """Certificate telescope wiring (System/GrowthState.lean,
+    stage_certificate_telescope; THEORY_MAP open item, 2026-10-16).
+
+    Each ACCEPTED generation of the synthetic recursion line appends a
+    StageCertificate (before = incumbent macro CE, after = candidate
+    macro CE, decrease = before - after, risk_spend = the worst-source
+    regression the stage paid) to <root>/stage_telescope.jsonl — the
+    same bookkeeping law the domain ladder uses. Rejected generations
+    keep the incumbent: no stage happened, no certificate. Import is
+    local so the pure stage_telescope module stays off the critical
+    import path of callers that never run cycles.
+    """
+    from hagi.train.stage_telescope import (
+        StageCertificate,
+        append_certificate,
+    )
+
+    if result.decision != "accepted":
+        return
+    decrease = result.incumbent_macro_ce - result.candidate_macro_ce
+    cert = StageCertificate(
+        generation=_generation_index(request.generation_id),
+        before=result.incumbent_macro_ce,
+        after=result.candidate_macro_ce,
+        decrease=decrease,
+        risk_spend=max(0.0, result.worst_source_regression),
+        n_eval=1,
+    )
+    append_certificate(root.parent, cert)
+
+
+def _generation_index(generation_id: str) -> int:
+    """Numeric generation index from an id like 'generation-7'
+    (the store's scheme, see _next_generation_id; 'depth-zero' maps
+    to 0)."""
+    if generation_id == "depth-zero":
+        return 0
+    m = re.fullmatch(r"generation-([1-9][0-9]*)", generation_id)
+    if m is None:
+        raise ValueError(f"unparseable generation id {generation_id!r}")
+    return int(m.group(1))
 
 
 def _packed_tokens(path: Path, vocab_size: int) -> list[int]:
