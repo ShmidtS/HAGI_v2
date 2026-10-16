@@ -204,6 +204,18 @@ def load_model(
         model.load_state_dict(incoming, strict=not skip_prefixes)
     except Exception as exc:  # pragma: no cover - the checks above are exhaustive
         raise _fail(f"state_dict could not be applied: {exc}") from exc
+    grown_from = getattr(cfg.model, "grown_from_layers", None)
+    if grown_from:
+        # Depth-grown body: trained layers keep the source residual_scale
+        # (runtime BranchScale clamp center), which differs from the value
+        # the larger num_layers implies. Restoring it here keeps the grown
+        # checkpoint function-preserving on every load.
+        from hagi.model.depth_grow import fix_old_residual_scale_, old_residual_scale
+
+        fix_old_residual_scale_(
+            model, int(grown_from),
+            old_residual_scale(int(grown_from), int(getattr(cfg.model, "loop_depth", 1))),
+        )
     return state["completed_steps"], cfg
 
 

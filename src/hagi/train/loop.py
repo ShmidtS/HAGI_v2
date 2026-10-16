@@ -1287,7 +1287,15 @@ class Trainer:
                     "body_grad_norm": body_norm,
                     "rest_grad_norm": rest_norm,
                 }
-        adam_lr, muon_lr = set_learning_rate(self.optimizer, self.step, cfg)
+        # R-warmup: measured loss gap (current window CE - running best)
+        # feeds the DERIVED warmup rate when schedule.adaptive_warmup is
+        # on (WarmupSchedule.lean). None keeps the hand ramp.
+        loss_gap = None
+        if getattr(cfg.train.schedule, "adaptive_warmup", False):
+            gap = getattr(self, "_warmup_loss_gap", None)
+            loss_gap = float(gap) if gap is not None else None
+        adam_lr, muon_lr = set_learning_rate(
+            self.optimizer, self.step, cfg, loss_gap)
         # Analytic step (optimal_step_unconstrained): when enabled, replace the
         # schedule's Adam LR with eta* = <g,d>/(L*||d||^2) computed from the
         # measured curvature. ``lr`` stays a CEILING, so the first deployment
@@ -1344,6 +1352,15 @@ class Trainer:
             receiver = "decision_only"
         if not has_lm_objective:
             ce_value = None
+        # R-warmup telemetry: measured loss gap = current window CE
+        # minus the best seen (running floor). Feeds warmup_eta when
+        # schedule.adaptive_warmup is on (WarmupSchedule.lean).
+        if ce_value is not None:
+            best = getattr(self, "_warmup_best_ce", None)
+            if best is None or ce_value < best:
+                self._warmup_best_ce = ce_value
+            self._warmup_loss_gap = max(
+                ce_value - self._warmup_best_ce, 0.0)
         metrics = {
             "step": self.step,
             "loss": loss_value,

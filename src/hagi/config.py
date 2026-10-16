@@ -421,6 +421,12 @@ class ModelConfig:
     # at ``num_layers``. Residual scale is computed from the *effective* depth
     # so stream variance stays O(1). 1 disables looping (standard stack).
     loop_depth: int = 1
+    # Depth-grow provenance: number of layers in the source checkpoint this
+    # body was grown from (function-preserving identity-block insertion;
+    # hagi.model.depth_grow). Layers < grown_from_layers keep the source
+    # residual_scale (runtime BranchScale clamp center), so loading a grown
+    # checkpoint must restore it (fix_old_residual_scale_). None = not grown.
+    grown_from_layers: int | None = None
     norm_eps: float = 1e-5
     target_params: int = 0
     # CDMA/OFDM precoding init: give every 2D channel weight a full-rank
@@ -551,6 +557,11 @@ class ScheduleConfig:
     min_lr_ratio: float = 0.02
     inverse_sqrt_stable: bool = True
     inverse_sqrt_tau: int = 0
+    # R-warmup (WarmupSchedule.lean): derive the warmup-phase LR from
+    # the MEASURED loss gap (eta = c*min{1/K0, Delta^-rho/(3^rho*K_rho)})
+    # instead of a hand ramp. Opt-in: default keeps the linear ramp.
+    adaptive_warmup: bool = False
+    adaptive_warmup_c: float = 0.5
 
 
 @dataclass
