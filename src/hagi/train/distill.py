@@ -34,6 +34,103 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def fixed_log_softmax(z: torch.Tensor) -> torch.Tensor:
+    """Collapse-fixed log-softmax (arXiv:2610.31642 Eq. 5).
+
+    Only the argmax logit is shifted to exactly 0; the log-sum-exp excludes
+    the argmax slot and the two are combined through ``softplus``. The
+    target-most entry stays accurate down to exponent underflow instead of
+    rounding to 0 at the precision cliff of the standard shift (≈5.5 bf16,
+    ≈16.6 fp32), and autograd through this form produces zero-sum gradients.
+    """
+    i_max = z.argmax(dim=-1, keepdim=True)
+    z_max = z.gather(-1, i_max)
+    shifted = z - z_max
+    others = shifted.scatter(-1, i_max, float("-inf"))
+    m = -torch.logsumexp(others, dim=-1, keepdim=True)
+    return shifted - F.softplus(-m)
+
+
+class _SoftTargetKL(torch.autograd.Function):
+    """Soft-target cross-entropy with the cancellation-fixed gradient.
+
+    Softmax Cancellation (arXiv:2610.31642 §3): computing ``softmax(z_S) -
+    softmax(z_T)`` from two separately rounded probabilities leaves a
+    non-zero gradient floor as ``z_S → z_T``, so the student drifts away
+    from the teacher during distillation. The backward here computes the
+    gradient from the raw logit difference via ``expm1``/``log1p``
+    (paper Eq. 9): it is exactly zero at ``z_S = z_T`` and accurate in the
+    near-equal regime.
+
+    The teacher must arrive as raw LOGITS, not log-probabilities: the
+    formulas are shift-invariant mathematically, but a ``log p`` target
+    shifts ``delta`` by a per-row constant (``lse_T``, order 1-10), and the
+    centering ``d = delta - <p, delta>`` then destroys the near-equal
+    signal to catastrophic cancellation (measured: sign flips at
+    ``|z_S - z_T| ~ 1e-7``).
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx, z_s: torch.Tensor, z_t: torch.Tensor
+    ) -> torch.Tensor:
+        log_q = fixed_log_softmax(z_s)
+        log_p = F.log_softmax(z_t, dim=-1)
+        p = log_p.exp()
+        # KL(p || q) per row: sum p*(log p - log q). The -H(p) term is
+        # constant in z_s, so the backward gradient is pure dCE/dz_s.
+        loss = (p * (log_p - log_q)).sum(dim=-1)
+        ctx.save_for_backward(z_s, z_t)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+        z_s, z_t = ctx.saved_tensors
+        p = F.softmax(z_t, dim=-1)
+        delta = z_s - z_t
+        d = delta - (p * delta).sum(dim=-1, keepdim=True)
+        s = d - torch.log1p((p * torch.expm1(d)).sum(dim=-1, keepdim=True))
+        u = p * torch.expm1(s)
+        # q = u + p exactly (p*exp(s) = p*(1+expm1(s))); force sum(g) = 0.
+        g = u - (u + p) * u.sum(dim=-1, keepdim=True)
+        return g * grad_loss.unsqueeze(-1), None
+
+
+def soft_target_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    reduction: str = "batchmean",
+) -> torch.Tensor:
+    """Cancellation-fixed KL distillation between raw logit tensors.
+
+    ``student_logits``/``teacher_logits`` are ``[..., V]`` with an identical
+    vocabulary; the gradient flows only into the student. The gradient into
+    the student is the paper's expm1/log1p form: zero when the student
+    matches the teacher exactly, instead of the non-zero noise floor of the
+    standard ``q - p`` subtraction. Temperature scaling is the caller's
+    responsibility (pass ``z/T`` from both sides) — a temperature applied to
+    only one side was the historical silent bug.
+
+    ``reduction`` follows :func:`torch.nn.functional.kl_div` (``"batchmean"``
+    is the standard KD choice).
+    """
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"shape mismatch: student {tuple(student_logits.shape)} vs "
+            f"teacher {tuple(teacher_logits.shape)}"
+        )
+    loss = _SoftTargetKL.apply(student_logits, teacher_logits)
+    if reduction == "batchmean":
+        return loss.sum() / max(student_logits.shape[0], 1)
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "none":
+        return loss
+    raise ValueError(f"unknown reduction {reduction!r}")
+
+
 def logit_kl(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -55,7 +152,7 @@ def logit_kl(
     t = float(temperature)
     if t <= 0:
         raise ValueError("temperature must be positive")
-    s = F.log_softmax(student_logits / t, dim=-1)
+    s = fixed_log_softmax(student_logits / t)
     q = F.softmax(teacher_logits / t, dim=-1)
     return (t * t) * F.kl_div(s, q, reduction=reduction)
 

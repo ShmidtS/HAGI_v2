@@ -36,7 +36,7 @@ from hagi.model.adaptive import freeze_base_in_place
 from hagi.model.norms import BlockRMSNorm, HeadNorm, RMSNorm
 from hagi.model.ternary import BitLinear, cache_ternary_weights, clear_ternary_weights
 from hagi.train.analytic_step import CurvatureProbe, select_step
-from hagi.train.distill import logit_kl
+from hagi.train.distill import soft_target_kl
 from hagi.train.insight import run_insight_cycle
 from hagi.train.optim import _muon_parameters, build_optimizer, set_learning_rate
 from hagi.train.safeqp_controller import corpus_grad_gram
@@ -252,16 +252,14 @@ def _distill_teacher_logit_target(
     doc_ids: torch.Tensor | None,
     loss_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Teacher's per-position log-probabilities, no gradient.
+    """Teacher's per-position raw logits, no gradient.
 
     A compact student head (H=3456) learning a wide teacher's (H=10368)
-    full logit vector is wasteful: the target is the teacher's DISTRIBUTION,
-    and a distribution needs only log-probabilities. The [N, V] float64
-    matrix of :func:`forward_kl_teacher` would be 2M x 32768 x 8B = 512MB
-    per microbatch; log-probs are the same information at the same cost,
-    but the KL can then be computed against the student's own softmax
-    without ever materializing a teacher-side mixture over the full vocab
-    in float64.
+    full logit vector is wasteful: the target is the teacher's DISTRIBUTION.
+    Raw fp32 logits (not log-probs — the cancellation-fixed KD
+    arXiv:2610.31642 §3 needs the true logit difference; a log-prob target
+    shifts it by lse_T and the centered delta loses the near-equal signal
+    to catastrophic cancellation) at the same [N, V] cost.
     """
     with torch.no_grad():
         out = teacher(input_ids, targets, doc_ids=doc_ids)
@@ -270,7 +268,7 @@ def _distill_teacher_logit_target(
         if loss_mask is not None:
             keep = loss_mask.reshape(-1)
             z = z.reshape(-1, z.shape[-1])[keep]
-        return torch.log_softmax(z, dim=-1).detach()
+        return z.detach()
 
 
 def _student_logits_masked(
@@ -707,6 +705,25 @@ class Trainer:
                 self.step, eta,
             )
             return {"certified_vetoed": 1}
+        # cut_safe_accept (ProbeError.lean, opt-in): certify the EXACT loss
+        # change with the Cauchy-Schwarz margin. dL_meas is the certified
+        # quadratic model at (eta, inner, curvature); eps_probe scales the
+        # curvature-probe error bound; eps_att == 0 until attention-quant
+        # calibration lands (L_att*eps_att = 0 is honest: no hidden slack).
+        if bool(getattr(self.cfg.train, "certified_cut_accept", False)):
+            from hagi.train.lip_energy import cut_safe_accept
+
+            dL_meas = -eta * g0_inner + 0.5 * L_eff * eta * eta * dn2
+            eps_probe = abs(float(self.cfg.train.certified_eps_rel)) * (
+                float(gmat.norm(dim=1).max()) * float(gn ** 0.5)
+            )
+            ok, slack = cut_safe_accept(dL_meas, dn2 ** 0.5, eps_probe)
+            if not ok:
+                logger.info(
+                    "step %d certified-step: CUT-VETO (margin not certified, "
+                    "dL_meas=%.3e slack=%.3e)", self.step, dL_meas, slack,
+                )
+                return {"certified_vetoed": 1, "cut_veto": 1}
         # Fresh momentum at zero LR (identity on parameters), then apply
         # theta <- theta - eta * d* eagerly.
         saved_lrs = [g["lr"] for g in self.optimizer.param_groups]
@@ -1227,8 +1244,14 @@ class Trainer:
                 s_logits = _student_logits_masked(
                     model, output.hidden, batch["loss_mask"]
                 )
+                # Cancellation-fixed KD (arXiv:2610.31642 §3): the gradient is
+                # formed from the raw logit difference via expm1/log1p — zero
+                # at student == teacher instead of the q - p noise floor.
+                # Temperature applies to both sides symmetrically (Hinton T²).
+                t_kd = float(self._distill_temperature)
                 kd_term = (
-                    logit_kl(s_logits, log_q, temperature=self._distill_temperature)
+                    (t_kd * t_kd)
+                    * soft_target_kl(s_logits / t_kd, log_q / t_kd)
                     * lm_weight
                 )
                 kd_sum = kd_sum + kd_term.detach().float()
@@ -1622,6 +1645,10 @@ def train(
                 hd += w * float(-(nz * nz.log()).sum())
             collapse_state["h_data"] = hd
         h_model = 0.0
+        # Margin-equilibrium telemetry (arXiv:2610.31642 §5): mean logit
+        # margin on the same fixed windows; memorization saturates at
+        # m* ≈ log(1/eps) under AdamW (18.4 at eps=1e-8). Log-only.
+        margin_acc = 0.0
         with torch.no_grad():
             for (x, y), w in zip(gate_batches[:-1], weights):
                 x = x.to(next(model.parameters()).device)
@@ -1629,6 +1656,7 @@ def train(
                 o = model(x, y)
                 f = o.hidden.reshape(-1, o.hidden.shape[-1])
                 total += w * float(model.head.exact_loss(f, y.reshape(-1)))
+                margin_acc += w * model.head.mean_logit_margin(f, y.reshape(-1))
                 # predictive entropy, chunked over rows to bound [N, V]
                 hm = 0.0
                 for i in range(0, f.shape[0], 256):
@@ -1637,6 +1665,7 @@ def train(
                     hm -= float((lp.exp() * lp).sum())  # E[-log p] > 0
                 h_model += w * (hm / f.shape[0])
         model.train()
+        collapse_state["margin"] = margin_acc
         try:
             from hagi.train.distill_recursion import gate_collapse_report
             report = gate_collapse_report(
@@ -1704,6 +1733,15 @@ def train(
         # samples. g_i is the step's AdamW-group (rest) pre-clip gradient
         # norm — the group the OptimizerStage chain is about — averaged over
         # the steps each domain contributed. Pure instrumentation.
+        # KNOWN DEGENERACY (measured 2026-10-19, all gen5/gen6 logs): the
+        # SAME step-level scalar gnorm is attributed to every domain that
+        # contributed to the step, so in joint windows (all domains in
+        # every step) every g_i is identical and cov_Tg is STRUCTURALLY
+        # zero; in leaf windows (single domain) n<2 also yields nothing.
+        # The metric becomes informative only with per-domain gradient
+        # norms (separate backward per domain) — deliberately NOT done
+        # (YAGNI: cost >> diagnostic value today). weighted_mean vs mean
+        # stay meaningful when domain token mixes vary across steps.
         if metrics.get("update_applied", True) and metrics.get("domain_tokens"):
             gnorm = metrics.get("rest_grad_norm")
             if isinstance(gnorm, float) and math.isfinite(gnorm):
@@ -1742,6 +1780,9 @@ def train(
             gce = _gate_ce(model)
             logger.info("gate_ce step %d: %.4f", trainer.step, gce)
             metrics["gate_ce"] = gce
+            gm = collapse_state.get("margin")
+            if gm is not None:
+                metrics["gate_margin"] = gm
             # T5 monitor: margin to the Pinsker collapse floor, log-only
             if collapse_state.get("floor") is not None:
                 metrics["collapse_margin"] = collapse_state["margin"]

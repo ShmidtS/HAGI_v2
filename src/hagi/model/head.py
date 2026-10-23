@@ -101,7 +101,19 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
 
     ``z_loss_weight > 0`` adds ``w * logsumexp(z)^2`` per row, whose gradient is
     ``2 * w * lse * softmax`` — folded into the same pass.
+
+    Softmax Collapse fix (arXiv:2610.31642 §2): the partition sum excludes the
+    TARGET logit (scatter 0 before the sum), so the loss is ``softplus(-m)``
+    with ``m = z_t - lse_{j≠t}`` — accurate down to exponent underflow instead
+    of rounding to 0 at the precision cliff (m ≈ 5.5 in bf16, 16.6 in fp32).
+    The backward target gradient is ``-sigmoid(-m) = -e^{-m}/(1+e^{-m})``, so
+    the row gradient sums to zero exactly even in float: with the standard
+    ``probs[t] - 1`` form the target entry rounds to 0 once ``1 + e^{-m}``
+    rounds to 1, and Adam normalizes the surviving non-target entries into a
+    Slingshot spike. Non-target entries ``p_j = exp(z_j - lse_{nt}) ·
+    sigmoid(-m)`` are formed from the same excluded sum and stay accurate.
     """
+
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -129,18 +141,22 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             logits = F.linear(h_chunk, weight)
             if bias is not None:
                 logits = logits + bias.to(work_dtype)
-            if work_dtype in (torch.float16, torch.bfloat16):
-                # Online-stable logsumexp in low precision: shift by the max so
-                # the exponent does not overflow the bf16/fp16 exponent range.
-                maxv = logits.max(dim=-1, keepdim=True).values
-                lse = ((logits - maxv).exp().sum(dim=-1, keepdim=True).log() + maxv).to(acc_dtype)
-                picked = logits.gather(-1, targets[start:end].unsqueeze(-1)).to(acc_dtype)
-            else:
-                logits = logits.to(acc_dtype)
-                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-                picked = logits.gather(-1, targets[start:end].unsqueeze(-1))
-            loss_sum += (lse - picked).sum()
+            t_idx = targets[start:end].unsqueeze(-1)
+            # Collapse-fixed reduction (see class docstring): the partition
+            # sum runs over non-target entries only, in fp32+ accumulation.
+            picked = logits.gather(-1, t_idx).to(acc_dtype)
+            maxv = logits.max(dim=-1, keepdim=True).values
+            e = (logits - maxv).exp()
+            e.scatter_(-1, t_idx, 0.0)
+            sum_nt = e.sum(dim=-1, keepdim=True, dtype=acc_dtype).clamp_min(
+                torch.finfo(acc_dtype).tiny
+            )
+            # m = z_t - lse_{j≠t}; loss = softplus(-m) (exact to underflow).
+            m = picked - maxv.to(acc_dtype) - sum_nt.log()
+            loss_sum += F.softplus(-m).sum()
             if z_loss_weight > 0:
+                # lse_full = lse_{j≠t} + softplus(m), same accuracy.
+                lse = sum_nt.log() + maxv.to(acc_dtype) + F.softplus(m)
                 z_sum += lse.squeeze(-1).pow(2).sum()
             if save_logits:
                 saved_logits.append(logits.detach())
@@ -179,36 +195,34 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
                 logits = F.linear(h_chunk, weight)
                 if bias is not None:
                     logits = logits + bias.to(work_dtype)
-            if work_dtype in (torch.float16, torch.bfloat16):
-                # bf16 softmax gradient is safe *in the current regime*: the
-                # z-loss pins logsumexp near 0 and the logit scale keeps logits in
-                # ~[-8, 8], so the max-shift exponent never overflows bf16's
-                # exponent range. Measured vs fp32: grad_weight rel err 1e-4,
-                # rare-token rows never zeroed (0/200). The old failure (grad
-                # norm ~20x, NaN ~step 250) predates z_loss/prior and only
-                # happened because logits drifted to +-100. Max-shift keeps the
-                # softmax exact in bf16; keeping the whole gradient path in bf16
-                # avoids the [N, V] fp32 cast, which was ~40ms/step.
-                maxv = logits.max(dim=-1, keepdim=True).values
-                lse = ((logits - maxv).exp().sum(dim=-1, keepdim=True).log() + maxv)
+            acc_dtype = torch.float64 if hidden.dtype == torch.float64 else torch.float32
+            # Collapse-fixed gradient (see class docstring). bf16/fp16 keep
+            # the elementwise ops in the work dtype (the exp of a max-shifted
+            # logit never overflows the low-precision exponent range; same
+            # ~0.4% relative noise as the historical path); the excluded-sum
+            # accumulation, margin and sigmoid run in fp32+.
+            t_idx = targets[start:end].unsqueeze(-1)
+            picked = logits.gather(-1, t_idx).to(acc_dtype)
+            maxv = logits.max(dim=-1, keepdim=True).values
+            e = (logits - maxv).exp()
+            e.scatter_(-1, t_idx, 0.0)
+            sum_nt = e.sum(dim=-1, keepdim=True, dtype=acc_dtype).clamp_min(
+                torch.finfo(acc_dtype).tiny
+            )
+            m = picked - maxv.to(acc_dtype) - sum_nt.log()
+            sig = torch.sigmoid(-m)
+            # g_j = p^nt_j * sigmoid(-m) for j != t; g_t = -sigmoid(-m).
+            # Row sum is zero by construction (sum p^nt = 1 over j != t).
+            coef = (sig / sum_nt).to(work_dtype)
+            g = e * coef
+            g.scatter_(-1, t_idx, -sig.to(work_dtype))
+            g.mul_(scale_ce)
+            if scale_z != 0.0:
+                # Full softmax (target included) for the z-loss term.
+                lse = (sum_nt.log() + maxv.to(acc_dtype) + F.softplus(m)).to(work_dtype)
                 probs = (logits - lse).exp()
-                g = probs.clone()
-                g.scatter_add_(-1, targets[start:end].unsqueeze(-1), torch.full_like(lse, -1.0))
-                g.mul_(scale_ce)
-                if scale_z != 0.0:
-                    g.add_(probs * (2.0 * scale_z * lse))
-            else:
-                acc_dtype = torch.float64 if hidden.dtype == torch.float64 else torch.float32
-                logits = logits.to(acc_dtype)
-                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-                probs = (logits - lse).exp()
-                g = probs.clone()
-                g.scatter_add_(-1, targets[start:end].unsqueeze(-1), torch.full_like(lse, -1.0))
-                g.mul_(scale_ce)
-                if scale_z != 0.0:
-                    g.add_(probs * (2.0 * scale_z * lse))
+                g.add_(probs * (2.0 * scale_z * lse))
 
-            g = g.to(weight.dtype)
             grad_hidden[start:end] = g @ weight
             # ``(h^T @ g)^T`` computes the same ``g^T @ h`` but ~2x faster on
             # ROCm (measured 258ms vs 498ms at [30720,32768]@[32768,1152]).
@@ -345,19 +359,20 @@ class LMHead(nn.Module):
         ):
             # Fused-CE fast path. Measured on the leaf (N=32736, V=32768, bf16):
             # the chunked custom Function costs ~283ms fwd+bwd while the plain
-            # full projection with PyTorch's fused cross_entropy kernel costs
-            # ~199ms -- the hand-rolled online LSE (max/exp/log in a Python
-            # chunk loop) is ~3x the cost of the projection matmul it wraps,
-            # and the fused kernel does the same reduction in one pass.
-            # Numerical cost: bf16 softmax noise, measured 0.028 nats on
-            # [4096, 32768]. VRAM: N*V*2 bytes extra (~2.1GB at N=32736),
-            # acceptable at leaf scale; the 1B config should keep the chunked
-            # path (its docstring cites 115GB runs). Z-loss and log_prior
-            # require the custom pass, so the fast path refuses them.
+            # full projection with a fused cross-entropy kernel costs ~199ms.
+            # The kernel is replaced by the collapse-fixed form below
+            # (arXiv:2610.31642 Eq. 6): F.cross_entropy zeroes the target
+            # gradient once the margin passes the precision cliff (≈5.5 in
+            # bf16 — the leaf regime), which triggers Slingshot spikes under
+            # AdamW. Autograd through this form yields g_t = -sigmoid(-m) and
+            # g_j = p^nt_j·sigmoid(-m): the row gradient sums to zero exactly.
+            # One extra [N, V] scatter temp vs the old kernel.
             logits = torch.nn.functional.linear(scaled, self.weight)
-            ce = torch.nn.functional.cross_entropy(
-                logits, targets, reduction="mean"
-            )
+            t_idx = targets.unsqueeze(-1)
+            z_t = logits.gather(-1, t_idx)
+            others = logits.scatter(-1, t_idx, float("-inf"))
+            m = z_t - torch.logsumexp(others, dim=-1, keepdim=True)
+            ce = F.softplus(-m).mean()
             zero = hidden.new_zeros((), dtype=torch.float32)
             return ce, zero
         ce, z = _ChunkedCrossEntropy.apply(
@@ -392,6 +407,32 @@ class LMHead(nn.Module):
             False,
         )
         return ce
+
+    def mean_logit_margin(self, hidden: torch.Tensor, targets: torch.Tensor) -> float:
+        """Mean logit margin ``m = z_t - lse_{j≠t}`` on sampled rows (fp32).
+
+        Margin-equilibrium telemetry (arXiv:2610.31642 §5): under AdamW with
+        weight decay λ and ε, memorized margins saturate at m* ≈ log(1/ε)
+        (18.4 at ε=1e-8). ``m → m*`` is the certified "memorization complete"
+        signal for the saturation/grokking gates; with the collapse fix the
+        measurement itself stays accurate beyond the fp32 cliff (16.6).
+        """
+        if hidden.ndim != 2 or targets.ndim != 1 or hidden.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"expected hidden [N, H] and targets [N], got {tuple(hidden.shape)} and {tuple(targets.shape)}"
+            )
+        if hidden.shape[0] == 0:
+            return 0.0
+        bias = self.log_prior.to(torch.float32) if self.log_prior is not None else None
+        scaled = self._eff_hidden(hidden).float() * self.logit_scale.detach().float()
+        logits = F.linear(scaled, self.weight.float())
+        if bias is not None:
+            logits = logits + bias
+        t_idx = targets.unsqueeze(-1)
+        z_t = logits.gather(-1, t_idx)
+        others = logits.scatter(-1, t_idx, float("-inf"))
+        m = z_t - torch.logsumexp(others, dim=-1)
+        return float(m.mean())
 
     def _sample_negatives(self, targets: torch.Tensor, k: int) -> torch.Tensor:
         """Build the shared in-batch/prior interference bank."""
@@ -433,8 +474,10 @@ class LMHead(nn.Module):
         added inside the local partition, because the proposal already carries
         it. The full receiver adds the prior exactly once.
 
-        The true class is always index 0 of the candidate set so the CE is
-        simply ``-log_softmax(logits)[:, 0]``.
+        The true class is always index 0 of the candidate set; with the
+        collapse fix (arXiv:2610.31642) the CE is ``softplus(-m)`` with
+        ``m = z_target - lse(negatives)`` — the negatives slice already
+        excludes the target, so no masking temp is needed.
         """
         n = scaled.shape[0]
         proposal = str(getattr(self.cfg, "sampled_proposal", "uniform"))
@@ -445,17 +488,18 @@ class LMHead(nn.Module):
         negative_logits = scaled @ self.weight.index_select(0, neg).t()
         # A sampled target is not a negative class for that row.
         negative_logits = negative_logits.masked_fill(targets.unsqueeze(1).eq(neg), float("-inf"))
-        logits = torch.cat([target_logits, negative_logits], dim=1)
         # Under q=prior this is conditional NCE: sampled classes already carry
         # source frequency through q, so adding log_prior here would count the
         # prior twice. Uniform q is constant and retains the ordinary bias.
         if bias is not None and proposal == "uniform":
             target_bias = bias.index_select(0, targets).unsqueeze(1)
             negative_bias = bias.index_select(0, neg).unsqueeze(0)
-            logits = logits + torch.cat([target_bias, negative_bias.expand(n, -1)], dim=1).to(logits.dtype)
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        ce = -log_probs[:, 0].mean()
+            target_logits = target_logits + target_bias
+            negative_logits = negative_logits + negative_bias.expand(n, -1).to(negative_logits.dtype)
+        m = target_logits.float() - torch.logsumexp(negative_logits.float(), dim=-1, keepdim=True)
+        ce = F.softplus(-m).mean()
         if self.z_loss_weight > 0:
+            logits = torch.cat([target_logits, negative_logits], dim=1)
             z_loss = logits.float().logsumexp(dim=-1).pow(2).mean()
         else:
             z_loss = scaled.new_zeros((), dtype=torch.float32)
