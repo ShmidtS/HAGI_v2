@@ -108,6 +108,8 @@ def main() -> int:
     parser.add_argument("--resume", required=True, help="checkpoint path (step-*.pt or best.pt)")
     parser.add_argument("--batches", type=int, default=20)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--json-out", default=None,
+                        help="write the per-domain results as JSON to this path")
     args = parser.parse_args()
 
     configure_runtime()
@@ -142,6 +144,10 @@ def main() -> int:
         )
     avg = sum(r["exact_ce"] for r in results) / len(results)
     print(f"  AVG   exact_ce={avg:.4f} ppl={math.exp(min(avg, 20.0)):.2f}")
+    if args.json_out:
+        import json
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
     return 0
 
 
