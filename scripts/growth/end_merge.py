@@ -124,23 +124,30 @@ def main() -> int:
     param_names = [n for n, _ in model.named_parameters()]
     moves: dict[str, tuple[float, float]] = {}
 
+    accepted: dict[str, tuple[float, float]] = {}
+
     def try_move(name: str, frac: float, scale: float) -> float:
-        """Применить ход к тензору, вернуть gate_ce (откат при отсутствии выигрыша)."""
-        module_key = name
-        final_t = final_sd[module_key]
-        bank_t = bank[module_key].to(final_t.device)
-        restored = final_t.detach().clone()
-        with torch.no_grad():
-            param = dict(model.named_parameters())[name]
-            param.copy_(restored)
-            target = final_t + (bank_t - final_t) * (frac * scale)
+        """Атомарный ход: применить (f, s), при отсутствии выигрыша вернуть
+        ПРЕЖНЕЕ принятое состояние тензора (не final — иначе повторный sweep
+        стирает ходы, принятые на более раннем проходе)."""
+        final_t = final_sd[name]
+        bank_t = bank[name].to(final_t.device)
+        param = dict(model.named_parameters())[name]
+
+        def apply(fs: tuple[float, float] | None) -> None:
+            f, s = fs if fs is not None else (0.0, 0.0)
+            target = final_t + (bank_t - final_t) * (f * s)
             param.copy_(target.to(param.dtype))
+
+        with torch.no_grad():
+            apply((frac, scale))
         ce = gate_ce(model, windows)
         if ce < current["ce"] - 1e-4:
             current["ce"] = ce
+            accepted[name] = (frac, scale)
             return ce
         with torch.no_grad():
-            dict(model.named_parameters())[name].copy_(restored.to(param.dtype))
+            apply(accepted.get(name))
         return current["ce"]
 
     current = {"ce": base_ce}
@@ -189,14 +196,20 @@ def main() -> int:
 
     final_ce = gate_ce(model, windows)
     out_path = Path(args.out) if args.out else ckpt_dir / "end_merged.pt"
-    torch.save(
-        {"model": {k: v.cpu() for k, v in model.state_dict().items()}, "step": start_step,
-         "meta": {"end_merge": True, "base_gate_ce": base_ce, "final_gate_ce": final_ce}},
-        out_path,
-    )
+    # Полный payload-формат load_model: config/format переносятся из best.pt,
+    # заменяется только model.
+    payload = torch.load(final_path, map_location="cpu", weights_only=False)
+    payload["model"] = {k: v.cpu() for k, v in model.state_dict().items()}
+    payload["meta"] = {
+        "end_merge": True,
+        "base_gate_ce": base_ce,
+        "final_gate_ce": final_ce,
+        "moves": len(accepted),
+    }
+    torch.save(payload, out_path)
     report = {
         "base": base_ce, "final": final_ce, "delta": final_ce - base_ce,
-        "moves": {k: {"frac": v[0], "scale": v[1]} for k, v in moves.items() if v[0] > 0},
+        "moves": {k: {"frac": v[0], "scale": v[1]} for k, v in accepted.items()},
         "verdict": "improved" if final_ce < base_ce - 1e-4 else "no-improvement",
         "out": str(out_path),
     }

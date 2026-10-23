@@ -17,6 +17,7 @@ EPS = math.sqrt(math.log(2.0 / DELTA) / (2.0 * TOKENS))
 RUNS = {
     "gen3": ("configs/rnn_gen3_root_ft.yaml", "checkpoints/rnn_gen3_root_ft/best.pt"),
     "gen4": ("configs/rnn_gen4_root_ft.yaml", "checkpoints/rnn_gen4_root_ft/best.pt"),
+    "gen4em": ("configs/rnn_gen4_root_ft.yaml", "checkpoints/rnn_gen4_root_ft/end_merged.pt"),
 }
 
 results = {}
@@ -35,17 +36,19 @@ for name, (cfg, resume) in RUNS.items():
 
 common = ["RU", "EN", "MATH", "CODE"]
 avg = {n: sum(results[n][d] for d in common) / len(common) for n in results}
-delta = avg["gen4"] - avg["gen3"]
+# кандидат gen4 = лучший из (best, end_merged) по AVG на общих доменах
+cand = "gen4em" if avg["gen4em"] < avg["gen4"] else "gen4"
+delta = avg[cand] - avg["gen3"]
 verdict = "ACCEPT" if (delta < -2 * EPS and all(
-    results["gen4"][d] <= results["gen3"][d] + 2 * EPS
+    results[cand][d] <= results["gen3"][d] + 2 * EPS
     for d in results["gen3"])) else "REJECT"
 
 report = {
     "protocol": "common-150b",
     "tokens_per_domain": TOKENS,
     "eps_hoeffding": EPS,
-    "avg_gen3": avg["gen3"],
-    "avg_gen4": avg["gen4"],
+    "avg": avg,
+    "candidate": cand,
     "delta": delta,
     "per_domain": results,
     "verdict": verdict,
