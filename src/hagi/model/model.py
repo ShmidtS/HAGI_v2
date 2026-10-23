@@ -19,8 +19,8 @@ from torch import nn
 
 from hagi.config import (
     Config,
-    count_params,
     cortex_write_width,
+    count_params,
     ffn_width,
     layer_windows,
 )
@@ -34,6 +34,7 @@ from hagi.model.head import LMHead
 from hagi.model.kv_cache import KVCache
 from hagi.model.norms import RMSNorm
 from hagi.model.outputs import ModelOutput
+from hagi.model.recurrent import build_recurrent_block
 
 
 class HAGI(nn.Module):
@@ -130,6 +131,16 @@ class HAGI(nn.Module):
                 init_ortho,
                 clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
             )
+            attn_module = None
+            if m.backbone == "recurrent":
+                attn_module = build_recurrent_block(
+                    h,
+                    None,
+                    norm_eps=m.norm_eps,
+                    use_ternary=use_ternary,
+                    residual_scale=residual_scale,
+                    clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
+                )
             self.blocks.append(
                 Block(
                     h,
@@ -141,6 +152,7 @@ class HAGI(nn.Module):
                     init_orthogonal=init_ortho,
                     rope=shared_rope,
                     clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
+                    attn_module=attn_module,
                 )
             )
 
@@ -182,6 +194,7 @@ class HAGI(nn.Module):
         self._window_layers = windows
         self._uniform_window = windows[0] if len(set(windows)) == 1 else None
         self._loop_depth = loop
+        self._backbone = m.backbone
 
     def param_summary(self) -> dict[str, int]:
         """Analytic parameter counts by group (see :func:`~hagi.config.count_params`)."""
@@ -207,7 +220,17 @@ class HAGI(nn.Module):
             block.adapters = adapter
 
     def allocate_cache(self, dtype: torch.dtype, device: torch.device) -> list[KVCache]:
-        """Attach a fresh KV-cache to every layer and return the list."""
+        """Attach a fresh KV-cache to every layer and return the list.
+
+        backbone="recurrent": KV-кэша нет; вместо него каждому слою включается
+        инкрементальное состояние (attach_state), лениво инициализируемое на
+        первом forward. Возвращается пустой список — контракт generate()
+        (список держится только ради lifetime) сохранён.
+        """
+        if self._backbone == "recurrent":
+            for block in self.blocks:
+                block.attn.attach_state()
+            return []
         a = self.cfg.model.attention
         caches = []
         for block in self.blocks:
@@ -219,7 +242,11 @@ class HAGI(nn.Module):
     def reset_cache(self) -> None:
         """Detach all KV-caches and clear the source filter's decode state."""
         for block in self.blocks:
-            block.attn.detach_cache()
+            attn = block.attn
+            if hasattr(attn, "detach_cache"):
+                attn.detach_cache()
+            else:
+                attn.detach_state()
         self.encoder.reset_state()
 
     def commit_controller_updates(self) -> None:
@@ -395,7 +422,15 @@ class HAGI(nn.Module):
                     pad = doc_ids.new_full((doc_ids.shape[0], prefix_len), -1)
                     doc_ids = torch.cat([pad, doc_ids], dim=1)
 
-        cache_len = self.blocks[0].attn._kv_cache.length if use_cache and self.blocks else 0
+        if use_cache and self.blocks:
+            first_attn = self.blocks[0].attn
+            cache_len = (
+                first_attn.length
+                if not hasattr(first_attn, "_kv_cache")
+                else (first_attn._kv_cache.length if first_attn._kv_cache is not None else 0)
+            )
+        else:
+            cache_len = 0
         t_total = cache_len + h.shape[1]
         h = self._run_blocks(h, positions, doc_ids, prefix_len, t_total, use_state=use_cache)
         h = self.out_norm(h)
@@ -494,7 +529,11 @@ class HAGI(nn.Module):
           toward 0 means the head has given up and is emitting the prior.
         """
         stats: dict[str, float] = {}
-        gains = [b.attn.q_norm.weight.abs().mean() for b in self.blocks if b.attn.q_norm is not None]
+        gains = [
+            q.weight.abs().mean()
+            for b in self.blocks
+            if (q := getattr(b.attn, "q_norm", None)) is not None
+        ]
         if gains:
             stats["qk_gain"] = float(torch.stack(gains).mean())
         stats["residual_gain"] = float(self.out_norm.weight.abs().mean())

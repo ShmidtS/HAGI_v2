@@ -999,3 +999,272 @@ def anytime_condensation_cost(sigma2: float, T: int, alpha: float) -> float:
     if not 0.0 < alpha < 1.0:
         raise ValueError("alpha must lie in (0, 1)")
     return 2.0 * sigma2 * math.log(T / alpha)
+
+
+# --- Pinsker CMI generalization + capacity floors (2026-10-18) ---------------
+# Ports: Information/Pinsker.lean (gen_pair_bound, cmi_iteration),
+# Information/RoutingCapacity.lean (router_capacity_bound),
+# Information/MemoryCapacity.lean (separated_needs_capacity).
+
+
+def gen_pair_bound(
+    q: list[float], ef: list[float], eg: list[float], kl_qp: float
+) -> float:
+    """Stability+information generalization bound [``gen_pair_bound``
+    (Information/Pinsker.lean)]:
+
+        |E_q f - E_p g| <= E_q|f - g| + 2 sqrt(KL(q||p))
+
+    Decomposition: stability term (expected pointwise gap under the
+    training distribution) + information term (Pinsker root of the
+    KL between sample and population distributions). q/p: probability
+    vectors (sum 1), ef/eg: expectations of the [0,1]-bounded test
+    functions Representative use: E_q|f-g| = measured stability,
+    KL = measured distribution shift; the bound is the generalization
+    certificate |gen gap| <= ... for the pair.
+
+    Returns the bound value. Caller owns the measurement semantics.
+    """
+    if len(q) != len(ef) or len(q) != len(eg):
+        raise ValueError("q, ef, eg must have equal length")
+    if kl_qp < 0.0:
+        raise ValueError("KL must be nonnegative")
+    stab = sum(qi * abs(f - g) for qi, f, g in zip(q, ef, eg))
+    return stab + 2.0 * math.sqrt(kl_qp)
+
+
+def cmi_iteration(stab: list[float], kls: list[float]) -> float:
+    """CMI generalization rate [``cmi_iteration`` (Pinsker.lean)]: with
+    per-sample deltas obeying Delta_i <= stab_i + 2 sqrt(KL_i), the MEAN
+    generalization gap obeys the Cauchy-iterated rate
+
+        (1/n) sum Delta_i <= (1/n) sum stab_i + 2 sqrt((1/n) sum KL_i).
+
+    sqrt-aggregation: the information term grows with the SQUARE ROOT of
+    the mean KL, not the mean sqrt - the whole CMI pipeline payoff
+    (Hoeffding mgf + Pinsker + stability decomposition).
+    Premises: stab_i >= 0, KL_i >= 0 (measured, h_emp_).
+    """
+    if not stab or len(stab) != len(kls):
+        raise ValueError("stab and kls must be nonempty, equal length")
+    if any(k < 0 for k in kls) or any(st < 0 for st in stab):
+        raise ValueError("stab and kls must be nonnegative")
+    n = len(stab)
+    return sum(stab) / n + 2.0 * math.sqrt(sum(kls) / n)
+
+
+def router_capacity_ok(n_tasks: int, routing_bits: int) -> bool:
+    """Routing capacity floor [``router_capacity_bound`` +
+    ``separated_needs_capacity``]: K 2eps-separated tasks served through a
+    B-bit router require log2(K) bits - K <= 2^B. Decoders do not create
+    information (``no_free_recovery``). Honest budget guard for merge
+    routing / quantized adapter decisions."""
+    if n_tasks < 0 or routing_bits < 0:
+        raise ValueError("counts must be nonnegative")
+    return n_tasks <= 2 ** routing_bits
+
+
+
+# --- PoE logZ bounds (Energy/PoEBound.lean, 2026-10-18) ----------------------
+
+
+def poe_logz_second_order(
+    z: list[list[float]], w: list[float], R: list[float]
+) -> tuple[float, float]:
+    """Certified PoE pooling error [``poe_logZ_second_order``
+    (Energy/PoEBound.lean)]: for weighted product-of-experts logits,
+    the Jensen gap between the pooled logZ and the weighted expert logZs
+    obeys the SHARP law
+
+        |log sum_v e^{<w, z_v>} - sum_i w_i log sum_v e^{z_i v}|
+            <= (1/8) * sum_i w_i R_i^2,
+
+    where R_i is the per-expert RANGE of the centered deviation
+    z_i v - mu_v. Premises: w >= 0, sum w = 1; R_i measured (h_emp_).
+    Returns (actual_gap, certified_bound). The audit's pairwise-M^2/8
+    form is REFUTED in Lean; per-expert-range 1/8 is the sharp law.
+
+    z: [K][V] logit grids, w: [K] weights, R: [K] per-expert ranges.
+    """
+    import math as _m
+    if not z or len(z) != len(w) or len(w) != len(R):
+        raise ValueError("z, w, R must be nonempty and equal length")
+    if any(wi < 0 for wi in w) or abs(sum(w) - 1.0) > 1e-6:
+        raise ValueError("w must be a probability vector")
+    if any(ri < 0 for ri in R):
+        raise ValueError("R must be nonnegative")
+    n_v = len(z[0])
+    k = len(w)
+    pooled = _m.log(sum(
+        _m.exp(sum(w[i] * z[i][v] for i in range(k))) for v in range(n_v)
+    ))
+    per_expert = sum(
+        w[i] * _m.log(sum(_m.exp(z[i][v]) for v in range(n_v)))
+        for i in range(k)
+    )
+    gap = abs(pooled - per_expert)
+    bound = 0.125 * sum(wi * ri * ri for wi, ri in zip(w, R))
+    return gap, bound
+
+
+def poe_softmax_speed(z: list[list[float]], w: list[float], big_m: float) -> tuple[float, float]:
+    """Per-token PoE speed bound [``poe_softmax_speed``]: if EVERY
+    expert's centered spread is <= M (uniform range), the Jensen gap is
+    <= M^2/8 - the K=2 case recovers the pairwise statement with the
+    midpoint. Returns (actual_gap, bound M^2/8)."""
+    if big_m < 0.0:
+        raise ValueError("M must be nonnegative")
+    gap, _ = poe_logz_second_order(z, w, [big_m] * len(w))
+    return gap, big_m * big_m / 8.0
+
+
+def poe_logz_pairwise(z: list[list[float]], w: list[float], D: list[list[float]]) -> tuple[float, float]:
+    """Honest PAIRWISE constant [``poe_logZ_pairwise``]: with pairwise
+    logit distances |z_i v - z_j v| <= D_ij, the Jensen gap is
+
+        <= (1/2) * sum_ij w_i w_j D_ij^2.
+
+    The audit's 1/8 pairwise constant FAILS (refuted in Lean with z1=(1,-1),
+    z2=(0,0), w=1/2: gap ~ 0.157 vs claimed 0.0625); 1/2 is provable via
+    the weighted Cauchy-Schwarz. Returns (actual_gap, bound)."""
+    import math as _m
+    k = len(z)
+    if not z or len(D) != k or any(len(row) != k for row in D):
+        raise ValueError("D must be a K x K matrix matching z")
+    gap, _ = poe_logz_second_order(z, w, [0.0] * k)  # gap recompute
+    bound = 0.5 * sum(
+        w[i] * w[j] * D[i][j] ** 2
+        for i in range(k) for j in range(k)
+    )
+    return gap, bound
+
+
+# --- LSE-shift / KL-additivity / smoothing (2026-10-19, ночь-2) ---------------
+
+
+def lse_shift_upper_bound(
+    x: list[float], y: list[float]
+) -> tuple[float, float, float]:
+    """First-order LSE shift with the r^2/8 certified remainder
+    [``lse_shift_lower`` / ``lse_shift_upper`` (Energy/PoEBound.lean)]:
+
+        lse(y) - lse(x) <= <sigma(x), y - x> + r^2/8,
+
+    where r is the RANGE of the shift (y_v - x_v): the exp-Jensen lower
+    bound (first-order term is a LOWER bound on the shift) plus the
+    Hoeffding-MGF upper remainder under the bounded range. Returns
+    (actual_shift, first_order_term, certified_bound = fo + r^2/8).
+    Premises: none beyond finiteness - fully unconditional.
+    """
+    import math as _m
+    if not x or len(x) != len(y):
+        raise ValueError("x and y must be nonempty, equal length")
+    lse_x = _m.log(sum(_m.exp(v) for v in x))
+    lse_y = _m.log(sum(_m.exp(v) for v in y))
+    zx = _m.log(sum(_m.exp(v) for v in x))
+    smax = [_m.exp(v - zx) for v in x]  # softmax(x)
+    fo = sum(sv * (yv - xv) for sv, yv, xv in zip(smax, y, x))
+    shifts = [yv - xv for yv, xv in zip(y, x)]
+    r = max(shifts) - min(shifts)
+    actual = lse_y - lse_x
+    return actual, fo, fo + r * r / 8.0
+
+
+def kl_product_additive(
+    kl1: float, kl2: float
+) -> float:
+    """KL additivity on independent products [``kl_product``
+    (Data/DField.lean)]: KL(p1 x p2 || q1 x q2) = KL(p1||q1) + KL(p2||q2)
+    - term-level split of the log of the ratio. Runtime: the joint
+    KL of independent per-position distributions decomposes - the
+    licence for per-position distillation budgets to sum over tokens.
+
+    The identity is arithmetic on composed distributions; here it is
+    the composition RULE: given measured per-position KLs, the joint
+    budget is their SUM (returns kl1 + kl2 with premise checks).
+    """
+    if kl1 < 0.0 or kl2 < 0.0:
+        raise ValueError("KLs must be nonnegative")
+    return kl1 + kl2
+
+
+def smooth_support(p: list[float], alpha: float, uniform: list[float] | None = None) -> list[float]:
+    """Support-gap fix [``dfield_smoothing`` (Data/DField.lean)]:
+    (1-alpha)*p + alpha*u > 0 pointwise for alpha in (0,1) and u > 0 -
+    the bridge from the zero-count reality to full-support KL theorems.
+    uniform defaults to the flat distribution. Returns the smoothed
+    vector (the premise side is checked: alpha strict (0,1)).
+    """
+    if not p:
+        raise ValueError("p must be nonempty")
+    if any(x < 0 for x in p):
+        raise ValueError("p must be nonnegative")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    if uniform is None:
+        u = [1.0 / len(p)] * len(p)
+    else:
+        if len(uniform) != len(p) or any(x <= 0 for x in uniform):
+            raise ValueError("uniform must be positive, equal length")
+        u = uniform
+    return [(1.0 - alpha) * pv + alpha * uv for pv, uv in zip(p, u)]
+
+
+# --- InfoNCE identities (Data/InfoNCE.lean, 2026-10-19) ----------------------
+
+
+def infonce_gap_is_kl(
+    llm_entropy_q: float, cross_entropy_qp: float, kl_qp: float
+) -> float:
+    """InfoNCE residual identity [``infonce_gap_is_kl``
+    (Data/InfoNCE.lean)]: the gap between the MI InfoNCE-estimate floor
+    and the estimate is EXACTLY KL(post || model):
+
+        (log k - H(q)) - (log k - CE(q, p)) = KL(q || p).
+
+    The contrastive estimate is terminal-exact iff the model equals the
+    posterior (gap zero iff KL zero). Runtime: report the measured gap
+    against the measured KL - any disagreement flags a calibration bug,
+    the identity is the invariant. Verifies and returns the gap.
+    """
+    gap = cross_entropy_qp - llm_entropy_q
+    if not (llm_entropy_q >= 0.0 and cross_entropy_qp >= 0.0):
+        raise ValueError("entropies must be nonnegative")
+    if abs(gap - kl_qp) > 1e-6 * max(1.0, abs(kl_qp)):
+        raise ValueError(
+            f"identity violated: gap {gap} != KL {kl_qp} - measured "
+            f"quantities are inconsistent (calibration bug)"
+        )
+    return gap
+
+
+def infonce_never_overestimates(
+    log_k: float, cross_entropy_qp: float, entropy_q: float
+) -> bool:
+    """MI floor check [``infonce_never_overestimates``]: the InfoNCE
+    estimate (log k - CE) never overestimates the MI floor
+    (log k - H(q)): CE(q,p) >= H(q) always holds. Returns True when the
+    measured quantities respect the floor (honest guard against
+    mis-calibrated contrastive estimators)."""
+    if cross_entropy_qp < 0.0 or entropy_q < 0.0:
+        raise ValueError("entropies must be nonnegative")
+    return cross_entropy_qp >= entropy_q
+
+
+def dfield_entropy_identity(
+    entropy_mixture: float, weights: list[float], entropies: list[float]
+) -> float:
+    """D-field entropy form [``dfield_entropy_identity``
+    (Data/DField.lean)]: D(w) = H(p_w) - sum_i w_i H(p_i) — the
+    generalized Jensen-Shannon divergence equals the mixture entropy
+    minus the weighted member entropies. Runtime: compute D from
+    measured entropies WITHOUT touching per-token distributions:
+    D = H(mixture) - <H-members>. Returns the negative-entropy deficit
+    (>= 0; equality iff all members identical)."""
+    if not weights or len(weights) != len(entropies):
+        raise ValueError("weights and entropies must be nonempty, equal length")
+    if any(w < 0 for w in weights) or abs(sum(weights) - 1.0) > 1e-6:
+        raise ValueError("weights must be a probability vector")
+    if any(h < 0 for h in entropies):
+        raise ValueError("entropies must be nonnegative")
+    return entropy_mixture - sum(w * h for w, h in zip(weights, entropies))

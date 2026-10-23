@@ -22,9 +22,14 @@ class Block(nn.Module):
         init_orthogonal: bool = False,
         rope=None,
         clamp_ratio: float = 2.0,
+        attn_module: nn.Module | None = None,
     ) -> None:
         super().__init__()
-        self.attn = Attention(
+        # backbone="recurrent": вместо GQA-ветки сюда передаётся готовый
+        # Recurrent (drop-in: forward(x, positions, mask) -> [B,T,H]). Слот
+        # остаётся с именем ``attn`` — все точки модели (depth_grow, adapters,
+        # allocate_cache) адресуют миксер через него.
+        self.attn: nn.Module = attn_module if attn_module is not None else Attention(
             hidden_size,
             attn_cfg,
             norm_eps,

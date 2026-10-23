@@ -90,3 +90,77 @@ def delta_from_rho(rho: float, safety: float = 1.0) -> float:
     if safety < 1.0:
         raise ValueError(f"safety must be >= 1, got {safety}")
     return safety / rho
+
+
+# --- WSqD noise budget (Probability/WSqD.lean R, NoiseTemperature.lean) ----
+
+
+def batch_variance(sigma2: float, batch: int) -> float:
+    """Reservoir noise temperature of a batch estimator [NoiseTemperature
+    ``batch_variance_eq``]: Var(batchMean) = popVar / B. The gradient
+    noise enters the step at scale sigma2 / B — the batch axis is a
+    noise-cooling axis ("1/B temperature").
+
+    ``batch`` must be >= 1; sigma2 >= 0 is the population gradient
+    variance (measured, h_emb_).
+    """
+    if batch < 1:
+        raise ValueError("batch must be >= 1")
+    if sigma2 < 0.0:
+        raise ValueError("sigma2 must be nonnegative")
+    return sigma2 / batch
+
+
+def stable_phase_noise(sigma2: float, batch0: float, n_stable: int) -> float:
+    """Stable-phase noise cost [WSqD ``stable_phase_noise``]:
+    n_w steps at constant batch B_0 cost exactly sigma^2 * n_w / B_0.
+    """
+    if batch0 <= 0.0:
+        raise ValueError("batch0 must be positive")
+    if n_stable < 0:
+        raise ValueError("n_stable must be nonnegative")
+    return sigma2 * n_stable / batch0
+
+
+def cooldown_tail_constant(sigma2: float, batch0: float, c: float) -> float:
+    """Cooldown tail is CONSTANT [WSqD ``cooldown_tail_constant`` ←
+    ``anneal_by_batch``]: a decay phase of ANY length with geometric
+    batch growth B_{t+1} = c*B_t (c > 1) contributes at most
+    sigma^2 * c / (B_0 (c-1)) — an unboundedly long cooldown is nearly
+    free in noise.
+    """
+    if batch0 <= 0.0:
+        raise ValueError("batch0 must be positive")
+    if c <= 1.0:
+        raise ValueError("growth factor c must be > 1")
+    if sigma2 < 0.0:
+        raise ValueError("sigma2 must be nonnegative")
+    return sigma2 * c / (batch0 * (c - 1.0))
+
+
+def wsqd_noise_budget(
+    sigma2: float, batch0: float, n_stable: int, c: float
+) -> float:
+    """Composed WSqD noise budget [WSqD ``wsqd_noise_budget``]:
+    stable phase (n_w steps at B_0) + decay phase (any length, growth c)
+    obeys the ADDITIVE budget
+        sigma^2 * n_w / B_0 + sigma^2 * c / (B_0 (c-1)).
+    The stable phase does the work; the cooldown polishes at a fixed
+    total price however long it runs — the scheduler licence behind
+    ``growing_accum``.
+    """
+    return stable_phase_noise(sigma2, batch0, n_stable) + cooldown_tail_constant(
+        sigma2, batch0, c
+    )
+
+
+def flatness_moment_bound(tail_constant: float) -> float:
+    """Stationary-flatness kernel [StationaryFlatness
+    ``flatness_moment_bound``]: a flatness functional with tail
+    P[X >= k] <= C/k^2 has E[X] <= 2C — "flat minima generalize"
+    becomes a measurable moment from the tail constant C (measured
+    from a k-sweep of the loss Hessian proxy).
+    """
+    if tail_constant < 0.0:
+        raise ValueError("tail constant C must be nonnegative")
+    return 2.0 * tail_constant

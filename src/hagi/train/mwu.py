@@ -116,3 +116,35 @@ if __name__ == "__main__":  # pragma: no cover
     b1, z, b2 = mwu_double_upper(ls, 0.3)
     print(f"double upper: {b1:.4f} >= {z:.4f} <= {b2:.4f}, "
           f"eta*={eta_star(ls):.4f}")
+
+
+# --- Skip/sink renormalization bound (Step/Upgrades.lean, 2026-10-18) --------
+
+
+def skip_renorm_bound(p: list[float], dropped: list[bool]) -> tuple[float, float]:
+    """L1 cost of skipping unread/sink blocks BEFORE renormalizing
+    [``skip_bound`` / ``sink_cost_bound`` (Step/Upgrades.lean)]:
+
+        sum_v |p_v - (0 if dropped else p_v / (1 - dropped_mass))|
+            <= 2 * dropped_mass
+
+    First-order in the DROPPED MASS, not in the window length T: skipping
+    low-mass blocks costs nothing; the mass map, not the block count, is
+    the cost. Runtime use: certified guard for skip-window / sink-token
+    corrections on the softmax selector. Returns (bound 2*dropped_mass,
+    actual L1 of the renormalization) - the actual value always fits
+    under the bound.
+    """
+    n = len(p)
+    if n != len(dropped) or n == 0:
+        raise ValueError("p and dropped must be nonempty, equal length")
+    if any(x < 0 for x in p):
+        raise ValueError("p must be nonnegative")
+    d = sum(pi for pi, dr in zip(p, dropped) if dr)
+    if d >= 1.0:
+        raise ValueError("dropped mass must be < 1")
+    l1 = 0.0
+    for pi, dr in zip(p, dropped):
+        target = 0.0 if dr else pi / (1.0 - d)
+        l1 += abs(pi - target)
+    return 2.0 * d, l1

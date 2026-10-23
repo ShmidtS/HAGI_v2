@@ -279,3 +279,31 @@ def variance_certificate(energies, t: float, eps: float) -> dict:
             delta, full, len(e), eps),
         "stop_steps": variance_stop_steps(delta, full, len(e), eps),
     }
+
+
+# --- Gibbs + Nernst composite (R549, Unified/NernstFannes.lean) -------------
+
+
+def gibbs_nernst_bound(n: int, delta: float, t: float) -> float:
+    """S(p_T) <= (n-1) e^{-delta/T} ln n + (1 + (n-1) e^{-delta/T}) ln 2
+    [R549 ``gibbs_nernst``].
+
+    Third law with an explicit exponential rate: for a Gibbs
+    distribution with energy gap delta around the minimizer v*, the
+    Shannon entropy is bounded by t-hat = (n-1) e^{-delta/T} via
+    gibbs_concentration + nernst_fannes + binary entropy <= ln 2.
+    As T -> 0+ the bound decays exponentially to 0 — cooling is
+    certified to drive the selector distribution to a point.
+
+    Premises (the theorem's): energies on n >= 2 states with a gap
+    delta > 0: E[v*] + delta <= E[v] for every v != v* (measured,
+    h_emp_); T > 0.
+    """
+    if n < 2:
+        raise ValueError("n must be >= 2 states")
+    if delta <= 0.0:
+        raise ValueError("delta (energy gap) must be positive")
+    if t <= 0.0:
+        raise ValueError("t must be positive")
+    t_hat = (n - 1) * math.exp(-delta / t)
+    return t_hat * math.log(n) + (1.0 + t_hat) * math.log(2.0)

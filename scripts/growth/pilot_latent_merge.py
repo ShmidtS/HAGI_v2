@@ -112,6 +112,21 @@ def main() -> None:
             for i, sd in enumerate(sds)
         ]
         s_val = float((rc["root_matrix"].double() - (W_shared + Ur.double() @ Vr.double().T)).abs().max())
+        # R103 satTail-optimal compression price (theory default, SS3):
+        # max|delta| overprices the ternary truncation when the
+        # saturation tail is heavy; the split-optimal scale minimizes
+        # n(s/2)^2 + satTail(s). Win-check: keep the exact-err max only
+        # when the split-optimal search certifiably lowers the bound.
+        try:
+            from hagi.model.ternary import optimal_ternary_scale, ternary_sat_diag
+            _delta = (rc["root_matrix"].double() - (W_shared + Ur.double() @ Vr.double().T)).float()
+            _base = float(_delta.abs().mean()) or 1.0
+            _d0 = ternary_sat_diag(_delta, _base)
+            _best_s, _d1 = optimal_ternary_scale(_delta, points=12)
+            if _d1["split_bound"] < _d0["split_bound"] and _best_s > 0:
+                s_val = _best_s
+        except Exception:
+            pass  # pricing aid only: fall back to exact max|delta|
         gate_ok = merge_gate(two_gap, prices, kappa=0.05, s=s_val,
                              n=int(W_shared.shape[0]))
         if not gate_ok:

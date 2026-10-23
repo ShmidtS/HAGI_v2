@@ -51,10 +51,11 @@ def _base_cfg() -> Config:
     return cfg
 
 
-def test_config_liveness_defaults_off():
+def test_config_liveness_defaults_on():
     cfg = _base_cfg()
-    validate_config(cfg)  # default window=0 must validate
-    assert cfg.train.liveness_window == 0
+    validate_config(cfg)  # theory default: liveness two-axis ON (window=32)
+    assert cfg.train.liveness_window == 32
+    assert cfg.train.liveness_min_steps == 64
 
 
 def test_config_liveness_validation():

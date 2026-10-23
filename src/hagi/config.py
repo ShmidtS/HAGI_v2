@@ -54,6 +54,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 CHECKPOINT_FORMAT_VERSION = 12
 
@@ -444,6 +445,10 @@ class ModelConfig:
     # before constructing the model, so all experts with the same seed draw
     # identical weights. 0 disables seeding (current RNG state is used).
     init_seed: int = 0
+    # Mixer backbone: "attention" (GQA, линия V42 по умолчанию — не трогать)
+    # или "recurrent" (RG-LRU-слои, hagi.model.recurrent). Residual/нормы/FFN
+    # и точка сборки Block общие; меняется только ветка attn-миксера.
+    backbone: Literal["attention", "recurrent"] = "attention"
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -696,8 +701,19 @@ class TrainConfig:
     # Теорема growing_batch_stabilized: при δ > 1/ρ (ρ = 1 − ηL)
     # стохастический хвост гаснет на скорости контракции — WSqD-полировка
     # R254 (фикс ×4) выведена из теоремы, а не подобрана. None → фикс.
+    # THEORY DEFAULT ON (NoiseTemperature batch_variance_eq + WSqD
+    # wsqd_noise_budget): the batch axis is the noise-cooling axis —
+    # geometric growth delta=1.02 with cap 16 (the theorem REQUIREs a cap;
+    # total cooldown-tail noise stays constant, sigma^2*c/(B0*(c-1))).
+    # None (БЫСТРО по умолчанию): growing-batch — инструмент ПОДАВЛЕНИЯ
+    # ШУМА в root_ft, где divergence-гвард ловит перелёты при accum=1
+    # (генератор пишет 1.0055/cap16 в ft-конфиги ЯВНО). Листам он НЕ
+    # нужен: измерение gen6 (2026-10-19) — delta=1.02 в листьях даёт
+    # 8.03 с/шаг против 0.62 (×13 wall-clock) с gate_ce листьев НЕ ЛУЧШЕ
+    # (ru 5.605 vs 5.567, math равные, code хуже). Не повторять:
+    # дефолт-протечка dataclass -> листовые конфиги генератора.
     batch_growth_delta: float | None = None
-    batch_growth_cap: int | None = None
+    batch_growth_cap: int | None = 16
     learning_rate: float = 3e-4
     max_grad_norm: float = 1.0
     precision: str = "bf16"
@@ -708,8 +724,12 @@ class TrainConfig:
     # ROCm build (measured 0.70s of 2.41s). BitNet b1.58 weights are ternary:
     # the quantizer reads only the sign pattern relative to row absmean, so the
     # per-direction isotropy Muon provides buys nothing that AdamW does not.
-    # Default off; Muon remains selectable for fp16/dense bodies where it helps.
-    use_muon: bool = False
+    # THEORY DEFAULT ON (Step/MuonStableLR R379-382): the Muon step is
+    # DERIVED (eta = (2/lambda)(Sigma sigma/m), NewtonPolar min-iterations),
+    # not tuned; the dense-body line (gen4+) runs use_muon: true anyway.
+    # Note: on ternary BitLinear bodies the sign-pattern argument still
+    # applies — keep explicit False there if desired.
+    use_muon: bool = True
     # Keep BitLinear master weights in fp32 while BF16 activations and matmuls
     # use BF16 effective ternary weights. Disabled by default to preserve
     # legacy BF16 behavior; this changes training/master precision, not
@@ -777,6 +797,12 @@ class TrainConfig:
     certified_eps_rel: float = 0.0
     # per-domain per-step regression budget (nats) for the R105 eta window
     certified_eps_nats: float = 0.02
+    # cut_safe_accept (ProbeError.lean): certify the EXACT loss change with
+    # the Cauchy-Schwarz margin before applying the certified step; veto
+    # when dL_meas + eps_probe*||d|| > 0. DEFAULT ON — the theorem only ever
+    # vetoes steps whose exact decrease is not certified (conservative;
+    # honest rejection, never invents descent).
+    certified_cut_accept: bool = True
     # "bernoulli" | "stride". Stride keeps every round(1/rate)-th position with
     # a step-dependent phase so the lattice covers the sequence over time.
     ce_keep_mode: str = "bernoulli"
@@ -817,12 +843,13 @@ class TrainConfig:
     # contrapositive of certified_controller.stop_condition): stop only
     # when BOTH axes are frozen — the energy axis (control CE not
     # decreasing) AND the data/growth axis (grad-norm injection signal
-    # flat). While either axis is alive, training continues. Disabled
-    # when ``liveness_window`` is 0.
-    liveness_window: int = 0
+    # flat). While either axis is alive, training continues. DEFAULT ON
+    # (theory: Unified/Liveness liveness_two_axis — honest stop is part of
+    # the certified cycle; window 32, min_steps 64 keeps short runs intact).
+    liveness_window: int = 32
     liveness_energy_tol: float = 0.005
     liveness_growth_tol: float = 1e-4
-    liveness_min_steps: int = 0
+    liveness_min_steps: int = 64
     # Recursive-growth primitive: load weights from a checkpoint as an
     # *initialization* (step 0, fresh optimizer) rather than a resume. A
     # level-N expert starts from the merged level-(N-1) model (the shared
@@ -1382,6 +1409,16 @@ def validate_config(cfg: Config) -> None:
     """
     m, t = cfg.model, cfg.train
     a = m.attention
+
+    if m.backbone not in ("attention", "recurrent"):
+        raise ValueError(
+            f"model.backbone must be 'attention' or 'recurrent', got {m.backbone!r}"
+        )
+    merge_cfg = getattr(cfg, "merge", None)
+    if m.backbone == "recurrent" and merge_cfg is not None and getattr(
+        merge_cfg, "enabled", False
+    ):
+        raise ValueError("model.backbone='recurrent' is not supported with merge.enabled=True")
 
     def positive_int(name: str, value: object, upper: int) -> None:
         if type(value) is not int or not 1 <= value <= upper:

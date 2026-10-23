@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import json
+import math
 
 LEDGER_NAME = "stage_telescope.jsonl"
 
@@ -164,6 +165,118 @@ def rebuild_from_ladder(ladder_path: Path, root: Path) -> int:
         for c in certs:
             fh.write(json.dumps(asdict(c)) + "\n")
     return len(certs)
+
+
+def anytime_growth_budget(
+    steps: int, band_mu: float, band_u: float
+) -> float:
+    """C_T <= C_0 + T*(mu + u) — the anytime growth budget [R548
+    ``anytime_growth_budget`` (Foundations/GrowthDynamics.lean)].
+
+    Composition of the telescope band with concentration: if each
+    capability step is a freshwater band b_t <= mu + u (mu the mean
+    per-step gain, u the anytime-concentration slack, e.g. the R525
+    band sqrt(2 sigma^2 ln(T/alpha))), then after T steps capability
+    NEVER exceeds the start plus T*(mu+u). The increment added to the
+    telescope (returns T*(mu+u)) does NOT include C_0 — the caller
+    adds its own measured start.
+    Premises (the theorem's): C(t+1) = C(t) + G_t and G_t <= b_t,
+    both measured (h_emp_) per step.
+    """
+    if steps < 0:
+        raise ValueError("steps must be nonnegative")
+    if band_u < 0.0:
+        raise ValueError("band slack u must be nonnegative")
+    return steps * (band_mu + band_u)
+
+
+def geometric_band_ceiling(
+    c0: float, b: float, sigma: float, steps: int
+) -> tuple[float, float]:
+    """Geometric decay band capability ceiling [R556
+    ``geometric_band_ceiling`` (Foundations/GrowthDynamics.lean)].
+
+    If per-step gain is covered by a geometrically decaying band
+    G_t <= b*(1-sigma)^t (b >= 0, 0 < sigma <= 1 — measured decay of
+    the growth axis), growth saturates:
+    C_T <= C_0 + (b/sigma)*(1-(1-sigma)^T) <= C_0 + b/sigma.
+    Returns (tight_T, asymptotic) — the T-exact and limit ceilings.
+    Bridge to the saturation signature satC (R531): a measured
+    decaying gain band certifies the saturation ceiling WITHOUT a
+    separate capacity measurement.
+    Premises (h_emp_): C(t+1) = C(t) + G_t and the band per step.
+    """
+    if b < 0.0:
+        raise ValueError("b must be nonnegative")
+    if not 0.0 < sigma <= 1.0:
+        raise ValueError("sigma must lie in (0, 1]")
+    if steps < 0:
+        raise ValueError("steps must be nonnegative")
+    tight = c0 + b * (1.0 - (1.0 - sigma) ** steps) / sigma
+    return tight, c0 + b / sigma
+
+
+def band_guaranteed_growth_floor(
+    c0: float, b: float, sigma: float, steps: int
+) -> float:
+    """Lower-band guaranteed growth floor [R560 ``band_guaranteed_growth``
+    (Foundations/GrowthDynamics.lean)].
+
+    Mirror of ``geometric_band_ceiling``: if the per-step gain is
+    SUPPORTED from below by a geometrically decaying band
+    G_t >= b*(1-sigma)^t (b >= 0, 0 < sigma <= 1 — measured decay of
+    the growth axis), then growth is CERTIFIED from below:
+    C_T >= C_0 + (b/sigma)*(1-(1-sigma)^T).
+
+    With R556 ``geometric_band_ceiling`` the band is now TWO-SIDED:
+    an upper ceiling C_0 + b_up/sigma_up and a lower floor
+    C_0 + (b_lo/sigma_lo)(1-(1-sigma_lo)^T) — the certified cascade
+    closes in both directions (R555 upper, R560/R561 lower).
+    Premises (h_emp_): C(t+1) = C(t) + G_t and the lower band per step.
+    """
+    if b < 0.0:
+        raise ValueError("b must be nonnegative")
+    if not 0.0 < sigma <= 1.0:
+        raise ValueError("sigma must lie in (0, 1]")
+    if steps < 0:
+        raise ValueError("steps must be nonnegative")
+    return c0 + b * (1.0 - (1.0 - sigma) ** steps) / sigma
+
+
+def band_time_to_target(
+    c_floor_after_T: float, c_star: float
+) -> bool:
+    """band_time_to_target (R560): if the guaranteed floor after T
+    steps already reaches the target C* (hreach), the target IS
+    reached: C* <= C_T. Composition of the floor with the thermostat
+    target timer. Pure implication, so the runtime form takes the
+    already-computed floor.
+    """
+    return c_floor_after_T >= c_star
+
+
+def time_to_target_log(
+    c0: float, c_star: float, b: float, sigma: float
+) -> int:
+    """Closed-form thermostat target timer [R567 ``time_to_target_log``].
+
+    Under the lower band G_t >= b(1-sigma)^t (b >= 0, 0 < sigma < 1,
+    C_0 <= C*, sigma*(C*-C_0) < b), the number of steps T satisfying
+    T >= ln(1 - sigma(C*-C_0)/b)/ln(1-sigma) certifies C* <= C_T.
+    Returns the minimal integer T. Requires STRICT sigma < 1 (the
+    theorem degenerates at sigma = 1) and reachability (hc1).
+    """
+    if b <= 0.0:
+        raise ValueError("b must be positive (reachability)")
+    if not 0.0 < sigma < 1.0:
+        raise ValueError("sigma must lie in (0, 1)")
+    if c_star < c0:
+        raise ValueError("target C* must be >= C0")
+    if sigma * (c_star - c0) >= b:
+        raise ValueError("unreachable: sigma*(C*-C0) >= b")
+    return math.ceil(
+        math.log(1.0 - sigma * (c_star - c0) / b) / math.log(1.0 - sigma)
+    )
 
 
 def risk_budget_termination(

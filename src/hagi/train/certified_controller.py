@@ -39,6 +39,14 @@ __all__ = [
     "phase_log_line",
     "anytime_safe_threshold",
     "anytime_accept_gate",
+    "anytime_freedman_term",
+    "anytime_freedman_thresholds",
+    "anytime_freedman_thresholds_two_sided",
+    "anytime_valid_budget",
+    "schedule_from_budget",
+    "anytime_safety_check",
+    "stochastic_noise_schedule",
+    "noise_eps_like",
     "gamma_min_for_target",
     "gamma_ceiling",
     "gamma_deficit_no_takeoff",
@@ -460,6 +468,133 @@ def anytime_accept_gate(
     return delta > u, u
 
 
+# --- Anytime-Freedman crossing ladder (R541-R542, FreedmanTwoSided.lean) ----
+# Port: closes the THEORY_MAP open item "anytime Freedman M+V". Theorem
+# ``anytime_freedman_thresholds``: for a martingale increment sequence with
+# |g| <= c, zero mean and conditional variance <= v_k, the probability that
+# ANY threshold rung j <= T is crossed while the running variance proxy
+# stays <= V_j is bounded by the SUM of per-rung Freedman terms
+# exp(-r_j^2 / (4 (V_j + c r_j))). Two-sided form (R542): same with |S|,
+# factor 2 (each arm S and -S is its own threshold ladder).
+
+
+def anytime_freedman_term(r: float, V: float, c: float) -> float:
+    """One rung of the anytime-Freedman ladder [R541].
+
+    ``history_additive_freedman`` (FreedmanTwoSided.lean): per-rung bound
+    exp(-r^2 / (4 (V + c r))). r > 0 is the threshold rung, V >= 0 the
+    variance budget, c > 0 the increment range cap.
+    """
+    if r <= 0.0:
+        raise ValueError("r must be positive")
+    if V < 0.0:
+        raise ValueError("V must be nonnegative")
+    if c <= 0.0:
+        raise ValueError("c must be positive")
+    return math.exp(-(r * r) / (4.0 * (V + c * r)))
+
+
+def anytime_freedman_thresholds(
+    thresholds: list[float], variances: list[float], c: float
+) -> float:
+    """P[exists j <= T: S_j >= r_j with Var running <= V_j] bound [R541].
+
+    Union bound over rungs j of per-rung Freedman terms. Premises (h_emp_):
+    increments bounded by c, zero conditional mean, conditional variance
+    <= v_j. thresholds/variances must be nonempty, equal length (T+1).
+    """
+    if not thresholds or len(thresholds) != len(variances):
+        raise ValueError("thresholds and variances must be nonempty, equal length")
+    return sum(
+        anytime_freedman_term(r, v, c) for r, v in zip(thresholds, variances)
+    )
+
+
+def anytime_freedman_thresholds_two_sided(
+    thresholds: list[float], variances: list[float], c: float
+) -> float:
+    """Two-sided anytime-Freedman bound [R542]: P[exists j <= T:
+    |S_j| >= r_j with Var <= V_j] <= 2 * sum of per-rung terms (each arm
+    S and -S is its own ladder with the same premises). Use for symmetric
+    drift monitors (two-sided CE A/B)."""
+    return 2.0 * anytime_freedman_thresholds(thresholds, variances, c)
+
+
+# --- Ville / anytime-safety stack (Unified/AnytimeMartingale.lean) ----------
+# Port: closes THEORY_MAP open item "anytime-valid control (Ville / geometric
+# schedule) on top of SafeQP". Per-step failure budgets that DECAY
+# geometrically (delta0*rho^t) sum to a CONSTANT total budget delta0/(1-rho)
+# over ANY horizon - valid at arbitrary stopping (union bound + geometric
+# telescoping), no peeking penalty.
+
+
+def anytime_valid_budget(delta0: float, rho: float) -> float:
+    """Total failure budget over ANY horizon [``anytime_valid_budget``]:
+    sum_t delta0*rho^t <= delta0/(1-rho) for 0 <= rho < 1. Choose the
+    per-step schedule so the total budget equals the affordable alpha."""
+    if delta0 < 0.0:
+        raise ValueError("delta0 must be nonnegative")
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must lie in [0, 1)")
+    return delta0 / (1.0 - rho)
+
+
+def schedule_from_budget(delta: float, rho: float) -> float:
+    """Inverse of ``anytime_valid_budget``: per-step initial budget delta0
+    whose geometric schedule sums to a total level ``delta``
+    (premise of ``anytime_safety``: delta0/(1-rho) <= delta)."""
+    if not 0.0 < delta < 1.0:
+        raise ValueError("delta must lie in (0, 1)")
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must lie in [0, 1)")
+    return delta * (1.0 - rho)
+
+
+def anytime_safety_check(
+    step_failures: list[float], delta0: float, rho: float, delta: float
+) -> bool:
+    """Honest verification of the ``anytime_safety`` premises: every
+    MEASURED per-step bad-event mass must fit under the schedule
+    delta0*rho^t, and the schedule total must fit the level
+    (delta0/(1-rho) <= delta). True only when the certificate chain holds."""
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must lie in [0, 1)")
+    budget = anytime_valid_budget(delta0, rho)
+    # theorem premise delta0/(1-rho) <= delta; float tolerance on the
+    # boundary (exact-arithmetic identity, 1 ulp of scheduling noise)
+    if budget > delta and not math.isclose(budget, delta, rel_tol=1e-12):
+        return False
+    for t, bad in enumerate(step_failures):
+        if bad > delta0 * rho**t:
+            return False
+    return True
+
+
+def stochastic_noise_schedule(
+    sigma: float, d_norm: float, n_domains: int, m_t: int,
+    delta0: float, rho: float, t: int,
+) -> float:
+    """``anytime_safety_stochastic`` runtime form: SafeQP epsilon inflation
+    at step t of the geometric schedule - noiseEps evaluated at the DECAYING
+    per-step level delta_t = delta0*rho^t, so uniformity over any horizon is
+    certified by the constant budget delta0/(1-rho). Premises (h_emp_):
+    bounded zero-mean per-sample noise, m_t >= 1."""
+    if m_t < 1:
+        raise ValueError("m_t must be >= 1")
+    if t < 0:
+        raise ValueError("t must be nonnegative")
+    return noise_eps_like(sigma, d_norm, n_domains, m_t, delta0 * rho**t)
+
+
+def noise_eps_like(
+    sigma: float, d_norm: float, n_domains: int, m: int, delta: float
+) -> float:
+    """noiseEps form (identical to ``safeqp_step.noise_eps``; lazy import,
+    single SSOT): sigma * ||d|| * sqrt(2 ln(|K|/delta) / m)."""
+    from hagi.train.safeqp_step import noise_eps  # lazy, single SSOT
+    return noise_eps(n_domains, sigma, d_norm, m, delta)
+
+
 # --- Gamma-budget of the mixer (R530, Growth/GammaDeficit.lean) -----------
 
 
@@ -510,3 +645,44 @@ def gamma_deficit_no_takeoff(
     """
     req = gamma_min_for_target(alpha, c_star, d_bar)
     return gamma < req, req
+
+
+# --- Plasticity radius (Growth/PlasticityLedger.lean) ------------------------
+
+
+def plasticity_radius(p_rows: list[list[float]]) -> tuple[float, float]:
+    """Information radius of the family as plasticity certificate
+    [``plasticityRadius`` / ``kl_le_log_card`` / ``radius_zero_of_eq``
+    (Growth/PlasticityLedger.lean)]:
+
+        radius = sum_i KL(P_i || famMix),  famMix = uniform mixture
+
+    Certificates: each KL(P_i||famMix) <= log|I|, hence
+    radius <= |I| * log|I|; radius == 0 exactly when all P_i are equal
+    (the family carries no plastic diversity - nothing to harvest).
+    Runtime: diagnostic for the disagreement/merger channels - radius is
+    the measurable (h_emp_) E_dev-proxy on the distribution level.
+    Returns (radius, upper_bound |I|*log|I|).
+    """
+    import math as _m
+    if not p_rows:
+        raise ValueError("empty family")
+    n_v = len(p_rows[0])
+    if any(len(r) != n_v for r in p_rows):
+        raise ValueError("rows must have equal length")
+    for r in p_rows:
+        if any(x < 0 for x in r):
+            raise ValueError("probabilities must be nonnegative")
+        tot = sum(r)
+        if abs(tot - 1.0) > 1e-6:
+            raise ValueError("rows must sum to 1")
+    m = len(p_rows)
+    mix = [sum(r[v] for r in p_rows) / m for v in range(n_v)]
+    rad = 0.0
+    for r in p_rows:
+        for pv, mv in zip(r, mix):
+            if pv > 0.0 and mv > 0.0:
+                rad += pv * _m.log(pv / mv) / m  # mean KL over family
+    # mean-KL radius: sum_i KL / |I| == KL against the mixture average;
+    # the theorem's upper bound on the SUM form scales by |I|
+    return rad * m, m * _m.log(m)

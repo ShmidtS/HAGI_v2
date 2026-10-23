@@ -53,6 +53,54 @@ import math
 # --- R105: the derived safe step ----------------------------------------
 
 
+def noise_eps(
+    n_domains: int, sigma: float, d_norm: float, m: int, delta: float
+) -> float:
+    """Minibatch noise inflation of the epsilon budget [StochasticSafeQP
+    ``noiseEps`` (Step/StochasticSafeQP.lean)]:
+
+        noiseEps = sigma * ||d|| * sqrt(2 ln(|K|/delta) / m)
+
+    With probability >= 1 - delta the MINIBATCH inner products
+    concentrate within this radius of the true (population) inner
+    products, so feasibility certified on the empirical margins holds
+    TRUE with budget eps + noiseEps (``stochastic_safeQP_feasibility``).
+    sigma is the per-sample gradient-noise std (measured, h_emp_),
+    |K| = n_domains the number of safety constraints, m the minibatch
+    size. THE lr<->batch dial: at (eta, m) -> (k*eta, k^2*m) the noise
+    budget is invariant (``lr_batch_equivalence``).
+    """
+    if n_domains < 1:
+        raise ValueError("n_domains must be >= 1")
+    if sigma < 0.0:
+        raise ValueError("sigma must be nonnegative")
+    if d_norm < 0.0:
+        raise ValueError("d_norm must be nonnegative")
+    if m < 1:
+        raise ValueError("minibatch size m must be >= 1")
+    if not 0.0 < delta < 1.0:
+        raise ValueError("delta must lie in (0, 1)")
+    return sigma * d_norm * math.sqrt(
+        2.0 * math.log(n_domains / delta) / m
+    )
+
+
+def lr_batch_equivalence_check(
+    eta: float, sigma: float, d_norm: float, m: int, k: int, delta: float,
+    n_domains: int = 1,
+) -> bool:
+    """``lr_batch_equivalence`` (Smith et al. 1711.00489, formalized):
+    k*eta * noiseEps(k^2*m) == eta * noiseEps(m) exactly. The scheduler
+    licence: instead of cutting LR by k, grow the batch by k^2 - the
+    noise budget is IDENTICAL, sequential updates on the same loss
+    curve are k times fewer. Returns True when the identity holds to
+    float tolerance (pure arithmetic check of the theorem's claim).
+    """
+    left = (k * eta) * noise_eps(n_domains, sigma, d_norm, k * k * m, delta)
+    right = eta * noise_eps(n_domains, sigma, d_norm, m, delta)
+    return math.isclose(left, right, rel_tol=1e-9)
+
+
 def eta_max(
     margins: dict[str, float],
     inner: dict[str, float],
@@ -403,3 +451,248 @@ def expert_gate_tau(
         )
         for row in expert_logits
     ]
+
+
+# --- Joint-step regression laws (Step/Joint.lean) ---------------------------
+
+
+def conflict_lr_limit(g_c: float, g_norm_sq: float, L: float) -> float:
+    """Conflict-regression boundary [``jointStep_conflict_regression``]:
+    when the control gradient conflicts with the joint gradient
+    (g_c . g < 0), ANY learning rate below 2|g_c.g| / (L (g.g)) still
+    strictly INCREASES the loss (quadIncr > 0). The boundary is the
+    honest veto line: at or above it descent is possible; below it the
+    step is provably harmful. Runtime use: cap the per-step lr on the
+    conflicting domain so adapters never sit in the regression zone.
+    """
+    if g_norm_sq <= 0.0:
+        raise ValueError("g_norm_sq must be positive")
+    if L <= 0.0:
+        raise ValueError("L must be positive")
+    return 2.0 * abs(g_c) / (L * g_norm_sq)
+
+
+def joint_step_regression_bound(
+    g_c_norm: float, g_norm_sq: float, L: float, lr: float
+) -> float:
+    """Worst-case joint increment [``jointStep_regression_bound``]:
+    quadIncr <= |lr| sqrt(g_c.g_c) sqrt(g.g) + (L/2) lr^2 (g.g) —
+    the certified upper envelope of a step against a conflicting
+    gradient (Cauchy-Schwarz + smoothness). Premises (h_emp_):
+    L-smooth curvature. Returns the bound; callers veto when it
+    exceeds the step's certified descent budget."""
+    if L < 0.0 or g_norm_sq < 0.0:
+        raise ValueError("L and g_norm_sq must be nonnegative")
+    return abs(lr) * (g_c_norm * (g_norm_sq ** 0.5)) + 0.5 * L * lr * lr * g_norm_sq
+
+
+def trust_region_loss_bound(
+    g_c_norm: float, L: float, R: float
+) -> float:
+    """Direction-free trust-region envelope [``trustRegion_bound``]:
+    with ||delta|| <= R, quadIncr <= sqrt(g_c.g_c) * R + (L/2) R^2 —
+    independent of the step direction. The honest radius budget for
+    probe-based steps: any step inside R costs at most this much."""
+    if L < 0.0 or R < 0.0:
+        raise ValueError("L and R must be nonnegative")
+    return g_c_norm * R + 0.5 * L * R * R
+
+
+
+# --- Armijo / Warmup (Step/ArmijoAcceptance.lean, Step/WarmupSchedule.lean) --
+
+
+def armijo_accept(
+    g_dot_d: float, d_norm_sq: float, alpha: float, L: float, c1: float = 0.25,
+) -> tuple[bool, float]:
+    """Armijo with an EXPLICIT step size [``armijo_step_size``]:
+    with the direction condition g.d <= -c1*||d||^2 and the size bound
+    alpha <= c1/L, the L-smooth model certifies
+
+        J(x + alpha*d) <= J(x) - (c1/2) alpha ||d||^2.
+
+    Returns (accept, certified_decrease). The point vs classical line
+    search: alpha is CHOSEN from the theorem (c1/L), not probed - no
+    backtracking loop, one evaluation.
+
+    Premises (h_emp_): L-smooth curvature; direction condition measured.
+    """
+    if L < 0.0 or d_norm_sq < 0.0:
+        raise ValueError("L and d_norm_sq must be nonnegative")
+    if c1 <= 0.0:
+        raise ValueError("c1 must be positive")
+    if alpha <= 0.0 or alpha > c1 / L:
+        return False, 0.0
+    if g_dot_d > -c1 * d_norm_sq:
+        return False, 0.0
+    return True, 0.5 * c1 * alpha * d_norm_sq
+
+
+def warmup_eta(
+    c: float, k0: float, k_rho: float, rho: float, delta: float
+) -> float:
+    """Warm (adaptively growing) step [``warmupEta``]:
+    eta_t = c * min(1/K0, Delta_t^(-rho) / (3^rho * K_rho)).
+
+    Structure [``warmup_eta_monotone``]: as the suboptimality Delta
+    DECREASES the step GROWS - the warm schedule is a CONSEQUENCE of
+    (rho, K0, K_rho)-smoothness, not a separate assumption. Premises:
+    rho > 0, K0 > 0, K_rho > 0, Delta > 0.
+    """
+    if k0 <= 0.0 or k_rho <= 0.0:
+        raise ValueError("K0 and K_rho must be positive")
+    if rho <= 0.0:
+        raise ValueError("rho must be positive")
+    if delta <= 0.0:
+        raise ValueError("Delta (suboptimality) must be positive")
+    if c < 0.0:
+        raise ValueError("c must be nonnegative")
+    return c * min(1.0 / k0, delta ** (-rho) / (3.0 ** rho * k_rho))
+
+
+
+# --- SNR weighting + NCE K-choice (Step/SNRWeights, Step/NCEExact) -----------
+
+
+def focused_wins(dev_sq: list[float]) -> tuple[bool, list[float]]:
+    """SNR weighting licence [``focused_beats_uniform``
+    (Step/SNRWeights.lean)]: IF some expert j has (dev_j)^2 strictly below
+    the uniform mean, THEN a weight vector (nearly) strictly better than
+    uniform exists. The constructive witness in the theorem: put mass 1
+    on the best expert. Runtime: SNR-focus beats uniform weighting of
+    experts whenever deviations are unequal - check first, focus second.
+
+    Returns (focused_is_better, witness_weights).
+    """
+    if not dev_sq or any(d < 0 for d in dev_sq):
+        raise ValueError("dev_sq must be nonempty nonnegative")
+    r = len(dev_sq)
+    mean = sum(dev_sq) / r
+    j = min(range(r), key=lambda i: dev_sq[i])
+    if not dev_sq[j] < mean:
+        return False, [1.0 / r] * r  # uniform is already the best focus
+    w = [0.0] * r
+    w[j] = 1.0
+    return True, w
+
+
+def focused_cost(dev_sq: list[float], w: list[float]) -> float:
+    """Weighted deviation energy sum_i w_i (dev_i)^2 - the quantity
+    ``focused_wins`` strictly reduces below the uniform mean."""
+    if len(dev_sq) != len(w) or not dev_sq:
+        raise ValueError("equal nonempty lengths required")
+    if any(x < 0 for x in dev_sq) or any(x < 0 for x in w):
+        raise ValueError("inputs must be nonnegative")
+    return sum(wi * d for wi, d in zip(w, dev_sq))
+
+
+def adaptive_k(moment: float, eps: float) -> int:
+    """Minimal K for an eps-accurate NCE estimate [``adaptiveK_bound``
+    (Step/NCEExact.lean)]: K >= moment/eps guarantees (1/K)*moment <= eps
+    - the number of noise samples is DERIVED from the measured second
+    moment of the importance weights, not picked."""
+    if moment < 0.0:
+        raise ValueError("moment must be nonnegative")
+    if eps <= 0.0:
+        raise ValueError("eps must be positive")
+    if moment == 0.0:
+        return 1
+    return math.ceil(moment / eps)
+
+
+def anchor_cadence(rho: float, gamma: float, eps: float) -> float:
+    """Anchor refit cadence [``anchor_cadence_criterion`` (NCEExact.lean)]:
+    refitting the NCE anchor every s steps keeps the stationary drift
+    rho*s/gamma <= eps whenever s <= gamma*eps/rho. Returns the maximal
+    legal cadence s - derived from measured (rho, gamma), not Scheduled.
+    """
+    if rho <= 0.0 or gamma <= 0.0 or eps <= 0.0:
+        raise ValueError("rho, gamma, eps must be positive")
+    return gamma * eps / rho
+
+
+
+# --- NCE partition estimator (Step/NCEExact.lean) -----------------------------
+
+
+def part_est_unbiased(z: list[float], q: list[float]) -> float:
+    """NCE partition estimate [``partEst_unbiased`` (Step/NCEExact.lean)]:
+    with importance weights impW(v) = exp(z_v) / (q_v * |V|)? — concretely
+    the estimator sum_v q_v * (exp(z_v) / q_v) = sum_v exp(z_v) = Z is
+    UNBIASED whenever q has full support: E_q[impW] = Z exactly. Lean
+    form: sum_v q_v * exp(z_v)/q_v = sum_v exp(z_v). Runtime: the NCE
+    estimate of Z from importance sampling is exact on-support; bias can
+    only enter via support clipping (use :func:`smooth_support`).
+    Returns the exact Z (numerically stabilized via max-shift)."""
+    if not z or len(z) != len(q):
+        raise ValueError("z and q must be nonempty, equal length")
+    if any(x <= 0 for x in q):
+        raise ValueError("q must be strictly positive (full support)")
+    m = max(z)
+    return math.exp(m) * sum(math.exp(v - m) for v in z)
+
+
+def second_moment_w(z: list[float], q: list[float]) -> float:
+    """Second moment of the importance weights [``secondMomentW`` +
+    ``secondMomentW_ge_sq`` (NCEExact.lean)]: M2 = sum_v q_v impW(v)^2
+    satisfies Z^2 <= M2 (Cauchy-Schwarz). The NCE variance is driven by
+    M2/Z^2 >= 1 - the K-sample budget comes from
+    :func:`adaptive_k` (moment/eps). Returns M2."""
+    if not z or len(z) != len(q):
+        raise ValueError("z and q must be nonempty, equal length")
+    if any(x <= 0 for x in q):
+        raise ValueError("q must be strictly positive")
+    Z = part_est_unbiased(z, q)
+    # impW(v) = exp(z_v)/q_v  (the per-v importance weight)
+    return sum(qv * (math.exp(zv) / qv) ** 2 for zv, qv in zip(z, q))
+
+
+def nce_variance_ratio(z: list[float], q: list[float]) -> float:
+    """Variance driver M2/Z^2 [relative second moment]: >= 1 by Cauchy-
+    Schwarz; the K-sample relative error scales as this ratio / K -
+    the honest cost of NCE at the current proposal q."""
+    Z = part_est_unbiased(z, q)
+    return second_moment_w(z, q) / (Z * Z)
+
+
+def kls_batch_noise(c: float, L: float, sq_n: float, num_samples: int) -> float:
+    """KLS batch noise second moment [``klsBatchNoise`` (Probability),
+    consumed by ``klsSafeQP_certified`` (Step/KLSSafeQP.lean)]: under a
+    Poincare inequality with constant C, sensitivity bounded by
+    |sens a x|^2 <= L^2 * sqN(a), and B mutually uncorrelated samples,
+    the second moment of the deviation field
+
+        dev(x) = (1/B) sum_i [proj a g_i(x) - E_q proj a g_i]
+
+    is at most V = C * L^2 * sqN(a) / B. Returns V (>= 0)."""
+    if c < 0.0 or L < 0.0 or sq_n < 0.0:
+        raise ValueError("C, L, sqN must be nonnegative")
+    if num_samples <= 0:
+        raise ValueError("B must be a positive integer")
+    return c * L * L * sq_n / num_samples
+
+
+def kls_safeqp_certified(
+    c: float, L: float, sq_n: float, num_samples: int, gd: float,
+    eps: float, t: float,
+) -> float:
+    """Certified QP acceptance mass [``klsSafeQP_certified``
+    (Step/KLSSafeQP.lean)]: with the KLS batch noise V (see
+    :func:`kls_batch_noise`) and the true-inner premise
+    ``eps + |gd| * t <= gd * trueInner(x)`` satisfied pointwise, the
+    q-mass of x where the ESTIMATOR accepts (gd*estInner >= eps) is
+
+        >= 1 - V / t^2
+
+    (Chebyshev on the deviation field). Runtime: the certificate the
+    SafeQP guard reports alongside a veto - the accept decision from
+    estimated inner products carries this mass guarantee. Returns the
+    certified lower bound 1 - V/t^2 (clamped from above at 1)."""
+    if t <= 0.0:
+        raise ValueError("t must be positive")
+    if eps < 0.0:
+        raise ValueError("eps must be nonnegative")
+    if gd == 0.0:
+        raise ValueError("gd must be nonzero (premise |gd|*t <= gd*true needs a sign)")
+    v = kls_batch_noise(c, L, sq_n, num_samples)
+    return min(1.0, 1.0 - v / (t * t))
