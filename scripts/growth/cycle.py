@@ -82,6 +82,9 @@ def ft_config(gen: int, width: int, n_domains: int, incumbent: str, kd: bool) ->
     s = re.sub(r"max_steps: \d+", f"max_steps: {FT_STEPS}", s)
     s = re.sub(r"hidden_size: \d+", f"hidden_size: {width}", s)
     s = re.sub(r"checkpoint_dir: .*", f"checkpoint_dir: checkpoints/c{gen}_root_ft", s)
+    # банк для end-merge (EMA): частые чекпоинты, держим 8
+    s = s.replace("checkpoint_interval: 400", "checkpoint_interval: 100")
+    s = s.replace("checkpoint_keep_last: 3", "checkpoint_keep_last: 8")
     s = s.replace("init_from: checkpoints/rnn_gen3_merged/root.pt", f"init_from: checkpoints/c{gen}_merged/root.pt")
     # геометрия merge-секции: norm_block_dim = ширина листа
     s = re.sub(r"norm_block_dim: \d+", f"norm_block_dim: {width}", s)
