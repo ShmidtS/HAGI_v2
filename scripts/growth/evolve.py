@@ -195,8 +195,12 @@ def main() -> int:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         if stall >= 2:
-            # класс исчерпан (growth_dichotomy): перенос лестницы в новую ширину
-            incumbent = width_grow(incumbent, args.width)
+            # класс исчерпан (growth_dichotomy): перенос лестницы в новую
+            # ширину; цель — минимум 2x текущей (инвариант класса)
+            from hagi.train.checkpoint import load_payload
+            cur = load_payload(str(incumbent), 'cpu')['config']['model']['hidden_size']
+            target = max(args.width, cur * 2)
+            incumbent = width_grow(incumbent, target)
             args.lr *= 0.8
             stall = 0
             with ladder.open("a", encoding="utf-8") as fh:
