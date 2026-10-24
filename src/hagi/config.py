@@ -764,6 +764,13 @@ class TrainConfig:
     gram_scan_corpora: list[str] = field(default_factory=list)
     gram_scan_tokens: int = 1024
     gram_scan_eps_rel: float = 0.0
+    # Split-batch noise probe (NoiseTemperature batch_variance_eq +
+    # KLSBridge; волна полной перечитки 2026-10-24): каждые N шагов один
+    # батч делится пополам, ‖g1−g2‖²/2 — несмещённая σ̂² мини-батчного
+    # шума за одну пробу. LOG-ONLY: питает вывод критического батча
+    # b* = 9Y²/(4(ε−Z)²) (train/grow_arithmetic.critical_batch) — кап
+    # batch-роста будет ВЫВЕДЕН, а не захардкожен, после калибровки Y.
+    noise_probe_interval: int = 0  # 0 = disabled
     # Analytic step (RecursiveGrowth.lean optimal_step_unconstrained, roadmap
     # #1.3): replace the LR hyperparameter class with the curvature-optimal
     # step eta* = <g,d>/(L*||d||^2). L is measured by a two-point probe on the

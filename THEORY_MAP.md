@@ -404,7 +404,57 @@ rnn-3 5.545 (ACCEPT −0.284, все 6 доменов улучшились).
 даст ещё меньше — кандидат на смену рычага: рост M (новые домены)
 или ранг, по Welch-триггеру.
 
-## Полная перечитка Lean (2026-10-23, #2: Optimization/Step 42 файла + Energy/System/Runtime/Budget 34 файла + выборочно Growth/Dynamics/Unified)
+## Полная перечитка Lean #2 (2026-10-24): ВСЕ каталоги, ~250 новых результатов
+
+Четыре чтеца покрыли весь корпус (Core/Data/Ensemble/Probability 61
+файл; Information/Foundations/Model/Architecture 30; Growth/Dynamics/
+Unified 64; Autonomy/Discovery/Pretraining/Omni/Spectral/External/
+Percolation/Examples/Prelude 35). Вывод: runtime-ядро (~90%) уже
+портировано волнами R419–R568; ниже — новое с поверхностью действия.
+
+### Портировано немедленно (train/grow_arithmetic.py, 15 тестов)
+
+| § | Теорема (файл) | Порт |
+| --- | -------------- | ---- |
+| GA | `certifiedGain = (M−c)/(N+1)` + `grow_epsilon_stop` (Growth/Grow) | арифметика добавления листьев: выигрыш лучшего < ε ⟹ сертифицированный СТОП перебора кандидатов |
+| MS | `twoGap_bounded`/`merge_skip_certificate` (Ensemble/Hoeffding): twoGap ≤ ½log cosh M ≤ M²/4 | скалярный пред-гейт merge: M²/4·η < ε ⟹ SKIP цикла (одна посылка вместо прогона) |
+| DF | `domain_disagreement_floor`: одна пара δ ⟹ twoGap ≥ ½log(1+p_u p_v(cosh δ−1)) | гарантированный пол выигрыша слияния |
+| NF | `disagreement_convergence_floor` (NoiseDisentangle): пол σ²/N | twoGap ниже σ²/N — шум, раунд исчерпан; N — рычаг денойзинга |
+| SO | `seed_only_disp_bound`/`seed_only_grow_stop` (SeedOnly): идентичный init ⟹ дисперсия ≤ Λ²s·Σa^i, цель недостижима | ДИАГНОЗ замедления лестницы: gen-N листья от prior без свежих данных затухают геометрически; gen6+ — свежие data-offsets / новые домены обязательны |
+| CB | `sfo_global_min` b*=9Y²/(4(ε−Z)²) (Budget/BatchCap) + `split_batch_noise_probe` (NoiseTemperature batch_variance_eq): σ̂²=‖g1−g2‖²/2 за одну пробу | кап batch-роста ВЫВОДИТСЯ из измеренного Y (log-only зонд в loop.py, `train.noise_probe_interval`) |
+
+Также исправлен дефект: `saturation_min_steps` игнорировался в
+стоп-условии (ранний стоп до стартового окна; best.pt-трекинг
+намеренно с шага 1 — разные вопросы).
+
+### Кандидаты (задокументировано, не срочно)
+
+- **Спектральный слой** (Flywheel port, MatrixNormRelations/
+  CoherenceCharacterization): точное тождество ‖A−A_k‖₂ = σ_k(A);
+  coherence без SVD: μ²·rank = (‖E‖_F/‖E‖₂)²; erank = exp(H(σ²/Σσ²))
+  — непрерывный измеритель ранга для spectral_compress; гэп-критерий
+  decision_criterion (σ₁−σ₂ > ε‖E‖_F ⟹ дешёвый SVD достаточен).
+- **Одно-логитные пробы** (Pretraining/Speedrun cePartition_factor):
+  Z' = Z(1+w_j(e^δ−1)) — O(1) обновление партиции (та же математика,
+  что noise-репо и наш fixed-CE); кандидат для insight-канала.
+- **Гиттинс-правило** (External/Diversity): рычаг = argmax Δquality/
+  Δcost, стоп когда ни один не бьёт инкумбента.
+- **Chinchilla-член (b·N)^α** (SupervisorSafety capMember): тернарный
+  b=log₂3 строго бьёт бинарный при равном N — формальная поддержка
+  тернарной линии.
+- **Pinsker-семейство усиления**: tv_le_pos_part_kl (линейный KL ≥ TV
+  при малых KL), Бретаньоль–Юбер при больших — точные концы для
+  KD-стопов.
+- **WallClockTakeoff**: малые циклы доминируют (slack (k²/2)Στ²) —
+  параллелить поколения мельче.
+- **gibbs_posterior_ratio**: кандидат ниже лидера на δ несёт ≤ e^{−δ/T}
+  массы — прунинг при сэмплировании ансамбля.
+- **measured_gain_horizon** (ProbeError): k ≤ (E0−Emin)/gain — кап
+  продуктивного горизонта прогона из измеренного спуска.
+
+
+
+## Перечитка Lean #1 (2026-10-23: Optimization/Step + Energy/System/Runtime/Budget + выборочно Growth)
 
 Аудит 178 результатов против портов. Вывод: ~90% runtime-значимого
 уже портировано волнами R419–R568 (подтверждено поимённо). НОВОЕ с

@@ -34,6 +34,57 @@ def _flat_grad(model: torch.nn.Module, device: torch.device) -> torch.Tensor | N
     return torch.cat(parts)
 
 
+def split_batch_noise_probe(
+    model: torch.nn.Module,
+    batch: dict,
+    device: torch.device | str = "cpu",
+) -> dict:
+    """σ̂² градиентного шума одной сплит-батч пробой (log-only).
+
+    Probability/NoiseTemperature ``batch_variance_eq`` + KLSBridge: обе
+    половинки батча несмещены на μ ⟹ E‖g₁−g₂‖²/2 = Var(g_half) —
+    несмещённая оценка параметрической дисперсии мини-батчного шума за
+    ОДНУ пробу (два forward+backward). Потребители: вывод критического
+    батча b* = 9Y²/(4(ε−Z)²) (grow_arithmetic.critical_batch) и пол
+    несогласия σ²/N (grow_arithmetic.disagreement_noise_floor).
+
+    Model gradients are restored to None (``zero_grad(set_to_none=True)``).
+    """
+    device = torch.device(device)
+    ids = batch["input_ids"].to(device)
+    targets = batch["targets"].to(device)
+    b, t = ids.shape[0], ids.shape[1]
+    if b < 2:
+        raise ValueError(f"split_batch_noise_probe needs batch >= 2, got {b}")
+    half = b // 2
+    grads: list[torch.Tensor] = []
+    for sl in (slice(0, half), slice(half, 2 * half)):
+        model.zero_grad(set_to_none=True)
+        output = model(ids[sl], targets[sl])
+        loss = output.lm_loss if output.lm_loss is not None else output.ce
+        if loss is None:
+            raise ValueError("probe forward produced no lm loss")
+        loss.backward()
+        g = _flat_grad(model, device)
+        if g is None:
+            raise ValueError("probe backward produced no gradients")
+        grads.append(g.detach().to(torch.float64))
+        del output, loss
+    model.zero_grad(set_to_none=True)
+    diff_sq = float((grads[0] - grads[1]).pow(2).sum())
+    n_params = int(grads[0].numel())
+    half_tokens = half * t
+    # Var(g_half) ≈ ‖g1−g2‖²/2 (обе половинки несмещены); пер-токенная
+    # дисперсия: Var(g_half) = v·P/m ⟹ v = σ̂²·m/P.
+    sigma_sq = diff_sq / 2.0
+    return {
+        "noise_var": sigma_sq,
+        "noise_var_per_token": sigma_sq * half_tokens / max(n_params, 1),
+        "half_tokens": half_tokens,
+        "n_params": n_params,
+    }
+
+
 def corpus_grad_gram(
     model: torch.nn.Module,
     samples: list[tuple[str, dict]],

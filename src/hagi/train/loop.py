@@ -995,6 +995,33 @@ class Trainer:
             except Exception as exc:  # measurement channel must not kill training
                 logger.warning("step %d gram-scan failed: %s", self.step, exc)
 
+        # Split-batch noise probe (batch_variance_eq, log-only): one
+        # measurement every noise_probe_interval steps, in the gram-scan
+        # slot (before the step's own gradients; grads zeroed after).
+        noise_metrics: dict = {}
+        probe_interval = int(getattr(cfg.train, "noise_probe_interval", 0))
+        if probe_interval > 0 and self.step % probe_interval == 0 and microbatches[0].get("targets") is not None:
+            try:
+                from hagi.train.safeqp_controller import split_batch_noise_probe
+
+                probe = split_batch_noise_probe(
+                    model, microbatches[0], device=next(model.parameters()).device
+                )
+                self._noise_probe_last = probe
+                noise_metrics = {
+                    "noise_var": probe["noise_var"],
+                    "noise_var_per_token": probe["noise_var_per_token"],
+                }
+                logger.info(
+                    "step %d noise-probe: sigma^2=%.3e per-token=%.3e",
+                    self.step,
+                    probe["noise_var"],
+                    probe["noise_var_per_token"],
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+            except Exception as exc:  # measurement channel must not kill training
+                logger.warning("step %d noise-probe failed: %s", self.step, exc)
+
         # Certified step (SafeQP.lean acting controller): the projection
         # graduates from telemetry to governing the update. The calibration
         # refresh runs BEFORE the step's own gradients exist (the gram-scan
@@ -1407,6 +1434,8 @@ class Trainer:
         }
         if gram_metrics:
             metrics.update(gram_metrics)
+        if noise_metrics:
+            metrics.update(noise_metrics)
         if certified_metrics:
             metrics.update(certified_metrics)
         if self._teacher is not None:
@@ -1872,7 +1901,10 @@ def train(
                     )
             else:
                 no_improve_count += 1
-                if no_improve_count >= patience:
+                # min_steps: пол стартового окна — стоп законен только
+                # после него (best.pt отслеживается с шага 1: см. NOTE
+                # выше, это разные вопросы — «что шипим» vs «когда стоп»).
+                if no_improve_count >= patience and trainer.step >= min_steps:
                     logger.info(
                         "saturation: control ce %.4f not improved by %.4f over %d samples; stopping at step %d",
                         sat_signal,
