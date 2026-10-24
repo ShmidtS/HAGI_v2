@@ -176,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="token offset into the corpus to begin reading from (recursive growth: the next expert continues where the previous one stopped)",
     )
+    parser.add_argument(
+        "--start-frac",
+        type=float,
+        default=0.0,
+        help="per-source fractional offset in [0,1): each corpus advances by this fraction of ITS OWN size (SeedOnly fresh-data injection for generation N; sealed budget respected per source, unlike the scalar --start-offset)",
+    )
     parser.add_argument("--profile", type=int, default=0, help="profile the first N steps; 0 = off")
     return parser
 
@@ -457,7 +463,7 @@ def main() -> int:
     from hagi.data.dataset import build_dataloader
     from hagi.train.loop import format_metrics, train
 
-    dataloader = build_dataloader(cfg, args.data_dir, start_offset=args.start_offset)
+    dataloader = build_dataloader(cfg, args.data_dir, start_offset=args.start_offset, start_frac=args.start_frac)
     tokens_per_step = cfg.train.batch_size * cfg.train.grad_accum_steps * cfg.train.data.seq_len
     logger.info(
         "training %d steps | %d tokens/step | %.2fB tokens total",

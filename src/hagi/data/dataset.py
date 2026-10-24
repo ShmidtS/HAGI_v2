@@ -316,11 +316,34 @@ def _assert_ids_in_vocabulary(
             )
 
 
+def fractional_start_offsets(
+    data_dir: str | Path, weights: dict[str, float], frac: float, seq_len: int
+) -> dict[str, int]:
+    """Пер-источниковые смещения как доля размера каждого корпуса.
+
+    SeedOnly-механизм свежести (seed_only_grow_stop: поколения с
+    идентичным init и теми же данными затухают геометрически): каждый
+    источник продвигается на ``frac`` своего размера — sealed budget
+    соблюдён для КАЖДОГО источника (скалярный start-offset ломается на
+    малых корпорах: python_instruct 2M токенов против edu 1212M).
+    """
+    if not 0.0 <= frac < 1.0:
+        raise ValueError(f"frac must be in [0,1), got {frac}")
+    offsets: dict[str, int] = {}
+    for name in weights:
+        path = dataset_path(data_dir, name)
+        n = len(np.memmap(path, dtype=TOKEN_DTYPE, mode="r"))
+        max_start = max(0, n - seq_len - 1)
+        offsets[name] = min(int(frac * n), max_start)
+    return offsets
+
+
 def build_dataloader(
     cfg,
     data_dir: str | None = None,
     start_offsets: dict[str, int] | None = None,
     start_offset: int = 0,
+    start_frac: float = 0.0,
 ) -> DataLoader:
     """Build the training dataloader from ``cfg.train.data``.
 
@@ -333,6 +356,9 @@ def build_dataloader(
         start_offset: a single token offset applied to every source (used when
             the expert trains on one corpus). Ignored if ``start_offsets`` is
             given.
+        start_frac: fractional per-source offset in [0,1) — каждый источник
+            продвигается на эту долю СВОЕГО размера (fresh-data инъекция
+            поколения N по seed_only-теореме; перекрывает скалярный offset).
 
     Returns:
         A :class:`DataLoader` yielding dicts of ``[B, seq_len]`` int64 tensors.
@@ -347,7 +373,14 @@ def build_dataloader(
         len(weights),
         ", ".join(f"{n}={w:.3f}" for n, w in sorted(weights.items(), key=lambda kv: -kv[1])),
     )
-    if start_offsets is None and start_offset:
+    if start_offsets is None and start_frac > 0.0:
+        start_offsets = fractional_start_offsets(root, weights, start_frac, dc.seq_len)
+        logger.info(
+            "fresh-data injection (SeedOnly): frac=%.3f per-source offsets %s",
+            start_frac,
+            dict(sorted(start_offsets.items())),
+        )
+    elif start_offsets is None and start_offset:
         start_offsets = {name: start_offset for name in weights}
     dataset = PackedMixDataset(
         data_dir=root,
