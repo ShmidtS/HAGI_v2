@@ -168,7 +168,7 @@ def main() -> int:
                 print(f"=== leaf {d} exit={rc}", flush=True)
 
     if args.leaves_only:
-        print(f"leaves done (--leaves-only); merge+ft+em отдельным запуском", flush=True)
+        print("leaves done (--leaves-only); merge+ft+em отдельным запуском", flush=True)
         return 0
 
     leaves = [f"checkpoints/c{gen}_{d}/best.pt" for d in args.domains]
