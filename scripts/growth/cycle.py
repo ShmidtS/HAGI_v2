@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -107,6 +108,14 @@ def ft_config(gen: int, width: int, n_domains: int, incumbent: str, kd: bool) ->
     return out
 
 
+
+_CHILD_ENV = dict(os.environ, HAGI_GPU_LOCK_CHILD="1")
+
+
+def _child(cmd: list[str], **kw):
+    """Дочерний вызов под родительским локом (токен разрешает старт)."""
+    return subprocess.run(cmd, env=_CHILD_ENV, **kw)
+
 def run_leaf(job: tuple[int, str, str, float, bool]) -> tuple[str, int]:
     gen, d, prior, frac, fresh = job
     log = open(ROOT / f"logs/c{gen}_leaf_{d}.err", "a")
@@ -114,7 +123,9 @@ def run_leaf(job: tuple[int, str, str, float, bool]) -> tuple[str, int]:
            "--start-frac", str(frac)]
     if not fresh:
         cmd += ["--init-from", prior]
-    r = subprocess.run(cmd, stdout=log, stderr=log, cwd=ROOT)
+    # Владелец лока сериализует своих детей сам (concurrency): токен в
+    # env разрешает ребёнку стартовать под родительским локом.
+    r = _child(cmd, stdout=log, stderr=log, cwd=ROOT)
     return d, r.returncode
 
 
@@ -173,23 +184,23 @@ def main() -> int:
 
     leaves = [f"checkpoints/c{gen}_{d}/best.pt" for d in args.domains]
     with open(ROOT / f"logs/c{gen}_merge.log", "a") as fh:
-        rc = subprocess.run([PY, "scripts/growth/pilot_latent_merge.py", "--leaves", *leaves,
-                             "--shared-init", args.prior, "--out", f"checkpoints/c{gen}_merged"],
-                            stdout=fh, stderr=fh, cwd=ROOT).returncode
+        rc = _child([PY, "scripts/growth/pilot_latent_merge.py", "--leaves", *leaves,
+                     "--shared-init", args.prior, "--out", f"checkpoints/c{gen}_merged"],
+                    stdout=fh, stderr=fh, cwd=ROOT).returncode
     if rc != 0:
         print("MERGE FAILED", flush=True)
         return 1
 
     with open(ROOT / f"logs/c{gen}_ft.log", "a") as fh:
-        rc = subprocess.run([PY, "scripts/train.py", "--config", f"configs/c{gen}_root_ft.yaml"],
-                            stdout=fh, stderr=fh, cwd=ROOT).returncode
+        rc = _child([PY, "scripts/train.py", "--config", f"configs/c{gen}_root_ft.yaml"],
+                    stdout=fh, stderr=fh, cwd=ROOT).returncode
     if rc != 0:
         print("FT FAILED", flush=True)
         return 1
 
     with open(ROOT / f"logs/c{gen}_endmerge.log", "a") as fh:
-        subprocess.run([PY, "scripts/growth/end_merge.py", "--config", f"configs/c{gen}_root_ft.yaml",
-                        "--checkpoint-dir", f"checkpoints/c{gen}_root_ft"], stdout=fh, stderr=fh, cwd=ROOT)
+        _child([PY, "scripts/growth/end_merge.py", "--config", f"configs/c{gen}_root_ft.yaml",
+                "--checkpoint-dir", f"checkpoints/c{gen}_root_ft"], stdout=fh, stderr=fh, cwd=ROOT)
     print(f"cycle {gen} complete (merge+ft+end-merge); certify: certify.py --tag c{gen}", flush=True)
     return 0
 

@@ -156,6 +156,8 @@ def _assert_gpu_lock_free() -> None:
     train.py отказывается стартовать, пока лок держит ЖИВОЙ процесс;
     cycle.py владеет локом на всё время поколения.
     """
+    if os.environ.get("HAGI_GPU_LOCK_CHILD") == "1":
+        return  # ребёнок владельца лока: сериализацию делает родитель
     lock = Path(__file__).resolve().parent / "growth" / ".gpu_lock"
     if not lock.exists():
         return
