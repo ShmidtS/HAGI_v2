@@ -47,7 +47,7 @@ FT_STEPS = 400
 BASE_CONFIG = ROOT / "configs/rnng4_leaf_math.yaml"  # шаблон геометрии/обучения
 
 
-def leaf_config(gen: int, domain: str, width: int, steps: int, seed_offset: int) -> Path:
+def leaf_config(gen: int, domain: str, width: int, steps: int, seed_offset: int, fresh: bool = False) -> Path:
     s = BASE_CONFIG.read_text(encoding="utf-8")
     s = re.sub(r"init_seed: (\d+)", lambda m: f"init_seed: {int(m.group(1)) + seed_offset}", s)
     s = re.sub(r"max_steps: \d+", f"max_steps: {steps}", s)
@@ -74,6 +74,13 @@ def leaf_config(gen: int, domain: str, width: int, steps: int, seed_offset: int)
             continue
         i += 1
     s = "\n".join(out) + "\n"
+    if fresh:
+        # Fresh-класс: ранние стопы ЗАПРЕЩЕНЫ — приёмник разогревается
+        # ~300-500 шагов (плато CE~10), saturation/divergence гварды
+        # убивают листья в разогреве (диагноз gen9: enedu остановлен на
+        # шаге 455 при бюджете 800). Чистый бюджет; best.pt пишется всегда.
+        s = s.replace("saturation_patience: 8", "saturation_patience: 0")
+        s = s.replace("divergence_patience: 6", "divergence_patience: 0")
     if "ce_keep_rate" not in s:
         s = s.replace("  compile_model: false", "  compile_model: false\n  ce_keep_rate: 0.5\n  noise_probe_interval: 200")
     out_path = ROOT / f"configs/c{gen}_{domain}.yaml"
@@ -167,7 +174,7 @@ def main() -> int:
             steps = DEFAULT_STEPS.get(d, 800)
         else:
             steps = DEFAULT_STEPS.get(d, PRIOR_STEPS) if d in args.new_domains else PRIOR_STEPS
-        leaf_config(gen, d, args.leaf_width, steps, seed_offset=200 * (gen - 4))
+        leaf_config(gen, d, args.leaf_width, steps, seed_offset=200 * (gen - 4), fresh=args.fresh_init)
         print(f"config c{gen}_{d}: steps={steps} width={args.leaf_width}")
     ft_config(gen, args.leaf_width, len(args.domains), args.incumbent, kd)
 
