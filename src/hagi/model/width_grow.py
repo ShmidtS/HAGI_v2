@@ -93,6 +93,17 @@ def _norm_followers(state: dict[str, torch.Tensor], old_h: int, new_h: int) -> N
             continue
         if t.dim() != 2 or old_h not in t.shape:
             continue
+        # квадратные SwiGLU-веса (I == H): семантика по ключу, не по форме
+        if key.endswith(("gate.weight", "up.weight")) and t.shape[1] == old_h:
+            new_t = torch.zeros(t.shape[0], new_h, dtype=t.dtype)
+            new_t[:, :old_h] = t * k
+            state[key] = new_t
+            continue
+        if key.endswith("down.weight") and t.shape[0] == old_h:
+            new_t = torch.zeros(new_h, t.shape[1], dtype=t.dtype)
+            new_t[:old_h] = t
+            state[key] = new_t
+            continue
         if "embedding" in key:
             # S'_0 = k·S_0; новые столбцы = МАЛЫЙ ШУМ: строго нулевые
             # приращения мертвы градиентно (все пути через ноль); head-столбцы
@@ -193,9 +204,17 @@ def grow_width_checkpoint(path: str, target_width: int, device: str = "cpu") -> 
     old_h = base.model.hidden_size
     grown_cfg = grow_width_config(base, target_width)
     state = grow_width_state_dict(payload["model"], old_h, target_width)
+    # intermediate фиксируется ЯВНО в payload-конфиге: иначе выводится от
+    # новой ширины и квадратные gate/up [I,H] не совпадут при загрузке
+    from hagi.config import ffn_width
+
+    fixed_inter = ffn_width(base.model)
     return {
         "format_version": payload["format_version"],
-        "config": cfg_dict | {"model": dict(cfg_dict.get("model", {})) | {"hidden_size": target_width}},
+        "config": cfg_dict | {"model": dict(cfg_dict.get("model", {})) | {
+            "hidden_size": target_width,
+            "ffn": dict(cfg_dict.get("model", {}).get("ffn", {})) | {"intermediate_size": fixed_inter},
+        }},
         "model": state,
         "completed_steps": payload["completed_steps"],
         "grown": grown_cfg,
