@@ -127,12 +127,24 @@ def main() -> int:
     ap.add_argument("--new-domains", nargs="*", default=[], help="домены без prior-специализации (длинные шаги)")
     ap.add_argument("--frac", type=float, default=0.45)
     ap.add_argument("--leaf-width", type=int, default=128)
-    ap.add_argument("--concurrency", type=int, default=3)
+    ap.add_argument("--concurrency", type=int, default=0,
+                    help="0 = width-aware автопредел (измерено: 3x128 бесплатно, 3x256 трэшинг 2.4x)")
     ap.add_argument("--no-kd", action="store_true")
     ap.add_argument("--skip-leaves", action="store_true", help="листья уже обучены: только merge+ft+em")
+    ap.add_argument("--leaves-only", action="store_true", help="только листья (частичный добор без merge)")
     ap.add_argument("--fresh-init", action="store_true",
                     help="сброс класса: без init_from у листьев (новая ширина; SeedOnly-разнообразие дают домены)")
     args = ap.parse_args()
+    # Единственный конвейер на GPU: лок на всё время поколения (train.py
+    # проверяет его при старте — ручные запуски поверх цикла невозможны).
+    import atexit
+    import os
+
+    lock = ROOT / "scripts/growth/.gpu_lock"
+    lock.write_text(str(os.getpid()))
+    atexit.register(lambda: lock.unlink(missing_ok=True))
+    if args.concurrency <= 0:
+        args.concurrency = max(1, 384 // args.leaf_width)
     gen = args.gen
     kd = not args.no_kd and args.leaf_width == 128  # KD требует ту же геометрию
 
@@ -154,6 +166,10 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             for d, rc in pool.map(run_leaf, jobs):
                 print(f"=== leaf {d} exit={rc}", flush=True)
+
+    if args.leaves_only:
+        print(f"leaves done (--leaves-only); merge+ft+em отдельным запуском", flush=True)
+        return 0
 
     leaves = [f"checkpoints/c{gen}_{d}/best.pt" for d in args.domains]
     with open(ROOT / f"logs/c{gen}_merge.log", "a") as fh:

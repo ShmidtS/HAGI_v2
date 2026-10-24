@@ -148,6 +148,33 @@ def dry_run(model, cfg, device: torch.device) -> int:
     return 0
 
 
+def _assert_gpu_lock_free() -> None:
+    """Единственный обучающий конвейер на GPU (lock-файл).
+
+    Инцидент 2026-10-24: ручной запуск листьев ПОВЕРХ идущего цикла дал
+    5 конкурирующих процессов и трэшинг GPU (3.4 с/шаг против 1.4).
+    train.py отказывается стартовать, пока лок держит ЖИВОЙ процесс;
+    cycle.py владеет локом на всё время поколения.
+    """
+    lock = Path(__file__).resolve().parent / "growth" / ".gpu_lock"
+    if not lock.exists():
+        return
+    try:
+        holder = int(lock.read_text().strip())
+    except ValueError:
+        return  # мусор в локе — не блокируем
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, holder)  # QUERY_LIMITED_INFORMATION
+    if handle:
+        kernel32.CloseHandle(handle)
+        raise SystemExit(
+            f"GPU busy: another training pipeline holds the lock (pid {holder}); "
+            "one pipeline at a time — scripts/growth/.gpu_lock"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the HAGI channel language model")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -198,6 +225,7 @@ def default_config_path_overrides(config_path: str | Path) -> dict[str, object]:
 
 
 def main() -> int:
+    _assert_gpu_lock_free()
     args = build_parser().parse_args()
 
     log_path = setup_logging(args.log_dir)
