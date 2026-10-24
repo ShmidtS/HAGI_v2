@@ -197,15 +197,10 @@ def main() -> int:
     final_ce = gate_ce(model, windows)
     out_path = Path(args.out) if args.out else ckpt_dir / "end_merged.pt"
     # Полный payload-формат load_model: config/format переносятся из best.pt,
-    # заменяется только model.
+    # заменяется только model. load_payload строг к неизвестным полям —
+    # никаких доп. ключей (отчёт живёт в end_merge_report.json).
     payload = torch.load(final_path, map_location="cpu", weights_only=False)
     payload["model"] = {k: v.cpu() for k, v in model.state_dict().items()}
-    payload["meta"] = {
-        "end_merge": True,
-        "base_gate_ce": base_ce,
-        "final_gate_ce": final_ce,
-        "moves": len(accepted),
-    }
     torch.save(payload, out_path)
     report = {
         "base": base_ce, "final": final_ce, "delta": final_ce - base_ce,
