@@ -51,6 +51,10 @@ def leaf_config(gen: int, domain: str, width: int, steps: int, seed_offset: int)
     s = re.sub(r"init_seed: (\d+)", lambda m: f"init_seed: {int(m.group(1)) + seed_offset}", s)
     s = re.sub(r"max_steps: \d+", f"max_steps: {steps}", s)
     s = re.sub(r"hidden_size: \d+", f"hidden_size: {width}", s)
+    # геометрия голов следует ширине (validate: q_heads*head_dim == width)
+    q_heads = max(1, width // 64)
+    s = re.sub(r"num_query_heads: \d+", f"num_query_heads: {q_heads}", s)
+    s = re.sub(r"num_kv_heads: \d+", f"num_kv_heads: {max(1, q_heads // 2)}", s)
     s = re.sub(r"checkpoint_dir: .*", f"checkpoint_dir: checkpoints/c{gen}_{domain}", s)
     # Замена весов mix построчно (устойчиво к CRLF): блок после "weights:"
     # до первой строки того же уровня отступа без слова-источника.
@@ -103,14 +107,14 @@ def ft_config(gen: int, width: int, n_domains: int, incumbent: str, kd: bool) ->
     return out
 
 
-def run_leaf(job: tuple[int, str, str, float]) -> tuple[str, int]:
-    gen, d, prior, frac = job
+def run_leaf(job: tuple[int, str, str, float, bool]) -> tuple[str, int]:
+    gen, d, prior, frac, fresh = job
     log = open(ROOT / f"logs/c{gen}_leaf_{d}.err", "a")
-    r = subprocess.run(
-        [PY, "scripts/train.py", "--config", f"configs/c{gen}_{d}.yaml",
-         "--init-from", prior, "--start-frac", str(frac)],
-        stdout=log, stderr=log, cwd=ROOT,
-    )
+    cmd = [PY, "scripts/train.py", "--config", f"configs/c{gen}_{d}.yaml",
+           "--start-frac", str(frac)]
+    if not fresh:
+        cmd += ["--init-from", prior]
+    r = subprocess.run(cmd, stdout=log, stderr=log, cwd=ROOT)
     return d, r.returncode
 
 
@@ -126,6 +130,8 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--no-kd", action="store_true")
     ap.add_argument("--skip-leaves", action="store_true", help="листья уже обучены: только merge+ft+em")
+    ap.add_argument("--fresh-init", action="store_true",
+                    help="сброс класса: без init_from у листьев (новая ширина; SeedOnly-разнообразие дают домены)")
     args = ap.parse_args()
     gen = args.gen
     kd = not args.no_kd and args.leaf_width == 128  # KD требует ту же геометрию
@@ -137,7 +143,7 @@ def main() -> int:
     ft_config(gen, args.leaf_width, len(args.domains), args.incumbent, kd)
 
     if not args.skip_leaves:
-        jobs = [(gen, d, args.prior, args.frac) for d in args.domains]
+        jobs = [(gen, d, args.prior, args.frac, args.fresh_init) for d in args.domains]
         print(f"launching {len(jobs)} leaves, concurrency={args.concurrency}, frac={args.frac}", flush=True)
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             for d, rc in pool.map(run_leaf, jobs):
