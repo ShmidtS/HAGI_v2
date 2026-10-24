@@ -137,7 +137,13 @@ def main() -> int:
     kd = not args.no_kd and args.leaf_width == 128  # KD требует ту же геометрию
 
     for d in args.domains:
-        steps = DEFAULT_STEPS.get(d, PRIOR_STEPS) if d in args.new_domains else PRIOR_STEPS
+        # fresh-init: ВСЕ листья — нового класса: полный бюджет каждому
+        # (диагноз gen9: prior-бюджет 500 останавливал листья в разогреве
+        # приёмника: все листья fresh-класса на шаге 100 имеют CE~10)
+        if args.fresh_init:
+            steps = DEFAULT_STEPS.get(d, 800)
+        else:
+            steps = DEFAULT_STEPS.get(d, PRIOR_STEPS) if d in args.new_domains else PRIOR_STEPS
         leaf_config(gen, d, args.leaf_width, steps, seed_offset=200 * (gen - 4))
         print(f"config c{gen}_{d}: steps={steps} width={args.leaf_width}")
     ft_config(gen, args.leaf_width, len(args.domains), args.incumbent, kd)
