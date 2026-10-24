@@ -85,7 +85,12 @@ def ft_config(gen: int, width: int, n_domains: int, incumbent: str, kd: bool) ->
     # банк для end-merge (EMA): частые чекпоинты, держим 8
     s = s.replace("checkpoint_interval: 400", "checkpoint_interval: 100")
     s = s.replace("checkpoint_keep_last: 3", "checkpoint_keep_last: 8")
-    s = s.replace("init_from: checkpoints/rnn_gen3_merged/root.pt", f"init_from: checkpoints/c{gen}_merged/root.pt")
+    # init_from в шаблоне листа НЕТ — вставляем явно (no-op замена обучала
+    # ft с нуля: диагностировано на gen8, gate 8.9 вместо ~6.2)
+    s = s.replace(
+        "train:\n  max_steps:",
+        f"train:\n  init_from: checkpoints/c{gen}_merged/root.pt\n  max_steps:",
+    )
     # геометрия merge-секции: norm_block_dim = ширина листа
     s = re.sub(r"norm_block_dim: \d+", f"norm_block_dim: {width}", s)
     if kd:
