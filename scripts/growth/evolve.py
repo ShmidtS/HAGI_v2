@@ -72,6 +72,11 @@ def specialize(incumbent_path: Path, frac: float, steps: int, lr: float, tag: st
     cfg.train.saturation_patience = 8
     cfg.train.divergence_patience = 6
     out_dir = ROOT / "checkpoints" / f"ev_{tag}"
+    # каждая итерация — новый эксперимент: старые чекпоинты (возможно,
+    # другой ширины класса) не должны попадать в EMA-банк end-merge
+    import shutil
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg.train.checkpoint_dir = str(out_dir)
     cfg.train.checkpoint_interval = max(50, steps // 4)
