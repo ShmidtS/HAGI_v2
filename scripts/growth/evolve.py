@@ -176,7 +176,8 @@ def main() -> int:
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    incumbent = Path(args.incumbent)
+    incumbent = ROOT / "checkpoints" / "incumbent.pt"
+    shutil.copyfile(args.incumbent, incumbent)
     ladder = ROOT / "checkpoints" / "evolve_ladder.jsonl"
     frac = args.frac0
     stall = 0  # подряд циклов без сертифицированного улучшения
@@ -192,7 +193,10 @@ def main() -> int:
                  "eps": round(eps, 5), "verdict": "ACCEPT" if new_path else "REJECT",
                  "date": "2026-10-24"}
         if new_path:
-            incumbent = new_path
+            # SSOT инкумбента: копия вне одноразовых каталогов поколений
+            ssot = ROOT / "checkpoints" / "incumbent.pt"
+            shutil.copyfile(new_path, ssot)
+            incumbent = ssot
             stall = 0
         else:
             stall += 1
