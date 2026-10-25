@@ -178,7 +178,9 @@ def main() -> int:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     incumbent = ROOT / "checkpoints" / "incumbent.pt"
-    shutil.copyfile(args.incumbent, incumbent)
+    src = Path(args.incumbent).resolve()
+    if src != incumbent.resolve():
+        shutil.copyfile(src, incumbent)
     ladder = ROOT / "checkpoints" / "evolve_ladder.jsonl"
     frac = args.frac0
     stall = 0  # подряд циклов без сертифицированного улучшения
