@@ -185,42 +185,72 @@ def main() -> int:
     frac = args.frac0
     stall = 0  # подряд циклов без сертифицированного улучшения
     gen = 0
-
+    ROTATION_FRAC = 0.75
+    from hagi.train.checkpoint import load_payload
+    cur_width = load_payload(str(incumbent), "cpu")["config"]["model"]["hidden_size"]
+    recent_deltas: list[float] = []
     while gen < args.generations:
         gen += 1
         tag = f"g{gen}"
         new_path, delta, eps = specialize(incumbent, frac, args.steps, args.lr, tag, device,
                                           args.eval_batches)
         frac = min(frac + 0.15, 0.9)
+        recent_deltas.append(delta)
         entry = {"gen": tag, "incumbent": incumbent.name, "delta": round(delta, 4),
                  "eps": round(eps, 5), "verdict": "ACCEPT" if new_path else "REJECT",
-                 "date": "2026-10-24"}
+                 "frac": round(frac, 2), "date": "2026-10-25"}
         if new_path:
-            # SSOT инкумбента: копия вне одноразовых каталогов поколений
-            ssot = ROOT / "checkpoints" / "incumbent.pt"
-            shutil.copyfile(new_path, ssot)
-            incumbent = ssot
+            # SSOT ВЕРСИОНИРУЕТСЯ: width-grow/перезапуск не должен терять
+            # сертифицированных инкумбентов (урок: rmtree снёс 512@5.1541)
+            versioned = ROOT / "checkpoints" / f"incumbent_w{cur_width}_{gen}.pt"
+            shutil.copyfile(new_path, versioned)
+            shutil.copyfile(new_path, ROOT / "checkpoints" / "incumbent.pt")
+            incumbent = versioned
+            cur_width = target_width_of(versioned)
             stall = 0
         else:
             stall += 1
         with ladder.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        if stall >= 2:
-            # класс исчерпан (growth_dichotomy): перенос лестницы в новую
-            # ширину; цель — минимум 2x текущей (инвариант класса)
-            from hagi.train.checkpoint import load_payload
-            cur = load_payload(str(incumbent), 'cpu')['config']['model']['hidden_size']
-            target = max(args.width, cur * 2)
+        # Data-exhaustion vs saturation: growth_dichotomy честен ТОЛЬКО на
+        # свежем сегменте. Деградация при frac >= ROTATION_FRAC — конец
+        # ротации данных (плохой хвост), а не потолок класса.
+        if stall >= 1 and frac >= ROTATION_FRAC:
+            frac = ROTATION_FRAC - 0.25
+            stall = 0
+            recent_deltas = []
+            with ladder.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"gen": f"{tag}-rotate", "frac": round(frac, 2),
+                                     "note": "data-exhaustion: rotation reset"},
+                                    ensure_ascii=False) + "\n")
+            continue
+
+        # width-grow: ОБА stall-REJECT'а на свежих сегментах И затухающий
+        # тренд ACCEPT'ов (b_t -> 0 на легальном сегменте;
+        # growth_pays_budget: класс растёт, когда шаг-бюджет больше не
+        # возвращает сертифицированный прирост).
+        fresh = frac < ROTATION_FRAC
+        best_accept = min((d for d in recent_deltas if d < 0), default=0.0)
+        decaying = len(recent_deltas) >= 2 and abs(recent_deltas[-1]) < 0.5 * abs(best_accept)
+        if stall >= 2 and fresh and decaying:
+            target = max(args.width, cur_width * 2)
             incumbent = width_grow(incumbent, target)
+            cur_width = target
             args.lr *= 0.8
             stall = 0
+            recent_deltas = []
             with ladder.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"gen": f"{tag}-width", "width": args.width,
-                                     "note": "growth_dichotomy: frozen class exhausted"},
+                fh.write(json.dumps({"gen": f"{tag}-width", "width": target,
+                                     "note": "growth_dichotomy: fresh-segment stalls + decayed ACCEPT trend"},
                                     ensure_ascii=False) + "\n")
     print(f"evolution complete: incumbent = {incumbent}", flush=True)
     return 0
+
+
+def target_width_of(path: Path) -> int:
+    from hagi.train.checkpoint import load_payload
+    return load_payload(str(path), "cpu")["config"]["model"]["hidden_size"]
 
 
 if __name__ == "__main__":
