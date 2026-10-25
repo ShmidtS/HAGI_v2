@@ -99,11 +99,6 @@ def _norm_followers(state: dict[str, torch.Tensor], old_h: int, new_h: int) -> N
             new_t[:, :old_h] = t * k
             state[key] = new_t
             continue
-        if key.endswith("down.weight") and t.shape[0] == old_h:
-            new_t = torch.zeros(new_h, t.shape[1], dtype=t.dtype)
-            new_t[:old_h] = t
-            state[key] = new_t
-            continue
         if "embedding" in key:
             # S'_0 = k·S_0; новые столбцы = МАЛЫЙ ШУМ: строго нулевые
             # приращения мертвы градиентно (все пути через ноль); head-столбцы
@@ -213,6 +208,11 @@ def grow_width_checkpoint(path: str, target_width: int, device: str = "cpu") -> 
         "format_version": payload["format_version"],
         "config": cfg_dict | {"model": dict(cfg_dict.get("model", {})) | {
             "hidden_size": target_width,
+            # head-геометрия следует ширине (validate: q*head_dim == H)
+            "attention": dict(cfg_dict.get("model", {}).get("attention", {})) | {
+                "num_query_heads": grown_cfg.model.attention.num_query_heads,
+                "num_kv_heads": grown_cfg.model.attention.num_kv_heads,
+            },
             "ffn": dict(cfg_dict.get("model", {}).get("ffn", {})) | {"intermediate_size": fixed_inter},
         }},
         "model": state,
