@@ -424,6 +424,38 @@ rnn-3 5.545 (ACCEPT −0.284, все 6 доменов улучшились).
 
 
 
+## Саморазвитие: evolve.py — замкнутый сертифицированный контур (2026-10-25)
+
+Заменяет ВСЕ одноразовые карусели: контроллер в одном процессе сам
+принимает каждое решение по теоремам, человек не участвует:
+
+    SPECIALIZE (fresh-segment ft -> trajectory end-merge -> certified
+    A/B; ACCEPT меняет инкумбент, SSOT checkpoints/incumbent.pt)
+    WIDTH-GROW при 2 stall-циклах (growth_dichotomy; width_grow
+    переносит лестницу функционально-сохраняюще)
+    STOP по grow_epsilon_stop.
+
+Измеренная история первого полного прогона (4 поколения):
+    256-класс: 5.4580 -> 5.2951 ACCEPT -> 5.2117 ACCEPT
+    (лучше старого 128-инкумбента 5.281 на 0.07 certified)
+    gen3/gen4 REJECT (конец свежих данных frac 0.9)
+    -> контроллер сам width-grow до 512 (42.5M), SSOT готов.
+
+Технологии, на которых стоит контур (все — машинно-проверены):
+  * width_grow: bit-for-bit перенос; RMSNorm форсирует √2-рост
+    (rms' = rms/√2 при нулевых новых каналах) ⟹ инвариант потока
+    S' = √2·S; ветки берут √2 от своих норм (out_norm состояния,
+    down·(1/k)); читатели потока comp k; fused in_proj пересобирается
+    по третям; emb-шум 1% оживляет градиентный каскад (строго-нулевые
+    приращения мертвы: все пути через ноль);
+  * fixed CE (2610.31642), cancellation-fixed KD, end-merge (noise-порт),
+    certified A/B (Hoeffding + no-regression clause), growing batch,
+    liveness/saturation/divergence-гварды, noise-probe телеметрия.
+
+Инфраструктурные находки (все закрыты в коде): GPU-lock (один конвейер,
+проверено в обе стороны), SSOT-инкумбент вне одноразовых каталогов,
+п per-generation очистка артефактов, width-aware concurrency.
+
 ## gen7 REJECT (насыщение класса подтверждено) → gen8: расширение класса M=9 (2026-10-24)
 
 - **rnn-7 REJECT** (5.288 vs 5.281): v3 fast-cycle на том же классе M=6/
