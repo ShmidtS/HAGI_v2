@@ -49,7 +49,7 @@ def gen_leaf_configs(gen: int, base_gen: int = 4) -> None:
             s = s.replace("  compile_model: false", "  compile_model: false\n  ce_keep_rate: 0.5\n  noise_probe_interval: 200")
         else:
             s = s.replace("ce_keep_rate: 0.5", "ce_keep_rate: 0.5\n  noise_probe_interval: 200")
-        s = s.replace(f"checkpoints/rnng{base_gen}_leaf_", f"checkpoints/g{gen}_leaf_")
+        s = s.replace(f"checkpoints/rnn{base_gen}g_leaf_", f"checkpoints/g{gen}_leaf_")
         out = ROOT / f"configs/g{gen}_leaf_{d}.yaml"
         out.write_text(s, encoding="utf-8")
         print(f"wrote {out.name}: steps={STEPS[d]} keep=0.5")
