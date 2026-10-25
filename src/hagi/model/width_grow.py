@@ -99,6 +99,12 @@ def _norm_followers(state: dict[str, torch.Tensor], old_h: int, new_h: int) -> N
             new_t[:, :old_h] = t * k
             state[key] = new_t
             continue
+        if key.endswith("down.weight") and t.shape[0] == old_h:
+            # writer (вход ветки уже 1x после gate/up comp k): вклад *1/k
+            new_t = torch.zeros(new_h, t.shape[1], dtype=t.dtype)
+            new_t[:old_h] = t / k
+            state[key] = new_t
+            continue
         if "embedding" in key:
             # S'_0 = k·S_0; новые столбцы = МАЛЫЙ ШУМ: строго нулевые
             # приращения мертвы градиентно (все пути через ноль); head-столбцы
