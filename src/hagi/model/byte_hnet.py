@@ -7,6 +7,8 @@ Reference-first:
   byte resolution with a residual from the encoder stage. No BPE, no regex:
   the vocabulary is exactly 256 values, killing the tokenizer boundary problem
   (measured 1.5-1.9x downstream compute penalty of BPE disappears).
+  Boundary mechanism ported from goombalab/hnet RoutingModule: cosine
+  distance between adjacent states, identity projections, STE.
 - Lean SSOT: primes ``BytePatch`` (patchCount = ceil(N/p), patch_attn_saving)
   for the fixed-rate ceiling; the dynamic boundary predictor is the runtime
   analog of the learned M in AdaptiveChunking (adaptive_le_static: a dynamic
@@ -63,14 +65,28 @@ class DynamicChunker(nn.Module):
         self.min_chunk = int(min_chunk)
         self.max_chunk = int(max_chunk)
         self.threshold = float(threshold)
-        self.boundary_head = nn.Linear(hidden_size, 1)
-        nn.init.zeros_(self.boundary_head.weight)
-        nn.init.ones_(self.boundary_head.bias)  # start: fire at every opportunity
+        # goombalab/hnet RoutingModule mechanism: the boundary signal is the
+        # cosine distance between ADJACENT token states, p = (1 - cos)/2,
+        # with IDENTITY projections (q = k = eye) — no learned parameters in
+        # the router itself; the encoder learns what makes neighbors differ.
+        # The old learned Linear head fired at every opportunity at init and
+        # had no gradient signal tied to semantic boundaries.
+
+    def boundary_probs(self, x: torch.Tensor) -> torch.Tensor:
+        """Boundary probability per position [B, T]; position 0 is forced to
+        1.0 (hnet PAD_PROB discipline: every sequence starts a chunk)."""
+        B, T, _ = x.shape
+        if T < 2:
+            return torch.ones(B, T, device=x.device, dtype=x.dtype)
+        a = torch.nn.functional.normalize(x[:, :-1], dim=-1)
+        b = torch.nn.functional.normalize(x[:, 1:], dim=-1)
+        cos = (a * b).sum(-1)
+        p = torch.clamp((1.0 - cos) / 2.0, 0.0, 1.0)
+        return torch.nn.functional.pad(p, (1, 0), value=1.0)
 
     def boundaries(self, x: torch.Tensor) -> torch.Tensor:
         """Hard boundary decisions [B, T] in {0,1} (1 = chunk ends here)."""
-        logits = self.boundary_head(x).squeeze(-1)
-        return (torch.sigmoid(logits) > self.threshold).to(x.dtype)
+        return (self.boundary_probs(x) > self.threshold).to(x.dtype)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, list[list[slice]]]:
         """Pool byte-rate states into chunk states.
@@ -84,9 +100,9 @@ class DynamicChunker(nn.Module):
         """
         B, T, H = x.shape
         raw = self.boundaries(x)  # [B, T] hard mask
-        # STE: forward uses the hard decision, backward flows through sigmoid
-        logits = self.boundary_head(x).squeeze(-1)
-        soft = torch.sigmoid(logits)
+        # STE (hnet STE): forward uses the hard decision, backward flows
+        # through the soft probability.
+        soft = self.boundary_probs(x)
         hard = raw + soft - soft.detach()
 
         chunks: list[list[slice]] = []
@@ -189,21 +205,35 @@ class ByteHNet(nn.Module):
         chunk_states: torch.Tensor,
         spans: list[list[slice]],
         byte_states: torch.Tensor,
+        boundary_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Expand chunk-rate backbone output to byte rate with encoder residual.
 
         chunk_states: [B, C, H] backbone output at chunk rate; byte_states:
         [B, T, H] the encoder's byte-rate states (residual path).
+        boundary_probs: optional [B, T] boundary probabilities — enables the
+        hnet DeChunkLayer blend: each byte gets ``p * mlp_out`` mixed with the
+        running previous output ``(1-p) * prev`` (EMA over boundary prob; the
+        hnet mechanism that keeps non-boundary positions anchored to the
+        carried value instead of receiving the full chunk update).
         Returns [B, T, H] byte-rate states ready for the LM head.
         """
         B, T, H = byte_states.shape
         out = byte_states.clone()
         for b in range(B):
             spans_b = spans[b]
+            prev = torch.zeros(H, device=byte_states.device, dtype=byte_states.dtype)
             for i, sp in enumerate(spans_b):
                 if i >= chunk_states.shape[1]:
                     break
                 pooled = chunk_states[b, i].expand(sp.stop - sp.start, H)
                 combined = torch.cat([pooled, byte_states[b, sp]], dim=-1)
-                out[b, sp] = out[b, sp] + self.dechunk_mlp(combined)
+                delta = self.dechunk_mlp(combined)
+                if boundary_probs is not None:
+                    # hnet DeChunkLayer: p-weighted blend with the running
+                    # previous output (dechunk EMA, step() form).
+                    p = boundary_probs[b, sp].unsqueeze(-1).clamp(1e-4, 1 - 1e-4)
+                    delta = p * delta + (1.0 - p) * prev
+                    prev = delta[-1].detach()
+                out[b, sp] = out[b, sp] + delta
         return self.out_norm(out)

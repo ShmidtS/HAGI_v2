@@ -35,11 +35,6 @@ from __future__ import annotations
 
 import torch
 
-# qwenbend constants: the gadget's exactness anchors in fp32/bf16.
-_GATE_HI = 128.0  # silu(+128) == 128 exactly; silu(<= -128) == 0 exactly
-_SCALE = 256.0  # feature weight; sum(gate contributions) hits +-128 margins
-_UP = 1.0 / 128.0  # up weight: product == 1.0 exactly when fired
-
 
 class ExactAND:
     """Allocate SwiGLU units of one layer as exact AND gates (qwenbend
@@ -91,29 +86,27 @@ class ExactAND:
         self.n_units += 1
         if i >= self.gate.shape[0]:
             raise ValueError("out of MLP units")
-        gate_acc = 0.0
+        # qwenputer q35 ``t_and`` half-unit margins (robust form): the gate is
+        # 512*(sum - n_pos) + 256 over must-be-1 features (+512 each) and
+        # -512 over must-be-0 features (each complement (1-f) shifts the sum
+        # the same way). All-fire -> +256 (silu == 256, up 1/256 -> exactly 1);
+        # ANY single violation shifts the gate by 512 -> <= -256, and
+        # silu(<= -256) == -0 EXACTLY even when literals carry fp32 noise.
+        # This doubles the noise slack of the earlier 256/128 form.
         for f in feats:
             dims = [f] if isinstance(f, int) else list(f)
-            self.gate[i, dims] += _SCALE
-            gate_acc += len(dims)
+            self.gate[i, dims] += 512.0
         for f in negs:
             dims = [f] if isinstance(f, int) else list(f)
-            self.gate[i, dims] -= _SCALE
-            gate_acc += len(dims)
-        # qwenbend: (-256*(len(feats)+len(negs)) + 128 + 256*len(negs))
-        # == 128 - 256*len(feats): the constant that centers the margin.
-        self.gate[i, self.one] += (-_SCALE * len(feats) + _GATE_HI) * 1.0
+            self.gate[i, dims] -= 512.0
+        self.gate[i, self.one] += 256.0 - 512.0 * len(feats)
         if up is None:
-            self.up[i, self.one] = _UP
+            self.up[i, self.one] = 1.0 / 256.0
         else:
             for dim, w in up.items():
                 self.up[i, dim] = w
         for dim, v in outs.items():
             self.down[dim, i] += v
-
-    def _gate_margin(self, feats: list[int | list[int]]) -> float:
-        n_pos = sum(1 if isinstance(f, int) else len(f) for f in feats)
-        return -_SCALE * n_pos + _GATE_HI  # gate value at the anchor when all fire
 
 
 class NibbleWord:

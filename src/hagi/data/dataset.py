@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -141,11 +142,14 @@ class PackedStream:
         eos_token_id: int,
         rng: np.random.Generator,
         start_offset: int = 0,
+        token_dtype=np.uint32,
     ) -> None:
         self.path = path
         self.seq_len = seq_len
         self.eos_token_id = eos_token_id
-        self.tokens = np.memmap(path, dtype=TOKEN_DTYPE, mode="r")
+        # token_dtype=np.uint8: raw byte streams (input_mode='bytes_hnet') —
+        # the corpus file IS the UTF-8 bytes, no tokenizer in the loop.
+        self.tokens = np.memmap(path, dtype=token_dtype, mode="r")
         self.n_tokens = len(self.tokens)
         if self.n_tokens < seq_len + 1:
             raise ValueError(f"{path.name} holds {self.n_tokens} tokens, need at least {seq_len + 1}")
@@ -221,6 +225,7 @@ class PackedMixDataset(IterableDataset):
         seed: int = 1234,
         cross_doc_attention: bool = False,
         start_offsets: dict[str, int] | None = None,
+        token_dtype=np.uint32,
     ) -> None:
         super().__init__()
         self.data_dir = data_dir
@@ -230,6 +235,7 @@ class PackedMixDataset(IterableDataset):
         self.seed = seed
         self.cross_doc_attention = cross_doc_attention
         self.start_offsets = start_offsets or {}
+        self.token_dtype = token_dtype
 
     def __iter__(self):
         info = get_worker_info()
@@ -246,6 +252,7 @@ class PackedMixDataset(IterableDataset):
                 self.eos_token_id,
                 rng,
                 start_offset=self.start_offsets.get(n, 0),
+                token_dtype=self.token_dtype,
             )
             for n in names
         ]
@@ -367,6 +374,12 @@ def build_dataloader(
     """
     dc = cfg.train.data
     root = data_dir or dc.data_dir
+    byte_mode = getattr(cfg.model, "input_mode", "tokens") == "bytes_hnet"
+    if byte_mode:
+        # Raw-byte streams: the corpus file IS the text bytes (uint8);
+        # eos = 0x0A (newline) drives doc_ids. No tokenizer in the loop.
+        root = root + "_bytes" if not root.endswith("_bytes") else root
+        dc = replace(dc, eos_token_id=10)
     weights = load_mix(root, dc.weights or None)
     logger.info(
         "packed mix over %d sources: %s",
@@ -390,6 +403,7 @@ def build_dataloader(
         seed=dc.seed,
         cross_doc_attention=dc.cross_doc_attention,
         start_offsets=start_offsets,
+        token_dtype=np.uint8 if byte_mode else np.uint32,
     )
     return DataLoader(
         dataset,

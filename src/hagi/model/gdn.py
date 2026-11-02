@@ -176,7 +176,14 @@ class GatedDeltaNet(nn.Module):
         else:
             g_eff = torch.exp(-torch.nn.functional.softplus(nu + math.log(math.e - 1)))
             b_eff = torch.sigmoid(beta)
-            k_eff, v_eff = k, v
+            # Canonical DeltaNet (arXiv:2412.06464, as in qwenputer/q35):
+            # keys are l2-normalized per head. Without it the projection term
+            # (gS)k kT scales the state by ~beta*||k||^2 per step (Kh=128 ->
+            # ~115x) and the recurrence diverges exponentially (measured NaN
+            # by step ~50). With one-hot keys (ram mode) the norm is already
+            # 1 — normalization is a no-op there, RAM writes stay exact.
+            k_eff = torch.nn.functional.normalize(k, dim=-1, eps=1e-6)
+            v_eff = v
 
         h = self._state if self._state_enabled else None
         outs, h = gdn_scan(k_eff, v_eff, g_eff, b_eff, h)
@@ -252,10 +259,10 @@ def gdn_scan(
         h = h0.to(floatd).clone()
     outs = k.new_empty(B, T, Hn, Vh)
     for t in range(T):
-        kt = k[:, t]  # [B,Hn,Kh]
+        kt = torch.nn.functional.normalize(k[:, t], dim=-1, eps=1e-6)  # [B,Hn,Kh]
         vt = v[:, t]  # [B,Hn,Vh]
         gt = g[:, t].unsqueeze(-1)  # [B,Hn,Kh,1] decay per key channel
-        bt = beta[:, t].unsqueeze(-1)  # [B,Hn,Kh,1]
+        bt = beta[:, t].unsqueeze(-1)
         dec = h * gt
         kv = (dec * kt.unsqueeze(-1)).sum(dim=2, keepdim=True)  # [B,Hn,1,Vh]
         h = dec + bt * (vt.unsqueeze(2) - kv) * kt.unsqueeze(-1)

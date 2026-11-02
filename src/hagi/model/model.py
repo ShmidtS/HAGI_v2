@@ -158,7 +158,8 @@ class HAGI(nn.Module):
                     clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
                 )
             elif m.backbone == "gdn":
-                from hagi.model.gdn import GDNConfig as _GDNGeom, GatedDeltaNet
+                from hagi.model.gdn import GatedDeltaNet
+                from hagi.model.gdn import GDNConfig as _GDNGeom
 
                 g = m.gdn
                 attn_module = GatedDeltaNet(
@@ -453,7 +454,31 @@ class HAGI(nn.Module):
             chunk_states, ste_mask, byte_spans = self.byte_hnet.encode(input_ids)
             byte_states = h
             self._chunker_surrogate = self.byte_hnet.chunker_surrogate(ste_mask)
+            self._boundary_probs = self.byte_hnet.chunker.boundary_probs(
+                self.byte_hnet.byte_embed(input_ids).detach()
+            )
             h = chunk_states
+            # doc_ids arrive at byte rate; the backbone runs at chunk rate.
+            # A chunk inherits the document of its LAST byte (chunks never
+            # straddle: they end at a boundary inside one doc or at max_chunk
+            # — the conservative choice keeps cross-doc masking sound).
+            if doc_ids is not None:
+                max_c = max(len(sp) for sp in byte_spans)
+                doc_ids = torch.stack(
+                    [
+                        torch.nn.functional.pad(
+                            doc_ids[b][
+                                torch.tensor(
+                                    [sp.stop - 1 for sp in byte_spans[b]],
+                                    device=doc_ids.device,
+                                )
+                            ],
+                            (0, max_c - len(byte_spans[b])),
+                            value=doc_ids[b].max(),
+                        )
+                        for b in range(doc_ids.shape[0])
+                    ]
+                )
         t_text = input_ids.shape[1] if self.byte_hnet is not None else h.shape[1]
 
         prefix_len = 0
@@ -481,7 +506,9 @@ class HAGI(nn.Module):
         if self.byte_hnet is not None and byte_spans is not None:
             # Expand chunk-rate backbone output back to byte rate with the
             # encoder residual; targets/head contract stays per-byte.
-            h = self.byte_hnet.dechunk(h, byte_spans, byte_states)
+            h = self.byte_hnet.dechunk(
+                h, byte_spans, byte_states, boundary_probs=getattr(self, "_boundary_probs", None)
+            )
         h = self.out_norm(h)
         # Hook for merged models: cross-block mixers run *after* the output
         # norm so the head sees ``mixer(out_norm(h))``. This ordering is what

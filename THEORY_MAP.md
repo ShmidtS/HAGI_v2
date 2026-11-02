@@ -643,3 +643,26 @@ rank_orthogonal_growth, не в клетке; зафиксировано в THEO
 - GDN out_proj zero-init: на шаге 0 градиент получает только out_proj —
   стандартное поведение residual-zero-init (в изоляции in_proj градиентится,
   test_gdn_neural_mode_backward_and_incremental_consistency).
+
+
+## Сверка с первоисточниками (2026-11-02, прямой перенос)
+
+Склонированы и прочитаны напрямую: goombalab/hnet, divagr18/qwenputer
+(вместе с docs/q35.md), voidash/qwenbend (engine_circuit.py — целиком),
+vixhal-baraiya/qwenGPU (README + архитектура). Три переноса и один
+корневой фикс:
+
+| Что | Источник | Изменение |
+| --- | -------- | --------- |
+| AND-гейт | qwenputer `prims.t_and` (полуединичный запас) | `exact_engine.ExactAND`: gate = 512·(Σpos−Σneg) + 256 − 512·n, up = 1/256. Любое нарушение сдвигает гейт на 512 → silu(−256) = −0 ТОЧНО даже при fp32-шуме литералов (запас ×2 против прежнего 256/128) |
+| Границы чанков | hnet `RoutingModule` | `byte_hnet.DynamicChunker`: p = (1−cos(h_t, h_{t+1}))/2, q = k = identity — БЕЗ обучаемых параметров роутера; STE поверх; p(0) = 1 (PAD_PROB-дисциплина) |
+| Дечункер | hnet `DeChunkLayer.step` | `byte_hnet.dechunk(..., boundary_probs)`: EMA-бленд p·out + (1−p)·prev по вероятности границы |
+| Дельта-скан | канонический DeltaNet (arXiv:2412.06464; тот же приём в qwenputer/q35 «Memory is the delta rule») | `gdn.gdn_scan`: ℓ2-нормировка ключей per-head ВНУТРИ скана. Без неё проекция (gS)k·kᵀ масштабирует состояние на ~β·‖k‖² (≈115× при Kh=128) — экспоненциальная расходимость, NaN к шагу ~50 (измерено). RAM-режим: one-hot ключи уже единичные — нормировка no-op, точная запись колонки сохранена (Lean gdnUpdate не нарушен) |
+
+Проверено прогоном: байт-GDN линия (hidden 128, 2 слоя, data_bytes 30MB
+сырых байт UTF-8) учится: CE 5.5435 → 5.5299 за 60 шагов, градиенты
+конечны, обновления принимаются certified-контуром.
+
+Open: GDN chunkwise-скан (WY-representation) — последовательный скан
+ограничивает wall-clock на длинных T; перенос при переносе линии на
+крупный масштаб.

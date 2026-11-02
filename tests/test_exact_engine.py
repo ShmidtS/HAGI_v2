@@ -69,9 +69,25 @@ def test_and_gadget_exact_in_bf16():
 
 def test_gated_up_scaling_form():
     m, gw, uw, dw = _fresh()
-    # up override: fires with output 128 * 0.5 = 64 exactly
+    # up override: gated scaling form — output = silu(256) * w = 256 * w exactly
     m.unit([3], {10: 1.0}, up={ONE: 0.5})
-    assert float(_run(gw, uw, dw, _x_with({3}))[10]) == 64.0
+    assert float(_run(gw, uw, dw, _x_with({3}))[10]) == 128.0
+
+
+def test_and_gadget_noise_robust_margins():
+    """qwenputer half-unit margins: a false AND is exactly 0 even when the
+    literals carry fp32 noise up to ~0.25 per dim (gate stays <= -256)."""
+    m, gw, uw, dw = _fresh()
+    m.unit([3, [7, 8]], {10: 1.0, 11: -1.0})
+    x = _x_with({3})
+    x[7] = 0.2  # noisy false literal
+    o = _run(gw, uw, dw, x)
+    assert float(o[10]) == 0.0
+    # fired side tolerates noise too: gate 256 - 512*0.01 = 254.9, output ~0.996
+    x2 = _x_with({3, 7})
+    x2[3] = 0.99
+    o2 = _run(gw, uw, dw, x2)
+    assert 0.95 < float(o2[10]) <= 1.0
 
 
 def test_unit_capacity_and_shape_validation():

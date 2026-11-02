@@ -26,6 +26,21 @@ from hagi.model.model import HAGI
 # --- GatedDeltaNet: exact RAM semantics -------------------------------------
 
 
+def test_gdn_scan_long_sequence_stability():
+    """Regression (2026-11-02): unnormalized keys made the delta-rule
+    projection scale the state by ~beta*||k||^2 per step (Kh=128 -> ~115x)
+    and the recurrence hit NaN by step ~50. Canonical DeltaNet normalizes
+    keys; the scan must stay finite on long sequences (arXiv:2412.06464)."""
+    B, T, Hn, Kh, Vh = 2, 600, 1, 128, 128
+    k = torch.randn(B, T, Hn, Kh)
+    v = torch.randn(B, T, Hn, Vh)
+    from hagi.model.gdn import gdn_scan
+
+    outs, h = gdn_scan(k, v, torch.full_like(k, 0.9), torch.full_like(k, 0.9), None)
+    assert bool(torch.isfinite(outs).all())
+    assert float(outs.abs().max()) < 1e4
+
+
 def test_gdn_ram_write_is_exact_column_overwrite():
     m = GatedDeltaNet(16, GDNConfig(n_heads=2), use_ternary=False)
     m.set_mode("ram")
@@ -112,8 +127,13 @@ def test_byte_hnet_chunker_receives_gradient_via_surrogate():
     chunk_states, ste, spans = m.encode(b)
     out = m.dechunk(chunk_states, spans, m.byte_embed(b))
     (out.sum() + m.chunker_surrogate(ste)).backward()
-    assert m.chunker.boundary_head.weight.grad is not None
-    assert m.chunker.boundary_head.weight.grad.abs().sum() > 0
+    # hnet-style cosine router: NO learned router weights — gradient reaches
+    # the encoder through the STE path
+    assert not any(
+        n.startswith("chunker.boundary") for n, _ in m.chunker.named_parameters()
+    )
+    assert m.byte_embed.weight.grad is not None
+    assert m.byte_embed.weight.grad.abs().sum() > 0
 
 
 def test_byte_hnet_rejects_out_of_range_ids():
@@ -185,7 +205,8 @@ def test_full_model_byte_gdn_forward_backward():
     m(ids)
     sur = ByteHNet.chunker_surrogate(m._chunker_surrogate)
     sur.backward()
-    assert m.byte_hnet.chunker.boundary_head.weight.grad is not None
+    assert m.byte_hnet.byte_embed.weight.grad is not None
+    assert m.byte_hnet.byte_embed.weight.grad.abs().sum() > 0
 
 
 def test_full_model_gdn_token_path_still_works():
