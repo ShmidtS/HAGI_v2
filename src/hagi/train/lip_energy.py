@@ -21,6 +21,8 @@ owned by callers (h_emp_ sources), this module owns the certificates.
 """
 from __future__ import annotations
 
+import math
+
 
 def lip_energy_quantization(kappa: float, dist: float) -> float:
     """|E(w) - E(qTern w)| <= kappa * ||w - qTern w|| [R563
@@ -36,6 +38,25 @@ def lip_energy_quantization(kappa: float, dist: float) -> float:
     if dist < 0.0:
         raise ValueError("dist must be nonnegative")
     return kappa * dist
+
+
+def gridq_energy_bound(lipschitz: float, n_coords: int, grid_step: float) -> float:
+    """|E(Q(w)) - E(w)| <= L * sqrt(n) * delta / 2 [EFArc.lean
+    ``gridQ_energy_bound`` (Unified/QuantEnergyBridge)].
+
+    Analytic quantization->energy bridge: composing the vector grid
+    contract (sum of per-coordinate rounding errors^2 <= n*(delta/2)^2,
+    Energy/GridQ) with an explicit Euclidean-Lipschitz energy constant
+    L replaces the empirical h_emp_ premise with an analytic one.
+    Runtime consumer: ternary/grid quantizers (BitLinear cache path).
+    """
+    if lipschitz < 0.0:
+        raise ValueError("lipschitz must be nonnegative")
+    if n_coords < 1:
+        raise ValueError("n_coords must be >= 1")
+    if grid_step <= 0.0:
+        raise ValueError("grid_step must be positive")
+    return lipschitz * math.sqrt(n_coords) * grid_step / 2.0
 
 
 def smooth_descent_energy_bound(

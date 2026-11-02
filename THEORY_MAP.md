@@ -621,3 +621,25 @@ latent-носитель (O(1)-состояние). Решение: НЕ порт
 rank_orthogonal_growth, не в клетке; зафиксировано в THEORY_MAP
 2026-10-20). Кандидат на будущую фазу: «latent-thinking шаги» как
 отдельная стадия ft после стабилизации лестницы.
+
+
+## Волна target-architecture (2026-11-02): GDN-RAM + ByteHNet
+
+Целевая архитектура (Qwenputer × Cartesia H-Net × Hagi Lean):
+
+| Компонент | Статус | Место |
+| --- | ------ | ----- |
+| Gated DeltaNet (S' = gS + β(v−gSk)kᵀ), Lean SSOT gdnUpdate/gdnBridge | ✔ | `model/gdn.py` (backbone='gdn'; RAM-режим α=1,β=1,k=eᵢ = точная запись колонки `ram_write`/`ram_read`; zero-init out_proj — function-preserving; инкрементальный state = KVCache-контракт) |
+| Byte-level H-Net (vocab 256, динамический чанкер STE + децункер) | ✔ | `model/byte_hnet.py` (input_mode='bytes_hnet'; min_chunk≥2 — precondition AdaptiveChunking `adaptive_le_static`; surrogate-градиент `train.chunker_weight`) |
+| Проводка model.forward: bytes → chunk → backbone → dechunk → head | ✔ | `model/model.py` (LM head остаётся per-byte: exact-CE канал совместим) |
+| Оптимизатор SafeQP/Muon/gate_never_increases | ✔ (без изменений) | `train/loop.py` + `safeqp_step.py` |
+| Точная память: GDN-RAM доступ из контура обучения | каркас | `gdn.ram_write/ram_read` — интерфейс готов, external-loop consumers (BendLite-верификатор, RV32-микро-исполнитель) — следующий раунд |
+
+Находки реализации:
+- Cold-start trap децункера: zero-init последнего слоя MLP обнулял градиент
+  ко всему бэкбону (dL/dchunk = W₂ᵀ·0 = 0). Фикс: small-random init 0.02
+  (residual и так даёт near-identity старт). Тест
+  test_full_model_byte_gdn_forward_backward фиксирует регрессию.
+- GDN out_proj zero-init: на шаге 0 градиент получает только out_proj —
+  стандартное поведение residual-zero-init (в изоляции in_proj градиентится,
+  test_gdn_neural_mode_backward_and_incremental_consistency).

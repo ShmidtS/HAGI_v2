@@ -142,6 +142,37 @@ class EmbeddingConfig:
 
 
 @dataclass
+class GDNConfig:
+    """Gated DeltaNet mixer geometry (backbone="gdn").
+
+    Full-matrix delta-rule state per layer (S' = g·S + β(v − gSk)kᵀ);
+    mode="ram" (α=1, β=1, one-hot keys) turns the state into an exact
+    addressable memory (Qwenputer semantics, Lean gdnUpdate/gdnBridge).
+    """
+
+    n_heads: int = 1
+    key_dim: int = 0  # 0 = hidden_size
+    value_dim: int = 0  # 0 = hidden_size
+    gate_bias: float = 1.0
+    mode: str = "neural"  # "neural" | "ram"
+
+
+@dataclass
+class ByteHNetConfig:
+    """Byte-level H-Net input path (input_mode="bytes_hnet").
+
+    Raw bytes (vocab 256) in; learned dynamic chunker compresses the byte
+    stream, the backbone runs at chunk rate, the dechunker expands back to
+    byte rate for the head. min_chunk >= 2 keeps the compute saving legal
+    (AdaptiveChunking: fixed rate p=1 saves nothing).
+    """
+
+    vocab_size: int = 256
+    min_chunk: int = 2
+    max_chunk: int = 8
+
+
+@dataclass
 class FFNConfig:
     """SwiGLU channel mixer width.
 
@@ -445,10 +476,17 @@ class ModelConfig:
     # before constructing the model, so all experts with the same seed draw
     # identical weights. 0 disables seeding (current RNG state is used).
     init_seed: int = 0
-    # Mixer backbone: "attention" (GQA, линия V42 по умолчанию — не трогать)
-    # или "recurrent" (RG-LRU-слои, hagi.model.recurrent). Residual/нормы/FFN
-    # и точка сборки Block общие; меняется только ветка attn-миксера.
-    backbone: Literal["attention", "recurrent"] = "attention"
+    # Mixer backbone: "attention" (GQA, линия V42 по умолчанию — не трогать),
+    # "recurrent" (RG-LRU-слои, hagi.model.recurrent) или "gdn" (Gated
+    # DeltaNet, hagi.model.gdn — full-matrix delta rule + точный RAM-режим).
+    # Residual/нормы/FFN и точка сборки Block общие; меняется только ветка
+    # attn-миксера.
+    backbone: Literal["attention", "recurrent", "gdn"] = "attention"
+    gdn: GDNConfig = field(default_factory=GDNConfig)
+    # Входной тракт: "tokens" (source coder V=262144/32768) или "bytes_hnet"
+    # (сырые байты, vocab 256, динамический чанкер + децункер — H-Net путь).
+    input_mode: Literal["tokens", "bytes_hnet"] = "tokens"
+    byte_hnet: ByteHNetConfig = field(default_factory=ByteHNetConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -730,6 +768,11 @@ class TrainConfig:
     # Note: on ternary BitLinear bodies the sign-pattern argument still
     # applies — keep explicit False there if desired.
     use_muon: bool = True
+    # ByteHNet dynamic chunker surrogate weight (input_mode="bytes_hnet"):
+    # gradient carrier for the STE boundary mask. 0 disables chunker learning
+    # (fixed-rate-like behavior); positive values trade backbone CE against
+    # boundary count (AdaptiveChunking: dynamic M can only win vs static p).
+    chunker_weight: float = 0.01
     # Keep BitLinear master weights in fp32 while BF16 activations and matmuls
     # use BF16 effective ternary weights. Disabled by default to preserve
     # legacy BF16 behavior; this changes training/master precision, not
@@ -1417,15 +1460,30 @@ def validate_config(cfg: Config) -> None:
     m, t = cfg.model, cfg.train
     a = m.attention
 
-    if m.backbone not in ("attention", "recurrent"):
+    if m.backbone not in ("attention", "recurrent", "gdn"):
         raise ValueError(
-            f"model.backbone must be 'attention' or 'recurrent', got {m.backbone!r}"
+            f"model.backbone must be 'attention', 'recurrent' or 'gdn', got {m.backbone!r}"
         )
     merge_cfg = getattr(cfg, "merge", None)
-    if m.backbone == "recurrent" and merge_cfg is not None and getattr(
+    if m.backbone in ("recurrent", "gdn") and merge_cfg is not None and getattr(
         merge_cfg, "enabled", False
     ):
-        raise ValueError("model.backbone='recurrent' is not supported with merge.enabled=True")
+        raise ValueError(
+            f"model.backbone={m.backbone!r} is not supported with merge.enabled=True"
+        )
+    if m.input_mode not in ("tokens", "bytes_hnet"):
+        raise ValueError(
+            f"model.input_mode must be 'tokens' or 'bytes_hnet', got {m.input_mode!r}"
+        )
+    if m.input_mode == "bytes_hnet":
+        if m.vocab_size != int(m.byte_hnet.vocab_size):
+            raise ValueError(
+                "model.vocab_size must equal byte_hnet.vocab_size in bytes_hnet mode"
+            )
+        if int(m.byte_hnet.min_chunk) < 2:
+            raise ValueError("byte_hnet.min_chunk must be >= 2 (p=1 saves nothing)")
+        if int(m.byte_hnet.max_chunk) < int(m.byte_hnet.min_chunk):
+            raise ValueError("byte_hnet.max_chunk must be >= min_chunk")
 
     def positive_int(name: str, value: object, upper: int) -> None:
         if type(value) is not int or not 1 <= value <= upper:

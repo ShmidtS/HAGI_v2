@@ -1297,6 +1297,12 @@ class Trainer:
             if anchor_ce is not None:
                 objective = (objective + anchor_w * anchor_ce) if objective is not None else anchor_w * anchor_ce
             if objective is not None:
+                # ByteHNet chunker surrogate: the STE boundary mask needs an
+                # explicit gradient carrier (H-Net adaptive chunking trade-off:
+                # CE gain vs boundary count). Absent for the token path.
+                surrogate = getattr(self.model, "_chunker_surrogate", None)
+                if surrogate is not None:
+                    objective = objective + float(cfg.train.chunker_weight) * surrogate
                 objective.backward()
                 loss_sum = loss_sum + objective.detach().float()
                 if output.ce is not None and lm_weight is not None:

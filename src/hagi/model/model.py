@@ -93,6 +93,22 @@ class HAGI(nn.Module):
             init_std=m.embedding.init_std,
         )
 
+        # Byte-level H-Net path (input_mode="bytes_hnet"): raw bytes in,
+        # learned dynamic chunker, backbone at chunk rate, dechunker back to
+        # byte rate. Absent by default — the token path is untouched.
+        self.byte_hnet = None
+        if m.input_mode == "bytes_hnet":
+            from hagi.model.byte_hnet import ByteHNet
+
+            bh = m.byte_hnet
+            self.byte_hnet = ByteHNet(
+                h,
+                vocab_size=bh.vocab_size,
+                min_chunk=bh.min_chunk,
+                max_chunk=bh.max_chunk,
+                norm_eps=m.norm_eps,
+            )
+
         # Residual scaling: 2 * L_eff branches each of variance s^2 keep the stream
         # at O(1) when s = 1/sqrt(2*L_eff). With loop_depth > 1 the same unique
         # blocks are applied multiple times, so the effective branch count is
@@ -141,6 +157,24 @@ class HAGI(nn.Module):
                     residual_scale=residual_scale,
                     clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
                 )
+            elif m.backbone == "gdn":
+                from hagi.model.gdn import GDNConfig as _GDNGeom, GatedDeltaNet
+
+                g = m.gdn
+                attn_module = GatedDeltaNet(
+                    h,
+                    _GDNGeom(
+                        n_heads=g.n_heads,
+                        key_dim=g.key_dim,
+                        value_dim=g.value_dim,
+                        gate_bias=g.gate_bias,
+                    ),
+                    norm_eps=m.norm_eps,
+                    use_ternary=use_ternary,
+                    residual_scale=residual_scale,
+                    clamp_ratio=getattr(m, "branch_clamp_ratio", 2.0),
+                )
+                attn_module.set_mode(g.mode)
             self.blocks.append(
                 Block(
                     h,
@@ -409,7 +443,18 @@ class HAGI(nn.Module):
                     raise ValueError("a selected decision_mask row requires decision_targets")
 
         h = self.encoder(input_ids, use_state=use_cache)
-        t_text = h.shape[1]
+        byte_spans: list[list[slice]] | None = None
+        byte_states: torch.Tensor | None = None
+        if self.byte_hnet is not None:
+            # H-Net path: encoder output IS the byte-rate embedding; chunk,
+            # run the backbone at chunk rate, then expand back to byte rate
+            # before out_norm/head so the LM head emits per-byte logits and
+            # the exact-CE calibration channel stays byte-exact.
+            chunk_states, ste_mask, byte_spans = self.byte_hnet.encode(input_ids)
+            byte_states = h
+            self._chunker_surrogate = self.byte_hnet.chunker_surrogate(ste_mask)
+            h = chunk_states
+        t_text = input_ids.shape[1] if self.byte_hnet is not None else h.shape[1]
 
         prefix_len = 0
         modal_pooled = None
@@ -433,6 +478,10 @@ class HAGI(nn.Module):
             cache_len = 0
         t_total = cache_len + h.shape[1]
         h = self._run_blocks(h, positions, doc_ids, prefix_len, t_total, use_state=use_cache)
+        if self.byte_hnet is not None and byte_spans is not None:
+            # Expand chunk-rate backbone output back to byte rate with the
+            # encoder residual; targets/head contract stays per-byte.
+            h = self.byte_hnet.dechunk(h, byte_spans, byte_states)
         h = self.out_norm(h)
         # Hook for merged models: cross-block mixers run *after* the output
         # norm so the head sees ``mixer(out_norm(h))``. This ordering is what
