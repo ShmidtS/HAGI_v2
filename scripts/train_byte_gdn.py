@@ -32,7 +32,9 @@ def main() -> int:
     ap.add_argument("--min-chunk", type=int, default=4)
     ap.add_argument("--max-chunk", type=int, default=12)
     ap.add_argument("--data", type=str, default="data_bytes")
+    ap.add_argument("--start-frac", type=float, default=0.0, help="fresh-data rotation offset [0,1)")
     ap.add_argument("--ckpt-dir", type=str, default="checkpoints/byte_gdn_v1")
+    ap.add_argument("--init", type=str, default="", help="checkpoint to warm-start from")
     args = ap.parse_args()
 
     from hagi.config import Config, validate_config
@@ -70,10 +72,15 @@ def main() -> int:
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = HAGI(cfg).to(device)
+    if args.init:
+        from hagi.train.checkpoint import load_model
+
+        load_model(args.init, model, device, lenient_config=True)
+        print(f"[byte-gdn] warm start from {args.init}", flush=True)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[byte-gdn] params {n_params/1e6:.2f}M, device {device}", flush=True)
 
-    dl = build_dataloader(cfg)
+    dl = build_dataloader(cfg, start_frac=args.start_frac)
     from hagi.train.checkpoint import save_checkpoint
 
     best_ce = float("inf")
