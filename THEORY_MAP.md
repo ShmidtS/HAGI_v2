@@ -708,3 +708,18 @@ alignment; √KL vs KL при KL<1; DV достигается ровно на f*
 
 Осталось вне кода: исполняемый exact-engine контур (firmware-уровня
 qwenbend), GDN chunkwise-скан (WY), Landaauer-мосты как потребители.
+
+
+## WY chunkwise GDN-скан (2026-11-03)
+
+`gdn.wy_scan` — chunkwise WY-форма гейт-дельта-правила (Yang et al.
+arXiv:2412.06464), ТОЧНО воспроизводит последовательный `gdn_scan`
+(fp32-eps, проверено на C=8/16/64 и с ненулевым h0; тест
+test_gdn_wy_scan_exact_vs_sequential). Ключевые ловушки, найденные
+тестами: (1) кумулятивный decay входит ВНУТРЬ скалярного дота
+Σ_k k̂_i k̃_l (D_i/D_l)_k, не снаружи; (2) write-key k̃=β⊙k̂ (Lean-форма
+bt·(...)*k̂ᵀ), read-key k̂; (3) частичные суммы выводов j≤i, полное
+только для конечного состояния; (4) накопление W списком + stack
+(inplace-записи в градиентный буфер ломали autograd).
+Forward GDN переключён: neural → wy_scan (chunk 64), ram →
+последовательный gdn_scan (точная семантика колонок).

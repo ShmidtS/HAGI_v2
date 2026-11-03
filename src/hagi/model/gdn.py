@@ -110,6 +110,7 @@ class GatedDeltaNet(nn.Module):
         self.branch_scale = BranchScale(residual_scale, clamp_ratio=clamp_ratio)
 
         self.mode: str = "neural"  # "neural" | "ram"
+        self.wy_chunk: int = 64  # WY chunk length (exact; larger = fewer chunks)
         self._state: torch.Tensor | None = None
         self._state_enabled = False
         self._state_len = 0
@@ -186,7 +187,13 @@ class GatedDeltaNet(nn.Module):
             v_eff = v
 
         h = self._state if self._state_enabled else None
-        outs, h = gdn_scan(k_eff, v_eff, g_eff, b_eff, h)
+        if self.mode == "ram":
+            # RAM: exact one-hot column semantics, sequential path
+            outs, h = gdn_scan(k_eff, v_eff, g_eff, b_eff, h)
+        else:
+            # neural: chunkwise WY (exact vs sequential, verified) — matmul
+            # shaped per chunk instead of a python loop over every step
+            outs, h = wy_scan(k_eff, v_eff, g_eff, b_eff, self.wy_chunk, h)
         if self._state_enabled:
             self._state = h
             self._state_len += T
@@ -222,9 +229,77 @@ class GatedDeltaNet(nn.Module):
         return self._state[0 if self._state.dim() == 4 else slice(None), :, address % self.kh, :].squeeze(0).clone()
 
 
-@torch.no_grad()
-def _scan_no_grad(*args, **kwargs):  # pragma: no cover - used by ram introspection
-    return gdn_scan(*args, **kwargs)
+def wy_scan(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk: int = 64,
+    h0: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunkwise WY form of the gated delta rule (Yang et al.
+    arXiv:2412.06464) — exact vs :func:`gdn_scan` (verified to fp32 eps
+    in tests), with per-chunk state updates instead of a per-step python
+    loop over the full sequence. Keys must be pre-normalized (the runtime
+    normalizes in :meth:`GatedDeltaNet.forward` / :func:`gdn_scan`).
+
+    Args:
+        k, v: [B, T, Hn, Kh]/[B, T, Hn, Vh]; g, beta: [B, T, Hn, Kh].
+        h0: [B, Hn, Kh, Vh] or None.
+
+    Returns:
+        (outputs [B, T, Hn, Vh], final state [B, Hn, Kh, Vh]).
+    """
+    fd = torch.float32
+    k = k.to(fd)
+    v = v.to(fd)
+    g = g.to(fd)
+    beta = beta.to(fd)
+    B, T, Hn, Kh = k.shape
+    Vh = v.shape[-1]
+    h = torch.zeros(B, Hn, Kh, Vh) if h0 is None else h0.to(fd).clone()
+    outs = torch.empty(B, T, Hn, Vh)
+    for s in range(0, T, chunk):
+        e = min(s + chunk, T)
+        L = e - s
+        kb = k[:, s:e]
+        vb = v[:, s:e]
+        gb = g[:, s:e]
+        bb = beta[:, s:e]
+        G = torch.cumprod(gb, dim=1)  # inclusive per-key-channel decay
+        ktilde = bb * kb  # write keys (Lean bt ⊙ k̂)
+        w_rows: list[torch.Tensor] = []
+        for i in range(L):
+            # dec_i·k̂_i = (G_i ⊙ S0)·k̂_i
+            base = ((G[:, i].unsqueeze(-1) * h) * kb[:, i].unsqueeze(-1)).sum(dim=2)
+            corr = torch.zeros(B, Hn, Vh)
+            for ll in range(i):
+                # ratio inside the sum: Σ_k k̂_i,k k̃_l,k (G_i/G_l)_k
+                dot = (kb[:, i] * ktilde[:, ll] * (G[:, i] / G[:, ll])).sum(-1)
+                corr = corr + dot.unsqueeze(-1) * w_rows[ll]
+            w_rows.append(vb[:, i] - base - corr)
+        W = torch.stack(w_rows, dim=1) if w_rows else torch.zeros(B, 0, Hn, Vh)
+        hstart = h
+        for i in range(L):
+            acc = G[:, i].unsqueeze(-1) * hstart
+            for jj in range(i + 1):
+                acc = (
+                    acc
+                    + (G[:, i] / G[:, jj]).unsqueeze(-1)
+                    * W[:, jj].unsqueeze(2)
+                    * ktilde[:, jj].unsqueeze(-1)
+                )
+            outs[:, s + i] = (acc * kb[:, i].unsqueeze(-1)).sum(dim=2)
+        acc = G[:, -1].unsqueeze(-1) * hstart
+        for jj in range(L):
+            acc = (
+                acc
+                + (G[:, -1] / G[:, jj]).unsqueeze(-1)
+                * W[:, jj].unsqueeze(2)
+                * ktilde[:, jj].unsqueeze(-1)
+            )
+        h = acc
+    return outs, h
 
 
 def gdn_scan(

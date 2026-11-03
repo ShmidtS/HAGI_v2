@@ -41,6 +41,30 @@ def test_gdn_scan_long_sequence_stability():
     assert float(outs.abs().max()) < 1e4
 
 
+def test_gdn_wy_scan_exact_vs_sequential():
+    """Chunkwise WY (arXiv:2412.06464) must reproduce gdn_scan to fp32 eps,
+    for chunk sizes 8/16/64 and with a nonzero initial state."""
+    from hagi.model.gdn import gdn_scan, wy_scan
+
+    B, T, Hn, Kh, Vh = 2, 64, 1, 32, 32
+    torch.manual_seed(1)
+    k = torch.randn(B, T, Hn, Kh)
+    v = torch.randn(B, T, Hn, Vh)
+    g = torch.rand(B, T, Hn, Kh) * 0.9 + 0.05
+    beta = torch.rand(B, T, Hn, Kh)
+    kn = torch.nn.functional.normalize(k, dim=-1, eps=1e-6)
+    o1, h1 = gdn_scan(kn, v, g, beta, None)
+    for chunk in (8, 16, 64):
+        o2, h2 = wy_scan(kn, v, g, beta, chunk)
+        assert (o1 - o2).abs().max() < 1e-4, chunk
+        assert (h1 - h2).abs().max() < 1e-5, chunk
+    h0 = torch.randn(B, Hn, Kh, Vh)
+    a1, b1 = gdn_scan(kn, v, g, beta, h0)
+    a2, b2 = wy_scan(kn, v, g, beta, 16, h0)
+    assert (a1 - a2).abs().max() < 1e-4
+    assert (b1 - b2).abs().max() < 1e-5
+
+
 def test_gdn_ram_write_is_exact_column_overwrite():
     m = GatedDeltaNet(16, GDNConfig(n_heads=2), use_ternary=False)
     m.set_mode("ram")
