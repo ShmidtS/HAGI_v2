@@ -257,48 +257,89 @@ def wy_scan(
     beta = beta.to(fd)
     B, T, Hn, Kh = k.shape
     Vh = v.shape[-1]
-    h = torch.zeros(B, Hn, Kh, Vh) if h0 is None else h0.to(fd).clone()
-    outs = torch.empty(B, T, Hn, Vh)
-    for s in range(0, T, chunk):
+    h = (
+        torch.zeros(B, Hn, Kh, Vh, device=k.device)
+        if h0 is None
+        else h0.to(fd).clone()
+    )
+    out_chunks: list[torch.Tensor] = []
+    # cumulative log-decay: pair ratios become exp differences (Yang alg. 1);
+    # batched pair matrix replaces per-pair outer products (OOM fix: the
+    # naive double loop saved ~L^2/2 rank-1 graphs per chunk — at L=64,
+    # D=384, B=4 that is ~5 GB per block per chunk kept for backward).
+    # cumulative log-decay via cumsum of logs (Yang alg. 1): cumprod underflows
+    # to 0 at long T (strong decay: measured 0.0 by step ~256), destroying the
+    # chunk-relative differences; log-space cumsum is exact.
+    cg = torch.cumsum(torch.log(g.clamp_min(1e-9)), dim=1)
+    for s0 in range(0, T, chunk):
+        s = s0
         e = min(s + chunk, T)
         L = e - s
-        kb = k[:, s:e]
-        vb = v[:, s:e]
-        gb = g[:, s:e]
+        kb = k[:, s:e]                      # [B,L,Hn,Kh]
+        vb = v[:, s:e]                      # [B,L,Hn,Vh]
         bb = beta[:, s:e]
-        G = torch.cumprod(gb, dim=1)  # inclusive per-key-channel decay
-        ktilde = bb * kb  # write keys (Lean bt ⊙ k̂)
+        ktilde = bb * kb                    # write keys (Lean bt ⊙ k̂)
+        # CHUNK-RELATIVE cumulative log-decay: the pair matrix and base terms
+        # combine S0 (the chunk-start state) with in-chunk decays only — the
+        # sequence-start decay is already folded into S0. Using the global cg
+        # double-counted the pre-chunk decay (measured off-by-decay^chunk
+        # error in chunk 2+; test_gdn_wy_scan_exact_vs_sequential catches it).
+        cgL = cg[:, s:e]
+        if s > 0:
+            cgL = cgL - cg[:, s - 1 : s]
+        # Numerics (Yang alg. 1 / FLA convention): the pair matrix factors
+        # exp(cg') and exp(−cg') with a SHIFTED log-decay (shift cancels in
+        # the difference) so neither factor overflows; base/outputs/state
+        # use the TRUE chunk-relative exp(cgL) — bounded in (0, 1].
+        cg_shift = cgL - cgL.max(dim=1, keepdim=True).values
+        # A[b,h,i,j] = Σ_k k̂_i,k k̃_j,k exp(cg_i,k − cg_j,k)  (shift exact in
+        # the difference; the naive unshifted e^{−cg_j} overflowed to inf at
+        # Kh=384, T=512 — measured)
+        A = torch.einsum(
+            "blhk,bmhk->bhlm", kb * torch.exp(cg_shift), ktilde * torch.exp(-cg_shift)
+        )                                    # [B,Hn,L,L]
+        hstart = h
         w_rows: list[torch.Tensor] = []
         for i in range(L):
-            # dec_i·k̂_i = (G_i ⊙ S0)·k̂_i
-            base = ((G[:, i].unsqueeze(-1) * h) * kb[:, i].unsqueeze(-1)).sum(dim=2)
-            corr = torch.zeros(B, Hn, Vh)
-            for ll in range(i):
-                # ratio inside the sum: Σ_k k̂_i,k k̃_l,k (G_i/G_l)_k
-                dot = (kb[:, i] * ktilde[:, ll] * (G[:, i] / G[:, ll])).sum(-1)
-                corr = corr + dot.unsqueeze(-1) * w_rows[ll]
+            # dec_i·k̂_i = (e^{cg_i} ⊙ S0)·k̂_i
+            base = (
+                (torch.exp(cgL[:, i]).unsqueeze(-1) * h) * kb[:, i].unsqueeze(-1)
+            ).sum(dim=2)                     # [B,Hn,Vh]
+            if i:
+                corr = torch.einsum(
+                    "bhij,bhjv->bhiv",
+                    A[:, :, i, :i].unsqueeze(2),
+                    torch.stack(w_rows, dim=1).transpose(1, 2),
+                ).squeeze(2)
+            else:
+                corr = torch.zeros(B, Hn, Vh, device=k.device)
             w_rows.append(vb[:, i] - base - corr)
-        W = torch.stack(w_rows, dim=1) if w_rows else torch.zeros(B, 0, Hn, Vh)
-        hstart = h
+        W = torch.stack(w_rows, dim=1)      # [B,L,Hn,Vh]
+        chunk_out: list[torch.Tensor] = []
         for i in range(L):
-            acc = G[:, i].unsqueeze(-1) * hstart
-            for jj in range(i + 1):
-                acc = (
-                    acc
-                    + (G[:, i] / G[:, jj]).unsqueeze(-1)
-                    * W[:, jj].unsqueeze(2)
-                    * ktilde[:, jj].unsqueeze(-1)
-                )
-            outs[:, s + i] = (acc * kb[:, i].unsqueeze(-1)).sum(dim=2)
-        acc = G[:, -1].unsqueeze(-1) * hstart
-        for jj in range(L):
-            acc = (
-                acc
-                + (G[:, -1] / G[:, jj]).unsqueeze(-1)
-                * W[:, jj].unsqueeze(2)
-                * ktilde[:, jj].unsqueeze(-1)
+            # y_i = (G_i⊙S0)·k̂_i + Σ_{j≤i} A[i,j] w_j
+            base_y = torch.einsum(
+                "bhk,bhkv->bhv", torch.exp(cgL[:, i]) * kb[:, i], hstart
             )
-        h = acc
+            acc_out = torch.einsum(
+                "bhij,bhjv->bhiv",
+                A[:, :, i, : i + 1].unsqueeze(2),
+                W[:, : i + 1].transpose(1, 2),
+            ).squeeze(2)
+            chunk_out.append(base_y + acc_out)
+        out_chunks.append(torch.stack(chunk_out, dim=1))
+        # end state per-channel decay: (G_end/G_j)_k = exp(cg_end,k − cg_j,k)
+        ratio_end = torch.exp(cgL[:, -1].unsqueeze(1) - cgL)  # [B,L,Hn,Kh]
+        # S_end[k,v] = G_end,k S0[k,v] + Σ_j w_j,v k̃_j,k ratio_end[j,k]
+        outer = torch.einsum(
+            "bhjv,bjhk->bhkv", W.transpose(1, 2), ratio_end * ktilde
+        )
+        h = torch.exp(cgL[:, -1]).unsqueeze(-1) * hstart + outer
+    outs = (
+        torch.cat(out_chunks, dim=1)
+        if out_chunks
+        else torch.zeros(B, 0, Hn, Vh, device=k.device)
+    )
     return outs, h
 
 
