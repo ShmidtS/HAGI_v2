@@ -19,8 +19,8 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from hagi.config import Config, validate_config  # noqa: E402
-from hagi.model.byte_hnet import ByteHNet, DynamicChunker
-from hagi.model.gdn import GatedDeltaNet, GDNConfig
+from hagi.model.byte_hnet import ByteHNet, DynamicChunker  # noqa: E402
+from hagi.model.gdn import GatedDeltaNet, GDNConfig  # noqa: E402
 from hagi.model.model import HAGI
 
 # --- GatedDeltaNet: exact RAM semantics -------------------------------------
