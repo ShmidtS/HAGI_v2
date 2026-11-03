@@ -145,7 +145,21 @@ def specialize(incumbent_path: Path, frac: float, steps: int, lr: float, tag: st
     eps = math.sqrt(math.log(2.0 / 0.05) / (2.0 * n))
     delta = cand_avg - inc_avg
     no_reg = all(cand_res[d] <= inc_res[d] + 2 * eps for d in cand_res)
-    verdict = "ACCEPT" if (delta < -2 * eps and no_reg) else "REJECT"
+    # Productive-transition gate (audit §3.2: trunc_idle_witness — soundness
+    # alone allows idle accepts): loss must fall by > 2 eps (beyond noise)
+    # or a per-domain capability must rise by > 2 eps.
+    from hagi.train.productive_gate import gate_accept
+
+    cap_gain = max(cand_res[d] - inc_res[d] for d in cand_res)  # CE drop = gain
+    productive_verdict = gate_accept(
+        sound=bool(no_reg), delta_capability=cap_gain, delta_loss=delta,
+        cap_floor=2 * eps, loss_floor=2 * eps,
+    )
+    verdict = (
+        "ACCEPT" if (delta < -2 * eps and no_reg) else "REJECT"
+    ) if productive_verdict == "ACCEPT" else (
+        "REJECT" if productive_verdict == "REJECT_UNSOUND" else "REJECT_IDLE"
+    )
     print(f"[{tag}] A/B: {inc_avg:.4f} -> {cand_avg:.4f} (delta {delta:+.4f}, eps {eps:.4f}, "
           f"no_reg {no_reg}) => {verdict}", flush=True)
     return (candidate_path, delta, eps) if verdict == "ACCEPT" else (None, delta, eps)
