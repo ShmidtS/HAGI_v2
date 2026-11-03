@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from hagi.config import Config, validate_config  # noqa: E402
 from hagi.model.byte_hnet import ByteHNet, DynamicChunker  # noqa: E402
 from hagi.model.gdn import GatedDeltaNet, GDNConfig  # noqa: E402
-from hagi.model.model import HAGI
+from hagi.model.model import HAGI  # noqa: E402
 
 # --- GatedDeltaNet: exact RAM semantics -------------------------------------
 
