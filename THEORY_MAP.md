@@ -743,3 +743,23 @@ Forward GDN переключён: neural → wy_scan (chunk 64), ram →
 сильном распаде, T=512); wy_chunk=32 (decay budget; 64 давал ошибку 0.02–0.18
 через clamp-артефакты). Регрессионные тесты: strong_decay_finite,
 raw_key_normalization.
+
+## VHCL-аудит (2026-11-03): формальные гарантии ↔ 4 источника
+
+Соответствие единой архитектуры (qwenputer/hnet/qwenGPU/qwenbend × primes):
+- **DeltaNet RAM** (gdn_onehot_is_colUpdate, ram_roundtrip): gdn.py ram_write/
+  ram_read + mode='ram' (последовательный скан, точная семантика колонок).
+- **H-Net router** (cosine boundary, p=(1−cos)/2 clamp, STE, min_chunk≥2):
+  byte_hnet.py DynamicChunker; STE-градиент через chunker_surrogate в loss
+  (loop.py, chunker_weight=0.01).
+- **DeChunkLayer** (p-weighted EMA blend): byte_hnet.dechunk (boundary_probs).
+- **Muon** (Newton–Schulz quintic, stable-LR cap η=(2/λ)(Σσ/m)): optim.py.
+- **SafeQP** (safeQP_descent/dual λ, certificate, η*=<g0,d*>/(L‖d‖²),
+  R105 eta_max cap, no_domain_regresses veto): formal.safe_qp_solve +
+  loop._apply_certified_step (certified_step='gate'|'step').
+- **Quant bridge** (gridQ_energy_bound + smooth_from_lipschitz_gradient):
+  lip_energy.py; BitLinear cached-STE + ternarize_split (TernaryExact).
+- **hnet balance loss c N_target**: заменён на measured surrogate (v1
+  решение); N_target-форма — кандидат после измерения дисперсии чанков.
+- **VM freeze (θ_VM ∇=0)**: применим при включении exact_engine в обучение
+  (сейчас opt-in, train-loop не активен — фиксировать нечего).
