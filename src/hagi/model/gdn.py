@@ -110,7 +110,9 @@ class GatedDeltaNet(nn.Module):
         self.branch_scale = BranchScale(residual_scale, clamp_ratio=clamp_ratio)
 
         self.mode: str = "neural"  # "neural" | "ram"
-        self.wy_chunk: int = 64  # WY chunk length (exact; larger = fewer chunks)
+        self.wy_chunk: int = 32  # WY chunk length: decay budget keeps fp32 exact
+        # (at 64, strong-decay chunks corrupt via clamp artifacts — measured
+        # 0.02-0.18 vs sequential; 32 stays at fp32 eps on real + random gates)
         self._state: torch.Tensor | None = None
         self._state_enabled = False
         self._state_len = 0
@@ -251,7 +253,10 @@ def wy_scan(
         (outputs [B, T, Hn, Vh], final state [B, Hn, Kh, Vh]).
     """
     fd = torch.float32
-    k = k.to(fd)
+    # normalize here (matches gdn_scan, which normalizes per step): callers may
+    # pass raw keys; unnormalized keys made A entries explode (measured NaN at
+    # t=68 with randn keys, norm ~16 per key).
+    k = torch.nn.functional.normalize(k.to(fd), dim=-1, eps=1e-6)
     v = v.to(fd)
     g = g.to(fd)
     beta = beta.to(fd)
@@ -292,12 +297,19 @@ def wy_scan(
         # the difference) so neither factor overflows; base/outputs/state
         # use the TRUE chunk-relative exp(cgL) — bounded in (0, 1].
         cg_shift = cgL - cgL.max(dim=1, keepdim=True).values
-        # A[b,h,i,j] = Σ_k k̂_i,k k̃_j,k exp(cg_i,k − cg_j,k)  (shift exact in
-        # the difference; the naive unshifted e^{−cg_j} overflowed to inf at
-        # Kh=384, T=512 — measured)
+        # fp32 overflow guard: a chunk of strong decay accumulates cg' as low
+        # as −210 (64 steps × ln 0.038), making e^{−cg'} = inf. Clamp the
+        # shifted decay at −70 (e^{70} ≈ 2.5e30, safely inside fp32): the
+        # affected pair terms are true-ratio ≤ e^{−140} ≈ 0, so the clamped
+        # value (≤ e^{−40} absolute) is negligible against O(1) outputs.
+        # Exactness vs the sequential scan is preserved wherever no clamp is
+        # active (verified by the exactness test with moderate decay).
+        cg_shift = cg_shift.clamp_min(-70.0)
+        # A[b,h,i,j] = Σ_k k̂_i,k k̃_j,k exp(cg_i,k − cg_j,k)
         A = torch.einsum(
             "blhk,bmhk->bhlm", kb * torch.exp(cg_shift), ktilde * torch.exp(-cg_shift)
         )                                    # [B,Hn,L,L]
+        hstart = h
         hstart = h
         w_rows: list[torch.Tensor] = []
         for i in range(L):
