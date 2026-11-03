@@ -54,7 +54,7 @@ def test_gdn_wy_scan_exact_vs_sequential():
     beta = torch.rand(B, T, Hn, Kh)
     kn = torch.nn.functional.normalize(k, dim=-1, eps=1e-6)
     o1, h1 = gdn_scan(kn, v, g, beta, None)
-    for chunk in (8, 16, 64):
+    for chunk in (8, 16, 32, 64):
         o2, h2 = wy_scan(kn, v, g, beta, chunk)
         assert (o1 - o2).abs().max() < 1e-4, chunk
         assert (h1 - h2).abs().max() < 1e-5, chunk
@@ -246,3 +246,42 @@ def test_full_model_gdn_token_path_still_works():
     out = m(ids, targets=targets)
     assert out.lm_loss is not None and torch.isfinite(out.lm_loss)
     out.lm_loss.backward()
+
+
+def test_gdn_wy_scan_strong_decay_finite_and_exact():
+    """Strong per-step decay (g down to ~0.04) at T=512 must stay finite and
+    exact vs the sequential scan — guards the fp32 overflow/clamp path that
+    produced NaN at bf16 T=1024 h=384 in training (root-caused 2026-11)."""
+    from hagi.model.gdn import gdn_scan, wy_scan
+
+    B, T, Hn, Kh, Vh = 2, 512, 1, 64, 64
+    torch.manual_seed(3)
+    k = torch.randn(B, T, Hn, Kh)
+    v = torch.randn(B, T, Hn, Vh)
+    g = torch.rand(B, T, Hn, Kh) * 0.86 + 0.04
+    beta = torch.rand(B, T, Hn, Kh)
+    kn = torch.nn.functional.normalize(k, dim=-1, eps=1e-6)
+    o1, h1 = gdn_scan(kn, v, g, beta, None)
+    for chunk in (16, 32):
+        o2, h2 = wy_scan(kn, v, g, beta, chunk)
+        assert torch.isfinite(o2).all(), chunk
+        assert (o1 - o2).abs().max() < 5e-4, chunk
+        assert (h1 - h2).abs().max() < 1e-4, chunk
+
+
+def test_gdn_wy_scan_normalizes_raw_keys():
+    """wy_scan must normalize keys itself (parity with gdn_scan): raw keys
+    with norm ~16 made A entries explode to inf — the training NaN root
+    cause. Passing unnormalized keys must give the same result."""
+    from hagi.model.gdn import gdn_scan, wy_scan
+
+    B, T, Hn, Kh, Vh = 2, 64, 1, 32, 32
+    torch.manual_seed(4)
+    k = torch.randn(B, T, Hn, Kh) * 8.0
+    v = torch.randn(B, T, Hn, Vh)
+    g = torch.rand(B, T, Hn, Kh) * 0.9 + 0.05
+    beta = torch.rand(B, T, Hn, Kh)
+    o1, _ = gdn_scan(k, v, g, beta, None)
+    o2, _ = wy_scan(k, v, g, beta, 16)
+    assert torch.isfinite(o2).all()
+    assert (o1 - o2).abs().max() < 1e-4
