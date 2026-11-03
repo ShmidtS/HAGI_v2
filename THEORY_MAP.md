@@ -730,7 +730,7 @@ Forward GDN переключён: neural → wy_scan (chunk 64), ram →
 1. **Ключи не нормированы в wy_scan** (gdn_scan нормирует внутри) — A[i,j]
    взрывались (norm(k)~16 → inf к t=68). Фикс: normalize внутри wy_scan
    (паритет с gdn_scan).
-2. **Переполнение e^{−cg}**: при сильном распаде g≈0.04 накal确认 cg за чанк
+2. **Переполнение e^{−cg}**: при сильном распаде g≈0.04 накапливает cg за чанк
    до −210 → e^{+210}=inf в fp32. Фикс: сдвиг cg' (max-shift, точен в
    разности) + clamp_min(−70).
 3. **cumprod underflow**: cumprod(g)→0.0 к шагу ~256 убивал chunk-relative
