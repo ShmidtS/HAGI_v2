@@ -689,3 +689,22 @@ batch 8x1024, AdamW 1e-3 bf16, iGPU ~3 c/шаг.
 1. Corpus rotation (start_frac) + больше данных — убрать повтор-циклы.
 2. Chunkwise GDN-скан (WY) — скорость.
 3. Muon включить после стабилизации AdamW-базлайна (A/B).
+
+
+## Волна §2b/§17/§18/§19 (порт 2026-11-03, по коду не по статусу)
+
+Аудит покрытия ALGORITHMS.md §0–19 по фактическому коду. Пробелы,
+найденные и закрытые в этом раунде:
+
+| § | Пробел | Порт | SSOT |
+| --- | ------ | ---- | ---- |
+| 2b | sign-scale/Lion/SAM отсутствовали в optim | `train/sign_step.py`: signScale, scaled-sign aligned-резюдуал (сырой sign НЕ aligned — контрпример (−1,−1,0.5) в тесте), certified descent bound η≤1/L, Lion-когерентность, SAM-трансфер | Unified/SignDescent.lean |
+| 17 | Active-Inference вертикаль отсутствовала | `train/active_inference.py`: proxy-дихотомия (нижний прокси сохраняет сертификат, верхний теряет), EFE-потолок G=P−I≤P, graceful-деградация гэпа, компаундинг L^H/(L²)^H + MPC-резет, амортизированный политик 2c | Probability/GibbsConcentration.lean (R462–467) |
+| 18 | Pinsker-семейство частично | `train/pinsker_family.py`: tv, kl, tv≤Σpos-part, Бхаттачарья≤1, 1−BC≤KL/2, TV≤√KL, −lnBC≤KL/2, Бретаньоль–Юбер TV≤√(1−e^{−KL}), TV-дуальность | Probability/PinskerTV.lean |
+| 19 | ДВ/Cramér отсутствовали | там же: Donsker–Varadhan E_p f − ln E_q e^f (достижение на f=ln(p/q)), (E−μ)²/2σ²≤KL, |E_p g−E_q g|≤(b−a)TV | Probability/ChernoffCGF.lean |
+
+Тесты: +21 (902 total). Ловля контрпримеров: сырой sign-шаг нарушает
+alignment; √KL vs KL при KL<1; DV достигается ровно на f*=ln(p/q).
+
+Осталось вне кода: исполняемый exact-engine контур (firmware-уровня
+qwenbend), GDN chunkwise-скан (WY), Landaauer-мосты как потребители.
