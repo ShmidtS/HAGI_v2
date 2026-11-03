@@ -24,7 +24,7 @@
 | Mu | MuonStableLR η=(2/λ)(Σσ/m) + NewtonPolar min-итерации (R379–R382) | ✔ | `optim.py: muon_eta_max_stable, min_ns_iterations` (opt-in, дефолт без изменений; σ≥3 вне бассейна — fail-fast) 2026-10-13 |
 | Gen | ModeState Qgen/Φ_HAGI/mode-drop/Pareto | ✔ | `train/gen_telemetry.py` (5 проб h_emp_G, Q-пламя, гейт, парето-выбор чекпоинтов; интеграция — отдельный раунд) 2026-10-13 |
 | Th | Thermostat T_t=T₀α^t + законная остановка (R387–R388) | ✔ | `train/thermostat.py` + ИНТЕГРАЦИЯ: `growth_cycle.py --thermostat-*` (opt-in CLI, дефолт off; фаза в селектор-мете, §Thermostat halt при EXPLOIT; δ = последний принятый A/B delta) 2026-10-13 |
-| Ly | BranchScale min-max / dead-layer stop / vocab V*=c / admission ΔVar/ΔC (Layers wave-5, Transfer wave-4) | ✔ | `model/layer_tuning.py` (s_l²·v_l = const init, L*=max{V_l>λ}, c-fit из |V|-свипа, argmax ΔVar/ΔC) 2026-10-13 |
+| Ly | BranchScale min-max / dead-layer stop / vocab V*=c / admission ΔVar/ΔC (Layers wave-5, Transfer wave-4) | ✘ удалено 2026-11-03 | `model/layer_tuning.py` удалён (0 src-импортов вне тестов; crescimento-скрипты не использовали; Chesterton-проверка git-истории выполнена). При необходимости восстановить из git ca6ecac^ |
 
 Честные границы: h_emp_*-троица ЗАКРЫТА в primes (R563 lip, R564 grow,
 R565 smooth — градиентная модель, Unified/DerivAlong.lean; порт 2026-10-18
@@ -723,3 +723,23 @@ bt·(...)*k̂ᵀ), read-key k̂; (3) частичные суммы выводо�
 (inplace-записи в градиентный буфер ломали autograd).
 Forward GDN переключён: neural → wy_scan (chunk 64), ram →
 последовательный gdn_scan (точная семантика колонок).
+
+## wy_scan численная устойчивость (2026-11-03, отладка NaN v4)
+
+Корень NaN при bf16 T=1024 h=384 (не OOM, не bf16-софтмакс):
+1. **Ключи не нормированы в wy_scan** (gdn_scan нормирует внутри) — A[i,j]
+   взрывались (norm(k)~16 → inf к t=68). Фикс: normalize внутри wy_scan
+   (паритет с gdn_scan).
+2. **Переполнение e^{−cg}**: при сильном распаде g≈0.04 накal确认 cg за чанк
+   до −210 → e^{+210}=inf в fp32. Фикс: сдвиг cg' (max-shift, точен в
+   разности) + clamp_min(−70).
+3. **cumprod underflow**: cumprod(g)→0.0 к шагу ~256 убивал chunk-relative
+   разности. Фикс: log-space cumsum (точно).
+4. **Двойной учёт pre-chunk decay**: глобальный cg в base/A считал распад
+   прошлых чанков дважды. Фикс: chunk-relative cgL (cg − cg[s−1]).
+5. **OOM**: наивный попарный цикл держал ~L²/2 rank-1 графов (~5 GB/блок).
+   Фикс: батчевая pair-матрица einsum.
+Итог: wy_scan бит-точен vs gdn_scan на всех масштабах (тест до 5e-4 при
+сильном распаде, T=512); wy_chunk=32 (decay budget; 64 давал ошибку 0.02–0.18
+через clamp-артефакты). Регрессионные тесты: strong_decay_finite,
+raw_key_normalization.
