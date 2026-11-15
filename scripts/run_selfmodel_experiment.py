@@ -58,6 +58,7 @@ def main() -> int:
         }
 
         # Then trial measured allocation policies over independent seeds.
+        from hagi_selfexperiment import run_experiment
         result = run_experiment(seeds=5)
         report["status"] = "COMPLETED"
         report["result"] = result
