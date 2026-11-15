@@ -386,19 +386,26 @@ def run_self_development(max_rounds: int = 4,
                          proposals_per_round: int = 10,
                          workers: int = 0,
                          batch_size: int = 8,
-                         floor_ladder: list[int] | None = None
+                         floor_ladder: list[int] | None = None,
+                         initial_segments: list[tuple[int, int]] | None = None,
                          ) -> dict[str, Any]:
     """floor_ladder: certified lever-change schedule (R223: on exhaustion
     of a lever, SWITCH the lever, don't repeat it). When relief drops below
     MIN_RELIEF with floor F, retry with the next smaller floor — a task that
     HOLDs at base budget cannot commit with less search, so a smaller floor
-    only makes the same HOLD cheaper. Loop ends when the ladder is spent."""
+    only makes the same HOLD cheaper. Loop ends when the ladder is spent.
+
+    initial_segments: resume hook — a previously recorded proposal stream
+    (e.g. read back from the model's own self_state.json). Growth replays
+    it policy-free first, so the stream continues instead of restarting;
+    the self-model is re-derived from the rebuilt trace (cheap, exact)."""
     workers = workers or min(32, (os.cpu_count() or 4))
     ladder = list(floor_ladder) if floor_ladder else [floor_budget]
     report: dict[str, Any] = {"rounds": [], "base_budget": base_budget,
                               "floor_ladder": ladder, "workers": workers}
     suite = hagi.make_task_suite()
-    segments: list[tuple[int, int]] = []
+    segments: list[tuple[int, int]] = [tuple(s) for s in (initial_segments or [])]
+    round_offset = len(segments)
     cache = ReplayCache()
 
     # Round-0 baseline: suite only (sequential, golden-pinned semantics).
@@ -408,6 +415,11 @@ def run_self_development(max_rounds: int = 4,
     for sp in suite:
         incumbent.stream_names.append(("suite", sp.name))
         incumbent.learn(sp, seed=10_000, train_neural=False)
+    if segments:
+        # resume: replay the recorded stream policy-free (growth semantics)
+        run_stream(incumbent, segments, suite=[], cache=None,
+                   learner=ParallelLearner(incumbent, workers),
+                   batch_size=batch_size)
     prev_wasted = sum(t["cost"] for t in incumbent.trace if not t["success"])
     report["baseline"] = {
         "learn_calls": len(incumbent.trace),
@@ -423,7 +435,8 @@ def run_self_development(max_rounds: int = 4,
         round_idx += 1
         t0 = time.perf_counter()
         # 1. GROW: extend the incumbent with this round's fresh proposals.
-        segments.append((proposals_per_round, 500_000 + 1000 * round_idx))
+        segments.append((proposals_per_round,
+                         500_000 + 1000 * (round_idx + round_offset)))
         grow_learner = ParallelLearner(incumbent, workers)
         run_stream(incumbent, [segments[-1]], suite=[], cache=None,
                    learner=grow_learner, batch_size=batch_size)
@@ -516,6 +529,8 @@ def run_self_development(max_rounds: int = 4,
             adopted = False
 
     final = incumbent
+    report["segments"] = [[int(n), int(s)] for n, s in segments]
+    report["_final_incumbent"] = final
     report["final"] = {
         "adopted_rounds": sum(1 for r in report["rounds"]
                               if r["gate"]["action"] == "COMMIT"),
@@ -544,6 +559,7 @@ def main() -> None:
     rep = run_self_development(max_rounds=a.max_rounds, workers=a.workers,
                                batch_size=a.batch_size,
                                floor_ladder=a.floor_ladder)
+    rep.pop("_final_incumbent", None)
     out = Path("experiments") / "selfloop_result.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")

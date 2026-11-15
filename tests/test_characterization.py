@@ -80,3 +80,17 @@ def test_selfloop_round1_golden():
     assert len(inc.trace) == 59
     assert wasted == 6000
     assert sum(t["success"] for t in inc.trace) == 56
+
+
+def test_selfrewrite_programs(tmp_path):
+    """The model's program export is exact: every generated standalone
+    Python function equals its certified expert over the full domain."""
+    from hagi_selfrewrite import export_programs
+    p = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    for sp in hagi.make_task_suite():
+        p.learn(sp, seed=10_000, train_neural=False)
+    rep = export_programs(p, tmp_path)
+    n_expr = sum(1 for ex in p.experts.values() if ex.program.expr is not None)
+    assert rep["functions"] == n_expr >= 30   # venn-mask experts have no AST
+    assert rep["failures"] == 0
+    assert rep["evaluations_checked"] > 1000

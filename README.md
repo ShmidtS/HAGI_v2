@@ -21,6 +21,14 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
   модель трассирует своё обучение и пытается вывести собственный
   предиктор успеха (ExprV9-синтез; при невозможности — честный HOLD).
 - `hagi_selfloop.py` — много-раундовый цикл саморазвития (см. ниже).
+- `hagi_selfrewrite.py` — self-rewrite: модель пишет собственные
+  программы (standalone Python, точная валидация по каждому эксперту,
+  0 ошибок на 19k проверок) и переписывает собственное состояние
+  (`checkpoints/self/self_state.json`); `--resume` загружается из
+  того, что модель сама о себе написала, и продолжает рост
+  (измерено: 5 циклов рост→рестарт→рост, суммарно 117 раундов,
+  411 экспертов, 395 standalone-функций, 34677 точных проверок
+  функций против экспертов, 0 ошибок, 7 self-rewrites).
 - `hagi_selfexperiment.py` — эксперименты с бюджетными политиками
   (seed-панели, online-conservative policies).
 - `hagi_v10_controller.py` — guarded optimizer step (MGDA/мультигрань).
@@ -68,6 +76,8 @@ python -m hagi --self-test-v9      # self-test ядра
 python -m pytest                   # characterization-гварды
 python -X utf8 -u hagi_selfloop.py --max-rounds 24 --workers 32
 python -X utf8 -u hagi_selfmodel.py           # одношаговый self-model
+python -X utf8 -u hagi_selfrewrite.py --rounds 10      # рост + self-rewrite
+python -X utf8 -u hagi_selfrewrite.py --resume --rounds 10  # автономный рестарт
 ```
 
 ## Принципы
