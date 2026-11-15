@@ -9,7 +9,7 @@ seeds and adopts, via the non-regression commit gate, only a policy that
 
   * preserves the baseline expert set exactly (superset) on EVERY seed,
   * keeps exact accuracy at 1.0 over the full base suite,
-  * strictly reduces mean wasted search candidates.
+  * strictly reduces total candidate evaluations (commits and holds).
 
 Generator, policy and evaluator are distinct: the evaluator is the exact
 verify_all machinery over declared finite supports; policies only touch
@@ -74,8 +74,10 @@ def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int = 8,
             m.learn(sp, seed=500_000 + r * 104_729 + k, train_neural=False)
     elapsed = time.perf_counter() - t0
     wasted = sum(t["cost"] for t in m.trace if not t["success"])
+    total_candidates = sum(t["cost"] for t in m.trace)
     return {"expert_names": frozenset(m.experts.keys()),
             "n_experts": len(m.experts), "wasted": wasted,
+            "total_candidates": total_candidates,
             "seconds": round(elapsed, 2), "trace": m.trace}
 
 
@@ -195,14 +197,22 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
         superset_all = all(r["expert_names"] >= b["expert_names"]
                            for r, b in zip(runs, base_stats))
         mean_wasted = float(np.mean([r["wasted"] for r in runs]))
+        mean_total_candidates = float(np.mean([r["total_candidates"] for r in runs]))
         mean_secs = float(np.mean([r["seconds"] for r in runs]))
+        baseline_total_candidates = float(np.mean([b["total_candidates"] for b in base_stats]))
         passes = (superset_all
-                  and mean_wasted < float(np.mean([b["wasted"] for b in base_stats])))
+                  and mean_total_candidates < baseline_total_candidates)
         gate[pname] = {
             "superset_on_all_seeds": superset_all,
             "exact_accuracy_floor": 1.0 if superset_all else None,
             "mean_wasted": round(mean_wasted, 1),
+            "mean_total_candidates": round(mean_total_candidates, 1),
+            "baseline_mean_total_candidates": round(baseline_total_candidates, 1),
+            "total_candidate_reduction_pct": round(
+                100 * (baseline_total_candidates - mean_total_candidates)
+                / max(1.0, baseline_total_candidates), 2),
             "mean_seconds": round(mean_secs, 2),
+            "per_seed_total_candidates": [r["total_candidates"] for r in runs],
             "verdict": "PASS" if passes else "REJECT",
             "per_seed_experts": [r["n_experts"] for r in runs],
             "per_seed_wasted": [r["wasted"] for r in runs],
@@ -224,14 +234,14 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
     passing = {p: g for p, g in gate.items()
                if p != "baseline" and g["verdict"] == "PASS"}
     if passing:
-        best = min(passing, key=lambda p: gate[p]["mean_wasted"])
+        best = min(passing, key=lambda p: gate[p]["mean_total_candidates"])
         report["gate"] = gate
         report["decision"] = {
             "action": "COMMIT",
             "adopted_policy": best,
             "policy_source": str(POLICIES[best]),
             "reason": ("measured non-regression on all seeds with strictly "
-                       "less wasted search"),
+                       "fewer total candidate evaluations"),
         }
     else:
         report["gate"] = gate
