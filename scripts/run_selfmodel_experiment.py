@@ -26,8 +26,8 @@ def main() -> int:
         "platform": platform.platform(),
     }
     try:
-        from hagi_selfmodel import run_self_optimization
-        result = run_self_optimization()
+        from hagi_selfexperiment import run_experiment
+        result = run_experiment(seeds=5)
         report["status"] = "COMPLETED"
         report["result"] = result
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
