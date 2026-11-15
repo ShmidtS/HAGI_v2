@@ -49,6 +49,26 @@ FAMILY_IDS = {"BoolVenn": 0, "unary": 1, "integer-binary": 2,
 
 # ---------------------------------------------------------------- Phase 1 ----
 
+FEATURE_KEYS = ("family", "arity", "domain", "library", "target_range", "target_unique")
+
+
+def _target_features(spec, seed: int, train_fraction: float) -> tuple[int, int]:
+    """Describe only the supervised target labels visible to the learner."""
+    domain = spec.inputs()
+    if not domain:
+        return 0, 0
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(domain))
+    bool_like = (spec.family == "BoolVenn" or
+                 (all(set(d) <= {0, 1} for d in spec.domains) and len(domain) <= 16))
+    if bool_like:
+        n_train = max(1, len(domain) - 1)
+    else:
+        n_train = max(1, min(len(domain) - 1, int(round(len(domain) * train_fraction))))
+    ys = [int(spec.teacher(*domain[int(i)])) for i in perm[:n_train]]
+    return (max(ys) - min(ys), len(set(ys))) if ys else (0, 0)
+
+
 class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
     """Records a (features -> outcome, cost) trace of its own learning."""
 
@@ -58,11 +78,15 @@ class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
 
     def learn(self, spec, seed=0, train_fraction=0.70, poison_one_label=False,
               train_neural=False, deadline=None):
+        train_fraction = float(kw.get("train_fraction", 0.70))
+        target_range, target_unique = _target_features(spec, seed, train_fraction)
         feats = {
             "family": FAMILY_IDS.get(spec.family, 6),
             "arity": spec.arity,
             "domain": len(spec.inputs()),
             "library": len(self.experts),
+            "target_range": target_range,
+            "target_unique": target_unique,
         }
         c0 = self.candidates_generated
         t0 = time.perf_counter()
@@ -77,16 +101,18 @@ class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
         return ev
 
 
-def _features(spec, model) -> tuple[int, ...]:
+def _features(spec, model, seed: int = 0,
+              train_fraction: float = 0.70) -> tuple[int, ...]:
+    target_range, target_unique = _target_features(spec, seed, train_fraction)
     return (FAMILY_IDS.get(spec.family, 6), spec.arity, len(spec.inputs()),
-            len(model.experts))
+            len(model.experts), target_range, target_unique)
 
 
 # ---------------------------------------------------------------- Phase 2 ----
 
 def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     """Induce self-model programs from the trace with HAGI's own machinery."""
-    rows = [(t["family"], t["arity"], t["domain"], t["library"]) for t in trace]
+    rows = [tuple(t[k] for k in FEATURE_KEYS) for t in trace]
     ys = [t["success"] for t in trace]
 
     # 1) success predictor: exact piecewise induction on the trace
@@ -99,7 +125,7 @@ def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     # 2) success predictor via the model's own batched-MDL synthesis
     if succ_expr is None:
         expr, _n = hagi.synthesize_batched_mdl_v9(
-            4, rows, ys, rows, ys, max_evals=20000, max_bits=64)
+            len(FEATURE_KEYS), rows, ys, rows, ys, max_evals=20000, max_bits=64)
         if expr is not None and all(int(expr.eval(r, {})) == y
                                     for r, y in zip(rows, ys)):
             succ_expr = expr
@@ -108,7 +134,7 @@ def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     cost_expr = None
     if len(set(costs)) > 1:
         ce, _n = hagi.synthesize_batched_mdl_v9(
-            4, rows, costs, rows, costs, max_evals=20000, max_bits=64)
+            len(FEATURE_KEYS), rows, costs, rows, costs, max_evals=20000, max_bits=64)
         if ce is not None and all(int(ce.eval(r, {})) == c
                                   for r, c in zip(rows, costs)):
             cost_expr = ce
@@ -146,13 +172,14 @@ def impossibility_certificate(trace: list[dict[str, Any]]) -> Optional[dict[str,
 # ---------------------------------------------------------------- Phase 3 ----
 
 def optimized_budget_policy(self_model: dict[str, Any], spec, model,
-                            base_budget: int, floor_budget: int) -> int:
-    """Self-model-driven compute allocation."""
+                            base_budget: int, floor_budget: int,
+                            seed: int = 0, train_fraction: float = 0.70) -> int:
+    """Self-model-driven compute allocation from the observed training split."""
     succ = self_model.get("_succ_expr")
     if succ is None:
         return base_budget
     try:
-        pred = int(succ.eval(_features(spec, model), {}))
+        pred = int(succ.eval(_features(spec, model, seed, train_fraction), {}))
     except Exception:
         return base_budget
     if pred == 0:
@@ -179,7 +206,8 @@ class SelfOptimizingProcessorV9(TracedProcessorV9):
         override = getattr(self, "optimized_budget_policy", None)
         if override is None:
             budget = optimized_budget_policy(
-                self.self_model, spec, self, self.base_budget, self.floor_budget)
+                self.self_model, spec, self, self.base_budget, self.floor_budget,
+                seed=seed, train_fraction=float(kw.get("train_fraction", 0.70)))
         else:
             budget = override(spec, self, self.base_budget, self.floor_budget)
         self.node_budget = max(1, min(self.base_budget, int(budget)))

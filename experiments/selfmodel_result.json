@@ -1,0 +1,94 @@
+{
+  "experiment": "HAGI finite self-model / derive-and-optimize",
+  "repository": "ShmidtS/HAGI_v2",
+  "branch": "experiment/selfmodel-20261115",
+  "commit": "f17cb495341451c573ce253812aaac4251b411f6",
+  "started_utc": "2026-11-15T11:49:27.969636+00:00",
+  "python": "3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]",
+  "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+  "status": "COMPLETED",
+  "result": {
+    "phase1_trace": {
+      "learn_calls": 59,
+      "commits": 55,
+      "holds": 4,
+      "wasted_candidates_on_holds": 6000,
+      "trace_seconds": 0.74,
+      "pipeline": {
+        "stages": [
+          "REUSE(certified-library-coverage)",
+          "boolvenn-exact(16 masks)",
+          "anf-zhegalkin-butterfly(+full-support)",
+          "direct-template(+full-support)",
+          "exact-rational-poly(1D/ND,+full-support)",
+          "exact-piecewise-poly(+full-support)",
+          "batched-mdl-mitm-dag(+full-support)",
+          "HOLD(rollback+audit)"
+        ],
+        "commit_reason_counts": {
+          "boolvenn-exact": 16,
+          "direct-template+full-support": 33,
+          "anf-zhegalkin-butterfly+full-support": 2,
+          "exact-multivar-poly+full-support": 1,
+          "batched-mdl-mitm-dag+full-support": 2,
+          "exact-piecewise-poly+full-support": 1,
+          "NO_VALIDATED_PROGRAM": 3,
+          "verified-expert-coverage:BIT_AND": 1
+        },
+        "experts": 55,
+        "theorems": 0
+      }
+    },
+    "phase2_self_model": {
+      "n_trace": 59,
+      "success_program": null,
+      "success_exact": false,
+      "cost_program": null,
+      "cost_exact": false
+    },
+    "self_algorithm": {
+      "pipeline": [
+        "REUSE(certified-library-coverage)",
+        "boolvenn-exact(16 masks)",
+        "anf-zhegalkin-butterfly(+full-support)",
+        "direct-template(+full-support)",
+        "exact-rational-poly(1D/ND,+full-support)",
+        "exact-piecewise-poly(+full-support)",
+        "batched-mdl-mitm-dag(+full-support)",
+        "HOLD(rollback+audit)"
+      ],
+      "success_predictor": null,
+      "cost_predictor": null,
+      "policy": "node_budget = base if self_model.predict_success(task)==1 else floor",
+      "gate": "adopt iff expert set identical/superset and floors hold; else rollback"
+    },
+    "phase3_optimization": {
+      "status": "ATTEMPTED_NAIVE_POLICY",
+      "policy": "floor_budget for auto-composed family",
+      "lost_experts": [
+        "V9_AUTO_R0_0_EQ_IN_SUB",
+        "V9_AUTO_R0_1_NEG_IN_BIT_AND"
+      ]
+    },
+    "phase4_gate": {
+      "action": "HOLD",
+      "reason": "naive policy lost experts -> gate rollback: V9_AUTO_R0_0_EQ_IN_SUB, V9_AUTO_R0_1_NEG_IN_BIT_AND",
+      "impossibility_certificate": {
+        "identical_features": [
+          4,
+          2,
+          121,
+          54
+        ],
+        "conflicting_outcomes": [
+          "V9_AUTO_R0_1_GE_IN_BIT_NOR8:HOLD",
+          "V9_AUTO_R0_0_EQ_IN_SUB:COMMIT"
+        ]
+      },
+      "rollback": "baseline configuration retained (tracer state is the adopted model)"
+    },
+    "adopted": false
+  },
+  "finished_utc": "2026-11-15T11:49:29.413827+00:00",
+  "exit_code": 0
+}
