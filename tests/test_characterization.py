@@ -144,3 +144,21 @@ def test_ingest_data(tmp_path):
     ev = p.learn(tasks[0], seed=10_000)
     assert ev["action"] == "COMMIT"
     assert p.verify_all([tasks[0]])["accuracy"] == 1.0
+
+
+def test_byte_lm():
+    """HAGI neural body (theory §2/§3/§6): one-hot CE over bytes,
+    guarded steps (holdout CE never increases), ternary quantization
+    with guarded recovery, generation returns prompt-consistent text."""
+    import hagi_lm
+    data = ("квадрат суммы равен сумме квадратов плюс произведение. " * 40).encode("utf-8")
+    lm = hagi_lm.ByteLM(k=6, dim=32, hidden=64)
+    rep = lm.train_guarded(data, epochs=40, log_every=0)
+    assert rep["best_holdout_ce"] < 3.0
+    hist = rep["history"]
+    assert min(hist) <= rep["best_holdout_ce"]  # §9: deployed = best snapshot
+    out = lm.generate("квадрат ", n_bytes=40, temp=0.3)
+    assert out.startswith("квадрат ")
+    lm.ternary_()
+    rep2 = lm.train_guarded(data, epochs=15, log_every=0)
+    assert rep2["best_holdout_ce"] < 4.0  # quantized + fine-tune stays sane

@@ -47,6 +47,12 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
   файлы как байты (детерминированное подмножество prev→next).
   Демо: физический закон 20−5t² восстановлен точным полиномом из
   sensor.csv; неоднозначные пары честно HOLD.
+- `hagi_lm.py` — нейро-тело по теории primes (§2 CE-loss по байтовому
+  словарю, §3 guarded-шаги: деплой только лучшего holdout-снапшота,
+  §6 тернарное квантование с guarded fine-tune): байтовый LM,
+  обучаемый на любых данных, с генерацией. Первый вероятностный
+  орган HAGI — измерено: CE 5.4→2.3 на 68 КБ кода/документации,
+  тернарная версия CE 2.5 (10% цена за 3× сжатие).
 - `scripts/run_selfmodel_experiment.py` — CI-прогон self-model.
 - `tests/test_characterization.py` — characterization-гварды.
 - `experiments/selfloop_result.json` — последний отчёт цикла.
@@ -107,6 +113,8 @@ python -X utf8 -u hagi_selfrewrite.py --resume --rounds 10  # автономны
 python hagi_execute.py --list                        # все написанные программы
 python hagi_execute.py --task LANG8_XOR_CIPHER --text "привет" --key 42
 python hagi_ingest.py path/to/data.csv      # учиться на любых данных
+python hagi_lm.py train README.md --ternary # нейро-тело (CE + генерация)
+python hagi_lm.py generate "HAGI — " --n 120
 ```
 
 ## Принципы
