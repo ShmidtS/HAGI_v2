@@ -412,7 +412,7 @@ def _first_divergence(incumbent, opt) -> Optional[dict]:
 
 
 def run_self_development(max_rounds: int = 4,
-                         base_budget: int = 2000,
+                         base_budget: int = 20000,
                          floor_budget: int = 200,
                          proposals_per_round: int = 10,
                          workers: int = 0,

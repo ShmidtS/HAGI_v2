@@ -11,19 +11,19 @@
       "holdout": {
         "holdout_size": 20,
         "confident_wrong": 0,
-        "unknown_safe": 1,
+        "unknown_safe": 2,
         "exact": true
       },
       "impossibility_certificate": null,
-      "neural_adapters": 45,
+      "neural_adapters": 46,
       "gate": {
         "action": "COMMIT",
-        "experts_incumbent": 61,
-        "experts_optimized": 61,
+        "experts_incumbent": 62,
+        "experts_optimized": 62,
         "exact_accuracy": 1.0,
-        "wasted_candidates": "10000 -> 1000",
-        "overrides": 6,
-        "seconds": 2.93
+        "wasted_candidates": "6000 -> 400",
+        "overrides": 4,
+        "seconds": 3.29
       }
     },
     {
@@ -37,19 +37,19 @@
       "holdout": {
         "holdout_size": 23,
         "confident_wrong": 0,
-        "unknown_safe": 2,
+        "unknown_safe": 1,
         "exact": true
       },
       "impossibility_certificate": null,
-      "neural_adapters": 50,
+      "neural_adapters": 54,
       "gate": {
         "action": "COMMIT",
-        "experts_incumbent": 66,
-        "experts_optimized": 66,
+        "experts_incumbent": 70,
+        "experts_optimized": 70,
         "exact_accuracy": 1.0,
-        "wasted_candidates": "11000 -> 2000",
-        "overrides": 11,
-        "seconds": 2.83
+        "wasted_candidates": "3400 -> 600",
+        "overrides": 5,
+        "seconds": 3.64
       }
     },
     {
@@ -63,33 +63,80 @@
       "holdout": {
         "holdout_size": 26,
         "confident_wrong": 0,
-        "unknown_safe": 2,
+        "unknown_safe": 1,
         "exact": true
       },
       "impossibility_certificate": null,
-      "neural_adapters": 59,
+      "neural_adapters": 63,
       "gate": {
         "action": "COMMIT",
-        "experts_incumbent": 75,
-        "experts_optimized": 75,
+        "experts_incumbent": 79,
+        "experts_optimized": 79,
         "exact_accuracy": 1.0,
-        "wasted_candidates": "4000 -> 2200",
-        "overrides": 12,
-        "seconds": 2.87
+        "wasted_candidates": "3600 -> 800",
+        "overrides": 6,
+        "seconds": 3.58
+      }
+    },
+    {
+      "round": 4,
+      "learn_calls": 97,
+      "self_model": {
+        "kind": "exact-decision-list",
+        "full_key_rules": 97,
+        "ambiguous_keys": 0
+      },
+      "holdout": {
+        "holdout_size": 29,
+        "confident_wrong": 0,
+        "unknown_safe": 0,
+        "exact": true
+      },
+      "impossibility_certificate": null,
+      "neural_adapters": 71,
+      "gate": {
+        "action": "LEVER_CHANGE",
+        "reason": "floor 200 exhausted -> floor 50 (R223: switch the lever, don't repeat it)",
+        "wasted_candidates": "800 -> 800"
+      }
+    },
+    {
+      "round": 5,
+      "learn_calls": 107,
+      "self_model": {
+        "kind": "exact-decision-list",
+        "full_key_rules": 107,
+        "ambiguous_keys": 0
+      },
+      "holdout": {
+        "holdout_size": 32,
+        "confident_wrong": 0,
+        "unknown_safe": 4,
+        "exact": true
+      },
+      "impossibility_certificate": null,
+      "neural_adapters": 76,
+      "gate": {
+        "action": "COMMIT",
+        "experts_incumbent": 92,
+        "experts_optimized": 92,
+        "exact_accuracy": 1.0,
+        "wasted_candidates": "12800 -> 400",
+        "overrides": 13,
+        "seconds": 4.37
       }
     }
   ],
-  "base_budget": 2000,
+  "base_budget": 20000,
   "floor_ladder": [
-    200,
     50,
     20
   ],
-  "workers": 8,
+  "workers": 32,
   "baseline": {
     "learn_calls": 57,
-    "commits": 53,
-    "wasted_candidates_on_holds": 6000,
+    "commits": 55,
+    "wasted_candidates_on_holds": 3000,
     "pipeline": {
       "stages": [
         "REUSE(certified-library-coverage)",
@@ -106,9 +153,10 @@
         "direct-template+full-support": 33,
         "exact-rational-poly+full-support": 4,
         "verified-expert-coverage:MUL": 1,
-        "NO_VALIDATED_PROGRAM": 3
+        "batched-mdl-mitm-dag+full-support": 2,
+        "NO_VALIDATED_PROGRAM": 1
       },
-      "experts": 53,
+      "experts": 55,
       "theorems": 0
     }
   },
@@ -124,13 +172,21 @@
     [
       10,
       503000
+    ],
+    [
+      10,
+      504000
+    ],
+    [
+      10,
+      505000
     ]
   ],
   "final": {
-    "adopted_rounds": 3,
-    "experts": 75,
+    "adopted_rounds": 4,
+    "experts": 92,
     "theorems": 0,
-    "neural_adapters": 59,
+    "neural_adapters": 76,
     "pipeline": {
       "stages": [
         "REUSE(certified-library-coverage)",
@@ -144,21 +200,25 @@
       ],
       "commit_reason_counts": {
         "boolvenn-exact": 16,
-        "direct-template+full-support": 34,
+        "direct-template+full-support": 33,
         "exact-rational-poly+full-support": 4,
         "verified-expert-coverage:MUL": 1,
-        "NO_VALIDATED_PROGRAM": 11,
-        "anf-zhegalkin-butterfly+full-support": 5,
-        "exact-multivar-poly+full-support": 3,
-        "batched-mdl-mitm-dag+full-support": 12,
-        "exact-piecewise-poly+full-support": 1
+        "batched-mdl-mitm-dag+full-support": 29,
+        "NO_VALIDATED_PROGRAM": 8,
+        "anf-zhegalkin-butterfly+full-support": 6,
+        "exact-piecewise-poly+full-support": 4,
+        "verified-expert-coverage:MAX": 1,
+        "exact-multivar-poly+full-support": 2,
+        "verified-expert-coverage:V9_AUTO_R0_3_PHYS_SPRING_ENERGY_IN_MUL": 1,
+        "verified-expert-coverage:GCD": 1,
+        "verified-expert-coverage:V9_AUTO_R0_4_SQUARE_IN_V9_AUTO_R0_0_NEG_IN_BIT_XOR": 1
       },
-      "experts": 75,
+      "experts": 92,
       "theorems": 0
     },
-    "wasted_candidates_on_holds": 2200,
-    "seconds_total": 8.63,
-    "workers": 8
+    "wasted_candidates_on_holds": 400,
+    "seconds_total": 18.6,
+    "workers": 32
   },
   "converged": false
 }

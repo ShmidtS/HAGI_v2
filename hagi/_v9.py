@@ -73,7 +73,7 @@ COMMUTATIVE_OPS = frozenset({
     "add", "mul", "gcd", "lcm", "min", "max", "eq", "ne",
     "bit_and", "bit_or", "bit_xor", "bit_nand8", "bit_nor8", "bit_xnor8",
 })
-CONSTS = (0, 1, -1, 2, -2)
+CONSTS = (0, 1, -1, 2, -2, 26, -26)  # +alphabet modulus for language tasks
 
 
 def gamma_bits(n: int) -> int:

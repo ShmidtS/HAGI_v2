@@ -14,9 +14,9 @@ import hagi  # noqa: E402
 
 GOLD = {
     "suite_len": 57,        # 49 core + 4 physics + 4 language families
-    "suite_experts": 53,    # 3 lang HOLD + 1 physics REUSE
+    "suite_experts": 55,    # only IS_VOWEL holds; physics 4/4, language 3/4
     "suite_accuracy": 1.0,
-    "suite_committed": 53,
+    "suite_committed": 55,
     "venn_head_eval": 0,
     "rot": [12.727922, -1.414214, -2.828427, 0.0,
             -5.656854, 0.0, 0.0, 0.0],
@@ -26,7 +26,7 @@ GOLD = {
 @pytest.fixture(scope="module")
 def trained_v9():
     suite = hagi.make_task_suite()
-    p = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    p = hagi.GrowingHagiProcessorV9(node_budget=20000)
     for sp in suite:
         p.learn(sp, seed=10_000)
     return p, suite
@@ -47,7 +47,7 @@ def test_v9_grow_and_verify(trained_v9):
 
 def test_determinism_second_run():
     suite = hagi.make_task_suite()
-    p2 = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    p2 = hagi.GrowingHagiProcessorV9(node_budget=20000)
     for sp in suite:
         p2.learn(sp, seed=10_000)
     assert len(p2.experts) == GOLD["suite_experts"]
@@ -73,13 +73,13 @@ def test_selfloop_round1_golden():
     Golden: suite(57)+segment(10) with 5 holds among the new frontier."""
     from hagi_selfloop import ParallelLearner, run_stream
     from hagi_selfmodel import TracedProcessorV9
-    inc = TracedProcessorV9(node_budget=2000)
+    inc = TracedProcessorV9(node_budget=20000)
     run_stream(inc, [(10, 501_000)], suite=None, cache=None,
                learner=ParallelLearner(inc, 1), batch_size=8)
     wasted = sum(t["cost"] for t in inc.trace if not t["success"])
     assert len(inc.trace) == 67
-    assert wasted == 10000
-    assert sum(t["success"] for t in inc.trace) == 61
+    assert wasted == 6000
+    assert sum(t["success"] for t in inc.trace) == 63
 
 
 def test_selfrewrite_programs(tmp_path):
@@ -105,7 +105,7 @@ def test_neural_gpu_backend():
     dev = resolve_device()
     assert dev in ("cpu", "cuda")
     suite = hagi.make_task_suite()
-    p = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    p = hagi.GrowingHagiProcessorV9(node_budget=20000)
     for sp in suite:
         p.learn(sp, seed=10_000, train_neural=True)
     adapters = sum(1 for e in p.experts.values() if e.adapter is not None)
