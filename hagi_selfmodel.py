@@ -157,7 +157,7 @@ def impossibility_certificate(trace: list[dict[str, Any]]) -> Optional[dict[str,
     (spec v10 sec 9: never claim what is not demonstrated)."""
     by_feats: dict[tuple, list[str]] = {}
     for t in trace:
-        key = (t["family"], t["arity"], t["domain"], t["library"])
+        key = tuple(t[k] for k in FEATURE_KEYS)
         by_feats.setdefault(key, []).append(
             f"{t['task']}:{'COMMIT' if t['success'] else 'HOLD'}")
     for key, names in sorted(by_feats.items()):

@@ -2,14 +2,266 @@
   "experiment": "HAGI finite self-model / derive-and-optimize",
   "repository": "ShmidtS/HAGI_v2",
   "branch": "experiment/selfmodel-20261115",
-  "commit": "a7d7a7e13128ce13a0d0342a796737c61e754ede",
-  "started_utc": "2026-11-15T11:57:35.931760+00:00",
+  "commit": "6ce7df7dcd2a0c1e5284f54782c0d0dac925034f",
+  "started_utc": "2026-11-15T11:58:13.680935+00:00",
   "python": "3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]",
   "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
-  "status": "ERROR",
-  "error_type": "NameError",
-  "error": "name 'kw' is not defined",
-  "traceback": "Traceback (most recent call last):\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/scripts/run_selfmodel_experiment.py\", line 30, in main\n    result = run_experiment(seeds=5)\n             ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfexperiment.py\", line 107, in run_experiment\n    tracer.learn(sp, seed=10_000, train_neural=False)\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfmodel.py\", line 81, in learn\n    train_fraction = float(kw.get(\"train_fraction\", 0.70))\n                           ^^\nNameError: name 'kw' is not defined\n",
-  "finished_utc": "2026-11-15T11:57:36.219948+00:00",
-  "exit_code": 1
+  "status": "COMPLETED",
+  "result": {
+    "derived_algorithm": {
+      "pipeline": [
+        "REUSE(certified-library-coverage)",
+        "boolvenn-exact(16 masks)",
+        "anf-zhegalkin-butterfly(+full-support)",
+        "direct-template(+full-support)",
+        "exact-rational-poly(1D/ND,+full-support)",
+        "exact-piecewise-poly(+full-support)",
+        "batched-mdl-mitm-dag(+full-support)",
+        "HOLD(rollback+audit)"
+      ],
+      "commit_reason_counts": {
+        "boolvenn-exact": 16,
+        "direct-template+full-support": 33,
+        "anf-zhegalkin-butterfly+full-support": 2,
+        "exact-multivar-poly+full-support": 1,
+        "batched-mdl-mitm-dag+full-support": 2,
+        "exact-piecewise-poly+full-support": 1,
+        "NO_VALIDATED_PROGRAM": 3,
+        "verified-expert-coverage:BIT_AND": 1
+      },
+      "success_feature_impossibility_certificate": {
+        "identical_features": [
+          4,
+          2,
+          121,
+          54
+        ],
+        "conflicting_outcomes": [
+          "V9_AUTO_R0_1_GE_IN_BIT_NOR8:HOLD",
+          "V9_AUTO_R0_0_EQ_IN_SUB:COMMIT"
+        ]
+      },
+      "note": "success of the exhaustive synthesis stage is a function of the task's full teacher data, not of coarse features; the experiment therefore trials MEASURED policies instead of claiming a symbolic predictor"
+    },
+    "gate": {
+      "baseline": {
+        "superset_on_all_seeds": true,
+        "mean_wasted": 45600.0,
+        "mean_seconds": 3.83,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          80,
+          80,
+          80,
+          82,
+          82
+        ],
+        "per_seed_wasted": [
+          50000,
+          54000,
+          40000,
+          36000,
+          48000
+        ],
+        "new_experts_vs_baseline": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ]
+      },
+      "floor_half_auto": {
+        "superset_on_all_seeds": false,
+        "mean_wasted": 26000.0,
+        "mean_seconds": 2.52,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          84,
+          79,
+          78,
+          77,
+          77
+        ],
+        "per_seed_wasted": [
+          24000,
+          29000,
+          25000,
+          25000,
+          27000
+        ],
+        "new_experts_vs_baseline": [
+          [
+            "V9_AUTO_R1_1_GE_IN_V9_AUTO_R1_2_CUBE_IN_FLOORDIV",
+            "V9_AUTO_R2_0_ABS_IN_BIT_AND",
+            "V9_AUTO_R2_0_EQ_IN_GCD",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R5_0_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8_IN_BIT_AND",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R5_1_GE_IN_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_0_LE_IN_V9_AUTO_R2_0_EQ_IN_GCD",
+            "V9_AUTO_R6_0_LT_IN_V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R6_0_NEG_IN_V9_AUTO_R5_1_GE_IN_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_3_LE_IN_GCD",
+            "V9_AUTO_R7_1_GE_IN_V9_AUTO_R6_3_LE_IN_GCD",
+            "V9_AUTO_R7_1_NEG_IN_V9_AUTO_R1_2_CUBE_IN_FLOORDIV",
+            "V9_AUTO_R7_1_SQUARE_IN_ABSDIFF",
+            "V9_AUTO_R7_3_GT_IN_V9_AUTO_R6_0_LE_IN_V9_AUTO_R2_0_EQ_IN_GCD",
+            "V9_BOOL3_R1_0",
+            "V9_BOOL3_R2_4",
+            "V9_BOOL3_R3_1",
+            "V9_BOOL3_R5_0",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R7_6"
+          ],
+          [
+            "V9_AUTO_R0_0_BIT_NOR8_IN_POW_INT",
+            "V9_AUTO_R2_3_CUBE_IN_MIN",
+            "V9_AUTO_R3_0_MUL_IN_SUB",
+            "V9_AUTO_R3_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R4_0_CLAMP_TO_3_IN_V9_AUTO_R1_0_NEG_IN_BIT_AND",
+            "V9_AUTO_R4_3_GT_IN_GCD",
+            "V9_AUTO_R5_1_ADD_IN_SUB",
+            "V9_AUTO_R6_3_MUL_IN_MUL",
+            "V9_BOOL3_R1_1",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R6_4"
+          ],
+          [
+            "V9_AUTO_R2_0_V9_AUTO_R0_0_SIGN_IN_FLOORDIV_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R3_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R3_2_SUB_IN_ABSDIFF",
+            "V9_AUTO_R4_1_BIT_NOT8_IN_BIT_NAND8",
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_LCM",
+            "V9_AUTO_R5_1_EQ_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R5_2_LCM_IN_POW_INT",
+            "V9_AUTO_R7_0_LT_IN_V9_AUTO_R5_1_EQ_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R7_0_SIGN_IN_V9_AUTO_R3_2_SUB_IN_ABSDIFF",
+            "V9_BOOL3_R2_3",
+            "V9_BOOL3_R4_1",
+            "V9_BOOL3_R4_5",
+            "V9_BOOL3_R5_2",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R6_3"
+          ],
+          [
+            "V9_AUTO_R1_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R1_3_ABS_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_3_ABS_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R4_4_SQUARE_IN_V9_AUTO_R1_0_LT_IN_SUB",
+            "V9_AUTO_R5_0_NEG_IN_BIT_OR",
+            "V9_AUTO_R5_2_V9_AUTO_R4_4_SQUARE_IN_V9_AUTO_R1_0_LT_IN_SUB_IN_V9_AUTO_R1_0_LT_IN_SUB",
+            "V9_AUTO_R7_0_V9_AUTO_R5_2_V9_AUTO_R4_4_SQUARE_IN_V9_AUTO_R1_0_LT_IN_SUB_IN_V9_AUTO_R1_0_LT_IN_SUB_IN_BIT_NAND8",
+            "V9_BOOL3_R4_1",
+            "V9_BOOL3_R6_2"
+          ],
+          [
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_MOD",
+            "V9_BOOL3_R5_3",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R7_2"
+          ]
+        ]
+      },
+      "floor_quarter_auto": {
+        "superset_on_all_seeds": false,
+        "mean_wasted": 13400.0,
+        "mean_seconds": 1.93,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          82,
+          78,
+          78,
+          74,
+          77
+        ],
+        "per_seed_wasted": [
+          13000,
+          14500,
+          12500,
+          13500,
+          13500
+        ],
+        "new_experts_vs_baseline": [
+          [
+            "V9_AUTO_R1_1_GE_IN_V9_AUTO_R1_2_CUBE_IN_FLOORDIV",
+            "V9_AUTO_R2_0_ABS_IN_BIT_AND",
+            "V9_AUTO_R2_0_EQ_IN_GCD",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R5_0_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8_IN_BIT_AND",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R5_1_GE_IN_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_0_LT_IN_V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R6_0_NEG_IN_V9_AUTO_R5_1_GE_IN_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_3_LE_IN_GCD",
+            "V9_AUTO_R7_0_SQUARE_IN_MAX",
+            "V9_AUTO_R7_2_V9_AUTO_R1_1_GE_IN_V9_AUTO_R1_2_CUBE_IN_FLOORDIV_IN_BIT_OR",
+            "V9_AUTO_R7_6_NEG_IN_V9_AUTO_R6_0_LT_IN_V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_BOOL3_R1_0",
+            "V9_BOOL3_R2_4",
+            "V9_BOOL3_R3_1",
+            "V9_BOOL3_R5_0",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R7_6"
+          ],
+          [
+            "V9_AUTO_R0_0_BIT_NOR8_IN_POW_INT",
+            "V9_AUTO_R2_3_CUBE_IN_MIN",
+            "V9_AUTO_R3_0_MUL_IN_SUB",
+            "V9_AUTO_R3_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R4_0_CLAMP_TO_3_IN_V9_AUTO_R1_0_NEG_IN_BIT_AND",
+            "V9_AUTO_R4_3_GT_IN_GCD",
+            "V9_AUTO_R6_1_MUL_IN_MUL",
+            "V9_AUTO_R7_3_SIGN_IN_GCD",
+            "V9_BOOL3_R1_1",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R6_5"
+          ],
+          [
+            "V9_AUTO_R2_0_V9_AUTO_R0_0_SIGN_IN_FLOORDIV_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R3_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R3_2_SUB_IN_ABSDIFF",
+            "V9_AUTO_R4_1_BIT_NOT8_IN_BIT_NAND8",
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_LCM",
+            "V9_AUTO_R5_1_EQ_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R5_2_LCM_IN_POW_INT",
+            "V9_AUTO_R7_0_LT_IN_V9_AUTO_R5_1_EQ_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R7_0_SIGN_IN_V9_AUTO_R3_2_SUB_IN_ABSDIFF",
+            "V9_BOOL3_R2_3",
+            "V9_BOOL3_R4_1",
+            "V9_BOOL3_R4_5",
+            "V9_BOOL3_R5_2",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R6_3"
+          ],
+          [
+            "V9_AUTO_R1_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R1_3_ABS_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_3_ABS_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R5_0_NEG_IN_BIT_OR",
+            "V9_AUTO_R6_0_SIGN_IN_V9_AUTO_R5_0_NEG_IN_BIT_OR",
+            "V9_AUTO_R7_1_GT_IN_SUB",
+            "V9_BOOL3_R5_3",
+            "V9_BOOL3_R5_6"
+          ],
+          [
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_MOD",
+            "V9_BOOL3_R5_3",
+            "V9_BOOL3_R6_1",
+            "V9_BOOL3_R7_2"
+          ]
+        ]
+      }
+    },
+    "decision": {
+      "action": "HOLD",
+      "reason": "no candidate policy preserved the baseline expert set on all seeds while reducing wasted search; baseline retained"
+    }
+  },
+  "finished_utc": "2026-11-15T11:58:55.903922+00:00",
+  "exit_code": 0
 }
