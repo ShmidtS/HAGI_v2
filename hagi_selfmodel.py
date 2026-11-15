@@ -78,7 +78,6 @@ class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
 
     def learn(self, spec, seed=0, train_fraction=0.70, poison_one_label=False,
               train_neural=False, deadline=None):
-        train_fraction = float(kw.get("train_fraction", 0.70))
         target_range, target_unique = _target_features(spec, seed, train_fraction)
         feats = {
             "family": FAMILY_IDS.get(spec.family, 6),

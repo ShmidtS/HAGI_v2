@@ -2,14 +2,14 @@
   "experiment": "HAGI finite self-model / derive-and-optimize",
   "repository": "ShmidtS/HAGI_v2",
   "branch": "experiment/selfmodel-20261115",
-  "commit": "c9386a2a2e468736409310ee89a6ff4915fd9a2e",
-  "started_utc": "2026-11-15T11:55:08.500071+00:00",
+  "commit": "a7d7a7e13128ce13a0d0342a796737c61e754ede",
+  "started_utc": "2026-11-15T11:57:35.931760+00:00",
   "python": "3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]",
   "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
   "status": "ERROR",
   "error_type": "NameError",
   "error": "name 'kw' is not defined",
-  "traceback": "Traceback (most recent call last):\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/scripts/run_selfmodel_experiment.py\", line 30, in main\n    result = run_self_optimization()\n             ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfmodel.py\", line 253, in run_self_optimization\n    tracer.learn(sp, seed=10_000, train_neural=False)\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfmodel.py\", line 81, in learn\n    train_fraction = float(kw.get(\"train_fraction\", 0.70))\n                           ^^\nNameError: name 'kw' is not defined\n",
-  "finished_utc": "2026-11-15T11:55:08.876548+00:00",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/scripts/run_selfmodel_experiment.py\", line 30, in main\n    result = run_experiment(seeds=5)\n             ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfexperiment.py\", line 107, in run_experiment\n    tracer.learn(sp, seed=10_000, train_neural=False)\n  File \"/home/runner/work/HAGI_v2/HAGI_v2/hagi_selfmodel.py\", line 81, in learn\n    train_fraction = float(kw.get(\"train_fraction\", 0.70))\n                           ^^\nNameError: name 'kw' is not defined\n",
+  "finished_utc": "2026-11-15T11:57:36.219948+00:00",
   "exit_code": 1
 }
