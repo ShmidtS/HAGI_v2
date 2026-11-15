@@ -59,7 +59,16 @@ def main() -> int:
 
         # Then trial measured allocation policies over independent seeds.
         from hagi_selfexperiment import run_experiment
-        result = run_experiment(seeds=10)
+        selected_policies = ["baseline","online_exact_2holds_quarter","online_coarse_2holds_half"]
+        result = run_experiment(
+            seeds=20, policy_names=selected_policies, seed_start=10
+        )
+        report["validation_protocol"] = {
+            "seed_start": 10,
+            "seed_count": 20,
+            "policies": selected_policies,
+            "purpose": "new-seed confirmation of the ten-seed candidate policies",
+        }
         report["status"] = "COMPLETED"
         report["result"] = result
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()

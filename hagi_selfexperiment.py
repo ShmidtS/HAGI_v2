@@ -141,8 +141,22 @@ POLICIES: dict[str, Policy] = {
 
 # ------------------------------------------------------------- experiment ---
 
-def run_experiment(seeds: int = 5) -> dict[str, Any]:
+def run_experiment(seeds: int = 5, policy_names: list[str] | None = None,
+                   seed_start: int = 0) -> dict[str, Any]:
     report: dict[str, Any] = {}
+    selected_names = list(POLICIES) if policy_names is None else list(dict.fromkeys(policy_names))
+    unknown = sorted(set(selected_names) - set(POLICIES))
+    if unknown:
+        raise ValueError(f"unknown policy names: {unknown}")
+    if "baseline" not in selected_names:
+        raise ValueError("policy_names must include 'baseline'")
+    selected_policies = {name: POLICIES[name] for name in selected_names}
+    report["validation_protocol"] = {
+        "seed_start": seed_start,
+        "seed_count": seeds,
+        "policies": selected_names,
+        "gate": "preserve every baseline expert on every seed AND reduce mean total candidate evaluations",
+    }
 
     # ---- Phase 1+2: derive the creation algorithm and self-model ----
     tracer = TracedProcessorV9(node_budget=2000)
@@ -182,9 +196,9 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
 
     # ---- Phase 3: controlled policy trials over seeds ----
     suite_names = frozenset(s.name for s in hagi.make_task_suite())
-    trials: dict[str, list[dict[str, Any]]] = {p: [] for p in POLICIES}
-    for seed in range(seeds):
-        for pname, policy in POLICIES.items():
+    trials: dict[str, list[dict[str, Any]]] = {p: [] for p in selected_policies}
+    for seed in range(seed_start, seed_start + seeds):
+        for pname, policy in selected_policies.items():
             res = run_growth(policy, seed)
             trials[pname].append(res)
             print(f"  seed={seed} policy={pname}: experts={res['n_experts']} "
@@ -239,7 +253,7 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
         report["decision"] = {
             "action": "COMMIT",
             "adopted_policy": best,
-            "policy_source": str(POLICIES[best]),
+            "policy_source": str(selected_policies[best]),
             "reason": ("measured non-regression on all seeds with strictly "
                        "fewer total candidate evaluations"),
         }
@@ -248,7 +262,7 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
         report["decision"] = {
             "action": "HOLD",
             "reason": ("no candidate policy preserved the baseline expert "
-                       "set on all seeds while reducing wasted search; "
+                       "set on all seeds while reducing total candidate evaluations; "
                        "baseline retained"),
         }
     return report
@@ -257,8 +271,11 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=5)
+    ap.add_argument("--seed-start", type=int, default=0)
+    ap.add_argument("--policies", nargs="+", choices=tuple(POLICIES))
     a = ap.parse_args()
-    rep = run_experiment(seeds=a.seeds)
+    rep = run_experiment(seeds=a.seeds, policy_names=a.policies,
+                         seed_start=a.seed_start)
     print(json.dumps({k: v for k, v in rep.items()
                       if k != "derived_algorithm"}, indent=2, ensure_ascii=False))
     d = rep["decision"]
