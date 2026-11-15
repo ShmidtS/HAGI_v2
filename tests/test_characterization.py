@@ -162,3 +162,16 @@ def test_byte_lm():
     lm.ternary_()
     rep2 = lm.train_guarded(data, epochs=15, log_every=0)
     assert rep2["best_holdout_ce"] < 4.0  # quantized + fine-tune stays sane
+
+
+def test_hybrid_mind(tmp_path, monkeypatch):
+    """Both organs behind one interface: exact programs answer with
+    EXACT label; unknown queries fall to the neural body (honestly
+    labelled, never certified)."""
+    import hagi_mind, hagi_lm
+    monkeypatch.chdir(Path(__file__).parent.parent)
+    exact = hagi_mind._exact_answer("gcd 12 18")
+    assert exact == ("GCD", "6")
+    assert hagi_mind._exact_answer("square -7") == ("SQUARE", "49")
+    assert hagi_mind._exact_answer("нок 4 6") == ("LCM", "12")
+    assert hagi_mind._exact_answer("что такое смысл жизни") is None

@@ -284,6 +284,16 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
     return report
 
 
+def _retrain_lm_guarded(state_dir: Path) -> None:
+    """Each forever cycle: the byte LM retrains on the model's own
+    artifacts (self-referential neural growth, §3/§9 guarded)."""
+    try:
+        import hagi_mind
+        print("[lm]", hagi_mind.retrain(), flush=True)
+    except Exception as e:  # neural body failure never stops the loop
+        print(f"[lm] retrain skipped: {e!r}", flush=True)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="HAGI self-rewrite loop")
     p.add_argument("--rounds", type=int, default=10)
@@ -308,6 +318,7 @@ def main() -> None:
                   f"failures={rep['programs']['failures']} "
                   f"rewrites={rep['self_state']['rewrites']} "
                   f"{rep['seconds']}s", flush=True)
+            _retrain_lm_guarded(a.state_dir)
             _time.sleep(1)
     rep = run(a.rounds, a.state_dir, workers=a.workers, resume=a.resume)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
