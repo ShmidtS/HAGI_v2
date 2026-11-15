@@ -36,6 +36,11 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
 - `hagi_selfexperiment.py` — эксперименты с бюджетными политиками
   (seed-панели, online-conservative policies).
 - `hagi_v10_controller.py` — guarded optimizer step (MGDA/мультигрань).
+- `hagi_execute.py` — ИСПОЛНИТЕЛЬ программ: модель запускает то, что
+  написала — execute(name, *args) для любой из сотен программ,
+  execute_text() прогоняет живой UTF-8 текст (кириллица, эмодзи)
+  через байтовые шифры (XOR round-trip работает), CLI для прямой
+  инференции.
 - `scripts/run_selfmodel_experiment.py` — CI-прогон self-model.
 - `tests/test_characterization.py` — characterization-гварды.
 - `experiments/selfloop_result.json` — последний отчёт цикла.
@@ -93,6 +98,8 @@ python -X utf8 -u hagi_selfloop.py --max-rounds 24 --workers 32
 python -X utf8 -u hagi_selfmodel.py           # одношаговый self-model
 python -X utf8 -u hagi_selfrewrite.py --rounds 10      # рост + self-rewrite
 python -X utf8 -u hagi_selfrewrite.py --resume --rounds 10  # автономный рестарт
+python hagi_execute.py --list                        # все написанные программы
+python hagi_execute.py --task LANG8_XOR_CIPHER --text "привет" --key 42
 ```
 
 ## Принципы

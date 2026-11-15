@@ -111,3 +111,21 @@ def test_neural_gpu_backend():
     adapters = sum(1 for e in p.experts.values() if e.adapter is not None)
     assert adapters > 0
     assert p.verify_all(suite)["accuracy"] == 1.0
+
+
+def test_execute_programs(tmp_path):
+    """The model's executor: runs the programs it wrote — byte-level UTF-8
+    ciphers stream real text; XOR round-trips; integer programs callable."""
+    import hagi_execute as hx
+    from hagi_selfrewrite import export_programs
+    p = hagi.GrowingHagiProcessorV9(node_budget=20000)
+    for sp in hagi.make_task_suite():
+        p.learn(sp, seed=10_000, train_neural=True)
+    export_programs(p, tmp_path)
+    hx._mod = None
+    hx.DEFAULT_PROGRAMS = tmp_path / "generated_programs.py"
+    enc = hx.execute_text("LANG8_XOR_CIPHER", "executor ok", key=42)
+    dec = hx.execute_text("LANG8_XOR_CIPHER", enc, key=42)
+    assert dec == "executor ok"
+    assert hx.execute("GCD", 12, 18) == 6
+    assert hx.execute_text("LANG8_CAESAR1", "abc") == "bcd"
