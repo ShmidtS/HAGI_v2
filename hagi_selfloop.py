@@ -28,9 +28,16 @@ CLI: python hagi_selfloop.py [--max-rounds N] [--workers N] [--json]
 """
 from __future__ import annotations
 
+import os
+# cap BLAS/OMP threads in every process (parent + spawn workers inherit
+# env): unbounded 24x-N BLAS thread storms crashed workers under neural
+# training (BrokenProcessPool, 2026-11-15).
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
-import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -162,6 +169,9 @@ def _state_probe(proc) -> dict[str, Any]:
 
 def _learn_worker(payload: bytes) -> bytes:
     """Run one learn call on a snapshot copy; return its state diff."""
+    # parallel workers always run the neural core on CPU: one GPU context
+    # per worker would multiply GPU memory and crash under load
+    os.environ["HAGI_NEURAL_DEVICE"] = "cpu"
     import cloudpickle
     proc, spec, seed, budget, train_neural = cloudpickle.loads(payload)
     proc.node_budget = int(budget)
@@ -182,6 +192,9 @@ def _learn_worker(payload: bytes) -> bytes:
                    ("cands", "evals", "commits", "holds", "version",
                     "unsolved", "compute", "risk")},
         "ram_ops": _ram_diff(pre["ram"], post["ram"]),
+        # neural core state after training (merged in stream order)
+        "core": proc.core.snapshot(),
+        "router": proc.router.snapshot(),
         "audit": {
             "task": spec.name,
             "alpha": alpha,
@@ -204,11 +217,15 @@ class ParallelLearner:
     All tasks in a batch are learned against the same library snapshot;
     their commits are merged into the parent in stream order (batch
     semantics, identical for growth and replay -> deterministic).
-    """
+    With train_neural=True every learn also fits the neural core
+    (FactorizedSharedCoreV9 adapters); core/router states ride the diff
+    and are restored in stream order. Exact outcomes are unaffected
+    (commit gate uses exact programs only), so determinism holds."""
 
-    def __init__(self, proc, workers: int):
+    def __init__(self, proc, workers: int, train_neural: bool = False):
         self.proc = proc
         self.workers = max(1, workers)
+        self.train_neural = bool(train_neural)
 
     def batch(self, jobs: list[tuple[Any, int, int]]) -> list[dict[str, Any]]:
         """jobs: [(spec, seed, budget)] -> merged diffs in order."""
@@ -217,13 +234,23 @@ class ParallelLearner:
         if not jobs:
             return []
         payloads = [cloudpickle.dumps(
-            (self.proc, spec, seed, budget, False))
+            (self.proc, spec, seed, budget, self.train_neural))
             for spec, seed, budget in jobs]
         if self.workers == 1 or len(jobs) == 1:
             results = [_learn_worker(p) for p in payloads]
         else:
-            with ProcessPoolExecutor(max_workers=min(self.workers, len(jobs))) as ex:
-                results = list(ex.map(_learn_worker, payloads))
+            from concurrent.futures.process import BrokenProcessPool
+            try:
+                with ProcessPoolExecutor(max_workers=min(self.workers, len(jobs))) as ex:
+                    results = list(ex.map(_learn_worker, payloads))
+            except BrokenProcessPool as e:
+                # worker died abruptly (observed with 24-way numpy/BLAS under
+                # neural training): degrade to in-process sequential learning —
+                # same payloads, same order, same results, just slower.
+                print(f"[ParallelLearner] BrokenProcessPool ({e!r}); "
+                      f"falling back to sequential in-process learning",
+                      file=sys.stderr, flush=True)
+                results = [_learn_worker(p) for p in payloads]
         diffs = [cloudpickle.loads(r) for r in results]
         # NOTE: caller merges diffs in stream order — merging here would
         # double-apply counters/logs/trace (dict updates are idempotent,
@@ -246,6 +273,10 @@ class ParallelLearner:
         p.risk_rem += dl["risk"]
         for slot, vec in d["ram_ops"]:
             p.ram.store(slot, vec)  # gate_beta=1: exact overwrite
+        if d.get("core") is not None:
+            p.core.restore(d["core"])
+        if d.get("router") is not None:
+            p.router.restore(d["router"])
         if d["trace_row"]:
             for row in d["trace_row"]:
                 p.trace.append(row)
@@ -298,7 +329,7 @@ class ReplayCache:
 def run_stream(proc, segments: list[tuple[int, int]],
                suite: list | None = None, cache: ReplayCache | None = None,
                learner: ParallelLearner | None = None,
-               batch_size: int = 8) -> None:
+               batch_size: int = 8, train_neural: bool = False) -> None:
     """Deterministic stream: suite (sequential) + proposal segments
     (parallel batches). `cache` short-circuits unchanged prefix tasks."""
     names = getattr(proc, "stream_names", None)
@@ -306,7 +337,7 @@ def run_stream(proc, segments: list[tuple[int, int]],
     for sp in (suite if suite is not None else hagi.make_task_suite()):
         if names is not None:
             names.append(("suite", sp.name))
-        ev = proc.learn(sp, seed=10_000, train_neural=False)
+        ev = proc.learn(sp, seed=10_000, train_neural=train_neural)
         if actions is not None:
             actions.append(("suite", sp.name, ev["action"]))
     for seg_idx, (n_prop, seed_base) in enumerate(segments):
@@ -388,6 +419,7 @@ def run_self_development(max_rounds: int = 4,
                          batch_size: int = 8,
                          floor_ladder: list[int] | None = None,
                          initial_segments: list[tuple[int, int]] | None = None,
+                         train_neural: bool = True,
                          ) -> dict[str, Any]:
     """floor_ladder: certified lever-change schedule (R223: on exhaustion
     of a lever, SWITCH the lever, don't repeat it). When relief drops below
@@ -414,12 +446,13 @@ def run_self_development(max_rounds: int = 4,
     incumbent.stream_actions = []
     for sp in suite:
         incumbent.stream_names.append(("suite", sp.name))
-        incumbent.learn(sp, seed=10_000, train_neural=False)
+        incumbent.learn(sp, seed=10_000, train_neural=train_neural)
     if segments:
         # resume: replay the recorded stream policy-free (growth semantics)
         run_stream(incumbent, segments, suite=[], cache=None,
-                   learner=ParallelLearner(incumbent, workers),
-                   batch_size=batch_size)
+                   learner=ParallelLearner(incumbent, workers,
+                                           train_neural=train_neural),
+                   batch_size=batch_size, train_neural=train_neural)
     prev_wasted = sum(t["cost"] for t in incumbent.trace if not t["success"])
     report["baseline"] = {
         "learn_calls": len(incumbent.trace),
@@ -437,9 +470,11 @@ def run_self_development(max_rounds: int = 4,
         # 1. GROW: extend the incumbent with this round's fresh proposals.
         segments.append((proposals_per_round,
                          500_000 + 1000 * (round_idx + round_offset)))
-        grow_learner = ParallelLearner(incumbent, workers)
+        grow_learner = ParallelLearner(incumbent, workers,
+                                       train_neural=train_neural)
         run_stream(incumbent, [segments[-1]], suite=[], cache=None,
-                   learner=grow_learner, batch_size=batch_size)
+                   learner=grow_learner, batch_size=batch_size,
+                   train_neural=train_neural)
         incumbent_wasted = sum(t["cost"] for t in incumbent.trace
                                if not t["success"])
 
@@ -453,6 +488,8 @@ def run_self_development(max_rounds: int = 4,
             "self_model": dl.describe(),
             "holdout": val,
             "impossibility_certificate": impossibility_certificate(trace),
+            "neural_adapters": sum(1 for ex in incumbent.experts.values()
+                                    if ex.adapter is not None),
         }
         if not val["exact"]:
             rnd_report["gate"] = {"action": "HOLD",
@@ -468,9 +505,10 @@ def run_self_development(max_rounds: int = 4,
                                        node_budget=base_budget)
         opt.stream_names = []
         opt.stream_actions = []
-        opt_learner = ParallelLearner(opt, workers)
+        opt_learner = ParallelLearner(opt, workers, train_neural=train_neural)
         run_stream(opt, segments, suite=suite, cache=cache,
-                   learner=opt_learner, batch_size=batch_size)
+                   learner=opt_learner, batch_size=batch_size,
+                   train_neural=train_neural)
         opt_wasted = sum(t["cost"] for t in opt.trace if not t["success"])
 
         # 4. Non-regression commit gate.
@@ -536,6 +574,8 @@ def run_self_development(max_rounds: int = 4,
                               if r["gate"]["action"] == "COMMIT"),
         "experts": len(final.experts),
         "theorems": len(final.theorems),
+        "neural_adapters": sum(1 for ex in final.experts.values()
+                                if ex.adapter is not None),
         "pipeline": describe_pipeline(final),
         "wasted_candidates_on_holds": sum(t["cost"] for t in final.trace
                                           if not t["success"]),

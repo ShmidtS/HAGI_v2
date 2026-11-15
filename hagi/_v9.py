@@ -3,6 +3,7 @@
 # monolith; legacy V5–V8 generations live in _legacy.
 from ._legacy import *  # noqa: F401,F403 — brings stdlib/numpy
 from ._legacy import _PRIME_MOD  # underscore name, not star-exported
+from ._neural_gpu import GpuGpmMixin  # GPU dispatch for the neural core
 # imports and legacy names; V9 re-definitions below override them.
 def _bit_not8(x: int) -> int:
     return (~int(x)) & 0xFF
@@ -182,6 +183,30 @@ def make_task_suite() -> list[TaskSpec]:
                  valid_rule="ordered_yz", family="composed-ternary"),
         TaskSpec("MEDIAN3", 3, (F, F, F), lambda x, y, z: sorted((x, y, z))[1],
                  family="composed-ternary"),
+    ])
+    # --- physics: exact integer laws (polynomial-invariant stage covers) ---
+    T2 = tuple(range(0, 3))
+    suite.extend([
+        TaskSpec("PHYS_FREE_FALL", 1, (tuple(range(0, 5)),), lambda t: 20 - 5 * t * t,
+                 family="physics"),
+        TaskSpec("PHYS_UNIFORM_MOTION", 1, (tuple(range(-3, 4)),),
+                 lambda t: 3 + 2 * t, family="physics"),
+        TaskSpec("PHYS_SPRING_ENERGY", 1, (tuple(range(-3, 4)),),
+                 lambda x: 3 * x * x, family="physics"),
+        TaskSpec("PHYS_MOMENTUM", 2, (tuple(range(0, 5)), tuple(range(-4, 5))),
+                 lambda m, v: m * v, family="physics"),
+    ])
+    # --- language: character codes 0..25 as the integer encoding ---
+    A = tuple(range(0, 26))
+    K = tuple(range(0, 26))
+    suite.extend([
+        TaskSpec("LANG_CAESAR3", 1, (A,), lambda c: (c + 3) % 26,
+                 family="language"),
+        TaskSpec("LANG_ATBASH", 1, (A,), lambda c: 25 - c, family="language"),
+        TaskSpec("LANG_IS_VOWEL", 1, (A,), lambda c: int(c in (0, 4, 8, 14, 20)),
+                 family="language"),
+        TaskSpec("LANG_SHIFT", 2, (A, K), lambda c, k: (c + k) % 26,
+                 family="language"),
     ])
     return suite
 
@@ -1062,8 +1087,12 @@ def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 4) -> np.ndarray:
     return X.T if transposed else X
 
 
-class ContinualGPMMemoryV9:
-    """GPM + SpaceDecoupling (P_R = I - UU^T) + EF21Markov + Newton-Schulz Muon."""
+class ContinualGPMMemoryV9(GpuGpmMixin):
+    """GPM + SpaceDecoupling (P_R = I - UU^T) + EF21Markov + Newton-Schulz Muon.
+
+    train_task_ef21_muon / consolidate_subspace dispatch to the GPU
+    (torch/CUDA-ROCm) backend when available — see hagi/_neural_gpu.py;
+    the CPU implementations are preserved as *_cpu methods."""
 
     def __init__(self, d_in: int, d_out: int, seed: int = 0):
         rng = np.random.default_rng(seed)
@@ -1084,7 +1113,7 @@ class ContinualGPMMemoryV9:
             return G
         return G - self.U_basis @ (self.U_basis.T @ G)
 
-    def train_task_ef21_muon(self, X: np.ndarray, Y: np.ndarray, steps: int = 35, lr: float = 0.2) -> float:
+    def _train_task_ef21_muon_cpu(self, X: np.ndarray, Y: np.ndarray, steps: int = 35, lr: float = 0.2) -> float:
         if len(X) == 0:
             return 0.0
         for _ in range(steps):
@@ -1106,7 +1135,7 @@ class ContinualGPMMemoryV9:
                     break
         return float(np.mean((X @ self.W - Y) ** 2))
 
-    def consolidate_subspace(self, X: np.ndarray, energy_thresh: float = 0.995) -> None:
+    def _consolidate_subspace_cpu(self, X: np.ndarray, energy_thresh: float = 0.995) -> None:
         res_X = X if self.U_basis.shape[1] == 0 else X - (X @ self.U_basis) @ self.U_basis.T
         if float(np.linalg.norm(res_X)) < 1e-10:
             return
@@ -1526,6 +1555,17 @@ class FactorizedSharedCoreV9:
                 mode = "rvq2"
 
         Phi_va = self.features(bname, vx, sx)
+
+        def _align_cols(P: np.ndarray, n: int) -> np.ndarray:
+            """Feature width can differ between train and val inputs for
+            data-dependent branches (observed 33 vs 15 on arity-3 replay):
+            align to the weight vector — truncate extras, zero-pad missing."""
+            if P.shape[1] == n:
+                return P
+            if P.shape[1] > n:
+                return P[:, :n]
+            return np.pad(P, ((0, 0), (0, n - P.shape[1])))
+
         if mode == "ce":
             assert ce_meta is not None
             Pv = Phi_va[:, ce_meta["cols"]]
@@ -1533,14 +1573,14 @@ class FactorizedSharedCoreV9:
             nb_total = 6 + len(ce_meta["cols"]) + len(ce_meta["packed"])
         elif mode == "rvq2":
             assert mlp_meta is not None and wq is not None
-            base_va = Phi_va @ wq
+            base_va = _align_cols(Phi_va, len(wq)) @ wq
             Xv_mlp = self._mlp_encode(vx, sx)
             r_va = (np.tanh(Xv_mlp @ mlp_meta["W1"] + mlp_meta["b1"]) @ mlp_meta["W2"] + mlp_meta["b2"]).ravel()
             pred_q = (base_va + r_va) * sy
             nb_total = 6 + len(packed) + len(mlp_meta["packed"])
         else:
             assert wq is not None
-            pred_q = (Phi_va @ wq) * sy
+            pred_q = (_align_cols(Phi_va, len(wq)) @ wq) * sy
             nb_total = 6 + len(packed)
 
         return FactorizedAdapterV9(

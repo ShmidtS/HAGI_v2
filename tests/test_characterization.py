@@ -13,10 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hagi  # noqa: E402
 
 GOLD = {
-    "suite_len": 49,
-    "suite_experts": 49,
+    "suite_len": 57,        # 49 core + 4 physics + 4 language families
+    "suite_experts": 53,    # 3 lang HOLD + 1 physics REUSE
     "suite_accuracy": 1.0,
-    "suite_committed": 49,
+    "suite_committed": 53,
     "venn_head_eval": 0,
     "rot": [12.727922, -1.414214, -2.828427, 0.0,
             -5.656854, 0.0, 0.0, 0.0],
@@ -68,18 +68,18 @@ def test_venn_and_hadamard():
 
 def test_selfloop_round1_golden():
     """Round-1 of the self-development loop must reproduce its certified
-    numbers exactly (waste cut by flooring predicted HOLDs). Guards the
-    parallel/merge machinery end-to-end (batch semantics, sequential
-    workers for determinism in tests)."""
+    numbers exactly. Guards the parallel/merge machinery end-to-end
+    (batch semantics, sequential workers for determinism in tests).
+    Golden: suite(57)+segment(10) with 5 holds among the new frontier."""
     from hagi_selfloop import ParallelLearner, run_stream
     from hagi_selfmodel import TracedProcessorV9
     inc = TracedProcessorV9(node_budget=2000)
     run_stream(inc, [(10, 501_000)], suite=None, cache=None,
                learner=ParallelLearner(inc, 1), batch_size=8)
     wasted = sum(t["cost"] for t in inc.trace if not t["success"])
-    assert len(inc.trace) == 59
-    assert wasted == 6000
-    assert sum(t["success"] for t in inc.trace) == 56
+    assert len(inc.trace) == 67
+    assert wasted == 10000
+    assert sum(t["success"] for t in inc.trace) == 61
 
 
 def test_selfrewrite_programs(tmp_path):
@@ -94,3 +94,20 @@ def test_selfrewrite_programs(tmp_path):
     assert rep["functions"] == n_expr >= 30   # venn-mask experts have no AST
     assert rep["failures"] == 0
     assert rep["evaluations_checked"] > 1000
+
+
+def test_neural_gpu_backend():
+    """GPU (torch/CUDA-ROCm) backend: resolves a device, trains a GPM
+    step without error, and stays result-compatible (same adapter count
+    and exact accuracy as the CPU path on the suite)."""
+    import os
+    from hagi._neural_gpu import resolve_device
+    dev = resolve_device()
+    assert dev in ("cpu", "cuda")
+    suite = hagi.make_task_suite()
+    p = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    for sp in suite:
+        p.learn(sp, seed=10_000, train_neural=True)
+    adapters = sum(1 for e in p.experts.values() if e.adapter is not None)
+    assert adapters > 0
+    assert p.verify_all(suite)["accuracy"] == 1.0

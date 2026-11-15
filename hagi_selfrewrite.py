@@ -288,9 +288,27 @@ def main() -> None:
     p = argparse.ArgumentParser(description="HAGI self-rewrite loop")
     p.add_argument("--rounds", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--forever", action="store_true",
+                   help="infinite autonomous self-development: grow-"
+                        "rewrite-resume cycles until the process is "
+                        "stopped; every cycle rewrites self_state.json "
+                        "and generated_programs.py")
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--state-dir", type=Path, default=Path("checkpoints/self"))
     a = p.parse_args()
+    if a.forever:
+        import time as _time
+        cycle = 0
+        while True:
+            cycle += 1
+            rep = run(a.rounds, a.state_dir, workers=a.workers, resume=True)
+            print(f"[forever cycle {cycle}] rounds={rep['self_state']['rounds_done']} "
+                  f"experts={rep['experts']} funcs={rep['programs']['functions']} "
+                  f"checked={rep['programs']['evaluations_checked']} "
+                  f"failures={rep['programs']['failures']} "
+                  f"rewrites={rep['self_state']['rewrites']} "
+                  f"{rep['seconds']}s", flush=True)
+            _time.sleep(1)
     rep = run(a.rounds, a.state_dir, workers=a.workers, resume=a.resume)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
 

@@ -49,7 +49,24 @@ FAMILY_IDS = {"BoolVenn": 0, "unary": 1, "integer-binary": 2,
 
 # ---------------------------------------------------------------- Phase 1 ----
 
-FEATURE_KEYS = ("family", "arity", "domain", "library", "target_range", "target_unique")
+FEATURE_KEYS = ("family", "arity", "domain", "library", "target_range",
+               "target_unique", "self_inv")
+
+
+def _self_inverse_flag(spec) -> int:
+    """1 if the target is self-inverse (f∘f = id) on sampled unary inputs.
+    Separates tasks identical in range/unique stats (ATBASH vs CAESAR)."""
+    if spec.arity != 1:
+        return 0
+    dom = spec.inputs()
+    for x in dom[:64]:
+        try:
+            y = int(spec.teacher(*x))
+            if not spec.valid((y,)) or int(spec.teacher(y)) != x[0]:
+                return 0
+        except Exception:
+            return 0
+    return 1
 
 
 def _target_features(spec, seed: int, train_fraction: float) -> tuple[int, int]:
@@ -84,6 +101,7 @@ class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
             "arity": spec.arity,
             "domain": len(spec.inputs()),
             "library": len(self.experts),
+            "self_inv": _self_inverse_flag(spec),
             "target_range": target_range,
             "target_unique": target_unique,
         }
@@ -105,7 +123,8 @@ def _features(spec, model, seed: int = 0,
               train_fraction: float = 0.70) -> tuple[int, ...]:
     target_range, target_unique = _target_features(spec, seed, train_fraction)
     return (FAMILY_IDS.get(spec.family, 6), spec.arity, len(spec.inputs()),
-            len(model.experts), target_range, target_unique)
+            len(model.experts), target_range, target_unique,
+            _self_inverse_flag(spec))
 
 
 # ---------------------------------------------------------------- Phase 2 ----
