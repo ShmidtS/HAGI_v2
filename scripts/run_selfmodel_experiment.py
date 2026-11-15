@@ -59,15 +59,15 @@ def main() -> int:
 
         # Then trial measured allocation policies over independent seeds.
         from hagi_selfexperiment import run_experiment
-        selected_policies = ["baseline","online_exact_2holds_quarter","online_coarse_2holds_half"]
+        selected_policies = ["baseline","online_exact_2holds_quarter","online_exact_1hold_quarter","online_exact_2holds_eighth"]
         result = run_experiment(
-            seeds=20, policy_names=selected_policies, seed_start=10
+            seeds=20, policy_names=selected_policies, seed_start=30
         )
         report["validation_protocol"] = {
-            "seed_start": 10,
+            "seed_start": 30,
             "seed_count": 20,
             "policies": selected_policies,
-            "purpose": "new-seed confirmation of the ten-seed candidate policies",
+            "purpose": "test more aggressive exact-profile thresholds against the validated policy on unseen seeds",
         }
         report["status"] = "COMPLETED"
         report["result"] = result

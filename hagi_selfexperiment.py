@@ -133,7 +133,9 @@ POLICIES: dict[str, Policy] = {
     "floor_half_auto": p_floor_half,
     "floor_quarter_auto": p_floor_quarter,
     "online_exact_1hold_half": make_online_conservative_policy(1, 0.50, False),
+    "online_exact_1hold_quarter": make_online_conservative_policy(1, 0.25, False),
     "online_exact_2holds_quarter": make_online_conservative_policy(2, 0.25, False),
+    "online_exact_2holds_eighth": make_online_conservative_policy(2, 0.125, False),
     "online_coarse_2holds_half": make_online_conservative_policy(2, 0.50, True),
     "online_coarse_3holds_quarter": make_online_conservative_policy(3, 0.25, True),
 }
