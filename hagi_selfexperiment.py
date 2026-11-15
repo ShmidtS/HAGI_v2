@@ -31,7 +31,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hagi  # noqa: E402
 from hagi_selfmodel import (  # noqa: E402  (reuse certified machinery)
-    FAMILY_IDS, TracedProcessorV9, impossibility_certificate)
+    FAMILY_IDS, TracedProcessorV9, impossibility_certificate, _target_features)
 
 Policy = Callable[[Any, int], int]   # (spec, base_budget) -> node_budget
 
@@ -47,8 +47,14 @@ def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int = 8,
         _orig_learn = m.learn
 
         def learn_with_policy(spec, seed=0, **kw):
-            m.node_budget = policy(spec, base_budget)
-            return _orig_learn(spec, seed=seed, **kw)
+            budget = int(policy(spec, base_budget, seed, m.trace, **kw))
+            budget = max(1, min(base_budget, budget))
+            m.node_budget = budget
+            event = _orig_learn(spec, seed=seed, **kw)
+            if m.trace:
+                m.trace[-1]["policy_budget"] = budget
+                m.trace[-1]["policy_reduced"] = budget < base_budget
+            return event
 
         m.learn = learn_with_policy  # type: ignore[method-assign]
 
@@ -75,22 +81,59 @@ def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int = 8,
 
 # ------------------------------------------------------------- policies ----
 
-def p_baseline(spec, base: int) -> int:
+def p_baseline(spec, base: int, seed=0, history=(), **kw) -> int:
     return base
 
 
-def p_floor_half(spec, base: int) -> int:
+def p_floor_half(spec, base: int, seed=0, history=(), **kw) -> int:
     return max(400, base // 2) if FAMILY_IDS.get(spec.family, 6) == 4 else base
 
 
-def p_floor_quarter(spec, base: int) -> int:
+def p_floor_quarter(spec, base: int, seed=0, history=(), **kw) -> int:
     return max(200, base // 4) if FAMILY_IDS.get(spec.family, 6) == 4 else base
+
+
+def _shape_key(spec, seed: int, train_fraction: float, coarse_domain: bool):
+    target_range, target_unique = _target_features(spec, seed, train_fraction)
+    domain = len(spec.inputs())
+    domain_key = (1 << (domain.bit_length() - 1)) if coarse_domain and domain > 0 else domain
+    return (FAMILY_IDS.get(spec.family, 6), spec.arity, domain_key,
+            target_range, target_unique)
+
+
+def make_online_conservative_policy(min_holds: int, fraction: float,
+                                    coarse_domain: bool = False):
+    """Reduce search only after repeated, costly HOLDs in the same observed task-shape bucket."""
+    def policy(spec, base: int, seed=0, history=(), **kw) -> int:
+        train_fraction = float(kw.get("train_fraction", 0.70))
+        key = _shape_key(spec, seed, train_fraction, coarse_domain)
+        prior = [
+            row for row in history
+            if _shape_key_from_trace(row, coarse_domain) == key
+        ]
+        if (len(prior) >= min_holds
+                and all(int(row["success"]) == 0 for row in prior)
+                and float(np.mean([row["cost"] for row in prior])) >= 1200):
+            return max(200, int(base * fraction))
+        return base
+    return policy
+
+
+def _shape_key_from_trace(row, coarse_domain: bool):
+    domain = int(row["domain"])
+    domain_key = (1 << (domain.bit_length() - 1)) if coarse_domain and domain > 0 else domain
+    return (int(row["family"]), int(row["arity"]), domain_key,
+            int(row["target_range"]), int(row["target_unique"]))
 
 
 POLICIES: dict[str, Policy] = {
     "baseline": p_baseline,
     "floor_half_auto": p_floor_half,
     "floor_quarter_auto": p_floor_quarter,
+    "online_exact_1hold_half": make_online_conservative_policy(1, 0.50, False),
+    "online_exact_2holds_quarter": make_online_conservative_policy(2, 0.25, False),
+    "online_coarse_2holds_half": make_online_conservative_policy(2, 0.50, True),
+    "online_coarse_3holds_quarter": make_online_conservative_policy(3, 0.25, True),
 }
 
 
@@ -163,6 +206,16 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
             "verdict": "PASS" if passes else "REJECT",
             "per_seed_experts": [r["n_experts"] for r in runs],
             "per_seed_wasted": [r["wasted"] for r in runs],
+            "reduced_budget_tasks_per_seed": [
+                sum(1 for row in r["trace"] if row.get("policy_reduced", False))
+                for r in runs],
+            "reduced_budget_commits_per_seed": [
+                sum(1 for row in r["trace"]
+                    if row.get("policy_reduced", False) and row["success"])
+                for r in runs],
+            "lost_experts_per_seed": [
+                sorted(b["expert_names"] - r["expert_names"])
+                for r, b in zip(runs, base_stats)],
             "new_experts_vs_baseline": [
                 sorted(r["expert_names"] - b["expert_names"])
                 for r, b in zip(runs, base_stats)],
