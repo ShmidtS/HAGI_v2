@@ -6943,6 +6943,16 @@ class FactorizedSharedCoreV9:
 
         _, bname, mode, wq, packed, _, ce_meta, ptr_n, mlp_meta = best
 
+        if ptr_n is None:
+            # Degenerate fit: every OMP candidate was rejected (|w| > 8) and
+            # the CE branch was inapplicable. Certify a conservative zero
+            # predictor instead of crashing — the commit gate downstream
+            # sees the true (poor) val metrics and can HOLD on this expert.
+            wq = np.zeros(Phi.shape[1], dtype=np.float64)
+            packed = pack_vector_dyadic5(wq, stages=1)[0]
+            mode, bname, ce_meta, mlp_meta = "reg", "poly", None, None
+            ptr_n = np.zeros(N, dtype=np.float64)
+
         acc_tr_cur = float(np.mean(np.rint(ptr_n * sy) == ty))
         mse_tr_cur = float(np.mean((ptr_n * sy - ty) ** 2))
         if acc_tr_cur < 0.99 and N >= 120 and mse_tr_cur > 0.08 and mode == "reg":
@@ -8337,7 +8347,12 @@ class GrowingHagiProcessorV9:
             self.total_commits += 1
             self._record_ram_fingerprint(spec.name, domain, all_y)
             drop = 1.0
-            obj_after = max(0.0, self.unsolved_objective - drop)
+            # Exact CertStepGen telescope (Lean contract): obj_after must be
+            # obj_before - drop with NO clamp — a floor at 0.0 breaks the
+            # telescope invariant once commits exceed the initial nominal
+            # budget (obj0=100) and verify_certificates() would fail forever
+            # after. The objective may legitimately go negative (over-repaid).
+            obj_after = self.unsolved_objective - drop
             b_spend = min(self.compute_budget, 0.5)
             r_spend = min(self.risk_rem, 0.01)
             self.compute_budget -= b_spend
