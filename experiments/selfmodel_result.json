@@ -2,10 +2,10 @@
   "experiment": "HAGI finite self-model / derive-and-optimize",
   "repository": "ShmidtS/HAGI_v2",
   "branch": "experiment/selfmodel-20261115",
-  "commit": "0e9ded3149bd7b5ce6a20f44f7fd69bb9ffc97e1",
-  "started_utc": "2026-11-15T12:04:36.381530+00:00",
+  "commit": "4a302cdc522e5388afe06ba0a354b78dc1372d18",
+  "started_utc": "2026-11-15T12:18:25.870184+00:00",
   "python": "3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]",
-  "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+  "platform": "Linux-7.0.0-1016-aws-x86_64-with-glibc2.43",
   "self_model": {
     "trace_examples": 59,
     "feature_schema": [
@@ -78,8 +78,9 @@
     "gate": {
       "baseline": {
         "superset_on_all_seeds": true,
+        "exact_accuracy_floor": 1.0,
         "mean_wasted": 45600.0,
-        "mean_seconds": 5.95,
+        "mean_seconds": 3.3,
         "verdict": "REJECT",
         "per_seed_experts": [
           80,
@@ -95,6 +96,27 @@
           36000,
           48000
         ],
+        "reduced_budget_tasks_per_seed": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "reduced_budget_commits_per_seed": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "lost_experts_per_seed": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
         "new_experts_vs_baseline": [
           [],
           [],
@@ -105,8 +127,9 @@
       },
       "floor_half_auto": {
         "superset_on_all_seeds": false,
+        "exact_accuracy_floor": null,
         "mean_wasted": 26000.0,
-        "mean_seconds": 3.79,
+        "mean_seconds": 2.27,
         "verdict": "REJECT",
         "per_seed_experts": [
           84,
@@ -121,6 +144,103 @@
           25000,
           25000,
           27000
+        ],
+        "reduced_budget_tasks_per_seed": [
+          45,
+          51,
+          39,
+          40,
+          44
+        ],
+        "reduced_budget_commits_per_seed": [
+          20,
+          20,
+          12,
+          14,
+          13
+        ],
+        "lost_experts_per_seed": [
+          [
+            "V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_AUTO_R1_0_SQUARE_IN_V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R2_0_ABS_IN_BIT_OR",
+            "V9_AUTO_R2_0_MUL_IN_BIT_XOR",
+            "V9_AUTO_R2_1_EQ_IN_GCD",
+            "V9_AUTO_R4_0_BIT_NOR8_IN_SUB",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_MUL_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_OR_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_3_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_OR_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R6_0_LE_IN_V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_2_GT_IN_GCD",
+            "V9_AUTO_R7_0_V9_AUTO_R1_0_SQUARE_IN_V9_AUTO_R0_0_EQ_IN_SUB_IN_BIT_XOR",
+            "V9_AUTO_R7_1_NEG_IN_V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_BOOL3_R4_0",
+            "V9_BOOL3_R5_1",
+            "V9_BOOL3_R7_1"
+          ],
+          [
+            "V9_AUTO_R0_1_LCM_IN_MUL",
+            "V9_AUTO_R1_3_CUBE_IN_MIN",
+            "V9_AUTO_R2_0_MUL_IN_SUB",
+            "V9_AUTO_R2_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R3_0_CLAMP_TO_3_IN_V9_AUTO_R1_0_NEG_IN_BIT_AND",
+            "V9_AUTO_R3_3_GT_IN_GCD",
+            "V9_AUTO_R5_0_ADD_IN_SUB",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_BIT_NOT8_IN_BIT_OR_IN_ADD",
+            "V9_AUTO_R6_2_V9_AUTO_R1_0_SQUARE_IN_MOD_IN_V9_AUTO_R3_0_CUBE_IN_BIT_XOR",
+            "V9_BOOL3_R0_1",
+            "V9_BOOL3_R6_2",
+            "V9_BOOL3_R7_0"
+          ],
+          [
+            "V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_LE_IN_V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R2_0_V9_AUTO_R0_0_BIT_NOT8_IN_GCD_IN_V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_V9_AUTO_R2_0_LE_IN_V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD_IN_BIT_XOR",
+            "V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R3_0_BIT_NOT8_IN_V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_LCM_IN_BIT_XNOR8",
+            "V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R4_1_NEG_IN_BIT_OR",
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_MIN",
+            "V9_AUTO_R5_1_MIN_IN_ABSDIFF",
+            "V9_AUTO_R6_1_NE_IN_GCD",
+            "V9_AUTO_R6_1_V9_AUTO_R1_0_GT_IN_BIT_XNOR8_IN_V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R7_1_GT_IN_V9_AUTO_R6_1_V9_AUTO_R1_0_GT_IN_BIT_XNOR8_IN_V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_BOOL3_R2_1",
+            "V9_BOOL3_R3_2",
+            "V9_BOOL3_R5_0"
+          ],
+          [
+            "V9_AUTO_R0_0_LCM_IN_V9_AUTO_R0_1_CUBE_IN_BIT_XOR",
+            "V9_AUTO_R1_0_ABS_IN_FLOORDIV",
+            "V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R2_0_BIT_AND_IN_V9_AUTO_R2_0_SQUARE_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R2_0_V9_AUTO_R2_0_MIN_IN_SUB_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R3_0_V9_AUTO_R1_0_ABS_IN_FLOORDIV_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R3_1_LCM_IN_V9_AUTO_R2_0_SQUARE_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R6_0_ABS_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R7_0_ADD_IN_V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R7_0_SQUARE_IN_MAX",
+            "V9_AUTO_R7_0_V9_AUTO_R7_0_ADD_IN_V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT_IN_BIT_XNOR8",
+            "V9_AUTO_R7_1_ABS_IN_MAX",
+            "V9_BOOL3_R5_5"
+          ],
+          [
+            "V9_AUTO_R4_0_GCD_IN_V9_AUTO_R1_0_SQUARE_IN_MIN",
+            "V9_AUTO_R5_0_BIT_NOT8_IN_MOD",
+            "V9_AUTO_R5_0_V9_AUTO_R5_1_MUL_IN_V9_AUTO_R3_0_SQUARE_IN_GCD_IN_V9_AUTO_R5_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_1_MUL_IN_V9_AUTO_R3_0_SQUARE_IN_GCD",
+            "V9_AUTO_R6_0_ABSDIFF_IN_V9_AUTO_R3_3_BIT_NOT8_IN_V9_AUTO_R3_1_ABS_IN_BIT_XOR",
+            "V9_AUTO_R6_2_V9_AUTO_R4_0_GCD_IN_V9_AUTO_R1_0_SQUARE_IN_MIN_IN_BIT_XNOR8",
+            "V9_AUTO_R7_0_BIT_NOR8_IN_BIT_OR",
+            "V9_BOOL3_R6_3"
+          ]
         ],
         "new_experts_vs_baseline": [
           [
@@ -199,8 +319,9 @@
       },
       "floor_quarter_auto": {
         "superset_on_all_seeds": false,
+        "exact_accuracy_floor": null,
         "mean_wasted": 13400.0,
-        "mean_seconds": 2.93,
+        "mean_seconds": 1.61,
         "verdict": "REJECT",
         "per_seed_experts": [
           82,
@@ -215,6 +336,106 @@
           12500,
           13500,
           13500
+        ],
+        "reduced_budget_tasks_per_seed": [
+          45,
+          50,
+          39,
+          40,
+          44
+        ],
+        "reduced_budget_commits_per_seed": [
+          18,
+          19,
+          12,
+          13,
+          13
+        ],
+        "lost_experts_per_seed": [
+          [
+            "V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_AUTO_R1_0_SQUARE_IN_V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R2_0_ABS_IN_BIT_OR",
+            "V9_AUTO_R2_0_MUL_IN_BIT_XOR",
+            "V9_AUTO_R2_1_EQ_IN_GCD",
+            "V9_AUTO_R4_0_BIT_NOR8_IN_SUB",
+            "V9_AUTO_R4_0_BIT_NOT8_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_MUL_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_OR_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_3_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_OR_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R6_0_LE_IN_V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_2_GT_IN_GCD",
+            "V9_AUTO_R7_0_V9_AUTO_R1_0_SQUARE_IN_V9_AUTO_R0_0_EQ_IN_SUB_IN_BIT_XOR",
+            "V9_AUTO_R7_1_NEG_IN_V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_BOOL3_R4_0",
+            "V9_BOOL3_R5_1",
+            "V9_BOOL3_R7_1"
+          ],
+          [
+            "V9_AUTO_R0_1_LCM_IN_MUL",
+            "V9_AUTO_R1_3_CUBE_IN_MIN",
+            "V9_AUTO_R2_0_MUL_IN_SUB",
+            "V9_AUTO_R2_0_SIGN_IN_FLOORDIV",
+            "V9_AUTO_R3_0_CLAMP_TO_3_IN_V9_AUTO_R1_0_NEG_IN_BIT_AND",
+            "V9_AUTO_R3_3_GT_IN_GCD",
+            "V9_AUTO_R5_0_V9_AUTO_R2_0_BIT_NOT8_IN_BIT_OR_IN_ADD",
+            "V9_AUTO_R5_1_SIGN_IN_MOD",
+            "V9_AUTO_R6_2_V9_AUTO_R1_0_SQUARE_IN_MOD_IN_V9_AUTO_R3_0_CUBE_IN_BIT_XOR",
+            "V9_AUTO_R7_2_SIGN_IN_GCD",
+            "V9_BOOL3_R0_1",
+            "V9_BOOL3_R6_2",
+            "V9_BOOL3_R7_1"
+          ],
+          [
+            "V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_LE_IN_V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R2_0_V9_AUTO_R0_0_BIT_NOT8_IN_GCD_IN_V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R2_0_V9_AUTO_R2_0_LE_IN_V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD_IN_BIT_XOR",
+            "V9_AUTO_R2_2_MAX_IN_V9_AUTO_R0_0_BIT_NOT8_IN_GCD",
+            "V9_AUTO_R3_0_BIT_NOT8_IN_V9_AUTO_R1_0_GT_IN_BIT_XNOR8",
+            "V9_AUTO_R4_0_LCM_IN_BIT_XNOR8",
+            "V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R4_1_NEG_IN_BIT_OR",
+            "V9_AUTO_R5_0_CLAMP_TO_3_IN_MIN",
+            "V9_AUTO_R5_1_MIN_IN_ABSDIFF",
+            "V9_AUTO_R6_1_NE_IN_GCD",
+            "V9_AUTO_R6_1_V9_AUTO_R1_0_GT_IN_BIT_XNOR8_IN_V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_AUTO_R7_1_GT_IN_V9_AUTO_R6_1_V9_AUTO_R1_0_GT_IN_BIT_XNOR8_IN_V9_AUTO_R4_1_BIT_NOT8_IN_POW_INT",
+            "V9_BOOL3_R2_1",
+            "V9_BOOL3_R3_2",
+            "V9_BOOL3_R5_0"
+          ],
+          [
+            "V9_AUTO_R0_0_LCM_IN_V9_AUTO_R0_1_CUBE_IN_BIT_XOR",
+            "V9_AUTO_R1_0_ABS_IN_FLOORDIV",
+            "V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R2_0_BIT_AND_IN_V9_AUTO_R2_0_SQUARE_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R2_0_V9_AUTO_R2_0_MIN_IN_SUB_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R3_0_V9_AUTO_R1_0_ABS_IN_FLOORDIV_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R3_1_LCM_IN_V9_AUTO_R2_0_SQUARE_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R6_0_ABS_IN_V9_AUTO_R2_0_CLAMP_TO_3_IN_SUB",
+            "V9_AUTO_R7_0_ADD_IN_V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT",
+            "V9_AUTO_R7_0_SQUARE_IN_MAX",
+            "V9_AUTO_R7_0_V9_AUTO_R7_0_ADD_IN_V9_AUTO_R4_0_ABSDIFF_IN_V9_AUTO_R2_0_BIT_NOT8_IN_V9_AUTO_R1_0_ABS_IN_POW_INT_IN_BIT_XNOR8",
+            "V9_AUTO_R7_1_ABS_IN_MAX",
+            "V9_BOOL3_R5_5",
+            "V9_BOOL3_R7_0",
+            "V9_BOOL3_R7_1"
+          ],
+          [
+            "V9_AUTO_R4_0_GCD_IN_V9_AUTO_R1_0_SQUARE_IN_MIN",
+            "V9_AUTO_R5_0_BIT_NOT8_IN_MOD",
+            "V9_AUTO_R5_0_V9_AUTO_R5_1_MUL_IN_V9_AUTO_R3_0_SQUARE_IN_GCD_IN_V9_AUTO_R5_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R5_1_MUL_IN_V9_AUTO_R3_0_SQUARE_IN_GCD",
+            "V9_AUTO_R6_0_ABSDIFF_IN_V9_AUTO_R3_3_BIT_NOT8_IN_V9_AUTO_R3_1_ABS_IN_BIT_XOR",
+            "V9_AUTO_R6_2_V9_AUTO_R4_0_GCD_IN_V9_AUTO_R1_0_SQUARE_IN_MIN_IN_BIT_XNOR8",
+            "V9_AUTO_R7_0_BIT_NOR8_IN_BIT_OR",
+            "V9_BOOL3_R6_3"
+          ]
         ],
         "new_experts_vs_baseline": [
           [
@@ -287,6 +508,214 @@
             "V9_BOOL3_R7_2"
           ]
         ]
+      },
+      "online_exact_1hold_half": {
+        "superset_on_all_seeds": false,
+        "exact_accuracy_floor": null,
+        "mean_wasted": 44800.0,
+        "mean_seconds": 3.29,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          78,
+          80,
+          80,
+          82,
+          82
+        ],
+        "per_seed_wasted": [
+          53000,
+          53000,
+          38000,
+          34000,
+          46000
+        ],
+        "reduced_budget_tasks_per_seed": [
+          3,
+          2,
+          3,
+          2,
+          2
+        ],
+        "reduced_budget_commits_per_seed": [
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "lost_experts_per_seed": [
+          [
+            "V9_AUTO_R5_3_V9_AUTO_R5_0_V9_AUTO_R2_0_ABS_IN_BIT_OR_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8_IN_V9_AUTO_R0_1_BIT_XOR_IN_BIT_XNOR8",
+            "V9_AUTO_R6_0_LE_IN_V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_AUTO_R6_2_GT_IN_GCD",
+            "V9_AUTO_R7_0_V9_AUTO_R1_0_SQUARE_IN_V9_AUTO_R0_0_EQ_IN_SUB_IN_BIT_XOR",
+            "V9_AUTO_R7_1_NEG_IN_V9_AUTO_R0_0_EQ_IN_SUB",
+            "V9_BOOL3_R5_1"
+          ],
+          [],
+          [],
+          [],
+          []
+        ],
+        "new_experts_vs_baseline": [
+          [
+            "V9_AUTO_R6_0_GT_IN_GCD",
+            "V9_AUTO_R6_1_ABSDIFF_IN_V9_AUTO_R4_0_MUL_IN_V9_AUTO_R0_0_CUBE_IN_ADD",
+            "V9_AUTO_R7_0_LE_IN_V9_AUTO_R1_0_V9_AUTO_R0_1_NEG_IN_BIT_AND_IN_POW_INT",
+            "V9_BOOL3_R5_0"
+          ],
+          [],
+          [],
+          [],
+          []
+        ]
+      },
+      "online_exact_2holds_quarter": {
+        "superset_on_all_seeds": true,
+        "exact_accuracy_floor": 1.0,
+        "mean_wasted": 45600.0,
+        "mean_seconds": 3.31,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          80,
+          80,
+          80,
+          82,
+          82
+        ],
+        "per_seed_wasted": [
+          50000,
+          54000,
+          40000,
+          36000,
+          48000
+        ],
+        "reduced_budget_tasks_per_seed": [
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "reduced_budget_commits_per_seed": [
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "lost_experts_per_seed": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "new_experts_vs_baseline": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ]
+      },
+      "online_coarse_2holds_half": {
+        "superset_on_all_seeds": true,
+        "exact_accuracy_floor": 1.0,
+        "mean_wasted": 45600.0,
+        "mean_seconds": 3.33,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          80,
+          80,
+          80,
+          82,
+          82
+        ],
+        "per_seed_wasted": [
+          50000,
+          54000,
+          40000,
+          36000,
+          48000
+        ],
+        "reduced_budget_tasks_per_seed": [
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "reduced_budget_commits_per_seed": [
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "lost_experts_per_seed": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "new_experts_vs_baseline": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ]
+      },
+      "online_coarse_3holds_quarter": {
+        "superset_on_all_seeds": true,
+        "exact_accuracy_floor": 1.0,
+        "mean_wasted": 45600.0,
+        "mean_seconds": 3.32,
+        "verdict": "REJECT",
+        "per_seed_experts": [
+          80,
+          80,
+          80,
+          82,
+          82
+        ],
+        "per_seed_wasted": [
+          50000,
+          54000,
+          40000,
+          36000,
+          48000
+        ],
+        "reduced_budget_tasks_per_seed": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "reduced_budget_commits_per_seed": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "lost_experts_per_seed": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "new_experts_vs_baseline": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ]
       }
     },
     "decision": {
@@ -294,6 +723,6 @@
       "reason": "no candidate policy preserved the baseline expert set on all seeds while reducing wasted search; baseline retained"
     }
   },
-  "finished_utc": "2026-11-15T12:05:41.732571+00:00",
+  "finished_utc": "2026-11-15T12:20:09.402262+00:00",
   "exit_code": 0
 }
