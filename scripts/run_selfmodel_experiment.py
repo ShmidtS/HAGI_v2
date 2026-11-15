@@ -26,7 +26,38 @@ def main() -> int:
         "platform": platform.platform(),
     }
     try:
-        from hagi_selfexperiment import run_experiment
+        import numpy as np
+        import hagi
+        from hagi_selfmodel import (
+            FEATURE_KEYS, TracedProcessorV9, describe_pipeline,
+            derive_self_model, impossibility_certificate,
+        )
+
+        # Separate trace/derive pass: extract the symbolic self-model itself.
+        tracer = TracedProcessorV9(node_budget=2000)
+        rng = np.random.default_rng(20260101)
+        seen = set()
+        for spec in hagi.make_task_suite():
+            tracer.learn(spec, seed=10_000, train_neural=False)
+        for k in range(10):
+            proposal = hagi.propose_noncircular_task_v9(tracer.experts, rng, 0, seen)
+            if proposal is None:
+                continue
+            spec, _parents = proposal
+            if spec.name not in tracer.experts:
+                tracer.learn(spec, seed=500_000 + k, train_neural=False)
+        symbolic = derive_self_model(tracer.trace)
+        report["self_model"] = {
+            "trace_examples": len(tracer.trace),
+            "feature_schema": list(FEATURE_KEYS),
+            "pipeline": describe_pipeline(tracer),
+            "symbolic_predictors": {
+                k: v for k, v in symbolic.items() if not k.startswith("_")
+            },
+            "impossibility_certificate": impossibility_certificate(tracer.trace),
+        }
+
+        # Then trial measured allocation policies over independent seeds.
         result = run_experiment(seeds=5)
         report["status"] = "COMPLETED"
         report["result"] = result
