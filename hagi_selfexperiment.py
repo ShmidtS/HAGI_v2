@@ -33,7 +33,7 @@ import hagi  # noqa: E402
 from hagi_selfmodel import (  # noqa: E402  (reuse certified machinery)
     FAMILY_IDS, TracedProcessorV9, impossibility_certificate, _target_features)
 
-Policy = Callable[[Any, int], int]   # (spec, base_budget) -> node_budget
+Policy = Callable[..., int]   # (spec, base_budget, seed, prior_trace, ...) -> node_budget
 
 
 # ------------------------------------------------------------ growth run ----
@@ -194,13 +194,13 @@ def run_experiment(seeds: int = 5) -> dict[str, Any]:
     for pname, runs in trials.items():
         superset_all = all(r["expert_names"] >= b["expert_names"]
                            for r, b in zip(runs, base_stats))
-        exact_acc_all = superset_all  # experts certified exact on full support
         mean_wasted = float(np.mean([r["wasted"] for r in runs]))
         mean_secs = float(np.mean([r["seconds"] for r in runs]))
         passes = (superset_all
                   and mean_wasted < float(np.mean([b["wasted"] for b in base_stats])))
         gate[pname] = {
             "superset_on_all_seeds": superset_all,
+            "exact_accuracy_floor": 1.0 if superset_all else None,
             "mean_wasted": round(mean_wasted, 1),
             "mean_seconds": round(mean_secs, 2),
             "verdict": "PASS" if passes else "REJECT",
