@@ -13,10 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hagi  # noqa: E402
 
 GOLD = {
-    "suite_len": 57,        # 49 core + 4 physics + 4 language families
-    "suite_experts": 55,    # only IS_VOWEL holds; physics 4/4, language 3/4
+    "suite_len": 62,        # 49 core + 4 physics + 9 language (latin+utf8-bytes+cyrillic)
+    "suite_experts": 59,    # byte pool 4/4 COMMIT; IS_VOWEL and RU_VOWEL hold
     "suite_accuracy": 1.0,
-    "suite_committed": 55,
+    "suite_committed": 59,
     "venn_head_eval": 0,
     "rot": [12.727922, -1.414214, -2.828427, 0.0,
             -5.656854, 0.0, 0.0, 0.0],
@@ -77,9 +77,9 @@ def test_selfloop_round1_golden():
     run_stream(inc, [(10, 501_000)], suite=None, cache=None,
                learner=ParallelLearner(inc, 1), batch_size=8)
     wasted = sum(t["cost"] for t in inc.trace if not t["success"])
-    assert len(inc.trace) == 67
-    assert wasted == 6000
-    assert sum(t["success"] for t in inc.trace) == 63
+    assert len(inc.trace) == 72
+    assert wasted == 9000
+    assert sum(t["success"] for t in inc.trace) == 68
 
 
 def test_selfrewrite_programs(tmp_path):

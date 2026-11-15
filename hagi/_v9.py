@@ -73,7 +73,7 @@ COMMUTATIVE_OPS = frozenset({
     "add", "mul", "gcd", "lcm", "min", "max", "eq", "ne",
     "bit_and", "bit_or", "bit_xor", "bit_nand8", "bit_nor8", "bit_xnor8",
 })
-CONSTS = (0, 1, -1, 2, -2, 26, -26)  # +alphabet modulus for language tasks
+CONSTS = (0, 1, -1, 2, -2, 26, -26, 256, -256)  # +alphabet/byte moduli (language, full UTF-8 pool)
 
 
 def gamma_bits(n: int) -> int:
@@ -206,6 +206,25 @@ def make_task_suite() -> list[TaskSpec]:
         TaskSpec("LANG_IS_VOWEL", 1, (A,), lambda c: int(c in (0, 4, 8, 14, 20)),
                  family="language"),
         TaskSpec("LANG_SHIFT", 2, (A, K), lambda c, k: (c + k) % 26,
+                 family="language"),
+    ])
+    # --- full UTF-8 pool: byte space 0..255 (ANY unicode text is bytes) ---
+    B = tuple(range(0, 256))
+    BK = tuple(range(0, 256))
+    suite.extend([
+        TaskSpec("LANG8_ATBASH", 1, (B,), lambda c: 255 - c, family="language"),
+        TaskSpec("LANG8_CAESAR1", 1, (B,), lambda c: (c + 1) % 256,
+                 family="language"),
+        TaskSpec("LANG8_SHIFT", 2, (B, BK), lambda c, k: (c + k) % 256,
+                 family="language"),
+        TaskSpec("LANG8_XOR_CIPHER", 2, (B, BK), lambda c, k: c ^ k,
+                 family="language"),
+    ])
+    # --- cyrillic codepoints (U+0400..U+04FF): not only Latin ---
+    RU_VOWELS = set(map(ord, "аеёиоуыэюяАЕЁИОУЫЭЮЯ"))
+    RU = tuple(range(0x400, 0x500))
+    suite.extend([
+        TaskSpec("LANG_RU_VOWEL", 1, (RU,), lambda c: int(c in RU_VOWELS),
                  family="language"),
     ])
     return suite
@@ -2332,7 +2351,9 @@ def synthesize_batched_mdl_v9(
     """Vectorized Batched MDL + O(1) Meet-in-the-Middle + Call-DAG Synthesis."""
     X = np.asarray(train_x, dtype=np.int64)
     Y = np.asarray(train_y, dtype=np.int64)
-    if X.size and int(np.max(np.abs(X))) > 128:
+    if X.size and int(np.max(np.abs(X))) > 2048:
+        # input magnitude cap: byte pool (0..255) and cyrillic codepoints
+        # (0x400..) must pass; intermediate-value safety stays with MAG_CAP
         return None, 0
     N = X.shape[0]
     leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [ExprV9.const(c) for c in CONSTS]
