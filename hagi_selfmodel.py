@@ -173,8 +173,18 @@ class SelfOptimizingProcessorV9(TracedProcessorV9):
         self.policy_overrides = 0
 
     def learn(self, spec, seed=0, **kw):
-        self.node_budget = optimized_budget_policy(
-            self.self_model, spec, self, self.base_budget, self.floor_budget)
+        # Honor an explicit experimental policy override. The original code
+        # attached this callback in the no-predictor fallback but never called
+        # it, so the advertised naive optimization was not actually applied.
+        override = getattr(self, "optimized_budget_policy", None)
+        if override is None:
+            budget = optimized_budget_policy(
+                self.self_model, spec, self, self.base_budget, self.floor_budget)
+        else:
+            budget = override(spec, self, self.base_budget, self.floor_budget)
+        self.node_budget = max(1, min(self.base_budget, int(budget)))
+        if self.node_budget < self.base_budget:
+            self.policy_overrides += 1
         ev = super().learn(spec, seed=seed, **kw)
         return ev
 
