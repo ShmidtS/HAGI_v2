@@ -412,7 +412,8 @@ def _first_divergence(incumbent, opt) -> Optional[dict]:
 
 
 def run_self_development(max_rounds: int = 4,
-                         base_budget: int = 20000,
+                         base_budget: int = 200000,  # 64-bit safe: evals are Python/numpy int64,
+                         # intermediate values guarded by MAG_CAP=2^28 in the vectorized evaluator
                          floor_budget: int = 200,
                          proposals_per_round: int = 10,
                          workers: int = 0,
@@ -592,7 +593,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=0,
                    help="parallel workers (0 = all CPUs, capped at 32)")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--floor-ladder", type=int, nargs="*", default=[200, 50, 20],
+    p.add_argument("--floor-ladder", type=int, nargs="*", default=[2000, 200, 50, 20],
                    help="certified lever-change schedule for the floor budget")
     p.add_argument("--json", action="store_true")
     a = p.parse_args()

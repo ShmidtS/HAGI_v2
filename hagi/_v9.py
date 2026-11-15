@@ -3054,7 +3054,7 @@ class GrowingHagiProcessorV9:
         lib_list = [(ex_idx[nm], nm, self.experts[nm]) for nm in self.experts]
         hit_expr, n_chk = synthesize_batched_mdl_v9(
             spec.arity, train_x, train_y, val_x, val_y,
-            library_experts=lib_list, max_evals=self.node_budget, max_bits=92, deadline=deadline,
+            library_experts=lib_list, max_evals=self.node_budget, max_bits=160, deadline=deadline,  # 64-bit headroom (gamma-coded)
         )
         self.candidates_generated += n_chk
         if hit_expr is not None:
