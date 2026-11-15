@@ -93,6 +93,7 @@ class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
                            poison_one_label=poison_one_label,
                            train_neural=train_neural, deadline=deadline)
         self.trace.append({**feats,
+                           "seed": int(seed),
                            "success": 1 if ev["action"] == "COMMIT" else 0,
                            "cost": min(self.candidates_generated - c0, 3000),
                            "seconds": round(time.perf_counter() - t0, 4),

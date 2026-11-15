@@ -5,7 +5,8 @@ on:
     branches:
       - experiment/selfmodel-20261115
     paths:
-      - hagi.py
+      - hagi/
+      - hagi_selfloop.py
       - hagi_selfmodel.py
       - hagi_selfexperiment.py
       - scripts/run_selfmodel_experiment.py
