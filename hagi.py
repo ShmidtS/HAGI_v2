@@ -8837,6 +8837,48 @@ def self_test_v9() -> None:
 # UNIFIED CLI
 # ==============================================================================
 
+def _benchmark() -> None:
+    """v9 benchmark: exact symbolic suite + neural adapter quality + memory footprint.
+
+    Reports file-size, resident tensor bytes (real parameter memory, unlike the
+    seed-compressed neural_bytes payload), wall time, and exact accuracy.
+    """
+    import statistics as _stat
+    suite = make_task_suite()
+    model = GrowingHagiProcessorV9(node_budget=8000)
+    t0 = time.time()
+    for i, sp in enumerate(suite):
+        model.learn(sp, seed=10_000 + i, train_neural=True)
+    learn_elapsed = time.time() - t0
+    check = model.verify_all(suite)
+    t0 = time.time()
+    rep = grow_v9(model, suite, max_rounds=2, out_dir=".omc/v9_bench")
+    grow_elapsed = time.time() - t0
+    nq = model.neural_quality_summary()
+    resident = sum(int(v.nbytes) for v in model.__dict__.values()
+                   if isinstance(v, np.ndarray))
+    core = model.core
+    resident_core = sum(int(a.nbytes) for a in vars(core).values()
+                        if isinstance(a, np.ndarray))
+    resident_core += sum(int(a.nbytes) for a in vars(core.gpm).values()
+                         if isinstance(a, np.ndarray))
+    result = {
+        "version": V9_VERSION,
+        "exact_committed": check["committed"], "exact_accuracy": check["accuracy"],
+        "experts_after_growth": rep["experts"], "theorems": rep["theorems"],
+        "neural_val_acc": round(nq["mean_val_exact_acc"], 4),
+        "neural_val_mse": round(nq["mean_val_mse"], 4),
+        "neural_payload_bytes": nq["total_neural_bytes"],
+        "resident_tensor_bytes_core": resident_core,
+        "resident_tensor_bytes_model": resident + resident_core,
+        "file_bytes": Path(__file__).stat().st_size,
+        "learn_suite_seconds": round(learn_elapsed, 2),
+        "grow_2rounds_seconds": round(grow_elapsed, 2),
+        "certs_ok": model.verify_certificates()["all_ok"],
+    }
+    print(json.dumps(result, indent=2))
+
+
 if __name__ == "__main__":
     _p = argparse.ArgumentParser(description="HAGI unified single-file build (v5+v7.4+v8.4+v9)")
     _p.add_argument("--self-test", action="store_true", help="v8.4 self-test")
