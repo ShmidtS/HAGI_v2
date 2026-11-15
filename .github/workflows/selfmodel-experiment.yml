@@ -1,0 +1,63 @@
+name: HAGI self-model experiment
+
+on:
+  push:
+    branches:
+      - experiment/selfmodel-20261115
+    paths:
+      - hagi.py
+      - hagi_selfmodel.py
+      - scripts/run_selfmodel_experiment.py
+      - .github/workflows/selfmodel-experiment.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hagi-selfmodel-experiment
+  cancel-in-progress: false
+
+jobs:
+  derive-and-optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out experiment branch
+        uses: actions/checkout@v4
+        with:
+          ref: experiment/selfmodel-20261115
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install minimal runtime
+        run: python -m pip install --disable-pip-version-check numpy
+
+      - name: Run TRACE → DERIVE → OPTIMIZE → GATE
+        id: experiment
+        continue-on-error: true
+        run: python scripts/run_selfmodel_experiment.py
+
+      - name: Publish experiment report to this branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f experiments/selfmodel_result.json ]; then
+            echo "Experiment did not produce a report file."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add experiments/selfmodel_result.json
+          if git diff --cached --quiet; then
+            echo "No report changes to publish."
+          else
+            git commit -m "experiment: publish self-model results [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
