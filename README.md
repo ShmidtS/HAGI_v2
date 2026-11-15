@@ -41,6 +41,12 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
   execute_text() прогоняет живой UTF-8 текст (кириллица, эмодзи)
   через байтовые шифры (XOR round-trip работает), CLI для прямой
   инференции.
+- `hagi_ingest.py` — обучение на ЛЮБЫХ данных: числовые CSV/TSV/JSON
+  (каждая пара столбцов проверяется на детерминированность y=f(x),
+  затем индукция точной программы, покрывающей 100% данных) и любые
+  файлы как байты (детерминированное подмножество prev→next).
+  Демо: физический закон 20−5t² восстановлен точным полиномом из
+  sensor.csv; неоднозначные пары честно HOLD.
 - `scripts/run_selfmodel_experiment.py` — CI-прогон self-model.
 - `tests/test_characterization.py` — characterization-гварды.
 - `experiments/selfloop_result.json` — последний отчёт цикла.
@@ -100,6 +106,7 @@ python -X utf8 -u hagi_selfrewrite.py --rounds 10      # рост + self-rewrite
 python -X utf8 -u hagi_selfrewrite.py --resume --rounds 10  # автономный рестарт
 python hagi_execute.py --list                        # все написанные программы
 python hagi_execute.py --task LANG8_XOR_CIPHER --text "привет" --key 42
+python hagi_ingest.py path/to/data.csv      # учиться на любых данных
 ```
 
 ## Принципы

@@ -129,3 +129,18 @@ def test_execute_programs(tmp_path):
     assert dec == "executor ok"
     assert hx.execute("GCD", 12, 18) == 6
     assert hx.execute_text("LANG8_CAESAR1", "abc") == "bcd"
+
+
+def test_ingest_data(tmp_path):
+    """Learning from arbitrary data files: a CSV column law is recovered
+    as an exact program; non-functional pairs hold honestly."""
+    (tmp_path / "s.csv").write_text(
+        "t,h\n" + "\n".join(f"{t},{20 - 5 * t * t}" for t in range(-8, 9)),
+        encoding="utf-8")
+    from hagi_ingest import ingest_file, tasks_from_numeric_file
+    tasks = tasks_from_numeric_file(tmp_path / "s.csv")
+    assert any(t.name == "INGEST_s_t_to_h" for t in tasks)
+    p = hagi.GrowingHagiProcessorV9(node_budget=200000)
+    ev = p.learn(tasks[0], seed=10_000)
+    assert ev["action"] == "COMMIT"
+    assert p.verify_all([tasks[0]])["accuracy"] == 1.0
