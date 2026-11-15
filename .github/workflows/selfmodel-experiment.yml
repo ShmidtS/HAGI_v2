@@ -7,6 +7,7 @@ on:
     paths:
       - hagi.py
       - hagi_selfmodel.py
+      - hagi_selfexperiment.py
       - scripts/run_selfmodel_experiment.py
       - .github/workflows/selfmodel-experiment.yml
   workflow_dispatch:
