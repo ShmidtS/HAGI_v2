@@ -1,20 +1,13 @@
 name: HAGI self-model experiment
 
+# manual only — no automatic runs, no auto-commits (removed 2026-11-15
+# at maintainer request; bot-authored result-publish commits were
+# stripped from history in the same change)
 on:
-  push:
-    branches:
-      - experiment/selfmodel-20261115
-    paths:
-      - hagi/
-      - hagi_selfloop.py
-      - hagi_selfmodel.py
-      - hagi_selfexperiment.py
-      - scripts/run_selfmodel_experiment.py
-      - .github/workflows/selfmodel-experiment.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hagi-selfmodel-experiment
@@ -44,22 +37,3 @@ jobs:
         id: experiment
         continue-on-error: true
         run: python scripts/run_selfmodel_experiment.py
-
-      - name: Publish experiment report to this branch
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ ! -f experiments/selfmodel_result.json ]; then
-            echo "Experiment did not produce a report file."
-            exit 1
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add experiments/selfmodel_result.json
-          if git diff --cached --quiet; then
-            echo "No report changes to publish."
-          else
-            git commit -m "experiment: publish self-model results [skip ci]"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          fi
