@@ -50,11 +50,9 @@ def _dedup_forever() -> None:
     PS_DEDUP.write_text(
         "$f = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
         "| Where-Object {$_.CommandLine -match 'selfrewrite'} "
-        "| Sort-Object CreationDate)
-"
+        "| Sort-Object CreationDate)\n"
         "if ($f.Count -gt 1) { $f | Select-Object -Skip 1 "
-        "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }
-")
+        "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }\n")
     subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy",
                     "Bypass", "-File", str(PS_DEDUP)], capture_output=True)
 
