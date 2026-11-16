@@ -22,7 +22,8 @@ def _forever_alive() -> bool:
     PS_DETECT.parent.mkdir(parents=True, exist_ok=True)
     PS_DETECT.write_text(
         "$c = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
-        "| Where-Object {$_.CommandLine -match 'selfrewrite'}).Count\n")
+        "| Where-Object {$_.CommandLine -match 'selfrewrite'})\n"
+        "$c.Count\n")
     out = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
          "-File", str(PS_DETECT)], capture_output=True, text=True).stdout.strip()
