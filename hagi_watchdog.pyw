@@ -97,8 +97,7 @@ def main() -> None:
             alive = _forever_alive()
             if n % 12 == 1:  # heartbeat every hour
                 with open(LOG, "a", encoding="utf-8") as fh:
-                    fh.write(f"[watchdog] alive checks={n} forever={alive}
-")
+                    fh.write(f"[watchdog] alive checks={n} forever={alive}\n")
             if not alive or _log_stale():
                 _start_forever()
         except Exception as e:
