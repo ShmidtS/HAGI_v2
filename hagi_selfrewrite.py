@@ -26,6 +26,8 @@ CLI:
 """
 from __future__ import annotations
 
+import re
+
 import argparse
 import json
 import pickle
@@ -66,7 +68,9 @@ def transpile(e, names: tuple[str, ...] = VAR_NAMES) -> str:
     if op == "const":
         return repr(int(e.value))
     if op == "call":
-        return f"{e.value}({', '.join(transpile(a, names) for a in e.args)})"
+        callee = _fn_hash(e.value) if re.fullmatch(
+            r"[A-Z][A-Za-z0-9_]*", str(e.value)) else str(e.value)
+        return f"{callee}({', '.join(transpile(a, names) for a in e.args)})"
     if op == "anf":
         n_vars, coeffs = e.value
         if not coeffs:
