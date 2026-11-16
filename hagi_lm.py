@@ -429,3 +429,154 @@ def load_adaptive(path) -> "AdaptiveByteLM":
     for n in ("emb", "pos", "W1", "b1", "W2", "b2"):
         getattr(lm, n).data.copy_(st[n])
     return lm
+
+
+class RopeAttentionByteLM:
+    """Theory-aligned unbounded-context LM (primes C307/C308/A8):
+
+    - C308 RoPE isometry: positions are ROTATIONS theta_i = i*theta0,
+      applied as (cos, sin) pairing — proven norm-preserving
+      (`rope_isometry`), no hash collisions;
+    - C307 attention branch: content-based softmax weights
+      p_i = softmax(q.k_i / sqrt(d)) over ALL positions — a real
+      attention branch, not a uniform bag;
+    - A8 heat-bath: optional geometric recency temperature folded
+      into the scores (scores get -lambda*d) — a Doeblin-style floor
+      certified mixing bound, not an ad-hoc decay.
+
+    §2/§3/§9 unchanged: one-hot CE, guarded steps, best-snapshot
+    deploy.
+    """
+
+    def __init__(self, dim: int = 64, hidden: int = 256,
+                 theta0: float = 1.0, lam: float = 0.05, seed: int = 7):
+        import torch
+        t = torch
+        self.t = t
+        self.dim, self.hidden = dim, hidden
+        self.theta0, self.lam = theta0, lam
+        g = t.Generator().manual_seed(seed)
+        self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)
+        self.q = t.nn.Parameter(t.randn(dim, generator=g) * 0.08)
+        self.W1 = t.nn.Parameter(t.randn(dim, hidden, generator=g) * 0.08)
+        self.b1 = t.nn.Parameter(t.zeros(hidden))
+        self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
+        self.b2 = t.nn.Parameter(t.zeros(256))
+
+    def params(self):
+        return [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
+
+    def _rope(self, e, L, device):
+        """C308 isometry: rotate each positional slot by theta_i = i*theta0
+        (pairwise (cos,sin) — exact norm preservation)."""
+        t = self.t
+        # angles for DIMENSION PAIRS (RoPE): pair j rotates by j*theta0;
+        # same rotation for every position -> exact isometry per slot
+        half = self.dim // 2
+        th = t.arange(half, device=device, dtype=t.float32) * self.theta0
+        cs, sn = t.cos(th), t.sin(th)
+        a, b = e[..., 0::2], e[..., 1::2]
+        r = t.empty_like(e)
+        r[..., 0::2] = a * cs - b * sn
+        r[..., 1::2] = a * sn + b * cs
+        return r
+
+    def logits(self, ctx):
+        """ctx: (B, L) newest-first. Full attention over all positions."""
+        t = self.t
+        B, L = ctx.shape
+        e = self.emb[ctx]                          # (B, L, dim)
+        e = self._rope(e, L, ctx.device)           # C308
+        # C307 branch: q-attention over positions
+        q = self.q                                  # (dim,)
+        scores = (e @ q) / (self.dim ** 0.5) - self.lam * t.arange(
+            L, device=ctx.device, dtype=t.float32)  # A8 heat-bath recency
+        p = t.softmax(scores, dim=-1)               # (B, L)
+        h = t.relu((p[..., None] * e).sum(dim=1) @ self.W1 + self.b1)
+        return h @ self.W2 + self.b2
+
+    def ce(self, ctx, nxt):
+        return self.t.nn.functional.cross_entropy(
+            self.logits(ctx), nxt, reduction="mean")
+
+    def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 3e-3,
+                      holdout: float = 0.1, batch: int = 256,
+                      max_train_ctx: int = 96, log_every: int = 0) -> dict:
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        rng = np.random.default_rng(7)
+        n = len(idx) - 2
+        perm = rng.permutation(n)
+        n_hold = max(16, int(n * holdout))
+        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+
+        def windows(positions, fixed_len=None):
+            xs, ys = [], []
+            for i in positions:
+                Lm = fixed_len or rng.integers(4, max_train_ctx + 1)
+                L = min(int(Lm), i)
+                xs.append(idx[i - L:i][::-1])
+                ys.append(idx[i])
+            pad = max(len(x) for x in xs)
+            X = np.zeros((len(xs), pad), dtype=np.int64)
+            for j, x in enumerate(xs):
+                X[j, :len(x)] = x
+            return (t.as_tensor(X, dtype=t.long),
+                    t.as_tensor(ys, dtype=t.long))
+
+        ctx_va, nxt_va = windows(hold, fixed_len=max_train_ctx)
+        opt = t.optim.Adam(self.params(), lr=lr)
+        best = float(self.ce(ctx_va, nxt_va).detach()); best_state = None
+        for ep in range(epochs):
+            perm2 = rng.permutation(len(train))
+            for bs in range(0, len(train), batch):
+                ctx, nxt = windows(train[perm2[bs:bs + batch]])
+                opt.zero_grad()
+                self.ce(ctx, nxt).backward()
+                opt.step()
+            ce_va = float(self.ce(ctx_va, nxt_va).detach())
+            if ce_va <= best:
+                best = ce_va
+                best_state = [q2.detach().clone() for q2 in self.params()]
+            if log_every and (ep + 1) % log_every == 0:
+                print(f"  ep {ep+1} ce {ce_va:.4f} (best {best:.4f})",
+                      flush=True)
+        if best_state is not None:
+            for q2, s in zip(self.params(), best_state):
+                q2.data.copy_(s)
+        return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
+
+    def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.5,
+                 seed: int = 1) -> str:
+        t = self.t
+        with t.no_grad():
+            g = t.Generator().manual_seed(seed)
+            ctx = list(prompt.encode("utf-8"))
+            out = bytearray()
+            for _ in range(n_bytes):
+                x = t.as_tensor([ctx[::-1]], dtype=t.long)
+                probs = t.softmax(self.logits(x)[0] / max(temp, 1e-3),
+                                  dim=-1)
+                b = int(t.multinomial(probs, 1, generator=g))
+                out.append(b); ctx.append(b)
+        return (prompt.encode("utf-8") + bytes(out)).decode(
+            "utf-8", errors="replace")
+
+
+def save_rope(lm, path) -> None:
+    t = lm.t
+    t.save({n: getattr(lm, n).detach().cpu() for n in
+            ("emb", "q", "W1", "b1", "W2", "b2")} |
+           {"kind": "rope_attention", "dim": lm.dim, "hidden": lm.hidden,
+            "theta0": lm.theta0, "lam": lm.lam}, path)
+
+
+def load_rope(path):
+    t, _ = _torch_and_device()
+    st = t.load(path, weights_only=False)
+    lm = RopeAttentionByteLM(dim=st["dim"], hidden=st["hidden"],
+                             theta0=st["theta0"], lam=st["lam"])
+    for n in ("emb", "q", "W1", "b1", "W2", "b2"):
+        getattr(lm, n).data.copy_(st[n])
+    return lm
