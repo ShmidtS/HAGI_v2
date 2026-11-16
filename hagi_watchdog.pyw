@@ -40,6 +40,25 @@ def _log_stale() -> bool:
         return False
 
 
+PS_DEDUP = ROOT / "checkpoints/self/dedup.ps1"
+
+
+def _dedup_forever() -> None:
+    """If >1 forever mains are alive, keep the oldest, kill the rest
+    (two writers on one state file corrupt the loop)."""
+    PS_DEDUP.parent.mkdir(parents=True, exist_ok=True)
+    PS_DEDUP.write_text(
+        "$f = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
+        "| Where-Object {$_.CommandLine -match 'selfrewrite'} "
+        "| Sort-Object CreationDate)
+"
+        "if ($f.Count -gt 1) { $f | Select-Object -Skip 1 "
+        "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }
+")
+    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy",
+                    "Bypass", "-File", str(PS_DEDUP)], capture_output=True)
+
+
 def _start_forever() -> int:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(
@@ -74,6 +93,7 @@ def main() -> None:
     LOCK.write_text(str(os.getpid()))
     while True:
         try:
+            _dedup_forever()
             if not _forever_alive() or _log_stale():
                 _start_forever()
         except Exception as e:
