@@ -320,6 +320,18 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
     return report
 
 
+def _self_edit_guarded(cycle: int) -> None:
+    """Each cycle: Nadya proposes a patch to her own learning knobs;
+    certified gate (benchmark no-regression) decides adoption."""
+    try:
+        import hagi_selfedit
+        res = hagi_selfedit.self_edit_cycle(seed=cycle)
+        print(f"[self-edit] {res.get('decision')}: {res.get('patch')}",
+              flush=True)
+    except Exception as e:  # self-edit failure never stops the loop
+        print(f"[self-edit] skipped: {e!r}", flush=True)
+
+
 def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
@@ -355,6 +367,7 @@ def main() -> None:
                   f"rewrites={rep['self_state']['rewrites']} "
                   f"{rep['seconds']}s", flush=True)
             _retrain_lm_guarded(a.state_dir)
+            _self_edit_guarded(cycle)
             _time.sleep(1)
     rep = run(a.rounds, a.state_dir, workers=a.workers, resume=a.resume)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
