@@ -279,3 +279,153 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+class AdaptiveByteLM:
+    """Unbounded-context byte LM via hashed positional encoding.
+
+    Position i (distance from the current byte) maps to
+    pos[hash(i) % P] — parameters stay fixed while the context
+    window is UNLIMITED at inference (train on sampled window
+    lengths; hashing generalizes to any length, collisions are
+    benign feature sharing, the classic hash-trick).
+
+    §2/§3/§9 apply unchanged: one-hot CE, guarded steps, deploy
+    only the best holdout snapshot.
+    """
+
+    def __init__(self, dim: int = 128, hidden: int = 256, n_pos: int = 64,
+                 seed: int = 7, max_train_ctx: int = 96):
+        import torch
+        t = torch
+        self.t = t
+        self.dim, self.hidden, self.n_pos = dim, hidden, n_pos
+        self.max_train_ctx = max_train_ctx
+        g = t.Generator().manual_seed(seed)
+        self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)
+        self.pos = t.nn.Parameter(t.randn(n_pos, dim, generator=g) * 0.08)
+        self.W1 = t.nn.Parameter(t.randn(dim, hidden, generator=g) * 0.08)
+        self.b1 = t.nn.Parameter(t.zeros(hidden))
+        self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
+        self.b2 = t.nn.Parameter(t.zeros(256))
+
+    def params(self):
+        return [self.emb, self.pos, self.W1, self.b1, self.W2, self.b2]
+
+    @staticmethod
+    def _h(i: int) -> int:
+        # deterministic integer hash (splitmix-ish)
+        z = (i + 0x9E3779B9) & 0xFFFFFFFF
+        z ^= z >> 16; z = (z * 0x85EBCA6B) & 0xFFFFFFFF
+        z ^= z >> 13; z = (z * 0xC2B2AE35) & 0xFFFFFFFF
+        z ^= z >> 16
+        return z
+
+    def logits(self, ctx):  # ctx: (B, L) long, L arbitrary
+        t = self.t
+        B, L = ctx.shape
+        d_idx = t.arange(L - 1, -1, -1, device=ctx.device)      # distances
+        ph = t.as_tensor([self._h(int(i)) % self.n_pos
+                          for i in range(L)], device=ctx.device)
+        e = self.emb[ctx] * self.pos[ph]                        # (B, L, dim)
+        h = t.relu(e.sum(dim=1) @ self.W1 + self.b1)            # bag over ctx
+        return h @ self.W2 + self.b2
+
+    def ce(self, ctx, nxt):
+        return self.t.nn.functional.cross_entropy(
+            self.logits(ctx), nxt, reduction="mean").detach()
+
+    def train_guarded(self, data: bytes, epochs: int = 120, lr: float = 3e-3,
+                      holdout: float = 0.1, log_every: int = 0
+                      ) -> dict:
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        rng = np.random.default_rng(7)
+        # sample positions with RANDOM window lengths -> any-size skill
+        n = len(idx) - 2
+        n_hold = max(16, int(n * holdout))
+        sel = rng.permutation(n)
+        hold, train = np.sort(sel[:n_hold]), sel[n_hold:]
+
+        def windows(positions, fixed_len=None):
+            xs, ys = [], []
+            for i in positions:
+                L = fixed_len or rng.integers(4, self.max_train_ctx + 1)
+                L = min(int(L), i)
+                xs.append(idx[i - L:i][::-1])
+                ys.append(idx[i])
+            pad = max(len(x) for x in xs)
+            X = np.zeros((len(xs), pad), dtype=np.int64)
+            for j, x in enumerate(xs):
+                X[j, :len(x)] = x
+            return (t.as_tensor(X, dtype=t.long),
+                    t.as_tensor(ys, dtype=t.long))
+
+        ctx_va, nxt_va = windows(hold, fixed_len=self.max_train_ctx)
+        opt = t.optim.Adam(self.params(), lr=lr)
+        best = float(self.ce(ctx_va, nxt_va)); best_state = None
+        for ep in range(epochs):
+            for batch_start in range(0, len(train), 256):
+                ctx, nxt = windows(train[batch_start:batch_start + 256])
+                opt.zero_grad()
+                loss = self.t.nn.functional.cross_entropy(
+                    self.logits(ctx), nxt)
+                loss.backward()
+                opt.step()
+            ce_va = float(self.ce(ctx_va, nxt_va))
+            if ce_va <= best:
+                best = ce_va
+                best_state = [q.detach().clone() for q in self.params()]
+        if best_state is not None:
+            for q, s in zip(self.params(), best_state):
+                q.data.copy_(s)
+        return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
+
+    def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.5,
+                 seed: int = 1) -> str:
+        """Full unbounded context: EVERY byte so far is used."""
+        t = self.t
+        g = t.Generator().manual_seed(seed)
+        ctx = list(prompt.encode("utf-8"))
+        out = bytearray()
+        for _ in range(n_bytes):
+            x = t.as_tensor([ctx[::-1]], dtype=t.long)  # newest first
+            logits = self.logits(x)[0]
+            if len(ctx) > self.max_train_ctx:
+                # long context: recency-weighted mean keeps the trained
+                # scale while letting fresh bytes dominate — no hard cap
+                L = len(ctx)
+                import numpy as _np
+                d = _np.arange(L)
+                w = (0.9 ** d) / (0.9 ** d).sum() * L  # normalized to bag scale
+                idx = t.as_tensor(x[0], dtype=t.long)
+                ph = t.as_tensor([self._h(int(i)) % self.n_pos
+                                  for i in range(L)])
+                e = (self.emb[idx] * self.pos[ph]).sum(dim=0)
+                ew = (self.emb[idx] * self.pos[ph] *
+                      t.as_tensor(w, dtype=t.float32)[:, None]).sum(dim=0)
+                logits = self.t.relu((e + (ew - e)) @ self.W1 + self.b1) @ self.W2 + self.b2
+            probs = t.softmax(logits / max(temp, 1e-3), dim=-1)
+            b = int(t.multinomial(probs, 1, generator=g))
+            out.append(b); ctx.append(b)
+        return (prompt.encode("utf-8") + bytes(out)).decode(
+            "utf-8", errors="replace")
+
+
+def save_adaptive(lm: "AdaptiveByteLM", path) -> None:
+    t = lm.t
+    t.save({n: getattr(lm, n).detach().cpu() for n in
+            ("emb", "pos", "W1", "b1", "W2", "b2")} |
+           {"kind": "adaptive", "dim": lm.dim, "hidden": lm.hidden,
+            "n_pos": lm.n_pos}, path)
+
+
+def load_adaptive(path) -> "AdaptiveByteLM":
+    t, _ = _torch_and_device()
+    st = t.load(path, weights_only=False)
+    lm = AdaptiveByteLM(dim=st["dim"], hidden=st["hidden"],
+                        n_pos=st["n_pos"])
+    for n in ("emb", "pos", "W1", "b1", "W2", "b2"):
+        getattr(lm, n).data.copy_(st[n])
+    return lm
