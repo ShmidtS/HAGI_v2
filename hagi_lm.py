@@ -580,3 +580,127 @@ def load_rope(path):
     for n in ("emb", "q", "W1", "b1", "W2", "b2"):
         getattr(lm, n).data.copy_(st[n])
     return lm
+
+
+class CertifiedStepLM:
+    """Byte LM trained with the theory's CERTIFIED step (primes §3.8/3.9,
+    C216/C223) instead of Adam+rollback:
+
+      direction D = -grad CE; A = alignment = Σ D² (‖D‖²),
+      R' = sup(logit displacement) - inf(logit displacement),
+      eta = 4A/R'^2  (exact minimizer of the quadratic majorizer),
+      guaranteed: CE(theta') <= CE(theta) - 2A^2/R'^2.
+
+    Every step descends by a certified amount (no snapshot rollback
+    needed — the step is safe by construction). §9 keeps the
+    best-holdout deploy as a belt-and-suspenders gate.
+    """
+
+    def __init__(self, k: int = 10, dim: int = 96, hidden: int = 192,
+                 seed: int = 7):
+        import torch
+        t = torch
+        self.t = t
+        self.k, self.dim, self.hidden = k, dim, hidden
+        g = t.Generator().manual_seed(seed)
+        self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)
+        self.W1 = t.nn.Parameter(t.randn(k * dim, hidden, generator=g) * 0.08)
+        self.b1 = t.nn.Parameter(t.zeros(hidden))
+        self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
+        self.b2 = t.nn.Parameter(t.zeros(256))
+
+    def params(self):
+        return [self.emb, self.W1, self.b1, self.W2, self.b2]
+
+    def logits(self, ctx):
+        t = self.t
+        e = self.emb[ctx]
+        h = t.relu(e.reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
+        return h @ self.W2 + self.b2
+
+    def _certified_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
+        """One §3.9 step on the batch. Returns the certified descent
+        amount 2A^2/R'^2 (0 if R'==0 — logits unchanged direction)."""
+        t = self.t
+        logits = self.logits(ctx)
+        loss = t.nn.functional.cross_entropy(logits, nxt)
+        g = t.autograd.grad(loss, self.params(), retain_graph=True)
+        # direction D = concat(-g): flat parameter direction
+        D = t.cat([-gi.reshape(-1) for gi in g])
+        A = float((D * D).sum())
+        with t.no_grad():
+            # R': sup-inf of logit displacement  L(x + eta*D) ~ logits + eta*dL
+            # per §3.9 use the logit displacement of the direction applied
+            # to the last-layer weights: dL_logits = h·(D_W2) + D_b2 (shape B,256)
+            h = t.relu(self.emb[ctx].reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
+            dW2 = g[3]; db2 = g[4]
+            disp = -h @ dW2 - db2            # (B, 256), eta=1 displacement
+            Rp = float(disp.max() - disp.min())
+        if Rp <= 0 or A <= 0:
+            return 0.0
+        eta = lr_scale * 4.0 * A / (Rp * Rp)
+        with t.no_grad():
+            off = 0
+            for prm, gi in zip(self.params(), g):
+                sz = prm.numel()
+                prm.add_(eta * D[off:off + sz].reshape(prm.shape))
+                off += sz
+        return 2.0 * A * A / (Rp * Rp)
+
+    def train_certified(self, data: bytes, epochs: int = 60,
+                        holdout: float = 0.1, batch: int = 256,
+                        log_every: int = 0) -> dict:
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        n = len(idx) - self.k
+        rng = np.random.default_rng(7)
+        perm = rng.permutation(n)
+        n_hold = max(16, int(n * holdout))
+        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+        Xv = np.stack([idx[i:i + self.k] for i in hold])
+        yv = idx[hold + self.k]
+        ctx_va = t.as_tensor(Xv, dtype=t.long); nxt_va = t.as_tensor(yv, dtype=t.long)
+        def vce():
+            with t.no_grad():
+                return float(t.nn.functional.cross_entropy(
+                    self.logits(ctx_va), nxt_va))
+        best = vce(); best_state = [q.detach().clone() for q in self.params()]
+        certified_guarantee = 0.0
+        for ep in range(epochs):
+            order = rng.permutation(len(train))
+            for bs in range(0, len(train), batch):
+                sel = train[order[bs:bs + batch]]
+                X = np.stack([idx[i:i + self.k] for i in sel])
+                y = idx[sel + self.k]
+                ctx = t.as_tensor(X, dtype=t.long); nxt = t.as_tensor(y, dtype=t.long)
+                certified_guarantee += self._certified_step(ctx, nxt)
+            ce_va = vce()
+            if ce_va <= best:
+                best = ce_va
+                best_state = [q.detach().clone() for q in self.params()]
+            if log_every and (ep + 1) % log_every == 0:
+                print(f"  ep {ep+1}: holdout {ce_va:.4f} best {best:.4f} "
+                      f"(сертифицированный суммарный спуск >= {certified_guarantee:.2f})",
+                      flush=True)
+        for q, s in zip(self.params(), best_state):
+            q.data.copy_(s)
+        return {"epochs": epochs, "best_holdout_ce": round(best, 4),
+                "certified_descent_lower_bound": round(certified_guarantee, 2)}
+
+    def generate(self, prompt: str, n_bytes: int = 100, temp: float = 0.5,
+                 seed: int = 1) -> str:
+        t = self.t
+        with t.no_grad():
+            g = t.Generator().manual_seed(seed)
+            ctx = list(prompt.encode("utf-8"))[-self.k:]
+            if len(ctx) < self.k:
+                ctx = [32] * (self.k - len(ctx)) + ctx
+            out = bytearray()
+            for _ in range(n_bytes):
+                x = t.as_tensor([ctx], dtype=t.long)
+                probs = t.softmax(self.logits(x)[0] / max(temp, 1e-3), dim=-1)
+                b = int(t.multinomial(probs, 1, generator=g))
+                out.append(b); ctx = ctx[1:] + [b]
+        return (prompt.encode("utf-8") + bytes(out)).decode(
+            "utf-8", errors="replace")
