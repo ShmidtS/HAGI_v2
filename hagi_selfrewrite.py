@@ -271,6 +271,21 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
 
     # the rewrite: model persists itself + its programs
     inc_path.write_bytes(pickle.dumps(final_proc))
+    # self-optimization (MDL): prune duplicates/pseudo-args, keep the
+    # call DAG intact, re-validate everything exactly; full library
+    # is kept as incumbent_full.pkl
+    try:
+        import hagi_selfoptimize as _opt
+        _res = _opt.prune_library(final_proc)
+        _new, _fails = _opt.apply_prune(final_proc, _res["keep"])
+        if _fails == 0 and len(_new.experts) < len(final_proc.experts):
+            inc_full = state_dir / "incumbent_full.pkl"
+            inc_full.write_bytes(pickle.dumps(final_proc))
+            final_proc = _new
+            inc_path.write_bytes(pickle.dumps(final_proc))
+        report["self_optimize"] = _res["report"]
+    except Exception as e:  # optimization must never break the loop
+        report["self_optimize"] = {"skipped": repr(e)[:80]}
     report["programs"] = export_programs(final_proc, state_dir)
     state = {
         "rounds_done": (prior or {}).get("rounds_done", 0)
