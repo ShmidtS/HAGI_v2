@@ -119,7 +119,7 @@ class ByteLM:
         ctx_tr, nxt_tr = windows(train)
         ctx_va, nxt_va = windows(hold)
         opt = t.optim.Adam(self.params(), lr=lr)
-        best_ce = float(self.ce(ctx_va, nxt_va))
+        best_ce = float(self.ce(ctx_va, nxt_va).detach())
         best_state = None
         history = []
         for ep in range(epochs):
@@ -127,7 +127,7 @@ class ByteLM:
             loss = self.ce(ctx_tr, nxt_tr)
             loss.backward()
             opt.step()
-            ce_va = float(self.ce(ctx_va, nxt_va))
+            ce_va = float(self.ce(ctx_va, nxt_va).detach())
             history.append(round(ce_va, 4))
             # §3: accept the step only if holdout CE did not increase
             if ce_va <= best_ce:
