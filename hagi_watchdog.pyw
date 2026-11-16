@@ -21,7 +21,7 @@ PS_DETECT = ROOT / "checkpoints/self/detect.ps1"
 def _forever_alive() -> bool:
     PS_DETECT.parent.mkdir(parents=True, exist_ok=True)
     PS_DETECT.write_text(
-        "(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
+        "$c = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
         "| Where-Object {$_.CommandLine -match 'selfrewrite'}).Count\n")
     out = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
