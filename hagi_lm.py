@@ -143,6 +143,66 @@ class ByteLM:
         return {"epochs": epochs, "best_holdout_ce": round(best_ce, 4),
                 "history": history}
 
+
+    # ---- big-corpus minibatch training (guarded §3/§9) ----------
+    def train_minibatch(self, data: bytes, steps: int = 3000,
+                        batch: int = 512, lr: float = 1e-3,
+                        val_every: int = 200, holdout: float = 0.02,
+                        log_every: int = 500) -> dict[str, Any]:
+        """Sampled-window SGD for large corpora; the guarded chain
+        (§3/§9) stays: deploy only the best holdout-CE snapshot."""
+        t = self.t
+        dev = ("cuda" if t.cuda.is_available() else "cpu")
+        idx_np = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        n = len(idx_np) - self.k - 1
+        rng = np.random.default_rng(7)
+        n_hold = max(256, int(n * holdout))
+        hold_idx = rng.choice(n, n_hold, replace=False)
+        hold_set = set(hold_idx.tolist())
+        hold_np = np.sort(hold_idx)
+        for p_ in self.params():
+            p_.data = p_.data.to(dev)
+        def windows_np(sel):
+            x = np.stack([idx_np[i:i + self.k] for i in sel])
+            y = idx_np[sel + self.k]
+            return (t.as_tensor(x, dtype=t.long, device=dev),
+                    t.as_tensor(y, dtype=t.long, device=dev))
+        ctx_va, nxt_va = windows_np(hold_np)
+        opt = t.optim.Adam(self.params(), lr=lr)
+        sched = t.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+        def val_ce():
+            ces = []
+            for i in range(0, len(hold_np), 8192):
+                with t.no_grad():
+                    ces.append(self.ce(ctx_va[i:i+8192], nxt_va[i:i+8192])
+                               * len(ctx_va[i:i+8192]))
+            return float(sum(ces) / len(hold_np))
+        best_ce = val_ce(); best_state = None
+        history = []
+        for step in range(1, steps + 1):
+            sel = rng.integers(0, n, size=batch)
+            ctx, nxt = windows_np(sel)
+            opt.zero_grad()
+            loss = self.ce(ctx, nxt)
+            loss.backward()
+            opt.step(); sched.step()
+            if step % val_every == 0:
+                ce_va = val_ce(); history.append(round(ce_va, 4))
+                if ce_va <= best_ce:
+                    best_ce = ce_va
+                    best_state = [p_.detach().clone() for p_ in self.params()]
+                if log_every and step % log_every == 0:
+                    print(f"  step {step}/{steps} holdout CE {ce_va:.4f} "
+                          f"(best {best_ce:.4f})", flush=True)
+        if best_state is not None:
+            for p_, s in zip(self.params(), best_state):
+                p_.data.copy_(s)
+        rep = {"steps": steps, "corpus_bytes": len(data),
+               "best_holdout_ce": round(best_ce, 4), "history": history}
+        for p_ in self.params():
+            p_.data = p_.data.cpu()
+        return rep
+
     # ---- generation --------------------------------------------------
     @t_no_grad_if
     def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.8,

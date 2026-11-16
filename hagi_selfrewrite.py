@@ -277,6 +277,16 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         "experts": len(final_proc.experts),
         "wasted": total["final"]["wasted_candidates_on_holds"],
     }
+    # curriculum phase accounting (primes CurriculumCert, order-free)
+    import hagi_curriculum as _curr
+    adopted = total["final"]["adopted_rounds"] or 1
+    relief = adopted / (adopted + total["final"]["wasted_candidates_on_holds"])
+    prior_curr = (prior or {}).get("curriculum", [])
+    prior_curr.append({"phase": "GROW->DERIVE->OPTIMIZE->GATE",
+                       "delta": round(relief, 4),
+                       "d_cert": 0.02, "steps": adopted})
+    state["curriculum"] = prior_curr
+    _curr.certificate(state)
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False),
                           encoding="utf-8")
     report["self_state"] = {k: (v if k != "segments" else len(v))

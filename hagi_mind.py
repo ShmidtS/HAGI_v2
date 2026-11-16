@@ -47,8 +47,7 @@ _ROUTES: dict[str, tuple[str, callable]] = {
     r"^add (-?\d+) (-?\d+)$": ("ADD", lambda m: (int(m[1]), int(m[2]))),
     r"^xor (.+) (-?\d+)$": ("LANG8_XOR_CIPHER",
         lambda m: (m[1], int(m[2]))),
-    r"^caesar (.+) (-?\d+)$": ("LANG8_CAESAR1",
-        lambda m: (m[1], int(m[2]))),
+    r"^caesar (.+)$": ("LANG8_CAESAR1", lambda m: (m[1],)),
 }
 
 
@@ -59,9 +58,10 @@ def _exact_answer(query: str) -> tuple[str, str] | None:
         if not m:
             continue
         args = parse(m)
-        if prog in ("LANG8_XOR_CIPHER", "LANG8_CAESAR1"):
-            text, key = args
-            out = hx.execute_text(prog, text, key=key)
+        if prog in ("LANG8_XOR_CIPHER", "LANG8_CAESAR1", "LANG_ATBASH",
+                    "LANG8_SHIFT"):
+            text, key = args if len(args) == 2 else (args[0], None)
+            out = hx.execute_text(prog, text, key=key) if key is not None                 else hx.execute_text(prog, text)
         else:
             out = hx.execute(prog, *args)
         return prog, str(out)

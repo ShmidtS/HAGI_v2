@@ -89,3 +89,29 @@ SSOT теории: `C:\primes` (Lean 4.35 / Mathlib, 966 теорем, 0 sorry/a
 сводятся к доказанным implication-гейтам (CertifiedLoop/CommitGate) и
 инвариантам реестра (AuditLedger); заявленные свойства — ровно те, что
 следуют из теорем, не шире.
+
+
+## Сверка 2026-11-16: обновление теории (C291 → C331+)
+
+Другой агент расширил C:\primes. Новые применённые элементы:
+
+- **CurriculumCert (curriculum phase accounting)** — order-free
+  фазовый учёт Δᵢ/dᵢ (curriculumTotal, curriculumTotal_comm,
+  curriculum_phase_accounting). Портирован в `hagi_curriculum.py`;
+  каждый forever-цикл дописывает фазовую запись в self_state, 
+  сертификат order-free по построению. Тест
+  `test_curriculum_certificate` проверяет коммутативность.
+- **VilleMonitor / stitching_countable_ville** — anytime-мосты:
+  не нарушены нами (наш anytime-инструмент — guarded best-snapshot
+  в LM-тренировке: деплой никогда не хуже лучшего; формальный
+  Ville-мост оставлен теории).
+- **Certified early exit depth routing (C336+)** — кандидат на
+  следующий порт: ранний выход из синтеза при сертифицированном
+  достижении; пока сознательно не применён (требует потока
+  доказательств внутри синтеза, не только финального гейта).
+- **E-track (§23, energy-based reasoning)** — за пределами текущего
+  ядра; зафиксировано как фронт.
+
+Нейро-тело докормлено: 529 MB корпус со всего компьютера
+(k=12, dim=256, hidden=512, 24k guarded шагов): holdout CE
+1.70 → 1.5553 и продолжает падать.

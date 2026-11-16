@@ -175,3 +175,16 @@ def test_hybrid_mind(tmp_path, monkeypatch):
     assert hagi_mind._exact_answer("square -7") == ("SQUARE", "49")
     assert hagi_mind._exact_answer("нок 4 6") == ("LCM", "12")
     assert hagi_mind._exact_answer("что такое смысл жизни") is None
+
+
+def test_curriculum_certificate():
+    """primes CurriculumCert port: order-free phase accounting —
+    delta_i/d_i sums commute; certificate attaches to state."""
+    import hagi_curriculum as c
+    a = [c.PhaseRecord("GROW", 0.5, 0.02), c.PhaseRecord("DERIVE", 0.3, 0.02)]
+    b = list(reversed(a))
+    assert c.curriculum_total(a) == c.curriculum_total(b)  # commutativity
+    state = {"curriculum": [ {"phase": "GROW", "delta": 0.5, "d_cert": 0.02, "steps": 3} ]}
+    c.certificate(state)
+    cert = state["curriculum_certificate"]
+    assert cert["total"] == 25.0 and cert["order_free"]

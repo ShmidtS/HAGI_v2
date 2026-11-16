@@ -129,3 +129,4 @@ _raw/
 # рабочий список формализации, не для коммитов
 FORMALIZATION_TODO.md
 goal_snap.json
+checkpoints/self/lm_corpus.bin
