@@ -3236,8 +3236,10 @@ class GrowingHagiProcessorV9:
 def propose_noncircular_task_v9(
     experts: dict[str, ExpertV9], rng: np.random.Generator, round_idx: int,
     seen_sigs: Optional[set[tuple[Any, ...]]] = None,
+    seen_sigs_names: Optional[set[str]] = None,
 ) -> Optional[tuple[TaskSpec, tuple[str, ...]]]:
     """Propose diverse, non-degenerate, novel composed tasks WITHOUT leaking ASTs to learn()."""
+    seen_sigs_names = seen_sigs_names if seen_sigs_names is not None else set()
     arith2 = [e for e in experts.values() if e.program.arity == 2 and e.family != "BoolVenn"]
     arith1 = [e for e in experts.values() if e.program.arity == 1 and e.family != "BoolVenn"]
     bool2 = [e for e in experts.values() if e.program.arity == 2 and e.family == "BoolVenn"]
@@ -3286,7 +3288,8 @@ def propose_noncircular_task_v9(
                 seen_sigs.add(sig)
             teacher = (lambda x, y, o=outer, i=inner, env=experts:
                        o.program.eval((i.program.eval((int(x),), env), int(y)), env))
-            sp = TaskSpec(f"V9_AUTO_R{round_idx}_{attempt}_{inner.name}_IN_{outer.name}", 2,
+            sp = TaskSpec(_short_auto_name(round_idx, attempt, inner.name, outer.name, seen_sigs_names),
+                          2,
                           (xs, ys), teacher, valid_rule=outer.valid_rule, family="auto-composed")
             return sp, (outer.name, inner.name)
         else:
@@ -3310,10 +3313,36 @@ def propose_noncircular_task_v9(
                 seen_sigs.add(sig)
             teacher = (lambda x, y, o=outer, i=inner, env=experts:
                        o.program.eval((int(x), i.program.eval((int(x), int(y)), env)), env))
-            sp = TaskSpec(f"V9_AUTO_R{round_idx}_{attempt}_{inner.name}_IN_{outer.name}", 2,
+            sp = TaskSpec(_short_auto_name(round_idx, attempt, inner.name, outer.name, seen_sigs_names),
+                          2,
                           (xs, ys), teacher, valid_rule=inner.valid_rule, family="auto-composed")
             return sp, (outer.name, inner.name)
     return None
+
+
+def _short_auto_name(round_idx: int, attempt: int, inner: str, outer: str,
+                     seen: set | None = None) -> str:
+    """Short unique name for auto-composed tasks: strip V9_AUTO_
+    boilerplate, keep the semantic core, dedupe with a counter."""
+    def core(n: str) -> str:
+        for part in ("V9_AUTO_", "V9_BOOL3_"):
+            while n.startswith(part):
+                n = n[len(part):]
+        # drop R<digits>_ and stray round/attempt index segments
+        import re as _re
+        n = _re.sub(r"R\d+_", "", n)
+        n = _re.sub(r"^\d+_", "", n)
+        n = _re.sub(r"_\d+(_\d+)$", r"\1", n)
+        return n
+    base = f"{core(inner)}_{core(outer)}"[:48]
+    name = base
+    k = 2
+    while seen is not None and name in seen:
+        name = f"{base}_{k}"
+        k += 1
+    if seen is not None:
+        seen.add(name)
+    return name
 
 
 def grow_v9(model: GrowingHagiProcessorV9, suite: Sequence[TaskSpec], max_rounds: int = 3,
