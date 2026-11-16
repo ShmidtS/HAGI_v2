@@ -199,7 +199,7 @@ def export_programs(proc, out_dir: Path) -> dict[str, Any]:
         if expr is None:
             continue
         params = ", ".join(VAR_NAMES[:ex.program.arity])
-        lines.append(f"def {name}({params}):")
+        lines.append(f"def {_fn_hash(name)}({params}):")
         lines.append(f"    return {transpile(expr, VAR_NAMES[:ex.program.arity])}")
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -211,7 +211,7 @@ def export_programs(proc, out_dir: Path) -> dict[str, Any]:
     checked = failed = 0
     for name, ex in proc.experts.items():
         expr = ex.program.expr
-        fn = getattr(mod, name, None)
+        fn = getattr(mod, _fn_hash(name), None)
         if expr is None or fn is None:
             if expr is not None:
                 failed += 1
