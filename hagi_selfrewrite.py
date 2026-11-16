@@ -261,8 +261,17 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         booted_from = "cold start"
         prior = None
 
+    # memory-aware workers: big incumbents x many workers -> pickling
+    # MemoryError; degrade worker count by library size (C328 work model)
+    eff_workers = workers
+    if workers and initial_segments:
+        size_est = max(1, len(initial_segments))
+        if size_est > 900:
+            eff_workers = min(workers, 12)
+        elif size_est > 600:
+            eff_workers = min(workers, 20)
     total = run_self_development(
-        max_rounds=rounds, workers=workers, floor_ladder=ladder,
+        max_rounds=rounds, workers=eff_workers, floor_ladder=ladder,
         initial_segments=initial_segments)
     final_proc = total.pop("_final_incumbent")
 

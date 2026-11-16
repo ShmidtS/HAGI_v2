@@ -162,7 +162,7 @@ def _state_probe(proc) -> dict[str, Any]:
         "unsolved": proc.unsolved_objective,
         "compute": proc.compute_budget, "risk": proc.risk_rem,
         "n_experts": len(proc.experts), "n_log": len(proc.growth_log),
-        "n_cert": len(proc.cert_log), "n_trace": len(proc.trace),
+        "n_cert": len(getattr(proc, "cert_log", [])), "n_trace": len(getattr(proc, "trace", [])),
         "ram": proc.ram.snapshot(),
     }
 
@@ -184,7 +184,7 @@ def _learn_worker(payload: bytes) -> bytes:
     new_names = names[pre["n_experts"]:]
     diff = {
         "ev": ev,
-        "trace_row": proc.trace[pre["n_trace"]:] or None,
+        "trace_row": getattr(proc, "trace", [])[pre["n_trace"]:] or None,
         "growth_log": proc.growth_log[pre["n_log"]:],
         "certs": proc.cert_log[pre["n_cert"]:],
         "new_experts": {n: proc.experts[n] for n in new_names},
@@ -233,11 +233,21 @@ class ParallelLearner:
         from concurrent.futures import ProcessPoolExecutor
         if not jobs:
             return []
-        payloads = [cloudpickle.dumps(
-            (self.proc, spec, seed, budget, self.train_neural))
-            for spec, seed, budget in jobs]
-        if self.workers == 1 or len(jobs) == 1:
-            results = [_learn_worker(p) for p in payloads]
+        payloads = []
+        for spec, seed, budget in jobs:
+            try:
+                payloads.append(cloudpickle.dumps(
+                    (self.proc, spec, seed, budget, self.train_neural)))
+            except MemoryError:
+                # payload too big to replicate — degrade to in-process
+                # learning for this job (honest, same order/semantics)
+                payloads.append(None)
+        if self.workers == 1 or len(jobs) == 1 or any(p is None for p in payloads):
+            results = [_learn_worker(p) if p is not None
+                       else _learn_worker_local(self.proc, spec, seed, budget,
+                                                self.train_neural)
+                       for p, (spec, seed, budget) in
+                       zip(payloads, jobs)]
         else:
             from concurrent.futures.process import BrokenProcessPool
             try:
