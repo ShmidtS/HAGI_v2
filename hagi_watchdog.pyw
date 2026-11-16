@@ -89,10 +89,17 @@ def main() -> None:
             pass
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     LOCK.write_text(str(os.getpid()))
+    n = 0
     while True:
         try:
+            n += 1
             _dedup_forever()
-            if not _forever_alive() or _log_stale():
+            alive = _forever_alive()
+            if n % 12 == 1:  # heartbeat every hour
+                with open(LOG, "a", encoding="utf-8") as fh:
+                    fh.write(f"[watchdog] alive checks={n} forever={alive}
+")
+            if not alive or _log_stale():
                 _start_forever()
         except Exception as e:
             with open(LOG, "a", encoding="utf-8") as fh:
