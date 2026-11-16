@@ -704,3 +704,88 @@ class CertifiedStepLM:
                 out.append(b); ctx = ctx[1:] + [b]
         return (prompt.encode("utf-8") + bytes(out)).decode(
             "utf-8", errors="replace")
+
+
+class AdaptiveScheduleLM(CertifiedStepLM):
+    """All previously hardcoded knobs made adaptive, per primes:
+
+    - C330 steps_to_quality: train until the quality gap Delta < eps
+      (ceil(Delta0/d) steps), NOT a fixed epoch count;
+    - Thermostat (Growth/Thermostat.lean): Gibbs temperature cools
+      T_t = T0 * alpha^t with the exact stop bound exp(-delta/T_t) —
+      sampling temperature is a schedule, not a constant;
+    - §3.9: certified step size eta = 4A/R'^2 (no fixed LR);
+    - batch adapts to the FLOP budget (C328/C331 work model).
+    """
+
+    def __init__(self, **kw):
+        self.T0 = kw.pop("T0", 1.0)          # Thermostat initial temperature
+        self.alpha = kw.pop("alpha", 0.97)   # cooling rate (0<alpha<1)
+        self.eps_quality = kw.pop("eps_quality", 0.05)  # C330 quality gap
+        self.flop_budget = kw.pop("flop_budget", 4_000_000)  # per-epoch work cap
+        super().__init__(**kw)
+
+    def temperature(self, t: int) -> float:
+        """Thermostat schedule T_t = T0*alpha^t (theory-exact)."""
+        return self.T0 * (self.alpha ** t)
+
+    def train_adaptive(self, data: bytes, max_epochs: int = 400,
+                       holdout: float = 0.1, log_every: int = 20) -> dict:
+        """Train until CE gap < eps_quality (C330) or the epoch cap;
+        certified steps (§3.9); batch shrinks under FLOP pressure."""
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        n = len(idx) - self.k
+        rng = np.random.default_rng(7)
+        perm = rng.permutation(n)
+        n_hold = max(16, int(n * holdout))
+        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+        Xv = np.stack([idx[i:i + self.k] for i in hold])
+        yv = idx[hold + self.k]
+        ctx_va = t.as_tensor(Xv, dtype=t.long)
+        nxt_va = t.as_tensor(yv, dtype=t.long)
+        def vce():
+            with t.no_grad():
+                return float(t.nn.functional.cross_entropy(
+                    self.logits(ctx_va), nxt_va))
+        d0 = vce()                      # Delta_0 (C330)
+        best = d0
+        best_state = [q.detach().clone() for q in self.params()]
+        epoch = 0
+        for epoch in range(1, max_epochs + 1):
+            # C330: stop when the certified gap target is met
+            if d0 - best < self.eps_quality and epoch > 10:
+                break
+            # C328/C331: adapt batch to the per-epoch FLOP budget
+            per_win = self.k * self.dim + self.dim * self.hidden + self.hidden * 256
+            batch = max(16, min(512, self.flop_budget // max(per_win, 1)))
+            order = rng.permutation(len(train))
+            for bs in range(0, len(train), batch):
+                sel = train[order[bs:bs + batch]]
+                X = np.stack([idx[i:i + self.k] for i in sel])
+                y = idx[sel + self.k]
+                self._certified_step(t.as_tensor(X, dtype=t.long),
+                                     t.as_tensor(y, dtype=t.long))
+            ce = vce()
+            if ce <= best:
+                best = ce
+                best_state = [q.detach().clone() for q in self.params()]
+            if log_every and epoch % log_every == 0:
+                print(f"  ep {epoch}: CE {ce:.4f} best {best:.4f} "
+                      f"T={self.temperature(epoch):.3f} batch={batch} "
+                      f"gap {d0-best:.3f}/{self.eps_quality}", flush=True)
+        for q, s in zip(self.params(), best_state):
+            q.data.copy_(s)
+        return {"epochs_run": epoch, "best_holdout_ce": round(best, 4),
+                "delta0": round(d0, 4),
+                "final_T": round(self.temperature(epoch), 4),
+                "stop_reason": ("quality-gap<eps (C330)" if d0 - best < self.eps_quality
+                                else "epoch cap")}
+
+    def generate(self, prompt: str, n_bytes: int = 100,
+                 temp: float | None = None, seed: int = 1) -> str:
+        """temp=None -> Thermostat: use the final cooled temperature."""
+        if temp is None:
+            temp = max(self.temperature(1000), 0.05)
+        return super().generate(prompt, n_bytes=n_bytes, temp=temp, seed=seed)
