@@ -58,6 +58,13 @@ _SIMPLE2 = {"absdiff": "abs({0} - {1})", "gcd": "_hagi_gcd({0}, {1})",
             "pow_int": "_hagi_pow({0}, {1})"}
 
 
+def _fn_hash(name: str) -> str:
+    """Stable short hash name for an exported function (deterministic
+    on the name — same expert always maps to the same hash)."""
+    import hashlib
+    return "f" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
 def transpile(e, names: tuple[str, ...] = VAR_NAMES) -> str:
     """ExprV9 -> standalone Python expression (helpers _hagi_* are emitted
     at the top of the generated module)."""
@@ -355,13 +362,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def _fn_hash(name: str) -> str:
-    """Stable short hash name for an exported function (deterministic
-    on the name — same expert always maps to the same hash)."""
-    import hashlib
-    return "f" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
 
 
 def rename_programs_hash(path: Path) -> dict[str, str]:
