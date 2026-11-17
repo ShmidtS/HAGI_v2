@@ -173,9 +173,11 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
     rng = random.Random(seed)
     log = json.loads(EDIT_LOG.read_text(encoding="utf-8")) if EDIT_LOG.exists() else \
         {"adopted": [], "rejected": []}
-    # C264 delta-budget: a long rejection series means the false-alarm
-    # budget is spent — reset the series (theory-exact bound for K<=6).
-    if len(log.get("rejected", [])) >= 2 * MAX_GATE_RUNS:
+    # C264 gate_pipeline_budget: the delta-schedule bound holds for
+    # K <= 6 SEQUENTIAL checks per series. A series longer than
+    # MAX_GATE_RUNS=6 exits the certified regime — reset at exactly 6
+    # (each fresh series re-enters the budget-covered range).
+    if len(log.get("rejected", [])) >= MAX_GATE_RUNS:
         log["rejected"] = log["rejected"][-MAX_GATE_RUNS:]
         EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
                             encoding="utf-8")
