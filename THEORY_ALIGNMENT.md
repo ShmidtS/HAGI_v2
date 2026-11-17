@@ -461,3 +461,9 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   по зондам с измеренным ε. generalization_safe_step /
   hagiPotential — Lyapunov-паттерн, совпадающий с CurriculumCert
   (сверено циклом 1).
+
+
+- Поправка к циклу 21: первый численный тест имел НЕвыполненные
+  посылки (ε < фактического drop) — FAIL был ошибкой теста, не
+  теоремы. При корректных посылках (ε_i ≥ Qm_i − Qm2_i)
+  Qgen_drop_bound точен: 0.2054 ≤ 0.3501 ✓.
