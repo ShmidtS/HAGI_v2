@@ -923,3 +923,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   через псевдоправдоподобие вместо joint-descent — теория честно
   оговаривает отсутствие joint-update descent theorem).
   Операционально: форма для будущей energy-головы Надь (фронт E1).
+
+
+## Цикл 17 (2026-11-18): Architecture/ResidualSplit
+
+- **rotated_factors_same_matrix / signMatrix_mul_self**: W =
+  M·diag(s) инвариантна к знаковому повороту факторов; S²=I ✓.
+- **naive_latent_merge_kills_flipped**: наивное усреднение
+  матриц с flipped-фактором даёт НУЛЕВУЮ строку — измерено.
+  КРИТИЧЕСКОЕ ОГРАНИЧЕНИЕ для нашего MDL-prune: перед merge
+  экспертов нужна знаковая канонизация факторов (иначе merge
+  уничтожает знание). Внесено в front-заметки prune.
