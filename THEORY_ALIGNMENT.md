@@ -436,3 +436,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **ortho_norm_sq** (Пифагор) — базис our GatingTailBound-аналога
   в head-гейтах; **Potential sq_decomp** — разложение дисперсии
   (Σ(r−c)² = Σ(r−mean)² + n(c−mean)²) — базис variance-гейтов.
+
+
+## Цикл 20 сверки (2026-11-19): Cert/CertifiedArgmax + Cert/Adapters
+
+- **certified_argmax_strict** (зазор > 2ε ⟹ порядок оценок =
+  истинный) — подтверждена численно; наш self-edit работает в
+  strict-зоне по построению (принимает только кандидатов с
+  зазором, не с шумом).
+- **certified_argmax_ambiguity** (существование перевернутого
+  argmax при зазоре ≤ ε) — подтверждена: это точная причина,
+  почему наш гейт НЕ полагается на «почти равные» сравнения.
+  Dispatch-отказ в ANF — тот же принцип.
+- **Adapters floorsKept_zeroFloor / protectedRisk_le** — наш
+  gate-rollback (reject при нарушении floors) — точное соответствие.
