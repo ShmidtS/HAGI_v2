@@ -796,3 +796,26 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   no-regression margin в self-edit гейтах.
 - **GuardedRobustLogit**: при отсутствии апгрейда система
   остаётся — соответствие rollback-on-reject.
+
+
+## Циклы 48 (2026-11-19): Growth/Ceilings — НАЙДЕНЫ И ИСПРАВЛЕНЫ 3 РЕАЛЬНЫХ
+## РАСХОЖДЕНИЯ
+
+Пользовательское требование: менять код только при расхождении.
+
+1. **Self-edit был декоративным** (CertifiedLoop): adopted-патчи
+   только логировались, prod-цикл работал на статических дефолтах.
+   ИСПРАВЛЕНО: adopted_settings() теперь подмешивает
+   сертифицированные knob'ы (floor_ladder [300,100,30], batch 8)
+   в run_self_development прод-цикла (hagi_selfrewrite).
+2. **No-op патчи жгли gate-бюджет** (ProxyGap T≤eps/c=3):
+   [200,50,20] гонялся дважды через полный гейт. ИСПРАВЛЕНО:
+   propose_patch фильтрует no-op ДО гейта (current_settings
+   учитывает adopted-оверрайды), решение noop-skipped без траты.
+3. **Серия reject'ов 12 > K≤6** (gate_pipeline_budget): сброс был
+   при 2*MAX_GATE_RUNS, вне сертифицированного диапазона.
+   ИСПРАВЛЕНО: сброс ровно при MAX_GATE_RUNS=6.
+
+Проверено: 40 seeds — 0 no-op просочилось; adopted_settings
+возвращает живые значения; сигнатура цикла принимает все ключи;
+13/13 тестов; фон перезапущен (pid 26340) на новых правилах.
