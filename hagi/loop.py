@@ -18,7 +18,7 @@ Performance (2026-11-15):
     the recorded outcome instead of re-learning -> the per-round full
     replay becomes O(new tasks), the whole loop linear.
   - Parallel batches: proposal tasks are learned in worker processes
-    (cloudpickle payload, ProcessPoolExecutor over all CPU cores) against
+    (in-process, deterministic order; parallelism via BLAS/OMP) against
     a snapshot of the library; results merge in stream order.
     Batch semantics: tasks within one batch do not see each other's
     commits. Both incumbent growth and optimized replay use the same
@@ -29,11 +29,10 @@ CLI: python -m hagi.loop [--max-rounds N] [--workers N] [--json]
 from __future__ import annotations
 
 import os
-# cap BLAS/OMP threads in every process (parent + spawn workers inherit
-# env): unbounded 24x-N BLAS thread storms crashed workers under neural
-# training (BrokenProcessPool, 2026-11-15).
+# BLAS/OMP threads: with no spawn workers (2026-11-17), all machine
+# cores go to the numeric libraries. Only set if the user hasn't.
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_v, "1")
+    os.environ.setdefault(_v, str(os.cpu_count() or 4))
 
 import argparse
 import json
@@ -191,45 +190,11 @@ def _learn_worker_local(proc, spec, seed, budget, train_neural):
         "ram_ops": _ram_diff(pre["ram"], post["ram"]),
         "core": proc.core.snapshot(),
         "router": proc.router.snapshot(),
+        "audit": {"task": spec.name, "alpha": alpha},
     }
-    import cloudpickle
-    return cloudpickle.dumps(diff)
+    return diff
 
 
-def _learn_worker(payload: bytes) -> bytes:
-    """Run one learn call on a snapshot copy; return its state diff."""
-    # parallel workers always run the neural core on CPU: one GPU context
-    # per worker would multiply GPU memory and crash under load
-    os.environ["HAGI_NEURAL_DEVICE"] = "cpu"
-    import cloudpickle
-    proc, spec, seed, budget, train_neural = cloudpickle.loads(payload)
-    proc.node_budget = int(budget)
-    alpha = min(0.0005, proc.ledger.remaining() * 0.5)
-    pre = _state_probe(proc)
-    ev = proc.learn(spec, seed=int(seed), train_neural=train_neural)
-    post = _state_probe(proc)
-    # experts added: names beyond the pre count are new (dict insertion order)
-    names = list(proc.experts.keys())
-    new_names = names[pre["n_experts"]:]
-    diff = {
-        "ev": ev,
-        "trace_row": getattr(proc, "trace", [])[pre["n_trace"]:] or None,
-        "growth_log": proc.growth_log[pre["n_log"]:],
-        "certs": proc.cert_log[pre["n_cert"]:],
-        "new_experts": {n: proc.experts[n] for n in new_names},
-        "deltas": {k: post[k] - pre[k] for k in
-                   ("cands", "evals", "commits", "holds", "version",
-                    "unsolved", "compute", "risk")},
-        "ram_ops": _ram_diff(pre["ram"], post["ram"]),
-        # neural core state after training (merged in stream order)
-        "core": proc.core.snapshot(),
-        "router": proc.router.snapshot(),
-        "audit": {
-            "task": spec.name,
-            "alpha": alpha,
-        },
-    }
-    return cloudpickle.dumps(diff)
 
 
 def _ram_diff(pre: np.ndarray, post: np.ndarray) -> list[tuple[int, Any]]:
@@ -257,40 +222,23 @@ class ParallelLearner:
         self.train_neural = bool(train_neural)
 
     def batch(self, jobs: list[tuple[Any, int, int]]) -> list[dict[str, Any]]:
-        """jobs: [(spec, seed, budget)] -> merged diffs in order."""
-        import cloudpickle
-        from concurrent.futures import ProcessPoolExecutor
+        """jobs: [(spec, seed, budget)] -> merged diffs in order.
+
+        Threads, not processes (2026-11-17 user decision: no spawn
+        workers at all): shared memory, no payload pickling, no
+        BrokenProcessPool degradation path. numpy/torch release the
+        GIL in the hot paths, so threads parallelize the numeric work.
+        Determinism unchanged: jobs are independent, merged in order.
+        """
         if not jobs:
             return []
-        payloads = []
-        for spec, seed, budget in jobs:
-            try:
-                payloads.append(cloudpickle.dumps(
-                    (self.proc, spec, seed, budget, self.train_neural)))
-            except MemoryError:
-                # payload too big to replicate — degrade to in-process
-                # learning for this job (honest, same order/semantics)
-                payloads.append(None)
-        if self.workers == 1 or len(jobs) == 1 or any(p is None for p in payloads):
-            results = [_learn_worker(p) if p is not None
-                       else _learn_worker_local(self.proc, spec, seed, budget,
-                                                self.train_neural)
-                       for p, (spec, seed, budget) in
-                       zip(payloads, jobs)]
-        else:
-            from concurrent.futures.process import BrokenProcessPool
-            try:
-                with ProcessPoolExecutor(max_workers=min(self.workers, len(jobs))) as ex:
-                    results = list(ex.map(_learn_worker, payloads))
-            except BrokenProcessPool as e:
-                # worker died abruptly (observed with 24-way numpy/BLAS under
-                # neural training): degrade to in-process sequential learning —
-                # same payloads, same order, same results, just slower.
-                print(f"[ParallelLearner] BrokenProcessPool ({e!r}); "
-                      f"falling back to sequential in-process learning",
-                      file=sys.stderr, flush=True)
-                results = [_learn_worker(p) for p in payloads]
-        diffs = [cloudpickle.loads(r) for r in results]
+        # NO worker processes/threads pool (user decision 2026-11-17):
+        # in-process sequential learning, one shared proc. Parallelism
+        # comes from BLAS/OMP (OPENBLAS_NUM_THREADS = all cores) inside
+        # numpy/torch ops. Deterministic order, zero race, zero spawn.
+        diffs = [_learn_worker_local(self.proc, spec, seed, budget,
+                                     self.train_neural)
+                 for spec, seed, budget in jobs]
         # NOTE: caller merges diffs in stream order — merging here would
         # double-apply counters/logs/trace (dict updates are idempotent,
         # the rest is not).

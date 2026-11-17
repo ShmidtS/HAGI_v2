@@ -26,6 +26,7 @@ CLI:
 """
 from __future__ import annotations
 
+import os
 import re
 
 import argparse
@@ -261,15 +262,10 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         booted_from = "cold start"
         prior = None
 
-    # memory-aware workers: big incumbents x many workers -> pickling
-    # MemoryError; degrade worker count by library size (C328 work model)
-    eff_workers = workers
-    if workers and initial_segments:
-        size_est = max(1, len(initial_segments))
-        if size_est > 900:
-            eff_workers = min(workers, 12)
-        elif size_est > 600:
-            eff_workers = min(workers, 20)
+    # workers: threads share memory — no pickling MemoryError, no
+    # degradation needed. Default = all CPU cores (user decision
+    # 2026-11-17: maximum possible for the machine).
+    eff_workers = workers or (os.cpu_count() or 4)
     # CertifiedLoop: gate-adopted knobs drive the production loop.
     try:
         from hagi import selfedit
@@ -438,7 +434,6 @@ def rename_programs_hash(path: Path) -> dict[str, str]:
     `def NAME(...)` and all its call sites get a short stable hash
     name f<sha1:10>. Helper functions (_hagi_*) keep their names.
     Returns the old->new mapping."""
-    import re
     src = path.read_text(encoding="utf-8")
     defs = re.findall(r"^def ([A-Z][A-Za-z0-9_]*)\(", src, flags=re.M)
     mapping = {old: _fn_hash(old) for old in defs}
