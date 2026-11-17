@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HAGI self-development loop — iterated self-model derivation and adoption.
 
-Extends hagi_selfmodel (single-shot TRACE->DERIVE->OPTIMIZE->GATE) with:
+Extends hagi.selfmodel (single-shot TRACE->DERIVE->OPTIMIZE->GATE) with:
 
   1. An exact decision-list self-model (lookup keyed on full trace
      features; unknown -> conservative default). Exact on the trace by
@@ -24,7 +24,7 @@ Performance (2026-11-15):
     commits. Both incumbent growth and optimized replay use the same
     batching, so streams stay deterministic and comparable.
 
-CLI: python hagi_selfloop.py [--max-rounds N] [--workers N] [--json]
+CLI: python -m hagi.loop [--max-rounds N] [--workers N] [--json]
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from typing import Any, Optional
 import numpy as np
 
 import hagi
-from hagi.hagi_selfmodel import (
+from hagi.selfmodel import (
     FEATURE_KEYS,
     SelfOptimizingProcessorV9,
     TracedProcessorV9,
@@ -138,7 +138,7 @@ class SelfModelPolicyProcessor(SelfOptimizingProcessorV9):
         self.dl = dl
 
     def learn(self, spec, seed=0, **kw):
-        from hagi.hagi_selfmodel import _features
+        from hagi.selfmodel import _features
         feats: dict[str, Any] = dict(zip(
             FEATURE_KEYS,
             _features(spec, self, seed,
@@ -341,7 +341,7 @@ class ParallelLearner:
 def _assign_budget(proc, spec, seed: int, train_fraction: float = 0.70) -> int:
     """Budget the policy would assign (mirrors SelfModelPolicyProcessor)."""
     if hasattr(proc, "dl"):
-        from hagi.hagi_selfmodel import _features
+        from hagi.selfmodel import _features
         feats = dict(zip(FEATURE_KEYS, _features(spec, proc, seed, train_fraction)))
         feats["seed"] = int(seed)
         pred = proc.dl.predict_success(feats)

@@ -57,7 +57,7 @@ def _baseline() -> dict[str, Any]:
 
 def run_benchmark(rounds: int = 2, workers: int = 8) -> dict[str, Any]:
     """Fixed mini-suite benchmark of the learning loop (deterministic)."""
-    from hagi import hagi_selfloop as sl
+    from hagi import loop as sl
     t0 = time.time()
     rep = sl.run_self_development(max_rounds=rounds, workers=workers,
                                   proposals_per_round=6)
@@ -77,7 +77,7 @@ def _gate_tests() -> bool:
 def current_settings() -> dict[str, Any]:
     """Snapshot of the CURRENT knob values: loop defaults overridden
     by gate-adopted settings (the production loop runs with them)."""
-    from hagi import hagi_selfloop as sl
+    from hagi import loop as sl
     import inspect
     sig = inspect.signature(sl.run_self_development)
     defaults = {k: v.default for k, v in sig.parameters.items()
@@ -193,7 +193,7 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
         proposal["decision"] = "dry"
         return proposal
     # the gate: benchmark with the patch applied (as loop settings)
-    from hagi import hagi_selfloop as sl
+    from hagi import loop as sl
     kwargs = {}
     if patch["knob"] == "batch_size":
         kwargs["batch_size"] = patch["value"]

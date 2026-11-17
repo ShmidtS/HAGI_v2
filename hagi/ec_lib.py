@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """EC-processor library — the WINNING genomes exposed as callable code.
 
-Built by Architecture Genesis / evolutionary search (hagi_ec_evolution).
+Built by Architecture Genesis / evolutionary search (hagi.genesis, part 2).
 Each profile gets its optimized scalar-multiply as a flat function
 (Nadya-compatible: takes/returns ints) plus a tuple-level API.
 
 Certified: every function passes group-law invariants (see
-hagi_ec_evolution.certified_correct) on the task curve
+hagi.genesis.certified_correct) on the task curve
 y^2 = x^3 + 497x + 1768 mod 9739.
 """
 from __future__ import annotations

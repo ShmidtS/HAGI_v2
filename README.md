@@ -9,23 +9,23 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
 
 ## Структура
 
-- `hagi/_neural_gpu.py` — GPU-бэкенд нейроядра (torch/CUDA-ROCm,
+- `hagi/hagi/gpu.py` — GPU-бэкенд нейроядра (torch/CUDA-ROCm,
   AMD Radeon 8060S): EF21-Muon + Newton-Schulz (C296/C297) и
   SVD-консолидация на устройстве; `HAGI_NEURAL_DEVICE=auto|cpu|cuda`,
   auto выбирает по бенчмарку; параллельные воркеры — всегда CPU.
 - `hagi/` — ядро (бывший монолит `hagi.py`, разрезан с сохранением
   семантики перекрытия имён):
-  - `hagi/_legacy.py` — поколения V5–V8 (исторические процессоры,
+  - `hagi/core.py (merged)` — поколения V5–V8 (исторические процессоры,
     guarded optimizer, тернарное квантование, CRAM, theorem miner);
-  - `hagi/_v9.py` — каноническое ядро V9: `GrowingHagiProcessorV9`,
+  - `hagi/core.py (merged)` — каноническое ядро V9: `GrowingHagiProcessorV9`,
     точный синтез (`synthesize_batched_mdl_v9`,
     `exact_piecewise_poly_fit`), Venn-голова, Hadamard-микшер,
     `AuditLedgerV9` (Hoeffding-альфа), `CertStepGen`-сертификаты.
-- `hagi/hagi_selfmodel.py` — одношаговый TRACE → DERIVE → OPTIMIZE → GATE:
+- `hagi/hagi/selfmodel.py` — одношаговый TRACE → DERIVE → OPTIMIZE → GATE:
   модель трассирует своё обучение и пытается вывести собственный
   предиктор успеха (ExprV9-синтез; при невозможности — честный HOLD).
-- `hagi/hagi_selfloop.py` — много-раундовый цикл саморазвития (см. ниже).
-- `hagi/hagi_selfrewrite.py` — self-rewrite: модель пишет собственные
+- `hagi/hagi/loop.py` — много-раундовый цикл саморазвития (см. ниже).
+- `hagi/hagi/rewrite.py` — self-rewrite: модель пишет собственные
   программы (standalone Python, точная валидация по каждому эксперту,
   0 ошибок на 19k проверок) и переписывает собственное состояние
   (`checkpoints/self/self_state.json`); `--resume` загружается из
@@ -33,21 +33,21 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
   (измерено: 5 циклов рост→рестарт→рост, суммарно 117 раундов,
   411 экспертов, 395 standalone-функций, 34677 точных проверок
   функций против экспертов, 0 ошибок, 7 self-rewrites).
-- `hagi/hagi_selfexperiment.py` — эксперименты с бюджетными политиками
+- `hagi/hagi/experiment.py` — эксперименты с бюджетными политиками
   (seed-панели, online-conservative policies).
-- `hagi/hagi_v10_controller.py` — guarded optimizer step (MGDA/мультигрань).
-- `hagi/hagi_execute.py` — ИСПОЛНИТЕЛЬ программ: модель запускает то, что
+- `hagi/hagi/controller.py` — guarded optimizer step (MGDA/мультигрань).
+- `hagi/hagi/execute.py` — ИСПОЛНИТЕЛЬ программ: модель запускает то, что
   написала — execute(name, *args) для любой из сотен программ,
   execute_text() прогоняет живой UTF-8 текст (кириллица, эмодзи)
   через байтовые шифры (XOR round-trip работает), CLI для прямой
   инференции.
-- `hagi/hagi_ingest.py` — обучение на ЛЮБЫХ данных: числовые CSV/TSV/JSON
+- `hagi/hagi/ingest.py` — обучение на ЛЮБЫХ данных: числовые CSV/TSV/JSON
   (каждая пара столбцов проверяется на детерминированность y=f(x),
   затем индукция точной программы, покрывающей 100% данных) и любые
   файлы как байты (детерминированное подмножество prev→next).
   Демо: физический закон 20−5t² восстановлен точным полиномом из
   sensor.csv; неоднозначные пары честно HOLD.
-- `hagi/hagi_lm.py` — нейро-тело по теории primes (§2 CE-loss по байтовому
+- `hagi/hagi/lm.py` — нейро-тело по теории primes (§2 CE-loss по байтовому
   словарю, §3 guarded-шаги: деплой только лучшего holdout-снапшота,
   §6 тернарное квантование с guarded fine-tune): байтовый LM,
   обучаемый на любых данных, с генерацией. Первый вероятностный
@@ -57,7 +57,7 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
 - `tests/test_characterization.py` — characterization-гварды.
 - `experiments/selfloop_result.json` — последний отчёт цикла.
 
-## Цикл саморазвития (`hagi/hagi_selfloop.py`)
+## Цикл саморазвития (`hagi/hagi/loop.py`)
 
 ```
 GROW     инкамбент + N новых некруговых задач (параллельные батчи)
@@ -106,15 +106,15 @@ EF21-Muon GPM + Hedge-router) обучается вместе с каждым к
 ```bash
 python -m hagi --self-test-v9      # self-test ядра
 python -m pytest                   # characterization-гварды
-python -X utf8 -u hagi_selfloop.py --max-rounds 24 --workers 32
-python -X utf8 -u hagi_selfmodel.py           # одношаговый self-model
-python -X utf8 -u hagi_selfrewrite.py --rounds 10      # рост + self-rewrite
-python -X utf8 -u hagi_selfrewrite.py --resume --rounds 10  # автономный рестарт
-python -m hagi.hagi_execute --list                        # все написанные программы
-python -m hagi.hagi_execute --task LANG8_XOR_CIPHER --text "привет" --key 42
-python -m hagi.hagi_ingest path/to/data.csv      # учиться на любых данных
-python -m hagi.hagi_lm train README.md --ternary # нейро-тело (CE + генерация)
-python -m hagi.hagi_lm generate "HAGI — " --n 120
+python -X utf8 -u hagi/loop.py --max-rounds 24 --workers 32
+python -X utf8 -u hagi/selfmodel.py           # одношаговый self-model
+python -X utf8 -u hagi/rewrite.py --rounds 10      # рост + self-rewrite
+python -X utf8 -u hagi/rewrite.py --resume --rounds 10  # автономный рестарт
+python -m hagi.hagi.execute --list                        # все написанные программы
+python -m hagi.hagi.execute --task LANG8_XOR_CIPHER --text "привет" --key 42
+python -m hagi.hagi.ingest path/to/data.csv      # учиться на любых данных
+python -m hagi.hagi.lm train README.md --ternary # нейро-тело (CE + генерация)
+python -m hagi.hagi.lm generate "HAGI — " --n 120
 ```
 
 ## Принципы

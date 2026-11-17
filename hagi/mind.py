@@ -15,10 +15,10 @@ docs, state) — self-referential neural growth. Guarded training
 (§3/§9) means the deployed LM is always the best holdout snapshot.
 
 CLI:
-  python hagi_mind.py ask "gcd 12 18"
-  python hagi_mind.py ask "xor hello 42"
-  python hagi_mind.py ask "расскажи о себе"
-  python hagi_mind.py retrain        # LM on own artifacts
+  python -m hagi.mind ask "gcd 12 18"
+  python -m hagi.mind ask "xor hello 42"
+  python -m hagi.mind ask "расскажи о себе"
+  python -m hagi.mind retrain        # LM on own artifacts
 """
 from __future__ import annotations
 
@@ -28,11 +28,11 @@ import sys
 from typing import Any, Callable
 from pathlib import Path
 
-from hagi import hagi_execute as hx  # noqa: E402
-from hagi import hagi_lm  # noqa: E402
+from hagi import execute as hx  # noqa: E402
+from hagi import lm  # noqa: E402
 
-SELF_SOURCES = ["generated_programs.py", "hagi_lm.py", "hagi_execute.py",
-                "hagi_ingest.py", "hagi_selfloop.py", "hagi_selfrewrite.py"]
+SELF_SOURCES = ["generated_programs.py", "lm.py", "execute.py",
+                "ingest.py", "loop.py", "rewrite.py"]
 
 # exact-route patterns: name -> (program, arg parser)
 _ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {
@@ -53,7 +53,7 @@ _ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {
 
 def _exact_answer(query: str) -> tuple[str, str] | None:
     q = query.strip().lower()
-    from hagi.hagi_selfrewrite import _fn_hash
+    from hagi.rewrite import _fn_hash
     for pat, (prog, parse) in _ROUTES.items():
         m = re.match(pat, q)
         if not m:
@@ -76,27 +76,28 @@ def ask(query: str) -> str:
     if exact:
         prog, out = exact
         return f"[EXACT · {prog}] {out}"
-    ckpt = hagi_lm.CKPT
+    ckpt = lm.CKPT
     if not ckpt.exists():
         return ("[NEURAL · нет чекпойнта] сначала: "
-                "python hagi_mind.py retrain")
-    lm = hagi_lm.load()
+                "python -m hagi.mind retrain")
+    model = lm.load()
     return "[NEURAL · вероятностная догадка, не сертифицировано] " + \
-        lm.generate(query, n_bytes=100, temp=0.6)
+        model.generate(query, n_bytes=100, temp=0.6)
 
 
 def retrain() -> str:
     root = Path(__file__).resolve().parent.parent   # repo root
+    pkg = root / "hagi"
     base = root / "checkpoints" / "self"
     files = [base / "generated_programs.py"] + \
             [root / f for f in SELF_SOURCES[1:]] + \
             [root / "README.md", root / "THEORY_ALIGNMENT.md"]
     files = [f for f in files if f.exists()]
     data = b"".join(f.read_bytes() for f in files)
-    lm = hagi_lm.ByteLM(k=10, dim=96, hidden=192)
-    rep = lm.train_guarded(data, epochs=90, log_every=30)
-    hagi_lm.CKPT.parent.mkdir(parents=True, exist_ok=True)
-    hagi_lm.save(lm)
+    model = lm.ByteLM(k=10, dim=96, hidden=192)
+    rep = model.train_guarded(data, epochs=90, log_every=30)
+    lm.CKPT.parent.mkdir(parents=True, exist_ok=True)
+    lm.save(model)
     return (f"LM перетренирована на {len(data)} байтах собственных "
             f"артефактов ({len(files)} файлов): holdout CE "
             f"{rep['best_holdout_ce']}")

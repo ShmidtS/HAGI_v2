@@ -13,10 +13,10 @@ them:
     by hand; the library itself composes via `call` nodes)
 
 CLI:
-  python hagi_execute.py --list
-  python hagi_execute.py --task LANG8_SHIFT --text "привет" --key 3
-  python hagi_execute.py --task LANG8_XOR_CIPHER --text "мир" --key 42
-  python hagi_execute.py --task LANG8_SHIFT --text <shifted> --key -3   (decrypt)
+  python -m hagi.execute --list
+  python -m hagi.execute --task LANG8_SHIFT --text "привет" --key 3
+  python -m hagi.execute --task LANG8_XOR_CIPHER --text "мир" --key 42
+  python -m hagi.execute --task LANG8_SHIFT --text <shifted> --key -3   (decrypt)
 """
 from __future__ import annotations
 

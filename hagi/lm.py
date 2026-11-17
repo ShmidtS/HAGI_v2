@@ -23,8 +23,8 @@ outputs are probabilistic and ungated; the exact programs in the
 library remain the only certified answers.
 
 CLI:
-  python hagi_lm.py train <file...> [--epochs N] [--k 8] [--dim 64]
-  python hagi_lm.py generate "<prompt>" [--n 120] [--temp 0.8]
+  python -m hagi.lm train <file...> [--epochs N] [--k 8] [--dim 64]
+  python -m hagi.lm generate "<prompt>" [--n 120] [--temp 0.8]
 """
 from __future__ import annotations
 

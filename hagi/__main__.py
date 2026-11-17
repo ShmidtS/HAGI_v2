@@ -1,3 +1,2 @@
-from ._v9 import _cli
-
+from .core import _cli
 _cli()

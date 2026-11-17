@@ -21,8 +21,8 @@ Three capabilities, all under the certified-gate discipline:
      new experts, new programs, and the state is rewritten again.
 
 CLI:
-  python hagi_selfrewrite.py --rounds N [--state-dir d]
-  python hagi_selfrewrite.py --resume --rounds N [--state-dir d]
+  python -m hagi.rewrite --rounds N [--state-dir d]
+  python -m hagi.rewrite --resume --rounds N [--state-dir d]
 """
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Any
 
 import hagi
-from hagi.hagi_selfmodel import TracedProcessorV9
-from hagi.hagi_selfloop import run_self_development
+from hagi.selfmodel import TracedProcessorV9
+from hagi.loop import run_self_development
 
 VAR_NAMES = ("x", "y", "z", "u", "v", "w")
 
@@ -272,7 +272,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
             eff_workers = min(workers, 20)
     # CertifiedLoop: gate-adopted knobs drive the production loop.
     try:
-        import hagi_selfedit
+        import selfedit
         adopted_kwargs = hagi_selfedit.adopted_settings()
     except Exception:
         adopted_kwargs = {}
@@ -299,7 +299,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
     # call DAG intact, re-validate everything exactly; full library
     # is kept as incumbent_full.pkl
     try:
-        import hagi_selfoptimize as _opt
+        import mdl as _opt
         _res = _opt.prune_library(final_proc)
         _new, _fails = _opt.apply_prune(final_proc, _res["keep"])
         if _fails == 0 and len(_new.experts) < len(final_proc.experts):
@@ -321,7 +321,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         "wasted": total["final"]["wasted_candidates_on_holds"],
     }
     # curriculum phase accounting (primes CurriculumCert, order-free)
-    import hagi_curriculum as _curr
+    import curriculum as _curr
     adopted = total["final"]["adopted_rounds"] or 1
     relief = adopted / (adopted + total["final"]["wasted_candidates_on_holds"])
     prior_curr = (prior or {}).get("curriculum", [])
@@ -341,7 +341,7 @@ def _self_edit_guarded(cycle: int) -> None:
     """Each cycle: Nadya proposes a patch to her own learning knobs;
     certified gate (benchmark no-regression) decides adoption."""
     try:
-        import hagi_selfedit
+        import selfedit
         res = hagi_selfedit.self_edit_cycle(seed=cycle)
         print(f"[self-edit] {res.get('decision')}: {res.get('patch')}",
               flush=True)
@@ -357,7 +357,7 @@ def _archgenesis_guarded(cycle: int) -> None:
     if cycle % 20 != 7:  # offset so it never collides with self-edit
         return
     try:
-        import hagi_archgenesis
+        import hagi.genesis as hagi_archgenesis
         res = hagi_archgenesis.genesis_cycle(seed=cycle,
                                              profile="throughput")
         print(f"[archgenesis] {res.get('decision')}: "
@@ -376,7 +376,7 @@ def _ec_evolution_guarded(cycle: int) -> None:
     if cycle % 30 != 13:
         return
     try:
-        import hagi_ec_evolution as ec
+        from hagi import genesis as ec
         profile = "throughput" if cycle % 60 < 30 else "security"
         res = ec.evolve(pop_size=8, generations=3, profile=profile,
                         seed=cycle)
@@ -390,7 +390,7 @@ def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
     try:
-        import hagi_mind
+        import mind
         print("[lm]", hagi_mind.retrain(), flush=True)
     except Exception as e:  # neural body failure never stops the loop
         print(f"[lm] retrain skipped: {e!r}", flush=True)
