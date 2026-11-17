@@ -392,3 +392,13 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Azuma (hoeffding_lemma_prefix, azuma_mgf)** — мартингальные
   границы: согласованы с Ensemble/Hoeffding и DataToQuality
   (квадратичные tolerance-границы для наших гейтов).
+
+
+## Цикл 16 сверки (2026-11-19): Benchmarks + Runtime/DyadicTernary
+
+- **QuadraticEndToEnd qStep_loss_exact**: F(x') = (1−2η)²(x−a)²
+  подтверждена численно (a=3,x=7,η=.25: 16→4, коэф. 0.25 ✓).
+  Тот же принцип «модель→операция→измеренная потеря→доказанный
+  результат» реализован в CertifiedStepLM (CE до/после шага).
+- **DyadicTernary tritEncode < 3^5=243**: подтверждено на крайних
+  словах (0, 242) и произвольном (46) ✓.
