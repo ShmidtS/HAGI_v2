@@ -237,3 +237,12 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   эмпирическая премиза; Lean позиционирует гонку, не решает.
 - Architecture/ (AlignedMerge, FactorizedMerge, Heterarchy) —
   фронты для слияния нейро-ядер при скейле.
+
+
+## Цикл 5 сверки (2026-11-17): CertStepGen телескоп — ЧИСЛЕННО ПОДТВЕРЖДЁН
+
+- **trajectory_telescope_gen**: objective(t_n) ≤ objective(t₀) −
+  Σ drops. Замер на живой модели: holdout CE 5.546→2.020 за 30
+  certified шагов; реальный спуск 3.526 ≥ Σ сертификатов 3.313 —
+  телескоп выполняется даже на не-обучающем holdout. Реализация
+  CertifiedStepLM точно соответствует ядру C278.
