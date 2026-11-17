@@ -666,3 +666,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   reject-if-increase в _certified_step — то же правило.
 - **wd_norm_bound** — ||w⁺|| ≤ ||w||+η·λ-член: вес-распад
   не разносит норму.
+
+
+## Цикл 38 сверки (2026-11-19): Unified/Liveness + CertifiedLoopKernel
+
+- **liveness_data_axis** (ρ·D+inj−xi ≤ D(T), xi<inj ⟹ D(T)>0):
+  формализация «никогда не останавливаться» — живое состояние:
+  D(324)=1019>0, поток новых программ > 0, failures=0 ✓.
+- **liveness_merge / liveness_two_axis**: разнообразие
+  (twoGap>0 ⟺ нет консенсуса) — 1019 различных экспертов ≠
+  константа ✓.
+- **kernel_core / certified_loop_kernel / kernel_anchor_quad**:
+  ядро forever-цикла (телескоп + floors + budget/risk ledger) —
+  покрыто циклами 5/10/14; legacy_obj_anti: измеренное ≠ legacy
+  objective (наша honest-label EXACT/NEURAL).
