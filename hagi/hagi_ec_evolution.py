@@ -45,6 +45,11 @@ GENE_SPACE: dict[str, list[Any]] = {
     "mod_strategy": ["native", "barrett"],
     "precompute": [0, 1, 2, 3],
 }
+# Honest boundary (measured): GLV endomorphism decomposition is NOT
+# applicable to this curve — beta^3 = 1 endomorphisms preserve only
+# a=0 curves, ours has a=497 (phi(G) measured OFF-curve, residual
+# 5169). Structural speedups here need projective coordinates instead
+# (front, not certified yet).
 
 
 # ======================================================================
@@ -85,6 +90,9 @@ def _add(Pt, Qt, genome: dict, stats: dict) -> tuple | None:
 
 def _mul_scalar(k: int, Pt, genome: dict, stats: dict) -> tuple | None:
     """Scalar multiply per the genome's strategy."""
+    if genome["mul_strategy"] == "ladder":
+        return _mul_ladder(k, Pt, genome, stats)
+    return _mul_double_add(k, Pt, genome, stats)
     if genome["mul_strategy"] == "ladder":
         return _mul_ladder(k, Pt, genome, stats)
     return _mul_double_add(k, Pt, genome, stats)

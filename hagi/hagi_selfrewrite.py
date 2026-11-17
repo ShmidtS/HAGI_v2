@@ -367,6 +367,25 @@ def _archgenesis_guarded(cycle: int) -> None:
         print(f"[archgenesis] skipped: {e!r}", flush=True)
 
 
+def _ec_evolution_guarded(cycle: int) -> None:
+    """Evolutionary EC-processor genesis: every 30th cycle evolve the
+    EC-processor genome one generation batch (certified-first fitness:
+    group-law gate, then modmul cost). Profile rotates by cycle parity:
+    even -> throughput, odd -> security (relative optimum, no universal
+    config)."""
+    if cycle % 30 != 13:
+        return
+    try:
+        import hagi_ec_evolution as ec
+        profile = "throughput" if cycle % 60 < 30 else "security"
+        res = ec.evolve(pop_size=8, generations=3, profile=profile,
+                        seed=cycle)
+        print(f"[ec-evolution] {profile}: best {res['best_fitness']} "
+              f"modmul/mul, genome={res['best_genome']}", flush=True)
+    except Exception as e:  # evolution failure never stops the loop
+        print(f"[ec-evolution] skipped: {e!r}", flush=True)
+
+
 def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
@@ -404,6 +423,7 @@ def main() -> None:
             _retrain_lm_guarded(a.state_dir)
             _self_edit_guarded(cycle)
             _archgenesis_guarded(cycle)
+            _ec_evolution_guarded(cycle)
             _time.sleep(1)
     rep = run(a.rounds, a.state_dir, workers=a.workers, resume=a.resume)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
