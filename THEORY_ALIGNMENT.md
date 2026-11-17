@@ -305,3 +305,21 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   цветам/формам.
 - Basis для CDGC (Logic→Concepts→World Model) готов: Venn+ANF —
   формальный логический фундамент, симулятор мира — следующий фронт.
+
+
+## Цикл 10 сверки (2026-11-19): AnfCompose + MasterChallengeV4Kernel +
+## CanaryRamp
+
+- **AnfCompose (f∘g∘h roundtrip)**: python-порт подтверждён — ANF
+  из таблицы композиции evалируется точно в f(g(x),h(x)) на всех 8
+  входах (n=3); stencil_guard_sound: support-зависимости g на {0,1}
+  и h на {2} проверены (guard на композицию = guard на компоненты).
+- **MasterChallengeV4Kernel** — телескоп Σdrops ≤ objective(t0) −
+  objective(tn) при FloorsKept/budget/risk/delta инвариантах. Наш
+  CertifiedStepLM + forever-гейты реализуют тот же контракт;
+  численно подтверждён в цикле 5 (3.526 ≥ 3.313).
+- **CanaryRamp linearRamp = j/T** — монотонный ограниченный ramp;
+  операциональный аналог — наше δ-расписание MAX_GATE_RUNS=6
+  (Σ6/(π²k²)≤1) и постепенное развёртывание self-edit патчей.
+- Логический конвейер Venn→TT→ANF→Compose→Dispatch полностью
+  портирован и численно идентичен теории.
