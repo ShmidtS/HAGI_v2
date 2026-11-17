@@ -89,12 +89,24 @@ def apply_patch(patch: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]
     return out
 
 
+# GatePipeline (C264) delta-schedule: serial gates consume the false-
+# alarm budget sum_k<=K 6/(pi^2 k^2) <= 1 — after MAX_GATE_RUNS
+# consecutive rejections in a series the budget is exhausted.
+MAX_GATE_RUNS = 6
+
+
 def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
     """One propose->gate->adopt cycle. Honest record in EDIT_LOG."""
     import random
     rng = random.Random(seed)
     log = json.loads(EDIT_LOG.read_text(encoding="utf-8")) if EDIT_LOG.exists() else \
         {"adopted": [], "rejected": []}
+    # C264 delta-budget: a long rejection series means the false-alarm
+    # budget is spent — reset the series (theory-exact bound for K<=6).
+    if len(log.get("rejected", [])) >= 2 * MAX_GATE_RUNS:
+        log["rejected"] = log["rejected"][-MAX_GATE_RUNS:]
+        EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
     baseline = _baseline()
     patch = propose_patch(rng)
     proposal = {"patch": patch, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
