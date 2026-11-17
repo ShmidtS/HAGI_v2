@@ -75,15 +75,28 @@ def _gate_tests() -> bool:
 
 
 def current_settings() -> dict[str, Any]:
-    """Snapshot of the CURRENT knob values (loop defaults)."""
+    """Snapshot of the CURRENT knob values: loop defaults overridden
+    by gate-adopted settings (the production loop runs with them)."""
     from hagi import hagi_selfloop as sl
     import inspect
     sig = inspect.signature(sl.run_self_development)
     defaults = {k: v.default for k, v in sig.parameters.items()
                 if v.default is not inspect.Parameter.empty}
-    return {"floor_ladder": defaults.get("floor_ladder") or [200],
-            "batch_size": defaults.get("batch_size"),
-            "proposals": defaults.get("proposals_per_round")}
+    cur = {"floor_ladder": defaults.get("floor_ladder") or [200],
+           "batch_size": defaults.get("batch_size"),
+           "proposals": defaults.get("proposals_per_round")}
+    # adopted (certified) settings override defaults — they ARE current
+    try:
+        adopted = adopted_settings()
+    except Exception:
+        adopted = {}
+    if "floor_ladder" in adopted:
+        cur["floor_ladder"] = adopted["floor_ladder"]
+    if "batch_size" in adopted:
+        cur["batch_size"] = adopted["batch_size"]
+    if "proposals" in adopted:
+        cur["proposals"] = adopted["proposals"]
+    return cur
 
 
 def propose_patch(rng) -> dict[str, Any]:
