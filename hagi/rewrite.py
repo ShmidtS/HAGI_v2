@@ -272,8 +272,8 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
             eff_workers = min(workers, 20)
     # CertifiedLoop: gate-adopted knobs drive the production loop.
     try:
-        import selfedit
-        adopted_kwargs = hagi_selfedit.adopted_settings()
+        from hagi import selfedit
+        adopted_kwargs = selfedit.adopted_settings()
     except Exception:
         adopted_kwargs = {}
     if "floor_ladder" not in adopted_kwargs:
@@ -341,8 +341,8 @@ def _self_edit_guarded(cycle: int) -> None:
     """Each cycle: Nadya proposes a patch to her own learning knobs;
     certified gate (benchmark no-regression) decides adoption."""
     try:
-        import selfedit
-        res = hagi_selfedit.self_edit_cycle(seed=cycle)
+        from hagi import selfedit
+        res = selfedit.self_edit_cycle(seed=cycle)
         print(f"[self-edit] {res.get('decision')}: {res.get('patch')}",
               flush=True)
     except Exception as e:  # self-edit failure never stops the loop
@@ -357,8 +357,8 @@ def _archgenesis_guarded(cycle: int) -> None:
     if cycle % 20 != 7:  # offset so it never collides with self-edit
         return
     try:
-        import hagi.genesis as hagi_archgenesis
-        res = hagi_archgenesis.genesis_cycle(seed=cycle,
+        from hagi import genesis
+        res = genesis.genesis_cycle(seed=cycle,
                                              profile="throughput")
         print(f"[archgenesis] {res.get('decision')}: "
               f"{res.get('mutation')} gain={res.get('rel_gain')}",
@@ -390,8 +390,8 @@ def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
     try:
-        import mind
-        print("[lm]", hagi_mind.retrain(), flush=True)
+        from hagi import mind
+        print("[lm]", mind.retrain(), flush=True)
     except Exception as e:  # neural body failure never stops the loop
         print(f"[lm] retrain skipped: {e!r}", flush=True)
 
