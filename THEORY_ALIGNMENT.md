@@ -480,3 +480,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Cert/Core CertStepDelta.deltaBound + delta_telescope** —
   δ-телескоп покрыт циклами 5/14; наш floor_ladder/δ-schedule —
   операциональная форма.
+
+
+## Цикл 23 сверки (2026-11-19): Growth/IntegrationOrder + StateBinding
+
+- **negative_expert_hurts_any_order**: удаление любого
+  отрицательного эксперта улучшает сумму В ЛЮБОМ порядке —
+  теоретическое обоснование нашего MDL-prune (дубликаты/псевдо-
+  эксперты = отрицательный вклад после вычета стоимости).
+- **sum_perm_invariant**: сумма инвариантна к порядку — точная
+  форма нашего order-free curriculum-учёта (сверено циклом 1,
+  anchor_total=30 сошёлся точно).
+- **StateBinding candidate_completeness_find** — поиск полного
+  кандидата на границе usableFrontier — наш self-edit knob-space
+  (declared candidates only) + usableFrontier_renewal = forever.
