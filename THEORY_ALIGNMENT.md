@@ -838,3 +838,13 @@ ANF 98/98, EC group law (N*G=O). 13/13 characterization tests
 - forever cycle 1 в проде на новом коде: rounds=343,
   experts=1582 (с MDL-полн. копией), failures=0, rewrites=47.
 - Рефакторинг завершён и верифицирован end-to-end.
+
+
+## Цикл 10 (2026-11-17): Unified/SignDescent + ProductiveTransition
+
+- **sgn1_mul_self / sgn1_sq** (SignSGD-примитивы): подтверждены
+  численно на {-3,-0.5,0,0.5,3}. SignSGD — фронт оптимизации
+  памяти (1 бит на координату градиента).
+- **ProductiveTransition (idle_not_productive)**: переход без
+  роста не продуктивен — контракт нашего forever (цикл принимается
+  только при rounds/rewrites росте; стагнация = сигнал).
