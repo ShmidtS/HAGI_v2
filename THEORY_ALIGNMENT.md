@@ -524,3 +524,12 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - Поправка к циклу 25: экономный QR дал неполный базис — тест
   был неверен, не теорема. С mode='complete': rank 3→6, прирост
   ровно k=3, |M·Rᵀ| ≈ 1e-15 — rank_orthogonal_growth ТОЧЕН.
+
+
+## Цикл 26 сверки (2026-11-19): Learning/HadamardParseval
+
+- **parseval** (Σ_w ⟨v,χ_w⟩² = N·||v||²) и **charProjR_cross_zero**
+  (⟨χ_w,χ_u⟩=0 при w≠u): подтверждены численно (k=3, N=8, точность
+  ≤1e-9). Хадамаров характерный базис ортонормирован с нормой √N —
+  энергетический фундамент Venn-головы §17 и low-rank
+  bit-allocation (фронт).
