@@ -349,6 +349,24 @@ def _self_edit_guarded(cycle: int) -> None:
         print(f"[self-edit] skipped: {e!r}", flush=True)
 
 
+def _archgenesis_guarded(cycle: int) -> None:
+    """Architecture Genesis: propose -> benchmark -> certified adopt
+    of a loop-config change (relative to the throughput profile).
+    Runs rarely (once per 20 cycles) — each probe costs a full
+    micro-benchmark (FlopsEconomy: probes are not free)."""
+    if cycle % 20 != 7:  # offset so it never collides with self-edit
+        return
+    try:
+        import hagi_archgenesis
+        res = hagi_archgenesis.genesis_cycle(seed=cycle,
+                                             profile="throughput")
+        print(f"[archgenesis] {res.get('decision')}: "
+              f"{res.get('mutation')} gain={res.get('rel_gain')}",
+              flush=True)
+    except Exception as e:  # genesis failure never stops the loop
+        print(f"[archgenesis] skipped: {e!r}", flush=True)
+
+
 def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
@@ -385,6 +403,7 @@ def main() -> None:
                   f"{rep['seconds']}s", flush=True)
             _retrain_lm_guarded(a.state_dir)
             _self_edit_guarded(cycle)
+            _archgenesis_guarded(cycle)
             _time.sleep(1)
     rep = run(a.rounds, a.state_dir, workers=a.workers, resume=a.resume)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
