@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # repo root
 EDIT_LOG = ROOT / "checkpoints/self/self_edits.json"
 BASELINE_PATH = ROOT / "checkpoints/self/edit_baseline.json"
 
@@ -57,7 +57,7 @@ def _baseline() -> dict[str, Any]:
 
 def run_benchmark(rounds: int = 2, workers: int = 8) -> dict[str, Any]:
     """Fixed mini-suite benchmark of the learning loop (deterministic)."""
-    import hagi_selfloop as sl
+    from hagi import hagi_selfloop as sl
     t0 = time.time()
     rep = sl.run_self_development(max_rounds=rounds, workers=workers,
                                   proposals_per_round=6)
@@ -102,7 +102,7 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
         proposal["decision"] = "dry"
         return proposal
     # the gate: benchmark with the patch applied (as loop settings)
-    import hagi_selfloop as sl
+    from hagi import hagi_selfloop as sl
     kwargs = {}
     if patch["knob"] == "batch_size":
         kwargs["batch_size"] = patch["value"]

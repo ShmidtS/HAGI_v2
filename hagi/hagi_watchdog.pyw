@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 LOCK = ROOT / "checkpoints/self/watchdog.lock"
 LOG = ROOT / "checkpoints/self/forever.log"
 STALE_S = 3 * 3600  # no log growth for 3h -> restart too
@@ -22,7 +22,7 @@ def _forever_alive() -> bool:
     PS_DETECT.parent.mkdir(parents=True, exist_ok=True)
     PS_DETECT.write_text(
         "$c = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
-        "| Where-Object {$_.CommandLine -match 'selfrewrite'})\n"
+        "| Where-Object {$_.CommandLine -match 'hagi.hagi_selfrewrite'})\n"
         "$c.Count\n")
     out = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -49,7 +49,7 @@ def _dedup_forever() -> None:
     PS_DEDUP.parent.mkdir(parents=True, exist_ok=True)
     PS_DEDUP.write_text(
         "$f = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
-        "| Where-Object {$_.CommandLine -match 'selfrewrite'} "
+        "| Where-Object {$_.CommandLine -match 'hagi.hagi_selfrewrite'} "
         "| Sort-Object CreationDate)\n"
         "if ($f.Count -gt 1) { $f | Select-Object -Skip 1 "
         "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }\n")
@@ -61,7 +61,7 @@ def _start_forever() -> int:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(
         [r"C:\Program Files\Python313\pythonw.exe", "-X", "utf8", "-u",
-         "hagi_selfrewrite.py", "--forever", "--rounds", "10",
+         "-m", "hagi.hagi_selfrewrite", "--forever", "--rounds", "10",
          "--workers", "32"],
         cwd=str(ROOT),
         stdout=open(LOG, "a", encoding="utf-8"),

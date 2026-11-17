@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hagi import *  # noqa: F401,F403
 
 
 def _expr_calls(expr) -> set[str]:

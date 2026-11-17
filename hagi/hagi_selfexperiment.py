@@ -30,7 +30,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hagi  # noqa: E402
-from hagi_selfmodel import (  # noqa: E402  (reuse certified machinery)
+from hagi.hagi_selfmodel import (  # noqa: E402  (reuse certified machinery)
     FAMILY_IDS, TracedProcessorV9, impossibility_certificate, _target_features)
 
 Policy = Callable[..., int]   # (spec, base_budget, seed, prior_trace, ...) -> node_budget

@@ -28,7 +28,7 @@ def main() -> int:
     try:
         import numpy as np
         import hagi
-        from hagi_selfmodel import (
+        from hagi.hagi_selfmodel import (
             FEATURE_KEYS, TracedProcessorV9, describe_pipeline,
             derive_self_model, impossibility_certificate,
         )
@@ -58,7 +58,7 @@ def main() -> int:
         }
 
         # Then trial measured allocation policies over independent seeds.
-        from hagi_selfexperiment import run_experiment
+        from hagi.hagi_selfexperiment import run_experiment
         selected_policies = ["baseline","online_exact_2holds_quarter","online_exact_1hold_quarter","online_exact_2holds_eighth"]
         result = run_experiment(
             seeds=20, policy_names=selected_policies, seed_start=30

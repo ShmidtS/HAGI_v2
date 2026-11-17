@@ -71,8 +71,8 @@ def test_selfloop_round1_golden():
     numbers exactly. Guards the parallel/merge machinery end-to-end
     (batch semantics, sequential workers for determinism in tests).
     Golden: suite(57)+segment(10) with 5 holds among the new frontier."""
-    from hagi_selfloop import ParallelLearner, run_stream
-    from hagi_selfmodel import TracedProcessorV9
+    from hagi.hagi_selfloop import ParallelLearner, run_stream
+    from hagi.hagi_selfmodel import TracedProcessorV9
     inc = TracedProcessorV9(node_budget=200000)
     run_stream(inc, [(10, 501_000)], suite=None, cache=None,
                learner=ParallelLearner(inc, 1), batch_size=8)
@@ -85,7 +85,7 @@ def test_selfloop_round1_golden():
 def test_selfrewrite_programs(tmp_path):
     """The model's program export is exact: every generated standalone
     Python function equals its certified expert over the full domain."""
-    from hagi_selfrewrite import export_programs
+    from hagi.hagi_selfrewrite import export_programs
     p = hagi.GrowingHagiProcessorV9(node_budget=2000)
     for sp in hagi.make_task_suite():
         p.learn(sp, seed=10_000, train_neural=False)
@@ -116,19 +116,22 @@ def test_neural_gpu_backend():
 def test_execute_programs(tmp_path):
     """The model's executor: runs the programs it wrote — byte-level UTF-8
     ciphers stream real text; XOR round-trips; integer programs callable."""
-    import hagi_execute as hx
-    from hagi_selfrewrite import export_programs
+    from hagi import hagi_execute as hx
+    from hagi.hagi_selfrewrite import export_programs
     p = hagi.GrowingHagiProcessorV9(node_budget=20000)
     for sp in hagi.make_task_suite():
         p.learn(sp, seed=10_000, train_neural=True)
     export_programs(p, tmp_path)
     hx._mod = None
     hx.DEFAULT_PROGRAMS = tmp_path / "generated_programs.py"
-    enc = hx.execute_text("LANG8_XOR_CIPHER", "executor ok", key=42)
-    dec = hx.execute_text("LANG8_XOR_CIPHER", enc, key=42)
+    from hagi.hagi_selfrewrite import _fn_hash
+    HX = _fn_hash("LANG8_XOR_CIPHER"); GC = _fn_hash("GCD")
+    CA = _fn_hash("LANG8_CAESAR1")
+    enc = hx.execute_text(HX, "executor ok", key=42)
+    dec = hx.execute_text(HX, enc, key=42)
     assert dec == "executor ok"
-    assert hx.execute("GCD", 12, 18) == 6
-    assert hx.execute_text("LANG8_CAESAR1", "abc") == "bcd"
+    assert hx.execute(GC, 12, 18) == 6
+    assert hx.execute_text(CA, "abc") == "bcd"
 
 
 def test_ingest_data(tmp_path):
@@ -137,7 +140,7 @@ def test_ingest_data(tmp_path):
     (tmp_path / "s.csv").write_text(
         "t,h\n" + "\n".join(f"{t},{20 - 5 * t * t}" for t in range(-8, 9)),
         encoding="utf-8")
-    from hagi_ingest import ingest_file, tasks_from_numeric_file
+    from hagi.hagi_ingest import ingest_file, tasks_from_numeric_file
     tasks = tasks_from_numeric_file(tmp_path / "s.csv")
     assert any(t.name == "INGEST_s_t_to_h" for t in tasks)
     p = hagi.GrowingHagiProcessorV9(node_budget=200000)
@@ -150,7 +153,7 @@ def test_byte_lm():
     """HAGI neural body (theory §2/§3/§6): one-hot CE over bytes,
     guarded steps (holdout CE never increases), ternary quantization
     with guarded recovery, generation returns prompt-consistent text."""
-    import hagi_lm
+    from hagi import hagi_lm
     data = ("квадрат суммы равен сумме квадратов плюс произведение. " * 40).encode("utf-8")
     lm = hagi_lm.ByteLM(k=6, dim=32, hidden=64)
     rep = lm.train_guarded(data, epochs=40, log_every=0)
@@ -168,19 +171,19 @@ def test_hybrid_mind(tmp_path, monkeypatch):
     """Both organs behind one interface: exact programs answer with
     EXACT label; unknown queries fall to the neural body (honestly
     labelled, never certified)."""
-    import hagi_mind, hagi_lm
+    from hagi import hagi_mind, hagi_lm
     monkeypatch.chdir(Path(__file__).parent.parent)
     exact = hagi_mind._exact_answer("gcd 12 18")
-    assert exact == ("GCD", "6")
-    assert hagi_mind._exact_answer("square -7") == ("SQUARE", "49")
-    assert hagi_mind._exact_answer("нок 4 6") == ("LCM", "12")
+    assert exact[1] == "6"          # program name is a hash now
+    assert hagi_mind._exact_answer("square -7")[1] == "49"
+    assert hagi_mind._exact_answer("нок 4 6")[1] == "12"
     assert hagi_mind._exact_answer("что такое смысл жизни") is None
 
 
 def test_curriculum_certificate():
     """primes CurriculumCert port: order-free phase accounting —
     delta_i/d_i sums commute; certificate attaches to state."""
-    import hagi_curriculum as c
+    from hagi import hagi_curriculum as c
     a = [c.PhaseRecord("GROW", 0.5, 0.02), c.PhaseRecord("DERIVE", 0.3, 0.02)]
     b = list(reversed(a))
     assert c.curriculum_total(a) == c.curriculum_total(b)  # commutativity

@@ -27,9 +27,8 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import hagi_execute as hx  # noqa: E402
-import hagi_lm  # noqa: E402
+from hagi import hagi_execute as hx  # noqa: E402
+from hagi import hagi_lm  # noqa: E402
 
 SELF_SOURCES = ["generated_programs.py", "hagi_lm.py", "hagi_execute.py",
                 "hagi_ingest.py", "hagi_selfloop.py", "hagi_selfrewrite.py"]
@@ -53,17 +52,20 @@ _ROUTES: dict[str, tuple[str, callable]] = {
 
 def _exact_answer(query: str) -> tuple[str, str] | None:
     q = query.strip().lower()
+    from hagi.hagi_selfrewrite import _fn_hash
     for pat, (prog, parse) in _ROUTES.items():
         m = re.match(pat, q)
         if not m:
             continue
         args = parse(m)
+        prog_h = _fn_hash(prog)   # programs are exported under hash names
         if prog in ("LANG8_XOR_CIPHER", "LANG8_CAESAR1", "LANG_ATBASH",
                     "LANG8_SHIFT"):
             text, key = args if len(args) == 2 else (args[0], None)
-            out = hx.execute_text(prog, text, key=key) if key is not None                 else hx.execute_text(prog, text)
+            out = hx.execute_text(prog_h, text, key=key) if key is not None \
+                else hx.execute_text(prog_h, text)
         else:
-            out = hx.execute(prog, *args)
+            out = hx.execute(prog_h, *args)
         return prog, str(out)
     return None
 
@@ -83,10 +85,11 @@ def ask(query: str) -> str:
 
 
 def retrain() -> str:
-    base = Path("checkpoints/self")
+    root = Path(__file__).resolve().parent.parent   # repo root
+    base = root / "checkpoints" / "self"
     files = [base / "generated_programs.py"] + \
-            [Path(f) for f in SELF_SOURCES[1:]] + \
-            [Path("README.md"), Path("THEORY_ALIGNMENT.md")]
+            [root / f for f in SELF_SOURCES[1:]] + \
+            [root / "README.md", root / "THEORY_ALIGNMENT.md"]
     files = [f for f in files if f.exists()]
     data = b"".join(f.read_bytes() for f in files)
     lm = hagi_lm.ByteLM(k=10, dim=96, hidden=192)

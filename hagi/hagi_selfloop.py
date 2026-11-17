@@ -45,7 +45,7 @@ from typing import Any, Optional
 import numpy as np
 
 import hagi
-from hagi_selfmodel import (
+from hagi.hagi_selfmodel import (
     FEATURE_KEYS,
     SelfOptimizingProcessorV9,
     TracedProcessorV9,

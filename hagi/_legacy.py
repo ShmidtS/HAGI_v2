@@ -1549,10 +1549,6 @@ def batch_fits_safe(programs: Sequence[Program], X: Optional[np.ndarray],
     return out
 
 
-def batch_fits(programs: Sequence[Program], X: Optional[np.ndarray],
-               Y: Optional[np.ndarray], device: str = "cpu") -> list[Optional[bool]]:
-    """Public sound wrapper. Unsafe/overflow-prone cases return None."""
-    return batch_fits_safe(programs, X, Y, device=device)
 
 
 # ------------------------- best-first candidate synthesis ----------------------
@@ -2202,37 +2198,8 @@ def fit_fiber_guarded(inputs, targets, val_inputs, val_targets, seed,
 # --------------- certified ternary compression (ALGORITHMS §TernaryGrad) --------
 
 
-def ternary_quantize_fiber(fiber) -> dict[str, Any]:
-    """Certified ternary quantization of a neural fiber's weight matrices.
-
-    Theory (quantOpt_energy_bound, quant_residual_norm): with levels
-    {-s, 0, +s}, s = max|w|, the elementwise error is |w - q| <= s/2 and the
-    squared residual norm is <= n*(s/2)^2 — an explicit, machine-checked
-    error ceiling for the compressed expert. Zero float arithmetic in the
-    quantizer itself (pure comparisons/multiplications).
-    """
-    out: dict[str, Any] = {"matrices": {}, "bounds": {}}
-    for name in ("w1", "w2"):
-        w = np.asarray(getattr(fiber, name), dtype=np.float64)
-        s = float(np.max(np.abs(w))) or 1.0
-        q = np.where(np.abs(w) <= s / 2, 0.0, np.sign(w) * s).astype(np.float64)
-        n = w.size
-        resid = float(np.sum((w - q) ** 2))
-        bound = n * (s / 2) ** 2
-        out["matrices"][name] = q.tolist()
-        out["bounds"][name] = {"s": s, "residual_sq": resid,
-                               "cert_bound_sq": bound,
-                               "holds": bool(resid <= bound + 1e-9)}
-    # b1/b2 (biases) kept exact: row vectors, negligible volume
-    out["matrices"]["b1"] = np.asarray(fiber.b1).tolist()
-    out["matrices"]["b2"] = np.asarray(fiber.b2).tolist()
-    return out
 
 
-def quantized_fiber_predict(q: dict[str, Any], xs) -> float:
-    x = np.asarray(xs, dtype=np.float64).reshape(1, -1) / 1.0
-    h = np.tanh(x @ np.asarray(q["matrices"]["w1"]) + np.asarray(q["matrices"]["b1"]))
-    return float((h @ np.asarray(q["matrices"]["w2"]) + np.asarray(q["matrices"]["b2"]))[0, 0])
 
 
 # ------------------- CRAM energy solver (E-track, E1/E2/P1/A5) ------------------
@@ -2420,12 +2387,6 @@ def _multivariate_poly_expr(
                                      for c, powers in terms))
 
 
-def _eval_multivariate_poly(
-    terms: Sequence[tuple[int, Sequence[int]]], xs: Sequence[int],
-) -> int:
-    return int(sum(int(c) * math.prod(int(x) ** int(p)
-                                      for x, p in zip(xs, powers))
-                   for c, powers in terms))
 
 
 def _poly_expr(coeffs: tuple[int, ...]) -> Expr:
@@ -2439,17 +2400,6 @@ def _eval_poly(coeffs: tuple[int, ...], x: int) -> int:
     return acc
 
 
-def _poly_pretty(coeffs: tuple[int, ...]) -> str:
-    terms = []
-    for i in range(len(coeffs) - 1, -1, -1):
-        c = coeffs[i]
-        if c == 0:
-            continue
-        term = ("" if c == 1 else ("-" if c == -1 else str(c) + "*"))
-        body = "x" if i == 0 else ("x" if i == 1 else f"x**{i}")
-        sign = "-" if (c < 0 and not terms) else (" - " if c < 0 else (" + " if terms else ""))
-        terms.append(sign + term + body if i else sign + ("" if term else str(c)))
-    return "poly(" + ("".join(terms) or "0") + ")"
 
 
 @dataclass

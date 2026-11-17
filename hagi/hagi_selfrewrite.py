@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Any
 
 import hagi
-from hagi_selfmodel import TracedProcessorV9
-from hagi_selfloop import run_self_development
+from hagi.hagi_selfmodel import TracedProcessorV9
+from hagi.hagi_selfloop import run_self_development
 
 VAR_NAMES = ("x", "y", "z", "u", "v", "w")
 
