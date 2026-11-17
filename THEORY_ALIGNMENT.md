@@ -609,3 +609,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Unified/NegativeTests** — бюджет не перерасходуем, риск не
   превышаем, RAM-запись точна: негативные тесты HAGI
   (отказ/rollback) имеют прямые lean-аналоги.
+
+
+## Цикл 33 сверки (2026-11-19): Step/WarmupSchedule + MDLObjective
+
+- **warmup_telescope_bound (C349)**: Σ(η/2)g² ≤ Δ₀−Δₙ —
+  подтверждён на живом спуске школы Нади (1.626 ≤ 3.213 при
+  Δ₀=5.526→Δₙ=2.312). Наш _certified_step удовлетворяет
+  контракту спуска напрямую.
+- **mdlObjective_nonincreasing / tradeoff / neg_lambda_forbidden**
+  — MDL-цель Lpred+λ·Lcode не растёт при L-шаге; λ<0 запрещено —
+  это уже встроено в hagi_selfoptimize (MDL-prune 1285→864,
+  цикл ранее).
