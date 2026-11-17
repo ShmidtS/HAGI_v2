@@ -828,3 +828,13 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 §3.9 certified step (CE 5.52->4.66, сертификат 0.43), Venn 64/64,
 ANF 98/98, EC group law (N*G=O). 13/13 characterization tests
 (золотые числа неизменны).
+
+
+## Цикл 9 (2026-11-17, пост-рефакторинг): ре-верификация на новом коде
+
+- curriculum commutativity (0.8==0.8), Venn AND-mask 4/4,
+  §3.9 certified step (5.52->4.66) — все сертификаты держатся
+  на переименованных модулях.
+- forever cycle 1 в проде на новом коде: rounds=343,
+  experts=1582 (с MDL-полн. копией), failures=0, rewrites=47.
+- Рефакторинг завершён и верифицирован end-to-end.
