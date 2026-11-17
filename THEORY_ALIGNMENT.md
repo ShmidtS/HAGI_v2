@@ -323,3 +323,18 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   (Σ6/(π²k²)≤1) и постепенное развёртывание self-edit патчей.
 - Логический конвейер Venn→TT→ANF→Compose→Dispatch полностью
   портирован и численно идентичен теории.
+
+
+## Цикл 11 сверки (2026-11-19): Ensemble/Hoeffding + Growth/RsiCriterion
+
+- **Hoeffding twoGap_bounded** — экспоненциальная граница через
+  cosh (log cosh/2 ≤ M²/4): согласована с DataToQuality
+  sampleComplexity (обе дают квадратичную зависимость от tolerance);
+  подтверждает honest-note цикла 6.
+- **Growth/RsiCriterion** — динамический критерий само-улучшения:
+  ξ + (1−ρ)D < βC ⟹ D растёт. Проверен на ЖИВОМ состоянии forever:
+  эксперты 1004→1019 (rounds 316), поток новых программ 0.14/раунд
+  > 0 — критерий ВЫПОЛНЕН на реальных данных (ρ≈1, ξ=prune < βC).
+- **Согласование Takeoff/Saturation**: growth-модули группы Growth
+  формализуют именно тот вечный цикл, который сейчас исполняется
+  (316 раундов без остановок).
