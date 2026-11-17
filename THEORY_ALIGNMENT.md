@@ -692,3 +692,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   измеренный (не постулированный) телескоп — наш цикл 5
   (реальный спуск 3.526 ≥ Σ сертификатов 3.313) и honest-note
   гейтов реализуют тот же принцип.
+
+
+## Цикл 40 сверки (2026-11-19): Step/Dominate + RoundViability
+
+- **domination_decompose**: разложение d = α·gs + ortho с
+  α=⟨d,gs⟩/||gs||² — подтверждено численно ( reconstruction
+  1e-16). Это алгебра разделения безопасной/опасной компонент
+  шага — основа наших guard-гейтов и GPM-проекций.
+- **safe_consensus_harmless / dominated_collateral_bound**:
+  безопасность консенсуса и границы collateral — форма
+  reject-if-increase (reject безопасен).
+- **RoundViability (round_viable / cycle_criterion)** — критерий
+  жизнеспособности раунда (γρkξ инварианты) — наш forever-round
+  контракт (gate passes ⟹ round принят).
