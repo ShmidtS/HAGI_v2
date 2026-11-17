@@ -366,3 +366,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   сближение C→Cstar без перескока (σ∈[0,1]) — наш curriculum
   order-free учёт и gate-rollback (отвержение ухудшений) — точные
   операциональные аналоги; anchor_total=30 сошёлся точно (цикл 1).
+
+
+## Цикл 14 сверки (2026-11-19): Dynamics/Laws + Dynamics/ProxyGap
+
+- **learning_time_lower_bound** (E0−E_T ≤ T·M, телескоп): тот же
+  телескоп-механизм, что подтверждён циклом 5 на CertifiedStepLM
+  (реальный спуск 3.526 ≥ Σ сертификатов 3.313); лимит скорости
+  рассеяния M — наш per-step сертификат.
+- **ProxyGap BudgetAlive / guarantee_horizon_bound** (T·c ≤ eps):
+  численно согласовано с self-edit: eps=MAX_GATE_RUNS=6,
+  c=2 запуска на кандидата ⟹ максимум 3 кандидата/цикл — живое
+  ограничение частоты самообновления верификатора.
+- **budget_consumed** (монотонность живости) — тривиально
+  выполняется в forever (gate-трата только растёт суммарно).
