@@ -494,3 +494,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **StateBinding candidate_completeness_find** — поиск полного
   кандидата на границе usableFrontier — наш self-edit knob-space
   (declared candidates only) + usableFrontier_renewal = forever.
+
+
+## Цикл 24 сверки (2026-11-19): Growth/NoiseDisentangle + FiberNecessity
+
+- **orthogonal_noise_averaging** (||среднее N ортогональных
+  шумов||² = σ²/N): подтверждена численно (N=16, σ=2: точное
+  равенство). Операционально: 32 воркера ⟹ шум /32.
+- **FiberNecessity (configs_injective_on_separated →
+  used_configs_lower_bound → fiber_params_floor)**: разделённые
+  задачи требуют различных конфигураций ⟹ дубликаты экспертов
+  не добавляют покрытие. Третье независимое обоснование MDL-prune
+  (циклы 4, 23, 24).
