@@ -784,3 +784,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   min-norm направления и fixed-batch расписания.
 - **BatchRangeBF16Cert**: BF16-диапазон логитов; мы считаем в
   float32 (строже BF16) — сертификат выполняется a fortiori.
+
+
+## Цикл 47 сверки (2026-11-19): Model/Attention (GQA/MLA) + Unified/Robust
+
+- **mla_cache_saving** (n·dc < 2·n·d при dc<2d): точная формула
+  экономии KV-кэша (×4 при dc=512,d=1024,n=4096) — расчёт для
+  KV-cache фронта (Next Steps) теперь теоретически обоснован.
+- **robust_eligible_iff_radius_le_margin**: элегибельность
+  решения ⟺ робастный радиус ≤ запас — точная форма нашего
+  no-regression margin в self-edit гейтах.
+- **GuardedRobustLogit**: при отсутствии апгрейда система
+  остаётся — соответствие rollback-on-reject.
