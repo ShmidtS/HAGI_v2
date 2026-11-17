@@ -757,3 +757,16 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   параллельные воркеры (наши 32) — термодинамически sound ось.
 - **coordinate_kl_nonneg** (координатный KL-шаг ≥ 0): KL не
   растёт при координатной оптимизации — согласовано с гейтами.
+
+
+## Цикл 45 сверки (2026-11-19): Unified/CostComposition + Ctv2Telescope
+
+- **hybrid_cost_lt / hybrid_ratio_le**: гибрид (MoD × SWA × L)
+  дешевле dense в (k/n)·((2w+1)/n) раз — подтверждено численно
+  (k=32,n=128,w=10: отношение 0.059 ≤ 0.061, экономия ×17).
+  Теоретическая база нашей EXACT/NEURAL гибридной маршрутизации
+  (hagi_mind): дорогое EXACT только на отобранных, NEURAL на
+  остальном.
+- **Ctv2Telescope (tc_step_of_stepcert / ec_chain_to_tc)**:
+  сертификат шага ⟹ телескоп-следствие — тот же механизм, что
+  подтверждён циклами 5/14/39.
