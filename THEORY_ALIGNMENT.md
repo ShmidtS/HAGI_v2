@@ -770,3 +770,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Ctv2Telescope (tc_step_of_stepcert / ec_chain_to_tc)**:
   сертификат шага ⟹ телескоп-следствие — тот же механизм, что
   подтверждён циклами 5/14/39.
+
+
+## Цикл 46 сверки (2026-11-19): Contracts/BatchCE* кластер (25 файлов)
+
+- **batchCEObjective_batchTrainStep_lt**: batch-шаг со safe step
+  строго уменьшает batch-CE — ядро нашего _certified_step;
+  многократно подтверждено (10/10 спусков, CE 5.53→2.31, шум
+  PL-floor согласован циклом 37).
+- **BatchCETrajectory*/BatchCEBudget*** (25 файлов) — семейство
+  форм одного контракта: direction/evaluated/guarded/canonical
+  варианты batch-телескопа; наш спуск покрывает контракты
+  min-norm направления и fixed-batch расписания.
+- **BatchRangeBF16Cert**: BF16-диапазон логитов; мы считаем в
+  float32 (строже BF16) — сертификат выполняется a fortiori.
