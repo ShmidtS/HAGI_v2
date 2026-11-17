@@ -848,3 +848,13 @@ ANF 98/98, EC group law (N*G=O). 13/13 characterization tests
 - **ProductiveTransition (idle_not_productive)**: переход без
   роста не продуктивен — контракт нашего forever (цикл принимается
   только при rounds/rewrites росте; стагнация = сигнал).
+
+
+## Цикл 11 (2026-11-17): Unified/OptimalConfig
+
+- **cfg_stability / cfg_descent**: heavy-ball (β,η)=(ρ²,(1−ρ)²)
+  при 0<ρ<1 автоматически стабилен и даёт строгий спуск —
+  подтверждено численно (ρ∈{0.3,0.5,0.7,0.9}).
+  Операционально: это формула для genesis-расширения momentum
+  knob (фронт: сейчас у нас нет momentum в knob-space —
+  сертифицированное добавление по cfg-формуле безопасно).
