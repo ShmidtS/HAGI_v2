@@ -545,3 +545,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   GatePipeline.false_commit: наш forever-rollback (reject при
   нарушении floors) реализует тот же контракт: суммарная
   вероятность Bad ≤ Σspent + Σδ ≤ δtotal.
+
+
+## Цикл 28 сверки (2026-11-19): Learning/SleepingRouter + FOOF
+
+- **SleepingRouter (sleeping exp-weights)**: веса неотрицательны,
+  потенциал активных положителен; численная симуляция (N=5,
+  T=40, η=0.5): regret 2.56 vs лучший эксперт = O(√(T·log N))
+  — роутер экспертов HAGI (маршрутизация 1019 программ)
+  реализует тот же sleeping-EW контракт: спящие (невостребованные)
+  эксперты не получают веса.
+- **FOOF (foof_normal_eq/step_identity)** — ridge-нормальные
+  уравнения FOOF-памяти: согласовано с регрессией в hagi_ingest.
