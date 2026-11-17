@@ -621,3 +621,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   — MDL-цель Lpred+λ·Lcode не растёт при L-шаге; λ<0 запрещено —
   это уже встроено в hagi_selfoptimize (MDL-prune 1285→864,
   цикл ранее).
+
+
+## Цикл 34 сверки (2026-11-19): Pretraining/Grokking + TrustRegion
+
+- **drift_solution / drift_half_life / grokking_timescale_separation**:
+  w(t)=w0·e^{−λt}, t½=ln2/λ — подтверждены численно. Разделение
+  масштабов (быстрое обучение << медленный decay-дрейф) объясняет
+  grokking-эффект и согласовано с задокументированным torch-отличием
+  AdamW (decay×lr, цикл 2).
+- **TrustRegion (hadamardRows_sup_bound / orthonormal_mulVec_isometry)**:
+  ортогональные преобразования сохраняют норму (изометрия) —
+  доверительный регион на хадамаровых направлениях.
