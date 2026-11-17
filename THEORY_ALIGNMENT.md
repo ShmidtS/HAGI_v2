@@ -289,3 +289,19 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   нарушение найдено и исправлено (§3.9 JVP R'), 2 улучшения
   внедрены (δ-schedule, strict-positive-gain), честные границы
   задокументированы. Все коммиты в main.
+
+
+## Цикл 9 сверки (2026-11-19): Data/BoolVenn + Model/Logic/VennHead +
+## Data/AnfTransform + AnfDispatch (CDGC этап A)
+
+- **VennHead python-порт** (hagi/hagi_venn.py): vAtom = relu(±A±B−1),
+  atomIdx порядок (++),(+-),(-+),(--); ВСЕ 64 проверки (16 масок × 4
+  входа) точны — vennHead_exact подтверждён численно.
+- **ANF python-порт** (hagi/hagi_anf.py): Мёбиус GF(2); инволюция
+  (anf_inversion) и вычисление полинома точны на 98 проверках
+  (n=1,2,3); dispatch с отказом при конфликте (AnfDispatch).
+- **Урок 34 Наде**: И/ИЛИ/НЕ как композиция концептов (CE 0.038,
+  recalls верны) — CDGC этап B-C начат: логика привязана к
+  цветам/формам.
+- Basis для CDGC (Logic→Concepts→World Model) готов: Venn+ANF —
+  формальный логический фундамент, симулятор мира — следующий фронт.
