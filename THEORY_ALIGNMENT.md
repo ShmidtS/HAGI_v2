@@ -717,3 +717,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **seed_only_grow_stop / cycle_decay_mono**: рост только от
   seed останавливается (сатурация) — контраст обосновывает
   loop-driven самоулучшение (наш forever + rewrites ⟹ inj>0).
+
+
+## Цикл 42 сверки (2026-11-19): Autonomy/SupervisorViability + Safety
+
+- **halving_mistake_bound** (≤ log2|H| ошибок): подтверждено
+  численно (64→6 ошибок = log2 64 ✓). Version-space halving —
+  форма нашего gate-отсева (каждый reject сужает пространство
+  кандидатов вдвое-эквивалентно).
+- **ternary_beats_binary**: тройной супервизор доминирует
+  бинарный — наш HOLD-режим при противоречии (ловушка в дуэлях)
+  операционально реализует третью ветку.
+- **majority_wrong_persists**: неверный мажоритарный вердикт
+  сохраняется при односторонней обратной связи — честный риск
+  majority-гейтов (документировано как граница, не скрыта).
