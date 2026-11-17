@@ -276,3 +276,16 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Core/Ambig.lse_shift** — сдвиг logsumexp на константу точен;
   применяется в softmax-нормировках (softmax инвариантен к сдвигу
   — согласовано с нашей реализацией).
+
+
+## Цикл 8 сверки (2026-11-18): полное покрытие
+
+- **GatedCEStep** — наш паттерн (frozen backbone + additive
+  adapters + safe step) ТОЧНО соответствует теореме строгого
+  спуска gated-CE: сверка архитектуры ✓.
+- **LLRD/NeuronAlloc/Lion/Lookahead/KVCache/DepthExit/CRAM** —
+  фронты при скейле (не заявляем).
+- ИТОГО за 8 циклов: 15 групп теория↔код сверены, 1 реальное
+  нарушение найдено и исправлено (§3.9 JVP R'), 2 улучшения
+  внедрены (δ-schedule, strict-positive-gain), честные границы
+  задокументированы. Все коммиты в main.
