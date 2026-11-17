@@ -912,3 +912,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   (softmax shift-invariance, циклы 7/15).
 - **budget_allocation_dominance**: бюджет доминирующему направлению
   — форма нашего FlopsEconomy-распределения.
+
+
+## Цикл 16 (2026-11-18): Model/EnergyReasoning/Pseudolikelihood
+## (теория обновлена — старые файлы EnergyReasoning заменены)
+
+- **pseudolikelihood_eq_conditional_ce**: PL = условный CE —
+  подтверждено численно; **pseudolikelihood_nonneg** ✓.
+  Это теоретический фундамент E-track (energy-based learning
+  через псевдоправдоподобие вместо joint-descent — теория честно
+  оговаривает отсутствие joint-update descent theorem).
+  Операционально: форма для будущей energy-головы Надь (фронт E1).
