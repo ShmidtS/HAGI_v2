@@ -680,3 +680,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   ядро forever-цикла (телескоп + floors + budget/risk ledger) —
   покрыто циклами 5/10/14; legacy_obj_anti: измеренное ≠ legacy
   objective (наша honest-label EXACT/NEURAL).
+
+
+## Цикл 39 сверки (2026-11-19): Benchmarks/QuadLoopWitness + Unified/Honest
+
+- **quadE_qhalf**: t полушагов η=1/2 ⟹ энергия ×(1/4)^t —
+  подтверждена численно на t=1,3,5 (точность 1e-12). Это
+  эталонный loop-witness: «модель→шаги→измеренная энергия→
+  точный закон сжатия».
+- **honest_telescope / measured_honest / telescope_measured** —
+  измеренный (не постулированный) телескоп — наш цикл 5
+  (реальный спуск 3.526 ≥ Σ сертификатов 3.313) и honest-note
+  гейтов реализуют тот же принцип.
