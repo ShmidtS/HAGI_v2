@@ -901,3 +901,14 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **CertifiedEstimator (prodPq ≤ 1)**: произведения вероятностей
   — форма e-process гейтов (C232 stitching), уже используемая
   в GatePipeline.
+
+
+## Цикл 15 (2026-11-18): Numerics/SoftmaxFix + Dynamics/ControllerPolicy
+
+- **ce_grad_sum_zero** (Σ(p − onehot) = 0): подтверждено (Σ=2e-16).
+- **ce_loss_margin**: CE = log(1 + Σ_{v≠y} e^{z_v−z_y}) — точная
+  margin-форма (совпадение до 1e-9). Это численно-стабильная
+  реализация CE (logit-shift), которую мы уже используем
+  (softmax shift-invariance, циклы 7/15).
+- **budget_allocation_dominance**: бюджет доминирующему направлению
+  — форма нашего FlopsEconomy-распределения.
