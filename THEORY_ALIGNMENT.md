@@ -519,3 +519,8 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   шаг по невыбранным направлениям) — согласовано с gated-градиентом.
 - **Geometry SphericalSimplex** (двугранные углы, избыток
   симплекса > 0) — фронт для Venn-головы §17 (геометрия решения).
+
+
+- Поправка к циклу 25: экономный QR дал неполный базис — тест
+  был неверен, не теорема. С mode='complete': rank 3→6, прирост
+  ровно k=3, |M·Rᵀ| ≈ 1e-15 — rank_orthogonal_growth ТОЧЕН.
