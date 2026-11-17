@@ -533,3 +533,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   ≤1e-9). Хадамаров характерный базис ортонормирован с нормой √N —
   энергетический фундамент Venn-головы §17 и low-rank
   bit-allocation (фронт).
+
+
+## Цикл 27 сверки (2026-11-19): Learning/PertTelescope + ContinualForgetting
+
+- **pert_telescope** (||Δ|| ≤ len·δ·L^len через цепь слоёв):
+  подтверждена численной симуляцией (3 слоя, L=1.5, δ=0.1).
+  Это граница чувствительности к возмущениям слоёв — связана с
+  DepthExitCert exitLeak ∏(1+μⱼ) (цикл 6).
+- **continual_forgetting_bound** — δ-бюджет забывания через
+  GatePipeline.false_commit: наш forever-rollback (reject при
+  нарушении floors) реализует тот же контракт: суммарная
+  вероятность Bad ≤ Σspent + Σδ ≤ δtotal.
