@@ -352,3 +352,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - Поиск кандидатов = search_cost_bound (линейно по числу
   кандидатов × cMeas) — соответствует нашему fixed-knob-space
   self-edit (m мал, стоимость измерения ограничена).
+
+
+## Цикл 13 сверки (2026-11-19): Growth/PlasticityLedger + Saturation
+
+- **plasticityRadius = Σ KL(P_i || famMix) ≤ |I|·log|I|**:
+  подтверждено численно (3 семейства: per-KL 0.32/0.24/0.00 ≤
+  log 3=1.099, сумма 0.554 ≤ 3.296). Операциональный смысл для
+  HAGI: разброс "взглядов" на мир ограничен логарифмом числа
+  экспертов — наш MDL-prune удаляет дубли = снижает |I| без
+  потери радиуса пластичности.
+- **Saturation never_overshoot / pl_gap_geometric**: экспоненциальное
+  сближение C→Cstar без перескока (σ∈[0,1]) — наш curriculum
+  order-free учёт и gate-rollback (отвержение ухудшений) — точные
+  операциональные аналоги; anchor_total=30 сошёлся точно (цикл 1).
