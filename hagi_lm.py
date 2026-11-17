@@ -206,8 +206,10 @@ class ByteLM:
     # ---- generation --------------------------------------------------
     @t_no_grad_if
     def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.8,
-                 seed: int = 1) -> str:
+                 seed: int = 1, stop_at_eos: bool = False,
+                 eos_bytes=None) -> str:
         t = self.t
+        eos = set(eos_bytes or [])
         g = t.Generator().manual_seed(seed)
         ctx = list(prompt.encode("utf-8"))[-self.k:]
         if len(ctx) < self.k:
@@ -220,6 +222,10 @@ class ByteLM:
             b = int(t.multinomial(probs, 1, generator=g))
             out.append(b)
             ctx = ctx[1:] + [b]
+            # the model stops ITSELF: terminator byte completes a sentence
+            if stop_at_eos and bytes([b]) in eos:
+                if bytes(out).rstrip().endswith(tuple(eos)):
+                    break
         return (prompt.encode("utf-8") + bytes(out)).decode("utf-8",
                                                             errors="replace")
 
