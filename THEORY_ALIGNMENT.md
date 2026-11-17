@@ -467,3 +467,16 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   посылки (ε < фактического drop) — FAIL был ошибкой теста, не
   теоремы. При корректных посылках (ε_i ≥ Qm_i − Qm2_i)
   Qgen_drop_bound точен: 0.2054 ≤ 0.3501 ✓.
+
+
+## Цикл 22 сверки (2026-11-19): Cert/Core (delta) + Growth/GainDecomposition
+
+- **GainDecomposition** — merge=mean, deviations_cancel
+  (Σdev=0), pairwise_variance_identity (Σᵢⱼ||Wᵢ−Wⱼ||²/N² =
+  2Σ||dev||²/N), orthogonal_energy_split (Σ||Wᵢ||² =
+  N||M||²+Σ||dev||²) — ВСЕ ТРИ тождества подтверждены численно
+  (точность ≤1e-9). Операциональный смысл: merge дубликатов при
+  MDL-prune не теряет энергию; отклонения ортогональны среднему.
+- **Cert/Core CertStepDelta.deltaBound + delta_telescope** —
+  δ-телескоп покрыт циклами 5/14; наш floor_ladder/δ-schedule —
+  операциональная форма.
