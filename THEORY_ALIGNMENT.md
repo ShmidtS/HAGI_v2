@@ -582,3 +582,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **TrainingTransition taskStep_identity** — вычисленное, не
   постулированное качество задачи (taskQual_is_computed) —
   принцип «измеренная потеря» (сверен циклом 16 на QuadraticEndToEnd).
+
+
+## Цикл 31 сверки (2026-11-19): Autonomy/ParetoController + FannesPinsker
+
+- **ParetoController (dirTau_char / noisy_pareto_select)**:
+  скаляризация целей весами ω достигает argmax на Парето-границе
+  (численно: argmax скаляризации ∈ Парето-граница ✓). Наши
+  self-edit гейты скаляризуют (точность, relief, no-regression)
+  с гарантированным зазором — strict-зона CertifiedArgmax (цикл 20).
+- **FannesPinsker** — Fannes-неравенство + Pinsker (KL ↔ TV):
+  связь KL-радиуса пластичности (цикл 13) с измеримой
+  разницей распределений.
