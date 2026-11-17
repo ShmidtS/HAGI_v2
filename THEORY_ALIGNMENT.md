@@ -706,3 +706,14 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **RoundViability (round_viable / cycle_criterion)** — критерий
   жизнеспособности раунда (γρkξ инварианты) — наш forever-round
   контракт (gate passes ⟹ round принят).
+
+
+## Цикл 41 сверки (2026-11-19): Growth/SeedOnly + GreedyTermination
+
+- **greedy_strict_search_terminates**: строгий спуск по
+  конечному множеству терминируется на координатном минимуме
+  без циклов (симуляция ✓). Валидирует наш self-edit поиск по
+  конечному knob-space (терминируется, не циклит).
+- **seed_only_grow_stop / cycle_decay_mono**: рост только от
+  seed останавливается (сатурация) — контраст обосновывает
+  loop-driven самоулучшение (наш forever + rewrites ⟹ inj>0).
