@@ -569,3 +569,16 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **zero_energy_domain_free**: нулевые домены бесплатны —
   прямой аргумент за sparse ternary (наш ternary_() уже
   оставляет нули: честная экономия бит уже в проде).
+
+
+## Цикл 30 сверки (2026-11-19): Learning/RegCovPD + HRCN + TrainingTransition
+
+- **regCov_posDef** (XᵀX+λI ≻ 0 при λ>0): подтверждено численно
+  (min eigenvalue 0.022 > 0). Фундамент FOOF/ridge-памяти
+  (hagi_ingest детерминированная регрессия).
+- **HRCN cross_talk_zero**: хадамаровы каналы не интерферируют
+  (cross ≈ 0, сверено) — разделение экспертов по каналам без
+  перекрёстных помех (частота-разделение HRCN).
+- **TrainingTransition taskStep_identity** — вычисленное, не
+  постулированное качество задачи (taskQual_is_computed) —
+  принцип «измеренная потеря» (сверен циклом 16 на QuadraticEndToEnd).
