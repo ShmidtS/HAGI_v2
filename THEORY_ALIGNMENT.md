@@ -633,3 +633,12 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **TrustRegion (hadamardRows_sup_bound / orthonormal_mulVec_isometry)**:
   ортогональные преобразования сохраняют норму (изометрия) —
   доверительный регион на хадамаровых направлениях.
+
+
+## Цикл 35 сверки (2026-11-19): Pretraining/Dust + DustMeasure
+
+- **rademacher_expect_sign** (E[sign⟨g,ε⟩]=0 при симметричном
+  ε): подтверждена Монте-Карло (20000 испытаний: |mean|<0.02).
+  Dust-оценщик — несмещённый инструмент измерения неиспользуемой
+  плотности данных; операционально соответствует нашему
+  детерминированному отбору при ingest (prune дубликатов).
