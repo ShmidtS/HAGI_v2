@@ -594,3 +594,18 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **FannesPinsker** — Fannes-неравенство + Pinsker (KL ↔ TV):
   связь KL-радиуса пластичности (цикл 13) с измеримой
   разницей распределений.
+
+
+## Цикл 32 сверки (2026-11-19): Step/GPM + GradClip + Unified/NegativeTests
+
+- **gpm_zero_forgetting**: ΔW в ортогональном дополнении старых
+  входов ⟹ (W+ΔW)·xs = W·xs — НУЛЕВОЕ забывание, подтверждено
+  численно (|ΔW·xs| ≈ 1e-16). С циклами 8 (GatedCE) и 25
+  (rank_orthogonal_growth) образует полную теоретическую тройку
+  нашего frozen-backbone+adapters ядра.
+- **GradClip (clip_norm_le/idem/dir)** — клиппинг сохраняет
+  направление, уменьшает норму: соответствует нашей защитной
+  нормировке шага (safeStepSize).
+- **Unified/NegativeTests** — бюджет не перерасходуем, риск не
+  превышаем, RAM-запись точна: негативные тесты HAGI
+  (отказ/rollback) имеют прямые lean-аналоги.
