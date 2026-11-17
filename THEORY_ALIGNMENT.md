@@ -450,3 +450,14 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   Dispatch-отказ в ANF — тот же принцип.
 - **Adapters floorsKept_zeroFloor / protectedRisk_le** — наш
   gate-rollback (reject при нарушении floors) — точное соответствие.
+
+
+## Цикл 21 сверки (2026-11-19): Generalization/ModeState
+
+- **Qgen_drop_bound**: взвешенная генерализация контролируется
+  per-probe погрешностями (Qgen(m) − Σw·ε ≤ Qgen(m')) —
+  подтверждена численно. Это теоретический фундамент наших
+  holdout-замеров: качество генерализации = взвешенная сумма
+  по зондам с измеренным ε. generalization_safe_step /
+  hagiPotential — Lyapunov-паттерн, совпадающий с CurriculumCert
+  (сверено циклом 1).
