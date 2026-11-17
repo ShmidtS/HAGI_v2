@@ -203,3 +203,21 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - curriculumTotal_comm (order-free) ✓
 - Thermostat T_t=T0·α^t ✓
 - §6 ternary (test_byte_lm) ✓
+
+
+## Цикл 3 сверки (2026-11-17): Autonomy/Budget/Optimization
+
+- **Insight.experience_cycle_bound** — цикл «опыта» растёт только
+  при положительном бюджете gains−costs>0. Внедрено в self-edit:
+  патч принимается теперь при СТРОГОМ улучшении (adopted rounds
+  или experts больше базовой линии), не просто не-регрессии.
+- **AdamW.adamw_shrink** — decoupled decay сжимает вес при
+  нулевом градиенте (фактор 1−λ). Численно проверено. Отмечено
+  отличие: torch AdamW масштабирует decay на lr (Lean adamwStep —
+  нет); на certified-step путь не влияет.
+- **TTTStability.ttt_bibo** — |W|≤1 ⟹ ограниченность: наши
+  нормированные Hedge-веса (ewNorm) всегда ≤1 ✓.
+- **Lookahead.slowStep**, **Lion.sgn/signStep**, **KVCache** —
+  не используются, честно не заявляем.
+- **Budget/ (BitAlloc, RDAlloc, ResidualVQ)** — фронт для
+  бит-аллокации при скейле квантования.

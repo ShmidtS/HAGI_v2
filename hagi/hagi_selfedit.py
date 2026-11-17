@@ -133,7 +133,10 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
         EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
                             encoding="utf-8")
         return proposal
-    no_regress = cand["adopted"] >= baseline["adopted"]
+    # Insight.experience_cycle_bound: adopt only if the cycle gains
+    # strictly exceed costs — no-regression plus positive evidence.
+    no_regress = (cand["adopted"] > baseline["adopted"]
+                  or cand["experts"] > baseline["experts"])
     proposal.update(decision="adopted" if no_regress else "rejected",
                     candidate=cand, baseline=baseline)
     (log["adopted"] if no_regress else log["rejected"]).append(proposal)
