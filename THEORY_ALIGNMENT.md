@@ -246,3 +246,19 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   certified шагов; реальный спуск 3.526 ≥ Σ сертификатов 3.313 —
   телескоп выполняется даже на не-обучающем holdout. Реализация
   CertifiedStepLM точно соответствует ядру C278.
+
+
+## Цикл 6 сверки (2026-11-18): DataToQuality/DepthExitCert/EnergyReasoning
+
+- **DataToQuality.sampleComplexity = log(m/δ)/(2η²)** — честная
+  ревизия self-edit гейта: 2 фиксированных бенчмарк-раунда дают
+  η≈±99% — гейт ДЕТЕРМИНИРОВАННЫЙ fixed-seed no-regression тест,
+  НЕ статистическая гарантия. Документировано прямо в коде гейта
+  (honest note). Статистическая версия требует ~780 раундов на
+  патч при η=5% — фронт при скейле.
+- **DepthExitCert (exitLeak = Σ bᵢ·∏(1+μⱼ))** — ранний выход из
+  стека с честной композицией скипов; наш floor_ladder —
+  операциональный аналог (budget floor падает при отсутствии
+  рельефа); формальный exit-certificate — фронт.
+- **EnergyReasoning/CRAM** (E-track E1) — energy-descent как
+  альтернативный алгоритм; зафиксировано как фронт, не заявляем.

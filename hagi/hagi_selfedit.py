@@ -133,8 +133,12 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
         EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
                             encoding="utf-8")
         return proposal
-    # Insight.experience_cycle_bound: adopt only if the cycle gains
-    # strictly exceed costs — no-regression plus positive evidence.
+    # Honest gate note (DataToQuality.sampleComplexity): this is a
+    # DETERMINISTIC fixed-seed no-regression test, not a statistical
+    # guarantee — 2 benchmark rounds give eta ~ +/-99% (sample
+    # complexity log(m/delta)/(2 eta^2) would need ~780 rounds for
+    # eta=5%). The gate is deliberately conservative: adopt only on
+    # strict positive evidence (Insight.experience_cycle_bound).
     no_regress = (cand["adopted"] > baseline["adopted"]
                   or cand["experts"] > baseline["experts"])
     proposal.update(decision="adopted" if no_regress else "rejected",
