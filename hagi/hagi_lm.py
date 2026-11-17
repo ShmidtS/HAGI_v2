@@ -744,6 +744,17 @@ class AdaptiveScheduleLM(CertifiedStepLM):
         """Thermostat schedule T_t = T0*alpha^t (theory-exact)."""
         return self.T0 * (self.alpha ** t)
 
+    @staticmethod
+    def aitken_final(L0, L1, L2):
+        """Audit.lean aitken_exact: the geometric-trajectory limit
+        Lstar from three consecutive measurements. Returns None when
+        the window is degenerate (den == 0) — the consistency test
+        (aitken_consistency) must pass before trusting this."""
+        den = L0 + L2 - 2 * L1
+        if den == 0:
+            return None
+        return (L0 * L2 - L1 ** 2) / den
+
     def train_adaptive(self, data: bytes, max_epochs: int = 400,
                        holdout: float = 0.1, log_every: int = 20) -> dict:
         """Train until CE gap < eps_quality (C330) or the epoch cap;

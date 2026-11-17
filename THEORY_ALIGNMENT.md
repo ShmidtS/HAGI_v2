@@ -262,3 +262,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   рельефа); формальный exit-certificate — фронт.
 - **EnergyReasoning/CRAM** (E-track E1) — energy-descent как
   альтернативный алгоритм; зафиксировано как фронт, не заявляем.
+
+
+## Цикл 7 сверки (2026-11-18): Audit.lean Aitken-экстраполяция
+
+- **aitken_exact**: по трём точкам геометрической траектории
+  Lstar = (L0·L2 − L1²)/(L0+L2−2L1). Реализовано как
+  AdaptiveScheduleLM.aitken_final (с None на вырожденном окне —
+  consistency-тест обязателен по aitken_consistency). Измерено на
+  CertifiedStepLM: окно ep10/20/30 предсказало финал 2.115,
+  фактический на ep120 — 1.772 (ошибка 0.34 — траектория не строго
+  геометрична, что теория и оговаривает).
+- **Core/Ambig.lse_shift** — сдвиг logsumexp на константу точен;
+  применяется в softmax-нормировках (softmax инвариантен к сдвигу
+  — согласовано с нашей реализацией).
