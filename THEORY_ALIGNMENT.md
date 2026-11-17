@@ -402,3 +402,12 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   результат» реализован в CertifiedStepLM (CE до/после шага).
 - **DyadicTernary tritEncode < 3^5=243**: подтверждено на крайних
   словах (0, 242) и произвольном (46) ✓.
+
+
+## Цикл 17 сверки (2026-11-19): Foundations/Telescope (C346)
+
+- **lyapunov_gain_noise** — V(T) ≤ V0 − Σgain + Σnoise:
+  подтверждён на живом спуске школы Нади (30 шагов:
+  V(T)=2.0807 ≤ 2.0807; Σgains=3.457, Σnoise=0.012 — шум
+  практически отсутствует, спуск чистый). telescope_le_sub
+  (прямая sub-форма C346) — базис всех наших гейтов.
