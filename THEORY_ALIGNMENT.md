@@ -380,3 +380,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   ограничение частоты самообновления верификатора.
 - **budget_consumed** (монотонность живости) — тривиально
   выполняется в forever (gate-трата только растёт суммарно).
+
+
+## Цикл 15 сверки (2026-11-19): Probability/Azuma + StatMech/Hopfield
+
+- **Hopfield freeEnergy_sandwich** — βE*/N ≤ (1/N)log Z ≤
+  log2 + β‖J‖²_F/2N: подтверждено численно (N=4, K=2, β=0.7:
+  0.3500 ≤ 1.0431 ≤ 1.3931 ✓). Ёмкость памяти считается с двух
+  сторон — operational для оценки предела stored-паттернов
+  надинного тела Надьиной книги.
+- **Azuma (hoeffding_lemma_prefix, azuma_mgf)** — мартингальные
+  границы: согласованы с Ensemble/Hoeffding и DataToQuality
+  (квадратичные tolerance-границы для наших гейтов).
