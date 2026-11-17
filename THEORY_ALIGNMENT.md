@@ -411,3 +411,16 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   V(T)=2.0807 ≤ 2.0807; Σgains=3.457, Σnoise=0.012 — шум
   практически отсутствует, спуск чистый). telescope_le_sub
   (прямая sub-форма C346) — базис всех наших гейтов.
+
+
+## Цикл 18 сверки (2026-11-19): Foundations/ConeTakeoff + GrowthBand
+
+- **cone_invariant_horizon**: инвариант k·C_t ≤ D_t при
+  γk ≤ ρ, γk²+(1−ρ)k ≤ β. Живое состояние: D/C = 1019/32 =
+  31.8 — конус глубокий (k можно брать до 31.8), нарушений нет.
+- **takeoff_from_cone** (C_T ≥ C0·(1+γk)^T): форма роста
+  геометрическая; фактический поток мощности rewrites/round =
+  0.136 > 0 — takeoff-форма сохраняется (усилено циклом 12).
+- **GrowthBand** (αmin ≤ (C'−C)/G ≤ αmax) — полосовой
+  ограничитель роста; соответствует нашему MAX_GATE_RUNS и
+  memory-aware workers (полоса, не свободный рост).
