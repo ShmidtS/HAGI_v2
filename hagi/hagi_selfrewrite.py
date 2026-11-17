@@ -270,9 +270,17 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
             eff_workers = min(workers, 12)
         elif size_est > 600:
             eff_workers = min(workers, 20)
+    # CertifiedLoop: gate-adopted knobs drive the production loop.
+    try:
+        import hagi_selfedit
+        adopted_kwargs = hagi_selfedit.adopted_settings()
+    except Exception:
+        adopted_kwargs = {}
+    if "floor_ladder" not in adopted_kwargs:
+        adopted_kwargs["floor_ladder"] = ladder
     total = run_self_development(
-        max_rounds=rounds, workers=eff_workers, floor_ladder=ladder,
-        initial_segments=initial_segments)
+        max_rounds=rounds, workers=eff_workers,
+        initial_segments=initial_segments, **adopted_kwargs)
     final_proc = total.pop("_final_incumbent")
 
     report: dict[str, Any] = {

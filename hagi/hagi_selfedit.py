@@ -74,12 +74,71 @@ def _gate_tests() -> bool:
     return r.returncode == 0
 
 
+def current_settings() -> dict[str, Any]:
+    """Snapshot of the CURRENT knob values (loop defaults)."""
+    from hagi import hagi_selfloop as sl
+    import inspect
+    sig = inspect.signature(sl.run_self_development)
+    defaults = {k: v.default for k, v in sig.parameters.items()
+                if v.default is not inspect.Parameter.empty}
+    return {"floor_ladder": defaults.get("floor_ladder") or [200],
+            "batch_size": defaults.get("batch_size"),
+            "proposals": defaults.get("proposals_per_round")}
+
+
 def propose_patch(rng) -> dict[str, Any]:
-    """Propose a knob change (declared space only)."""
+    """Propose a knob change (declared space only).
+
+    GrowthCeilings.expansion_required / ProxyGap horizon: a no-op
+    patch (value identical to the current setting) would burn
+    gate-budget (<= 3 candidates/cycle) on a triviality — never
+    propose it. Only changes are candidates.
+    """
     import random
-    knob = rng.choice(list(KNOBS.keys()))
-    value = rng.choice(KNOBS[knob])
-    return {"knob": knob, "value": value}
+    cur = current_settings()
+    for _ in range(64):
+        knob = rng.choice(list(KNOBS.keys()))
+        value = rng.choice(KNOBS[knob])
+        if knob == "floor_ladder":
+            if value == cur.get("floor_ladder"):
+                continue
+        elif value == cur.get(knob):
+            continue
+        return {"knob": knob, "value": value}
+    return {"knob": "batch_size", "value": 8}  # fallback change
+
+
+def is_noop(patch: dict[str, Any]) -> bool:
+    """True when the patch equals the current setting (wastes gate budget)."""
+    cur = current_settings()
+    if patch["knob"] == "floor_ladder":
+        return patch["value"] == cur.get("floor_ladder")
+    return patch["value"] == cur.get(patch["knob"])
+
+
+def adopted_settings() -> dict[str, Any]:
+    """Last adopted value per knob from the edit log (gated, certified).
+
+    CertifiedLoop contract: adopted patches must actually drive the
+    production loop — otherwise the self-edit cycle is decorative.
+    Returns kwargs for run_self_development.
+    """
+    if not EDIT_LOG.exists():
+        return {}
+    log = json.loads(EDIT_LOG.read_text(encoding="utf-8"))
+    last: dict[str, Any] = {}
+    for e in log.get("adopted", []):
+        p = e.get("patch", {})
+        if p.get("knob") and "value" in p:
+            last[p["knob"]] = p["value"]
+    kwargs: dict[str, Any] = {}
+    if "floor_ladder" in last:
+        kwargs["floor_ladder"] = last["floor_ladder"]
+    if "batch_size" in last:
+        kwargs["batch_size"] = last["batch_size"]
+    if "proposals" in last:
+        kwargs["proposals_per_round"] = last["proposals"]
+    return kwargs
 
 
 def apply_patch(patch: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
@@ -110,6 +169,11 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
     baseline = _baseline()
     patch = propose_patch(rng)
     proposal = {"patch": patch, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if is_noop(patch):
+        # No-op = no expansion (GrowthCeilings.expansion_required):
+        # skip without spending gate runs (ProxyGap horizon T<=eps/c).
+        proposal["decision"] = "noop-skipped"
+        return proposal
     if dry:
         proposal["decision"] = "dry"
         return proposal
