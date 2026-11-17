@@ -424,3 +424,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **GrowthBand** (αmin ≤ (C'−C)/G ≤ αmax) — полосовой
   ограничитель роста; соответствует нашему MAX_GATE_RUNS и
   memory-aware workers (полоса, не свободный рост).
+
+
+## Цикл 19 сверки (2026-11-19): Foundations/QuadEta + Ortho + Potential
+
+- **quad_eta_identity** (векторная форма): L(w−η∇L) =
+  (1−η)²·L(w) — подтверждена численно (k=5, η=0.3: точное
+  равенство до 1e-12); quad_eta_descent при 0<η<2 — тот же
+  режим, что CertifiedStepLM safeStep (η=4A/R'² < 2 по
+  конструкции сертификата).
+- **ortho_norm_sq** (Пифагор) — базис our GatingTailBound-аналога
+  в head-гейтах; **Potential sq_decomp** — разложение дисперсии
+  (Σ(r−c)² = Σ(r−mean)² + n(c−mean)²) — базис variance-гейтов.
