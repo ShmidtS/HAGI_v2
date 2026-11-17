@@ -557,3 +557,15 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
   эксперты не получают веса.
 - **FOOF (foof_normal_eq/step_identity)** — ridge-нормальные
   уравнения FOOF-памяти: согласовано с регрессией в hagi_ingest.
+
+
+## Цикл 29 сверки (2026-11-19): Learning/NetworkBudget + SpectralBudget
+
+- **network_bit_error** (сквозная ошибка ≤ √(n·N)/2·Lⁿ при
+  per-layer квантовании √(N/n)/2): подтверждена симуляцией
+  (3 слоя: 0.95 ≤ 8.23 ✓). Оптимум бит-бюджета: поровну между
+  слоями при равных L — основа низкорангового квантования
+  ternary-весов (фронт из Next Steps, теперь с формулой).
+- **zero_energy_domain_free**: нулевые домены бесплатны —
+  прямой аргумент за sparse ternary (наш ternary_() уже
+  оставляет нули: честная экономия бит уже в проде).
