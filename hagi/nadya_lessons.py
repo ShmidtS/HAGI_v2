@@ -39,7 +39,7 @@ def teach_school(epochs: int = 120, k: int = 10, dim: int = 96,
     """Train the dedicated school model FROM SCRATCH on the whole
     book. Fresh training on a small book never forgets: the book is
     the single source of truth, re-learned every time."""
-    import hagi_lm
+    from hagi import hagi_lm
     data = corpus()
     lm = hagi_lm.ByteLM(k=k, dim=dim, hidden=hidden)
     rep = lm.train_guarded(data, epochs=epochs, log_every=0)
@@ -49,6 +49,6 @@ def teach_school(epochs: int = 120, k: int = 10, dim: int = 96,
 
 
 def ask_school(prompt: str, n: int = 40, temp: float = 0.3) -> str:
-    import hagi_lm
+    from hagi import hagi_lm
     lm = hagi_lm.load(SCHOOL_CKPT)
     return lm.generate(prompt, n_bytes=n, temp=temp).split("\n")[0][len(prompt):].strip()
