@@ -158,3 +158,28 @@ SSOT теории: `C:\primes` (Lean 4.35 / Mathlib, 966 теорем, 0 sorry/a
   но certified-step — единственный вариант с гарантированным
   спуском на каждом шаге; целевой рецепт — certified base + Adam
   polish при скейле.
+
+
+## Сверка 2026-11-17: полный рефакторинг по Lean-формализации
+
+Прочитана формализация (CertifiedLoop, ComputeToQuality C330,
+GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
+Архитектурные выводы, воплощённые в коде:
+
+1. **CertifiedLoop `gate_never_increases`** — forever-цикл HAGI_v2
+   это реализация доказанного safe anytime-цикла: без сертификата
+   состояние сохраняется, энергия не растёт никогда. Наша связка
+   гейтов (точность 1.0, relief>=2%, no-regression benchmark в
+   self-edit) — операционализация этой теоремы.
+2. **ComputeToQuality C330** — «минимизация вычислений»: учиться до
+   ε-цели (steps_to_quality: ⌈Δ₀/d⌉ шагов), FLOP-бюджет на эпоху
+   (C328 work model), low-rank tradeoff (2kn < n²). Реализовано:
+   AdaptiveScheduleLM (train-until-eps, adaptive batch), memory-aware
+   workers (degradation по размеру библиотеки).
+3. **GatePipeline C264** — δ-расписание Σ6/(π²k²)≤1 для серии
+   гейтов: каждый commit消耗ляет долю бюджета ложных срабатываний.
+   Фронт: внедрить явный δ-бюджет в self-edit гейт.
+4. **KVCacheCert C331** — кэш точен (kv_cache_exact), отношение
+   работ 3R=(n+2)W; фронт: кэшировать окна LM-инференса.
+5. **Структура**: один источник истины — всё в пакете hagi/,
+   без дублей-шим; root CLI = python -m hagi.hagi_*.
