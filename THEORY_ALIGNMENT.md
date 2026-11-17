@@ -183,3 +183,23 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
    работ 3R=(n+2)W; фронт: кэшировать окна LM-инференса.
 5. **Структура**: один источник истины — всё в пакете hagi/,
    без дублей-шим; root CLI = python -m hagi.hagi_*.
+
+
+## Сверка 2026-11-17 (v2): построчная сверка формул Lean↔Python
+
+Найдено и ИСПРАВЛЕНО реальное расхождение:
+
+- **§3.9 batch R'** — CertifiedStepLM считал R' по last-layer
+  displacement (h·dW2): нелинейность emb/W1 оставалась за кадром,
+  шаг иногда УВЕЛИЧИВАЛ CE (нарушение сертификата, найдено
+  численно: trial CE 3.98→7.41). Исправлено на точный JVP всей
+  сети вдоль D (`torch.autograd.functional.jvp` всех параметров),
+  R'^2 = mean квадратов per-sample ranges (batchLogitRangeSquare,
+  C223). Верификация: 10/10 шагов спускаются, реальный спуск ≥
+  сертификата на каждом.
+
+Подтверждены численно (код↔Lean):
+- curriculumTotal = Δ₁/d₁+Δ₂/d₂; Lean-якорь anchor_total=30 ✓
+- curriculumTotal_comm (order-free) ✓
+- Thermostat T_t=T0·α^t ✓
+- §6 ternary (test_byte_lm) ✓

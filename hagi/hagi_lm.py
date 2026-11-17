@@ -631,27 +631,36 @@ class CertifiedStepLM:
         logits = self.logits(ctx)
         loss = t.nn.functional.cross_entropy(logits, nxt)
         g = t.autograd.grad(loss, self.params(), retain_graph=True)
-        # direction D = concat(-g): flat parameter direction
         D = t.cat([-gi.reshape(-1) for gi in g])
         A = float((D * D).sum())
-        with t.no_grad():
-            # R': sup-inf of logit displacement  L(x + eta*D) ~ logits + eta*dL
-            # per §3.9 use the logit displacement of the direction applied
-            # to the last-layer weights: dL_logits = h·(D_W2) + D_b2 (shape B,256)
-            h = t.relu(self.emb[ctx].reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
-            dW2 = g[3]; db2 = g[4]
-            disp = -h @ dW2 - db2            # (B, 256), eta=1 displacement
-            Rp = float(disp.max() - disp.min())
-        if Rp <= 0 or A <= 0:
+        # §3.9: R'^2 = MEAN of per-sample squared logit ranges of the FULL
+        # directional displacement — exact JVP of the whole network along D
+        # (theory: dirLogitRange of batchMeanDirection; includes emb/W1
+        # nonlinearity — no last-layer shortcut, hence the certified
+        # guarantee L(θ') ≤ L(θ) − 2A²/R'² holds on the batch mean loss).
+        _, disp = t.autograd.functional.jvp(
+            lambda *prm: self._logits_from_params(prm, ctx),
+            tuple(self.params()), tuple(-gi for gi in g))
+        per_sample_range = disp.max(dim=1).values - disp.min(dim=1).values
+        Rp_sq = float((per_sample_range ** 2).mean())
+        if Rp_sq <= 0 or A <= 0:
             return 0.0
-        eta = lr_scale * 4.0 * A / (Rp * Rp)
+        eta = lr_scale * 4.0 * A / Rp_sq
         with t.no_grad():
             off = 0
             for prm, gi in zip(self.params(), g):
                 sz = prm.numel()
                 prm.add_(eta * D[off:off + sz].reshape(prm.shape))
                 off += sz
-        return 2.0 * A * A / (Rp * Rp)
+        return 2.0 * A * A / Rp_sq
+
+    def _logits_from_params(self, params, ctx):
+        """logits as an explicit function of the parameter tuple (for JVP)."""
+        t = self.t
+        emb, W1, b1, W2, b2 = params
+        e = emb[ctx]
+        h = t.relu(e.reshape(ctx.shape[0], -1) @ W1 + b1)
+        return h @ W2 + b2
 
     def train_certified(self, data: bytes, epochs: int = 60,
                         holdout: float = 0.1, batch: int = 256,

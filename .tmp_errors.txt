@@ -1,0 +1,317 @@
+  c:\HAGI_v2\hagi\_legacy.py:210:17 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\_legacy.py:359:46 - error: Argument of type "((x: Unknown) -> Unknown) | ((x: SupportsAbs[_T@abs], /) -> _T@abs) | ((x: int) -> int) | ((x: Unknown) -> int)" cannot be assigned to parameter "teacher" of type "(...) -> int" in function "__init__"
+  c:\HAGI_v2\hagi\_legacy.py:647:16 - error: Type "Unknown | bool | int | integer[Unknown] | float | floating[Unknown]" is not assignable to return type "int | float | bool"
+  c:\HAGI_v2\hagi\_legacy.py:672:20 - error: Argument of type "type[operator] | type[Pow] | type[LShift] | type[RShift]" cannot be assigned to parameter "key" of type "type[Add] | type[Sub] | type[Mult] | type[Div] | type[FloorDiv] | type[Mod] | type[Pow] | type[BitAnd] | type[BitOr] | type[BitXor] | type[LShift] | type[RShift]" in function "__getitem__"
+  c:\HAGI_v2\hagi\_legacy.py:674:20 - error: Argument of type "type[unaryop]" cannot be assigned to parameter "key" of type "type[UAdd] | type[USub] | type[Invert] | type[Not]" in function "__getitem__"
+  c:\HAGI_v2\hagi\_legacy.py:685:34 - error: Argument of type "type[cmpop]" cannot be assigned to parameter "key" of type "type[Eq] | type[NotEq] | type[Lt] | type[LtE] | type[Gt] | type[GtE]" in function "__getitem__"
+  c:\HAGI_v2\hagi\_legacy.py:1149:1 - error: "OPS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:1262:40 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1262:40 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1339:5 - error: "_TORCH_CHECKED" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:1343:9 - error: "_TORCH_OK" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:1346:9 - error: "_TORCH_OK" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:1354:18 - error: "device" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1355:17 - error: "from_numpy" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1356:17 - error: "from_numpy" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1358:18 - error: "ones_like" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1364:24 - error: "full_like" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1364:47 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1364:47 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1375:58 - error: "minimum" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1375:73 - error: "maximum" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1376:46 - error: "sort" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1376:58 - error: "stack" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1377:45 - error: "clamp" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1385:25 - error: "where" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1386:24 - error: "div" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1386:94 - error: "remainder" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1387:42 - error: "gcd" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1391:25 - error: "where" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1391:57 - error: "where" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1392:24 - error: "abs" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1392:47 - error: "gcd" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1393:42 - error: "minimum" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1394:42 - error: "maximum" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1396:32 - error: "eq" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1396:49 - error: "ne" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1396:66 - error: "lt" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1397:32 - error: "le" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1397:49 - error: "gt" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1397:66 - error: "ge" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1398:48 - error: "int64" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1408:25 - error: "where" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1408:46 - error: "zeros_like" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1412:43 - error: "sign" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1412:65 - error: "int64" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1414:45 - error: "clamp" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1420:36 - error: "ones_like" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1434:29 - error: "ones" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1434:56 - error: "bool" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1438:40 - error: "equal" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:1473:54 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1473:54 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1482:13 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\_legacy.py:1623:28 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1623:28 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:1646:70 - error: Argument of type "tuple[int, ...] | None" cannot be assigned to parameter "a" of type "tuple[int, ...]" in function "apply_tern"
+  c:\HAGI_v2\hagi\_legacy.py:1646:74 - error: Argument of type "tuple[int, ...] | None" cannot be assigned to parameter "b" of type "tuple[int, ...]" in function "apply_tern"
+  c:\HAGI_v2\hagi\_legacy.py:1646:78 - error: Argument of type "tuple[int, ...] | None" cannot be assigned to parameter "c" of type "tuple[int, ...]" in function "apply_tern"
+  c:\HAGI_v2\hagi\_legacy.py:1679:66 - error: Argument of type "tuple[int, ...] | None" cannot be assigned to parameter "b" of type "tuple[int, ...]" in function "apply_bin"
+  c:\HAGI_v2\hagi\_legacy.py:1680:60 - error: Argument of type "tuple[int, ...] | None" cannot be assigned to parameter "a" of type "tuple[int, ...]" in function "apply_bin"
+  c:\HAGI_v2\hagi\_legacy.py:1690:50 - error: Argument of type "tuple[Expr, tuple[int, ...], Expr, tuple[int, ...] | None]" cannot be assigned to parameter "object" of type "tuple[Expr, tuple[int, ...], Expr, tuple[int, ...]]" in function "append"
+  c:\HAGI_v2\hagi\_legacy.py:1691:38 - error: Argument of type "tuple[Expr, tuple[int, ...] | None, Expr, tuple[int, ...]]" cannot be assigned to parameter "object" of type "tuple[Expr, tuple[int, ...], Expr, tuple[int, ...]]" in function "append"
+  c:\HAGI_v2\hagi\_legacy.py:2075:9 - error: Method "load" overrides class "GrowingMathProcessor" in an incompatible manner
+  c:\HAGI_v2\hagi\_legacy.py:2193:11 - error: Cannot assign to attribute "guard_certificate" for class "NeuralFiber"
+  c:\HAGI_v2\hagi\_legacy.py:2554:31 - error: "cuda" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:2554:56 - error: "device" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:2611:24 - error: "cuda" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\_legacy.py:2873:45 - error: Argument of type "GrowingMathProcessorV7" cannot be assigned to parameter "model" of type "GrowingHagiProcessorV8" in function "verify_growth_lineage"
+  c:\HAGI_v2\hagi\_legacy.py:2927:45 - error: Argument of type "GrowingMathProcessorV7" cannot be assigned to parameter "model" of type "GrowingHagiProcessorV8" in function "verify_growth_lineage"
+  c:\HAGI_v2\hagi\_legacy.py:3195:20 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:3210:31 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3210:31 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3212:24 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3212:24 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3222:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_legacy.py:3321:29 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_legacy.py:3336:55 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3336:55 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:3341:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_legacy.py:3352:17 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\_legacy.py:3367:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_legacy.py:3399:24 - error: Argument of type "list[ExprV8]" cannot be assigned to parameter "iterable" of type "Iterable[Self@ExprV8]" in function "extend"
+  c:\HAGI_v2\hagi\_legacy.py:3400:16 - error: Type "list[Self@ExprV8]" is not assignable to return type "list[ExprV8]"
+  c:\HAGI_v2\hagi\_legacy.py:3678:5 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:3681:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:3685:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:3887:21 - error: Argument of type "_Array1D[float64] | None" cannot be assigned to parameter "w_float" of type "ndarray[_AnyShape, dtype[Any]]" in function "__init__"
+  c:\HAGI_v2\hagi\_legacy.py:3887:33 - error: Argument of type "ndarray[_AnyShape, dtype[Any]] | None" cannot be assigned to parameter "w_quant" of type "ndarray[_AnyShape, dtype[Any]]" in function "__init__"
+  c:\HAGI_v2\hagi\_legacy.py:3975:26 - error: "W" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:3995:13 - error: "Q" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4427:94 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:4427:94 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_legacy.py:4554:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4555:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4556:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4557:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4558:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4559:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4560:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4561:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4562:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4563:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4564:35 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4565:34 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4566:35 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4567:37 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4568:36 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4569:37 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4572:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4575:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4577:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4581:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4585:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4594:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4595:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4596:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4597:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4600:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4603:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4607:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:4609:36 - error: "R2" is possibly unbound (reportPossiblyUnboundVariable)
+  c:\HAGI_v2\hagi\_legacy.py:4670:61 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4671:21 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4830:31 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4831:29 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4842:15 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4849:10 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:4907:69 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5013:27 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5013:80 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5089:42 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5206:21 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5251:60 - error: Variable not allowed in type expression (reportInvalidTypeForm)
+  c:\HAGI_v2\hagi\_legacy.py:5391:1 - error: "TOKEN_BITS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:5392:1 - error: "VAR_NAMES" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_legacy.py:5393:1 - error: "DYADIC_LEVELS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:45:9 - error: "_DEVICE" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:50:13 - error: "_DEVICE" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:53:13 - error: "_DEVICE" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:62:9 - error: "_DEVICE" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:65:9 - error: "_DEVICE" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:71:5 - error: "W" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:76:9 - error: "W" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:104:5 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:107:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:111:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:170:5 - error: "S" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_neural_gpu.py:182:27 - error: "Ut" is possibly unbound (reportPossiblyUnboundVariable)
+  c:\HAGI_v2\hagi\_neural_gpu.py:189:31 - error: Operator "-" not supported for "None" (reportOptionalOperand)
+  c:\HAGI_v2\hagi\_neural_gpu.py:206:18 - error: Instance variable "W" is not initialized in the class body or __init__ method (reportUninitializedInstanceVariable)
+  c:\HAGI_v2\hagi\_neural_gpu.py:206:26 - error: Instance variable "ef_v" is not initialized in the class body or __init__ method (reportUninitializedInstanceVariable)
+  c:\HAGI_v2\hagi\_neural_gpu.py:208:21 - error: Cannot access attribute "_train_task_ef21_muon_cpu" for class "GpuGpmMixin*"
+  c:\HAGI_v2\hagi\_neural_gpu.py:213:18 - error: Instance variable "U_basis" is not initialized in the class body or __init__ method (reportUninitializedInstanceVariable)
+  c:\HAGI_v2\hagi\_neural_gpu.py:217:14 - error: Cannot access attribute "_consolidate_subspace_cpu" for class "GpuGpmMixin*"
+  c:\HAGI_v2\hagi\_v9.py:5:22 - error: Import symbol "TaskSpec" has type "type[hagi._legacy.TaskSpec]", which is not assignable to declared type "type[hagi._v9.TaskSpec]"
+  c:\HAGI_v2\hagi\_v9.py:5:22 - error: Import symbol "make_task_suite" has type "() -> builtins.list[hagi._legacy.TaskSpec]", which is not assignable to declared type "() -> builtins.list[hagi._v9.TaskSpec]"
+  c:\HAGI_v2\hagi\_v9.py:5:22 - error: Import symbol "Theorem" has type "type[hagi._legacy.Theorem]", which is not assignable to declared type "type[hagi._v9.Theorem]"
+  c:\HAGI_v2\hagi\_v9.py:5:22 - error: Import symbol "batch_logit_safe_step_ce" has type "(X_feat: ndarray[_AnyShape, dtype[Any]], y_int: ndarray[_AnyShape, dtype[Any]], num_classes: int, steps: int = 80, l2_reg: ndarray[_AnyShape, dtype[Any]] | None = None, eps_pert: float = 0) -> dict[str, Any]", which is not assignable to declared type "(X_feat: ndarray[_AnyShape, dtype[Any]], y_int: ndarray[_AnyShape, dtype[Any]], num_classes: int, steps: int = 300, l2_reg: ndarray[_AnyShape, dtype[Any]] | None = None, use_bf16_guard: bool = False) -> dict[str, Any]"
+  c:\HAGI_v2\hagi\_v9.py:5:22 - error: Import symbol "exact_piecewise_poly_fit" has type "(train_x: Sequence[tuple[int, ...]], train_y: Sequence[int]) -> (ExprV8 | None)", which is not assignable to declared type "(train_x: Sequence[tuple[int, ...]], train_y: Sequence[int]) -> (ExprV9 | None)"
+  c:\HAGI_v2\hagi\_v9.py:36:1 - error: "OPS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:67:1 - error: "UNARY_OPS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:68:1 - error: "BINARY_OPS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:77:1 - error: "CONSTS" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:127:1 - error: "BOOL_NAMES" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:151:46 - error: Argument of type "((x: Unknown) -> Unknown) | ((x: SupportsAbs[_T@abs], /) -> _T@abs) | ((x: int) -> int) | ((x: Unknown) -> int)" cannot be assigned to parameter "teacher" of type "(...) -> int" in function "__init__"
+  c:\HAGI_v2\hagi\_v9.py:253:31 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:253:31 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:255:24 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:255:24 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:265:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_v9.py:319:29 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_v9.py:332:55 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:332:55 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:337:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_v9.py:348:17 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\_v9.py:373:24 - error: Argument of type "list[ExprV9]" cannot be assigned to parameter "iterable" of type "Iterable[Self@ExprV9]" in function "extend"
+  c:\HAGI_v2\hagi\_v9.py:374:16 - error: Type "list[Self@ExprV9]" is not assignable to return type "list[ExprV9]"
+  c:\HAGI_v2\hagi\_v9.py:392:30 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_v9.py:421:17 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\_v9.py:532:25 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:532:25 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:534:17 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:534:17 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:567:35 - error: Argument of type "ExprV9 | None" cannot be assigned to parameter "expr" of type "ExprV9" in function "eval_expr_vec"
+  c:\HAGI_v2\hagi\_v9.py:599:26 - error: "None" is not iterable
+  c:\HAGI_v2\hagi\_v9.py:841:9 - error: "H" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:842:5 - error: "H" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1099:5 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1102:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1106:9 - error: "X" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1127:14 - error: "W" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1154:26 - error: "W" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1166:9 - error: "S" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1438:13 - error: "W1" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1440:13 - error: "W2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1445:12 - error: "W1" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1445:20 - error: "W2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1560:27 - error: "Phi" is possibly unbound (reportPossiblyUnboundVariable)
+  c:\HAGI_v2\hagi\_v9.py:1591:18 - error: No overloads for "__getitem__" match the provided arguments (reportCallIssue)
+  c:\HAGI_v2\hagi\_v9.py:1591:18 - error: Argument of type "tuple[slice[None, None, None], list[int] | Any | ndarray[_AnyShape, dtype[Any]] | bytes]" cannot be assigned to parameter "key" of type "list[str]" in function "__getitem__"
+  c:\HAGI_v2\hagi\_v9.py:1592:95 - error: Cannot access attribute "T" for class "list[int]"
+  c:\HAGI_v2\hagi\_v9.py:1592:95 - error: Cannot access attribute "T" for class "bytes"
+  c:\HAGI_v2\hagi\_v9.py:1600:32 - error: Argument of type "bytes | None" cannot be assigned to parameter "obj" of type "Sized" in function "len"
+  c:\HAGI_v2\hagi\_v9.py:1604:32 - error: Argument of type "bytes | None" cannot be assigned to parameter "obj" of type "Sized" in function "len"
+  c:\HAGI_v2\hagi\_v9.py:1608:38 - error: Argument of type "bytes | None" cannot be assigned to parameter "packed_bytes" of type "bytes" in function "__init__"
+  c:\HAGI_v2\hagi\_v9.py:1767:21 - error: "T" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:1785:17 - error: "T" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2362:94 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:2362:94 - error: Argument of type "Any | None" cannot be assigned to parameter "x" of type "ConvertibleToInt" in function "__new__"
+  c:\HAGI_v2\hagi\_v9.py:2484:55 - error: Argument of type "ExprV9 | None" cannot be assigned to parameter "expr" of type "ExprV9" in function "eval_expr_vec"
+  c:\HAGI_v2\hagi\_v9.py:2519:59 - error: Argument of type "ExprV9 | None" cannot be assigned to parameter "expr" of type "ExprV9" in function "eval_expr_vec"
+  c:\HAGI_v2\hagi\_v9.py:2537:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2541:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2542:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2543:31 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2544:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2545:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2546:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2547:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2548:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2549:30 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2550:35 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2551:34 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2552:35 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2553:37 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2554:36 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2555:37 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2558:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2561:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2563:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2567:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2571:17 - error: "R" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2580:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2581:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2582:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2583:34 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2586:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2589:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2593:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:2595:21 - error: "R2" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\_v9.py:3325:28 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_execute.py:43:43 - error: Argument of type "ModuleSpec | None" cannot be assigned to parameter "spec" of type "ModuleSpec" in function "module_from_spec"
+  c:\HAGI_v2\hagi\hagi_execute.py:44:10 - error: "loader" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_execute.py:44:17 - error: "exec_module" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_execute.py:66:37 - error: Argument of type "int | None" cannot be assigned to parameter "args" of type "int" in function "execute"
+  c:\HAGI_v2\hagi\hagi_lm.py:346:28 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_lm.py:361:17 - error: "L" is constant (because it is uppercase) and cannot be redefined (reportConstantRedefinition)
+  c:\HAGI_v2\hagi\hagi_lm.py:510:71 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_lm.py:658:48 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_lm.py:739:70 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_mind.py:37:31 - error: Expected class but received "(obj: object, /) -> TypeIs[(...) -> object]" (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\hagi_selfexperiment.py:59:19 - error: Cannot assign to attribute "learn" for class "TracedProcessorV9"
+  c:\HAGI_v2\hagi\hagi_selfexperiment.py:62:11 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfexperiment.py:166:11 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:74:20 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:75:20 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:91:38 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:141:14 - error: Import from `hagi_selfmodel` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_selfloop.py:145:9 - error: Argument of type "Literal['seed']" cannot be assigned to parameter "key" of type "Literal['family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv']" in function "__setitem__"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:146:40 - error: Argument of type "dict[Literal['family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv'], int]" cannot be assigned to parameter "feats" of type "dict[str, Any]" in function "predict_success"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:343:14 - error: Import from `hagi_selfmodel` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_selfloop.py:345:9 - error: Argument of type "Literal['seed']" cannot be assigned to parameter "key" of type "Literal['family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv']" in function "__setitem__"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:359:26 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:361:24 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:364:24 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:368:23 - error: Expected type arguments for generic class "list" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:383:15 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:408:19 - error: Expected type arguments for generic class "list" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:410:35 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:421:33 - error: "batch" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:431:25 - error: "_merge" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:438:51 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:478:39 - error: Type "list[tuple[int, ...]]" is not assignable to declared type "list[tuple[int, int]]" (reportAssignmentType)
+  c:\HAGI_v2\hagi\hagi_selfloop.py:484:15 - error: Cannot assign to attribute "stream_names" for class "TracedProcessorV9"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:485:15 - error: Cannot assign to attribute "stream_actions" for class "TracedProcessorV9"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:487:19 - error: Cannot access attribute "stream_names" for class "TracedProcessorV9"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:545:13 - error: Cannot assign to attribute "stream_names" for class "SelfModelPolicyProcessor"
+  c:\HAGI_v2\hagi\hagi_selfloop.py:546:13 - error: Cannot assign to attribute "stream_actions" for class "SelfModelPolicyProcessor"
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:178:20 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:221:9 - error: Method "learn" overrides class "TracedProcessorV9" in an incompatible manner
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:269:11 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:300:21 - error: "__getitem__" method not defined on type "int" (reportIndexIssue)
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:300:21 - error: "__getitem__" method not defined on type "float" (reportIndexIssue)
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:316:14 - error: Cannot assign to attribute "optimized_budget_policy" for class "SelfOptimizingProcessorV9"
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:319:16 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfmodel.py:356:12 - error: Expected type arguments for generic class "set" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfoptimize.py:54:51 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfoptimize.py:83:21 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfoptimize.py:91:18 - error: Expected type arguments for generic class "tuple" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:96:46 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:103:38 - error: "Never" is not iterable (reportGeneralTypeIssues)
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:220:43 - error: Argument of type "ModuleSpec | None" cannot be assigned to parameter "spec" of type "ModuleSpec" in function "module_from_spec"
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:221:10 - error: "loader" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:221:17 - error: "exec_module" is not a known attribute of "None" (reportOptionalMemberAccess)
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:294:16 - error: Import from `hagi_selfoptimize` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:316:12 - error: Import from `hagi_curriculum` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:327:63 - error: Argument of type "Unknown | Any | list[int] | int" cannot be assigned to parameter "obj" of type "Sized" in function "len"
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:336:16 - error: Import from `hagi_selfedit` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_selfrewrite.py:348:16 - error: Import from `hagi_mind` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\hagi_v10_controller.py:170:32 - error: Argument of type "Tensor | Literal[0]" cannot be assigned to parameter "tensor" of type "Tensor" in function "dot"
+  c:\HAGI_v2\hagi\hagi_v10_controller.py:178:22 - error: Cannot access attribute "norm" for class "Literal[0]"
+  c:\HAGI_v2\hagi\hagi_v10_controller.py:197:22 - error: "__getitem__" method not defined on type "Literal[0]" (reportIndexIssue)
+  c:\HAGI_v2\hagi\nadya_lessons.py:38:40 - error: Expected type arguments for generic class "dict" (reportMissingTypeArgument)
+  c:\HAGI_v2\hagi\nadya_lessons.py:42:12 - error: Import from `hagi_lm` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\hagi\nadya_lessons.py:52:12 - error: Import from `hagi_lm` is implicitly relative and will not work if this file is imported as a module
+  c:\HAGI_v2\scripts\run_selfmodel_experiment.py:50:9 - error: Argument of type "dict[str, int | list[Literal['family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv']] | dict[str, Any] | None]" cannot be assigned to parameter "value" of type "str" in function "__setitem__"
+  c:\HAGI_v2\scripts\run_selfmodel_experiment.py:66:9 - error: Argument of type "dict[str, int | list[str] | str]" cannot be assigned to parameter "value" of type "str" in function "__setitem__"
+  c:\HAGI_v2\scripts\run_selfmodel_experiment.py:73:9 - error: Argument of type "dict[str, Any]" cannot be assigned to parameter "value" of type "str" in function "__setitem__"
+  c:\HAGI_v2\scripts\run_selfmodel_experiment.py:75:9 - error: Argument of type "Literal[0]" cannot be assigned to parameter "value" of type "str" in function "__setitem__"
+  c:\HAGI_v2\scripts\run_selfmodel_experiment.py:82:9 - error: Argument of type "Literal[1]" cannot be assigned to parameter "value" of type "str" in function "__setitem__"
+  c:\HAGI_v2\tests\test_characterization.py:177:12 - error: Object of type "None" is not subscriptable (reportOptionalSubscript)
+  c:\HAGI_v2\tests\test_characterization.py:178:12 - error: Object of type "None" is not subscriptable (reportOptionalSubscript)
+  c:\HAGI_v2\tests\test_characterization.py:179:12 - error: Object of type "None" is not subscriptable (reportOptionalSubscript)
+  c:\HAGI_v2\tests\test_characterization.py:193:12 - error: No overloads for "__getitem__" match the provided arguments (reportCallIssue)
+  c:\HAGI_v2\tests\test_characterization.py:193:12 - error: Argument of type "Literal['total']" cannot be assigned to parameter "s" of type "slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None]" in function "__getitem__"
+  c:\HAGI_v2\tests\test_characterization.py:193:38 - error: No overloads for "__getitem__" match the provided arguments (reportCallIssue)
+  c:\HAGI_v2\tests\test_characterization.py:193:38 - error: Argument of type "Literal['order_free']" cannot be assigned to parameter "s" of type "slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None]" in function "__getitem__"

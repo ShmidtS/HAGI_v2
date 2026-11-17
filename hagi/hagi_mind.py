@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from typing import Any, Callable
 from pathlib import Path
 
 from hagi import hagi_execute as hx  # noqa: E402
@@ -34,7 +35,7 @@ SELF_SOURCES = ["generated_programs.py", "hagi_lm.py", "hagi_execute.py",
                 "hagi_ingest.py", "hagi_selfloop.py", "hagi_selfrewrite.py"]
 
 # exact-route patterns: name -> (program, arg parser)
-_ROUTES: dict[str, tuple[str, callable]] = {
+_ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {
     r"^(?:чему равен )?gcd (\d+) (\d+)$": ("GCD",
         lambda m: (int(m[1]), int(m[2]))),
     r"^(?:чему равен )?нок (\d+) (\d+)$": ("LCM",

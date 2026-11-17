@@ -1,6 +1,7 @@
 # HAGI V9 canonical core (growing processor, exact synthesis,
 # certified Venn head, guarded steps) — split from the historical
 # monolith; legacy V5–V8 generations live in _legacy.
+from typing import Any, Callable, Optional, Sequence  # noqa: F401
 from ._legacy import *  # noqa: F401,F403 — brings stdlib/numpy
 from ._legacy import _PRIME_MOD  # underscore name, not star-exported
 from ._neural_gpu import GpuGpmMixin  # GPU dispatch for the neural core

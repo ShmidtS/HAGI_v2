@@ -36,7 +36,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -87,6 +87,8 @@ def _target_features(spec, seed: int, train_fraction: float) -> tuple[int, int]:
 
 
 class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
+    stream_names: list = None  # set by selfloop (dynamic per-round streams)
+    stream_actions: list = None
     """Records a (features -> outcome, cost) trace of its own learning."""
 
     def __init__(self, *a, **kw):

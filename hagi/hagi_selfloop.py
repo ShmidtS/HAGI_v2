@@ -138,10 +138,11 @@ class SelfModelPolicyProcessor(SelfOptimizingProcessorV9):
         self.dl = dl
 
     def learn(self, spec, seed=0, **kw):
-        from hagi_selfmodel import _features
-        feats = dict(zip(FEATURE_KEYS,
-                         _features(spec, self, seed,
-                                   float(kw.get("train_fraction", 0.70)))))
+        from hagi.hagi_selfmodel import _features
+        feats: dict[str, Any] = dict(zip(
+            FEATURE_KEYS,
+            _features(spec, self, seed,
+                      float(kw.get("train_fraction", 0.70)))))
         feats["seed"] = int(seed)
         pred = self.dl.predict_success(feats)
         if pred is None:
@@ -165,6 +166,34 @@ def _state_probe(proc) -> dict[str, Any]:
         "n_cert": len(getattr(proc, "cert_log", [])), "n_trace": len(getattr(proc, "trace", [])),
         "ram": proc.ram.snapshot(),
     }
+
+
+def _learn_worker_local(proc, spec, seed, budget, train_neural):
+    """In-process variant of _learn_worker (no pickling — for jobs too
+    large to serialize when memory is tight)."""
+    os.environ["HAGI_NEURAL_DEVICE"] = "cpu"
+    proc.node_budget = int(budget)
+    alpha = min(0.0005, proc.ledger.remaining() * 0.5)
+    pre = _state_probe(proc)
+    ev = proc.learn(spec, seed=int(seed), train_neural=train_neural)
+    post = _state_probe(proc)
+    names = list(proc.experts.keys())
+    new_names = names[pre["n_experts"]:]
+    diff = {
+        "ev": ev,
+        "trace_row": getattr(proc, "trace", [])[pre["n_trace"]:] or None,
+        "growth_log": proc.growth_log[pre["n_log"]:],
+        "certs": proc.cert_log[pre["n_cert"]:],
+        "new_experts": {n: proc.experts[n] for n in new_names},
+        "deltas": {k: post[k] - pre[k] for k in
+                   ("cands", "evals", "commits", "holds", "version",
+                    "unsolved", "compute", "risk")},
+        "ram_ops": _ram_diff(pre["ram"], post["ram"]),
+        "core": proc.core.snapshot(),
+        "router": proc.router.snapshot(),
+    }
+    import cloudpickle
+    return cloudpickle.dumps(diff)
 
 
 def _learn_worker(payload: bytes) -> bytes:
@@ -312,7 +341,7 @@ class ParallelLearner:
 def _assign_budget(proc, spec, seed: int, train_fraction: float = 0.70) -> int:
     """Budget the policy would assign (mirrors SelfModelPolicyProcessor)."""
     if hasattr(proc, "dl"):
-        from hagi_selfmodel import _features
+        from hagi.hagi_selfmodel import _features
         feats = dict(zip(FEATURE_KEYS, _features(spec, proc, seed, train_fraction)))
         feats["seed"] = int(seed)
         pred = proc.dl.predict_success(feats)
@@ -390,7 +419,13 @@ def run_stream(proc, segments: list[tuple[int, int]],
                     jobs.append((sp, seed, budget))
                     fresh_pos.append((pos, budget))
             if jobs:
-                diffs = learner.batch(jobs)
+                if learner is None:
+                    # no pool provided: honest in-process sequential path
+                    diffs = [_learn_worker_local(proc, sp, seed, budget,
+                                                 train_neural)
+                             for sp, seed, budget in jobs]
+                else:
+                    diffs = learner.batch(jobs)
                 for (pos, budget), d in zip(fresh_pos, diffs):
                     if cache is not None:
                         cache.put(pos, budget, d)

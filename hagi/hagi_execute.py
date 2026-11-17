@@ -40,6 +40,8 @@ def _load(path: Path | None = None):
             f"{p} not found — run hagi_selfrewrite first so the model "
             "writes its programs")
     spec = importlib.util.spec_from_file_location("hagi_generated", p)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {p}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _mod = mod
@@ -63,7 +65,7 @@ def execute_text(name: str, text: str, key: int | None = None) -> str:
     arity = 2 if key is not None else 1
     out = bytearray()
     for b in data:
-        out.append(execute(name, b, key) & 0xFF if arity == 2
+        out.append(execute(name, b, int(key or 0)) & 0xFF if arity == 2
                    else execute(name, b) & 0xFF)
     # decode back, lossy so any byte stream is viewable
     return out.decode("utf-8", errors="replace")
