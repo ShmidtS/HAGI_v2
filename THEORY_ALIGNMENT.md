@@ -338,3 +338,17 @@ GatePipeline C264, CurriculumCert, KVCacheCert C331, BatchCE*).
 - **Согласование Takeoff/Saturation**: growth-модули группы Growth
   формализуют именно тот вечный цикл, который сейчас исполняется
   (316 раундов без остановок).
+
+
+## Цикл 12 сверки (2026-11-19): Growth/SelfDevelopment + Takeoff
+
+- **self_development_find** — существование безопасного кандидата
+  с G(a') ≥ G(a₀): операционально реализовано self-edit adopt-
+  gate (принимаются только кандидаты с строгим положительным
+  гейном при сохранении инвариантов = safeCandidates).
+- **Takeoff/elasticity_chain** — телескоп x_T ≥ x_0·∏(1+e_t):
+  подтверждён на живом росте forever: эксперты 1004→1019,
+  ∏ = 1.0149 > 1 — takeoff выполнен; decay-ветка не активна.
+- Поиск кандидатов = search_cost_bound (линейно по числу
+  кандидатов × cMeas) — соответствует нашему fixed-knob-space
+  self-edit (m мал, стоимость измерения ограничена).
