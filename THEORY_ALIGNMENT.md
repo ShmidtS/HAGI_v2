@@ -995,3 +995,15 @@ self-edit гейт работает (no-op фильтр активен), failure
   Pinsker KL ≥ 2t²; shannon_le_log_card; вогнутость энтропии
   (mix_entropy_lower) ✓.
 - Расхождений кода с теорией не найдено; Python-правок не требуется.
+
+## Волна 51 (2026-11-18) — FiniteEM, Azuma, hoeffding_radius
+
+- **FiniteEM**: EM-монотонность evidence численно ✓ (0.1595→0.1740,
+  M-step p0'=posterior даёт KL=0). EM-модуль в реализации
+  отсутствует (N/A, не расхождение).
+- **Azuma**: adaptive_success (ΣS ≥ n·p0−Δ при history-dependent
+  полах) ✓ эмпирически; azuma_tail 2exp(−Δ²/2nc²) ✓ (empirical
+  0.0291 ≤ bound 0.1642 на 20k испытаниях).
+- **core.py hoeffding_radius** = √(log(2/α)/(2n)) — граница для
+  СРЕДНЕГО (Hoeffding при c=1/2), согласована с Azuma-хвостом
+  теории ✓. Правок кода не требуется.
