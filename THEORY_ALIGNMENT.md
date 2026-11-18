@@ -1279,3 +1279,11 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **FiberNecessity**: configs injective на separated family —
   counting floor из Capacity (волна 50) ✓.
 - Расхождений нет.
+
+## Чистый перезапуск цикла (2026-11-18)
+
+- Все артефакты стагнации удалены (domains/, unified.pt, ledger,
+  netlist, sweep_state). Цикл стартовал с нуля.
+- Динамика CE живая: 2.37 → 2.30 → 1.51 за 10 чанков (~1 час),
+  нейро-фаза стабильна 350-380с/чанк.
+- Нейро-фаза разблокирована rotating holdout (wave 75 fix).
