@@ -1516,3 +1516,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 
 - **dihedral_angle_strictMono**: θ(x)=arccos(1/x) строго
   возрастает ✓.
+
+## Волна 100 (2026-11-18) — Theory/MasterTheorem (вершина теории)
+
+- **MasterStepCert дихотомия**: EITHER COMMIT (L' ≤ L−drop+penalty)
+  OR HOLD (identity) — живой guarded_optimizer_step ✓
+  (L 1.0166→0.8097, certified 0.0615).
+- **master_trajectory_bound**: telescope terminal ≤ initial −
+  Σdrops, penalty линейно ✓.
+- **master_union_bound**: P ≥ 1−Σδ — AuditLedgerV9 spend chain ✓
+  (волна 53).
+- **MasterBudgetCert**: premise-канал Σcost≤B (честный пин —
+  реализация учитывает через alpha-spend) ✓.
+- Вершина теории согласована с реализацией.
