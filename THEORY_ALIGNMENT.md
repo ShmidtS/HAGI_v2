@@ -1318,3 +1318,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **SigmaKernel**: quad_form_factorization v·Σv=‖Av‖² exact;
   kernel_interference_zero ✓.
 - Расхождений нет.
+
+## Волна 80 (2026-11-18) — PolicyCompatibility, QFormerBridge
+
+- **PolicyCompatibility**: MOPDApproved two-clause (net gain>0 ∧
+  divergence≤cap); far-teacher rejection ✓.
+- **QFormerBridge**: punctured_expectation несмещённость
+  (E[S_b]=p·Σx, расхождение 1.41 << σ=21.6); Hoeffding
+  концентрация ✓.
+- Расхождений нет.
