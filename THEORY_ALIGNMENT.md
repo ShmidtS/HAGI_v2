@@ -982,3 +982,16 @@ self-edit гейт работает (no-op фильтр активен), failure
   columnEnergy_basis — базисное среднее = frob/d точно ✓.
 - **ManifoldHyperConn**: N/A — mHC-микшинг (doubly stochastic) в
   реализации отсутствует; не расхождение, модуль не инстанцирован.
+
+## Волна 50 (2026-11-18) — Information/Capacity, Probability/FannesPinsker
+
+- **Capacity.lean (5/5 блоков)**: counting floor (K=4 задачи при
+  |S|=3 → пропуск найден ✓); no_free_recovery (DPP на квантайзере);
+  router K ≤ 2^B; GainRecoverability — recoverable_avg
+  (best 0.250 ≥ E/N 0.127), devSignal_self > 0; repRate
+  trichotomy (5/5, 3/7, 0/4) ✓.
+- **FannesPinsker (4/4)**: fannes_unconditional 300/300
+  рандомизированных распределений (worst tightness 0.47);
+  Pinsker KL ≥ 2t²; shannon_le_log_card; вогнутость энтропии
+  (mix_entropy_lower) ✓.
+- Расхождений кода с теорией не найдено; Python-правок не требуется.
