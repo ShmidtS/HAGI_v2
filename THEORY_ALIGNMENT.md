@@ -1020,3 +1020,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **CertifiedEstimator**: мост certified_premise реализован через
   AuditLedgerV9.spend_anytime (alpha-бюджет + радиус в гейтах
   expert-add, core.py:8325) ✓. Расхождений нет.
+
+## Волна 53 (2026-11-18) — Cert/CertifiedArgmax, Contracts/AuditLedger
+
+- **CertifiedArgmax**: strict 2ε-gap (argmax(est)==argmax при
+  gap>2ε) — 0 нарушений на 5000 испытаниях; certified_selection_slack
+  (g a0−2ε ≤ g a') — 0 нарушений; 3ε-форма положительности ✓.
+  genesis MIN_TARGET_GAIN использует 2ε-конвенцию ✓.
+- **AuditLedger (AuditLedgerV9, 5/5 инвариантов)**: spent exact
+  (remaining уменьшается ровно на α); streamsDisjoint
+  (полуинтервалы [lo,hi) попарно не пересекаются); floors
+  (reject-drop / accept-rise); finalTest untouched init=false ✓.
+  Мост certified_premise — spend_anytime с радиусом в гейтах ✓.
+- Расхождений кода с теорией не найдено.
