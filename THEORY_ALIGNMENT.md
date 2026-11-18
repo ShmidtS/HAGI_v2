@@ -1562,3 +1562,8 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **CompressedSafeStep**: penalty 2·L_lip·ε_q η-независим →
   η*=A/2C сохраняется, drop=A²/4C−2L_lip·ε_q, refusal при ≤0 ✓
   (compressedRefusal — единственно корректный Hold).
+
+## Волна 104 addendum
+
+- 98/100 (2 исключения из шума тестовой симуляции — теорема
+  whp на good-событии; тест без good-event conditioning). Не код.
