@@ -1180,3 +1180,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **NeuronAlloc**: (Σ√cᵢ)²/N ≤ Σcᵢ/nᵢ — та же КШ форма
   (убывающая отдача аллокации нейронов) ✓.
 - Расхождений нет.
+
+## Волна 69 (2026-11-18) — AdamW, CautiousOptimizer, Lookahead
+
+- **AdamW**: decoupled decay при нулевом градиенте — точный
+  фактор 1−lr·λ=0.97 на живом torch.optim.AdamW ✓.
+- **CautiousOptimizer ↔ controller.grad_agreement_min**: маска
+  согласия со знаком градиента (min_dot в StepResult) —
+  ‖masked‖≤‖u‖, identity/zero случаи ✓.
+- **Lookahead**: якорь = выпуклая комбинация, в оболочке ✓.
+- Анти-стагнация цикла: суммарный replay cap + weighted-random
+  targets для разнообразия схем (ns_0006: 2522с — вдвое быстрее).
+- Расхождений нет.
