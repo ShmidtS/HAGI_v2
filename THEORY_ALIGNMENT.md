@@ -1494,3 +1494,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   (compile roundtrip) 16/16; подкубическая чётность
   c_S=⊕_{x⊆S}f(x) 16/16 — все exact на 16 Venn масках
   (свёрно с logic.py ANF-алгеброй и fabric.MASKS) ✓.
+
+## Волна 97 (2026-11-18) — Semantics/Split, State/Transition
+
+- **Split**: combineObjective = loss(head θ x, y) — CertifiedStepLM
+  logits+CE ровно эта композиция ✓ (identity head × CE demo).
+- **State/Transition**: TrainingInput (grad, скорость, cost, risk)
+  ≈ §3.9 certified step контракт ✓ (волна 54).
+- Расхождений нет.
