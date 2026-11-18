@@ -1487,3 +1487,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   (soft coordinate updates не повышают F_i).
 - **meanfield_decomposition**: F(p)=E_∏p[H]+(1/β)ΣH(p_i) —
   факторизованная форма ✓ (1/2·ordered-pair конвенция энергии).
+
+## Волна 96 (2026-11-18) — Data/AnfTransform
+
+- **ANF butterfly**: инволюция T(T(f))=f 16/16; eval∘transform=id
+  (compile roundtrip) 16/16; подкубическая чётность
+  c_S=⊕_{x⊆S}f(x) 16/16 — все exact на 16 Venn масках
+  (свёрно с logic.py ANF-алгеброй и fabric.MASKS) ✓.
