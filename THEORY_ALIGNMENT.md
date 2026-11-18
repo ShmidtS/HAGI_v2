@@ -1479,3 +1479,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   replay composition identity exact ✓.
 - **SafeQP**: spectral_tail_energy (dropped=Σcoeff_outside²)
   exact; three_stage_error_budget triangle ✓.
+
+## Волна 95 (2026-11-18) — PairwiseCategorical, EnergyCoordinateStep
+
+- **coordinate_kl_identity**: F_i(p)−F_i(q_i) = (1/β)·KL(p‖q_i),
+  q_i = softDef(−β·hz) — 100/100 exact ✓; nonneg 100/100 ✓
+  (soft coordinate updates не повышают F_i).
+- **meanfield_decomposition**: F(p)=E_∏p[H]+(1/β)ΣH(p_i) —
+  факторизованная форма ✓ (1/2·ordered-pair конвенция энергии).
