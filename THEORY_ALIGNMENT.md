@@ -1232,3 +1232,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   stop) ✓.
 - Цикл: SOLVED-reuse стабильно в tape-out'ах, нейро-фаза ~350с.
 - Расхождений нет.
+
+## Волна 74 (2026-11-18) — Growth/GainRenewal
+
+- **gain_renewal_floor_pos**: G(t≥1) ≥ γ(inj−ξ)=0.24 ✓ (первый
+  прогон неверно применил stationary floor к t=0 — тест исправлен,
+  не код; теорема floor — про t≥1, stationary — асимптота).
+- **closed form**: G(t) ≥ ρᵗG0+γ(inj−ξ)(1−ρᵗ)/(1−ρ) точное
+  равенство на t=1 ✓; stationary G→2.4 ✓; ρ=1 → linear ✓.
+- **bounded_frontier**: cap γD̄/α ✓.
+-genesis relief-механика согласована. Расхождений нет.
