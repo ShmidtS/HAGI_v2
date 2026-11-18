@@ -1553,3 +1553,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **TwoDomainConfidence**: union-bound allowance переносит
   guarded non-regression + observed margin в population gap
   (механика C264/волна 53) ✓.
+
+## Волна 104 (2026-11-18) — StochasticSafeStep, CompressedSafeStep
+
+- **StochasticSafeStep**: η=(Â−r)/(2(Ĉ+u)), realized ≥
+  (Â−r)²/(4(Ĉ+u)) на good-событии (Freedman radius) 100/100 ✓;
+  альтернатива — полный Hold (hold_refusal_safe) ✓.
+- **CompressedSafeStep**: penalty 2·L_lip·ε_q η-независим →
+  η*=A/2C сохраняется, drop=A²/4C−2L_lip·ε_q, refusal при ≤0 ✓
+  (compressedRefusal — единственно корректный Hold).
