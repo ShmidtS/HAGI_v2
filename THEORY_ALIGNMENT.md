@@ -1511,3 +1511,8 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **VennPacking**: 64 трита → 13 байт (⌈64/5⌉, 3⁵=243<256);
   12-байтовая нижняя граница невозможна (64·log₂3=101.4 > 96 бит)
   — tight ✓.
+
+## Волна 99 (2026-11-18) — Geometry/SphericalSimplex
+
+- **dihedral_angle_strictMono**: θ(x)=arccos(1/x) строго
+  возрастает ✓.
