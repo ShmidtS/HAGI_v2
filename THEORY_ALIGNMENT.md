@@ -1465,3 +1465,10 @@ self-edit гейт работает (no-op фильтр активен), failure
 
 - **PoEBound (доп. волна 92)**: |logZ_w − logZ_approx| ≤ ⅛·ΣwᵢRᵢ² —
   строгая форма 200/200 ✓ (и более слабая ½-форма тоже).
+
+## Волна 93 (2026-11-18) — Research/PPT (N/A), MarkovPercolation
+
+- **PPT**: power-target на последовательностях с честной WARNING-
+  границей (seq-power ≠ tokenwise temperature, softmax-invariance
+  c·z≠z) — Research-модуль, в реализации не инстанцирован (N/A).
+- Форма согласована с SoftmaxFix (Numerics, волна ранее).
