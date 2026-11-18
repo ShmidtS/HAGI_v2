@@ -1544,3 +1544,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   strict antitonicity — бюджет не является физикой (честный пин)
   ✓; «нет двойного счёта CE drop в двух каналах» — реализация
   spine (certified_guarantee per-step) согласована.
+
+## Волна 103 (2026-11-18) — TwoDomainConfidence, GaugeQuotient
+
+- **GaugeQuotient**: quotientResidual r_G(z)=inf_φ‖Tz−e^{iφ}z‖ —
+  gauge-инвариант точный (rot φ=0.7, разность <1e-9) ✓;
+  эквивариантность T(gz)=gTz ✓.
+- **TwoDomainConfidence**: union-bound allowance переносит
+  guarded non-regression + observed margin в population gap
+  (механика C264/волна 53) ✓.
