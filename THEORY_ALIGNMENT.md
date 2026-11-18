@@ -1377,3 +1377,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   сводится к MWU дословно (KEY IDENTITY swWeight=ewWeight),
   algLoss=m_t self-consistency структурно ✓.
 - Цикл: 47 чанков, CE 1.5139, tape-out reuse стабилен.
+
+## Волна 86 (2026-11-18) — SoftRouterMix, SpectralBudget
+
+- **soft_router_ce_bound**: CE(Σw z) ≤ Σw CE(z) через lse-Jensen —
+  200/200 ✓; **mixture_ce_le** — вогнутость log 200/200 ✓.
+- **SpectralBudget**: Parseval-декомпозиция энергии по доменам
+  (Σ‖P_w v‖²=‖v‖²) — бюджет ∝ доменной энергии ✓.
