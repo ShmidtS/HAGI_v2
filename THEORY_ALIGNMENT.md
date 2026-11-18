@@ -1575,3 +1575,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   (audit chain, волна 53) ✓.
 - **DBridge dQuad_nonneg**: (ΣpW·d)² ≤ ΣpW·d² (Cauchy-Schwarz)
   100/100 ✓.
+
+## Волна 106 (2026-11-18) — Theory/Interpretability, MasterEF
+
+- **rebuildable_of_compressible**: ε_rebuild = lip·δ (Lipschitz
+  transport) ✓; counting negative result (Σig^B описаний) ✓.
+- **MasterEF**: идеальная vs исполняемая траектория — концевая
+  коррекция e(T)−e(0), без новой индукции и без двойного счёта
+  drops ✓ (certified drops наследуются концевой коррекцией).
