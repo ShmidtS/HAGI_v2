@@ -1079,3 +1079,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   градиентный момент; численный спуск сошёлся |softmax−emp|
   0.2376→0.0614→0 ✓.
 - Расхождений не найдено.
+
+## Волна 57 (2026-11-18) — Cert/Adapters, BatchCEAlignmentBudget
+
+- **Cert/Adapters**: zeroFloor/descentCertStep/holdTransition/
+  risk-polarity — покрыты волнами 53–55 (floors ledger, HOLD/COMMIT,
+  exact rollback) ✓.
+- **BatchCEAlignmentBudget**: rangeCurvature = coef/B ≥ 0 —
+  численно тривиально согласовано (R'²-механика волны 56) ✓.
+- Расхождений нет.
