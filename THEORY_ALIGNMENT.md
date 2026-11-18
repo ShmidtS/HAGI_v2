@@ -1535,3 +1535,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **tracking**: d(t+1) ≤ q·d(t)+Δ, q=1−μ/L — аффинная рекурсия,
   стационарный радиус Δ·L/μ ✓ (численный прогон 100 шагов с
   дрейфующим оптимумом); SC⊂PL мост — честный пин теории.
+
+## Волна 102 (2026-11-18) — Theory/CEChain, LogitGrowth
+
+- **CEChain universal safe step**: η=A/2C → drop A²/4C — 100/100
+  exact; η* оптимальный шаг majorizer ✓ (§3.9-носитель).
+- **LogitGrowth**: budget/eta = normalized model charge; CE
+  strict antitonicity — бюджет не является физикой (честный пин)
+  ✓; «нет двойного счёта CE drop в двух каналах» — реализация
+  spine (certified_guarantee per-step) согласована.
