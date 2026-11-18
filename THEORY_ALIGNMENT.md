@@ -1127,3 +1127,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   сертифицируем.
 - **AdaGrad**: accumulator monotone ✓.
 - Расхождений нет.
+
+## Волна 63 (2026-11-18) — EF21Quantizer
+
+- **scaling instance**: EF21-Muon в core (ef_v += 0.5·(g_proj−ef_v)) —
+  compressor C=0.5·Id, α=0.5: ‖Cu−u‖=(1−α)‖u‖ точное равенство ✓;
+  momentum error ‖v'−g‖=0.5‖v−g‖ ≤ (1−α)‖g−v‖ ✓.
+- **ternary/TopK честно α=0** — разреженный witness подтверждает
+  не-контрактивность (теория прямо запрещает заявлять α>0) ✓.
+- Расхождений нет.
