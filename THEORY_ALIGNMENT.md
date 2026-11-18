@@ -1148,3 +1148,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **InfoPreservation**: mirror-regret reuse N/A (пустое тело файла,
   statement в MirrorHedge).
 - Расхождений нет.
+
+## Волна 66 (2026-11-18) — Lion, RobbinsMonro, SAM, PolyStep, MomentumHB, PLConvergence, LRSchedule
+
+- **Lion**: ‖sign step‖ = η√d точное равенство ✓.
+- **RobbinsMonro**: Ση=∞, Ση²<∞; эмпирическая сходимость θ→1.054
+  (истина 1.0) на 300 шагах ✓.
+- **SAM**: ‖perturb‖ ≤ ρ ✓. **PolyStep**: p>0.5 сходится ✓.
+- **MomentumHB**: корни характеристического многочлена —
+  комплексная пара с |λ| согласована при D<0 ✓.
+- **PLConvergence**: ρ=1−2μc₁+c₂cδ=0.89 ∈ [0,1), dominance gate
+  0.05<0.16 ✓.
+- **LRSchedule**: cosine decay ∈[0,η0] монотонно; warmup ramp ✓.
+- Расхождений нет.
