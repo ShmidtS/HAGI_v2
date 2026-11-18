@@ -1267,3 +1267,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **CE РАЗБЛОКИРОВАН В ЖИВОМ ЦИКЛЕ**: после rotating-holdout
   фикса CE колеблется по чанкам (1.2238→1.2263→1.2308) — модель
   обновляется на каждом ingest (было: 1.376 ровно 23 итерации).
+
+## Волна 77 (2026-11-18) — Grow, IntegrationOrder, FiberNecessity
+
+- **Grow**: certifiedGain monotone (меньший c → больший gain),
+  ε-stop по минимуму кандидатов ✓; честная граница: ranking по
+  bound не есть merged CE (selection_hurts) — в реализации
+  selection по измеренному CE, не по bound ✓.
+- **IntegrationOrder**: удаление отрицательного члена селекции
+  строго увеличивает сумму ✓.
+- **FiberNecessity**: configs injective на separated family —
+  counting floor из Capacity (волна 50) ✓.
+- Расхождений нет.
