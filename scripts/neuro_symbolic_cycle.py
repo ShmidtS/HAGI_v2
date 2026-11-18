@@ -88,6 +88,15 @@ def weave_task(task: dict, pop_size: int = 80, generations: int = 2000,
 
 # ---------- COMMIT: tape-out the certified netlist ----------
 
+def prev_gates(c: dict) -> int:
+    p = c.get("_reuse_of") or {}
+    return p.get("gates", 0)
+
+
+def prev_netlist(c: dict) -> str:
+    return (c.get("_reuse_of") or {}).get("netlist", "")
+
+
 def commit(circuits: list[dict], chunk_id: str, ce: float) -> None:
     prev = json.loads(TAPEOUT.read_text(encoding="utf-8")) \
         if TAPEOUT.exists() else []
@@ -95,12 +104,23 @@ def commit(circuits: list[dict], chunk_id: str, ce: float) -> None:
         "chunk": chunk_id, "holdout_ce": ce,
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "circuits": [
-            {"name": c["profile"], "seed": c["seed"],
-             "certified_gen": c["certified_gen"],
-             "gates": len(c["best"]["gates"]),
-             "bits": c["bits"],
-             "netlist": fabric.render(c["best"]),
-             "certificate": "exhaustive truth table: PASS"}
+            ({"name": c["profile"], "seed": c["seed"],
+              "certified_gen": c["certified_gen"],
+              "gates": prev_gates(c), "bits": c["bits"],
+              "netlist": prev_netlist(c) if c.get("_reuse_of")
+                         else fabric.render(c["best"]),
+              "certificate":
+                  "REUSE of certified circuit (exhaustive PASS)"
+                  if c.get("_reuse_of")
+                  else "exhaustive truth table: PASS"}
+             if c.get("_reuse_of") else
+             {"name": c["profile"], "seed": c["seed"],
+              "certified_gen": c["certified_gen"],
+              "gates": len(c["best"]["gates"]),
+              "bits": c["bits"],
+              "netlist": fabric.render(c["best"]),
+              "certificate": "exhaustive truth table: PASS",
+              "truth_hash": c.get("truth_hash")})
             for c in circuits]}
     prev.append(tape)
     TAPEOUT.write_text(json.dumps(prev, ensure_ascii=False, indent=2),
@@ -175,6 +195,16 @@ def main() -> None:
                     solved[c["name"]] = c
         circuits, reused = [], 0
         seen_tables = {}
+        # index: truth-hash → certified circuit from past tape-outs
+        solved_tables = {}
+        netlist_path = ROOT / "checkpoints" / "processor_netlist.json"
+        if netlist_path.exists():
+            for tape in json.loads(
+                    netlist_path.read_text(encoding="utf-8")):
+                for c in tape["circuits"]:
+                    th = c.get("truth_hash")
+                    if th:
+                        solved_tables[th] = c
         for i, task in enumerate(tasks):
             thash = __import__("hashlib").sha1(
                 json.dumps(sorted(task["truth"].items()),
@@ -186,7 +216,21 @@ def main() -> None:
                 reused += 1
                 continue
             seen_tables[thash] = task["name"]
+            if thash in solved_tables:
+                # already solved in an earlier tape-out: honest reuse
+                prev = solved_tables[thash]
+                print(f"  fabric [{task['name']}]: SOLVED earlier "
+                      f"[{prev['name']}] — reusing certified circuit",
+                      flush=True)
+                circuits.append({"profile": f"{task['name']}_{thash}",
+                                 "seed": prev.get("seed", 0),
+                                 "certified_gen": prev.get("certified_gen"),
+                                 "best": None, "bits": prev.get("bits"),
+                                 "_reuse_of": prev})
+                continue
             res = weave_task(task, seed=5 + i)
+            if res:
+                res["truth_hash"] = thash
             if res:
                 res["profile"] = f"{task['name']}_{thash}"
                 circuits.append(res)
