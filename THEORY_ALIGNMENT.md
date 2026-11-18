@@ -1007,3 +1007,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **core.py hoeffding_radius** = √(log(2/α)/(2n)) — граница для
   СРЕДНЕГО (Hoeffding при c=1/2), согласована с Azuma-хвостом
   теории ✓. Правок кода не требуется.
+
+## Волна 52 (2026-11-18) — ChernoffCGF, Concentration, CertifiedEstimator
+
+- **ChernoffCGF**: kl_dv_attained (Donsker на f=ln(p/q), Z=1) —
+  200/200 распределений ✓; Hellinger H²=1−BC тождество и мост
+  H²≤KL/2 ✓.
+- **Concentration**: concRadius δ n = √(ln(1/δ)/(2n)) формально
+  тождественен core.py hoeffding_radius(α,n)=√(ln(2/α)/(2n)) при
+  δ=α/2 (двусторонняя конвенция: общий α = два односторонних
+  хвоста) ✓; pm1-rescale exp(−nη²/2)=exp(−2n(η/2)²) ✓.
+- **CertifiedEstimator**: мост certified_premise реализован через
+  AuditLedgerV9.spend_anytime (alpha-бюджет + радиус в гейтах
+  expert-add, core.py:8325) ✓. Расхождений нет.
