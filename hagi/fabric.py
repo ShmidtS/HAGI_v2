@@ -213,13 +213,27 @@ def crossover(a: dict, b: dict, rng: random.Random) -> dict:
 
 def evolve(truth: dict, inputs_from: callable, n_inputs: int = 2,
            pop_size: int = 40, generations: int = 300, seed: int = 7,
-           log: bool = True, profile: str = "adder") -> dict:
+           log: bool = True, profile: str = "adder",
+           seed_cells: list[dict] | None = None) -> dict:
     rng = random.Random(seed)
     W = truth.get("_W", 8)
     table = {k: v for k, v in truth.items() if k != "_W"}
     n_out = len(next(iter(table.values())))
     pop = [random_genome(rng, W=W, n_inputs=n_inputs, n_outputs=n_out)
            for _ in range(pop_size)]
+    # curriculum: seed certified cells into the initial population
+    # (standard cell-library flow — cells carry their own exhaustive
+    # certificates; the composition search starts from proven parts)
+    if seed_cells:
+        for sc in seed_cells[:max(1, pop_size // 4)]:
+            g = {"W": W, "n_inputs": n_inputs,
+                 "gates": [dict(x) for x in sc["gates"]],
+                 "outs": list(sc.get("outs", []))}
+            if g["outs"]:
+                g["outs"] = [min(o, n_inputs + len(g["gates"]) - 1)
+                             for o in g["outs"]]
+            pop[0] = g
+            break
     certified, best, grow_gen = None, None, None
     best_soft = [0.0]
     best_soft_gen = [0]

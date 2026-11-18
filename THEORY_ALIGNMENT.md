@@ -1396,3 +1396,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Первый полный круг теории (волны 49–87, все кластеры: Architecture,
   Probability, Cert, Contracts, Dynamics, Optimization, Growth,
   Ensemble, Learning, Information, Math-формы) ЗАКРЫТ.
+
+## Модернизация схемы + курсор данных (2026-11-18)
+
+- **СТАГНАЦИЯ №2 ДИАГНОСТИРОВАНА И ВЫЛЕЧЕНА**: (1) данные — walk
+  каждый раз с корня; фикс: persistent lexical cursor (поток новых
+  байтов вырос в 10 раз: +1.3MB/итерация против 0.1); (2) схема —
+  одна уникальная схема за прогон (adder dedup → reuse без роста);
+  фикс: LADDER задач stage0 full-adder → stage1 2-bit adder
+  КОМПОЗИЦИЕЙ сертифицированных ячеек (cell-library flow, 32/32
+  exhaustive) → stage2 MUX.
+- **ПЕРВЫЙ КОМПОЗИЦИОННЫЙ TAPE-OUT**: «adder2_bit: COMPOSED from
+  certified cells — CERTIFIED 32/32» — логическая схема процессора
+  модернизирована: из 1 full-adder в 2-bit adder каскад (10 гейтов).

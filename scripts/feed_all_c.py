@@ -50,12 +50,21 @@ SKIP_DIRS = {"$Recycle.Bin", "System Volume Information",
 _lock = None
 
 
-def iter_files(root: str = "C:/"):
-    """Walk EVERYTHING; skip only unavoidable OS locks."""
+def iter_files(root: str = "C:/", start_after: str | None = None):
+    """Walk EVERYTHING; skip only unavoidable OS locks. start_after:
+    full path of the last consumed FILE — resume lexically after it
+    (files visited in sorted order within sorted dirs)."""
+    started = start_after is None
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for f in filenames:
-            yield os.path.join(dirpath, f)
+        dirnames[:] = sorted([d for d in dirnames if d not in SKIP_DIRS])
+        for f in sorted(filenames):
+            path = os.path.join(dirpath, f)
+            if not started:
+                if path > start_after:
+                    started = True
+                    yield path
+                continue
+            yield path
 
 
 def sample_bytes(p: str, size: int) -> bytes | None:
@@ -79,7 +88,7 @@ def load_state() -> dict:
     if SWEEP_STATE.exists():
         return json.loads(SWEEP_STATE.read_text(encoding="utf-8"))
     return {"seen": {}, "visited": 0, "sampled": 0, "skipped_locked": 0,
-            "bytes_ingested": 0, "chunks": 0}
+            "bytes_ingested": 0, "chunks": 0, "cursor": None}
 
 
 def save_state(st: dict) -> None:
