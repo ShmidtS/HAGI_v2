@@ -1462,3 +1462,6 @@ self-edit гейт работает (no-op фильтр активен), failure
   сертификация не заявляется, согласовано с честной границей) ✓.
 - **Step/Muon**: chunked_sum_exact + ce_prior_decomposition
   (CE=H(prior)+KL) — формы согласованы ✓.
+
+- **PoEBound (доп. волна 92)**: |logZ_w − logZ_approx| ≤ ⅛·ΣwᵢRᵢ² —
+  строгая форма 200/200 ✓ (и более слабая ½-форма тоже).
