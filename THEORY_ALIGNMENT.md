@@ -1161,3 +1161,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   0.05<0.16 ✓.
 - **LRSchedule**: cosine decay ∈[0,η0] монотонно; warmup ramp ✓.
 - Расхождений нет.
+
+## Волна 67 (2026-11-18) — MirrorHedge/HedgeRouter, PPOClip
+
+- **MirrorHedge ↔ HedgeRouter (core:4213)**: экспоненциальные веса с
+  log-sum-exp стабилизацией; survivor lower bound (w_i ≥ e^{−ηL_i}/K,
+  проверка в log-space) не нарушен за 300 раундов; MWU regret
+  3.07 ≤ ηT+lnK/η = 153.2 ✓.
+- **PPOClip**: клипнутый surrogate ≤ (1+ε)|A| — верхняя граница
+  формы ppoClip ✓ (используется в policy-гейтах при наличии).
+- Расхождений нет.
