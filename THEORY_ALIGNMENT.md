@@ -1599,3 +1599,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   соответствует core+fabric+ledger ✓.
 - **TransitionCert FourCert**: одна версия перехода, 4 сертификата
   — CertifiedStep (54) + ledger (53) + growth (74) + macro ✓.
+
+## Волна 108 (2026-11-18) — Model: LayerNorm, SoftmaxHead, Attention/GQA
+
+- **LayerNorm**: scale-invariance LN(cx)=LN(x) — 50/50 ✓.
+- **SoftmaxHead**: SSOT ceOneHot reparametrization (миграционный
+  seed) — согласовано с CEChain волна 102 ✓.
+- **Attention/GQA**: KV-cache n_kv голов → экономия n_h/n_kv
+  точно ✓ (формализация источника №57).
