@@ -1502,3 +1502,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **State/Transition**: TrainingInput (grad, скорость, cost, risk)
   ≈ §3.9 certified step контракт ✓ (волна 54).
 - Расхождений нет.
+
+## Волна 98 (2026-11-18) — Runtime/TernaryExact, VennPacking
+
+- **TernaryExact**: ternary_split_bound exact (total err =
+  in-range + saturation split, 1513.66=1513.66) ✓; global bound
+  κ(√n·s/2+√satTail) ≥ measured err (80.4 ≥ 38.9) ✓.
+- **VennPacking**: 64 трита → 13 байт (⌈64/5⌉, 3⁵=243<256);
+  12-байтовая нижняя граница невозможна (64·log₂3=101.4 > 96 бит)
+  — tight ✓.
