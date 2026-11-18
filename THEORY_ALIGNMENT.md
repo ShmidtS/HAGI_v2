@@ -1327,3 +1327,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   (E[S_b]=p·Σx, расхождение 1.41 << σ=21.6); Hoeffding
   концентрация ✓.
 - Расхождений нет.
+
+## Волна 81 (2026-11-18) — Learning кластер: ContinualForgetting, Hadamard, PertTelescope
+
+- **ContinualForgetting**: two-channel контракт — kernel floors
+  carried (record_floor monotone через траекторию) + audit chain
+  Σδ≤δtotal (spend_anytime) ✓ (прямо на AuditLedgerV9).
+- **HadamardParseval**: HᵀH=I, ‖Hx‖=‖x‖ exact ✓.
+- **PertTelescope**: telescope sum identity exact ✓.
+- Расхождений нет.
