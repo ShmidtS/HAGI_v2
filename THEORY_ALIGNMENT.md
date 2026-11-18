@@ -1222,3 +1222,13 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **momentumRate_char**: ρ=(q+√(q²+4β))/2 — характеристическое
   уравнение ρ²=qρ+β точное на (q,β) ∈ {(.5,.9),(1,0),(−.3,.5)} ✓.
 - Расхождений нет.
+
+## Волна 73 (2026-11-18) — Checkpoint, AdaptiveCycle
+
+- **Checkpoint**: AM-GM floor k+n/k ≥ 2√n, оптимум k=√n=31.6
+  численно ✓ (checkpoint-стратегия сохранений в unified/lm.save).
+- **AdaptiveCycle**: внешний рост ≤ C0/δ × внутренний K-горизонт —
+  структурный контракт neuro_symbolic_cycle (рост доменов + cert
+  stop) ✓.
+- Цикл: SOLVED-reuse стабильно в tape-out'ах, нейро-фаза ~350с.
+- Расхождений нет.
