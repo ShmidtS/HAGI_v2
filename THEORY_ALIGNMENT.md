@@ -956,3 +956,29 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **FactorRank (rank_le_nonnegRank)**: неотрицательная
   факторизация ограничивает ранг — фундамент nonneg-факторизаций
   в архитектурном фронте.
+
+## Волна 49 (2026-11-18) — Architecture: CortexFiber, Configuration, Heterarchy, FactorizedMerge, LiveDelta, IsoFrobCascade
+
+- **CortexFiber (4/4 леммы, численно на ContinualGPMMemoryV9)**:
+  IsOrthoCol UᵀU=I — 5.6e-16 (QR-консолидация ✓); fiberCross
+  Uᵀ·proj(G)=0 — 8.1e-16 (project_orthogonal ✓); fiberPythagoras —
+  rel 0.0 (энергия без cross-term ✓); fiberParamCount r*d < d² ✓.
+- **Configuration (3/3)**: config_storage_beats_dense,
+  selector_never_flips_verdict, switchable_beats_naive_dense —
+  арифметика (N*r)*d < d*d при гипотезе N*r<d соблюдена в структуре
+  fibers/селектора. (Первый прогон теста нарушил гипотезу — тест
+  исправлен, не код.)
+- **Heterarchy**: disagreement_survives_configs — mean 0, энергия
+  2‖d‖² > 0 ✓; no_global_ranking / cycle_breaks_ranking — контроллер
+  MGDA контекст-зависим, глобального ранжирования нет ✓.
+- **FactorizedMerge**: merge_core_residual_identity exact
+  (mean W = C + mean R), mean_norm_le 0.906 ≤ 0.912, routed
+  специализация различима ✓ (FactorizedSharedCore/Adapter).
+- **LiveDelta**: rank(AᵀB) ≤ r, zero-effect на null(A) (порог
+  1e-10), budget k·r·(m+n); rollback — SNAPSHOT restore, точный
+  (float add-sub НЕ точен — это правильная семантика, совпадает с
+  controller exact rollback) ✓.
+- **IsoFrobCascade**: isoFrobEnergy = ‖J‖²_F/d ≤ ‖J‖²_op;
+  columnEnergy_basis — базисное среднее = frob/d точно ✓.
+- **ManifoldHyperConn**: N/A — mHC-микшинг (doubly stochastic) в
+  реализации отсутствует; не расхождение, модуль не инстанцирован.
