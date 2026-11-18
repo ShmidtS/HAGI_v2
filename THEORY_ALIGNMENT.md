@@ -1588,3 +1588,14 @@ self-edit гейт работает (no-op фильтр активен), failure
 
 - Тестовая ошибка (нормированный сдвиг) исправлена: transport
   bound точен при явной нормировке δ — 50/50 ✓. Не код.
+
+## Волна 107 (2026-11-18) — Training: TTCAT, CRMSM, Admission, TransitionCert
+
+- **Admission rule**: estimatedGain − r_conf − lam_M*memCost −
+  lam_R*risk > 0 — форма строгого порога 200/200 ✓.
+- **TTCAT joint theorem**: union bound микро-delta + макро-
+  checkpoints ✓ (master_union_bound, волна 100).
+- **CRMSM skeleton**: композиция доказанных блоков — структурно
+  соответствует core+fabric+ledger ✓.
+- **TransitionCert FourCert**: одна версия перехода, 4 сертификата
+  — CertifiedStep (54) + ledger (53) + growth (74) + macro ✓.
