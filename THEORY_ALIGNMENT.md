@@ -1420,3 +1420,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   стабильна ~360с.
 - Лестница остановлена на stage 2 (честная стабильность; stage 3+
   — расширение: comparator, 4-bit adder, ALU-кус — по запросу).
+
+## Волна 89 (2026-11-18) — ВТОРОЙ КРУГ начат: CortexFiber re-verify
+
+- **CortexFiber regression check** после fabric-фиксов: ortho
+  5.55e-16, cross 8.05e-16, pythagoras 0.0 — без регрессий ✓.
+- **fabric implication oracle**: 256/256 ✓ (после emulate guard).
+- Данные: cursor движется, 15.6MB+ ingested, ~200-250 файлов/чанк.
+- Цикл: ns_0065, CE ~1.51, MUX SOLVED-reuse стабилен.
