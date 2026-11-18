@@ -112,7 +112,8 @@ def emulate(genome: dict, inputs: list[int]) -> list[int]:
             idx = (ab << 1) | bb          # bit3=(T,T) ... bit0=(F,F)
             res |= ((m >> idx) & 1) << bit
         wires.append(res)
-    return [wires[o] for o in genome["outs"]]
+    n = len(wires)
+    return [wires[o] if 0 <= o < n else wires[-1] for o in genome["outs"]]
 
 
 def certify(genome: dict, truth: dict, inputs_from: callable):

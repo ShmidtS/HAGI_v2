@@ -65,16 +65,17 @@ def derive_tasks(model, k: int, n_tasks: int = 3, seed: int = 13) -> list[dict]:
     return tasks
 
 
-def weave_task(task: dict, pop_size: int = 80, generations: int = 2000,
-               restarts: int = 4, seed: int = 5) -> dict | None:
+def weave_task(task: dict, pop_size: int = 100, generations: int = 3000,
+               restarts: int = 10, seed: int = 5) -> dict | None:
     """Run the fabric loop for one derived task. Multi-restart GA with
     certified-first COMMIT gate. Returns the certified optimized
     genome (the tape-out circuit) or None (honest: no commit)."""
     truth = task["truth"]
     ins = task["ins"]
     for r in range(restarts):
-        # W=4: nibble buses (task derives nibble adder bits)
-        res = fabric.evolve({**truth, "_W": 4}, ins,
+        # W=1: adder slice is boolean (inputs are single bits) —
+        # 1 lane is exact and 4x cheaper to certify
+        res = fabric.evolve({**truth, "_W": 1}, ins,
                             n_inputs=task["n_inputs"],
                             pop_size=pop_size, generations=generations,
                             seed=seed + r, log=False,
