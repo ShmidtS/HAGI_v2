@@ -1088,3 +1088,9 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **BatchCEAlignmentBudget**: rangeCurvature = coef/B ≥ 0 —
   численно тривиально согласовано (R'²-механика волны 56) ✓.
 - Расхождений нет.
+
+## Волна 58 (2026-11-18) — BatchCEBestResidual
+
+- **exists_alignment_le_fixedAlignmentCesaro**: min ≤ Cesaro —
+  train_certified держит best_state по holdout (snapshot минимума
+  траектории); CE 0.009 на синтетике ✓.
