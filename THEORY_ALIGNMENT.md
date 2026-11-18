@@ -1359,3 +1359,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **LogicChoiceCert**: vennHead исполняет маску exhaustively
   (16×4), choice-CE = C223 reuse (§3.9, волна 54) ✓.
 - Расхождений нет.
+
+## Волна 84 (2026-11-18) — NaturalLean (N/A), ChainUnification, InterpretiveGrowth
+
+- **NaturalLean**: Lean-tactic интероп — N/A для Python.
+- **ChainUnification**: measurement-tail chain
+  G_cap=eta_p*eta_o*eta_s*E_dev — 100/100 ✓.
+- **InterpretiveGrowth**: causalEffect pos/mean<=max леммы 100/100;
+  passive carrier = нулевой причинный эффект ✓.
+- Расхождений нет. Первый полный круг теории почти замкнут.
