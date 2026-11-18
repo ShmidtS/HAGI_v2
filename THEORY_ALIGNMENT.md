@@ -1567,3 +1567,11 @@ self-edit гейт работает (no-op фильтр активен), failure
 
 - 98/100 (2 исключения из шума тестовой симуляции — теорема
   whp на good-событии; тест без good-event conditioning). Не код.
+
+## Волна 105 (2026-11-18) — Training/Admission, Data/DBridge
+
+- **Admission**: noAdmitWithoutPositiveMargin gate — refuse при
+  неположительной марже; Ville e-process soundness через monitor
+  (audit chain, волна 53) ✓.
+- **DBridge dQuad_nonneg**: (ΣpW·d)² ≤ ΣpW·d² (Cauchy-Schwarz)
+  100/100 ✓.
