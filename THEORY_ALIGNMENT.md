@@ -1046,3 +1046,22 @@ self-edit гейт работает (no-op фильтр активен), failure
   (profile-weighted, cycle 31) + strict-gap adopt (rel_gain 0.077 ≥
   MIN_TARGET_GAIN 0.01) + no-regression margin 5% ✓.
 - Расхождений не найдено.
+
+## Волна 55 (2026-11-18) — Cert/Core, Cert/Empirical, Cert/EvalBinding
+
+- **Cert/Core**: CertStep telescope — controller.guarded_optimizer_step:
+  COMMIT с certified_gain=0.0164 (loss 1.6092→1.5283), HOLD при
+  конфликте = exact rollback (loss неизменен 1.5283→1.5283) ✓;
+  HoldStep.id всегда доступен (rollback безусловен) ✓.
+- **Cert/Empirical**: семантика «посылка предъявляется измерением» —
+  measured-MSE-drop guard (core:2128): accept только при измеренном
+  строгом спуске ✓. Отдельного Empirical-типа нет (N/A, семантика
+  соблюдена в гейтах).
+- **Cert/EvalBinding**: L_before/L_after — не detached counters:
+  controller.loss_before=validation_fn(model) до шага, loss_after
+  после; commit gate использует e_gen+e_quant+e_route+m_safety —
+  MachineEvalBridge ε-маржа ✓.
+- **Cert/StepGen**: riskRem как явное поле — риск-остаток в
+  controller (backtracks, task alphas); delta-бюджет telescoping в
+  audit ledger ✓.
+- Расхождений не найдено.
