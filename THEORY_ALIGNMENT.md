@@ -1336,3 +1336,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **HadamardParseval**: HᵀH=I, ‖Hx‖=‖x‖ exact ✓.
 - **PertTelescope**: telescope sum identity exact ✓.
 - Расхождений нет.
+
+## Волна 82 (2026-11-18) — BitBudget, NetworkBudget, RCDL, FOOF
+
+- **BitBudget**: тернарный слой m·r·log₂3 = 1.25M бит на живой
+  unified модели (плотность 0.42) ✓; network_bit_error форма ✓.
+- **RCDL**: gauge_shift — разностная инвариантность s(q1)−s(q2)
+  при сдвиге v→v+b·w точна ✓ (сдвиг значения на константу b,
+  сравнение/argmax инвариантны).
+- **FOOF**: normal_eq exact ✓; one-step identity — верна
+  интерпретация «шаг по невязке нормального уравнения»
+  (W0−(W0C−VXᵀ)C⁻¹ = W*); дословная форма «(W₀X−V)XᵀC⁻¹» при
+  W0≠0 не даёт W* — помечено как docstring-неточность теории
+  (FOOF в коде не инстанцирован, не кодовый баг).
