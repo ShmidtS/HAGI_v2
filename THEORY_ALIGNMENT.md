@@ -1472,3 +1472,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   границей (seq-power ≠ tokenwise temperature, softmax-invariance
   c·z≠z) — Research-модуль, в реализации не инстанцирован (N/A).
 - Форма согласована с SoftmaxFix (Numerics, волна ранее).
+
+## Волна 94 (2026-11-18) — Step/LazyAdam, SafeQP
+
+- **LazyAdam**: lazyDecay_exact (dense≡β₂^d·v при g=0, 1e-15) ✓;
+  replay composition identity exact ✓.
+- **SafeQP**: spectral_tail_energy (dropped=Σcoeff_outside²)
+  exact; three_stage_error_budget triangle ✓.
