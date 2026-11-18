@@ -664,12 +664,18 @@ class CertifiedStepLM:
 
     def train_certified(self, data: bytes, epochs: int = 60,
                         holdout: float = 0.1, batch: int = 256,
-                        log_every: int = 0) -> dict:
+                        log_every: int = 0,
+                        holdout_seed: int | None = None) -> dict:
         import numpy as np
         t = self.t
         idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
         n = len(idx) - self.k
-        rng = np.random.default_rng(7)
+        # rotating holdout: fixed seed freezes the record forever and
+        # blocks all further learning when replay repeats (stagnation
+        # fix); rotating the split keeps the certified-selection
+        # semantics (best on ITS holdout) while letting the model move.
+        rng = np.random.default_rng(7 if holdout_seed is None
+                                    else holdout_seed)
         perm = rng.permutation(n)
         n_hold = max(16, int(n * holdout))
         hold, train = np.sort(perm[:n_hold]), perm[n_hold:]

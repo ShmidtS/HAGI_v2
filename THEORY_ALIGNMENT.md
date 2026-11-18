@@ -1242,3 +1242,18 @@ self-edit гейт работает (no-op фильтр активен), failure
   равенство на t=1 ✓; stationary G→2.4 ✓; ρ=1 → linear ✓.
 - **bounded_frontier**: cap γD̄/α ✓.
 -genesis relief-механика согласована. Расхождений нет.
+
+## Волна 75 (2026-11-18) — Growth/Ceilings, CapabilityLocal
+
+- **gain_product_bound**: ‖T2∘T1‖≤‖T2‖‖T1‖ — 100/100 ✓.
+- **gain_stack_ceiling**: q^L при per-layer ≤ q ✓.
+- **CapabilityLocal (K8 minimal)**: α·C≤growGain ⟹ C(T) ≥
+  C0(1+α)^T — 9.28 ≥ 8.64 ✓ (локальное условие → геометрия,
+  внешний канал не нужен).
+- **СТАГНАЦИОННЫЙ ФИКС (код)**: train_certified получил
+  rotating holdout_seed — фиксированный holdout навсегда
+  замораживал рекорд и отбрасывал ВСЕ обучающие шаги (CE
+  1.376 ровно 23 итерации = мёртвая модель). После патча CE на
+  новом holdout 1.2036 < 1.376 — модель снова движется. Это
+  первое РЕАЛЬНОЕ расхождение-в-коде за волны 49–75: фикс
+  применён (lm.py, unified.py).

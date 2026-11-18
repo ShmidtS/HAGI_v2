@@ -88,9 +88,10 @@ class Unified:
         # training (certified step path)
         t0 = time.perf_counter()
         reps = []
-        for _ in range(max(1, repeat)):
+        for rep_i in range(max(1, repeat)):
             reps.append(self.model.train_certified(
-                combined, epochs=epochs))
+                combined, epochs=epochs,
+                holdout_seed=7 + rep_i * 131 + len(self.domains) * 17))
         ce = min(r.get("best_holdout_ce", 99) for r in reps)
         entry["ce"] = ce
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
