@@ -1310,3 +1310,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   учёта ∑(d1+d2) слагаемого, потерянного при перецентровке).
 - **PolyStep**: softmax-веса p_v=exp(−C_v/ε) — численно
   тривиально согласованы с MWU (волна 67).
+
+## Волна 79 (2026-11-18) — Ensemble/UniformCert, SigmaKernel
+
+- **UniformCert**: probabilistic method (union bound → good point
+  существует) — 423/423 случаев bound<1 все good ✓.
+- **SigmaKernel**: quad_form_factorization v·Σv=‖Av‖² exact;
+  kernel_interference_zero ✓.
+- Расхождений нет.
