@@ -1368,3 +1368,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **InterpretiveGrowth**: causalEffect pos/mean<=max леммы 100/100;
   passive carrier = нулевой причинный эффект ✓.
 - Расхождений нет. Первый полный круг теории почти замкнут.
+
+## Волна 85 (2026-11-18) — RouterMix, SleepingRouter
+
+- **RouterMix switch**: вклад домена = w·d изолирован, cross-talk
+  end-to-end 0 (с hrcn_cross_talk_zero, волна 83) ✓.
+- **SleepingRouter**: спящие на импутированных потерях m_t —
+  сводится к MWU дословно (KEY IDENTITY swWeight=ewWeight),
+  algLoss=m_t self-consistency структурно ✓.
+- Цикл: 47 чанков, CE 1.5139, tape-out reuse стабилен.
