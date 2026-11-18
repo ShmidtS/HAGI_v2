@@ -1113,3 +1113,17 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **ControllerPolicy ratio_dominance**: бюджет по максимальному
   Γ/K — allocate-семантика AuditLedger ✓.
 - Расхождений нет.
+
+## Волны 61–62 (2026-11-18) — ProxyGap, AdamBias, HBRate, AdaGrad
+
+- **ProxyGap**: budget monotone (Σ(e+δ) неубывает), horizon
+  actual ≤ eps/c ✓ (Red-Queen цена self-shift оплачена из eps).
+- **AdamBias**: const-gradient unbiased — p_t = t·g/(|g|+ε)
+  точно (проверено на живом torch.optim.Adam); bias bound
+  m_t=g(1−βᵗ) exact ✓.
+- **HBRate**: cfg η=(1−ρ)², β=ρ² держит ημ=(1−ρ)² на нижней
+  границе интервала — критический случай D=0, |λ|=√β для обеих
+  мод, heavy-ball не растёт (50 итераций) ✓ — momentum knob
+  сертифицируем.
+- **AdaGrad**: accumulator monotone ✓.
+- Расхождений нет.
