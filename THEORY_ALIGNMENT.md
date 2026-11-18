@@ -1428,3 +1428,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **fabric implication oracle**: 256/256 ✓ (после emulate guard).
 - Данные: cursor движется, 15.6MB+ ingested, ~200-250 файлов/чанк.
 - Цикл: ns_0065, CE ~1.51, MUX SOLVED-reuse стабилен.
+
+## Волна 90 (2026-11-18) — ВТОРОЙ КРУГ: upstream обновился (218 файлов),
+## EnergyFlow первый из новых
+
+- **Upstream-детект**: 218 lean-файлов теории изменены за 3 дня —
+  массовая реорганизация. Второй круг фокусируется на обновлённых
+  и новых файлах (Energy/, Research/, Semantics/, Theory/, Step/).
+- **EnergyFlow**: quadraticVar variance-form + identity 200/200
+  exact; null-direction (постоянный u = gauge) 200/200 ✓;
+  logsumexp grad = softmax(βv)·u — β-параметризация подтверждена
+  (первая проверка с p=softmax(v) не совпала — конвенция теории
+  β-точна) ✓; softmax_legendre_identity 100/100 ✓.
