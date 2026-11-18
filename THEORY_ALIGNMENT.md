@@ -1440,3 +1440,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   logsumexp grad = softmax(βv)·u — β-параметризация подтверждена
   (первая проверка с p=softmax(v) не совпала — конвенция теории
   β-точна) ✓; softmax_legendre_identity 100/100 ✓.
+
+## Волна 91 (2026-11-18) — Landauer, FreeEnergy
+
+- **Landauer**: honest-ledger bound (per-coord quant err ≤
+  (scale/2)², dissipation ≥ measured) форма согласована ✓.
+- **FreeEnergy**: free_energy_gap F[q]−F* = τ·KL(q‖p) — тождество
+  верно в конвенции F := −E_q[v] − τ·H(q) (F* в p): 1.157=1.157
+  exact ✓. Две мои первые конвенции (Гиббс-прямая) давали −τ·KL —
+  знак/определение F различаются; теория использует поток-конвенцию
+  «lowering F = KL-descent». Тест-фикс, не код.
+- **token_kl_decomposition**: chain-rule additivity ✓.
