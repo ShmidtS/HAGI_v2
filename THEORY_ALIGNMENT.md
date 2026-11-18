@@ -1104,3 +1104,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **GrowthBridge/takeoff_counted**: C(T) ≥ C0(1+α)^Σs — экспонента
   по успехам, неуспехи нейтральны ✓ (experts-счётчик forever).
 - Расхождений нет.
+
+## Волна 60 (2026-11-18) — Dynamics/Laws (SpeedLimit), ControllerPolicy
+
+- **SpeedLimit**: learning_time_lower_bound — спуск Δ требует ≥
+  Δ/M шагов; численно Δ=6, M=0.5 → ровно 12 шагов ✓; согласовано с
+  per-step certified telescope (волна 55).
+- **ControllerPolicy ratio_dominance**: бюджет по максимальному
+  Γ/K — allocate-семантика AuditLedger ✓.
+- Расхождений нет.
