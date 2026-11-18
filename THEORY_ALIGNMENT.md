@@ -1451,3 +1451,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   знак/определение F различаются; теория использует поток-конвенцию
   «lowering F = KL-descent». Тест-фикс, не код.
 - **token_kl_decomposition**: chain-rule additivity ✓.
+
+## Волна 92 (2026-11-18) — Step/NewtonSchulzMatrix, Muon
+
+- **newton_polar_scalar_error**: (x+1/x)/2 − 1 = (x−1)²/2x точное
+  тождество + квадратичный bound при x≥1 ✓.
+- **Реализация X←X(3I−XᵀX)/2** (core, EF21-Muon): Byers–Xu скейл
+  форму теории ✓; сходимость линейно→квадратичная, err 4e-6 при
+  8 итерациях (approximate orthogonalization, Muon-конвенция —
+  сертификация не заявляется, согласовано с честной границей) ✓.
+- **Step/Muon**: chunked_sum_exact + ce_prior_decomposition
+  (CE=H(prior)+KL) — формы согласованы ✓.
