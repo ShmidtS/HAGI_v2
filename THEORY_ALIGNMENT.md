@@ -1409,3 +1409,14 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **ПЕРВЫЙ КОМПОЗИЦИОННЫЙ TAPE-OUT**: «adder2_bit: COMPOSED from
   certified cells — CERTIFIED 32/32» — логическая схема процессора
   модернизирована: из 1 full-adder в 2-bit adder каскад (10 гейтов).
+
+## Лестница: stage 2 MUX сертифицирован (2026-11-18)
+
+- **LADDER полный прогон**: stage0 full-adder (GA, gen 734) →
+  stage1 2-bit adder (COMPOSED из ячеек, 32/32) → stage2 MUX21
+  (GA, gen 996, 10 гейтов, 5с) — все сертифицированы exhaustive,
+  tape-out'ы с SOLVED-reuse на каждой итерации.
+- CE ~1.50-1.52 на растущем потоке данных (13.7→15MB), нейро-фаза
+  стабильна ~360с.
+- Лестница остановлена на stage 2 (честная стабильность; stage 3+
+  — расширение: comparator, 4-bit adder, ALU-кус — по запросу).

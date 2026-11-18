@@ -291,6 +291,13 @@ def main() -> None:
                     res["truth_hash"] = thash
                     res["profile"] = f"{task['name']}_{thash}"
                     circuits.append(res)
+                    # ladder advance: stage 1 composed ONCE → stage 2
+                    sf = ROOT / "checkpoints" / "ladder_stage.json"
+                    if json.loads(sf.read_text(encoding="utf-8")).get("stage", 0) == 1:
+                        sf.write_text(json.dumps({"stage": 2}),
+                                      encoding="utf-8")
+                        print(f"  LADDER: stage 1 composed → stage 2 "
+                              f"(MUX) unlocked", flush=True)
                     print(f"  fabric [{task['name']}]: COMPOSED from "
                           f"certified cells — CERTIFIED 32/32",
                           flush=True)
