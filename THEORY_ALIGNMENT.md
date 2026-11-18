@@ -1349,3 +1349,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   (W0−(W0C−VXᵀ)C⁻¹ = W*); дословная форма «(W₀X−V)XᵀC⁻¹» при
   W0≠0 не даёт W* — помечено как docstring-неточность теории
   (FOOF в коде не инстанцирован, не кодовый баг).
+
+## Волна 83 (2026-11-18) — HRCN, RegCovPD, LogicChoiceCert
+
+- **HRCN**: cross_talk_zero между доменами памяти — ортогональные
+  Hadamard-проекторы, ‖P2·shift‖=0 точно ✓.
+- **RegCovPD**: regCov_quad v·(XXᵀ+λI)v = Σ(Xᵀv)² + λ‖v‖²
+  exact ✓.
+- **LogicChoiceCert**: vennHead исполняет маску exhaustively
+  (16×4), choice-CE = C223 reuse (§3.9, волна 54) ✓.
+- Расхождений нет.
