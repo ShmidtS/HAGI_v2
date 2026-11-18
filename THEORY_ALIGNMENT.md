@@ -1136,3 +1136,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **ternary/TopK честно α=0** — разреженный witness подтверждает
   не-контрактивность (теория прямо запрещает заявлять α>0) ✓.
 - Расхождений нет.
+
+## Волны 64–65 (2026-11-18) — DirectionPacking, InexactContraction, GradAccum, InfoPreservation
+
+- **DirectionPacking**: Welch μ² ≥ (M−d)/(d(M−1)) держится на
+  (M,d) = (20,8), (50,16), (6,4) ✓ (теория: tr S=M доказан, полный
+  Welch — открытая итерация upstream).
+- **InexactContraction**: x(k) ≤ qᵏx₀ + ε/(1−q) — 0 нарушений;
+  floor ε/(1−q) достигнут ✓ (квантованный останов: τ > ε/(1−q)).
+- **GradAccum**: fullGrad = Σ microGrad при общем знаменателе N ✓.
+- **InfoPreservation**: mirror-regret reuse N/A (пустое тело файла,
+  statement в MirrorHedge).
+- Расхождений нет.
