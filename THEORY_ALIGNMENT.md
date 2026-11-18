@@ -1257,3 +1257,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   новом holdout 1.2036 < 1.376 — модель снова движется. Это
   первое РЕАЛЬНОЕ расхождение-в-коде за волны 49–75: фикс
   применён (lm.py, unified.py).
+
+## Волна 76 (2026-11-18) — GainDecomposition, GammaDeficit + CE разблокирован
+
+- **GainDecomposition**: merge_is_mean, deviations_cancel
+  (Σf(Wk)−N·f(M)=6.7e-16), pairwise_variance_identity
+  (111.79=111.79), decompose_reconstruct exact ✓.
+- **GammaDeficit**: γ_min=αC*/D̄=1.25 ✓.
+- **CE РАЗБЛОКИРОВАН В ЖИВОМ ЦИКЛЕ**: после rotating-holdout
+  фикса CE колеблется по чанкам (1.2238→1.2263→1.2308) — модель
+  обновляется на каждом ingest (было: 1.376 ровно 23 итерации).
