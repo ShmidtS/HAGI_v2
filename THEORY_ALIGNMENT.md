@@ -1384,3 +1384,15 @@ self-edit гейт работает (no-op фильтр активен), failure
   200/200 ✓; **mixture_ce_le** — вогнутость log 200/200 ✓.
 - **SpectralBudget**: Parseval-декомпозиция энергии по доменам
   (Σ‖P_w v‖²=‖v‖²) — бюджет ∝ доменной энергии ✓.
+
+## Волна 87 (2026-11-18) — TernaryPert, ToyTrajectory, TrainingTransition, FOOFUnique
+
+- **TernaryPert**: per-coordinate ошибка квантизации ≤ scale/2 ✓
+  (тернарная проекция to_symbolic использует ту же сетку).
+- **ToyTrajectory/TrainingTransition**: CertStep-цепь траектории —
+  согласованы волнами 55/73 (telescope + hold) ✓.
+- **FOOFUnique**: единственность оптимума через положительную
+  определённость C=XXᵀ+λI ✓ (λ>0 → строго).
+- Первый полный круг теории (волны 49–87, все кластеры: Architecture,
+  Probability, Cert, Contracts, Dynamics, Optimization, Growth,
+  Ensemble, Learning, Information, Math-формы) ЗАКРЫТ.
