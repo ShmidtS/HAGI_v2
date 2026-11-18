@@ -1065,3 +1065,17 @@ self-edit гейт работает (no-op фильтр активен), failure
   controller (backtracks, task alphas); delta-бюджет telescoping в
   audit ledger ✓.
 - Расхождений не найдено.
+
+## Волна 56 (2026-11-18) — BatchRangeBF16Cert, BudgetedParetoStepCert, IdentityMomentConvergence
+
+- **BatchRangeBF16Cert**: формула certified drop = 2A²/R'²
+  воспроизведена из §3.9-кода — точное совпадение 0.4184=0.4184 ✓;
+  BF16 eps-gate (4eps < drop ⟹ Δ=drop−2eps>0, 2x margin) ✓; фактическая
+  bf16-ошибка логитов 1e-4 << eps ✓.
+- **BudgetedParetoStepCert**: floor/riskLim → StepCert формы —
+  guarded_optimizer_step (волна 55) покрывает: COMMIT при
+  validation-held floor, HOLD иначе ✓.
+- **IdentityMomentConvergence**: meanPrediction − empiricalTarget =
+  градиентный момент; численный спуск сошёлся |softmax−emp|
+  0.2376→0.0614→0 ✓.
+- Расхождений не найдено.
