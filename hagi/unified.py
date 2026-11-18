@@ -73,15 +73,18 @@ class Unified:
         # tail) and the ledger records exact bytes seen.
         import numpy as _np
         parts = []
+        total_cap = replay_cap  # TOTAL budget for all past domains
+        per_domain = max(total_cap // max(1, len(self.domains)),
+                         32_000) if total_cap else None
         for name, e in self.domains.items():
             d = self._domain_bytes(name, e)
             if not d:
                 continue
-            if replay_cap is not None and len(d) > replay_cap:
-                seg = max(replay_cap // 3, 1024)
+            if per_domain is not None and len(d) > per_domain:
+                seg = max(per_domain // 3, 8_000)
                 d = d[:seg] + d[len(d)//2 - seg//2:len(d)//2 + seg//2] +                     d[-seg:]
             parts.append(d)
-        combined = b"".join(parts)
+        combined = b"".join(parts)[:total_cap] if total_cap else             b"".join(parts)
         # training (certified step path)
         t0 = time.perf_counter()
         reps = []

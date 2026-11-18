@@ -153,7 +153,8 @@ def main() -> None:
         cid = f"ns_{st['chunks']:04d}"
         (ROOT / "checkpoints" / "domains" / f"{cid}.bin").write_bytes(blob)
         # ---- neural training on cumulative corpus ----
-        r = u.ingest(cid, blob, epochs=4, repeat=1)
+        r = u.ingest(cid, blob, epochs=2, repeat=1,
+                     replay_cap=200_000)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "
@@ -162,11 +163,32 @@ def main() -> None:
         chunk, chunk_bytes, files_now = [], 0, 0
         # ---- 2+3. DERIVE + WEAVE: fabric self-assembly ----
         model = u.model
-        tasks = derive_tasks(model, k=u.k)
-        circuits = []
+        tasks = derive_tasks(model, k=u.k,
+                             seed=13 + st['chunks'] * 7)
+        # dedup: truth-table hash — same boolean problem = same circuit;
+        # honest "reused" instead of wasting search budget
+        solved = {}
+        netlist_path = ROOT / "checkpoints" / "processor_netlist.json"
+        if netlist_path.exists():
+            for tape in json.loads(netlist_path.read_text(encoding="utf-8")):
+                for c in tape["circuits"]:
+                    solved[c["name"]] = c
+        circuits, reused = [], 0
+        seen_tables = {}
         for i, task in enumerate(tasks):
+            thash = __import__("hashlib").sha1(
+                json.dumps(sorted(task["truth"].items()),
+                           default=str).encode()).hexdigest()[:10]
+            if thash in seen_tables:
+                print(f"  fabric [{task['name']}]: DUPLICATE of "
+                      f"[{seen_tables[thash]}] — reused, no re-search",
+                      flush=True)
+                reused += 1
+                continue
+            seen_tables[thash] = task["name"]
             res = weave_task(task, seed=5 + i)
             if res:
+                res["profile"] = f"{task['name']}_{thash}"
                 circuits.append(res)
                 nb = res["bits"]
                 ng = len(res["best"]["gates"])
