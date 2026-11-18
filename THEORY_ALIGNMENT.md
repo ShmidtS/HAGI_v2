@@ -1094,3 +1094,13 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **exists_alignment_le_fixedAlignmentCesaro**: min ≤ Cesaro —
   train_certified держит best_state по holdout (snapshot минимума
   траектории); CE 0.009 на синтетике ✓.
+
+## Волна 59 (2026-11-18) — EndpointContraction, LatentContraction, GrowthBridge
+
+- **EndpointContraction**: contraction_limit E(t) ≤ γᵗE0+δ/(1−γ) —
+  0 нарушений на 100 итерациях; E∞=δ/(1−γ) точно ✓.
+- **LatentContraction (core:7238)**: q=δ/(δ+1)<1, итерационный
+  бюджет из log-формы contraction_limit, z∈[0,1/(m−δ)] assert ✓.
+- **GrowthBridge/takeoff_counted**: C(T) ≥ C0(1+α)^Σs — экспонента
+  по успехам, неуспехи нейтральны ✓ (experts-счётчик forever).
+- Расхождений нет.
