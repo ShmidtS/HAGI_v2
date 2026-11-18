@@ -1033,3 +1033,16 @@ self-edit гейт работает (no-op фильтр активен), failure
   (reject-drop / accept-rise); finalTest untouched init=false ✓.
   Мост certified_premise — spend_anytime с радиусом в гейтах ✓.
 - Расхождений кода с теорией не найдено.
+
+## Волна 54 (2026-11-18) — Contracts/BatchCE* кластер
+
+- **BatchCEStepCertificate**: canonical trainStep = batchNextParameters —
+  реализация §3.9 в CertifiedStepLM._certified_step: direction=−grad,
+  полный JVP R'², сертификат 2A²/R'²=0.624, фактический спуск
+  1.044 ≥ сертификата ✓; zero-range→CE-preserved семантика ✓.
+- **BatchCEBudgetGuard**: batchCEObjective_nonneg (CE=5.54≥0 ✓);
+  empty-batch guard сделан upstream (unified.ingest 4096-порог) ✓.
+- **BatchCEGrowth/GrowthSelection**: Pareto scalarization
+  (profile-weighted, cycle 31) + strict-gap adopt (rel_gain 0.077 ≥
+  MIN_TARGET_GAIN 0.01) + no-regression margin 5% ✓.
+- Расхождений не найдено.
