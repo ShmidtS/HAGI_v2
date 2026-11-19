@@ -1616,3 +1616,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   query-grad ≤ ε·M (форма anti-lock-in guard) ✓.
 - **TanhCEStep**: affine embedding форма — стыковка TanhTaylor ✓
   (фит-гейт tanh fiber в core, волна 82 measured-drop guard).
+
+## Волна 110 (2026-11-18) — Model: HypothesisCompetition, AlignmentRisk, MeasuredEffects
+
+- **DHC step**: инерция (1-rho) + поддержка rho*s + подавление
+  kappa*C*p — форма структурно реализована (HedgeRouter) ✓.
+- **AlignmentRisk kl_budget_risk_bound**: risk <= c*sqrt(KL)
+  через Pinsker TV ✓ (alignment-штраф = риск-сертификат).
+- **MeasuredEffects**: измеряемые эффекты = premise-канал ✓.
