@@ -1718,3 +1718,10 @@ self-edit гейт работает (no-op фильтр активен), failure
 - direction=−grad, R'²-JVP, drop 2A²/R'² — повторно exact после
   upstream обновлений ✓ (157 дельт стилевые для SSOT-форм).
 - Цикл: 163 чанка, CE 1.5173, нейро-фаза стабильна ~364с.
+
+## Волна 122 addendum
+
+- Расхождение в первом прогоне было артефактом теста (torch.manual_seed
+  не зафиксирован до randint → разные батчи в formula vs cert).
+  С фиксацией seed: manual 2A²/R'² = _certified_step = 0.4474 exact ✓.
+  Не код.
