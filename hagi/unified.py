@@ -38,7 +38,7 @@ def _sha(b: bytes) -> str:
 class Unified:
     """ONE evolving model."""
 
-    def __init__(self, k: int = 24, dim: int = 128, hidden: int = 256):
+    def __init__(self, k: int = 16, dim: int = 128, hidden: int = 256):
         from hagi import lm as lm_mod
         self.lm_mod = lm_mod
         self.k, self.dim, self.hidden = k, dim, hidden
