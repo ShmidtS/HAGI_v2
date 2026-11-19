@@ -1670,3 +1670,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   concRadius-формы (волна 91) ✓.
 - **GDNTransfer**: hybrid stack product gain (submultiplicative)
   ✓; GDN 3-формы вердикт — реализация несёт RAM-форму (GDNRAM) ✓.
+
+## Волна 116 (2026-11-18) — Model: AttentionSpend, AttentionTransfer, CEGroupedScale
+
+- **AttentionSpend**: dense T*n*n_h*d vs hybrid T*(2w+1)*n_kv*d —
+  hybrid строго дешевле при w<n и n_kv<=n_h ✓.
+- **AttentionTransfer**: attn_branch_damped — сдвиг выпуклой
+  смеси <= max||e_i||, uniform Lipschitz -> branch Lipschitz ✓.
+- **CEGroupedScale**: disjoint blocks reindexing, honest пины
+  (math calls не равны FLOPs) ✓.
