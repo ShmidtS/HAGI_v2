@@ -74,17 +74,29 @@ class Unified:
         import numpy as _np
         parts = []
         total_cap = replay_cap  # TOTAL budget for all past domains
-        per_domain = max(total_cap // max(1, len(self.domains)),
-                         32_000) if total_cap else None
+        # WAVE 133 FIX (Goodhart): old order put the FRESH domain last,
+        # and the [:total_cap] truncation ate 97% of the tail — new data
+        # was nearly never trained on. Theory (anti-forgetting + fresh
+        # data): fresh domain FIRST and in full, then uniform strided
+        # replay over past domains for the remainder of the budget.
+        fresh_name = source
+        fresh_bytes = self._domain_bytes(fresh_name,
+                                         self.domains[fresh_name])
+        replay_budget = max(total_cap - len(fresh_bytes), 0)             if total_cap else None
+        n_past = max(1, len(self.domains) - 1)
+        per_domain = max(replay_budget // n_past, 8_000)             if replay_budget else None
         for name, e in self.domains.items():
+            if name == fresh_name:
+                continue
             d = self._domain_bytes(name, e)
             if not d:
                 continue
             if per_domain is not None and len(d) > per_domain:
-                seg = max(per_domain // 3, 8_000)
-                d = d[:seg] + d[len(d)//2 - seg//2:len(d)//2 + seg//2] +                     d[-seg:]
+                # uniform stride sample (covers the whole file honestly)
+                step = max(1, len(d) // per_domain)
+                d = d[::step][:per_domain]
             parts.append(d)
-        combined = b"".join(parts)[:total_cap] if total_cap else             b"".join(parts)
+        combined = (fresh_bytes + b"".join(parts))[:total_cap]             if total_cap else fresh_bytes + b"".join(parts)
         # training (certified step path)
         t0 = time.perf_counter()
         reps = []
