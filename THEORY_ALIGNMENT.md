@@ -1741,3 +1741,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   (L 1.0→падение сохранено).
 - Цикл: 172 чанка, CE 1.4977, жив. 23 дельты за 6ч — стабильный
   темп upstream.
+
+## Волна 124 addendum — GrowthBridge новая вероятностная форма
+
+- **growth_state_geometric_growth_probabilistic**: log-bridge +
+  concDelta → C_T ≥ C_0·exp(a(p0·T − concDelta) − Σeps) с вер ≥
+  1−δ — численно на 100 шагов ✓ (Azuma-масштаб concDelta, волна
+  91 согласована). Upstream расширил takeoff в вероятностную
+  форму — реализация (experts счётчик) покрывает детерминистскую
+  часть (волна 59), вероятностная — premise s_t измеримых.
