@@ -1607,3 +1607,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   seed) — согласовано с CEChain волна 102 ✓.
 - **Attention/GQA**: KV-cache n_kv голов → экономия n_h/n_kv
   точно ✓ (формализация источника №57).
+
+## Волна 109 (2026-11-18) — Model/Routing (ratchet), TanhCEStep
+
+- **ratchet_advantage_step**: A+_j−A_j = η·a_j·‖δ‖² per-key —
+  exact ✓; monotone ✓ (все attended ключи растут).
+- **deadlock_witness**: attention ε=1/10 на полезном ключе →
+  query-grad ≤ ε·M (форма anti-lock-in guard) ✓.
+- **TanhCEStep**: affine embedding форма — стыковка TanhTaylor ✓
+  (фит-гейт tanh fiber в core, волна 82 measured-drop guard).
