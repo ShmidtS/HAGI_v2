@@ -1652,3 +1652,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   kv_work_ratio 3*recompute = (n+2)*cached ✓.
 - **StateUnification**: tie/invariant модуль (layer 5) —
   структурно согласован ✓.
+
+## Волна 114 (2026-11-18) — Model/BYOL, RL/GRPO, Adaptive/Switch MoE
+
+- **BYOL bl=1-cosS**: bounds [0,2], anti-monotone, zero при
+  cos=1, no collapse pressure (bl не зависит от popVar) —
+  100/100 ✓ (моя первая проверка с 2-2cos была неверной формой).
+- **GRPO**: A_i = r_i − mean(r) по группе, ΣA=0, без критика ✓.
+- **Switch MoE**: load-balance L ∝ ΣP², минимум при uniform ✓.
