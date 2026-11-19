@@ -1801,3 +1801,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   лучше — оставляем композицию для stage1).
 - Правила INTEGRATION_PATCH соблюдены: rollback-safe (fast-path
   возвращает None → GA), upstream verify-гейт не ослаблен.
+
+## Волна 129 (2026-11-19) — ManifoldHyperConn
+
+- **mhc_stack_no_growth**: doubly stochastic стек L=1..20 —
+  ‖δ_L‖ ≤ ‖δ₀‖ без роста ✓.
+- **Honest boundary подтверждён**: row-stochastic-only при
+  концентрации масс (col0≈1, n=50) расширяет L2 до sqrt(n)=7.07
+  — column-sum premise load-bearing ✓.
+- **Tightness**: permutation matrix — equality ✓.
+- Цикл с fusion fast-path: 198 чанков, CE 1.5046, mux21 reuse
+  (SOLVED-кэш → fast-path корректно перекрыт, без двойной работы).
