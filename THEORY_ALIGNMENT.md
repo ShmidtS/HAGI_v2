@@ -1689,3 +1689,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   квантователя — форма согласована с тернарной проекцией
   to_symbolic (живая плотность 0.42) ✓.
 - Цикл: 155 чанков, CE 1.5069, процесс жив.
+
+## Волна 120 (2026-11-18) — Cert/Telescope, Benchmarks остатки
+
+- **additive_ledger_telescope**: terminal−initial = Σdrops exact ✓;
+  certs_telescope конъюнкция (строгое убывание + risk-рост) ✓.
+- Benchmarks: QuadraticEndToEnd/TernaryWitness сверены (118).
+- Цикл: 157 чанков, CE 1.5328 (колебание на новых данных —
+  rotating holdout жив).
