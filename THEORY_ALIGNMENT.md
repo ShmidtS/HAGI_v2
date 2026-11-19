@@ -1750,3 +1750,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   91 согласована). Upstream расширил takeoff в вероятностную
   форму — реализация (experts счётчик) покрывает детерминистскую
   часть (волна 59), вероятностная — premise s_t измеримых.
+
+## Волна 125 (2026-11-18) — Semantics: FunctionalState, DerivedStateCoherence
+
+- **FunctionalState**: FunState = weights+budget+stepCount (без
+  полей-эффектов), энергия = функция весов (детерминизм) — PASS.
+- **DerivedStateCoherence**: derived-поля когерентны с базисом,
+  мутация постороннего поля не меняет энергию — PASS.
+- Цикл: 177 чанков, CE 1.5112, жив.
