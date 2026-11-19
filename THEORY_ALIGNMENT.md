@@ -1697,3 +1697,9 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Benchmarks: QuadraticEndToEnd/TernaryWitness сверены (118).
 - Цикл: 157 чанков, CE 1.5328 (колебание на новых данных —
   rotating holdout жив).
+
+## Волна 120 addendum — QuadLoopWitness, TernaryProbe
+
+- **qhalf**: траектория полушагов сходится к цели точно ✓.
+- **TernaryProbe**: клип глобального σ* в (0, σmax] —
+  минимизирует только вычисленный bound (честный пин) ✓.
