@@ -1933,3 +1933,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Статус: фаза устойчивого роста; архитектурные рычаги исчерпаны
   на текущем объёме данных (k=16, cap 400K, fresh-first, v4.0
   синтез) — следующий скачок потребует нового порядка данных.
+
+## Волна 141 (2026-11-19) — Интеграция env-growth v4.4 (пользователь)
+
+- hagi_environment_growth_v4_4: 5-битная среда, 4 непрозрачных
+  действия, банк 72 моделей; active identification 65% экономия
+  проб, перенос памяти, drift-detect, full-table fallback для
+  недоверенных, HOLD на nondeterminism; independent verifier
+  PASS 260 записей; self-tests 9/9 PASS.
+- Интегрировано: hagi/env_growth_v4_4.py + _verify.py +
+  checkpoints/env_model_bank_v4_4.json.
+- **Мост среда→процессор** (hagi/env_growth_v4_4_bridge.py):
+  выученная модель мира → v4.0 factored netlist — 33 гейта
+  depth 7, behavioral exact 128/128 переходов. Мир стал схемой.
