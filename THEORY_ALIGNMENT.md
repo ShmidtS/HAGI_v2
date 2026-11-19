@@ -1906,3 +1906,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   PASS + tamper_rejected=True, MDL routing 85%, ADT экономия 25%,
   синтез-компрессия 42%, PAC L* работает на 5-15% шуме.
 - Цикл перезапущен с оригиналом v4.0 (pid 22628, chunks=258).
+
+## Волна 138 (2026-11-19) — OpenBLAS gemm malloc fix
+
+- OpenBLAS: malloc failed in gemm_driver при 8 потоках (конфликт
+  thread pool между python-процессами на Windows).
+- Фикс: OPENBLAS_NUM_THREADS=4 + OPENBLAS_MAIN_FREE=1 (выделение
+  main-буфера отдельно) — итерация ns_0258 прошла чисто (298s).
