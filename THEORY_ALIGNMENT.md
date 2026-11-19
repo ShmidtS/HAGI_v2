@@ -1812,3 +1812,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **Tightness**: permutation matrix — equality ✓.
 - Цикл с fusion fast-path: 198 чанков, CE 1.5046, mux21 reuse
   (SOLVED-кэш → fast-path корректно перекрыт, без двойной работы).
+
+## Волна 130 (2026-11-19) — Core/ErrorProp
+
+- **propagate_bound**: ‖δ_L‖ ≤ α^L‖δ₀‖ + ρΣαⁱ при ‖J‖≤α, ‖r‖≤ρ
+  — 100/100 PASS (первый прогон 31/100 — тест нарушал предпосылку
+  ‖J‖≤α, не код).
+- **contractive α=1**, **cascadeGain per-layer product**,
+  **propagate_sub (residuals cancel)** — все PASS.
+- Цикл: 203 чанка, CE 1.5009, ns_0202.
