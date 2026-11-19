@@ -1821,3 +1821,11 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **contractive α=1**, **cascadeGain per-layer product**,
   **propagate_sub (residuals cancel)** — все PASS.
 - Цикл: 203 чанка, CE 1.5009, ns_0202.
+
+## Волна 131 (2026-11-19) — Core/RoPEMoments, Core/Concat
+
+- **RoPEMoments**: rot_norm (unitarity), rope_score_delta (score
+  зависит только от n−m), rope_translation_shift — численно PASS.
+- **Concat**: concatCols n копий child head = n независимых голов
+  (блочная эквивалентность) — PASS.
+- Цикл: 208 чанков, CE 1.5179 (колебание на новом потоке).
