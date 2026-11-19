@@ -1660,3 +1660,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   100/100 ✓ (моя первая проверка с 2-2cos была неверной формой).
 - **GRPO**: A_i = r_i − mean(r) по группе, ΣA=0, без критика ✓.
 - **Switch MoE**: load-balance L ∝ ΣP², минимум при uniform ✓.
+
+## Волна 115 (2026-11-18) — Model: GDNTransfer, NonlinearCE, CEConfidenceScale
+
+- **NonlinearCE**: nonlinearCurvature = R^2/4 + 4*rho*||d||^2 —
+  eta^2-фактор majorizer формы ✓ (alignment A = -D(CE o f)[d] —
+  chain rule reuse).
+- **CEConfidenceScale**: fresh finite categorical labels — radius
+  concRadius-формы (волна 91) ✓.
+- **GDNTransfer**: hybrid stack product gain (submultiplicative)
+  ✓; GDN 3-формы вердикт — реализация несёт RAM-форму (GDNRAM) ✓.
