@@ -1758,3 +1758,8 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **DerivedStateCoherence**: derived-поля когерентны с базисом,
   мутация постороннего поля не меняет энергию — PASS.
 - Цикл: 177 чанков, CE 1.5112, жив.
+
+## Волна 126 (2026-11-18) — regression batch после дельт
+
+- §3.9 SSOT exact / adder2 compose 32/32 / GPM ortho — все PASS.
+- Цикл: 180 чанков, CE 1.5087.
