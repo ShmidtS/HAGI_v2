@@ -1,0 +1,98 @@
+[
+  {
+    "delay_mask": 14,
+    "effect_mask": 16,
+    "guard_mask": 5,
+    "guard_value": 1,
+    "model_id": 0,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 7,
+    "effect_mask": 1,
+    "guard_mask": 18,
+    "guard_value": 2,
+    "model_id": 1,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 12,
+    "effect_mask": 8,
+    "guard_mask": 13,
+    "guard_value": 5,
+    "model_id": 2,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 5,
+    "effect_mask": 5,
+    "guard_mask": 18,
+    "guard_value": 18,
+    "model_id": 3,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 6,
+    "effect_mask": 10,
+    "guard_mask": 25,
+    "guard_value": 24,
+    "model_id": 4,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 4,
+    "effect_mask": 9,
+    "guard_mask": 9,
+    "guard_value": 1,
+    "model_id": 5,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 11,
+    "effect_mask": 3,
+    "guard_mask": 12,
+    "guard_value": 12,
+    "model_id": 6,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 6,
+    "effect_mask": 16,
+    "guard_mask": 29,
+    "guard_value": 21,
+    "model_id": 7,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 12,
+    "effect_mask": 9,
+    "guard_mask": 27,
+    "guard_value": 19,
+    "model_id": 8,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 5,
+    "effect_mask": 9,
+    "guard_mask": 27,
+    "guard_value": 8,
+    "model_id": 9,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 7,
+    "effect_mask": 12,
+    "guard_mask": 20,
+    "guard_value": 4,
+    "model_id": 10,
+    "xor_mask": 6
+  },
+  {
+    "delay_mask": 14,
+    "effect_mask": 8,
+    "guard_mask": 23,
+    "guard_value": 6,
+    "model_id": 11,
+    "xor_mask": 6
+  }
+]
