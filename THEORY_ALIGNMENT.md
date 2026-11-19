@@ -1829,3 +1829,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **Concat**: concatCols n копий child head = n независимых голов
   (блочная эквивалентность) — PASS.
 - Цикл: 208 чанков, CE 1.5179 (колебание на новом потоке).
+
+## Волна 132 (2026-11-19) — Contracts/BatchCE* бюджетная группа
+
+- **rangeCurvature** = batchFeatureRangeCoefficient / B — nonneg
+  50/50, empty batch → 0 ✓.
+- BudgetGuard/Pareto/AlignmentBudget — инварианты уже покрыты
+  формами §3.9 (волна 54) и BudgetedPareto (волна 87);
+  регрессий нет.
+- Цикл: 213 чанков, CE 1.5146, жив (pid 28356).
