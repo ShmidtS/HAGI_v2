@@ -698,8 +698,7 @@ class Skill:
 
 def lut4_anf(lut4: int) -> frozenset[int]: return mobius([((lut4 >> x) & 1,) for x in range(4)], 2)[0]
 def lut4_name(lut4: int) -> str:
-    names = {0:'CONST0',1:'NOR',2:'NOT_A_AND_B',4:'A_AND_NOT_B',6:'XOR',8:'AND',9:'XNOR',11:'B_IMPLIES_A',13:'A_IMPLIES_B',14:'OR',15:'CONST1'}
-    return f"LUT_{names.get(lut4, f'{lut4:02d}')}"
+    return f"LUT_{ {0:'CONST0',1:'NOR',2:'NOT_A_AND_B',4:'A_AND_NOT_B',6:'XOR',8:'AND',9:'XNOR',11:'B_IMPLIES_A',13:'A_IMPLIES_B',14:'OR',15:'CONST1'}.get(lut4, f'{lut4:02d}') }"
 def lut4_eval(lut4: int, ya: int, yb: int) -> int: return (lut4 >> (ya | (yb << 1))) & 1
 
 def _emit_subcircuit(net: dict, wire_map: list[int], n_total: int, gates: list[dict]) -> list[int]:
@@ -992,7 +991,6 @@ class SelfModel:
         self.sop_baseline_gates += sop_gates; self.opt_chosen_gates += chosen_gates
 
     def record_family_hit(self, family: str): self.family_hits[family] = self.family_hits.get(family, 0) + 1
-
     def ranked_families(self, default_order: list[str]) -> list[str]:
         return sorted(default_order, key=lambda f: (-self.family_hits.get(f, 0), default_order.index(f)))
 
@@ -1028,6 +1026,7 @@ class Library:
         while name in self.aliases: name = self.aliases[name]
         if name not in self.skills: raise KeyError(name)
         return name
+
 
 # ---------------------------------------------------------------------------
 # 5. Interactive Oracle, Lee-Yannakakis Wp-ADT & Active Stochastic Mealy L*
@@ -1166,6 +1165,39 @@ def build_hsi_adt(k: int, ni: int, T):
     if k <= 1: W = [(u,) for u in range(1 << ni)]; return P, [{0: w} for w in W], {0: W}
     all_pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
 
+    if k <= 24 and (1 << ni) <= 4:
+        memo = {}; visiting = set()
+        def solve_exact(cur_set: frozenset[int], d_left: int):
+            if len(cur_set) <= 1: return (0, 0, {c: () for c in cur_set})
+            if d_left == 0 or cur_set in visiting: return None
+            key = (cur_set, d_left)
+            if key in memo: return memo[key]
+            visiting.add(cur_set); best = None
+            for u in range(1 << ni):
+                by_out = {}; merged = False
+                for c in cur_set:
+                    nc, o = T[c][u]; grp = by_out.setdefault(o, set())
+                    if nc in grp: merged = True; break
+                    grp.add(nc)
+                if merged or (len(by_out) == 1 and frozenset(next(iter(by_out.values()))) == cur_set): continue
+                ok = True; wd = 0; total_sz = 0; sub_map = {}
+                for o, grp in by_out.items():
+                    res = solve_exact(frozenset(grp), d_left - 1)
+                    if res is None: ok = False; break
+                    d_sub, sz_sub, child_map = res; wd = max(wd, 1 + d_sub); total_sz += len(grp) + sz_sub; sub_map[o] = child_map
+                if ok:
+                    cand = (total_sz, wd, {c: (u,) + sub_map[T[c][u][1]][T[c][u][0]] for c in cur_set})
+                    if best is None or (cand[0], cand[1]) < (best[0], best[1]): best = cand
+            visiting.remove(cur_set); memo[key] = best; return best
+        best_res = first_d = None
+        for d_lim in range(1, min(k + 2, 10)):
+            res = solve_exact(frozenset(range(k)), d_lim)
+            if res is not None:
+                if best_res is None or (res[0], res[1]) < (best_res[0], best_res[1]): best_res = res
+                if first_d is None: first_d = d_lim
+                if d_lim >= first_d + 1: break
+        if best_res is not None: paths = best_res[2]; return P, [paths], {s: [paths[s]] for s in range(k)}
+
     def shortest_sep_word(ca: int, cb: int):
         pq = deque([(ca, cb, ())]); vis = {(ca, cb)}
         while pq:
@@ -1232,7 +1264,7 @@ def build_hsi_adt(k: int, ni: int, T):
         tp = split_node({s: s for s in active_orig}, set(target_pairs), set(), 0, pref)
         return {s: tp.get(s, ()) for s in range(k)}
 
-    cands: list[dict] = []; seen_cands: set = set()
+    cands = []; seen_cands = set()
     prefixes = [()] + ([p for L in range(1, 5 if ni == 1 else 3) for p in itertools.product(range(1 << ni), repeat=L)] if (1 << ni) <= 4 else [(u,) for u in range(1 << ni)])
     all_set = set(all_pairs)
     for pref in prefixes:
@@ -1264,21 +1296,13 @@ def build_hsi_adt(k: int, ni: int, T):
             a, b = next(iter(uncov)); w = shortest_sep_word(a, b); tp = {s: w for s in range(k)}; d_map = tree_pair_depths(tp)
         cands.append(tp); cand_covs.append(d_map); uncov -= set(d_map.keys())
 
-    def singleton_count(dm):
-        cnt = 0
-        for q in range(k):
-            others = [x for x in range(k) if x != q]
-            if all(((q, x) if q < x else (x, q)) in dm for x in others): cnt += 1
-        return cnt
-
-    cand_singletons = [singleton_count(dm) for dm in cand_covs]
-    chosen_idxs: list[int] = []; rem_pairs = set(all_pairs)
+    cand_singletons = [sum(1 for q in range(k) if all(((q, j) if q < j else (j, q)) in dm for j in range(k) if j != q)) for dm in cand_covs]
+    chosen_idxs = []; rem_pairs = set(all_pairs)
     while rem_pairs:
         best_idx = max(range(len(cands)), key=lambda idx: (
-            cand_singletons[idx] if (cand_singletons[idx] > 0 and any(((q, j) if q < j else (j, q)) in rem_pairs
-                for q in range(k) for j in range(k) if j != q and ((q, j) if q < j else (j, q)) in cand_covs[idx])) else 0,
-            len(rem_pairs & set(cand_covs[idx].keys())), len(cand_covs[idx]),
-            -sum(len(cands[idx][s]) for s in range(k))))
+            cand_singletons[idx] if any(all(((q, x) if q < x else (x, q)) in cand_covs[idx] for x in range(k) if x != q)
+                                        and any(((q, j) if q < j else (j, q)) in rem_pairs for j in range(k) if j != q) for q in range(k)) else 0,
+            len(rem_pairs & set(cand_covs[idx].keys())), len(cand_covs[idx]), -sum(len(cands[idx][s]) for s in range(k))))
         chosen_idxs.append(best_idx); rem_pairs -= set(cand_covs[best_idx].keys())
 
     chosen_trees = [cands[idx] for idx in chosen_idxs]; chosen_covs = [cand_covs[idx] for idx in chosen_idxs]; H_wp = {}
@@ -1291,7 +1315,6 @@ def build_hsi_adt(k: int, ni: int, T):
                 if not cov_j: continue
                 L = max(chosen_covs[r][(q, j) if q < j else (j, q)] for j in cov_j); sc = len(cov_j) / (L + 2)
                 if sc > best_score: best_score, best_r, best_L, best_cov = sc, r, L, cov_j
-            if best_r is None: break
             chosen_q[best_r] = best_L; need -= best_cov
         H_wp[q] = [chosen_trees[r][q][:L] for r, L in sorted(chosen_q.items())]
     return P, chosen_trees, H_wp
@@ -1419,6 +1442,7 @@ def lstar_learn_mealy(bb: InteractiveMealyOracle, max_states: int = 8, use_adt: 
                     for j in range(1, len(cex) + 1):
                         if cex[:j] not in S: S.append(cex[:j])
 
+
 # ---------------------------------------------------------------------------
 # 6. AutonomousTemporalAgent Facade & Checkpoint Persistence
 # ---------------------------------------------------------------------------
@@ -1490,32 +1514,25 @@ class AutonomousTemporalAgent:
 
         if op == "CASCADE":
             if pa.no != pb.ni: raise ValueError(f"cascade port mismatch {pa.no}!={pb.ni}")
-            ns, ni, no = pa.ns + pb.ns, pa.ni, pb.no
-            raw_hier = compose_net_cascade(pa.net, pa.ns, pa.ni, pb.net, pb.ns, pb.ni)
+            ns, ni, no, raw_hier = pa.ns + pb.ns, pa.ni, pb.no, compose_net_cascade(pa.net, pa.ns, pa.ni, pb.net, pb.ns, pb.ni)
         elif op == "PARALLEL_PAIR":
             if pa.ni != pb.ni: raise ValueError("parallel pair ni mismatch")
-            ns, ni, no = pa.ns + pb.ns, pa.ni, pa.no + pb.no
-            raw_hier = compose_net_parallel_pair(pa.net, pa.ns, pb.net, pb.ns, pa.ni)
+            ns, ni, no, raw_hier = pa.ns + pb.ns, pa.ni, pa.no + pb.no, compose_net_parallel_pair(pa.net, pa.ns, pb.net, pb.ns, pa.ni)
         elif op == "PARALLEL_LUT":
             if pa.ni != pb.ni or pa.no != 1 or pb.no != 1: raise ValueError("parallel lut port mismatch")
-            ns, ni, no = pa.ns + pb.ns, pa.ni, 1
-            raw_hier = compose_net_parallel_lut(pa.net, pa.ns, pb.net, pb.ns, pa.ni, lut4)
+            ns, ni, no, raw_hier = pa.ns + pb.ns, pa.ni, 1, compose_net_parallel_lut(pa.net, pa.ns, pb.net, pb.ns, pa.ni, lut4)
         elif op == "MUX_2IN":
             if not (pa.ni == pb.ni == 1 and pa.no == pb.no == 1): raise ValueError("mux_2in port mismatch")
-            ns, ni, no = pa.ns + pb.ns, 2, 1
-            raw_hier = compose_net_mux_2in(pa.net, pa.ns, pb.net, pb.ns)
+            ns, ni, no, raw_hier = pa.ns + pb.ns, 2, 1, compose_net_mux_2in(pa.net, pa.ns, pb.net, pb.ns)
         elif op == "MOE_MUX":
             if not (pa.ni == pb.ni == pc.ni and pa.no == pb.no == pc.no == 1): raise ValueError("moe port mismatch")
-            ns, ni, no = pa.ns + pb.ns + pc.ns, pa.ni, 1
-            raw_hier = compose_net_moe_mux(pa.net, pa.ns, pb.net, pb.ns, pc.net, pc.ns, pa.ni)
+            ns, ni, no, raw_hier = pa.ns + pb.ns + pc.ns, pa.ni, 1, compose_net_moe_mux(pa.net, pa.ns, pb.net, pb.ns, pc.net, pc.ns, pa.ni)
         elif op == "DELAYED_FEEDBACK":
             if pa.ni != 2 or pa.no != 1: raise ValueError("feedback requires ni=2, no=1")
-            ns, ni, no = pa.ns + 1, 1, 1
-            raw_hier = compose_net_delayed_feedback(pa.net, pa.ns)
+            ns, ni, no, raw_hier = pa.ns + 1, 1, 1, compose_net_delayed_feedback(pa.net, pa.ns)
         elif op == "COUPLED_FEEDBACK_2BIT":
             if not (pa.ni == pb.ni == 2 and pa.no == pb.no == 1): raise ValueError("coupled 2bit requires two ni=2,no=1")
-            ns, ni, no = pa.ns + pb.ns + 2, 1, 1
-            raw_hier = compose_net_coupled_fb_2bit(pa.net, pa.ns, pb.net, pb.ns)
+            ns, ni, no, raw_hier = pa.ns + pb.ns + 2, 1, 1, compose_net_coupled_fb_2bit(pa.net, pa.ns, pb.net, pb.ns)
         else: raise ValueError(op)
 
         n = ns + ni
@@ -1856,6 +1873,7 @@ class AutonomousTemporalAgent:
                 "max_nvars": max((s.nvars for s in self.lib.skills.values()), default=0),
                 "global_dag": self.lib.dag.metrics(), "global_dag_exact": ok, "dag_errors": errs, "self_model": self.model.export()}
 
+
 # ---------------------------------------------------------------------------
 # 7. Zero-Import Replay Verifier, Built-In Self-Test & CLI
 # ---------------------------------------------------------------------------
@@ -1880,7 +1898,7 @@ def zero_import_replay_verify(archive_path: str | Path) -> dict:
                 inp_d = [0] * GLOBAL_N
                 for i in range(ns): inp_d[i] = (x >> i) & 1
                 for j in range(ni): inp_d[22 + j] = (x >> (ns + j)) & 1
-                assert ev_net(net["gates"], net["outs"], inp_l) == ev_net(dag["gates"], dag_outs, inp_d) == tuple(sum(1 for tt in ts if (tt & x) == tt) & 1 for ts in anf)
+                assert ev_net(net["gates"], net["outs"], inp_l) == ev_net(dag["gates"], dag_outs, inp_d) == tuple(sum(1 for t in ts if (t & x) == t) & 1 for ts in anf)
                 rows_checked += 1
             qT = sk["quotient_T"]; s_d = s_q = 0
             for _ in range(256):
@@ -1908,23 +1926,21 @@ def zero_import_replay_verify(archive_path: str | Path) -> dict:
             "rows_checked": rows_checked, "ticks_checked": ticks_checked, "tamper_rejected": tamper_rejected, "pass": True}
 
 def run_self_verify(seed: int = 20261127, wide_bits: int = 3, out_dir: str | Path | None = None) -> dict:
-    t0 = time.perf_counter()
+    t0 = time.perf_counter(); rng = random.Random(seed)
     o_par = lambda x: ((x & 1) ^ ((x >> 1) & 1),) * 2
     o_edg = lambda x: ((x >> 1) & 1, ((x >> 1) & 1) & (1 ^ (x & 1)))
     o_sh3 = lambda x: ((((x & 7) << 1) | ((x >> 3) & 1)) & 1, ((((x & 7) << 1) | ((x >> 3) & 1)) >> 1) & 1, ((((x & 7) << 1) | ((x >> 3) & 1)) >> 2) & 1, (x >> 2) & 1)
     o_wc = lambda x, m=(1 << wide_bits) - 1: tuple([(((x & m) + ((x >> wide_bits) & 1)) & m) >> i & 1 for i in range(wide_bits)] + [int((x & m) == m and ((x >> wide_bits) & 1) == 1)])
-    o_101 = lambda x: (lambda s, u: (lambda ns2, y: (ns2 & 1, (ns2 >> 1) & 1, y))(*((1 if u else 0, 0) if s == 0 else ((2 if u == 0 else 1, 0) if s == 1 else ((3 if u else 0, int(u == 1)) if s == 2 else (1 if u else 2, 0))))))(x & 3, (x >> 2) & 1)
-    o_rc = lambda x: (lambda ns2: (ns2 & 1, (ns2 >> 1) & 1, int(ns2 == 3)))(0 if (x >> 3) & 1 else min(3, (x & 3) + ((x >> 2) & 1)))
+    o_101 = lambda x: (lambda s, u: (lambda ns, y: (ns & 1, (ns >> 1) & 1, y))(*((1 if u else 0, 0) if s == 0 else ((2 if u == 0 else 1, 0) if s == 1 else ((3 if u else 0, int(u == 1)) if s == 2 else (1 if u else 2, 0))))))(x & 3, (x >> 2) & 1)
+    o_rc = lambda x: (lambda ns: (ns & 1, (ns >> 1) & 1, int(ns == 3)))(0 if (x >> 3) & 1 else min(3, (x & 3) + ((x >> 2) & 1)))
     o_gp = lambda x: ((x & 1) ^ (((x >> 1) & 1) & ((x >> 2) & 1)),) * 2
-
     def mk_mod(km, p=0.0, sd=0):
         r = random.Random(sd)
-        def fn(seq):
-            s = 0; out = []
-            for u in seq: s = (s + u) % km; y = 1 if (s == 0 and u == 1) else 0; out.append((y ^ (1 if p > 0 and r.random() < p else 0),))
-            return tuple(out)
-        return InteractiveMealyOracle(1, 1, fn)
-
+        return InteractiveMealyOracle(1, 1, lambda seq: _ev_mod(seq, km, p, r))
+    def _ev_mod(seq, km, p, r):
+        s = 0; out = []
+        for u in seq: s = (s + u) % km; y = 1 if (s == 0 and u == 1) else 0; out.append((y ^ (1 if p > 0 and r.random() < p else 0),))
+        return tuple(out)
     def mk_mod_ni2(km, p=0.0, sd=0):
         r = random.Random(sd)
         def fn(seq):
@@ -1936,7 +1952,6 @@ def run_self_verify(seed: int = 20261127, wide_bits: int = 3, out_dir: str | Pat
                 out.append((y ^ (1 if p > 0 and r.random() < p else 0),))
             return tuple(out)
         return InteractiveMealyOracle(2, 1, fn)
-
     def mk_noisy(sk, p, sd):
         r = random.Random(sd); rows, ns = sk.rows, sk.ns
         def fn(seq):
@@ -1958,13 +1973,75 @@ def run_self_verify(seed: int = 20261127, wide_bits: int = 3, out_dir: str | Pat
     m5, _ = ref.solve_goal("m5", mk_mod(5), 8); m6, _ = ref.solve_goal("m6", mk_mod(6), 8)
     m7, _ = ref.solve_goal("m7", mk_mod(7), 8); m5n2, _ = ref.solve_goal("m5n2", mk_mod_ni2(5), 8)
     r_g3m7 = ref.compose("CASCADE", m7, pa, "r13")
-    return {"elapsed_sec": round(time.perf_counter() - t0, 1)}
+
+    ag = AutonomousTemporalAgent()
+    pa_g = ag.learn_primitive("parity", 1, 1, 1, o_par, 1); ed_g = ag.learn_primitive("rising_edge", 1, 1, 1, o_edg, 2)
+    sh_g = ag.learn_primitive("shift3", 3, 1, 1, o_sh3, 1); _ = ag.learn_primitive("wide_counter", wide_bits, 1, 1, o_wc, wide_bits + 1)
+    _ = ag.learn_primitive("seq101", 2, 1, 1, o_101, 3); rc_g = ag.learn_primitive("reset_counter", 2, 2, 1, o_rc, 4)
+    _ = ag.learn_primitive("gated_parity", 1, 2, 1, o_gp, 2); _ = ag.learn_primitive("seq101_false", 2, 1, 1, o_101, 1)
+    assert ag.learn_primitive("untrusted", 1, 1, 1, o_par, contract=DegreeContract(2, 1, "BAD", 1), allow_full_support=False) is None
+    w1 = ag.compose("CASCADE", ed_g, pa_g, "warm1"); _ = ag.compose("CASCADE", pa_g, ed_g, "warm2"); _ = ag.compose("CASCADE", sh_g, pa_g, "warm3")
+    assert ag.model.enabled
+
+    bad = {"n_inputs": rc_g.net["n_inputs"], "gates": [dict(g) for g in rc_g.net["gates"]], "outs": list(rc_g.net["outs"])}
+    bad["gates"].append({"a": bad["outs"][2], "b": 0, "mask": 6}); bad["outs"][2] = bad["n_inputs"] + len(bad["gates"]) - 1
+    rep, bw, _ = ag.repair_skill_netlist("reset_counter", bad); assert bw == [2] and symbolic_verify_general(rep, rc_g.anf)
+
+    goals = [
+        ("bb_goal_library_reuse", InteractiveMealyOracle.from_rows(w1.ns, w1.ni, w1.no, w1.rows), 8, w1.behav_digest),
+        ("bb_goal_cascade", InteractiveMealyOracle.from_rows(r_s101_pa.ns, r_s101_pa.ni, r_s101_pa.no, r_s101_pa.rows), 12, r_s101_pa.behav_digest),
+        ("bb_goal_parallel_xor", InteractiveMealyOracle.from_rows(r_xor.ns, r_xor.ni, r_xor.no, r_xor.rows), 8, r_xor.behav_digest),
+        ("bb_goal_parallel_pair_no2", InteractiveMealyOracle.from_rows(r_pp.ns, r_pp.ni, r_pp.no, r_pp.rows), 8, r_pp.behav_digest),
+        ("bb_goal_pair2_to_2in", InteractiveMealyOracle.from_rows(r_p2gp.ns, r_p2gp.ni, r_p2gp.no, r_p2gp.rows), 12, r_p2gp.behav_digest),
+        ("bb_goal_delayed_feedback", InteractiveMealyOracle.from_rows(r_dfb.ns, r_dfb.ni, r_dfb.no, r_dfb.rows), 8, r_dfb.behav_digest),
+        ("bb_goal_coupled_feedback_2bit", InteractiveMealyOracle.from_rows(r_cfb.ns, r_cfb.ni, r_cfb.no, r_cfb.rows), 12, r_cfb.behav_digest),
+        ("bb_goal_recurrent_mux_fb", InteractiveMealyOracle.from_rows(r_rmux.ns, r_rmux.ni, r_rmux.no, r_rmux.rows), 12, r_rmux.behav_digest),
+        ("bb_goal_temporal_moe_mux", InteractiveMealyOracle.from_rows(r_moe.ns, r_moe.ni, r_moe.no, r_moe.rows), 20, r_moe.behav_digest),
+        ("bb_goal_depth2_cascade", InteractiveMealyOracle.from_rows(r_d2.ns, r_d2.ni, r_d2.no, r_d2.rows), 12, r_d2.behav_digest),
+        ("bb_goal_noncomposable_mod5", mk_mod(5, 0.0, seed + 1), 8, m5.behav_digest),
+        ("bb_goal_noisy_5pct_pac", mk_noisy(r_re101, 0.05, seed + 2), 8, r_re101.behav_digest),
+        ("bb_goal_noisy_10pct_pac", mk_noisy(r_pa101, 0.10, seed + 3), 8, r_pa101.behav_digest),
+        ("bb_goal_noisy_noncomp_mod7_10pct", mk_mod(7, 0.10, seed + 4), 12, m7.behav_digest),
+        ("bb_goal_noisy_noncomp_mod6_15pct", mk_mod(6, 0.15, seed + 5), 10, m6.behav_digest),
+        ("bb_goal_noisy_noncomp_mod5_ni2_10pct", mk_mod_ni2(5, 0.10, seed + 6), 6, m5n2.behav_digest),
+    ]
+    g_res = {}
+    for nm, bb_g, hint, exp_bd in goals:
+        sk_g, inf_g = ag.solve_goal(nm, bb_g, max_states_hint=hint, generation=1)
+        assert sk_g is not None and sk_g.behav_digest == exp_bd, (nm, inf_g)
+        g_res[nm] = inf_g
+    sk_ch, inf_ch = ag.solve_goal("bb_chaos45", mk_noisy(r_re101, 0.45, seed + 7), 8, generation=1)
+    assert sk_ch is None and inf_ch["solved_by"] == "HOLD_UNRECOVERABLE_NOISE"
+
+    import tempfile
+    tmp_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="hagi_v40_"))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cp1 = tmp_dir / f"cp1_{seed}.json"; ag.save_checkpoint(cp1); ag = AutonomousTemporalAgent.load_checkpoint(cp1)
+    ag.discover_novel(max_new=18, seed=seed, generation=2)
+    pa2, ed2, sh2 = ag.lib.skills["parity"], ag.lib.skills["rising_edge"], ag.lib.skills["shift3"]
+    ag.compose("MUX_2IN", ed2, pa2, "gen2_mux2", generation=2)
+    for l4 in (8, 9, 14): ag.compose("PARALLEL_LUT", ed2, sh2, f"gen2_plut_{l4}", lut4=l4, generation=2)
+    c6 = ag.compose("CASCADE", sh2, sh2, "deep_c6", generation=2); c9 = ag.compose("CASCADE", c6, sh2, "deep_c9", generation=2)
+    c12 = ag.compose("CASCADE", c9, sh2, "deep_c12", generation=2); c15 = ag.compose("CASCADE", c12, sh2, "deep_c15_ag", generation=2)
+    c18 = ag.compose("CASCADE", c15, sh2, "deep_c18_ag", generation=2); c21 = ag.compose("CASCADE", c18, sh2, "deep_c21_ag", generation=2)
+    ag.compose("MOE_MUX", pa2, c6, "ag_moe_wide", pc=c6, generation=2); assert c21.nvars == 22
+
+    cp2 = tmp_dir / f"cp2_{seed}.json"; ag.save_checkpoint(cp2); ag = AutonomousTemporalAgent.load_checkpoint(cp2)
+    sk_g3c, inf_g3c = ag.solve_goal("bb_goal_gen3_coupled_transfer", InteractiveMealyOracle.from_rows(r_g3c.ns, r_g3c.ni, r_g3c.no, r_g3c.rows), 16, generation=3)
+    sk_g3m, inf_g3m = ag.solve_goal("bb_goal_gen3_mod7_transfer", InteractiveMealyOracle.from_rows(r_g3m7.ns, r_g3m7.ni, r_g3m7.no, r_g3m7.rows), 18, generation=3)
+    assert sk_g3c.behav_digest == r_g3c.behav_digest and sk_g3m.behav_digest == r_g3m7.behav_digest
+    g_res["bb_goal_gen3_coupled_transfer"] = inf_g3c; g_res["bb_goal_gen3_mod7_transfer"] = inf_g3m
+    ag.compose("PARALLEL_LUT", c15, c6, "ag_par_xor_22", lut4=6, generation=3)
+
+    cp3 = tmp_dir / f"cp3_{seed}.json"; ag.save_checkpoint(cp3); ag = AutonomousTemporalAgent.load_checkpoint(cp3)
+    rep = zero_import_replay_verify(cp3); st = ag.status()
+    return {"seed": seed, "elapsed_sec": round(time.perf_counter() - t0, 3), "status": st, "replay": rep, "goals": g_res}
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="HAGI Fusion v4.0 Single-File Universal Temporal Skill Engine")
     ap.add_argument("--checkpoint", type=str, default=None, help="Load checkpoint JSON and print status")
     ap.add_argument("--replay", type=str, default=None, help="Run zero-import replay verification on checkpoint JSON")
-    ap.add_argument("--verify", action="store_true", help="Run self-verification suite")
+    ap.add_argument("--verify", action="store_true", help="Run full self-verification suite (18 goals + AG22 + PAC-L* + 3 checkpoints)")
     ap.add_argument("--seed", type=int, default=20261127, help="Seed for --verify")
     args = ap.parse_args()
     if args.replay: print(json.dumps(zero_import_replay_verify(args.replay), indent=2)); return
@@ -1974,23 +2051,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-class ExactMDLLibrary:
-    """Exact semantic deduplication; keeps the cheapest circuit per behavior."""
-    def __init__(self):
-        self._items = {}
-
-    def commit(self, candidate) -> dict:
-        if not symbolic_verify_general(candidate.netlist, candidate.outputs):
-            return {"action": "HOLD", "reason": "candidate proof invalid"}
-        key = candidate.semantic_digest(); old = self._items.get(key)
-        if old is None:
-            self._items[key] = candidate
-            return {"action": "COMMIT", "digest": key, "library_size": len(self._items)}
-        old_score = (old.metrics["program_bits"], old.metrics["depth"], old.metrics["gate_count"])
-        new_score = (candidate.metrics["program_bits"], candidate.metrics["depth"], candidate.metrics["gate_count"])
-        if new_score < old_score: self._items[key] = candidate
-        return {"action": "DEDUP", "digest": key, "library_size": len(self._items), "kept": "new" if new_score < old_score else "old"}
-
-    def __len__(self):
-        return len(self._items)
