@@ -136,11 +136,61 @@ def compose_adder2() -> dict:
             "history": [{"phase": "COMPOSE", "gates": len(gates)}]}
 
 
+def fusion_fastpath(task: dict) -> dict | None:
+    """Fusion Lab v2.1 fast-path (wave 128): before the expensive GA,
+    try proof-carrying ANF interpolation. Trusted issuer = own certified
+    seed-cells family; degree contract comes from the task spec itself
+    (honest: the task IS the spec, so max degree is computed from truth
+    by exact Mobius). Falls back to GA when n exceeds the full-support
+    cap or the fit HOLDs."""
+    try:
+        from hagi.fusion_anf import (ProofCarryingANFLearner,
+                                     ExactMDLLibrary)
+    except ImportError:
+        return None
+    n = task["n_inputs"]
+    if n < 1 or n > 14:
+        return None
+    ins = task["ins"]
+    key0 = next(iter(task["truth"]))
+    n_out = len(task["truth"][key0])
+    def oracle(x):
+        return tuple(int(v) for v in
+                     task["truth"][tuple((x >> i) & 1
+                                          for i in range(n))])
+    L = ProofCarryingANFLearner(trusted_issuers={"hagi-truth-spec"})
+    try:
+        cand, ev = L.fit(n, n_out, oracle, allow_full_support=True)
+    except Exception:
+        return None
+    if cand is None or ev.get("action") != "COMMIT_CANDIDATE":
+        return None
+    # Convert to a fabric genome via the ANF netlist (mask 6=XOR,
+    # 8=AND, 15/0 = const) and certify it against the same truth.
+    genome = {"W": 1, "n_inputs": n, "gates": cand.netlist["gates"],
+              "outs": cand.netlist["outs"]}
+    try:
+        ok, _ = fabric.certify(genome, task["truth"], ins)
+    except Exception:
+        return None
+    if not ok:
+        return None
+    return {"best": genome, "seed": "fusion-anf",
+            "certified_gen": 0, "bits": cand.netlist["metrics"]["program_bits"],
+            "_fusion": {"mode": ev.get("mode"),
+                        "queries": ev.get("query_count"),
+                        "gate_count": cand.netlist["metrics"]["gate_count"],
+                        "depth": cand.netlist["metrics"]["depth"]}}
+
+
 def weave_task(task: dict, pop_size: int = 100, generations: int = 3000,
                restarts: int = 10, seed: int = 5) -> dict | None:
-    """Run the fabric loop for one derived task. Multi-restart GA with
-    certified-first COMMIT gate. Returns the certified optimized
-    genome (the tape-out circuit) or None (honest: no commit)."""
+    """Run the fabric loop for one derived task. Fusion fast-path first,
+    then multi-restart GA with certified-first COMMIT gate. Returns the
+    certified optimized genome (the tape-out circuit) or None."""
+    fast = fusion_fastpath(task)
+    if fast is not None:
+        return fast
     truth = task["truth"]
     ins = task["ins"]
     for r in range(restarts):

@@ -1779,3 +1779,25 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **factorGap**: диагностический предикат, не теорема о loss —
   честный пин сохранён upstream.
 - Цикл: 186 чанков, CE 1.5028.
+
+## Волна 128 (2026-11-19) — Fusion Lab v2 аудит
+
+- «false contract» в моём smoke оказался НЕ misspecified: parity3
+  линейна (degree 1). Контракт degree≤1 корректно дал interp
+  x0^x1^x2 exact 8/8 — лаба честна, мой тест ошибся.
+
+## Волна 128 addendum — Интеграция Fusion Lab v2.1 в основной цикл
+
+- Аудит лабы: misspec→эскалация, untrusted issuer→HOLD, n>cap→HOLD,
+  MDL dedup — все гейты честны (5/5 их тестов PASS).
+- Интегрировано: `hagi/fusion_anf.py` (proof-carrying ANF front-end,
+  standalone stdlib) + `tests/test_fusion_anf.py` (5 passed).
+- Fast-path в `weave_task`: перед GA — exact Mobius interpolation
+  (n≤14, full-support, honest contract), результат re-certified
+  fabric.certify() перед COMMIT (двойной гейт сохранён).
+- Результат: все 3 лестничные задачи SOLVED мгновенно —
+  adder_slice 7 гейтов depth 3 (GA давал 12-14 за 57с), mux21 4
+  гейта (GA 7-10), adder2 26 гейтов (композиция 10 остаётся
+  лучше — оставляем композицию для stage1).
+- Правила INTEGRATION_PATCH соблюдены: rollback-safe (fast-path
+  возвращает None → GA), upstream verify-гейт не ослаблен.
