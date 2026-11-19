@@ -1946,3 +1946,17 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **Мост среда→процессор** (hagi/env_growth_v4_4_bridge.py):
   выученная модель мира → v4.0 factored netlist — 33 гейта
   depth 7, behavioral exact 128/128 переходов. Мир стал схемой.
+
+## Волна 142 (2026-11-19) — Интеграция env-growth v4.6 (пользователь)
+
+- v4.6: 4-битная частично наблюдаемая среда, банк 1536 гипотез с
+  bitset-ускорением, OOD LUT3-механизмы вне грамматики,
+  PROVEN_EXACT полные аудиты (48 пар), adversarial контрпример
+  (одна изменённая связь ловится полным аудитом после
+  PROVISIONAL_SAMPLED).
+- Self-tests 7/7, independent verifier 100/100 PASS (в нашем дереве).
+- Интегрировано: hagi/env_growth_v4_6.py + _verify.py.
+- **Мост v4.6→v4.0** (hagi/env_growth_v4_6_bridge.py):
+  - bank world: PROVISIONAL→audit→PROVEN, 43 гейта exact 64/64;
+  - OOD world (GRAMMAR_MISMATCH): full-table fallback → 42 гейта
+    exact + восстановлено LUT3-правило f3=124, g=10.
