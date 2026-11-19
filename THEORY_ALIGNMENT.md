@@ -1679,3 +1679,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   смеси <= max||e_i||, uniform Lipschitz -> branch Lipschitz ✓.
 - **CEGroupedScale**: disjoint blocks reindexing, honest пины
   (math calls не равны FLOPs) ✓.
+
+## Волна 118 (2026-11-18) — ТРЕТИЙ КРУГ начат; Benchmarks/
+
+- Upstream: 156 файлов обновлены за сутки (стиль+содержание).
+- **QuadraticEndToEnd**: qLoss/qGrad/qStep end-to-end — сходимость
+  x→a за 50 шагов ✓ (минимальный сертифицированный цикл).
+- **TernaryWitness**: jump-drop E(x)−k·s²/8 ≥ 0 из свойств
+  квантователя — форма согласована с тернарной проекцией
+  to_symbolic (живая плотность 0.42) ✓.
+- Цикл: 155 чанков, CE 1.5069, процесс жив.
