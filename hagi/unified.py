@@ -92,9 +92,16 @@ class Unified:
             if not d:
                 continue
             if per_domain is not None and len(d) > per_domain:
-                # uniform stride sample (covers the whole file honestly)
-                step = max(1, len(d) // per_domain)
-                d = d[::step][:per_domain]
+                # uniform CONTIGUOUS coverage: few blocks spread evenly
+                # (byte-stride made text undecodable and leaked stride
+                # structure into holdout — ns_0225 CE 0.22 artifact;
+                # 3-byte micro-blocks shred language structure — keep
+                # >=2KB coherent spans)
+                n_blocks = max(1, min(12, per_domain // 2048))
+                bl = min(len(d) // n_blocks, per_domain // n_blocks)
+                bounds = [i*len(d)//n_blocks for i in range(n_blocks)]
+                chunks = [d[b:b+bl] for b in bounds]
+                d = b"".join(chunks)[:per_domain]
             parts.append(d)
         combined = (fresh_bytes + b"".join(parts))[:total_cap]             if total_cap else fresh_bytes + b"".join(parts)
         # training (certified step path)
