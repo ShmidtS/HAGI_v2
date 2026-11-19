@@ -1624,3 +1624,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - **AlignmentRisk kl_budget_risk_bound**: risk <= c*sqrt(KL)
   через Pinsker TV ✓ (alignment-штраф = риск-сертификат).
 - **MeasuredEffects**: измеряемые эффекты = premise-канал ✓.
+
+## Волна 111 (2026-11-18) — Generalization/ModeState, Semantics/MemorySemantics
+
+- **ModeState hagiPotential**: Phi = energy + lambda*protectedRisk
+  + nu*max(0, Qtarget - Qgen) — форма scalarization ✓;
+  generalization_safe_step — Phi падает на fit - lambda*budget -
+  nu*eps_Q ✓.
+- **RamWriteCert**: точная RAM-семантика (чужие адреса нетронуты)
+  ✓; GDN bridge: дельта = updateRow (GDNRAM в core, волна 71) ✓.
