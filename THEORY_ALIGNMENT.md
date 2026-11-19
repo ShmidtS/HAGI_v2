@@ -1642,3 +1642,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   KL(q‖pθ)−KL(q‖p_E) exact ✓ (master identity дистилляции).
 - **FlowMatching**: CFM sample loss = ||v(t,x)−(x1−x0)||² (OT
   поле) — форма sqDiffObjective bridge ✓.
+
+## Волна 113 (2026-11-18) — Theory/MasterBudget, Semantics/StateUnification
+
+- **budget_from_resource_ledger**: Σcosts = budget0 - budgetT
+  exact (ledger instantiation) ✓; cap из неотрицательного
+  терминального остатка ✓.
+- **KV-cache demo**: cached_total_work 2*Sum = T*(T+1) exact ✓;
+  kv_work_ratio 3*recompute = (n+2)*cached ✓.
+- **StateUnification**: tie/invariant модуль (layer 5) —
+  структурно согласован ✓.
