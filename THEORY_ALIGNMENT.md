@@ -1633,3 +1633,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   nu*eps_Q ✓.
 - **RamWriteCert**: точная RAM-семантика (чужие адреса нетронуты)
   ✓; GDN bridge: дельта = updateRow (GDNRAM в core, волна 71) ✓.
+
+## Волна 112 (2026-11-18) — Data/DField, Distill, Theory/FlowMatching
+
+- **DField**: D(w)=Σw_i·KL(p_i‖p_w) ≥ 0 — cross-corpus divergence
+  field 100/100 ✓.
+- **Distill ce_gap_kl_identity**: CE_q(pθ)−CE_q(p_E) =
+  KL(q‖pθ)−KL(q‖p_E) exact ✓ (master identity дистилляции).
+- **FlowMatching**: CFM sample loss = ||v(t,x)−(x1−x0)||² (OT
+  поле) — форма sqDiffObjective bridge ✓.
