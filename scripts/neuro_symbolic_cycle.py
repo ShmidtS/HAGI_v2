@@ -304,7 +304,7 @@ def main() -> None:
         (ROOT / "checkpoints" / "domains" / f"{cid}.bin").write_bytes(blob)
         # ---- neural training on cumulative corpus ----
         r = u.ingest(cid, blob, epochs=2, repeat=1,
-                     replay_cap=200_000)
+                     replay_cap=400_000)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "
