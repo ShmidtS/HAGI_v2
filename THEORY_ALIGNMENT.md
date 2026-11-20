@@ -2069,3 +2069,17 @@ self-edit гейт работает (no-op фильтр активен), failure
   fresh task; (3) нерегрессия+MDL — transfer_eval 4 условия;
   (4) персистентность — resume round-trip.
 - Полный прогон: 45/45 PASS (было 24; +21 новых).
+
+## Волна 152 (2026-11-20) — Единая структура: версии убраны из имён
+
+- Переименования (git mv, семантика сохранена):
+  env_growth_v4_4* → env_temporal* (5-бит temporal worlds)
+  env_growth_v4_6* → env_lut* (4-бит LUT-грамматика + OOD)
+  fusion_v4_0.py → skill_engine.py
+  fusion_anf.py → anf_frontend.py
+  legacy_v5_v8.py → legacy_kernel.py
+- Все импорты обновлены (8 файлов), compat-shim в корне удалён.
+- Docstring-заголовки очищены от v4.x-упоминаний.
+- ARCHITECTURE.md актуализирован под новые имена.
+- Гейт: 45/45 тестов PASS, skill_engine self-verify (57 skills,
+  DAG exact), цикл перезапущен (pid 10812, chunks=374).
