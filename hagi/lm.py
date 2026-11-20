@@ -35,6 +35,20 @@ from typing import Any
 
 import numpy as np
 
+def _resolve_device(t, dim: int = 0, hidden: int = 0) -> str:
+    """WAVE 176: GPU accel via HAGI_DEVICE (cuda|cpu|auto, default
+    auto: cuda on big models; small test models stay on CPU — CUDA
+    init overhead dominates there)."""
+    import os
+    pref = os.environ.get("HAGI_DEVICE", "auto")
+    if pref == "cpu":
+        return "cpu"
+    cuda_ok = t.cuda.is_available()
+    if pref == "cuda":
+        return "cuda" if cuda_ok else "cpu"
+    return "cuda" if cuda_ok and dim * hidden >= 8192 else "cpu"
+
+
 CKPT = Path("checkpoints/lm_byte.pt")
 
 
@@ -84,6 +98,10 @@ class ByteLM:
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
         self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
+        self.device = _resolve_device(t, self.dim, self.hidden)
+        if self.device == "cuda":
+            for prm in self.params():
+                prm.data = prm.data.to(self.device)
 
     def params(self):
         return [self.emb, self.W1, self.b1, self.W2, self.b2]
@@ -330,6 +348,10 @@ class AdaptiveByteLM:
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
         self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
+        self.device = _resolve_device(t, self.dim, self.hidden)
+        if self.device == "cuda":
+            for prm in self.params():
+                prm.data = prm.data.to(self.device)
 
     def params(self):
         return [self.emb, self.pos, self.W1, self.b1, self.W2, self.b2]
@@ -485,6 +507,10 @@ class RopeAttentionByteLM:
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
         self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
+        self.device = _resolve_device(t, self.dim, self.hidden)
+        if self.device == "cuda":
+            for prm in self.params():
+                prm.data = prm.data.to(self.device)
 
     def params(self):
         return [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
@@ -632,12 +658,18 @@ class CertifiedStepLM:
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
         self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
+        self.device = _resolve_device(t, self.dim, self.hidden)
+        if self.device == "cuda":
+            for prm in self.params():
+                prm.data = prm.data.to(self.device)
 
     def params(self):
         return [self.emb, self.W1, self.b1, self.W2, self.b2]
 
     def logits(self, ctx):
         t = self.t
+        if ctx.device != getattr(self, "device", ctx.device):
+            ctx = ctx.to(self.device)   # WAVE 176: robust CPU input
         e = self.emb[ctx]
         h = t.relu(e.reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
         return h @ self.W2 + self.b2
@@ -645,10 +677,18 @@ class CertifiedStepLM:
     def ternary_(self) -> dict[str, Any]:
         return ternary_quant(self)
 
+    def _to_dev(self, tns):
+        """WAVE 176: move externally-created tensors to the model
+        device (robust API — callers may pass CPU tensors)."""
+        if hasattr(tns, "to"):
+            return tns.to(self.device)
+        return type(tns)(x.to(self.device) for x in tns)
+
     def _certified_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
         """One §3.9 step on the batch. Returns the certified descent
         amount 2A^2/R'^2 (0 if R'==0 — logits unchanged direction)."""
         t = self.t
+        ctx, nxt = self._to_dev((ctx, nxt))
         logits = self.logits(ctx)
         loss = t.nn.functional.cross_entropy(logits, nxt)
         g = t.autograd.grad(loss, self.params(), retain_graph=True)
@@ -688,6 +728,7 @@ class CertifiedStepLM:
         A ≤ 0, or η* > 1 — the unit cap of the theorem).
         """
         t = self.t
+        ctx, nxt = self._to_dev((ctx, nxt))
         logits = self.logits(ctx)
         loss = t.nn.functional.cross_entropy(logits, nxt)
         g = t.autograd.grad(loss, self.params(), retain_graph=True)
@@ -726,9 +767,13 @@ class CertifiedStepLM:
                      holdout_seed: int | None):
         """Common train/holdout split + validation tensors.
         Rotating holdout: fixed seed freezes the record forever and
-        blocks further learning on replay (stagnation fix)."""
+        blocks further learning on replay (stagnation fix).
+        WAVE 176 (GPU): batches ride the model device; windowing via
+        sliding_window_view (zero-copy vectorization) instead of the
+        python-loop np.stack."""
         import numpy as np
         t = self.t
+        dev = self.device
         idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
         n = len(idx) - self.k
         rng = np.random.default_rng(7 if holdout_seed is None
@@ -736,10 +781,11 @@ class CertifiedStepLM:
         perm = rng.permutation(n)
         n_hold = max(16, int(n * holdout))
         hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
-        Xv = np.stack([idx[i:i + self.k] for i in hold])
-        yv = idx[hold + self.k]
-        ctx_va = t.as_tensor(Xv, dtype=t.long)
-        nxt_va = t.as_tensor(yv, dtype=t.long)
+        # zero-copy sliding windows: windows[i] = idx[i:i+k]
+        from numpy.lib.stride_tricks import sliding_window_view
+        win = sliding_window_view(idx, self.k)  # shape (len(idx)-k+1, k)
+        ctx_va = t.as_tensor(win[hold], dtype=t.long, device=dev)
+        nxt_va = t.as_tensor(idx[hold + self.k], dtype=t.long, device=dev)
 
         def vce():
             with t.no_grad():
@@ -747,10 +793,11 @@ class CertifiedStepLM:
                     self.logits(ctx_va), nxt_va))
 
         def make_batch(sel):
-            X = np.stack([idx[i:i + self.k] for i in sel])
+            X = win[sel]                      # vectorized gather
             y = idx[sel + self.k]
-            return (t.as_tensor(X, dtype=t.long),
-                    t.as_tensor(y, dtype=t.long))
+            return (t.as_tensor(np.ascontiguousarray(X), dtype=t.long,
+                                device=dev),
+                    t.as_tensor(y, dtype=t.long, device=dev))
         return rng, train, vce, make_batch
 
     def _ef21_step(self, ctx, nxt, e_res: list, lr_scale: float = 1.0
@@ -766,6 +813,7 @@ class CertifiedStepLM:
         Returns (certified_drop | 0, admitted).
         """
         t = self.t
+        ctx, nxt = self._to_dev((ctx, nxt))
         logits = self.logits(ctx)
         loss = t.nn.functional.cross_entropy(logits, nxt)
         g = t.autograd.grad(loss, self.params(), retain_graph=True)
