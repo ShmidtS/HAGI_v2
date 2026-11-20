@@ -346,6 +346,10 @@ class ExprV9:
                 payload += gamma_bits(zigzag(int(c)) + 1) + gamma_bits(len(powers) + 1)
                 payload += sum(gamma_bits(int(p) + 1) for p in powers)
             return TOKEN_BITS + payload
+        if self.op == "construct":
+            from hagi.representations import construct_bits
+            label = str(self.value.get("candidate_id") or self.value.get("repr_id", ""))
+            return TOKEN_BITS + gamma_bits(construct_bits(self.value) + 1) + gamma_bits(len(label) + 1)
         return TOKEN_BITS + sum(a.bits(expert_index) for a in self.args)
 
     def callees(self) -> set[str]:
@@ -383,6 +387,9 @@ class ExprV9:
             return VAR_NAMES[idx] if idx < len(VAR_NAMES) else f"x{idx}"
         if self.op == "const":
             return str(self.value)
+        if self.op == "construct":
+            from hagi.representations import construct_pretty
+            return construct_pretty(self.value)
         if self.op == "call":
             return f"{self.value}({', '.join(a.pretty() for a in self.args)})"
         if self.op == "anf":
@@ -538,6 +545,23 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
         if abs(v) > _VEC_MAG_LIMIT:
             return np.zeros(N, dtype=np.int64), np.zeros(N, dtype=bool)
         return np.full(N, v, dtype=np.int64), np.ones(N, dtype=bool)
+    if op == "construct":
+        if expr.args or not isinstance(expr.value, dict):
+            return np.zeros(N, dtype=np.int64), np.zeros(N, dtype=bool)
+        artifact = expr.value.get("artifact")
+        out = np.zeros(N, dtype=np.int64)
+        ok = np.zeros(N, dtype=bool)
+        if artifact is None:
+            return out, ok
+        for i, row in enumerate(X):
+            xs = tuple(int(v) for v in row)
+            try:
+                if artifact.supports(xs):
+                    out[i] = int(artifact.eval(xs, env))
+                    ok[i] = abs(int(out[i])) <= _VEC_MAG_LIMIT
+            except (ValueError, TypeError, OverflowError):
+                ok[i] = False
+        return out, ok
     if op == "call":
         if env is None or expr.value not in env:
             return np.zeros(N, dtype=np.int64), np.zeros(N, dtype=bool)
@@ -703,6 +727,12 @@ def candidate_programs_v9(arity: int) -> list[ProgramV9]:
             ExprV9("fma", (x, y, z)), ExprV9("clamp", (x, y, z)),
             ExprV9("median3", (x, y, z)), ExprV9("mul3", (x, y, z)),
         ]
+    # Registered declarative constructs are first-class synthesis leaves.
+    from hagi.representations import construct_candidates
+    for payload in construct_candidates():
+        artifact = payload.get("artifact")
+        if getattr(artifact, "arity", None) == arity:
+            cands.append(ExprV9("construct", (), payload))
     by_text = {}
     for e in cands:
         by_text.setdefault(e.pretty(), e)
@@ -2368,15 +2398,39 @@ def synthesize_batched_mdl_v9(
         # (0x400..) must pass; intermediate-value safety stays with MAG_CAP
         return None, 0
     N = X.shape[0]
-    leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [ExprV9.const(c) for c in CONSTS]
-    L_arr = np.stack([
-        np.ascontiguousarray(X[:, int(lf.value or 0)]) if lf.op == "var" else np.full(N, int(lf.value), dtype=np.int64)
-        for lf in leaf_exprs
-    ])
-    L_bits = [lf.bits() for lf in leaf_exprs]
-
     env = {name: ex for _, name, ex in library_experts}
     ex_idx = {name: idx for idx, name, _ in library_experts}
+    leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [ExprV9.const(c) for c in CONSTS]
+
+    # Promote only constructs whose declared support covers both induction
+    # and validation rows. Full task-domain acceptance remains try_commit's
+    # independent certification gate in GrowingHagiProcessorV9.learn().
+    from hagi.representations import construct_candidates
+    evaluation_rows = list(train_x) + list(val_x)
+    for payload in construct_candidates():
+        artifact = payload.get("artifact")
+        if getattr(artifact, "arity", None) != arity:
+            continue
+        try:
+            if not all(artifact.supports(tuple(row)) for row in evaluation_rows):
+                continue
+            values = [int(artifact.eval(tuple(row), env)) for row in train_x]
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if any(abs(v) > _VEC_MAG_LIMIT for v in values):
+            continue
+        leaf_exprs.append(ExprV9("construct", (), payload))
+
+    def _leaf_train_values(expr: ExprV9) -> np.ndarray:
+        if expr.op == "var":
+            return np.ascontiguousarray(X[:, int(expr.value)])
+        if expr.op == "const":
+            return np.full(N, int(expr.value), dtype=np.int64)
+        return np.asarray([int(expr.eval(tuple(row), env)) for row in train_x],
+                          dtype=np.int64)
+
+    L_arr = np.stack([_leaf_train_values(lf) for lf in leaf_exprs])
+    L_bits = [lf.bits() for lf in leaf_exprs]
 
     for i, lf in enumerate(leaf_exprs):
         if np.array_equal(L_arr[i], Y):
