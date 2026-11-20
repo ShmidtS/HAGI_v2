@@ -93,7 +93,8 @@ def construct_bits(value: Any,
 
 
 def construct_pretty(value: Any) -> str:
-    return f"construct({value.get('repr_id')})"
+    label = value.get("candidate_id") or value.get("repr_id")
+    return f"construct({label})"
 
 
 def construct_to_dict(value: Any) -> Any:
@@ -212,7 +213,10 @@ def artifact_to_payload(value: dict) -> dict:
     """construct-node value -> JSON-safe payload."""
     art = value["artifact"]
     payload = art.to_dict()
-    return {"repr_id": value.get("repr_id"), "artifact": payload}
+    out = {"repr_id": value.get("repr_id"), "artifact": payload}
+    if value.get("candidate_id") is not None:
+        out["candidate_id"] = str(value["candidate_id"])
+    return out
 
 
 def artifact_from_payload(payload: dict) -> dict:
@@ -220,8 +224,58 @@ def artifact_from_payload(payload: dict) -> dict:
     rid = payload["repr_id"]
     factory = ARTIFACT_FACTORIES.get(rid)
     if factory is None:
+        # Factories are allowed to live in optional representation modules.
+        # Import lazily so persisted ExprV9 payloads restore in a fresh process.
+        try:
+            from hagi import automaton_repr  # noqa: F401
+        except ImportError:
+            pass
+        factory = ARTIFACT_FACTORIES.get(rid)
+    if factory is None:
         raise ValueError(f"no artifact factory for repr {rid}")
-    return {"repr_id": rid, "artifact": factory(payload["artifact"])}
+    out = {"repr_id": rid, "artifact": factory(payload["artifact"])}
+    if payload.get("candidate_id") is not None:
+        out["candidate_id"] = str(payload["candidate_id"])
+    return out
+
+
+# Declarative artifacts registered here are exposed to ExprV9 and BatchedMDL
+# as candidate leaves. Values remain Python objects in the live process; the
+# ExprV9 payload itself is serialized through the artifact's JSON descriptor.
+CONSTRUCT_CANDIDATES: dict[str, dict[str, Any]] = {}
+
+
+def register_artifact_candidate(name: str, repr_id: str, artifact: Artifact) -> None:
+    if not name or name in CONSTRUCT_CANDIDATES:
+        raise ValueError(f"duplicate or empty construct candidate: {name!r}")
+    if not isinstance(repr_id, str) or not repr_id:
+        raise ValueError("repr_id must be a non-empty string")
+    if repr_id not in ARTIFACT_FACTORIES:
+        # Import the optional implementation module that owns the factory.
+        try:
+            from hagi import automaton_repr  # noqa: F401
+        except ImportError:
+            pass
+    if repr_id not in ARTIFACT_FACTORIES:
+        raise ValueError(f"no artifact factory for repr {repr_id}")
+    required = ("eval", "supports", "bits", "to_dict")
+    if any(not callable(getattr(artifact, method, None)) for method in required):
+        raise TypeError("construct candidate does not implement the Artifact contract")
+    import json
+    # Reject executable/non-JSON payloads at the registration boundary.
+    json.dumps(artifact.to_dict(), sort_keys=True)
+    CONSTRUCT_CANDIDATES[name] = {
+        "repr_id": repr_id, "candidate_id": name, "artifact": artifact,
+    }
+
+
+def construct_candidates() -> list[dict[str, Any]]:
+    """Return registered construct leaves in stable order."""
+    return [dict(CONSTRUCT_CANDIDATES[name]) for name in sorted(CONSTRUCT_CANDIDATES)]
+
+
+def clear_artifact_candidates() -> None:
+    CONSTRUCT_CANDIDATES.clear()
 
 
 # ExprV9 helpers for construct nodes (called from core to_dict/from_dict)
