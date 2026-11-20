@@ -53,7 +53,8 @@ def test_invents_counter_mod():
     assert bp is not None
     assert all(bp.apply(x) == y for x, y in pairs)
     proof = verify_blueprint(bp, pairs)
-    assert proof["status"] == "PROVEN_EXACT"
+    assert proof["status"] == "VERIFIED_SAMPLES"
+    assert proof["scope"] == "observed_pairs"
 
 
 def test_invention_on_cluster_of_same_class():
@@ -78,7 +79,7 @@ def test_transfer_to_fresh_task():
     # (same q family, different table) — transfer means the CLASS transfers
     verified_any = False
     for bp in r["blueprints"]:
-        if verify_blueprint(bp, fresh)["status"] == "PROVEN_EXACT":
+        if verify_blueprint(bp, fresh)["status"] == "VERIFIED_SAMPLES":
             verified_any = True
             break
     assert verified_any or r["q_name"]
@@ -93,3 +94,31 @@ def test_counterexample_rollback():
     bad_pairs = pairs[:-1] + [(15, (bp.apply(15) + 1) % 16)]
     proof = verify_blueprint(bp, bad_pairs)
     assert proof["status"] == "HOLD_COUNTEREXAMPLE"
+
+
+
+def test_incomplete_domain_never_gets_exact_certificate():
+    pairs = _cnt_mod_pairs(5)
+    bp = synthesize_blueprint(pairs)
+    assert bp is not None
+    proof = verify_blueprint(bp, pairs[:-1], range(16))
+    assert proof["status"] == "HOLD_INCOMPLETE_DOMAIN"
+    assert proof["missing_count"] == 1
+
+
+def test_full_domain_certificate_queries_oracle_for_missing_labels():
+    pairs = _cnt_mod_pairs(5)
+    bp = synthesize_blueprint(pairs)
+    assert bp is not None
+    labels = dict(pairs)
+    proof = verify_blueprint(bp, pairs[:5], range(16), oracle=labels.get)
+    assert proof["status"] == "PROVEN_EXACT"
+    assert proof["checked"] == 16
+
+
+def test_full_domain_certificate_rejects_missing_oracle_label():
+    pairs = _cnt_mod_pairs(5)
+    bp = synthesize_blueprint(pairs)
+    assert bp is not None
+    proof = verify_blueprint(bp, pairs[:5], range(16), oracle=lambda x: None)
+    assert proof["status"] == "HOLD_UNLABELED"
