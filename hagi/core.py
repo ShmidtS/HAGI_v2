@@ -2473,6 +2473,24 @@ def synthesize_batched_mdl_v9(
         except Exception:
             return False
 
+    # New declarative representations are expensive leaves compared with
+    # primitive variables/constants. Give their direct pairwise compositions
+    # a budgeted first pass so the ordinary grammar cannot starve them before
+    # the priority queue reaches their MDL depth.
+    construct_ids = [i for i, expr in enumerate(leaf_exprs) if expr.op == "construct"]
+    for pos, i in enumerate(construct_ids):
+        for j in construct_ids[pos + 1:]:
+            for op, values in (
+                ("bit_and", L_arr[i] & L_arr[j]),
+                ("mul", L_arr[i] * L_arr[j]),
+                ("min", np.minimum(L_arr[i], L_arr[j])),
+            ):
+                cand = ExprV9(op, (leaf_exprs[i], leaf_exprs[j]))
+                if cand.bits(ex_idx) <= max_bits and np.array_equal(values, Y):
+                    total_checked += 1
+                    if verify_val(cand):
+                        return cand, total_checked
+
     while buckets and total_checked < max_evals:
         if deadline is not None and time.monotonic() >= deadline:
             break
