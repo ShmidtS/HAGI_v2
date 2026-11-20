@@ -14,7 +14,8 @@ Search: enumerate blueprints of depth 1-2, score NetGain on the whole
 gap cluster: sum(L_cur(T) - L_with_B(T)) - MetaCost(B) > 0.
 
 Verification (counterexample-driven, lesson from env_lut):
-  sampled fit -> full-domain audit -> PROVEN_EXACT, else rollback.
+  sampled fit -> VERIFIED_SAMPLES; PROVEN_EXACT only after a complete
+  labeled finite-domain audit, else HOLD.
 Overfit guard: matched-null z >= 4 (analytic bound first, Monte Carlo
 only on borderline candidates); alpha/delta budget spent per attempt
 via AuditLedgerV9-compatible spend interface.
