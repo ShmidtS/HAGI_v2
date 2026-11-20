@@ -1991,3 +1991,17 @@ self-edit гейт работает (no-op фильтр активен), failure
   наблюдений, логируется при proven, honest skip иначе.
 - AST-линт: будущих критичных unused imports не обнаружено.
 - Тесты: 9/9 (rdl+fusion) после чистки.
+
+## Волна 145 (2026-11-20) — Фаза 0: core.py split (goal 592610a9+)
+
+- core.py (8989) разрезан: hagi/legacy_v5_v8.py (5454 строки, frozen
+  V5-V8 body) + core.py (3562: head + star-import + private imports +
+  V9). Семантика «later definitions win» сохранена разрезом ПОСЛЕ
+  последнего V8 определения (маркер Task Specification).
+- Явные underscore/CAPS импорты для V9: _exact_poly_fit family,
+  BINARY_OPS/OPS/TOKEN_BITS/... _bit_*_8, _pow_int, _sign, _PRIME_MOD.
+- VERSION продублирована в legacy (self_test V5 ссылается на global
+  legacy-модуля).
+- Гейт: 24/24 тестов PASS, self_test v5/v7/v8 OK.
+- Известное: self_test_v9 LANG_CAESAR3 HOLD — pre-existing flaky
+  (подтверждено на git HEAD оригинале, не регрессия).
