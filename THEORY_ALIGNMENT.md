@@ -2244,3 +2244,17 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Обучение перезапущено на новом коде (pid 23268, chunks=403,
   0 Traceback).
 - 2 новых теста; всего 93/93 PASS.
+
+## Волна 166 (2026-11-21, круг 10) — сверка Unified/System/Probability
+
+- Полный обход непокрытых каталогов теории: CertifiedLoop
+  (gate_never_increases, strict descent, risk accumulation ≈ наш
+  cert_log + MIN_RELIEF), CommitGate (gate ⟺ win > cost — наш
+  transfer_eval 4 условия СТРОГО сильнее), AnytimeMartingale
+  (anytime δ-budget ≈ spend_anytime + Hoeffding), DescentCore
+  (descent_drop ≈ §3.9/adaptive), GrowthState (potential_joint ≈
+  MIN_RELIEF margin), Liveness, Probability/Azuma (Hoeffding
+  radius формула совпадает с классикой).
+- Расхождений кода с теорией не найдено; все контракты либо
+  реализованы, либо импликативно покрыты более сильными гейтами.
+- Цикл жив (pid 23268, tape-outs). 93/93 PASS.
