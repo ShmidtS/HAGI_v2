@@ -2017,3 +2017,14 @@ self-edit гейт работает (no-op фильтр активен), failure
   за пределами certified support + counterexample (первое
   несоответствие возвращается, не глотается).
 - tests/test_representations.py: 4 теста PASS.
+
+## Волна 147 (2026-11-20) — Фаза 2: diagnosis.py
+
+- HoldReason таксономия (BUDGET/REPRESENTATION_GAP/NONDETERMINISTIC/
+  RANDOM_INCOMPRESSIBLE), ResidualProfile пробы: плотность,
+  run-length, энтропия гэпов, автокорреляции (value + производная —
+  счётчики), xor-маски, отражение, residual builtin, MN-классы.
+- GapBuffer/GapCluster: K_min=3 однородных подписи — одна задача
+  никогда не запускает изобретение (анти-костыль).
+- tests/test_diagnosis.py: 4 PASS (dense-vs-структура, таксономия,
+  кластеризация, random-noise не STRUCTURAL).
