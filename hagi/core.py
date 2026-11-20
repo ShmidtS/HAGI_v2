@@ -1387,7 +1387,14 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
         Vt = Vt[pos]
         tot = float(np.sum(S**2))
         cum = np.cumsum(S**2) / tot
-        k = min(len(S), int(np.searchsorted(cum, energy_thresh)) + 1)
+        # WAVE 172 (C485 fix): float cumsum may cap at 0.99999...,
+        # silently dropping trailing directions and breaking
+        # gpm_zero_forgetting (loss(A) grew 32% after train(B)).
+        # energy_thresh >= 1.0 means the FULL span.
+        if energy_thresh >= 1.0:
+            k = len(S)
+        else:
+            k = min(len(S), int(np.searchsorted(cum, energy_thresh)) + 1)
         new_dirs = Vt[:k].T
         if self.U_basis.shape[1] == 0:
             Q, _ = np.linalg.qr(new_dirs)
@@ -1397,8 +1404,10 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
             U_svd, s_svd, _ = np.linalg.svd(combined, full_matrices=False)
             keep = s_svd > 1e-9
             self.U_basis = U_svd[:, keep]
-        if self.U_basis.shape[1] >= self.W.shape[0]:
-            self.U_basis = self.U_basis[:, : max(0, self.W.shape[0] - 2)]
+        # WAVE 172: keep full span up to d_in — the "-2" margin left
+        # protected directions unconstrained (zero-forgetting leak).
+        if self.U_basis.shape[1] > self.W.shape[0]:
+            self.U_basis = self.U_basis[:, : self.W.shape[0]]
 
 
 def quantize_bitalloc_exact(

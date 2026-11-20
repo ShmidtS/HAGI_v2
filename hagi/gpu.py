@@ -173,7 +173,13 @@ def consolidate_subspace_gpu(X: np.ndarray, U_basis: np.ndarray,
     if tot <= 0.0:
         return U_basis
     cum = t.cumsum(S ** 2, dim=0) / tot
-    k = min(len(S), int(t.searchsorted(cum, t.as_tensor(energy_thresh, device=cum.device))) + 1)
+    # WAVE 172 (C485): energy_thresh >= 1.0 means FULL span — float
+    # cumsum caps at 0.99999... and silently drops trailing directions
+    # (rank loss broke gpm_zero_forgetting: loss(A) +32% after train(B)).
+    if energy_thresh >= 1.0:
+        k = len(S)
+    else:
+        k = min(len(S), int(t.searchsorted(cum, t.as_tensor(energy_thresh, device=cum.device))) + 1)
     new_dirs = Vh[:k].T
     if U_basis.shape[1] == 0:
         Q, _ = t.linalg.qr(new_dirs)
@@ -185,8 +191,11 @@ def consolidate_subspace_gpu(X: np.ndarray, U_basis: np.ndarray,
         out = Us[:, keep]
     if max_basis is None:
         max_basis = X.shape[1]
-    if out.shape[1] >= max_basis:
-        out = out[:, : max(0, max_basis - 2)]
+    # WAVE 172: keep the FULL span up to max_basis — the old
+    # "max_basis - 2" margin always left 2 directions unconstrained,
+    # letting updates leak into protected task-A directions.
+    if out.shape[1] > max_basis:
+        out = out[:, :max_basis]
     return out.cpu().numpy()
 
 
