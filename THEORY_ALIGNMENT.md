@@ -2116,3 +2116,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   нарушалась (факт +1.32 при обещанных −0.81); после фикса CE 0.059
   против 0.075 у non-EF пути.
 - 2 теста; всего 57/57 PASS.
+
+## Волна 156 (2026-11-20) — C428/C472: budget allocation + Fisher tolerances
+
+- hagi/budget.py: точная закрытая форма weightedExpAllocation
+  (Budget/WeightedExpAlloc.lean) — бюджет Σw·r=B сходится точно;
+  fisher_tolerances — мост C472 (Gershgorin column curvature →
+  per-coordinate ε_j, монотонность fisher_alloc_mono, изотропный
+  случай даёт uniform).
+- 3 теста; всего 60/60 PASS.
