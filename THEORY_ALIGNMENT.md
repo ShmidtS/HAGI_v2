@@ -2163,3 +2163,18 @@ self-edit гейт работает (no-op фильтр активен), failure
   cached form (одна квантификация на шаг оптимизатора) — контракт.
 - Тест: уровни стабильны при повторной квантификации, энергия не
   растёт. 4 теста ternary; всего 68/68 PASS.
+
+## Волна 161 (2026-11-20, круг 6) — РЕФАКТОРИНГ: минимум кода максимум смысла
+
+- DRY sha/digest: 8 копий канонического content-hash в 6 модулях →
+  hagi/util.py::sha (единая точка); digest = sha алиасы сохранены.
+- Мёртвый артефакт env_model_bank_v4_4.json удалён (никем не читался).
+- Неиспользуемые hashlib-импорты вычищены после дедупа.
+- lm.py: общий каркас _train_split (split + holdout + windows) для
+  train_certified и train_ef21 — −60 строк дублируемого цикла.
+- Chesterton-решения НЕ удалять: 18 def-дублей legacy_kernel↔core —
+  это семантика «later definitions win» (V8 self-tests живы);
+  controller.py (MGDA §4.C) и lessons.py — dormant API с ясным
+  смыслом; genesis/fabric mutate — разные семантики при одинаковых
+  именах.
+- 68/68 PASS после каждого шага.
