@@ -1960,3 +1960,23 @@ self-edit гейт работает (no-op фильтр активен), failure
   - bank world: PROVISIONAL→audit→PROVEN, 43 гейта exact 64/64;
   - OOD world (GRAMMAR_MISMATCH): full-table fallback → 42 гейта
     exact + восстановлено LUT3-правило f3=124, g=10.
+
+## Волна 143 (2026-11-19) — Рефакторинг проекта (goal 9834b051)
+
+- hagi_fusion_v4_0.py перемещён в пакет: hagi/fusion_v4_0.py
+  (корневой shim оставлен для обратной совместимости, тот же
+  класс-объект).
+- Обновлены импорты: scripts/neuro_symbolic_cycle.py,
+  env bridges (from hagi import fusion_v4_0 as v40).
+- ExactMDLLibrary добавлена в пакетный модуль (была отдельной
+  допиской).
+- **RDL (Representation Discovery Loop)**: hagi/rdl.py — контур
+  изобретения конструкций (FAIL→propose class+param→sampled
+  check→adversarial full sweep→certificate). Семейства: LFSR,
+  counter-mod-N, saturating, Gray, shift2 (33 конструкции).
+  Измерение: cnt_mod(5) — экономия 52% против full-table.
+- tests/test_rdl.py: 4 теста (counter/LFSR discovery, честный HOLD
+  на неизвестном классе, полнота пространства семей).
+- Полный тест-прогон: 24/24 PASS (20 старых + 4 RDL).
+- Chesterton: core.py (8989 строк) НЕ переупорядочен — «later
+  definitions win shared names», перестановка сломает семантику.
