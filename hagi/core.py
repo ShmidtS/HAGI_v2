@@ -286,6 +286,9 @@ class ExprV9:
             return min(max(vals[0], -3), 3)
         if self.op == "mul3":
             return vals[0] * vals[1] * vals[2]
+        if self.op == "construct":
+            from hagi.representations import construct_eval
+            return construct_eval(self.value, xs, env)
         fn = OPS.get(self.op)
         if fn is None:
             raise ValueError(f"unsupported op: {self.op}")
@@ -302,6 +305,9 @@ class ExprV9:
                 c = 1 + len(coeffs)
             elif self.op in ("poly", "poly_nd"):
                 c = 1 + len(self.value or ())
+            elif self.op == "construct":
+                from hagi.representations import construct_bits as _cb
+                c = 1 + _cb(self.value)
             else:
                 c = 1 + sum(a.cost for a in self.args)
             object.__setattr__(self, "_cost_memo", c)
@@ -441,6 +447,9 @@ class ExprV9:
         val = self.value
         if self.op == "anf" and val is not None:
             val = [int(val[0]), [[int(s), int(c)] for s, c in val[1]]]
+        elif self.op == "construct" and isinstance(val, dict):
+            from hagi.representations import construct_to_dict_safe
+            val = construct_to_dict_safe(val)
         return {"op": self.op, "value": val, "args": [a.to_dict() for a in self.args]}
 
     @staticmethod
@@ -453,6 +462,9 @@ class ExprV9:
             val = tuple((int(t[0]), tuple(int(p) for p in t[1])) for t in val)
         elif op == "anf" and val is not None:
             val = (int(val[0]), tuple((int(s), int(c)) for s, c in val[1]))
+        elif op == "construct" and isinstance(val, dict):
+            from hagi.representations import construct_from_dict_safe
+            val = construct_from_dict_safe(val)
         return ExprV9(op, tuple(ExprV9.from_dict(a) for a in d.get("args", [])), val)
 
 

@@ -2005,3 +2005,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Гейт: 24/24 тестов PASS, self_test v5/v7/v8 OK.
 - Известное: self_test_v9 LANG_CAESAR3 HOLD — pre-existing flaky
   (подтверждено на git HEAD оригинале, не регрессия).
+
+## Волна 146 (2026-11-20) — Фаза 1: representations.py
+
+- Протоколы Representation/Artifact + REPR_REGISTRY + фабрики
+  артефактов (registry-driven restore).
+- ExprV9 получил делегирующий узел op="construct": eval/bits/to_dict/
+  from_dict делегируют в реестр (вставки в 3 точки, лестница learn()
+  не тронута).
+- verify_artifact_contract: full-domain + JSON round-trip + ABSTAIN
+  за пределами certified support + counterexample (первое
+  несоответствие возвращается, не глотается).
+- tests/test_representations.py: 4 теста PASS.
