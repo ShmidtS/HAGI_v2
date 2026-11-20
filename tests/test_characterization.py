@@ -45,6 +45,7 @@ def test_suite_shape():
     assert len(suite) == GOLD["suite_len"]
 
 
+@pytest.mark.slow
 def test_v9_grow_and_verify(trained_v9):
     p, suite = trained_v9
     assert len(p.experts) == GOLD["suite_experts"]
@@ -53,6 +54,7 @@ def test_v9_grow_and_verify(trained_v9):
     assert chk["committed"] == GOLD["suite_committed"]
 
 
+@pytest.mark.slow
 def test_determinism_second_run():
     suite = hagi.make_task_suite()
     p2 = hagi.GrowingHagiProcessorV9(node_budget=200000)
@@ -74,6 +76,7 @@ def test_venn_and_hadamard():
     assert np.asarray(rot).round(6).tolist() == GOLD["rot"]
 
 
+@pytest.mark.slow
 def test_selfloop_round1_golden():
     """Round-1 of the self-development loop must reproduce its certified
     numbers exactly. Guards the parallel/merge machinery end-to-end
@@ -94,6 +97,7 @@ def test_selfloop_round1_golden():
     assert sum(t["success"] for t in inc.trace) == 68
 
 
+@pytest.mark.slow
 def test_selfrewrite_programs(tmp_path):
     """The model's program export is exact: every generated standalone
     Python function equals its certified expert over the full domain."""
@@ -108,6 +112,7 @@ def test_selfrewrite_programs(tmp_path):
     assert rep["evaluations_checked"] > 1000
 
 
+@pytest.mark.slow
 def test_neural_gpu_backend():
     """GPU (torch/CUDA-ROCm) backend: resolves a device, trains a GPM
     step without error, and stays result-compatible (same adapter count
@@ -125,6 +130,7 @@ def test_neural_gpu_backend():
     assert p.verify_all(suite)["accuracy"] == 1.0
 
 
+@pytest.mark.slow
 def test_execute_programs(tmp_path):
     """The model's executor: runs the programs it wrote — byte-level UTF-8
     ciphers stream real text; XOR round-trips; integer programs callable."""
@@ -161,6 +167,7 @@ def test_ingest_data(tmp_path):
     assert p.verify_all([tasks[0]])["accuracy"] == 1.0
 
 
+@pytest.mark.slow
 def test_byte_lm():
     """HAGI neural body (theory §2/§3/§6): one-hot CE over bytes,
     guarded steps (holdout CE never increases), ternary quantization
