@@ -2028,3 +2028,16 @@ self-edit гейт работает (no-op фильтр активен), failure
   никогда не запускает изобретение (анти-костыль).
 - tests/test_diagnosis.py: 4 PASS (dense-vs-структура, таксономия,
   кластеризация, random-noise не STRUCTURAL).
+
+## Волна 148 (2026-11-20) — Фаза 3: invention.py MetaGrammar
+
+- ConstructBlueprint = Quotient(ident/shift/reflect/xor/bitrev4/mod) ×
+  Basis(FULL/SPARSE/INTERVALS/GF2_ANF/POLY_LIN/**OUT_PERIOD** — новый
+  изобретённый кодек счётчиков y=(x+o) mod p) × depth.
+- Поиск: enumerate depth 1-2, минимальные биты на задачу, NetGain на
+  кластере; **комбинаторная значимость** вместо грубого z:
+  log2(|table-space|/|family|) — counter mod5 получил 29.15 бит
+  значимости (STRUCTURAL), FULL — FULL_NOT_STRUCTURAL.
+- Counterexample-driven верификация: PROVEN_EXACT / HOLD_COUNTEREXAMPLE.
+- 6/6 тестов: FULL≠STRUCTURAL, random-noise не INVENTED, counter
+  discovery, кластер one-class, zero-shot transfer, контрпример откат.
