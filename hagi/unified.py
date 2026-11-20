@@ -27,8 +27,13 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-UNET_CKPT = ROOT / "checkpoints" / "unified.pt"
-LEDGER = ROOT / "checkpoints" / "unified_ledger.json"
+# WAVE 178 (save-guard, backlog item from the smoke-accident):
+# HAGI_CKPT_DIR redirects ALL checkpoint writes (model, ledger,
+# domain bins) — tests/smoke models can never touch production.
+import os as _os
+CKPT_DIR = Path(_os.environ.get("HAGI_CKPT_DIR", str(ROOT / "checkpoints")))
+UNET_CKPT = CKPT_DIR / "unified.pt"
+LEDGER = CKPT_DIR / "unified_ledger.json"
 
 
 def _sha(b: bytes) -> str:
@@ -75,7 +80,7 @@ class Unified:
                 "skipped": "too_small",
             }
         # persist domain bytes (cumulative replay source)
-        ddir = ROOT / "checkpoints" / "domains"
+        ddir = CKPT_DIR / "domains"
         ddir.mkdir(parents=True, exist_ok=True)
         (ddir / f"{source}.bin").write_bytes(data)
         # replay ALL domains (anti-forgetting: cumulative book);
@@ -146,13 +151,13 @@ class Unified:
 
     def _domain_bytes(self, name: str, entry: dict) -> bytes:
         """Bytes for a domain — from disk cache (data kept per domain)."""
-        p = ROOT / "checkpoints" / "domains" / f"{name}.bin"
+        p = CKPT_DIR / "domains" / f"{name}.bin"
         return p.read_bytes() if p.exists() else b""
 
     def ingest_file(self, path: Path, epochs: int = 200, repeat: int = 2) -> dict:
         data = path.read_bytes()
-        (ROOT / "checkpoints" / "domains").mkdir(parents=True, exist_ok=True)
-        (ROOT / "checkpoints" / "domains" / f"{path.stem}.bin").write_bytes(data)
+        (CKPT_DIR / "domains").mkdir(parents=True, exist_ok=True)
+        (CKPT_DIR / "domains" / f"{path.stem}.bin").write_bytes(data)
         return self.ingest(path.stem, data, epochs=epochs, repeat=repeat)
 
     # ---- text (lessons) ----
@@ -160,7 +165,7 @@ class Unified:
     def learn_text(
         self, name: str, text: str, epochs: int = 200, repeat: int = 2
     ) -> dict:
-        d = ROOT / "checkpoints" / "domains"
+        d = CKPT_DIR / "domains"
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{name}.bin").write_text(text, encoding="utf-8")
         return self.ingest(name, text.encode("utf-8"), epochs=epochs, repeat=repeat)
@@ -246,8 +251,8 @@ class Unified:
         quantize to symbolic."""
         if sources:
             for name, data in sources:
-                (ROOT / "checkpoints" / "domains").mkdir(exist_ok=True, parents=True)
-                (ROOT / "checkpoints" / "domains" / f"{name}.bin").write_bytes(data)
+                (CKPT_DIR / "domains").mkdir(exist_ok=True, parents=True)
+                (CKPT_DIR / "domains" / f"{name}.bin").write_bytes(data)
                 self.ingest(name, data, epochs=epochs)
         report = self.ingest("__evolve__", b"", epochs=epochs) if False else None
         # per-domain holdout CE (forgetting measure)
