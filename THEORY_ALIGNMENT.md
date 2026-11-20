@@ -2409,3 +2409,20 @@ self-edit гейт работает (no-op фильтр активен), failure
   restore (require_tag=True); tamper-тест — подменённый store не
   исполняется.
 - 113/113 PASS.
+
+## Сверка primes 2026-11-21 (волна 177)
+- Upstream: коммит 54b75a4a «holdout concentration without replacement»
+  (23:53) — финализация C487: HoldoutWithoutReplacement.lean 1340 строк.
+  Наш rotating holdout (rng.permutation → hold/train, wave 169 fix)
+  точно соответствует постановке: выборка без возвращения =
+  инъективная k-строка перестановки. Расхождений нет.
+- Главная теорема (c): P[|wrMean−μ|≥ε] ≤ 2exp(−kε²/(2(σ̂²(2N−k)/N+ε)))
+  — variance-adaptive Freedman-форма с fpc-кредитом. Строже C435
+  только УСЛОВНО (σ̂²(2N−k)/N+ε ≤ 1/4).
+- Решение: hoeffding_radius в core.py ОСТАЁТСЯ консервативным
+  (C435 with-replacement). Замена на условную wr-границу в вертикали
+  допусков не оправдана (YAGNI: σ̂² потерь у нас обычно велика,
+  условие ≤1/4 не выполняется; консерватизм безопасен).
+- Честные пины upstream приняты: не-Serfling (потраекторный бюджет
+  Freedman), k=N тривиально исключён, uniformity перестановок —
+  bridge-лемма не формализована (на концентрацию не влияет).
