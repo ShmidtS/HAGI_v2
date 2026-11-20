@@ -12,16 +12,17 @@ Phase sources (all implemented in this repo):
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
-from typing import Callable, Optional
 
 
 def six_phase_cycle(objective: Callable[[np.ndarray], float],
                     grad: Callable[[np.ndarray], np.ndarray],
                     w0: np.ndarray,
                     steps_train: int = 10,
-                    hadamard_len: Optional[int] = None,
-                    merge_cand: Optional[np.ndarray] = None,
+                    hadamard_len: int | None = None,
+                    merge_cand: np.ndarray | None = None,
                     stop_patience: int = 2,
                     eta: float = 0.1,
                     delta_total: float = 0.05) -> dict:

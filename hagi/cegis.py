@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable
 
 from hagi.invention import ConstructBlueprint, synthesize_blueprint
 
@@ -35,21 +35,21 @@ class CounterexampleMemory:
 @dataclass
 class CegisResult:
     status: str                 # PROVEN_EXACT | HOLD_CEGIS_EXHAUSTED | HOLD_NO_CANDIDATE
-    blueprint: Optional[ConstructBlueprint]
+    blueprint: ConstructBlueprint | None
     rounds: int
     queries: int                # oracle label budget spent
     train_size: int             # final train size (init + counterexamples)
-    final_sweep: Optional[dict] = None   # full-domain certificate result
+    final_sweep: dict | None = None   # full-domain certificate result
 
 
 def cegis_invent(train_x: list[int],
-                 query: Callable[[int], Optional[int]],
+                 query: Callable[[int], int | None],
                  cegis_pool: list[int],
                  full_domain: range,
                  max_rounds: int = 6,
                  init_frac: float = 0.25,
-                 query_budget: Optional[int] = None,
-                 rng: Optional[random.Random] = None) -> CegisResult:
+                 query_budget: int | None = None,
+                 rng: random.Random | None = None) -> CegisResult:
     """Active CEGIS: synthesize on train, refine on counterexamples from
     cegis_pool, certify on full_domain at the end.
 
@@ -70,7 +70,7 @@ def cegis_invent(train_x: list[int],
     pool = list(cegis_pool)
     rng.shuffle(pool)
 
-    best: Optional[ConstructBlueprint] = None
+    best: ConstructBlueprint | None = None
     for round_i in range(1, max_rounds + 1):
         pairs = sorted(train.items())
         bp = synthesize_blueprint(pairs, rng=rng)

@@ -24,11 +24,11 @@ registry (registered via representations.register_artifact_factory),
 transferable to fresh tasks.
 """
 from __future__ import annotations
+
 import math
 import random
 from dataclasses import dataclass
-from typing import Callable, Optional
-
+from typing import Callable
 
 # --------------------------------------------------------------------------
 # Quotient transforms
@@ -94,7 +94,7 @@ def basis_full(core_pairs: list[tuple[int, int]]) -> dict:
     return {"kind": "FULL", "table": dict(core_pairs)}
 
 
-def basis_sparse(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
+def basis_sparse(core_pairs: list[tuple[int, int]]) -> dict | None:
     active = sorted(x for x, y in core_pairs if y != 0)
     if not active:
         return {"kind": "SPARSE", "set": set()}
@@ -104,7 +104,7 @@ def basis_sparse(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
     return {"kind": "SPARSE", "set": set(active)}
 
 
-def basis_intervals(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
+def basis_intervals(core_pairs: list[tuple[int, int]]) -> dict | None:
     act = {x for x, y in core_pairs if y != 0}
     if not act:
         return {"kind": "INTERVALS", "iv": []}
@@ -120,7 +120,7 @@ def basis_intervals(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
     return {"kind": "INTERVALS", "iv": runs}
 
 
-def basis_gf2_anf(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
+def basis_gf2_anf(core_pairs: list[tuple[int, int]]) -> dict | None:
     if len(core_pairs) != 16:
         return None
     vals = [0] * 16
@@ -138,7 +138,7 @@ def basis_gf2_anf(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
     return {"kind": "GF2_ANF", "terms": terms}
 
 
-def basis_out_period(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
+def basis_out_period(core_pairs: list[tuple[int, int]]) -> dict | None:
     """y = (x + o) mod p — counter/ring structures (invented basis)."""
     if len(core_pairs) < 3:
         return None
@@ -150,7 +150,7 @@ def basis_out_period(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
     return None
 
 
-def basis_poly_lin(core_pairs: list[tuple[int, int]]) -> Optional[dict]:
+def basis_poly_lin(core_pairs: list[tuple[int, int]]) -> dict | None:
     if len(core_pairs) < 2:
         return None
     # exact linear fit through >= 2 points (y = kx + c), integer k, c
@@ -262,7 +262,7 @@ def _payload_bits(basis_name: str, payload: dict, core_size: int) -> int:
     return core_size * 4
 
 
-def _ranked_quotients(hints: Optional[dict] = None):
+def _ranked_quotients(hints: dict | None = None):
     """Diagnosis→search wire: order QUOTIENTS by ResidualProfile signals
     so likely families are tried first (δ-budget economy). Pure
     reordering — the enumeration itself and MDL choice are unchanged,
@@ -284,9 +284,9 @@ def _ranked_quotients(hints: Optional[dict] = None):
 def synthesize_blueprint(
     pairs: list[tuple[int, int]],
     max_depth: int = 1,
-    rng: Optional[random.Random] = None,
-    hints: Optional[dict] = None,
-) -> Optional[ConstructBlueprint]:
+    rng: random.Random | None = None,
+    hints: dict | None = None,
+) -> ConstructBlueprint | None:
     """Enumerate blueprints; return the one with minimal
     meta_bits + payload_bits that fits ALL pairs exactly. hints
     (from diagnosis.ResidualProfile) only reorder the search."""
@@ -334,7 +334,7 @@ def matched_null_verdict(
     pairs: list[tuple[int, int]],
     alpha: float = 0.01,
     z_threshold: float = 4.0,
-    rng: Optional[random.Random] = None,
+    rng: random.Random | None = None,
     n_mc: int = 150,
 ) -> dict:
     """STRUCTURAL only if blueprint compression beats size-and-sparsity
@@ -382,7 +382,7 @@ def matched_null_verdict(
 def verify_blueprint(
     bp: ConstructBlueprint,
     pairs: list[tuple[int, int]],
-    full_domain: Optional[range] = None,
+    full_domain: range | None = None,
 ) -> dict:
     """PROVEN_EXACT only with FULL labeled coverage of the domain:
     every domain point must carry a label and match. Unlabeled points
@@ -419,10 +419,10 @@ def verify_blueprint(
 
 def invent_blueprint(
     cluster_pairs: list[list[tuple[int, int]]],
-    rng: Optional[random.Random] = None,
+    rng: random.Random | None = None,
     max_attempts: int = 200,
-    hints: Optional[dict] = None,
-) -> Optional[dict]:
+    hints: dict | None = None,
+) -> dict | None:
     """Find ONE blueprint that fits ALL tasks of the cluster exactly,
     beats matched-null (STRUCTURAL), and yields positive NetGain.
     hints (ResidualProfile signals) reorder the family search."""

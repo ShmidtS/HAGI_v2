@@ -9,7 +9,7 @@ Stop threshold inferred analytically from the observed zeros/fixeds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Sequence
 
 
 def _digit_sum10(x: int) -> int:
@@ -128,7 +128,7 @@ def synthesize_while_loop(
     bp: WhileLoopBlueprint,
     pairs: list[tuple[int, int]],
     domain: Sequence[int],
-) -> Optional[WhileLoopArtifact]:
+) -> WhileLoopArtifact | None:
     """Infer stop_le analytically from the boundary between zeros/fixed
     points and the rest; then verify exactly on all pairs."""
     obs = {int(x): int(y) for x, y in pairs}

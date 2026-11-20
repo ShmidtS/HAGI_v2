@@ -73,7 +73,6 @@ def clear_reified() -> None:
 def save_reified_ops_state(state_dir) -> int:
     """Persist reified ops as source + meta (invented_reprs.json).
     Returns the number saved. Source-based: survives cold restart."""
-    import inspect
     import json
     from pathlib import Path
     d = Path(state_dir)

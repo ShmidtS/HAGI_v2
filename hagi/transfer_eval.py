@@ -14,8 +14,9 @@ held-out tasks that were NOT in the discovery cluster:
 On any failure: ROLLBACK (registry entry removed, snapshot restored).
 """
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Callable
 
 
 @dataclass

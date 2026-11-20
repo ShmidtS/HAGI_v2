@@ -11,11 +11,12 @@ matching gap signatures — one random task never pays for a new
 representation (this is what prevents one-off hacks).
 """
 from __future__ import annotations
+
 import math
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 class HoldReason(Enum):
@@ -37,7 +38,7 @@ class ResidualProfile:
     autocorr_reflect: float          # P(f(x) == f(C-x)) over sampled C
     autocorr_xor: float              # max_m P(f(x) == f(x^m)), m in 1..15
     residual_frac_builtin: float     # fraction unexplained by best builtin fit
-    mn_classes: Optional[int] = None  # Myhill-Nerode classes (sequential)
+    mn_classes: int | None = None  # Myhill-Nerode classes (sequential)
 
     def signature(self) -> tuple:
         """Coarse signature for clustering."""
@@ -99,8 +100,8 @@ def _entropy(values: Sequence[int]) -> float:
 def build_residual_profile(
     train_x: Sequence[Sequence[int]],
     train_y: Sequence[int],
-    domain: Optional[Iterable[Sequence[int]]] = None,
-    builtin_fit: Optional[Callable[[Sequence, Sequence], float]] = None,
+    domain: Iterable[Sequence[int]] | None = None,
+    builtin_fit: Callable[[Sequence, Sequence], float] | None = None,
 ) -> ResidualProfile:
     n = len(train_x)
     flat_x = [x[0] if len(x) == 1 else int(sum(x)) for x in train_x]

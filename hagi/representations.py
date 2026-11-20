@@ -19,9 +19,9 @@ Honest limits: a construct artifact is exact only on its certified
 domain; outside it raises (never guesses).
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, Sequence, runtime_checkable
 
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 # --------------------------------------------------------------------------
 # Protocols
@@ -30,12 +30,12 @@ from typing import Any, Callable, Optional, Protocol, Sequence, runtime_checkabl
 @runtime_checkable
 class Artifact(Protocol):
     def eval(self, xs: Sequence[int],
-             env: Optional[dict] = None) -> int: ...
+             env: dict | None = None) -> int: ...
     def supports(self, xs: Sequence[int]) -> bool: ...
-    def bits(self, expert_index: Optional[dict] = None) -> int: ...
+    def bits(self, expert_index: dict | None = None) -> int: ...
     def verify_contract(self, oracle_or_domain: Any) -> Any: ...
     def to_dict(self) -> dict[str, Any]: ...
-    def emit_python(self, fn_name: str, env: Optional[dict] = None) -> str: ...
+    def emit_python(self, fn_name: str, env: dict | None = None) -> str: ...
 
 
 @runtime_checkable
@@ -47,7 +47,7 @@ class Representation(Protocol):
     def supports_task(self, profile: dict) -> bool: ...
     def probe_potential(self, obs: dict) -> float: ...
     def synthesize(self, obs: dict, budget: float,
-                   ledger: Any) -> Optional[Artifact]: ...
+                   ledger: Any) -> Artifact | None: ...
 
 
 # --------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def get(repr_id: str) -> Representation:
 # --------------------------------------------------------------------------
 
 def construct_eval(value: Any, xs: Sequence[int],
-                   env: Optional[dict] = None) -> int:
+                   env: dict | None = None) -> int:
     """Evaluate a construct node: value = {"repr_id": ..., "artifact": ...}."""
     if not isinstance(value, dict) or "artifact" not in value:
         raise ValueError("construct node missing artifact payload")
@@ -85,7 +85,7 @@ def construct_eval(value: Any, xs: Sequence[int],
 
 
 def construct_bits(value: Any,
-                   expert_index: Optional[dict] = None) -> int:
+                   expert_index: dict | None = None) -> int:
     art = value.get("artifact")
     if art is None:
         raise ValueError("construct node missing artifact payload")
@@ -110,7 +110,7 @@ class ContractResult:
     ok: bool
     reason: str = ""
     checked_pairs: int = 0
-    counterexample: Optional[tuple] = None
+    counterexample: tuple | None = None
 
 
 def verify_artifact_contract(artifact: Artifact, teacher: Callable[..., int],

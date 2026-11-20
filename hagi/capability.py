@@ -8,7 +8,7 @@ zero noise acceptances.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 
 @dataclass
@@ -52,7 +52,7 @@ def capability_delta(before: CapabilitySnapshot,
 
 
 def heldout_suite(tasks: list[tuple[str, Callable, range, int]],
-                  solver: Callable[[str, range, int], Optional[tuple[int, int]]],
+                  solver: Callable[[str, range, int], tuple[int, int] | None],
                   ) -> tuple[int, float, float]:
     """Run held-out transfer panel. solver(name, domain, target) returns
     (bits_cost | None-if-HOLD, samples_used). Returns (solved, rate,
