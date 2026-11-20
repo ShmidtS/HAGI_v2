@@ -2258,3 +2258,17 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Расхождений кода с теорией не найдено; все контракты либо
   реализованы, либо импликативно покрыты более сильными гейтами.
 - Цикл жив (pid 23268, tape-outs). 93/93 PASS.
+
+## Волна 167 (2026-11-21, круг 11) — рефакторинг: семантическая чистота имён
+
+- gamma_bits в invention.py переименован в _cost_bits: это cost-
+  кодирование (n<=0→1, 2·bl), НЕ элиас-гамма теории (legacy_kernel,
+  n<1→raise) — одно имя = одна семантика.
+- Мёртвый код удалён: _gamma (capability), restore_reified
+  (reifier — вытеснен restore_reified_ops_state).
+- Неиспользуемые импорты вычищены (field, Sequence, QUOTIENTS/BASES
+  в cegis).
+- Chesterton: bfs_plan env_lut vs env_temporal — РАЗНЫЕ контракты
+  (actions-path vs states-path), не дубли; fabric/genesis mutate —
+  разные семантики (проверено ранее).
+- 93/93 PASS.

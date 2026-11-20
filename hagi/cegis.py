@@ -16,8 +16,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from hagi.invention import (BASES, QUOTIENTS, ConstructBlueprint,
-                            synthesize_blueprint)
+from hagi.invention import ConstructBlueprint, synthesize_blueprint
 
 
 @dataclass

@@ -11,3 +11,4 @@ def sha(obj) -> str:
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+

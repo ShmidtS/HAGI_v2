@@ -26,8 +26,8 @@ transferable to fresh tasks.
 from __future__ import annotations
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 
 # --------------------------------------------------------------------------
@@ -235,7 +235,7 @@ class ConstructBlueprint:
         }
 
 
-def gamma_bits(n: int) -> int:
+def _cost_bits(n: int) -> int:
     if n <= 0:
         return 1
     return 2 * n.bit_length()
@@ -252,11 +252,11 @@ def _payload_bits(basis_name: str, payload: dict, core_size: int) -> int:
     if k == "FULL":
         return core_size * 4
     if k == "SPARSE":
-        return gamma_bits(len(payload["set"]) + 1) + len(payload["set"]) * 4
+        return _cost_bits(len(payload["set"]) + 1) + len(payload["set"]) * 4
     if k == "INTERVALS":
-        return gamma_bits(len(payload["iv"]) + 1) + len(payload["iv"]) * 8
+        return _cost_bits(len(payload["iv"]) + 1) + len(payload["iv"]) * 8
     if k == "GF2_ANF":
-        return gamma_bits(len(payload["terms"]) + 1) + len(payload["terms"]) * 4
+        return _cost_bits(len(payload["terms"]) + 1) + len(payload["terms"]) * 4
     if k == "POLY_LIN":
         return 2 * 8
     return core_size * 4
@@ -302,7 +302,7 @@ def synthesize_blueprint(
                 continue
             core_size = len(core)
             pbits = _payload_bits(b_name, payload, core_size)
-            mbits = gamma_bits(len(q_name)) + 8
+            mbits = _cost_bits(len(q_name)) + 8
             total = mbits + pbits
             bp = ConstructBlueprint(q_name, q_param, q_fn, b_name, payload,
                                     mbits, total_bits=total)

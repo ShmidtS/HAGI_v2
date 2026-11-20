@@ -66,14 +66,6 @@ def snapshot_reified() -> dict:
     return out
 
 
-def restore_reified(fns: dict[str, Callable[..., int]]) -> None:
-    """Restore from persisted pure functions (rewrite.py --resume)."""
-    for op, fn in fns.items():
-        if not op.startswith("reified:"):
-            raise ValueError(f"bad reified op name: {op}")
-        REIFIED_OPS[op] = fn
-
-
 def clear_reified() -> None:
     REIFIED_OPS.clear()
 

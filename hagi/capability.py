@@ -7,7 +7,7 @@ zero noise acceptances.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 
@@ -24,12 +24,6 @@ class CapabilitySnapshot:
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
-
-
-def _gamma(n: int) -> int:
-    """Elias-gamma-ish bit cost of a small integer (same as legacy)."""
-    n = max(1, int(n))
-    return 2 * (n.bit_length() - 1) + 1
 
 
 def total_mdl(library_meta_bits: int,
