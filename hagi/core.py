@@ -2016,6 +2016,14 @@ class HedgeRouterV9:
         assert np.all(self.weights + 1e-12 >= floor)
         return self.weights.copy()
 
+    def ordered(self, names: Optional[Sequence[str]] = None) -> list:
+        """Expert order by descending weight (Hedge prior). If names given,
+        returns indices into `names` sorted by weight; else weight argsort."""
+        order = np.argsort(-self.weights)
+        if names is None:
+            return order.tolist()
+        return [i for i in order if i < len(names)]
+
 
 @dataclass
 class AuditStream:
