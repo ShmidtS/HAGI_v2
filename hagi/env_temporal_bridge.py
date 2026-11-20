@@ -8,7 +8,7 @@ bits 0-4 = state s, bits 5-6 = action a; outputs 0-4 = next state.
 """
 from __future__ import annotations
 import random
-from hagi import env_growth_v4_4 as env
+from hagi import env_temporal as env
 
 
 def env_model_to_netlist(model_id: int, clock_action: int | None = None,

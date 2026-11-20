@@ -9,7 +9,7 @@ Encoding: bits 0-3 = state s, bits 4-5 = action a; outputs 0-3 = next
 state.
 """
 from __future__ import annotations
-from hagi import env_growth_v4_6 as env
+from hagi import env_lut as env
 from hagi.env_table_compiler import compile_transition_table
 
 

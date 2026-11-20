@@ -7,7 +7,7 @@ transitions. Rule of Three refactor: the table-compiler was duplicated
 in both env bridges.
 """
 from __future__ import annotations
-from hagi import fusion_v4_0 as v40
+from hagi import skill_engine as v40
 
 
 def compile_transition_table(table, n_bits: int, n_act_bits: int) -> dict:

@@ -62,9 +62,9 @@ V5_VERSION = VERSION
 
 
 
-# --- Phase 0 refactor: V5-V8 body extracted to hagi.legacy_v5_v8 ---
-from hagi.legacy_v5_v8 import *  # noqa: F401,F403
-from hagi.legacy_v5_v8 import (  # noqa: F401 — private/CAPS used by V9
+# --- Legacy V5-V8 kernel body lives in hagi.legacy_kernel ---
+from hagi.legacy_kernel import *  # noqa: F401,F403
+from hagi.legacy_kernel import (  # noqa: F401 — private/CAPS used by V9
     _exact_multivariate_poly_fit, _exact_poly_fit, _fit_poly_or_const,
     _monomial_exponents, BINARY_OPS, COMMUTATIVE_OPS, CONSTS,
     DYADIC_LEVELS, OPS, TOKEN_BITS, VAR_NAMES, _PRIME_MOD,

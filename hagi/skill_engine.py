@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HAGI Fusion v4.0 — Autonomous Proof-Carrying Universal Temporal Skill Engine (single-file).
+"""HAGI Skill Engine — Autonomous Proof-Carrying Universal Temporal Skill Engine (single-file).
 
 Core mathematical & algorithmic subsystems:
   1. GF(2) Algebraic Normal Form (ANF) learner with DegreeContracts & full-cube audit

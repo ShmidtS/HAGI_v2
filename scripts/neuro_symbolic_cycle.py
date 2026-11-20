@@ -144,11 +144,11 @@ def fusion_fastpath(task: dict) -> dict | None:
     by exact Mobius). Falls back to GA when n exceeds the full-support
     cap or the fit HOLDs."""
     try:
-        from hagi.fusion_v4_0 import (ProofCarryingANFLearner,
+        from hagi.skill_engine import (ProofCarryingANFLearner,
                                       ExactMDLLibrary)
     except ImportError:
         try:
-            from hagi.fusion_anf import (ProofCarryingANFLearner,
+            from hagi.anf_frontend import (ProofCarryingANFLearner,
                                          ExactMDLLibrary)
         except ImportError:
             return None

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HAGI Environment-Grounded Growth v4.4.
+"""HAGI Temporal Environment Growth.
 
 A finite-state, action-driven environment benchmark with:
 - hidden 5-bit temporal dynamics and four opaque action symbols;

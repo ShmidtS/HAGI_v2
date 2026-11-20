@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hagi import env_growth_v4_6 as env
+from hagi import env_lut as env
 from hagi.diagnosis import GapBuffer, GapRecord, HoldReason, build_residual_profile
-from hagi.env_growth_v4_6_bridge import env_model_to_netlist
+from hagi.env_lut_bridge import env_model_to_netlist
 from hagi.invention import invent_blueprint
 from hagi.representations import register_artifact_factory
 from hagi.transfer_eval import CapabilityMeter, TaskResult

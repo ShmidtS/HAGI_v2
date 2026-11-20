@@ -14,11 +14,11 @@
 ### Символьный синтез (стек модернизирован)
 | Модуль | Роль |
 |---|---|
-| `fusion_v4_0.py` | Autonomous Temporal Skill Engine (v4.0, пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay. Компилятор по умолчанию: adder 5g, mux 3g |
-| `fusion_anf.py` | v2.1 ANF front-end (fallback синтезатор) |
+| `skill_engine.py` | Autonomous Temporal Skill Engine (пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay. Компилятор по умолчанию: adder 5g, mux 3g |
+| `anf_frontend.py` | v2.1 ANF front-end (fallback синтезатор) |
 | `env_table_compiler.py` | общий компилятор transition-table → netlist (Rule of Three) |
-| `env_growth_v4_4.py` + `_bridge.py` | среды 5-бит: active identification, перенос памяти, drift |
-| `env_growth_v4_6.py` + `_bridge.py` | среды 4-бит: банк 1536 гипотез, OOD LUT3, PROVEN_EXACT аудит |
+| `env_temporal.py` + `_bridge.py` | среды 5-бит (temporal): active identification, перенос памяти, drift |
+| `env_lut.py` + `_bridge.py` | среды 4-бит (LUT-грамматика + OOD): банк 1536 гипотез, OOD LUT3, PROVEN_EXACT аудит |
 | `rdl.py` | **Representation Discovery Loop**: изобретение конструкций (LFSR/cnt-mod/sat/Gray/shift2), FAIL→propose→sampled→adversarial sweep→certificate, измерение экономии (52% vs full-table) |
 
 ### Цикл и контроль
