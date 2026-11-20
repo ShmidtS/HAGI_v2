@@ -2041,3 +2041,12 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Counterexample-driven верификация: PROVEN_EXACT / HOLD_COUNTEREXAMPLE.
 - 6/6 тестов: FULL≠STRUCTURAL, random-noise не INVENTED, counter
   discovery, кластер one-class, zero-shot transfer, контрпример откат.
+
+## Волна 149 (2026-11-20) — Фаза 4: transfer_eval.py CapabilityMeter
+
+- Внешний гейт: zero-shot на held-out (вне кластера), 4 условия
+  COMMIT (нерегрессия PROGRAM, прирост ёмкости >0, 0 ложных
+  STRUCTURAL на контроли, cost win по битам/пробам), иначе ROLLBACK
+  с удалением реестровой записи и восстановлением снапшота.
+- tests/test_transfer_eval.py: 5 PASS (commit/regression/purity/
+  capacity/cost).
