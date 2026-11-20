@@ -216,6 +216,12 @@ def make_task_suite() -> list[TaskSpec]:
 # 3. Call-DAG AST, ProgramV9 & Vectorized Evaluator
 # ==============================================================================
 
+# V10-2: Reified operator registry — invented coordinates promoted to
+# first-class unary/binary macro-ops usable inside ExprV9 programs.
+# Filled by hagi.reifier.reify_construct(); persists via to_state().
+REIFIED_OPS: dict = {}
+
+
 @dataclass(frozen=True)
 class ExprV9:
     op: str
@@ -289,6 +295,9 @@ class ExprV9:
         if self.op == "construct":
             from hagi.representations import construct_eval
             return construct_eval(self.value, xs, env)
+        fn = REIFIED_OPS.get(self.op)
+        if fn is not None:
+            return int(fn(*vals))
         fn = OPS.get(self.op)
         if fn is None:
             raise ValueError(f"unsupported op: {self.op}")
