@@ -13,11 +13,13 @@ A finite-state, action-driven environment benchmark with:
 This is a bounded synthetic system-identification experiment, not an AGI claim.
 """
 from __future__ import annotations
+from hagi.util import sha
 import argparse, hashlib, itertools, json, math, random, statistics, time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+
 
 N_BITS = 5
 N_STATES = 1 << N_BITS
@@ -27,8 +29,6 @@ TRUSTED_ISSUER = "HAGI_TEMPORAL_SIM_V1"
 ROLES = ("xor", "guard", "delay")
 
 
-def sha(obj) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def clock_fn(s: int) -> int:

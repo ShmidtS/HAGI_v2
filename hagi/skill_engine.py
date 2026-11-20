@@ -48,8 +48,9 @@ def ev(p: frozenset[int], x: int) -> int:
 def deg(p: frozenset[int]) -> int:
     return max((t.bit_count() for t in p), default=0)
 
-def digest(x) -> str:
-    return hashlib.sha256(json.dumps(x, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+from hagi.util import sha
+
+digest = sha  # canonical content hash
 
 def binom_p_ge(m: int, k: int) -> float:
     return sum(math.comb(m, j) for j in range(k, m + 1)) / (1 << m)

@@ -4,15 +4,15 @@ Does not import the learning engine. Reconstructs deterministic worlds and check
 all saved probes, exact transition tables, ANFs, and shortest plans.
 """
 from __future__ import annotations
+from hagi.util import sha
 import argparse, json, random, hashlib
 from collections import deque, Counter
 from pathlib import Path
 
+
 N=16
 A=4
 
-def sha(x):
-    return hashlib.sha256(json.dumps(x, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 def b(s,i): return (s>>i)&1
 

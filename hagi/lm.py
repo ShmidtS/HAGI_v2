@@ -50,6 +50,24 @@ def t_no_grad_if(fn):
     return wrapper
 
 
+def ternary_quant(module) -> dict[str, Any]:
+    """b1.58 per-row ternary quantization (Energy/STEStep.lean):
+    s = mean(|W|, dim=1) per output row, Q = round(clamp(W/s, −1, +1))·s.
+    Scale-invariant (ternary_scale_invariance) — no spectral cap.
+    NOT idempotent across calls (s re-estimated); STE contract: one
+    call per optimizer step."""
+    t = module.t
+    report = {}
+    for name in ("emb", "W1", "W2"):
+        W = getattr(module, name)
+        with t.no_grad():
+            s = W.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
+            q = t.round(W / s).clamp(-1.0, 1.0) * s
+            report[name] = float((q - W).abs().max())
+            W.copy_(q)
+    return report
+
+
 class ByteLM:
     """k-byte context -> next-byte logits. Ternary-quantizable."""
 
@@ -83,28 +101,7 @@ class ByteLM:
 
     # ---- §6 ternary quantization ------------------------------------
     def ternary_(self) -> dict[str, Any]:
-        """In-place ternary quantization of W1/W2/emb (§6), b1.58
-        per-row scheme (Energy/STEStep.lean): s = mean(|W|, dim=1)
-        per output row, Q = round(clamp(W/s, −1, +1)), W~ = Q·s.
-        Self-stabilization invariant (ternary_scale_invariance): the
-        map is invariant under W -> c·W — no spectral cap needed.
-        eps-floor guards all-zero rows (degenerate row's escape).
-        Note: per-row scheme is NOT idempotent (a second call re-estimates
-        s from the already-quantized weights); gridQ_idem applies to the
-        fixed-Δ grid quantizer, not this scheme. The STE cached form
-        (one quantization per optimizer step) is the contract — call
-        once per step, cache s alongside if dequantization is needed.
-        """
-        t = self.t
-        report = {}
-        for name in ("emb", "W1", "W2"):
-            W = getattr(self, name)
-            with t.no_grad():
-                s = W.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
-                q = t.round(W / s).clamp(-1.0, 1.0) * s
-                report[name] = float((q - W).abs().max())
-                W.copy_(q)
-        return report
+        return ternary_quant(self)
 
     # ---- §3 guarded step / §9 certified chain -----------------------
     def train_guarded(self, data: bytes, epochs: int = 30, lr: float = 3e-3,
@@ -639,19 +636,7 @@ class CertifiedStepLM:
         return h @ self.W2 + self.b2
 
     def ternary_(self) -> dict[str, Any]:
-        """b1.58 per-row ternary quantization (Energy/STEStep.lean):
-        s = mean(|W|, dim=1), Q = round(clamp(W/s, −1, +1))·s. The map
-        is scale-invariant (ternary_scale_invariance) — no spectral cap."""
-        t = self.t
-        report = {}
-        for name in ("emb", "W1", "W2"):
-            W = getattr(self, name)
-            with t.no_grad():
-                s = W.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
-                q = t.round(W / s).clamp(-1.0, 1.0) * s
-                report[name] = float((q - W).abs().max())
-                W.copy_(q)
-        return report
+        return ternary_quant(self)
 
     def _certified_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
         """One §3.9 step on the batch. Returns the certified descent

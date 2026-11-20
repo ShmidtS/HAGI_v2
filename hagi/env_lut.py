@@ -3,9 +3,11 @@
 
 Bounded experiment: partially observable 4-bit environment, active model discovery
 from a compositional Boolean-LUT grammar, exact OOD fallback, and model-based planning.
+
 Standard library only. This is not a claim of general intelligence.
 """
 from __future__ import annotations
+from hagi.util import sha
 import argparse, hashlib, itertools, json, math, random, statistics, time
 from collections import deque
 from dataclasses import dataclass, asdict
@@ -18,8 +20,6 @@ _MODEL_CACHE = {}
 _PROBE_INDEX_CACHE = {}
 
 
-def sha(obj):
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def bit(s, i):

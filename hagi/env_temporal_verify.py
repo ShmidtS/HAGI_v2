@@ -13,8 +13,9 @@ from pathlib import Path
 N=32; A=4
 MODEL_BANK=[]
 
-def digest(x):
-    return hashlib.sha256(json.dumps(x, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+from hagi.util import sha
+
+digest = sha  # canonical content hash
 
 def next_state(role, s, p):
     if role == "clock": return (s+1)%N
