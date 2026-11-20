@@ -39,6 +39,7 @@ import hagi  # noqa: E402
 
 # --------------------------------------------------------------- parsing ----
 
+
 def _int_or_none(v: str) -> int | None:
     try:
         return int(v.strip())
@@ -91,8 +92,7 @@ def _json_numbers(obj: Any) -> list[int]:
     return out
 
 
-def _pair_tasks(xs: list[int], ys: list[int], name: str
-                ) -> list[hagi.TaskSpec]:
+def _pair_tasks(xs: list[int], ys: list[int], name: str) -> list[hagi.TaskSpec]:
     """Exact-function test: y must be unambiguous for each observed x."""
     mapping: dict[int, int] = {}
     for x, y in zip(xs, ys):
@@ -112,15 +112,16 @@ def _pair_tasks(xs: list[int], ys: list[int], name: str
     return [hagi.TaskSpec(name, 1, (dom,), teacher, family="ingest")]
 
 
-def tasks_from_numeric_file(path: Path, max_tasks: int = 16
-                            ) -> list[hagi.TaskSpec]:
+def tasks_from_numeric_file(path: Path, max_tasks: int = 16) -> list[hagi.TaskSpec]:
     tasks: list[hagi.TaskSpec] = []
     if path.suffix.lower() == ".json":
-        nums = _json_numbers(json.loads(path.read_text(encoding="utf-8",
-                                                       errors="replace")))
+        nums = _json_numbers(
+            json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        )
         if len(nums) >= 8:
-            tasks += _pair_tasks(nums[::2][:512], nums[1::2][:512],
-                                 f"INGEST_{path.stem}_json_pairs")
+            tasks += _pair_tasks(
+                nums[::2][:512], nums[1::2][:512], f"INGEST_{path.stem}_json_pairs"
+            )
     else:
         cols = _numeric_columns(path)
         names = [n for n in cols if len(cols[n]) >= 8]
@@ -128,8 +129,11 @@ def tasks_from_numeric_file(path: Path, max_tasks: int = 16
             for j in range(len(names)):
                 if i == j or len(tasks) >= max_tasks:
                     continue
-                tasks += _pair_tasks(cols[names[i]], cols[names[j]],
-                                     f"INGEST_{path.stem}_{names[i]}_to_{names[j]}")
+                tasks += _pair_tasks(
+                    cols[names[i]],
+                    cols[names[j]],
+                    f"INGEST_{path.stem}_{names[i]}_to_{names[j]}",
+                )
     return tasks
 
 
@@ -154,8 +158,11 @@ def tasks_from_text_file(path: Path) -> list[hagi.TaskSpec]:
             raise ValueError("outside deterministic subset")
         return v
 
-    return [hagi.TaskSpec(f"INGEST_{path.stem}_nextbyte", 1, (dom,), teacher,
-                          family="ingest")]
+    return [
+        hagi.TaskSpec(
+            f"INGEST_{path.stem}_nextbyte", 1, (dom,), teacher, family="ingest"
+        )
+    ]
 
 
 def ingest_file(path: Path) -> list[hagi.TaskSpec]:
@@ -171,8 +178,8 @@ def ingest_file(path: Path) -> list[hagi.TaskSpec]:
 
 # --------------------------------------------------------------- learning ---
 
-def learn_from_data(paths: list[Path], budget: int = 200000
-                    ) -> dict[str, Any]:
+
+def learn_from_data(paths: list[Path], budget: int = 200000) -> dict[str, Any]:
     proc = hagi.GrowingHagiProcessorV9(node_budget=budget)
     report: dict[str, Any] = {"files": [], "tasks": 0, "committed": 0}
     for path in paths:
@@ -181,16 +188,17 @@ def learn_from_data(paths: list[Path], budget: int = 200000
         except Exception as e:  # unparseable file is a honest skip
             report["files"].append({"file": str(path), "error": repr(e)[:120]})
             continue
-        f_info: dict[str, Any] = {"file": str(path), "tasks": len(tasks),
-                                  "results": []}
+        f_info: dict[str, Any] = {"file": str(path), "tasks": len(tasks), "results": []}
         for sp in tasks:
             ev = proc.learn(sp, seed=10_000, train_neural=True)
-            f_info["results"].append({
-                "task": sp.name,
-                "action": ev["action"],
-                "reason": ev.get("reason", "")[:40],
-                "program": ev.get("program", "")[:80],
-            })
+            f_info["results"].append(
+                {
+                    "task": sp.name,
+                    "action": ev["action"],
+                    "reason": ev.get("reason", "")[:40],
+                    "program": ev.get("program", "")[:80],
+                }
+            )
             report["tasks"] += 1
             report["committed"] += int(ev["action"] == "COMMIT")
         report["files"].append(f_info)

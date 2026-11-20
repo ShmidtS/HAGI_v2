@@ -1,4 +1,5 @@
 """Shared tiny utilities (DRY: sha was duplicated in 6 modules)."""
+
 from __future__ import annotations
 
 import hashlib

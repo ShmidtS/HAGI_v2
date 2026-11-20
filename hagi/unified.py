@@ -40,6 +40,7 @@ class Unified:
 
     def __init__(self, k: int = 16, dim: int = 128, hidden: int = 256):
         from hagi import lm as lm_mod
+
         self.lm_mod = lm_mod
         self.k, self.dim, self.hidden = k, dim, hidden
         self.model = lm_mod.CertifiedStepLM(k=k, dim=dim, hidden=hidden)
@@ -47,22 +48,32 @@ class Unified:
 
     # ---- ingest: ANY data ----
 
-    def ingest(self, source: str, data: bytes, epochs: int = 200,
-               repeat: int = 2, replay_cap: int | None = None) -> dict:
+    def ingest(
+        self,
+        source: str,
+        data: bytes,
+        epochs: int = 200,
+        repeat: int = 2,
+        replay_cap: int | None = None,
+    ) -> dict:
         """Ingest any bytes as a domain; certified training on it.
         The ONE model accumulates: previous data is re-included
         (fresh-replay of all domains = no forgetting, book is the
         single source of truth)."""
         import numpy as np
+
         sha = _sha(data)
-        entry = self.domains.setdefault(source, {"sha": sha, "bytes": 0,
-                                                 "ce": None})
-        is_new = (entry["sha"] != sha)
+        entry = self.domains.setdefault(source, {"sha": sha, "bytes": 0, "ce": None})
+        is_new = entry["sha"] != sha
         entry["sha"], entry["bytes"] = sha, len(data)
-        if len(data) < 4096:            # too small for certified split
+        if len(data) < 4096:  # too small for certified split
             self.save()
-            return {"source": source, "bytes": len(data), "new": is_new,
-                    "skipped": "too_small"}
+            return {
+                "source": source,
+                "bytes": len(data),
+                "new": is_new,
+                "skipped": "too_small",
+            }
         # persist domain bytes (cumulative replay source)
         ddir = ROOT / "checkpoints" / "domains"
         ddir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +83,7 @@ class Unified:
         # the cycle stays time-bounded — sampling is honest (head/mid/
         # tail) and the ledger records exact bytes seen.
         import numpy as _np
+
         parts = []
         total_cap = replay_cap  # TOTAL budget for all past domains
         # WAVE 133 FIX (Goodhart): old order put the FRESH domain last,
@@ -80,11 +92,10 @@ class Unified:
         # data): fresh domain FIRST and in full, then uniform strided
         # replay over past domains for the remainder of the budget.
         fresh_name = source
-        fresh_bytes = self._domain_bytes(fresh_name,
-                                         self.domains[fresh_name])
-        replay_budget = max(total_cap - len(fresh_bytes), 0)             if total_cap else None
+        fresh_bytes = self._domain_bytes(fresh_name, self.domains[fresh_name])
+        replay_budget = max(total_cap - len(fresh_bytes), 0) if total_cap else None
         n_past = max(1, len(self.domains) - 1)
-        per_domain = max(replay_budget // n_past, 8_000)             if replay_budget else None
+        per_domain = max(replay_budget // n_past, 8_000) if replay_budget else None
         for name, e in self.domains.items():
             if name == fresh_name:
                 continue
@@ -99,35 +110,46 @@ class Unified:
                 # >=2KB coherent spans)
                 n_blocks = max(1, min(12, per_domain // 2048))
                 bl = min(len(d) // n_blocks, per_domain // n_blocks)
-                bounds = [i*len(d)//n_blocks for i in range(n_blocks)]
-                chunks = [d[b:b+bl] for b in bounds]
+                bounds = [i * len(d) // n_blocks for i in range(n_blocks)]
+                chunks = [d[b : b + bl] for b in bounds]
                 d = b"".join(chunks)[:per_domain]
             parts.append(d)
-        combined = (fresh_bytes + b"".join(parts))[:total_cap]             if total_cap else fresh_bytes + b"".join(parts)
+        combined = (
+            (fresh_bytes + b"".join(parts))[:total_cap]
+            if total_cap
+            else fresh_bytes + b"".join(parts)
+        )
         # training (certified step path)
         t0 = time.perf_counter()
         reps = []
         for rep_i in range(max(1, repeat)):
-            reps.append(self.model.train_certified(
-                combined, epochs=epochs,
-                holdout_seed=7 + rep_i * 131 + len(self.domains) * 17))
+            reps.append(
+                self.model.train_certified(
+                    combined,
+                    epochs=epochs,
+                    holdout_seed=7 + rep_i * 131 + len(self.domains) * 17,
+                )
+            )
         ce = min(r.get("best_holdout_ce", 99) for r in reps)
         entry["ce"] = ce
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.save()
-        return {"source": source, "bytes": len(data), "new": is_new,
-                "replay_domains": len(self.domains),
-                "replay_bytes": len(combined),
-                "holdout_ce": ce,
-                "seconds": round(time.perf_counter() - t0, 1)}
+        return {
+            "source": source,
+            "bytes": len(data),
+            "new": is_new,
+            "replay_domains": len(self.domains),
+            "replay_bytes": len(combined),
+            "holdout_ce": ce,
+            "seconds": round(time.perf_counter() - t0, 1),
+        }
 
     def _domain_bytes(self, name: str, entry: dict) -> bytes:
         """Bytes for a domain — from disk cache (data kept per domain)."""
         p = ROOT / "checkpoints" / "domains" / f"{name}.bin"
         return p.read_bytes() if p.exists() else b""
 
-    def ingest_file(self, path: Path, epochs: int = 200,
-                    repeat: int = 2) -> dict:
+    def ingest_file(self, path: Path, epochs: int = 200, repeat: int = 2) -> dict:
         data = path.read_bytes()
         (ROOT / "checkpoints" / "domains").mkdir(parents=True, exist_ok=True)
         (ROOT / "checkpoints" / "domains" / f"{path.stem}.bin").write_bytes(data)
@@ -135,32 +157,37 @@ class Unified:
 
     # ---- text (lessons) ----
 
-    def learn_text(self, name: str, text: str, epochs: int = 200,
-                   repeat: int = 2) -> dict:
+    def learn_text(
+        self, name: str, text: str, epochs: int = 200, repeat: int = 2
+    ) -> dict:
         d = ROOT / "checkpoints" / "domains"
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{name}.bin").write_text(text, encoding="utf-8")
-        return self.ingest(name, text.encode("utf-8"), epochs=epochs,
-                           repeat=repeat)
+        return self.ingest(name, text.encode("utf-8"), epochs=epochs, repeat=repeat)
 
     # ---- inference ----
 
     def ask(self, prompt: str, n: int = 60) -> str:
         r = self.model.generate(prompt, n_bytes=n)
-        return r[len(prompt):].strip() if r.startswith(prompt) else r
+        return r[len(prompt) :].strip() if r.startswith(prompt) else r
 
     # ---- persistence ----
 
     def save(self) -> None:
         import torch as _t
-        st = {n: getattr(self.model, n).detach().cpu()
-              for n in ("emb", "W1", "b1", "W2", "b2")}
-        st.update({"k": self.model.k, "dim": self.model.dim,
-                   "hidden": self.model.hidden})
+
+        st = {
+            n: getattr(self.model, n).detach().cpu()
+            for n in ("emb", "W1", "b1", "W2", "b2")
+        }
+        st.update(
+            {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
+        )
         UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
         _t.save(st, UNET_CKPT)
-        LEDGER.write_text(json.dumps(self.domains, ensure_ascii=False,
-                                     indent=1), encoding="utf-8")
+        LEDGER.write_text(
+            json.dumps(self.domains, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
 
     @staticmethod
     def exists() -> bool:
@@ -170,16 +197,18 @@ class Unified:
     def load(cls) -> "Unified":
         import torch as _t
         from hagi import lm as lm_mod
+
         u = cls.__new__(cls)
         u.lm_mod = lm_mod
         st = _t.load(UNET_CKPT, weights_only=False)
         u.k, u.dim, u.hidden = st["k"], st["dim"], st["hidden"]
-        u.model = lm_mod.CertifiedStepLM(k=u.k, dim=u.dim,
-                                         hidden=u.hidden)
+        u.model = lm_mod.CertifiedStepLM(k=u.k, dim=u.dim, hidden=u.hidden)
         with _t.no_grad():
             for n in ("emb", "W1", "b1", "W2", "b2"):
                 getattr(u.model, n).copy_(st[n])
-        u.domains = json.loads(LEDGER.read_text(encoding="utf-8"))             if LEDGER.exists() else {}
+        u.domains = (
+            json.loads(LEDGER.read_text(encoding="utf-8")) if LEDGER.exists() else {}
+        )
         return u
 
     # ---- neuro -> symbolic ----
@@ -188,52 +217,55 @@ class Unified:
         """Ternary projection of the body's first layer to the fabric
         substrate. The committed artifact is symbolic (masks/ternary)."""
         import torch
+
         W1 = self.model.W1.detach()
         scale = W1.abs().mean() * 2 + 1e-12
         tern = torch.round(W1 / scale).clamp(-1, 1).int()
-        return {"shape": list(W1.shape), "scale": scale.item(),
-                "ternary_nonzeros": int((tern != 0).sum()),
-                "density": round(float((tern != 0).float().mean()), 4)}
+        return {
+            "shape": list(W1.shape),
+            "scale": scale.item(),
+            "ternary_nonzeros": int((tern != 0).sum()),
+            "density": round(float((tern != 0).float().mean()), 4),
+        }
 
     # ---- self-evolution cycle ----
 
-    def evolve_step(self, sources: list[tuple[str, bytes]] | None = None,
-                    epochs: int = 120) -> dict:
+    def evolve_step(
+        self, sources: list[tuple[str, bytes]] | None = None, epochs: int = 120
+    ) -> dict:
         """One GROW->CERTIFY cycle over all domains (+ any new sources).
         This is the self-evolution unit: ingest all, train cumulative,
         measure per-domain forgetting (CE on each domain's own holdout),
         quantize to symbolic."""
         if sources:
             for name, data in sources:
-                (ROOT / "checkpoints" / "domains").mkdir(exist_ok=True,
-                        parents=True)
-                (ROOT / "checkpoints" / "domains" / f"{name}.bin")\
-                    .write_bytes(data)
+                (ROOT / "checkpoints" / "domains").mkdir(exist_ok=True, parents=True)
+                (ROOT / "checkpoints" / "domains" / f"{name}.bin").write_bytes(data)
                 self.ingest(name, data, epochs=epochs)
-        report = self.ingest("__evolve__", b"", epochs=epochs) \
-            if False else None
+        report = self.ingest("__evolve__", b"", epochs=epochs) if False else None
         # per-domain holdout CE (forgetting measure)
         ce_by = {}
         for name in self.domains:
             data = self._domain_bytes(name, self.domains[name])
             if not data:
                 continue
-            idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64) \
-                if (np := __import__("numpy")) else None
+            idx = (
+                np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+                if (np := __import__("numpy"))
+                else None
+            )
             if len(idx) < self.k + 32:
                 continue
             rng = np.random.default_rng(9)
             n = len(idx) - self.k
             sel = rng.choice(n, min(256, n), replace=False)
-            X = np.stack([idx[i:i + self.k] for i in sel])
+            X = np.stack([idx[i : i + self.k] for i in sel])
             yv = idx[sel + self.k]
             t = self.model.t
             ctx = t.as_tensor(X, dtype=t.long)
             nxt = t.as_tensor(yv, dtype=t.long)
             with t.no_grad():
-                ce = float(t.nn.functional.cross_entropy(
-                    self.model.logits(ctx), nxt))
+                ce = float(t.nn.functional.cross_entropy(self.model.logits(ctx), nxt))
             ce_by[name] = round(ce, 4)
         sym = self.to_symbolic()
-        return {"domains": len(self.domains), "ce_by_domain": ce_by,
-                "symbolic": sym}
+        return {"domains": len(self.domains), "ce_by_domain": ce_by, "symbolic": sym}

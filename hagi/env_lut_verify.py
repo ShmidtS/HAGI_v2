@@ -5,14 +5,12 @@ all saved probes, exact transition tables, ANFs, and shortest plans.
 """
 from __future__ import annotations
 from hagi.util import sha
-import argparse, json, random, hashlib
+import argparse, json, random
 from collections import deque, Counter
 from pathlib import Path
 
-
 N=16
 A=4
-
 
 def b(s,i): return (s>>i)&1
 

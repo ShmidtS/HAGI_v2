@@ -8,7 +8,7 @@ Standard library only. This is not a claim of general intelligence.
 """
 from __future__ import annotations
 from hagi.util import sha
-import argparse, hashlib, itertools, json, math, random, statistics, time
+import argparse, itertools, json, math, random, statistics, time
 from collections import deque
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -21,32 +21,25 @@ _PROBE_INDEX_CACHE = {}
 
 
 
-
 def bit(s, i):
     return (s >> i) & 1
 
-
 def lut2(lut, a, b):
     return (lut >> (a | (b << 1))) & 1
-
 
 def obs(s):
     # 4 latent bits -> 3 observed bits; x2 and x3 are aliased through parity.
     return bit(s, 0) | (bit(s, 1) << 1) | ((bit(s, 2) ^ bit(s, 3)) << 2)
 
-
 def clock(s):
     return (s + 1) & 15
-
 
 def rotate4(s):
     return ((s << 1) & 15) | (s >> 3)
 
-
 def toggle(s):
     # Fixed primitive: toggle x2 iff x0 and not x1.
     return s ^ (4 if (bit(s, 0) and not bit(s, 1)) else 0)
-
 
 def coupled(s, f, g):
     # Same-tick depth-2 composition. First update x0 using LUT2(x1,x2),
@@ -56,7 +49,6 @@ def coupled(s, f, g):
     nx3 = x3 ^ lut2(g, nx0, x1)
     return nx0 | (x1 << 1) | (x2 << 2) | (nx3 << 3)
 
-
 def deep_ood(s, f3, g):
     # Out-of-base-grammar action: 3-input LUT update of x0, followed by x3 update.
     x0, x1, x2, x3 = (bit(s, i) for i in range(4))
@@ -65,7 +57,6 @@ def deep_ood(s, f3, g):
     nx3 = x3 ^ lut2(g, nx0, x1)
     return nx0 | (x1 << 1) | (x2 << 2) | (nx3 << 3)
 
-
 def apply_role(s, role, f=0, g=0, ood=None):
     if role == "clock": return clock(s)
     if role == "shift": return rotate4(s)
@@ -73,7 +64,6 @@ def apply_role(s, role, f=0, g=0, ood=None):
     if role == "coupled": return coupled(s, f, g)
     if role == "deep_ood": return deep_ood(s, ood[0], ood[1])
     raise ValueError(role)
-
 
 @dataclass
 class World:
@@ -120,13 +110,10 @@ class World:
     def goal_test(self):
         return self.state == self.goal
 
-
 def transition_table(roles, f, g):
     return [[apply_role(s, roles[a], f, g) for a in range(N_ACTIONS)] for s in range(N_STATES)]
 
-
 def model_digest(table): return sha(table)
-
 
 def generate_models(clock_action):
     if clock_action in _MODEL_CACHE:
@@ -147,13 +134,11 @@ def generate_models(clock_action):
     _MODEL_CACHE[clock_action] = models
     return models
 
-
 def observation_signature_from_state(s, suffix_len):
     out = [obs(s)]
     for _ in range(suffix_len):
         s = clock(s); out.append(obs(s))
     return tuple(out)
-
 
 def identify_clock(world):
     expected = tuple(obs((i + 1) & 15) for i in range(16))
@@ -165,14 +150,12 @@ def identify_clock(world):
         if tuple(seq) == expected: matches.append(a)
     return (matches[0] if len(matches) == 1 else None), cost, len(matches)
 
-
 def probe_world(world, c_action, state, action, suffix_len):
     world.reset(); cost = 0
     for _ in range(state): world.step(c_action); cost += 1
     seq = [world.step(action)]; cost += 1
     for _ in range(suffix_len): seq.append(world.step(c_action)); cost += 1
     return tuple(seq), cost
-
 
 def query_signature(model, state, action, suffix_len, c_action):
     s = model["table"][state][action]
@@ -181,7 +164,6 @@ def query_signature(model, state, action, suffix_len, c_action):
         s = model["table"][s][c_action]
         out.append(obs(s))
     return tuple(out)
-
 
 def build_probe_index(c_action):
     """Precompute exact signature partitions for the finite hypothesis grammar.
@@ -208,7 +190,6 @@ def build_probe_index(c_action):
     _PROBE_INDEX_CACHE[c_action] = out
     return out
 
-
 def choose_active_probe_index(c_action, candidate_mask, used):
     models, partitions, _ = build_probe_index(c_action)
     n = candidate_mask.bit_count()
@@ -230,14 +211,12 @@ def choose_active_probe_index(c_action, candidate_mask, used):
             best = item
     return None if best is None else best[5]
 
-
 def entropy(groups, n):
     h=0.0
     for c in groups.values():
         p=c/n
         h -= p*math.log2(p)
     return h
-
 
 def choose_active_probe(models, c_action, used):
     rest = [a for a in range(N_ACTIONS) if a != c_action]
@@ -260,7 +239,6 @@ def choose_active_probe(models, c_action, used):
                 item=(score,-cost,-s,-a,-k,key,groups)
                 if best is None or item[:5] > best[:5]: best=item
     return None if best is None else best[5]
-
 
 def learn_active(world, initial_models=None, max_queries=80, strategy="active"):
     c_action, clock_cost, nclock = identify_clock(world)
@@ -331,12 +309,10 @@ def learn_active(world, initial_models=None, max_queries=80, strategy="active"):
     return {"status":"HOLD_AMBIGUOUS","clock_action":c_action,"clock_cost":clock_cost,
             "queries":q,"interactions":interactions,"evidence":evidence,"candidate_start":start_n,"candidate_left":len(models)}
 
-
 def decode_hidden_from_clock_signature(seq):
     # The 5-observation signature along clock uniquely identifies all 16 latent states.
     sigmap={observation_signature_from_state(s,4):s for s in range(16)}
     return sigmap.get(tuple(seq))
-
 
 def full_table_fallback(world, c_action):
     table=[[None]*N_ACTIONS for _ in range(N_STATES)]
@@ -354,7 +330,6 @@ def full_table_fallback(world, c_action):
     if any(v is None for row in table for v in row): raise AssertionError("incomplete table")
     return table,interactions,rows
 
-
 def apply_mobius(values, n):
     a=[int(v)&1 for v in values]
     for bit_i in range(n):
@@ -362,7 +337,6 @@ def apply_mobius(values, n):
         for x in range(1<<n):
             if x & step: a[x] ^= a[x^step]
     return [i for i,v in enumerate(a) if v]
-
 
 def table_to_anf(table):
     # Each action is a 4-input, 4-output deterministic state transition.
@@ -375,13 +349,11 @@ def table_to_anf(table):
         actions.append(outs)
     return actions
 
-
 def eval_anf(terms,s):
     out=0
     for t in terms:
         if (s&t)==t: out ^= 1
     return out
-
 
 def verify_table_anf(table, anfs):
     checks=0
@@ -391,7 +363,6 @@ def verify_table_anf(table, anfs):
             if got != table[s][a]: return False,checks,(s,a,got,table[s][a])
             checks += 1
     return True,checks,None
-
 
 def bfs_plan(table,start,goal):
     q=deque([start]); prev={start:None}; prev_a={}
@@ -408,7 +379,6 @@ def bfs_plan(table,start,goal):
         path.append(prev_a[cur]); cur=prev[cur]
     return list(reversed(path))
 
-
 def execute_plan(world, table, path, goal):
     world.reset(); s=0; trace=[]
     for a in path:
@@ -417,7 +387,6 @@ def execute_plan(world, table, path, goal):
         if observed != obs(pred): return False,trace,"observation mismatch"
         s=pred; trace.append({"action":a,"predicted_state":s,"observed":observed})
     return world.goal_test() and s==goal,trace,"ok" if world.goal_test() and s==goal else "goal mismatch"
-
 
 def make_world(seed, ood=False, same_dynamics=None, noisy=False, f3=None):
     rng=random.Random(seed ^ 0xC0FFEE)
@@ -435,7 +404,6 @@ def make_world(seed, ood=False, same_dynamics=None, noisy=False, f3=None):
             f3=rng.choice(choices)
     goal=rng.randrange(1,16)
     return World(seed,roles,f,g,goal,ood,f3,0,0,0,noisy,{})
-
 
 def audit_candidate_full(world, c_action, model):
     """Exhaustively check all 16 x 3 non-clock transitions via reset + clock addressing."""
@@ -457,7 +425,6 @@ def audit_candidate_full(world, c_action, model):
             "total_pairs":N_STATES*N_ACTIONS,"interactions":interactions,
             "pass":len(rows)==N_STATES*(N_ACTIONS-1) and not mismatches,"mismatches":mismatches,"rows":rows}
 
-
 def table_from_full_audit(audit, c_action):
     if not audit.get("complete") or len(audit.get("rows", [])) != N_STATES * (N_ACTIONS - 1):
         raise ValueError("cannot build table from incomplete audit")
@@ -475,7 +442,6 @@ def table_from_full_audit(audit, c_action):
     if any(v is None for row in table for v in row):
         raise ValueError("full audit left missing transitions")
     return table, audit["interactions"], rows
-
 
 def run_adversarial_unseen_transition(seed):
     """Construct an OOD environment differing at one state/action not sampled by learner."""
@@ -505,7 +471,6 @@ def run_adversarial_unseen_transition(seed):
             "target":list(target),"learner_status":learned["status"],"sampled_validation":learned.get("validation_status"),
             "full_audit_detected":not full["pass"],"pairs_checked":full["pairs_checked"],"mismatches":full["mismatches"]}
 
-
 def run_seed(seed, strategy="active"):
     world=make_world(seed)
     learned=learn_active(world,strategy=strategy)
@@ -522,7 +487,6 @@ def run_seed(seed, strategy="active"):
             "validation_status":learned.get("validation_status","NONE"),
             "goal":world.goal,"plan":path,"plan_length":len(path),
             "execution":trace,"execution_ok":ok,"reason":reason}
-
 
 def infer_deep_ood_rule(table, clock_action):
     """Recover a novel 3-input update followed by a 2-input update from the exact table."""
@@ -563,7 +527,6 @@ def infer_deep_ood_rule(table, clock_action):
             continue
         return {"action":action,"f3":f3,"g":g,"reconstructed_rows":N_STATES}
     return None
-
 
 def run_ood(seed):
     world = make_world(seed, ood=True)
@@ -606,7 +569,6 @@ def run_ood(seed):
             "true_f3": world.f3, "true_g": world.g,
             "inferred_novel_rule": inferred, "novel_rule_exact": rule_exact}
 
-
 def self_tests():
     tests=[]
     # Partial observation really aliases pairs, while 5-step clock observations identify every hidden state.
@@ -646,7 +608,6 @@ def self_tests():
     tests.append({"name":"recover_novel_three_input_lut_from_ood_full_table","pass":True,"trials":len(recovered)})
     return tests
 
-
 def exact_audit_record(run):
     if run.get("status") not in ("PASS_SAMPLED", "PASS"):
         return {"seed":run.get("seed"),"status":"HOLD_NO_CANDIDATE"}
@@ -661,7 +622,6 @@ def exact_audit_record(run):
             "pairs_checked":audit["pairs_checked"],"total_pairs":audit["total_pairs"],
             "interactions":audit["interactions"],"mismatches":audit["mismatches"],
             "candidate_digest":run.get("model_digest")}
-
 
 def run_panel(start_seed, n, outdir):
     outdir.mkdir(parents=True,exist_ok=True); active=[]; random_runs=[]; ood=[]
@@ -708,7 +668,6 @@ def run_panel(start_seed, n, outdir):
     (outdir/"random_exact_audits.json").write_text(json.dumps(random_exact,indent=2))
     (outdir/"panel_summary.json").write_text(json.dumps(summary,indent=2))
     return summary
-
 
 def main():
     ap=argparse.ArgumentParser()

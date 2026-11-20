@@ -6,7 +6,7 @@ serialized audit facts, checks all plans, query traces, model mappings, checkpoi
 and tamper cases.
 """
 from __future__ import annotations
-import argparse, hashlib, json
+import argparse, json
 from collections import deque
 from pathlib import Path
 

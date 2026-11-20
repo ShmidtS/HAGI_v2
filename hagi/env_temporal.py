@@ -14,12 +14,11 @@ This is a bounded synthetic system-identification experiment, not an AGI claim.
 """
 from __future__ import annotations
 from hagi.util import sha
-import argparse, hashlib, itertools, json, math, random, statistics, time
+import argparse, itertools, json, math, random, statistics, time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
-
 
 N_BITS = 5
 N_STATES = 1 << N_BITS
@@ -30,10 +29,8 @@ ROLES = ("xor", "guard", "delay")
 
 
 
-
 def clock_fn(s: int) -> int:
     return (s + 1) % N_STATES
-
 
 def role_fn(role: str, s: int, p: dict) -> int:
     if role == "clock":
@@ -51,7 +48,6 @@ def role_fn(role: str, s: int, p: dict) -> int:
             return low | 16
         return (low ^ int(p["delay_mask"]))
     raise ValueError(role)
-
 
 def generate_bank(n_models: int = 12) -> list[dict]:
     rng = random.Random(440044)
@@ -90,9 +86,7 @@ def generate_bank(n_models: int = 12) -> list[dict]:
             signatures.add(sig)
     return bank
 
-
 BANK = generate_bank()
-
 
 @dataclass
 class TemporalWorld:
@@ -159,7 +153,6 @@ class TemporalWorld:
             observed ^= 1  # deterministic repeat inconsistency, internal state remains correct.
         return observed
 
-
 @dataclass
 class AgentMemory:
     version: str = "4.4"
@@ -180,7 +173,6 @@ class AgentMemory:
         return cls(version=body["version"], contexts=body["contexts"],
                    history=body["history"], alerts=body["alerts"])
 
-
 def candidate_records(clock_action: int, model_ids: Iterable[int] | None = None) -> list[dict]:
     nonclock = [a for a in range(N_ACTIONS) if a != clock_action]
     mids = list(range(len(BANK))) if model_ids is None else list(model_ids)
@@ -191,13 +183,11 @@ def candidate_records(clock_action: int, model_ids: Iterable[int] | None = None)
             out.append({"model_id": mid, "mapping": mapping})
     return out
 
-
 def predict_candidate(cand: dict, params_bank: list[dict], state: int, action: int,
                       clock_action: int) -> int:
     if action == clock_action:
         return clock_fn(state)
     return role_fn(cand["mapping"][action], state, params_bank[cand["model_id"]])
-
 
 def identify_clock(world: TemporalWorld) -> tuple[int | None, dict, int]:
     """Find the unique +1 mod-32 action. If reset probes collide, verify full orbit."""
@@ -266,7 +256,6 @@ def identify_clock(world: TemporalWorld) -> tuple[int | None, dict, int]:
         return orbit_found[0], observations, cost
     return None, observations, cost
 
-
 def navigate_query(world: TemporalWorld, clock_action: int, current_state: int,
                    target_state: int, action: int) -> tuple[int, int, int]:
     nav = (target_state - current_state) % N_STATES
@@ -276,13 +265,11 @@ def navigate_query(world: TemporalWorld, clock_action: int, current_state: int,
     observed = world.step(action)
     return observed, nav, 1
 
-
 def query_pair(world: TemporalWorld, clock_action: int, current_state: int,
                pair: tuple[int, int]) -> tuple[int, int, int]:
     s, a = pair
     observed, nav, probes = navigate_query(world, clock_action, current_state, s, a)
     return observed, nav, probes
-
 
 def choose_pair(candidates: list[dict], untested: list[tuple[int, int]],
                 params_bank: list[dict], clock_action: int, current_state: int,
@@ -308,13 +295,11 @@ def choose_pair(candidates: list[dict], untested: list[tuple[int, int]],
             best_score, best_pair = score, (s, a)
     return best_pair
 
-
 def filter_candidates(candidates: list[dict], observations: dict[tuple[int, int], int],
                       params_bank: list[dict], clock_action: int) -> list[dict]:
     return [c for c in candidates if all(
         predict_candidate(c, params_bank, s, a, clock_action) == y
         for (s, a), y in observations.items())]
-
 
 def active_identify(world: TemporalWorld, clock_action: int, observations: dict,
                     current_state: int, strategy: str = "active", rng=None,
@@ -341,7 +326,6 @@ def active_identify(world: TemporalWorld, clock_action: int, observations: dict,
     return chosen, {"current_state": current_state, "nav_steps": nav_total,
                     "probe_queries": probe_total, "query_order": query_order,
                     "remaining_candidates": len(candidates)}
-
 
 def minimum_distinguishing_pairs(target_model: int, mapping: dict, params_bank: list[dict],
                                  clock_action: int, prior_observations: dict) -> list[tuple[int, int]]:
@@ -391,7 +375,6 @@ def minimum_distinguishing_pairs(target_model: int, mapping: dict, params_bank: 
     result.reverse()
     return result
 
-
 def build_candidate_table(cand: dict, clock_action: int, params_bank: list[dict]) -> list[list[int]]:
     table = [[0] * N_ACTIONS for _ in range(N_STATES)]
     for s in range(N_STATES):
@@ -399,7 +382,6 @@ def build_candidate_table(cand: dict, clock_action: int, params_bank: list[dict]
             if a == clock_action: table[s][a] = clock_fn(s)
             else: table[s][a] = role_fn(cand["mapping"][a], s, params_bank[cand["model_id"]])
     return table
-
 
 def full_table_learn(world: TemporalWorld, clock_action: int, observations: dict,
                      current_state: int) -> tuple[list[list[int]], dict]:
@@ -421,7 +403,6 @@ def full_table_learn(world: TemporalWorld, clock_action: int, observations: dict
     return table, {"current_state": current_state, "nav_steps": nav_total,
                    "probe_queries": probe_total, "query_order": query_order}
 
-
 def bfs_plan(table: list[list[int]], start: int, goal: int) -> list[int] | None:
     q = deque([start]); prev = {start: None}; prev_a = {}
     while q:
@@ -436,7 +417,6 @@ def bfs_plan(table: list[list[int]], start: int, goal: int) -> list[int] | None:
     while prev[s] is not None:
         path.append(prev_a[s]); s=prev[s]
     return list(reversed(path))
-
 
 class TemporalGrowthAgent:
     def __init__(self, memory: AgentMemory | None = None, strategy: str = "active"):
@@ -549,10 +529,8 @@ class TemporalGrowthAgent:
         self.memory.history.append(rec)
         return rec
 
-
 def random_action_roles(seed: int) -> tuple[str,...]:
     p=list(("clock",)+ROLES); random.Random(seed).shuffle(p); return tuple(p)
-
 
 def make_world(seed: int, model_id: int | None, context: str, goal: int,
                *, family=TRUSTED_FAMILY, issuer=TRUSTED_ISSUER,
@@ -560,7 +538,6 @@ def make_world(seed: int, model_id: int | None, context: str, goal: int,
     roles=roles or random_action_roles(seed)
     params=BANK[model_id] if model_id is not None else None
     return TemporalWorld(seed,model_id,roles,params,context,family,issuer,goal,out_of_family,noisy_repeat)
-
 
 def _audit_world(world: TemporalWorld) -> dict:
     if world.out_of_family:
@@ -570,7 +547,6 @@ def _audit_world(world: TemporalWorld) -> dict:
     return {"seed":world.seed,"model_id":world.model_id,"roles":list(world.action_roles),"goal":world.goal,
             "family":world.family,"issuer":world.issuer,"out_of_family":False,
             "params":dict(world.params)}
-
 
 def run_seed(seed: int) -> dict:
     rng=random.Random(seed)
@@ -609,7 +585,6 @@ def run_seed(seed: int) -> dict:
             "new_context":new_context,"new_context_audit":new_audit,"ood":ood,"ood_audit":ood_audit,
             "spoof":spoof,"spoof_audit":spoof_audit,"noisy":noisy,"noisy_audit":noisy_audit,
             "audits":audits,"checkpoint":cp,"checkpoint_roundtrip":restored.payload()==cp}
-
 
 def self_tests() -> list[dict]:
     out=[]
@@ -662,7 +637,6 @@ def self_tests() -> list[dict]:
     assert rejected
     out.append({"test":"checkpoint_tamper_rejected","pass":True})
     return out
-
 
 def run_panel(start_seed: int, n_seeds: int, outdir: Path) -> dict:
     outdir.mkdir(parents=True,exist_ok=True); runs=[]
@@ -732,7 +706,6 @@ def run_panel(start_seed: int, n_seeds: int, outdir: Path) -> dict:
     (outdir/"panel_runs.json").write_text(json.dumps(runs,indent=2,sort_keys=True))
     (outdir/"panel_summary.json").write_text(json.dumps(summary,indent=2,sort_keys=True))
     return summary
-
 
 def main():
     ap=argparse.ArgumentParser()

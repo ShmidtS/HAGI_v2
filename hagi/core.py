@@ -8,6 +8,7 @@ old star-import chain.
 
 Consolidation refactor 2026-11-17. Public names unchanged.
 """
+
 #!/usr/bin/env python3
 """HAGI unified — single-file build (v5 core + v7.4 + v8.4 + v9.0 layers)
 =========================================================================
@@ -56,24 +57,37 @@ Dependencies: Python >=3.10, NumPy.
 """
 
 
-
 VERSION = "5.0.0"
 V5_VERSION = VERSION
-
 
 
 # --- Legacy V5-V8 kernel body lives in hagi.legacy_kernel ---
 from hagi.legacy_kernel import *  # noqa: F401,F403
 from hagi.legacy_kernel import (  # noqa: F401 — private/CAPS used by V9
-    _exact_multivariate_poly_fit, _exact_poly_fit, _fit_poly_or_const,
-    _monomial_exponents, BINARY_OPS, COMMUTATIVE_OPS, CONSTS,
-    DYADIC_LEVELS, OPS, TOKEN_BITS, VAR_NAMES, _PRIME_MOD,
-    _bit_nand8, _bit_nor8, _bit_not8, _bit_xnor8, _pow_int, _sign,
+    _exact_multivariate_poly_fit,
+    _exact_poly_fit,
+    _fit_poly_or_const,
+    _monomial_exponents,
+    BINARY_OPS,
+    COMMUTATIVE_OPS,
+    CONSTS,
+    DYADIC_LEVELS,
+    OPS,
+    TOKEN_BITS,
+    VAR_NAMES,
+    _PRIME_MOD,
+    _bit_nand8,
+    _bit_nor8,
+    _bit_not8,
+    _bit_xnor8,
+    _pow_int,
+    _sign,
 )
 
 # ==============================================================================
 # 2. Task Specification & Benchmark Curriculum
 # ==============================================================================
+
 
 @dataclass
 class TaskSpec:
@@ -107,10 +121,22 @@ class TaskSpec:
 
 
 BOOL_NAMES = {
-    0: "BOOL_FALSE", 1: "BOOL_NOR", 2: "BOOL_NOT_X_AND_Y", 3: "BOOL_NOT_X",
-    4: "BOOL_X_AND_NOT_Y", 5: "BOOL_NOT_Y", 6: "BOOL_XOR", 7: "BOOL_NAND",
-    8: "BOOL_AND", 9: "BOOL_XNOR", 10: "BOOL_Y", 11: "BOOL_X_IMPLIES_Y",
-    12: "BOOL_X", 13: "BOOL_Y_IMPLIES_X", 14: "BOOL_OR", 15: "BOOL_TRUE",
+    0: "BOOL_FALSE",
+    1: "BOOL_NOR",
+    2: "BOOL_NOT_X_AND_Y",
+    3: "BOOL_NOT_X",
+    4: "BOOL_X_AND_NOT_Y",
+    5: "BOOL_NOT_Y",
+    6: "BOOL_XOR",
+    7: "BOOL_NAND",
+    8: "BOOL_AND",
+    9: "BOOL_XNOR",
+    10: "BOOL_Y",
+    11: "BOOL_X_IMPLIES_Y",
+    12: "BOOL_X",
+    13: "BOOL_Y_IMPLIES_X",
+    14: "BOOL_OR",
+    15: "BOOL_TRUE",
 }
 
 
@@ -118,16 +144,24 @@ def make_task_suite() -> list[TaskSpec]:
     suite: list[TaskSpec] = []
     bool_domain = ((0, 1), (0, 1))
     for mask, name in BOOL_NAMES.items():
-        suite.append(TaskSpec(
-            name, 2, bool_domain,
-            lambda x, y, m=mask: (m >> ((int(x) << 1) | int(y))) & 1,
-            family="BoolVenn",
-        ))
+        suite.append(
+            TaskSpec(
+                name,
+                2,
+                bool_domain,
+                lambda x, y, m=mask: (m >> ((int(x) << 1) | int(y))) & 1,
+                family="BoolVenn",
+            )
+        )
     U = tuple(range(-8, 9))
     unary = [
-        ("NEG", lambda x: -x), ("ABS", abs), ("SIGN", _sign),
-        ("SQUARE", lambda x: x * x), ("CUBE", lambda x: x * x * x),
-        ("BIT_NOT8", _bit_not8), ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),
+        ("NEG", lambda x: -x),
+        ("ABS", abs),
+        ("SIGN", _sign),
+        ("SQUARE", lambda x: x * x),
+        ("CUBE", lambda x: x * x * x),
+        ("BIT_NOT8", _bit_not8),
+        ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),
     ]
     for name, fn in unary:
         suite.append(TaskSpec(name, 1, (U,), fn, family="unary"))
@@ -137,8 +171,10 @@ def make_task_suite() -> list[TaskSpec]:
         ("MUL", lambda x, y: x * y, "all"),
         ("FLOORDIV", lambda x, y: x // y, "nonzero_y"),
         ("MOD", lambda x, y: x % y, "nonzero_y"),
-        ("GCD", math.gcd, "all"), ("LCM", math.lcm, "all"),
-        ("MIN", min, "all"), ("MAX", max, "all"),
+        ("GCD", math.gcd, "all"),
+        ("LCM", math.lcm, "all"),
+        ("MIN", min, "all"),
+        ("MAX", max, "all"),
         ("ABSDIFF", lambda x, y: abs(x - y), "all"),
         ("EQ", lambda x, y: int(x == y), "all"),
         ("NE", lambda x, y: int(x != y), "all"),
@@ -154,63 +190,128 @@ def make_task_suite() -> list[TaskSpec]:
         ("BIT_XNOR8", _bit_xnor8, "all"),
     ]
     for name, fn, valid in binary:
-        suite.append(TaskSpec(name, 2, (U, U), fn, valid_rule=valid, family="integer-binary"))
+        suite.append(
+            TaskSpec(name, 2, (U, U), fn, valid_rule=valid, family="integer-binary")
+        )
     P = tuple(range(-3, 4))
     E = tuple(range(0, 5))
     suite.append(TaskSpec("POW_INT", 2, (P, E), _pow_int, family="integer-binary"))
     Z = tuple(range(-8, 9))
     F = tuple(range(-4, 5))
-    suite.extend([
-        TaskSpec("FMA", 3, (Z, Z, Z), lambda x, y, z: x * y + z, family="composed-ternary"),
-        TaskSpec("CLAMP", 3, (Z, F, F), lambda x, lo, hi: min(max(x, lo), hi),
-                 valid_rule="ordered_yz", family="composed-ternary"),
-        TaskSpec("MEDIAN3", 3, (F, F, F), lambda x, y, z: sorted((x, y, z))[1],
-                 family="composed-ternary"),
-    ])
+    suite.extend(
+        [
+            TaskSpec(
+                "FMA",
+                3,
+                (Z, Z, Z),
+                lambda x, y, z: x * y + z,
+                family="composed-ternary",
+            ),
+            TaskSpec(
+                "CLAMP",
+                3,
+                (Z, F, F),
+                lambda x, lo, hi: min(max(x, lo), hi),
+                valid_rule="ordered_yz",
+                family="composed-ternary",
+            ),
+            TaskSpec(
+                "MEDIAN3",
+                3,
+                (F, F, F),
+                lambda x, y, z: sorted((x, y, z))[1],
+                family="composed-ternary",
+            ),
+        ]
+    )
     # --- physics: exact integer laws (polynomial-invariant stage covers) ---
     T2 = tuple(range(0, 3))
-    suite.extend([
-        TaskSpec("PHYS_FREE_FALL", 1, (tuple(range(0, 5)),), lambda t: 20 - 5 * t * t,
-                 family="physics"),
-        TaskSpec("PHYS_UNIFORM_MOTION", 1, (tuple(range(-3, 4)),),
-                 lambda t: 3 + 2 * t, family="physics"),
-        TaskSpec("PHYS_SPRING_ENERGY", 1, (tuple(range(-3, 4)),),
-                 lambda x: 3 * x * x, family="physics"),
-        TaskSpec("PHYS_MOMENTUM", 2, (tuple(range(0, 5)), tuple(range(-4, 5))),
-                 lambda m, v: m * v, family="physics"),
-    ])
+    suite.extend(
+        [
+            TaskSpec(
+                "PHYS_FREE_FALL",
+                1,
+                (tuple(range(0, 5)),),
+                lambda t: 20 - 5 * t * t,
+                family="physics",
+            ),
+            TaskSpec(
+                "PHYS_UNIFORM_MOTION",
+                1,
+                (tuple(range(-3, 4)),),
+                lambda t: 3 + 2 * t,
+                family="physics",
+            ),
+            TaskSpec(
+                "PHYS_SPRING_ENERGY",
+                1,
+                (tuple(range(-3, 4)),),
+                lambda x: 3 * x * x,
+                family="physics",
+            ),
+            TaskSpec(
+                "PHYS_MOMENTUM",
+                2,
+                (tuple(range(0, 5)), tuple(range(-4, 5))),
+                lambda m, v: m * v,
+                family="physics",
+            ),
+        ]
+    )
     # --- language: character codes 0..25 as the integer encoding ---
     A = tuple(range(0, 26))
     K = tuple(range(0, 26))
-    suite.extend([
-        TaskSpec("LANG_CAESAR3", 1, (A,), lambda c: (c + 3) % 26,
-                 family="language"),
-        TaskSpec("LANG_ATBASH", 1, (A,), lambda c: 25 - c, family="language"),
-        TaskSpec("LANG_IS_VOWEL", 1, (A,), lambda c: int(c in (0, 4, 8, 14, 20)),
-                 family="language"),
-        TaskSpec("LANG_SHIFT", 2, (A, K), lambda c, k: (c + k) % 26,
-                 family="language"),
-    ])
+    suite.extend(
+        [
+            TaskSpec(
+                "LANG_CAESAR3", 1, (A,), lambda c: (c + 3) % 26, family="language"
+            ),
+            TaskSpec("LANG_ATBASH", 1, (A,), lambda c: 25 - c, family="language"),
+            TaskSpec(
+                "LANG_IS_VOWEL",
+                1,
+                (A,),
+                lambda c: int(c in (0, 4, 8, 14, 20)),
+                family="language",
+            ),
+            TaskSpec(
+                "LANG_SHIFT", 2, (A, K), lambda c, k: (c + k) % 26, family="language"
+            ),
+        ]
+    )
     # --- full UTF-8 pool: byte space 0..255 (ANY unicode text is bytes) ---
     B = tuple(range(0, 256))
     BK = tuple(range(0, 256))
-    suite.extend([
-        TaskSpec("LANG8_ATBASH", 1, (B,), lambda c: 255 - c, family="language"),
-        TaskSpec("LANG8_CAESAR1", 1, (B,), lambda c: (c + 1) % 256,
-                 family="language"),
-        TaskSpec("LANG8_SHIFT", 2, (B, BK), lambda c, k: (c + k) % 256,
-                 family="language"),
-        TaskSpec("LANG8_XOR_CIPHER", 2, (B, BK), lambda c, k: c ^ k,
-                 family="language"),
-    ])
+    suite.extend(
+        [
+            TaskSpec("LANG8_ATBASH", 1, (B,), lambda c: 255 - c, family="language"),
+            TaskSpec(
+                "LANG8_CAESAR1", 1, (B,), lambda c: (c + 1) % 256, family="language"
+            ),
+            TaskSpec(
+                "LANG8_SHIFT", 2, (B, BK), lambda c, k: (c + k) % 256, family="language"
+            ),
+            TaskSpec(
+                "LANG8_XOR_CIPHER", 2, (B, BK), lambda c, k: c ^ k, family="language"
+            ),
+        ]
+    )
     # --- cyrillic codepoints (U+0400..U+04FF): not only Latin ---
     RU_VOWELS = set(map(ord, "аеёиоуыэюяАЕЁИОУЫЭЮЯ"))
     RU = tuple(range(0x400, 0x500))
-    suite.extend([
-        TaskSpec("LANG_RU_VOWEL", 1, (RU,), lambda c: int(c in RU_VOWELS),
-                 family="language"),
-    ])
+    suite.extend(
+        [
+            TaskSpec(
+                "LANG_RU_VOWEL",
+                1,
+                (RU,),
+                lambda c: int(c in RU_VOWELS),
+                family="language",
+            ),
+        ]
+    )
     return suite
+
 
 # ==============================================================================
 # 3. Call-DAG AST, ProgramV9 & Vectorized Evaluator
@@ -236,7 +337,9 @@ class ExprV9:
     def const(v: int) -> "ExprV9":
         return ExprV9("const", (), int(v))
 
-    def eval(self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None) -> int:
+    def eval(
+        self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None
+    ) -> int:
         if self.op == "var":
             return int(xs[int(self.value)])
         if self.op == "const":
@@ -247,7 +350,9 @@ class ExprV9:
             vals = tuple(a.eval(xs, env) for a in self.args)
             callee = env[self.value]
             if not callee.supports(vals):
-                raise ValueError(f"call to {self.value} outside certified support: {vals}")
+                raise ValueError(
+                    f"call to {self.value} outside certified support: {vals}"
+                )
             return callee.program.eval(vals, env)
         if self.op == "anf":
             n_vars, coeffs = self.value
@@ -265,7 +370,9 @@ class ExprV9:
             return int(acc)
         if self.op == "if_cond":
             cond_val = self.args[0].eval(xs, env)
-            return self.args[1].eval(xs, env) if cond_val else self.args[2].eval(xs, env)
+            return (
+                self.args[1].eval(xs, env) if cond_val else self.args[2].eval(xs, env)
+            )
         vals = [a.eval(xs, env) for a in self.args]
         if self.op == "poly":
             acc = 0
@@ -274,7 +381,7 @@ class ExprV9:
             return int(acc)
         if self.op == "poly_nd":
             total = 0
-            for coef, powers in (self.value or ()):
+            for coef, powers in self.value or ():
                 term = int(coef)
                 for x_val, p in zip(xs, powers):
                     term *= int(x_val) ** int(p)
@@ -294,6 +401,7 @@ class ExprV9:
             return vals[0] * vals[1] * vals[2]
         if self.op == "construct":
             from hagi.representations import construct_eval
+
             return construct_eval(self.value, xs, env)
         fn = REIFIED_OPS.get(self.op)
         if fn is not None:
@@ -316,6 +424,7 @@ class ExprV9:
                 c = 1 + len(self.value or ())
             elif self.op == "construct":
                 from hagi.representations import construct_bits as _cb
+
                 c = 1 + _cb(self.value)
             else:
                 c = 1 + sum(a.cost for a in self.args)
@@ -329,7 +438,11 @@ class ExprV9:
             return TOKEN_BITS + gamma_bits(zigzag(int(self.value)) + 1)
         if self.op == "call":
             idx = expert_index.get(str(self.value), 0) if expert_index else 0
-            return TOKEN_BITS + gamma_bits(idx + 1) + sum(a.bits(expert_index) for a in self.args)
+            return (
+                TOKEN_BITS
+                + gamma_bits(idx + 1)
+                + sum(a.bits(expert_index) for a in self.args)
+            )
         if self.op == "anf":
             n_vars, coeffs = self.value
             payload = gamma_bits(n_vars + 1) + gamma_bits(len(coeffs) + 1)
@@ -337,7 +450,9 @@ class ExprV9:
             return TOKEN_BITS + payload
         if self.op == "poly":
             coeffs = tuple(int(v) for v in (self.value or ()))
-            payload = gamma_bits(len(coeffs) + 1) + sum(gamma_bits(zigzag(v) + 1) for v in coeffs)
+            payload = gamma_bits(len(coeffs) + 1) + sum(
+                gamma_bits(zigzag(v) + 1) for v in coeffs
+            )
             return TOKEN_BITS + payload + sum(a.bits(expert_index) for a in self.args)
         if self.op == "poly_nd":
             terms = tuple(self.value or ())
@@ -362,7 +477,9 @@ class ExprV9:
             return mapping.get(idx, self)
         if not self.args:
             return self
-        return ExprV9(self.op, tuple(a.substitute(mapping) for a in self.args), self.value)
+        return ExprV9(
+            self.op, tuple(a.substitute(mapping) for a in self.args), self.value
+        )
 
     def subtrees(self) -> list["ExprV9"]:
         out = [self]
@@ -375,7 +492,11 @@ class ExprV9:
             return replacement
         if not self.args:
             return self
-        return ExprV9(self.op, tuple(a.replace_subtree(target, replacement) for a in self.args), self.value)
+        return ExprV9(
+            self.op,
+            tuple(a.replace_subtree(target, replacement) for a in self.args),
+            self.value,
+        )
 
     def pretty(self) -> str:
         if self.op == "var":
@@ -392,8 +513,11 @@ class ExprV9:
                 if s == 0:
                     terms.append("1")
                 else:
-                    vs = [VAR_NAMES[i] if i < len(VAR_NAMES) else f"x{i}"
-                          for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1]
+                    vs = [
+                        VAR_NAMES[i] if i < len(VAR_NAMES) else f"x{i}"
+                        for i in range(n_vars)
+                        if (s >> (n_vars - 1 - i)) & 1
+                    ]
                     terms.append("&".join(vs))
             return "anf(" + (" ^ ".join(terms) if terms else "0") + ")"
         if self.op == "if_cond":
@@ -415,7 +539,9 @@ class ExprV9:
             return "poly(" + ("".join(terms) if terms else "0") + ")"
         if self.op == "poly_nd":
             terms = []
-            for coef, powers in sorted((self.value or ()), key=lambda it: (sum(it[1]), it[1]), reverse=True):
+            for coef, powers in sorted(
+                (self.value or ()), key=lambda it: (sum(it[1]), it[1]), reverse=True
+            ):
                 c = int(coef)
                 if c == 0:
                     continue
@@ -425,7 +551,7 @@ class ExprV9:
                     if p == 0:
                         continue
                     nm = VAR_NAMES[idx] if idx < len(VAR_NAMES) else f"x{idx}"
-                  
+
                 body = "*".join(factors) if factors else str(abs(c))
                 if factors and abs(c) != 1:
                     body = f"{abs(c)}*{body}"
@@ -458,6 +584,7 @@ class ExprV9:
             val = [int(val[0]), [[int(s), int(c)] for s, c in val[1]]]
         elif self.op == "construct" and isinstance(val, dict):
             from hagi.representations import construct_to_dict_safe
+
             val = construct_to_dict_safe(val)
         return {"op": self.op, "value": val, "args": [a.to_dict() for a in self.args]}
 
@@ -473,6 +600,7 @@ class ExprV9:
             val = (int(val[0]), tuple((int(s), int(c)) for s, c in val[1]))
         elif op == "construct" and isinstance(val, dict):
             from hagi.representations import construct_from_dict_safe
+
             val = construct_from_dict_safe(val)
         return ExprV9(op, tuple(ExprV9.from_dict(a) for a in d.get("args", [])), val)
 
@@ -485,7 +613,11 @@ class ProgramV9:
 
     @property
     def cost(self) -> int:
-        return 4 if self.venn_mask is not None else (self.expr.cost if self.expr else 10**9)
+        return (
+            4
+            if self.venn_mask is not None
+            else (self.expr.cost if self.expr else 10**9)
+        )
 
     def bits(self, expert_index: Optional[dict[str, int]] = None) -> int:
         if self.venn_mask is not None:
@@ -494,7 +626,9 @@ class ProgramV9:
             return 10**9
         return self.expr.bits(expert_index)
 
-    def eval(self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None) -> int:
+    def eval(
+        self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None
+    ) -> int:
         if len(xs) != self.arity:
             raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")
         if self.venn_mask is not None:
@@ -512,8 +646,11 @@ class ProgramV9:
         return self.expr.pretty()
 
     def to_dict(self) -> dict[str, Any]:
-        return {"arity": self.arity, "venn_mask": self.venn_mask,
-                "expr": self.expr.to_dict() if self.expr else None}
+        return {
+            "arity": self.arity,
+            "venn_mask": self.venn_mask,
+            "expr": self.expr.to_dict() if self.expr else None,
+        }
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "ProgramV9":
@@ -527,7 +664,9 @@ class ProgramV9:
 _VEC_MAG_LIMIT = 1 << 28
 
 
-def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9"]] = None) -> tuple[np.ndarray, np.ndarray]:
+def eval_expr_vec(
+    expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9"]] = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Conservative vectorized int64 evaluator (ok=False lanes -> scalar authority)."""
     N = X.shape[0]
     op = expr.op
@@ -558,9 +697,9 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
             else:
                 ok &= np.isin(subX[:, i], dom)
         if callee.valid_rule == "nonzero_y":
-            ok &= (subX[:, 1] != 0)
+            ok &= subX[:, 1] != 0
         elif callee.valid_rule == "ordered_yz":
-            ok &= (subX[:, 1] <= subX[:, 2])
+            ok &= subX[:, 1] <= subX[:, 2]
         if not np.any(ok):
             return np.zeros(N, dtype=np.int64), ok
         if callee.program.venn_mask is not None:
@@ -581,14 +720,14 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
         v, ok = eval_expr_vec(expr.args[0], X, env)
         acc = np.zeros(N, dtype=np.int64)
         for ci in reversed(list(expr.value or ())):
-            ok &= (np.abs(acc) <= _VEC_MAG_LIMIT)
+            ok &= np.abs(acc) <= _VEC_MAG_LIMIT
             acc = np.where(ok, acc * v + int(ci), 0)
-        ok &= (np.abs(acc) <= _VEC_MAG_LIMIT)
+        ok &= np.abs(acc) <= _VEC_MAG_LIMIT
         return acc, ok
     if op == "poly_nd":
         acc = np.zeros(N, dtype=np.int64)
         ok = np.ones(N, dtype=bool)
-        for coef, powers in (expr.value or ()):
+        for coef, powers in expr.value or ():
             term = np.full(N, int(coef), dtype=np.int64)
             for idx, p in enumerate(powers):
                 if p:
@@ -596,7 +735,7 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
                     safe_x = np.where(ok, X[:, idx], 0)
                     term = np.where(ok, term * (safe_x ** int(p)), 0)
             acc = np.where(ok, acc + term, 0)
-        ok &= (np.abs(acc) <= _VEC_MAG_LIMIT)
+        ok &= np.abs(acc) <= _VEC_MAG_LIMIT
         return acc, ok
     if op == "anf":
         n_vars, coeffs = expr.value
@@ -616,56 +755,86 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
         v, aok = eval_expr_vec(a, X, env)
         vs.append(v)
         ok &= aok
-    if op == "neg": res = -vs[0]
-    elif op == "abs": res = np.abs(vs[0])
-    elif op == "sign": res = np.sign(vs[0]).astype(np.int64)
-    elif op == "bit_not8": res = (~vs[0]) & 0xFF
-    elif op == "clamp3": res = np.clip(vs[0], -3, 3)
+    if op == "neg":
+        res = -vs[0]
+    elif op == "abs":
+        res = np.abs(vs[0])
+    elif op == "sign":
+        res = np.sign(vs[0]).astype(np.int64)
+    elif op == "bit_not8":
+        res = (~vs[0]) & 0xFF
+    elif op == "clamp3":
+        res = np.clip(vs[0], -3, 3)
     elif op == "square":
-        ok &= (np.abs(vs[0]) <= 32768)
+        ok &= np.abs(vs[0]) <= 32768
         s0 = np.where(ok, vs[0], 0)
         res = s0 * s0
     elif op == "cube":
-        ok &= (np.abs(vs[0]) <= 1024)
+        ok &= np.abs(vs[0]) <= 1024
         s0 = np.where(ok, vs[0], 0)
         res = s0 * s0 * s0
-    elif op == "absdiff": res = np.abs(vs[0] - vs[1])
+    elif op == "absdiff":
+        res = np.abs(vs[0] - vs[1])
     elif op == "fma":
         ok &= (np.abs(vs[0]) <= 32768) & (np.abs(vs[1]) <= 32768)
-        s0 = np.where(ok, vs[0], 0); s1 = np.where(ok, vs[1], 0)
+        s0 = np.where(ok, vs[0], 0)
+        s1 = np.where(ok, vs[1], 0)
         res = s0 * s1 + vs[2]
-    elif op == "clamp": res = np.minimum(np.maximum(vs[0], vs[1]), vs[2])
-    elif op == "median3": res = np.sort(np.stack(vs, axis=0), axis=0)[1]
+    elif op == "clamp":
+        res = np.minimum(np.maximum(vs[0], vs[1]), vs[2])
+    elif op == "median3":
+        res = np.sort(np.stack(vs, axis=0), axis=0)[1]
     elif op == "mul3":
-        ok &= (np.abs(vs[0]) <= 1024) & (np.abs(vs[1]) <= 1024) & (np.abs(vs[2]) <= 1024)
-        s0 = np.where(ok, vs[0], 0); s1 = np.where(ok, vs[1], 0); s2 = np.where(ok, vs[2], 0)
+        ok &= (
+            (np.abs(vs[0]) <= 1024) & (np.abs(vs[1]) <= 1024) & (np.abs(vs[2]) <= 1024)
+        )
+        s0 = np.where(ok, vs[0], 0)
+        s1 = np.where(ok, vs[1], 0)
+        s2 = np.where(ok, vs[2], 0)
         res = s0 * s1 * s2
-    elif op == "add": res = vs[0] + vs[1]
-    elif op == "sub": res = vs[0] - vs[1]
+    elif op == "add":
+        res = vs[0] + vs[1]
+    elif op == "sub":
+        res = vs[0] - vs[1]
     elif op == "mul":
         ok &= (np.abs(vs[0]) <= 32768) & (np.abs(vs[1]) <= 32768)
-        s0 = np.where(ok, vs[0], 0); s1 = np.where(ok, vs[1], 0)
+        s0 = np.where(ok, vs[0], 0)
+        s1 = np.where(ok, vs[1], 0)
         res = s0 * s1
-    elif op == "min": res = np.minimum(vs[0], vs[1])
-    elif op == "max": res = np.maximum(vs[0], vs[1])
-    elif op == "eq": res = (vs[0] == vs[1]).astype(np.int64)
-    elif op == "ne": res = (vs[0] != vs[1]).astype(np.int64)
-    elif op == "lt": res = (vs[0] < vs[1]).astype(np.int64)
-    elif op == "le": res = (vs[0] <= vs[1]).astype(np.int64)
-    elif op == "gt": res = (vs[0] > vs[1]).astype(np.int64)
-    elif op == "ge": res = (vs[0] >= vs[1]).astype(np.int64)
-    elif op == "bit_and": res = vs[0] & vs[1]
-    elif op == "bit_or": res = vs[0] | vs[1]
-    elif op == "bit_xor": res = vs[0] ^ vs[1]
-    elif op == "bit_nand8": res = (~(vs[0] & vs[1])) & 0xFF
-    elif op == "bit_nor8": res = (~(vs[0] | vs[1])) & 0xFF
-    elif op == "bit_xnor8": res = (~(vs[0] ^ vs[1])) & 0xFF
+    elif op == "min":
+        res = np.minimum(vs[0], vs[1])
+    elif op == "max":
+        res = np.maximum(vs[0], vs[1])
+    elif op == "eq":
+        res = (vs[0] == vs[1]).astype(np.int64)
+    elif op == "ne":
+        res = (vs[0] != vs[1]).astype(np.int64)
+    elif op == "lt":
+        res = (vs[0] < vs[1]).astype(np.int64)
+    elif op == "le":
+        res = (vs[0] <= vs[1]).astype(np.int64)
+    elif op == "gt":
+        res = (vs[0] > vs[1]).astype(np.int64)
+    elif op == "ge":
+        res = (vs[0] >= vs[1]).astype(np.int64)
+    elif op == "bit_and":
+        res = vs[0] & vs[1]
+    elif op == "bit_or":
+        res = vs[0] | vs[1]
+    elif op == "bit_xor":
+        res = vs[0] ^ vs[1]
+    elif op == "bit_nand8":
+        res = (~(vs[0] & vs[1])) & 0xFF
+    elif op == "bit_nor8":
+        res = (~(vs[0] | vs[1])) & 0xFF
+    elif op == "bit_xnor8":
+        res = (~(vs[0] ^ vs[1])) & 0xFF
     elif op == "floordiv":
-        ok &= (vs[1] != 0)
+        ok &= vs[1] != 0
         safe = np.where(vs[1] != 0, vs[1], 1)
         res = np.floor_divide(vs[0], safe)
     elif op == "mod":
-        ok &= (vs[1] != 0)
+        ok &= vs[1] != 0
         safe = np.where(vs[1] != 0, vs[1], 1)
         res = np.mod(vs[0], safe)
     elif op == "gcd":
@@ -674,11 +843,12 @@ def eval_expr_vec(expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9
         res = np.lcm(vs[0], vs[1])
     elif op == "pow_int":
         ok &= (vs[1] >= 0) & (vs[1] <= 8) & (np.abs(vs[0]) <= 32)
-        sa = np.where(ok, vs[0], 0); sb = np.where(ok, vs[1], 0)
-        res = sa ** sb
+        sa = np.where(ok, vs[0], 0)
+        sb = np.where(ok, vs[1], 0)
+        res = sa**sb
     else:
         raise ValueError(f"unsupported vec op: {op}")
-    ok &= (np.abs(res) <= _VEC_MAG_LIMIT)
+    ok &= np.abs(res) <= _VEC_MAG_LIMIT
     return res, ok
 
 
@@ -688,8 +858,12 @@ def candidate_programs_v9(arity: int) -> list[ProgramV9]:
     if arity == 1:
         x = v[0]
         cands += [
-            ExprV9("neg", (x,)), ExprV9("abs", (x,)), ExprV9("sign", (x,)),
-            ExprV9("bit_not8", (x,)), ExprV9("square", (x,)), ExprV9("cube", (x,)),
+            ExprV9("neg", (x,)),
+            ExprV9("abs", (x,)),
+            ExprV9("sign", (x,)),
+            ExprV9("bit_not8", (x,)),
+            ExprV9("square", (x,)),
+            ExprV9("cube", (x,)),
             ExprV9("clamp3", (x,)),
         ]
     elif arity == 2:
@@ -700,27 +874,35 @@ def candidate_programs_v9(arity: int) -> list[ProgramV9]:
     elif arity == 3:
         x, y, z = v
         cands += [
-            ExprV9("fma", (x, y, z)), ExprV9("clamp", (x, y, z)),
-            ExprV9("median3", (x, y, z)), ExprV9("mul3", (x, y, z)),
+            ExprV9("fma", (x, y, z)),
+            ExprV9("clamp", (x, y, z)),
+            ExprV9("median3", (x, y, z)),
+            ExprV9("mul3", (x, y, z)),
         ]
     by_text = {}
     for e in cands:
         by_text.setdefault(e.pretty(), e)
-    return [ProgramV9(arity, e) for e in sorted(by_text.values(), key=lambda e: (e.cost, e.pretty()))]
+    return [
+        ProgramV9(arity, e)
+        for e in sorted(by_text.values(), key=lambda e: (e.cost, e.pretty()))
+    ]
 
 
 # ==============================================================================
 # 4. VennHead + 13-Byte VennPacking + ANF Zhegalkin / compose3 + Hadamard + 5-Trit Codec
 # ==============================================================================
 
+
 def venn_atoms(s1: np.ndarray, s2: np.ndarray) -> np.ndarray:
     """Exact 4-ReLU-neuron Venn atom basis on {-1, +1} inputs (C242)."""
-    return np.column_stack([
-        np.maximum(0.0, (-s1 - s2) * 0.5),
-        np.maximum(0.0, (-s1 + s2) * 0.5),
-        np.maximum(0.0, (s1 - s2) * 0.5),
-        np.maximum(0.0, (s1 + s2) * 0.5),
-    ])
+    return np.column_stack(
+        [
+            np.maximum(0.0, (-s1 - s2) * 0.5),
+            np.maximum(0.0, (-s1 + s2) * 0.5),
+            np.maximum(0.0, (s1 - s2) * 0.5),
+            np.maximum(0.0, (s1 + s2) * 0.5),
+        ]
+    )
 
 
 def venn_head_eval(mask: int, x_bin: Sequence[int]) -> int:
@@ -739,7 +921,7 @@ def pack_venn_16_flat() -> bytes:
     out = bytearray()
     for off in range(0, len(trits), 5):
         b = 0
-        for t in trits[off:off + 5]:
+        for t in trits[off : off + 5]:
             b = b * 3 + t
         out.append(b)
     assert len(out) == 13
@@ -792,8 +974,9 @@ def anf_eval(coeffs: Sequence[int], n_vars: int, xs: Sequence[int]) -> int:
     return acc
 
 
-def anf_compose3(f_bool: Callable[[int, int], int],
-                 g_tt: Sequence[int], h_tt: Sequence[int]) -> list[int]:
+def anf_compose3(
+    f_bool: Callable[[int, int], int], g_tt: Sequence[int], h_tt: Sequence[int]
+) -> list[int]:
     """C302 compose3(f, g, h)(x) = f(g(x), h(x)) ANF transform."""
     assert len(g_tt) == len(h_tt)
     tt = [int(f_bool(int(g_tt[i]) & 1, int(h_tt[i]) & 1)) & 1 for i in range(len(g_tt))]
@@ -820,7 +1003,9 @@ def anf_to_expr_v9(coeffs: Sequence[int], n_vars: int) -> ExprV9:
             if s == 0:
                 mons.append(ExprV9.const(1))
             else:
-                vs = [ExprV9.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1]
+                vs = [
+                    ExprV9.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1
+                ]
                 t = vs[0]
                 for v in vs[1:]:
                     t = ExprV9("bit_and", (t, v))
@@ -842,7 +1027,7 @@ def sylvester_hadamard(k: int) -> np.ndarray:
     H = np.array([[1.0]], dtype=np.float64)
     for _ in range(k):
         H = np.block([[H, H], [H, -H]])
-    H /= math.sqrt(2 ** k)
+    H /= math.sqrt(2**k)
     _HADAMARD_CACHE[k] = H
     return H
 
@@ -856,7 +1041,9 @@ def block_hadamard_rotate(v: np.ndarray, blk_size: int = 8) -> tuple[np.ndarray,
     return (vp @ H).ravel(), n
 
 
-def block_hadamard_unrotate(vr: np.ndarray, orig_n: int, blk_size: int = 8) -> np.ndarray:
+def block_hadamard_unrotate(
+    vr: np.ndarray, orig_n: int, blk_size: int = 8
+) -> np.ndarray:
     H = sylvester_hadamard(int(round(math.log2(blk_size))))
     nb = vr.size // blk_size
     return (vr.reshape(nb, blk_size) @ H.T).ravel()[:orig_n]
@@ -871,7 +1058,7 @@ def quantize_5block_exact(blk: np.ndarray) -> tuple[np.ndarray, tuple[int, int, 
     if m < 1e-15:
         return np.zeros_like(blk), (0, 0, 121)
     exp2 = max(-126, min(126, math.ceil(math.log2(m / 1.5 + 1e-18))))
-    sc = 2.0 ** exp2
+    sc = 2.0**exp2
     bn = blk / sc
     s = DYADIC_LEVELS[:, None]
     ratio = bn[None, :] / s
@@ -900,7 +1087,7 @@ def pack_vector_dyadic5(vec: np.ndarray, stages: int = 2) -> tuple[bytes, np.nda
     rem = vp.copy()
     for _ in range(stages):
         for b in range(nblk):
-            blk = rem[b * 5:(b + 1) * 5]
+            blk = rem[b * 5 : (b + 1) * 5]
             q_blk, (exp2, best, bval) = quantize_5block_exact(blk)
             if exp2 == 0 and best == 0 and bval == 121:
                 buf.append(255)
@@ -908,7 +1095,7 @@ def pack_vector_dyadic5(vec: np.ndarray, stages: int = 2) -> tuple[bytes, np.nda
                 buf.append(exp2 + 128)
                 buf.append(best)
                 buf.append(bval)
-            rem[b * 5:(b + 1) * 5] -= q_blk
+            rem[b * 5 : (b + 1) * 5] -= q_blk
     raw = bytes(buf)
     return raw, unpack_vector_dyadic5(raw)
 
@@ -921,24 +1108,29 @@ def unpack_vector_dyadic5(buf: bytes) -> np.ndarray:
     pos = 3
     for _ in range(stages):
         for b in range(nblk):
-            tag = buf[pos]; pos += 1
+            tag = buf[pos]
+            pos += 1
             if tag == 255:
                 continue
             exp2 = tag - 128
-            best = buf[pos]; pos += 1
-            bval = buf[pos]; pos += 1
-            sc = 2.0 ** exp2
+            best = buf[pos]
+            pos += 1
+            bval = buf[pos]
+            pos += 1
+            sc = 2.0**exp2
             lvl = float(DYADIC_LEVELS[best])
             trits = [0] * 5
             v = bval
             for i in range(4, -1, -1):
                 trits[i] = (v % 3) - 1
                 v //= 3
-            out[b * 5:(b + 1) * 5] += np.array(trits, dtype=np.float64) * (lvl * sc)
+            out[b * 5 : (b + 1) * 5] += np.array(trits, dtype=np.float64) * (lvl * sc)
     return out[:n]
 
 
-def pack_bitalloc_records(k: int, idx_sorted: np.ndarray, records: list[tuple[int, tuple[int, int, int]]]) -> bytes:
+def pack_bitalloc_records(
+    k: int, idx_sorted: np.ndarray, records: list[tuple[int, tuple[int, int, int]]]
+) -> bytes:
     n_blocks = (k + 4) // 5
     buf = bytearray()
     buf.append(int(k))
@@ -965,28 +1157,36 @@ def pack_bitalloc_records(k: int, idx_sorted: np.ndarray, records: list[tuple[in
 
 def unpack_bitalloc_records(buf: bytes, D: int) -> np.ndarray:
     pos = 0
-    k = buf[pos]; pos += 1
-    wide = buf[pos]; pos += 1
+    k = buf[pos]
+    pos += 1
+    wide = buf[pos]
+    pos += 1
     idx_sorted = []
     for _ in range(k):
         if wide:
-            idx_sorted.append(int.from_bytes(buf[pos:pos + 2], "little")); pos += 2
+            idx_sorted.append(int.from_bytes(buf[pos : pos + 2], "little"))
+            pos += 2
         else:
-            idx_sorted.append(buf[pos]); pos += 1
-    n_rec = buf[pos]; pos += 1
+            idx_sorted.append(buf[pos])
+            pos += 1
+    n_rec = buf[pos]
+    pos += 1
     n_blocks = (k + 4) // 5
     wq_s = np.zeros(k, dtype=np.float64)
     for ri in range(n_rec):
         blk_id = ri if ri < n_blocks else buf[pos]
         if ri >= n_blocks:
             pos += 1
-        tag = buf[pos]; pos += 1
+        tag = buf[pos]
+        pos += 1
         if tag == 255:
             continue
         exp2 = tag - 128
-        best = buf[pos]; pos += 1
-        bval = buf[pos]; pos += 1
-        sc = 2.0 ** exp2
+        best = buf[pos]
+        pos += 1
+        bval = buf[pos]
+        pos += 1
+        sc = 2.0**exp2
         lvl = float(DYADIC_LEVELS[best])
         trits = [0] * 5
         v = bval
@@ -994,7 +1194,7 @@ def unpack_bitalloc_records(buf: bytes, D: int) -> np.ndarray:
             trits[i] = (v % 3) - 1
             v //= 3
         sl = slice(blk_id * 5, min((blk_id + 1) * 5, k))
-        wq_s[sl] += np.array(trits[:sl.stop - sl.start], dtype=np.float64) * (lvl * sc)
+        wq_s[sl] += np.array(trits[: sl.stop - sl.start], dtype=np.float64) * (lvl * sc)
     out = np.zeros(D, dtype=np.float64)
     if k > 0:
         out[np.array(idx_sorted, dtype=np.int64)] = wq_s
@@ -1004,6 +1204,7 @@ def unpack_bitalloc_records(buf: bytes, D: int) -> np.ndarray:
 # ==============================================================================
 # 5. Range-Safe Log-Linear CE, BF16 Guard, EF21-Muon, Continual GPM & Neural Core
 # ==============================================================================
+
 
 def bf16_nearest_float(x: float) -> float:
     """IEEE-754 BF16 round-to-nearest-even (relative error <= 2^-8 in normal binade)."""
@@ -1028,14 +1229,18 @@ def batch_logit_safe_step_ce(
     """C223/C230/C249: Certified range-safe step eta = 4*A / (Q' + 4*curv) + BF16 4*eps gate."""
     B, d = X_feat.shape
     theta = np.zeros((num_classes, d), dtype=np.float64)
-    reg = np.zeros(d, dtype=np.float64) if l2_reg is None else np.asarray(l2_reg, dtype=np.float64)
+    reg = (
+        np.zeros(d, dtype=np.float64)
+        if l2_reg is None
+        else np.asarray(l2_reg, dtype=np.float64)
+    )
 
     def ce_loss(th: np.ndarray) -> float:
         lg = X_feat @ th.T
         lg_s = lg - np.max(lg, axis=1, keepdims=True)
         lse = np.max(lg, axis=1) + np.log(np.sum(np.exp(lg_s), axis=1))
         target_l = lg[np.arange(B), y_int]
-        reg_term = 0.5 * float(np.sum(reg[None, :] * (th ** 2)))
+        reg_term = 0.5 * float(np.sum(reg[None, :] * (th**2)))
         return float(np.mean(lse - target_l)) + reg_term
 
     loss0 = ce_loss(theta)
@@ -1058,13 +1263,15 @@ def batch_logit_safe_step_ce(
         d_logits = X_feat @ D.T
         r_prime = np.max(d_logits, axis=1) - np.min(d_logits, axis=1)
         Q_prime = float(np.mean(r_prime * r_prime))
-        curv_reg = 2.0 * float(np.max(reg)) * float(np.sum(D * D)) if np.any(reg > 0) else 0.0
+        curv_reg = (
+            2.0 * float(np.max(reg)) * float(np.sum(D * D)) if np.any(reg > 0) else 0.0
+        )
         denom = Q_prime + 4.0 * curv_reg
         if denom <= 1e-18:
             held += 1
             break
         eta = 4.0 * A / denom
-        cert_drop = 2.0 * (A ** 2) / denom
+        cert_drop = 2.0 * (A**2) / denom
         cand = theta + eta * D
         if use_bf16_guard:
             cand_bf = bf16_vec(cand)
@@ -1124,7 +1331,11 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
         self.ef_v = np.zeros_like(self.W)
 
     def snapshot_optimizer(self) -> dict[str, np.ndarray]:
-        return {"W": self.W.copy(), "U_basis": self.U_basis.copy(), "ef_v": self.ef_v.copy()}
+        return {
+            "W": self.W.copy(),
+            "U_basis": self.U_basis.copy(),
+            "ef_v": self.ef_v.copy(),
+        }
 
     def restore_optimizer(self, snap: dict[str, np.ndarray]) -> None:
         self.W = snap["W"].copy()
@@ -1136,7 +1347,9 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
             return G
         return G - self.U_basis @ (self.U_basis.T @ G)
 
-    def _train_task_ef21_muon_cpu(self, X: np.ndarray, Y: np.ndarray, steps: int = 35, lr: float = 0.2) -> float:
+    def _train_task_ef21_muon_cpu(
+        self, X: np.ndarray, Y: np.ndarray, steps: int = 35, lr: float = 0.2
+    ) -> float:
         if len(X) == 0:
             return 0.0
         for _ in range(steps):
@@ -1158,17 +1371,22 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
                     break
         return float(np.mean((X @ self.W - Y) ** 2))
 
-    def _consolidate_subspace_cpu(self, X: np.ndarray, energy_thresh: float = 0.995) -> None:
-        res_X = X if self.U_basis.shape[1] == 0 else X - (X @ self.U_basis) @ self.U_basis.T
+    def _consolidate_subspace_cpu(
+        self, X: np.ndarray, energy_thresh: float = 0.995
+    ) -> None:
+        res_X = (
+            X if self.U_basis.shape[1] == 0 else X - (X @ self.U_basis) @ self.U_basis.T
+        )
         if float(np.linalg.norm(res_X)) < 1e-10:
             return
         _, S, Vt = np.linalg.svd(res_X, full_matrices=False)
         pos = S > 1e-10
         if not np.any(pos):
             return
-        S = S[pos]; Vt = Vt[pos]
-        tot = float(np.sum(S ** 2))
-        cum = np.cumsum(S ** 2) / tot
+        S = S[pos]
+        Vt = Vt[pos]
+        tot = float(np.sum(S**2))
+        cum = np.cumsum(S**2) / tot
         k = min(len(S), int(np.searchsorted(cum, energy_thresh)) + 1)
         new_dirs = Vt[:k].T
         if self.U_basis.shape[1] == 0:
@@ -1180,11 +1398,16 @@ class ContinualGPMMemoryV9(GpuGpmMixin):
             keep = s_svd > 1e-9
             self.U_basis = U_svd[:, keep]
         if self.U_basis.shape[1] >= self.W.shape[0]:
-            self.U_basis = self.U_basis[:, :max(0, self.W.shape[0] - 2)]
+            self.U_basis = self.U_basis[:, : max(0, self.W.shape[0] - 2)]
 
 
 def quantize_bitalloc_exact(
-    Phi: np.ndarray, idx: np.ndarray, wk: np.ndarray, y: np.ndarray, sy: float, lam: float,
+    Phi: np.ndarray,
+    idx: np.ndarray,
+    wk: np.ndarray,
+    y: np.ndarray,
+    sy: float,
+    lam: float,
     max_extra_stages: int = 12,
 ) -> tuple[np.ndarray, bytes]:
     """BitAlloc + EF21 Data-Aware ResidualVQ with exact byte codec."""
@@ -1193,7 +1416,7 @@ def quantize_bitalloc_exact(
     mag_order = np.argsort(-np.abs(wk))
     idx_sorted = idx[mag_order]
     Sub_s = Phi[:, idx_sorted]
-    col_energy = np.mean(Sub_s ** 2, axis=0)
+    col_energy = np.mean(Sub_s**2, axis=0)
     A = Sub_s.T @ Sub_s + max(lam, 1e-9) * np.eye(idx.size)
     k = idx.size
     n_blocks = (k + 4) // 5
@@ -1204,7 +1427,7 @@ def quantize_bitalloc_exact(
         sl = slice(b * 5, min((b + 1) * 5, k))
         blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))
         q_blk, meta = quantize_5block_exact(blk)
-        wq_s[sl] += q_blk[:sl.stop - sl.start]
+        wq_s[sl] += q_blk[: sl.stop - sl.start]
         records.append((b, meta))
     for _ in range(max_extra_stages):
         r_data = y - Sub_s @ wq_s
@@ -1212,7 +1435,12 @@ def quantize_bitalloc_exact(
             break
         dw = np.linalg.solve(A, Sub_s.T @ r_data)
         blk_errs = [
-            float(np.sum((dw[b * 5:min((b + 1) * 5, k)] ** 2) * col_energy[b * 5:min((b + 1) * 5, k)]))
+            float(
+                np.sum(
+                    (dw[b * 5 : min((b + 1) * 5, k)] ** 2)
+                    * col_energy[b * 5 : min((b + 1) * 5, k)]
+                )
+            )
             for b in range(n_blocks)
         ]
         best_b = int(np.argmax(blk_errs))
@@ -1221,16 +1449,18 @@ def quantize_bitalloc_exact(
         sl = slice(best_b * 5, min((best_b + 1) * 5, k))
         blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))
         q_blk, meta = quantize_5block_exact(blk)
-        wq_s[sl] += q_blk[:sl.stop - sl.start]
+        wq_s[sl] += q_blk[: sl.stop - sl.start]
         records.append((best_b, meta))
     packed = pack_bitalloc_records(k, idx_sorted, records)
     rec = unpack_bitalloc_records(packed, Phi.shape[1])
     return rec, packed
 
 
-def _omp_candidates(Phi: np.ndarray, y: np.ndarray, max_k: int = 16, lam: float = 1e-7) -> list[tuple[np.ndarray, np.ndarray]]:
+def _omp_candidates(
+    Phi: np.ndarray, y: np.ndarray, max_k: int = 16, lam: float = 1e-7
+) -> list[tuple[np.ndarray, np.ndarray]]:
     N, D = Phi.shape
-    norms = np.sqrt(np.sum(Phi ** 2, axis=0)) + 1e-12
+    norms = np.sqrt(np.sum(Phi**2, axis=0)) + 1e-12
     Phi_n = Phi / norms[None, :]
     r = y.copy()
     selected: list[int] = []
@@ -1256,22 +1486,29 @@ def _omp_candidates(Phi: np.ndarray, y: np.ndarray, max_k: int = 16, lam: float 
     return cands
 
 
-def _press_score_ridge(Phi_sub: np.ndarray, wk: np.ndarray, y: np.ndarray, ty: np.ndarray, sy: float, lam: float) -> tuple[float, float]:
+def _press_score_ridge(
+    Phi_sub: np.ndarray,
+    wk: np.ndarray,
+    y: np.ndarray,
+    ty: np.ndarray,
+    sy: float,
+    lam: float,
+) -> tuple[float, float]:
     """Exact Leave-One-Out (Allen's PRESS) error via Hat Matrix diagonal h_i."""
     N, D = Phi_sub.shape
     pred = (Phi_sub @ wk) * sy
     resid = ty - pred
     if D >= N:
-        return float(np.mean(resid ** 2)) * 100.0 + float(np.sum(wk ** 2)), 0.0
+        return float(np.mean(resid**2)) * 100.0 + float(np.sum(wk**2)), 0.0
     A = Phi_sub.T @ Phi_sub + max(lam, 1e-8) * np.eye(D)
     try:
         A_inv_Pt = np.linalg.solve(A, Phi_sub.T)
     except np.linalg.LinAlgError:
-        return float(np.mean(resid ** 2)) * 100.0, 0.0
+        return float(np.mean(resid**2)) * 100.0, 0.0
     h = np.sum(Phi_sub * A_inv_Pt.T, axis=1)
     denom = np.maximum(0.08, 1.0 - h)
     loo_pred = ty - resid / denom
-    w_norm_pen = 1e-3 * float(np.sum(wk ** 2)) * (sy ** 2) / max(1, N)
+    w_norm_pen = 1e-3 * float(np.sum(wk**2)) * (sy**2) / max(1, N)
     loo_mse = float(np.mean((loo_pred - ty) ** 2)) + w_norm_pen
     loo_acc = float(np.mean(np.rint(loo_pred) == ty))
     return loo_mse, loo_acc
@@ -1314,30 +1551,36 @@ class FactorizedSharedCoreV9:
         if branch == "poly":
             cols = [xn[:, i] for i in range(d)]
             fs = [np.ones((N, 1), dtype=np.float64)]
-            for i in range(d): fs.append(cols[i][:, None])
             for i in range(d):
-                for j in range(i, d): fs.append((cols[i] * cols[j])[:, None])
+                fs.append(cols[i][:, None])
             for i in range(d):
                 for j in range(i, d):
-                    for k in range(j, d): fs.append((cols[i] * cols[j] * cols[k])[:, None])
+                    fs.append((cols[i] * cols[j])[:, None])
+            for i in range(d):
+                for j in range(i, d):
+                    for k in range(j, d):
+                        fs.append((cols[i] * cols[j] * cols[k])[:, None])
             if d <= 2:
                 for i in range(d):
                     for j in range(i, d):
                         for k in range(j, d):
                             for l in range(k, d):
-                                fs.append((cols[i] * cols[j] * cols[k] * cols[l])[:, None])
+                                fs.append(
+                                    (cols[i] * cols[j] * cols[k] * cols[l])[:, None]
+                                )
             else:
-                for i in range(d): fs.append((cols[i] ** 4)[:, None])
+                for i in range(d):
+                    fs.append((cols[i] ** 4)[:, None])
             return np.hstack(fs)
         if branch == "hinge":
             fs = [np.ones((N, 1), dtype=np.float64)]
             for i in range(d):
-                fs.append(xn[:, i:i + 1])
-                fs.append(np.abs(xn[:, i:i + 1]))
+                fs.append(xn[:, i : i + 1])
+                fs.append(np.abs(xn[:, i : i + 1]))
                 for knot in (-0.375, -step1, 0.0, step1, 0.375):
                     fs.append(np.maximum(0.0, xn[:, i] - knot)[:, None])
                     fs.append(np.maximum(0.0, knot - xn[:, i])[:, None])
-                fs.append(np.maximum(0.0, 1.0 - sx * np.abs(xn[:, i:i + 1])))
+                fs.append(np.maximum(0.0, 1.0 - sx * np.abs(xn[:, i : i + 1])))
             for i in range(d):
                 for j in range(i + 1, d):
                     diff = xn[:, i] - xn[:, j]
@@ -1369,7 +1612,7 @@ class FactorizedSharedCoreV9:
                 fs.extend([b0 * b2, b1 * b2, b0 * b1 * b2])
             return np.hstack(fs)
         xp = np.zeros((N, 8), dtype=np.float64)
-        xp[:, :min(3, d)] = xn[:, :min(3, d)]
+        xp[:, : min(3, d)] = xn[:, : min(3, d)]
         xp[:, 3] = xn[:, 0] - xn[:, 1] if d >= 2 else np.abs(xn[:, 0])
         xp[:, 4] = xn[:, 1] - xn[:, 2] if d >= 3 else np.maximum(0.0, xn[:, 0])
         xp[:, 5] = xn[:, 0] - xn[:, 2] if d >= 3 else np.maximum(0.0, -xn[:, 0])
@@ -1386,13 +1629,18 @@ class FactorizedSharedCoreV9:
         four = []
         for f in (1.0, 2.0, 4.0):
             for i in range(min(3, d)):
-                four.append(np.sin(math.pi * f * xn[:, i:i + 1]))
-                four.append(np.cos(math.pi * f * xn[:, i:i + 1]))
-        return np.hstack([
-            self.features("poly", xs_arr, sx),
-            self.features("hinge", xs_arr, sx)[:, 1:],
-            h1_t, h1_r, h2_sg,
-        ] + four)
+                four.append(np.sin(math.pi * f * xn[:, i : i + 1]))
+                four.append(np.cos(math.pi * f * xn[:, i : i + 1]))
+        return np.hstack(
+            [
+                self.features("poly", xs_arr, sx),
+                self.features("hinge", xs_arr, sx)[:, 1:],
+                h1_t,
+                h1_r,
+                h2_sg,
+            ]
+            + four
+        )
 
     def _mlp_encode(self, A: np.ndarray, sx: float) -> np.ndarray:
         an = A / sx
@@ -1401,13 +1649,19 @@ class FactorizedSharedCoreV9:
         if d >= 2:
             for i in range(d):
                 for j in range(i + 1, d):
-                    cols.append(an[:, i:i + 1] - an[:, j:j + 1])
-                    cols.append(np.abs(an[:, i:i + 1] - an[:, j:j + 1]))
+                    cols.append(an[:, i : i + 1] - an[:, j : j + 1])
+                    cols.append(np.abs(an[:, i : i + 1] - an[:, j : j + 1]))
         return np.hstack(cols)
 
     def _fit_stage2_mlp(
-        self, tx: np.ndarray, resid_n: np.ndarray, vx: np.ndarray, sx: float,
-        hidden: int = 12, steps: int = 280, seed: int = 7,
+        self,
+        tx: np.ndarray,
+        resid_n: np.ndarray,
+        vx: np.ndarray,
+        sx: float,
+        hidden: int = 12,
+        steps: int = 280,
+        seed: int = 7,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         rng = np.random.default_rng(seed)
         Xin = self._mlp_encode(tx, sx)
@@ -1418,17 +1672,21 @@ class FactorizedSharedCoreV9:
         W2 = np.zeros((hidden, 1))
         b2 = np.zeros((1, 1))
         yn = resid_n.reshape(-1, 1)
-        m1 = np.zeros_like(W1); m2 = np.zeros_like(W2); v2 = np.zeros_like(W2)
-        mb1 = np.zeros_like(b1); vb1 = np.zeros_like(b1)
-        mb2 = np.zeros_like(b2); vb2 = np.zeros_like(b2)
-        best = (float(np.mean(yn ** 2)), W1.copy(), b1.copy(), W2.copy(), b2.copy())
+        m1 = np.zeros_like(W1)
+        m2 = np.zeros_like(W2)
+        v2 = np.zeros_like(W2)
+        mb1 = np.zeros_like(b1)
+        vb1 = np.zeros_like(b1)
+        mb2 = np.zeros_like(b2)
+        vb2 = np.zeros_like(b2)
+        best = (float(np.mean(yn**2)), W1.copy(), b1.copy(), W2.copy(), b2.copy())
         lr0 = 0.04
         for t in range(1, steps + 1):
             cos_lr = lr0 * 0.5 * (1.0 + math.cos(math.pi * t / steps))
             h = np.tanh(Xin @ W1 + b1)
             pred = h @ W2 + b2
             err = pred - yn
-            loss = float(np.mean(err ** 2))
+            loss = float(np.mean(err**2))
             if loss < best[0]:
                 best = (loss, W1.copy(), b1.copy(), W2.copy(), b2.copy())
             dp = (2.0 / N) * err
@@ -1439,18 +1697,23 @@ class FactorizedSharedCoreV9:
             gb1 = np.sum(dh, axis=0, keepdims=True)
             m1 = 0.85 * m1 + 0.15 * gW1
             W1 -= (cos_lr * 0.7) * newton_schulz_orthogonalize(m1, iters=3)
-            m2 = 0.9 * m2 + 0.1 * gW2; v2 = 0.999 * v2 + 0.001 * (gW2 * gW2)
-            W2 -= cos_lr * (m2 / (1 - 0.9 ** t)) / (np.sqrt(v2 / (1 - 0.999 ** t)) + 1e-8)
-            mb1 = 0.9 * mb1 + 0.1 * gb1; vb1 = 0.999 * vb1 + 0.001 * (gb1 * gb1)
-            b1 -= cos_lr * (mb1 / (1 - 0.9 ** t)) / (np.sqrt(vb1 / (1 - 0.999 ** t)) + 1e-8)
-            mb2 = 0.9 * mb2 + 0.1 * gb2; vb2 = 0.999 * vb2 + 0.001 * (gb2 * gb2)
-            b2 -= cos_lr * (mb2 / (1 - 0.9 ** t)) / (np.sqrt(vb2 / (1 - 0.999 ** t)) + 1e-8)
+            m2 = 0.9 * m2 + 0.1 * gW2
+            v2 = 0.999 * v2 + 0.001 * (gW2 * gW2)
+            W2 -= cos_lr * (m2 / (1 - 0.9**t)) / (np.sqrt(v2 / (1 - 0.999**t)) + 1e-8)
+            mb1 = 0.9 * mb1 + 0.1 * gb1
+            vb1 = 0.999 * vb1 + 0.001 * (gb1 * gb1)
+            b1 -= cos_lr * (mb1 / (1 - 0.9**t)) / (np.sqrt(vb1 / (1 - 0.999**t)) + 1e-8)
+            mb2 = 0.9 * mb2 + 0.1 * gb2
+            vb2 = 0.999 * vb2 + 0.001 * (gb2 * gb2)
+            b2 -= cos_lr * (mb2 / (1 - 0.9**t)) / (np.sqrt(vb2 / (1 - 0.999**t)) + 1e-8)
         _, W1, b1, W2, b2 = best
         all_w = np.concatenate([W1.ravel(), b1.ravel(), W2.ravel(), b2.ravel()])
         wr, orig_n = block_hadamard_rotate(all_w, 8)
         packed_mlp, wr_q = pack_vector_dyadic5(wr, stages=2)
         all_wq = block_hadamard_unrotate(wr_q, orig_n, 8)
-        p1 = W1.size; p2 = p1 + b1.size; p3 = p2 + W2.size
+        p1 = W1.size
+        p2 = p1 + b1.size
+        p3 = p2 + W2.size
         W1q = all_wq[:p1].reshape(W1.shape)
         b1q = all_wq[p1:p2].reshape(b1.shape)
         W2q = all_wq[p2:p3].reshape(W2.shape)
@@ -1505,10 +1768,17 @@ class FactorizedSharedCoreV9:
                     pred_f = (Phi[:, idx] @ wk) * sy
                     mse_tr_f = float(np.mean((pred_f - ty) ** 2))
                     acc_tr_f = float(np.mean(np.rint(pred_f) == ty))
-                    mse_loo, acc_loo = _press_score_ridge(Phi[:, idx], wk, y, ty, sy, lam=lam)
+                    mse_loo, acc_loo = _press_score_ridge(
+                        Phi[:, idx], wk, y, ty, sy, lam=lam
+                    )
                     b_best_acc = max(b_best_acc, acc_loo)
                     est_nb = 9 + len(idx) + ((len(idx) + 4) // 5) * 3
-                    f_obj = 0.4 * mse_tr_f + 0.6 * mse_loo + 0.002 * est_nb + (1.0 - 0.5 * (acc_tr_f + acc_loo)) * 0.5
+                    f_obj = (
+                        0.4 * mse_tr_f
+                        + 0.6 * mse_loo
+                        + 0.002 * est_nb
+                        + (1.0 - 0.5 * (acc_tr_f + acc_loo)) * 0.5
+                    )
                     float_cands.append((f_obj, lam, idx, wk, mse_loo, acc_loo))
             float_cands.sort(key=lambda c: c[0])
             for _, lam, idx, wk, mse_loo, acc_loo in float_cands[:3]:
@@ -1517,9 +1787,24 @@ class FactorizedSharedCoreV9:
                 mse_tr = float(np.mean((pred_q - ty) ** 2))
                 acc_tr = float(np.mean(np.rint(pred_q) == ty))
                 nb = 6 + len(packed)
-                obj = 0.4 * mse_tr + 0.6 * mse_loo + 0.002 * nb + (1.0 - 0.5 * (acc_tr + acc_loo)) * 0.5
+                obj = (
+                    0.4 * mse_tr
+                    + 0.6 * mse_loo
+                    + 0.002 * nb
+                    + (1.0 - 0.5 * (acc_tr + acc_loo)) * 0.5
+                )
                 if obj < best[0]:
-                    best = (obj, bname, "reg", wq, packed, packed, None, pred_q / sy, None)
+                    best = (
+                        obj,
+                        bname,
+                        "reg",
+                        wq,
+                        packed,
+                        packed,
+                        None,
+                        pred_q / sy,
+                        None,
+                    )
             b_idx = self.BRANCHES.index(bname)
             branch_losses[b_idx] = 1.0 - b_best_acc
             if best[0] < 0.025:
@@ -1534,21 +1819,44 @@ class FactorizedSharedCoreV9:
             for c_i in range(len(classes)):
                 yc = (y_idx == c_i).astype(np.float64) - np.mean(y_idx == c_i)
                 scores += np.abs(Phi_h.T @ yc)
-            top_cols = np.argsort(-scores)[:min(4, Phi_h.shape[1])]
+            top_cols = np.argsort(-scores)[: min(4, Phi_h.shape[1])]
             Phi_sub = Phi_h[:, top_cols]
-            res = batch_logit_safe_step_ce(Phi_sub, y_idx, len(classes), steps=300,
-                                           l2_reg=np.full(top_cols.size, 1e-6))
+            res = batch_logit_safe_step_ce(
+                Phi_sub,
+                y_idx,
+                len(classes),
+                steps=300,
+                l2_reg=np.full(top_cols.size, 1e-6),
+            )
             theta = res["theta"]
             raw_ce, th_dec = pack_vector_dyadic5(theta.ravel(), stages=2)
             th_q = th_dec.reshape(theta.shape)
             nb_ce = 6 + top_cols.size + len(raw_ce)
-            pred_tr = np.array([classes[i] for i in np.argmax(Phi_sub @ th_q.T, axis=1)], dtype=np.float64)
+            pred_tr = np.array(
+                [classes[i] for i in np.argmax(Phi_sub @ th_q.T, axis=1)],
+                dtype=np.float64,
+            )
             acc_tr = float(np.mean(pred_tr == ty))
             mse_tr = float(np.mean((pred_tr - ty) ** 2))
             obj_ce = mse_tr + 0.002 * nb_ce + (1.0 - acc_tr) * 0.5
             if obj_ce < best[0]:
-                ce_meta = {"classes": classes, "cols": top_cols.tolist(), "theta": th_q, "packed": raw_ce}
-                best = (obj_ce, "hinge", "ce", None, raw_ce, raw_ce, ce_meta, pred_tr / sy, None)
+                ce_meta = {
+                    "classes": classes,
+                    "cols": top_cols.tolist(),
+                    "theta": th_q,
+                    "packed": raw_ce,
+                }
+                best = (
+                    obj_ce,
+                    "hinge",
+                    "ce",
+                    None,
+                    raw_ce,
+                    raw_ce,
+                    ce_meta,
+                    pred_tr / sy,
+                    None,
+                )
 
         if router is not None:
             router.update(branch_losses)
@@ -1570,11 +1878,15 @@ class FactorizedSharedCoreV9:
         if acc_tr_cur < 0.99 and N >= 120 and mse_tr_cur > 0.08 and mode == "reg":
             resid_tr = y - ptr_n
             cut = int(0.8 * N)
-            _, r_icv, _ = self._fit_stage2_mlp(tx[:cut], resid_tr[:cut], tx[cut:], sx, hidden=12, steps=260, seed=7)
+            _, r_icv, _ = self._fit_stage2_mlp(
+                tx[:cut], resid_tr[:cut], tx[cut:], sx, hidden=12, steps=260, seed=7
+            )
             mse_icv_0 = float(np.mean((resid_tr[cut:] * sy) ** 2))
             mse_icv_1 = float(np.mean(((resid_tr[cut:] - r_icv) * sy) ** 2))
             if mse_icv_1 < 0.72 * mse_icv_0:
-                _, _, mlp_meta = self._fit_stage2_mlp(tx, resid_tr, vx, sx, hidden=12, steps=280, seed=7)
+                _, _, mlp_meta = self._fit_stage2_mlp(
+                    tx, resid_tr, vx, sx, hidden=12, steps=280, seed=7
+                )
                 mode = "rvq2"
 
         Phi_va = self.features(bname, vx, sx)
@@ -1592,13 +1904,22 @@ class FactorizedSharedCoreV9:
         if mode == "ce":
             assert ce_meta is not None
             Pv = Phi_va[:, ce_meta["cols"]]
-            pred_q = np.array([ce_meta["classes"][i] for i in np.argmax(Pv @ ce_meta["theta"].T, axis=1)], dtype=np.float64)
+            pred_q = np.array(
+                [
+                    ce_meta["classes"][i]
+                    for i in np.argmax(Pv @ ce_meta["theta"].T, axis=1)
+                ],
+                dtype=np.float64,
+            )
             nb_total = 6 + len(ce_meta["cols"]) + len(ce_meta["packed"])
         elif mode == "rvq2":
             assert mlp_meta is not None and wq is not None
             base_va = _align_cols(Phi_va, len(wq)) @ wq
             Xv_mlp = self._mlp_encode(vx, sx)
-            r_va = (np.tanh(Xv_mlp @ mlp_meta["W1"] + mlp_meta["b1"]) @ mlp_meta["W2"] + mlp_meta["b2"]).ravel()
+            r_va = (
+                np.tanh(Xv_mlp @ mlp_meta["W1"] + mlp_meta["b1"]) @ mlp_meta["W2"]
+                + mlp_meta["b2"]
+            ).ravel()
             pred_q = (base_va + r_va) * sy
             nb_total = 6 + len(packed) + len(mlp_meta["packed"])
         else:
@@ -1607,8 +1928,15 @@ class FactorizedSharedCoreV9:
             nb_total = 6 + len(packed)
 
         return FactorizedAdapterV9(
-            arity=d, branch=bname, mode=mode, sx=sx, sy=sy,
-            w_quant=wq, packed_bytes=packed, ce_meta=ce_meta, mlp_meta=mlp_meta,
+            arity=d,
+            branch=bname,
+            mode=mode,
+            sx=sx,
+            sy=sy,
+            w_quant=wq,
+            packed_bytes=packed,
+            ce_meta=ce_meta,
+            mlp_meta=mlp_meta,
             compressed_bytes=nb_total,
             val_exact_acc_quant=float(np.mean(np.rint(pred_q) == vy)),
             val_mse_quant=float(np.mean((pred_q - vy) ** 2)),
@@ -1641,14 +1969,24 @@ class FactorizedAdapterV9:
         val = float((Phi @ self.w_quant)[0])
         if self.mode == "rvq2" and self.mlp_meta is not None:
             Xm = core._mlp_encode(x, self.sx)
-            r = float((np.tanh(Xm @ self.mlp_meta["W1"] + self.mlp_meta["b1"]) @ self.mlp_meta["W2"] + self.mlp_meta["b2"])[0, 0])
+            r = float(
+                (
+                    np.tanh(Xm @ self.mlp_meta["W1"] + self.mlp_meta["b1"])
+                    @ self.mlp_meta["W2"]
+                    + self.mlp_meta["b2"]
+                )[0, 0]
+            )
             val += r
         return val * self.sy
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "arity": self.arity, "branch": self.branch, "mode": self.mode,
-            "sx": self.sx, "sy": self.sy, "compressed_bytes": self.compressed_bytes,
+            "arity": self.arity,
+            "branch": self.branch,
+            "mode": self.mode,
+            "sx": self.sx,
+            "sy": self.sy,
+            "compressed_bytes": self.compressed_bytes,
             "packed_hex": self.packed_bytes.hex(),
             "val_exact_acc_quant": self.val_exact_acc_quant,
             "val_mse_quant": self.val_mse_quant,
@@ -1659,13 +1997,17 @@ class FactorizedAdapterV9:
         elif self.mode == "rvq2" and self.mlp_meta is not None:
             out["mlp_packed_hex"] = self.mlp_meta["packed"].hex()
             out["mlp_shapes"] = [
-                list(self.mlp_meta["W1"].shape), list(self.mlp_meta["b1"].shape),
-                list(self.mlp_meta["W2"].shape), list(self.mlp_meta["b2"].shape),
+                list(self.mlp_meta["W1"].shape),
+                list(self.mlp_meta["b1"].shape),
+                list(self.mlp_meta["W2"].shape),
+                list(self.mlp_meta["b2"].shape),
             ]
         return out
 
     @staticmethod
-    def from_dict(d: dict[str, Any], core: "FactorizedSharedCoreV9") -> "FactorizedAdapterV9":
+    def from_dict(
+        d: dict[str, Any], core: "FactorizedSharedCoreV9"
+    ) -> "FactorizedAdapterV9":
         arity = int(d["arity"])
         branch = str(d["branch"])
         mode = str(d["mode"])
@@ -1686,18 +2028,31 @@ class FactorizedAdapterV9:
             if mode == "rvq2" and "mlp_packed_hex" in d:
                 mp = bytes.fromhex(d["mlp_packed_hex"])
                 s1, sb1, s2, sb2 = [tuple(int(x) for x in sh) for sh in d["mlp_shapes"]]
-                n_all = s1[0] * s1[1] + sb1[0] * sb1[1] + s2[0] * s2[1] + sb2[0] * sb2[1]
+                n_all = (
+                    s1[0] * s1[1] + sb1[0] * sb1[1] + s2[0] * s2[1] + sb2[0] * sb2[1]
+                )
                 wr_q = unpack_vector_dyadic5(mp)
                 all_wq = block_hadamard_unrotate(wr_q, n_all, 8)
-                p1 = s1[0] * s1[1]; p2 = p1 + sb1[0] * sb1[1]; p3 = p2 + s2[0] * s2[1]
+                p1 = s1[0] * s1[1]
+                p2 = p1 + sb1[0] * sb1[1]
+                p3 = p2 + s2[0] * s2[1]
                 mlp_meta = {
-                    "W1": all_wq[:p1].reshape(s1), "b1": all_wq[p1:p2].reshape(sb1),
-                    "W2": all_wq[p2:p3].reshape(s2), "b2": all_wq[p3:].reshape(sb2),
+                    "W1": all_wq[:p1].reshape(s1),
+                    "b1": all_wq[p1:p2].reshape(sb1),
+                    "W2": all_wq[p2:p3].reshape(s2),
+                    "b2": all_wq[p3:].reshape(sb2),
                     "packed": mp,
                 }
         return FactorizedAdapterV9(
-            arity=arity, branch=branch, mode=mode, sx=sx, sy=sy,
-            w_quant=w_quant, packed_bytes=packed, ce_meta=ce_meta, mlp_meta=mlp_meta,
+            arity=arity,
+            branch=branch,
+            mode=mode,
+            sx=sx,
+            sy=sy,
+            w_quant=w_quant,
+            packed_bytes=packed,
+            ce_meta=ce_meta,
+            mlp_meta=mlp_meta,
             compressed_bytes=int(d["compressed_bytes"]),
             val_exact_acc_quant=float(d["val_exact_acc_quant"]),
             val_mse_quant=float(d["val_mse_quant"]),
@@ -1707,6 +2062,7 @@ class FactorizedAdapterV9:
 # ==============================================================================
 # 6. CRAM Energy-Based + Latent Reasoning + Mean-Field KL + Pseudolikelihood
 # ==============================================================================
+
 
 class CRAMEngineV9:
     @staticmethod
@@ -1723,7 +2079,8 @@ class CRAMEngineV9:
         adj = [set() for _ in range(n_nodes)]
         for a, b in edges:
             if a != b:
-                adj[a].add(b); adj[b].add(a)
+                adj[a].add(b)
+                adj[b].add(a)
         adj_list = [sorted(s) for s in adj]
         giv = dict(givens or {})
         rng = np.random.default_rng(seed)
@@ -1742,8 +2099,8 @@ class CRAMEngineV9:
         sweeps = hb_steps = stale = 0
         T = 0.85
         alpha_cool = 0.96
-        sparse_work = sum(len(adj_list[i]) * (num_colors ** 2) for i in range(n_nodes))
-        dense_work = n_nodes * max(1, n_nodes - 1) * (num_colors ** 2)
+        sparse_work = sum(len(adj_list[i]) * (num_colors**2) for i in range(n_nodes))
+        dense_work = n_nodes * max(1, n_nodes - 1) * (num_colors**2)
 
         while sweeps < max_sweeps and cur_e > 0:
             improved = False
@@ -1751,7 +2108,15 @@ class CRAMEngineV9:
                 if i in giv:
                     continue
                 fields = sparse_fields(i, y)
-                noisy = [f + (float(rng.uniform(-eps_noise, eps_noise)) if eps_noise > 0 else 0.0) for f in fields]
+                noisy = [
+                    f
+                    + (
+                        float(rng.uniform(-eps_noise, eps_noise))
+                        if eps_noise > 0
+                        else 0.0
+                    )
+                    for f in fields
+                ]
                 cur_f = noisy[y[i]]
                 best_val = min(noisy)
                 if cur_f - best_val > 2.0 * eps_noise:
@@ -1765,13 +2130,20 @@ class CRAMEngineV9:
             if not improved:
                 stale += 1
                 if stale >= 8:
-                    y = [giv.get(i, int(rng.integers(0, num_colors))) for i in range(n_nodes)]
+                    y = [
+                        giv.get(i, int(rng.integers(0, num_colors)))
+                        for i in range(n_nodes)
+                    ]
                     stale = 0
                     T = 0.85
                     cur_e = energy(y)
                     continue
                 for _ in range(min(12, max(3, cur_e * 2))):
-                    conf = [i for i in range(n_nodes) if i not in giv and any(y[i] == y[j] for j in adj_list[i])]
+                    conf = [
+                        i
+                        for i in range(n_nodes)
+                        if i not in giv and any(y[i] == y[j] for j in adj_list[i])
+                    ]
                     if not conf:
                         break
                     pick = conf[int(rng.integers(0, len(conf)))]
@@ -1780,24 +2152,36 @@ class CRAMEngineV9:
                         if free_nb:
                             pick = free_nb[int(rng.integers(0, len(free_nb)))]
                     fields = sparse_fields(pick, y)
-                    logits = np.array([-f / max(0.15, T) for f in fields], dtype=np.float64)
+                    logits = np.array(
+                        [-f / max(0.15, T) for f in fields], dtype=np.float64
+                    )
                     logits -= np.max(logits)
-                    probs = np.exp(logits); probs /= np.sum(probs)
+                    probs = np.exp(logits)
+                    probs /= np.sum(probs)
                     y[pick] = int(rng.choice(num_colors, p=probs))
                     hb_steps += 1
                 T *= alpha_cool
                 cur_e = energy(y)
 
-        valid = all(y[a] != y[b] for a, b in edges) and all(y[i] == g for i, g in giv.items())
+        valid = all(y[a] != y[b] for a, b in edges) and all(
+            y[i] == g for i, g in giv.items()
+        )
         return {
-            "coloring": y, "valid": valid, "energy": cur_e, "sweeps": sweeps, "hb_steps": hb_steps,
+            "coloring": y,
+            "valid": valid,
+            "energy": cur_e,
+            "sweeps": sweeps,
+            "hb_steps": hb_steps,
             "validity_certificate": bool(cur_e < 1 and valid),
             "givens_respected": all(y[i] == g for i, g in giv.items()),
-            "sparse_work_per_sweep": sparse_work, "dense_work_per_sweep": dense_work,
+            "sparse_work_per_sweep": sparse_work,
+            "dense_work_per_sweep": dense_work,
         }
 
     @staticmethod
-    def mean_field_kl_step(B: np.ndarray, K: np.ndarray, p: np.ndarray, beta: float = 2.0, iters: int = 12) -> dict[str, Any]:
+    def mean_field_kl_step(
+        B: np.ndarray, K: np.ndarray, p: np.ndarray, beta: float = 2.0, iters: int = 12
+    ) -> dict[str, Any]:
         """E2b/B1: Mean-Field Coordinate KL Descent: F(p) - F(q) = (1/beta)*KL(p_i || q_i) >= 0."""
         N, A = p.shape
         p_cur = p.copy()
@@ -1806,29 +2190,60 @@ class CRAMEngineV9:
         def free_energy(pm: np.ndarray) -> float:
             unary = float(np.sum(B * pm))
             pair = 0.5 * float(np.einsum("ia,ijab,jb->", pm, K_sym, pm))
-            ent = float(np.sum(np.where(pm > 1e-18, pm * np.log(np.maximum(pm, 1e-18)), 0.0))) / beta
+            ent = (
+                float(
+                    np.sum(
+                        np.where(pm > 1e-18, pm * np.log(np.maximum(pm, 1e-18)), 0.0)
+                    )
+                )
+                / beta
+            )
             return unary + pair + ent
 
         f0 = free_energy(p_cur)
         f_hist = [f0]
         for _ in range(iters):
             for i in range(N):
-                hz = B[i] + np.einsum("jab,jb->a", K_sym[i], p_cur) - np.einsum("ab,b->a", K_sym[i, i], p_cur[i])
+                hz = (
+                    B[i]
+                    + np.einsum("jab,jb->a", K_sym[i], p_cur)
+                    - np.einsum("ab,b->a", K_sym[i, i], p_cur[i])
+                )
                 logits = -beta * hz
                 logits -= np.max(logits)
-                q_i = np.exp(logits); q_i /= np.sum(q_i)
+                q_i = np.exp(logits)
+                q_i /= np.sum(q_i)
                 p_old_i = p_cur[i].copy()
-                kl = float(np.sum(np.where(p_old_i > 1e-18, p_old_i * np.log(np.maximum(p_old_i, 1e-18) / np.maximum(q_i, 1e-18)), 0.0)))
+                kl = float(
+                    np.sum(
+                        np.where(
+                            p_old_i > 1e-18,
+                            p_old_i
+                            * np.log(
+                                np.maximum(p_old_i, 1e-18) / np.maximum(q_i, 1e-18)
+                            ),
+                            0.0,
+                        )
+                    )
+                )
                 f_before = free_energy(p_cur)
                 p_cur[i] = q_i
                 f_after = free_energy(p_cur)
                 assert abs((f_before - f_after) - kl / beta) <= 1e-7
                 f_hist.append(f_after)
-        return {"p": p_cur, "free_energy_0": f0, "free_energy_final": f_hist[-1],
-                "monotonic": all(f_hist[k + 1] <= f_hist[k] + 1e-9 for k in range(len(f_hist) - 1))}
+        return {
+            "p": p_cur,
+            "free_energy_0": f0,
+            "free_energy_final": f_hist[-1],
+            "monotonic": all(
+                f_hist[k + 1] <= f_hist[k] + 1e-9 for k in range(len(f_hist) - 1)
+            ),
+        }
 
     @staticmethod
-    def solve_latent_maze(n_nodes: int, adj: Sequence[Sequence[int]], goal: int, eps_z: float = 1e-6) -> dict[str, Any]:
+    def solve_latent_maze(
+        n_nodes: int, adj: Sequence[Sequence[int]], goal: int, eps_z: float = 1e-6
+    ) -> dict[str, Any]:
         """E3/B2 Two-Phase Latent Contraction: m * z = A z + 1_G with m = Delta + 1."""
         delta = max((len(nb) for nb in adj), default=0)
         m = float(delta + 1)
@@ -1838,7 +2253,12 @@ class CRAMEngineV9:
         if q > 0:
             max_it = max(1, math.ceil(math.log(eps_z * (1.0 - q)) / math.log(q)))
             for _ in range(max_it):
-                z_new = np.array([(sum(z[j] for j in adj[i]) + (1.0 if i == goal else 0.0)) / m for i in range(n_nodes)])
+                z_new = np.array(
+                    [
+                        (sum(z[j] for j in adj[i]) + (1.0 if i == goal else 0.0)) / m
+                        for i in range(n_nodes)
+                    ]
+                )
                 diff = float(np.max(np.abs(z_new - z)))
                 z = z_new
                 iters += 1
@@ -1848,22 +2268,37 @@ class CRAMEngineV9:
             z[goal] = 1.0 / m
             iters = 1
         assert np.all(z >= -1e-12) and np.all(z <= 1.0 / (m - delta) + 1e-12)
-        return {"z": z, "iters": iters, "contraction_q": q, "upper_bound": 1.0 / (m - delta)}
+        return {
+            "z": z,
+            "iters": iters,
+            "contraction_q": q,
+            "upper_bound": 1.0 / (m - delta),
+        }
 
     @staticmethod
-    def attention_coupling_matrix(kappa: np.ndarray, scores_z: np.ndarray, f_compat: np.ndarray) -> np.ndarray:
+    def attention_coupling_matrix(
+        kappa: np.ndarray, scores_z: np.ndarray, f_compat: np.ndarray
+    ) -> np.ndarray:
         """B3 AttentionCoupling: symmetric by construction."""
         s = scores_z - np.max(scores_z, axis=1, keepdims=True)
         w = np.exp(s) / np.sum(np.exp(s), axis=1, keepdims=True)
         kw = kappa * w
-        K = kw[:, :, None, None] * f_compat[None, None, :, :] + kw.T[:, :, None, None] * f_compat.T[None, None, :, :]
+        K = (
+            kw[:, :, None, None] * f_compat[None, None, :, :]
+            + kw.T[:, :, None, None] * f_compat.T[None, None, :, :]
+        )
         for i in range(K.shape[0]):
             K[i, i] = 0.0
         return K
 
     @staticmethod
     def alternating_latent_visible_solve(
-        n_nodes: int, adj: Sequence[Sequence[int]], goal: int, num_colors: int = 2, rounds: int = 3, seed: int = 42
+        n_nodes: int,
+        adj: Sequence[Sequence[int]],
+        goal: int,
+        num_colors: int = 2,
+        rounds: int = 3,
+        seed: int = 42,
     ) -> dict[str, Any]:
         """B4 Alternating (z, y)-Rounds: settle latent z -> attention coupling -> guarded visible descent."""
         res_z = CRAMEngineV9.solve_latent_maze(n_nodes, adj, goal, eps_z=1e-6)
@@ -1880,20 +2315,36 @@ class CRAMEngineV9:
         y = [int(rng.integers(0, num_colors)) for _ in range(n_nodes)]
 
         def pair_e(st):
-            return 0.5 * sum(K[i, j, st[i], st[j]] for i in range(n_nodes) for j in range(n_nodes) if i != j)
+            return 0.5 * sum(
+                K[i, j, st[i], st[j]]
+                for i in range(n_nodes)
+                for j in range(n_nodes)
+                if i != j
+            )
 
         e0 = pair_e(y)
         for _ in range(rounds):
             for i in range(n_nodes):
-                fields = [sum(K[i, j, c, y[j]] for j in range(n_nodes) if j != i) for c in range(num_colors)]
+                fields = [
+                    sum(K[i, j, c, y[j]] for j in range(n_nodes) if j != i)
+                    for c in range(num_colors)
+                ]
                 best_c = int(np.argmin(fields))
                 if fields[best_c] < fields[y[i]] - 1e-12:
                     y[i] = best_c
         ef = pair_e(y)
-        return {"z": z, "y": y, "energy_0": e0, "energy_final": ef, "monotone_drop": ef <= e0 + 1e-12}
+        return {
+            "z": z,
+            "y": y,
+            "energy_0": e0,
+            "energy_final": ef,
+            "monotone_drop": ef <= e0 + 1e-12,
+        }
 
     @staticmethod
-    def train_cram_pseudolikelihood(samples: np.ndarray, num_colors: int, beta: float = 1.0, steps: int = 80) -> dict[str, Any]:
+    def train_cram_pseudolikelihood(
+        samples: np.ndarray, num_colors: int, beta: float = 1.0, steps: int = 80
+    ) -> dict[str, Any]:
         """E1/B2 Pseudolikelihood -> Local-Field CE training of unary B."""
         M, N = samples.shape
         B_learned = np.zeros((N, num_colors), dtype=np.float64)
@@ -1901,7 +2352,9 @@ class CRAMEngineV9:
         for i in range(N):
             y_i = samples[:, i]
             X_i = np.ones((M, 1), dtype=np.float64)
-            res = batch_logit_safe_step_ce(X_i, y_i, num_colors, steps=steps, l2_reg=np.array([1e-4]))
+            res = batch_logit_safe_step_ce(
+                X_i, y_i, num_colors, steps=steps, l2_reg=np.array([1e-4])
+            )
             B_learned[i] = -res["theta"][:, 0] / beta
             losses.append(res["loss_final"])
         return {"B": B_learned, "mean_pl_loss": float(np.mean(losses))}
@@ -1910,6 +2363,7 @@ class CRAMEngineV9:
 # ==============================================================================
 # 7. HNet Adaptive Chunking + GDNRAM Lag-1 Associative Memory
 # ==============================================================================
+
 
 def hnet_opt_ratio(a: float, b: float, T: float) -> float:
     """HNet continuous optimal chunk ratio s = (2*b*T/a)^(1/3)."""
@@ -1930,7 +2384,9 @@ def adjacent_pairs(xs: Sequence[Any]) -> list[tuple[Any, Any]]:
     return [(xs[0], xs[0])] + list(zip(xs, xs[1:]))
 
 
-def boundary_chunks(boundary: Callable[[Any], bool], xs: Sequence[Any]) -> list[list[Any]]:
+def boundary_chunks(
+    boundary: Callable[[Any], bool], xs: Sequence[Any]
+) -> list[list[Any]]:
     if not xs:
         return []
     chunks = [[xs[0]]]
@@ -1942,7 +2398,9 @@ def boundary_chunks(boundary: Callable[[Any], bool], xs: Sequence[Any]) -> list[
     return chunks
 
 
-def capped_boundary_chunks(capacity: int, boundary: Callable[[Any], bool], xs: Sequence[Any]) -> Optional[list[list[Any]]]:
+def capped_boundary_chunks(
+    capacity: int, boundary: Callable[[Any], bool], xs: Sequence[Any]
+) -> Optional[list[list[Any]]]:
     ch = boundary_chunks(boundary, xs)
     return ch if len(ch) <= capacity else None
 
@@ -1963,28 +2421,38 @@ class GDNRAMV9:
     def restore(self, snap: np.ndarray) -> None:
         self.mem = snap.copy()
 
-    def store(self, addr: int, val: np.ndarray, gate_beta: float = 1.0, decay_g: float = 0.0) -> None:
+    def store(
+        self, addr: int, val: np.ndarray, gate_beta: float = 1.0, decay_g: float = 0.0
+    ) -> None:
         slot = int(addr) % self.mem.shape[0]
-        v = np.asarray(val, dtype=np.float64).ravel()[:self.mem.shape[1]]
+        v = np.asarray(val, dtype=np.float64).ravel()[: self.mem.shape[1]]
         if v.size < self.mem.shape[1]:
             v = np.pad(v, (0, self.mem.shape[1] - v.size))
-        self.mem[slot] = (1.0 - decay_g) * self.mem[slot] * (1.0 - gate_beta) + gate_beta * v
+        self.mem[slot] = (1.0 - decay_g) * self.mem[slot] * (
+            1.0 - gate_beta
+        ) + gate_beta * v
 
     def load(self, addr: int) -> np.ndarray:
         return self.mem[int(addr) % self.mem.shape[0]].copy()
 
     def load_stutter_head(self, addr_seq: Sequence[int]) -> np.ndarray:
         norm = stutter_norm(addr_seq)
-        return self.load(norm[0]) if norm else np.zeros(self.mem.shape[1], dtype=np.float64)
+        return (
+            self.load(norm[0])
+            if norm
+            else np.zeros(self.mem.shape[1], dtype=np.float64)
+        )
 
 
 # ==============================================================================
 # 8. Formal Runtime Governance: CertStepGen, AuditLedger, HedgeRouter
 # ==============================================================================
 
+
 @dataclass
 class CertStepGen:
     """Canonical transition certificate (Hagi/Cert/StepGen.lean)."""
+
     version: int
     task: str
     action: str
@@ -2044,6 +2512,7 @@ class AuditStream:
 @dataclass
 class AuditLedgerV9:
     """C264/C274 AuditLedger: disjoint streams, alpha spending, floors, final_test_untouched."""
+
     delta_total: float = 0.05
     spent: dict[str, float] = field(default_factory=dict)
     streams: dict[str, AuditStream] = field(default_factory=dict)
@@ -2062,7 +2531,9 @@ class AuditLedgerV9:
             return self.streams[task]
         lo = self.next_cursor_base
         hi = lo + max(1, int(n_samples))
-        assert hi <= self.final_test_lo, "audit stream overlapped held-out final test range"
+        assert (
+            hi <= self.final_test_lo
+        ), "audit stream overlapped held-out final test range"
         st = AuditStream(lo=lo, hi=hi, cursor=lo)
         self.streams[task] = st
         self.next_cursor_base = hi
@@ -2078,7 +2549,9 @@ class AuditLedgerV9:
             return 1.0
         return math.sqrt(math.log(2.0 / alpha) / (2.0 * n))
 
-    def spend_anytime(self, task: str, alpha: float, n_samples: int) -> tuple[bool, float]:
+    def spend_anytime(
+        self, task: str, alpha: float, n_samples: int
+    ) -> tuple[bool, float]:
         if alpha < 0 or alpha > self.remaining() + 1e-12:
             return False, 1.0
         self.spent[task] = self.spent.get(task, 0.0) + alpha
@@ -2121,6 +2594,7 @@ def ram_available_bytes() -> int:
         pass
     try:
         import psutil
+
         return int(psutil.virtual_memory().available)
     except ImportError:
         pass
@@ -2129,13 +2603,20 @@ def ram_available_bytes() -> int:
             import ctypes
 
             class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
 
-            st = MEMORYSTATUSEX(); st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
             return int(st.ullAvailPhys)
         except Exception:
@@ -2147,7 +2628,10 @@ def ram_available_bytes() -> int:
 # 9. Fast Exact Polynomial Induction, Piecewise Solver & Meet-in-the-Middle MDL
 # ==============================================================================
 
-def _exact_poly_fit(xs: Sequence[int], ys: Sequence[int], max_degree: int = 5) -> Optional[tuple[int, ...]]:
+
+def _exact_poly_fit(
+    xs: Sequence[int], ys: Sequence[int], max_degree: int = 5
+) -> Optional[tuple[int, ...]]:
     pts = sorted({(int(x), int(y)) for x, y in zip(xs, ys)})
     if len({x for x, _ in pts}) < 2:
         return None
@@ -2171,21 +2655,31 @@ def _exact_poly_fit(xs: Sequence[int], ys: Sequence[int], max_degree: int = 5) -
             if any(c.denominator != 1 for c in coeffs):
                 continue
             icoeffs = tuple(int(c) for c in coeffs)
-            if all(sum(ci * (x ** i) for i, ci in enumerate(icoeffs)) == y for x, y in pts):
+            if all(
+                sum(ci * (x**i) for i, ci in enumerate(icoeffs)) == y for x, y in pts
+            ):
                 return icoeffs
     return None
 
 
 def _monomial_exponents(arity: int, max_degree: int) -> tuple[tuple[int, ...], ...]:
-    return tuple(sorted(
-        (powers for powers in itertools.product(range(max_degree + 1), repeat=arity)
-         if sum(powers) <= max_degree),
-        key=lambda powers: (sum(powers), powers),
-    ))
+    return tuple(
+        sorted(
+            (
+                powers
+                for powers in itertools.product(range(max_degree + 1), repeat=arity)
+                if sum(powers) <= max_degree
+            ),
+            key=lambda powers: (sum(powers), powers),
+        )
+    )
 
 
-def _fast_mod_p_consistent(rows_int: list[tuple[int, ...]], ys_int: list[int],
-                           monomials: tuple[tuple[int, ...], ...]) -> bool:
+def _fast_mod_p_consistent(
+    rows_int: list[tuple[int, ...]],
+    ys_int: list[int],
+    monomials: tuple[tuple[int, ...], ...],
+) -> bool:
     """Fast exact O(k^3) modular filter mod 2^31-1 before exact Fraction solve."""
     P = _PRIME_MOD
     ncols = len(monomials)
@@ -2225,7 +2719,10 @@ def _fast_mod_p_consistent(rows_int: list[tuple[int, ...]], ys_int: list[int],
 
 
 def _exact_multivariate_poly_fit(
-    inputs: Sequence[Sequence[int]], targets: Sequence[int], arity: int, max_degree: int = 4
+    inputs: Sequence[Sequence[int]],
+    targets: Sequence[int],
+    arity: int,
+    max_degree: int = 4,
 ) -> Optional[tuple[tuple[int, tuple[int, ...]], ...]]:
     if len(inputs) != len(targets) or not inputs or arity < 1:
         return None
@@ -2238,36 +2735,59 @@ def _exact_multivariate_poly_fit(
             continue
         if not _fast_mod_p_consistent(rows, ys, monomials):
             continue
-        sample_rows = rows[:min(len(rows), max(ncols + 12, int(ncols * 2)))]
-        sample_ys = ys[:len(sample_rows)]
+        sample_rows = rows[: min(len(rows), max(ncols + 12, int(ncols * 2)))]
+        sample_ys = ys[: len(sample_rows)]
         matrix = []
         for row, y in zip(sample_rows, sample_ys):
-            features = [Fraction(math.prod(x ** p for x, p in zip(row, powers))) for powers in monomials]
+            features = [
+                Fraction(math.prod(x**p for x, p in zip(row, powers)))
+                for powers in monomials
+            ]
             matrix.append(features + [Fraction(y)])
         pivot_row = 0
         pivot_rows: list[int] = []
         full_rank = True
         for col in range(ncols):
-            pivot = next((r for r in range(pivot_row, len(matrix)) if matrix[r][col] != 0), None)
+            pivot = next(
+                (r for r in range(pivot_row, len(matrix)) if matrix[r][col] != 0), None
+            )
             if pivot is None:
                 if len(sample_rows) < len(rows):
                     matrix = [
-                        [Fraction(math.prod(x ** p for x, p in zip(r, powers))) for powers in monomials] + [Fraction(y)]
+                        [
+                            Fraction(math.prod(x**p for x, p in zip(r, powers)))
+                            for powers in monomials
+                        ]
+                        + [Fraction(y)]
                         for r, y in zip(rows, ys)
                     ]
                     pivot_row = 0
                     pivot_rows = []
                     for col2 in range(ncols):
-                        piv2 = next((rr for rr in range(pivot_row, len(matrix)) if matrix[rr][col2] != 0), None)
+                        piv2 = next(
+                            (
+                                rr
+                                for rr in range(pivot_row, len(matrix))
+                                if matrix[rr][col2] != 0
+                            ),
+                            None,
+                        )
                         if piv2 is None:
-                            full_rank = False; break
-                        matrix[pivot_row], matrix[piv2] = matrix[piv2], matrix[pivot_row]
+                            full_rank = False
+                            break
+                        matrix[pivot_row], matrix[piv2] = (
+                            matrix[piv2],
+                            matrix[pivot_row],
+                        )
                         sc = matrix[pivot_row][col2]
                         matrix[pivot_row] = [v / sc for v in matrix[pivot_row]]
                         for rr in range(len(matrix)):
                             if rr != pivot_row and matrix[rr][col2]:
                                 fac = matrix[rr][col2]
-                                matrix[rr] = [a - fac * b for a, b in zip(matrix[rr], matrix[pivot_row])]
+                                matrix[rr] = [
+                                    a - fac * b
+                                    for a, b in zip(matrix[rr], matrix[pivot_row])
+                                ]
                         pivot_row += 1
                 else:
                     full_rank = False
@@ -2281,7 +2801,9 @@ def _exact_multivariate_poly_fit(
             for r in range(len(matrix)):
                 if r != pivot_row and matrix[r][col]:
                     fac = matrix[r][col]
-                    matrix[r] = [a - fac * b for a, b in zip(matrix[r], matrix[pivot_row])]
+                    matrix[r] = [
+                        a - fac * b for a, b in zip(matrix[r], matrix[pivot_row])
+                    ]
             pivot_rows.append(pivot_row)
             pivot_row += 1
         if not full_rank or len(pivot_rows) < ncols:
@@ -2289,8 +2811,14 @@ def _exact_multivariate_poly_fit(
         coefficients = [matrix[pivot_rows[col]][-1] for col in range(ncols)]
         if any(v.denominator != 1 for v in coefficients):
             continue
-        terms = tuple((int(c), powers) for c, powers in zip(coefficients, monomials) if c)
-        if all(sum(c * math.prod(x ** p for x, p in zip(row, powers)) for c, powers in terms) == y for row, y in zip(rows, ys)):
+        terms = tuple(
+            (int(c), powers) for c, powers in zip(coefficients, monomials) if c
+        )
+        if all(
+            sum(c * math.prod(x**p for x, p in zip(row, powers)) for c, powers in terms)
+            == y
+            for row, y in zip(rows, ys)
+        ):
             return terms
     return None
 
@@ -2305,7 +2833,9 @@ def _fit_poly_or_const(pts: list[tuple[int, int]]) -> Optional[ExprV9]:
     return None
 
 
-def exact_piecewise_poly_fit(train_x: Sequence[tuple[int, ...]], train_y: Sequence[int]) -> Optional[ExprV9]:
+def exact_piecewise_poly_fit(
+    train_x: Sequence[tuple[int, ...]], train_y: Sequence[int]
+) -> Optional[ExprV9]:
     """Exact rational piecewise polynomial / modular residue / generalized predicate discovery."""
     arity = len(train_x[0])
     if arity == 1:
@@ -2324,27 +2854,52 @@ def exact_piecewise_poly_fit(train_x: Sequence[tuple[int, ...]], train_y: Sequen
                 cl = _fit_poly_or_const(left)
                 cr = _fit_poly_or_const(right)
                 if cl is not None and cr is not None and cl != cr:
-                    return ExprV9("if_cond", (ExprV9("lt", (ExprV9.var(0), ExprV9.const(thr))), cl, cr))
+                    return ExprV9(
+                        "if_cond",
+                        (ExprV9("lt", (ExprV9.var(0), ExprV9.const(thr))), cl, cr),
+                    )
     elif 2 <= arity <= 3:
         preds: list[tuple[ExprV9, Callable[[tuple[int, ...]], bool]]] = [
             (ExprV9("lt", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] < r[1]),
             (ExprV9("le", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] <= r[1]),
             (ExprV9("eq", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] == r[1]),
-            (ExprV9("bit_and", (ExprV9.var(0), ExprV9.const(1))), lambda r: (r[0] & 1) != 0),
+            (
+                ExprV9("bit_and", (ExprV9.var(0), ExprV9.const(1))),
+                lambda r: (r[0] & 1) != 0,
+            ),
         ]
         if arity == 2:
-            preds.append((ExprV9("lt", (ExprV9.var(0), ExprV9.const(0))), lambda r: r[0] < 0))
-            preds.append((ExprV9("lt", (ExprV9.var(1), ExprV9.const(0))), lambda r: r[1] < 0))
+            preds.append(
+                (ExprV9("lt", (ExprV9.var(0), ExprV9.const(0))), lambda r: r[0] < 0)
+            )
+            preds.append(
+                (ExprV9("lt", (ExprV9.var(1), ExprV9.const(0))), lambda r: r[1] < 0)
+            )
         for cond_expr, fn in preds:
             true_pts = [(r, y) for r, y in zip(train_x, train_y) if fn(r)]
             false_pts = [(r, y) for r, y in zip(train_x, train_y) if not fn(r)]
             if len(true_pts) < 6 or len(false_pts) < 6:
                 continue
-            tl = _exact_multivariate_poly_fit([r for r, _ in true_pts], [y for _, y in true_pts], arity, max_degree=2)
-            tr = _exact_multivariate_poly_fit([r for r, _ in false_pts], [y for _, y in false_pts], arity, max_degree=2)
+            tl = _exact_multivariate_poly_fit(
+                [r for r, _ in true_pts], [y for _, y in true_pts], arity, max_degree=2
+            )
+            tr = _exact_multivariate_poly_fit(
+                [r for r, _ in false_pts],
+                [y for _, y in false_pts],
+                arity,
+                max_degree=2,
+            )
             if tl is not None and tr is not None and tl != tr:
-                eb1 = ExprV9.const(tl[0][0]) if (len(tl) == 1 and sum(tl[0][1]) == 0) else ExprV9("poly_nd", (), tl)
-                eb2 = ExprV9.const(tr[0][0]) if (len(tr) == 1 and sum(tr[0][1]) == 0) else ExprV9("poly_nd", (), tr)
+                eb1 = (
+                    ExprV9.const(tl[0][0])
+                    if (len(tl) == 1 and sum(tl[0][1]) == 0)
+                    else ExprV9("poly_nd", (), tl)
+                )
+                eb2 = (
+                    ExprV9.const(tr[0][0])
+                    if (len(tr) == 1 and sum(tr[0][1]) == 0)
+                    else ExprV9("poly_nd", (), tr)
+                )
                 return ExprV9("if_cond", (cond_expr, eb1, eb2))
     return None
 
@@ -2368,11 +2923,19 @@ def synthesize_batched_mdl_v9(
         # (0x400..) must pass; intermediate-value safety stays with MAG_CAP
         return None, 0
     N = X.shape[0]
-    leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [ExprV9.const(c) for c in CONSTS]
-    L_arr = np.stack([
-        np.ascontiguousarray(X[:, int(lf.value or 0)]) if lf.op == "var" else np.full(N, int(lf.value), dtype=np.int64)
-        for lf in leaf_exprs
-    ])
+    leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [
+        ExprV9.const(c) for c in CONSTS
+    ]
+    L_arr = np.stack(
+        [
+            (
+                np.ascontiguousarray(X[:, int(lf.value or 0)])
+                if lf.op == "var"
+                else np.full(N, int(lf.value), dtype=np.int64)
+            )
+            for lf in leaf_exprs
+        ]
+    )
     L_bits = [lf.bits() for lf in leaf_exprs]
 
     env = {name: ex for _, name, ex in library_experts}
@@ -2383,14 +2946,22 @@ def synthesize_batched_mdl_v9(
             if all(lf.eval(r, env) == y for r, y in zip(val_x, val_y)):
                 return lf, 1
 
-    is_bool_task = (X.min() >= 0 and X.max() <= 1 and Y.min() >= 0 and Y.max() <= 1) if N > 0 else False
+    is_bool_task = (
+        (X.min() >= 0 and X.max() <= 1 and Y.min() >= 0 and Y.max() <= 1)
+        if N > 0
+        else False
+    )
     useful_libs: list[tuple[int, str, ExpertV9]] = []
     for idx, nm, ex in library_experts:
         if ex.program.arity > arity or ex.program.expr is None:
             continue
         if not is_bool_task and ex.family == "BoolVenn":
             continue
-        if ex.program.arity == 2 and ex.program.expr.op in OPS and all(a.op == "var" for a in ex.program.expr.args):
+        if (
+            ex.program.arity == 2
+            and ex.program.expr.op in OPS
+            and all(a.op == "var" for a in ex.program.expr.args)
+        ):
             continue
         useful_libs.append((idx, nm, ex))
     useful_libs.sort(key=lambda it: (it[2].program.cost, -it[0]))
@@ -2433,7 +3004,9 @@ def synthesize_batched_mdl_v9(
         B_exprs = [x[0] for x in batch]
         V = np.stack([x[1] for x in batch])
 
-        def register(res_arr: np.ndarray, builder_fn: Callable[[int, int], ExprV9], new_bits: int) -> Optional[ExprV9]:
+        def register(
+            res_arr: np.ndarray, builder_fn: Callable[[int, int], ExprV9], new_bits: int
+        ) -> Optional[ExprV9]:
             nonlocal total_checked
             if new_bits > max_bits:
                 return None
@@ -2470,11 +3043,17 @@ def synthesize_batched_mdl_v9(
         V_sq_ok = np.where(np.abs(V) <= 32768, V * V, MAG_CAP + 1)
         V_cb_ok = np.where(np.abs(V) <= 1024, V * V * V, MAG_CAP + 1)
         for uop, ures in (
-            ("neg", -V), ("abs", np.abs(V)), ("sign", np.sign(V).astype(np.int64)),
-            ("bit_not8", (~V) & 0xFF), ("clamp3", np.clip(V, -3, 3)),
-            ("square", V_sq_ok), ("cube", V_cb_ok),
+            ("neg", -V),
+            ("abs", np.abs(V)),
+            ("sign", np.sign(V).astype(np.int64)),
+            ("bit_not8", (~V) & 0xFF),
+            ("clamp3", np.clip(V, -3, 3)),
+            ("square", V_sq_ok),
+            ("cube", V_cb_ok),
         ):
-            hit = register(ures, lambda bi, _, o=uop: ExprV9(o, (B_exprs[bi],)), min_b + TOKEN_BITS)
+            hit = register(
+                ures, lambda bi, _, o=uop: ExprV9(o, (B_exprs[bi],)), min_b + TOKEN_BITS
+            )
             if hit is not None:
                 return hit, total_checked
 
@@ -2497,7 +3076,13 @@ def synthesize_batched_mdl_v9(
                     ok_row_mask = np.all(ok_flat.reshape(ok_idxs.size, N), axis=1)
                     if np.any(ok_row_mask):
                         final_idxs = ok_idxs[ok_row_mask]
-                        hit = register(res_2d[ok_row_mask], lambda bi, _, o=ename, idxs=final_idxs: ExprV9("call", (B_exprs[int(idxs[bi])],), o), min_b + cbits)
+                        hit = register(
+                            res_2d[ok_row_mask],
+                            lambda bi, _, o=ename, idxs=final_idxs: ExprV9(
+                                "call", (B_exprs[int(idxs[bi])],), o
+                            ),
+                            min_b + cbits,
+                        )
                         if hit is not None:
                             return hit, total_checked
             elif ex.program.arity == 2:
@@ -2508,10 +3093,18 @@ def synthesize_batched_mdl_v9(
                         continue
                     lv = L_arr[li]
                     lv_min, lv_max = int(np.min(lv)), int(np.max(lv))
-                    base_mask = non_const_mask if lf.op == "const" else np.ones(B_len, dtype=bool)
+                    base_mask = (
+                        non_const_mask
+                        if lf.op == "const"
+                        else np.ones(B_len, dtype=bool)
+                    )
                     for order_idx in (0, 1):
                         if order_idx == 0:
-                            if lv_min < d1_lo or lv_max > d1_hi or (ex.valid_rule == "nonzero_y" and np.any(lv == 0)):
+                            if (
+                                lv_min < d1_lo
+                                or lv_max > d1_hi
+                                or (ex.valid_rule == "nonzero_y" and np.any(lv == 0))
+                            ):
                                 continue
                             cand_mask = base_mask & (V_min >= d0_lo) & (V_max <= d0_hi)
                         else:
@@ -2526,7 +3119,11 @@ def synthesize_batched_mdl_v9(
                         K_ok = ok_idxs.size
                         V_sel = V[ok_idxs]
                         L_rep = np.broadcast_to(lv[None, :], (K_ok, N))
-                        flat_in = np.column_stack((V_sel.ravel(), L_rep.ravel())) if order_idx == 0 else np.column_stack((L_rep.ravel(), V_sel.ravel()))
+                        flat_in = (
+                            np.column_stack((V_sel.ravel(), L_rep.ravel()))
+                            if order_idx == 0
+                            else np.column_stack((L_rep.ravel(), V_sel.ravel()))
+                        )
                         res_flat, ok_flat = eval_expr_vec(ex.program.expr, flat_in, env)
                         res_2d = res_flat.reshape(K_ok, N)
                         ok_row_mask = np.all(ok_flat.reshape(K_ok, N), axis=1)
@@ -2534,8 +3131,17 @@ def synthesize_batched_mdl_v9(
                             final_idxs = ok_idxs[ok_row_mask]
                             hit = register(
                                 res_2d[ok_row_mask],
-                                (lambda bi, _, o=ename, l=lf, idxs=final_idxs, oi=order_idx:
-                                 ExprV9("call", (B_exprs[int(idxs[bi])], l) if oi == 0 else (l, B_exprs[int(idxs[bi])]), o)),
+                                (
+                                    lambda bi, _, o=ename, l=lf, idxs=final_idxs, oi=order_idx: ExprV9(
+                                        "call",
+                                        (
+                                            (B_exprs[int(idxs[bi])], l)
+                                            if oi == 0
+                                            else (l, B_exprs[int(idxs[bi])])
+                                        ),
+                                        o,
+                                    )
+                                ),
                                 min_b + cbits + L_bits[li],
                             )
                             if hit is not None:
@@ -2544,69 +3150,124 @@ def synthesize_batched_mdl_v9(
         Va = V[:, None, :]
         Lb = L_arr[None, :, :]
         for op in BINARY_OPS:
-            if op == "add": R = Va + Lb
-            elif op == "sub": R = Va - Lb
+            if op == "add":
+                R = Va + Lb
+            elif op == "sub":
+                R = Va - Lb
             elif op == "mul":
                 ok_m = (np.abs(Va) <= 32768) & (np.abs(Lb) <= 32768)
-                sa = np.where(ok_m, Va, 0); sb = np.where(ok_m, Lb, 0)
+                sa = np.where(ok_m, Va, 0)
+                sb = np.where(ok_m, Lb, 0)
                 R = np.where(ok_m, sa * sb, MAG_CAP + 1)
-            elif op == "min": R = np.minimum(Va, Lb)
-            elif op == "max": R = np.maximum(Va, Lb)
-            elif op == "eq": R = (Va == Lb).astype(np.int64)
-            elif op == "ne": R = (Va != Lb).astype(np.int64)
-            elif op == "lt": R = (Va < Lb).astype(np.int64)
-            elif op == "le": R = (Va <= Lb).astype(np.int64)
-            elif op == "gt": R = (Va > Lb).astype(np.int64)
-            elif op == "ge": R = (Va >= Lb).astype(np.int64)
-            elif op == "bit_and": R = Va & Lb
-            elif op == "bit_or": R = Va | Lb
-            elif op == "bit_xor": R = Va ^ Lb
-            elif op == "bit_nand8": R = (~(Va & Lb)) & 0xFF
-            elif op == "bit_nor8": R = (~(Va | Lb)) & 0xFF
-            elif op == "bit_xnor8": R = (~(Va ^ Lb)) & 0xFF
+            elif op == "min":
+                R = np.minimum(Va, Lb)
+            elif op == "max":
+                R = np.maximum(Va, Lb)
+            elif op == "eq":
+                R = (Va == Lb).astype(np.int64)
+            elif op == "ne":
+                R = (Va != Lb).astype(np.int64)
+            elif op == "lt":
+                R = (Va < Lb).astype(np.int64)
+            elif op == "le":
+                R = (Va <= Lb).astype(np.int64)
+            elif op == "gt":
+                R = (Va > Lb).astype(np.int64)
+            elif op == "ge":
+                R = (Va >= Lb).astype(np.int64)
+            elif op == "bit_and":
+                R = Va & Lb
+            elif op == "bit_or":
+                R = Va | Lb
+            elif op == "bit_xor":
+                R = Va ^ Lb
+            elif op == "bit_nand8":
+                R = (~(Va & Lb)) & 0xFF
+            elif op == "bit_nor8":
+                R = (~(Va | Lb)) & 0xFF
+            elif op == "bit_xnor8":
+                R = (~(Va ^ Lb)) & 0xFF
             elif op == "floordiv":
                 safe = np.where(Lb != 0, Lb, 1)
-                R = np.where(np.broadcast_to(Lb != 0, np.broadcast_shapes(Va.shape, Lb.shape)), np.floor_divide(Va, safe), MAG_CAP + 1)
+                R = np.where(
+                    np.broadcast_to(Lb != 0, np.broadcast_shapes(Va.shape, Lb.shape)),
+                    np.floor_divide(Va, safe),
+                    MAG_CAP + 1,
+                )
             elif op == "mod":
                 safe = np.where(Lb != 0, Lb, 1)
-                R = np.where(np.broadcast_to(Lb != 0, np.broadcast_shapes(Va.shape, Lb.shape)), np.mod(Va, safe), MAG_CAP + 1)
+                R = np.where(
+                    np.broadcast_to(Lb != 0, np.broadcast_shapes(Va.shape, Lb.shape)),
+                    np.mod(Va, safe),
+                    MAG_CAP + 1,
+                )
             elif op == "gcd":
                 R = np.gcd(Va, Lb)
             elif op == "lcm":
                 ok_l = (np.abs(Va) <= 10000) & (np.abs(Lb) <= 10000)
-                sa = np.where(ok_l, Va, 0); sb = np.where(ok_l, Lb, 0)
+                sa = np.where(ok_l, Va, 0)
+                sb = np.where(ok_l, Lb, 0)
                 R = np.where(ok_l, np.lcm(sa, sb), MAG_CAP + 1)
             elif op == "pow_int":
                 ok_p = (Lb >= 0) & (Lb <= 8) & (np.abs(Va) <= 32)
-                sa = np.where(ok_p, Va, 0); sb = np.where(ok_p, Lb, 0)
-                R = np.where(ok_p, sa ** sb, MAG_CAP + 1)
+                sa = np.where(ok_p, Va, 0)
+                sb = np.where(ok_p, Lb, 0)
+                R = np.where(ok_p, sa**sb, MAG_CAP + 1)
             else:
                 continue
             for li in range(len(leaf_exprs)):
-                hit = register(R[:, li:li + 1, :], lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(o, (B_exprs[bi], l)), min_b + TOKEN_BITS + L_bits[li])
+                hit = register(
+                    R[:, li : li + 1, :],
+                    lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(o, (B_exprs[bi], l)),
+                    min_b + TOKEN_BITS + L_bits[li],
+                )
                 if hit is not None:
                     return hit, total_checked
             if op not in COMMUTATIVE_OPS:
-                if op == "sub": R2 = Lb - Va
-                elif op == "lt": R2 = (Lb < Va).astype(np.int64)
-                elif op == "le": R2 = (Lb <= Va).astype(np.int64)
-                elif op == "gt": R2 = (Lb > Va).astype(np.int64)
-                elif op == "ge": R2 = (Lb >= Va).astype(np.int64)
+                if op == "sub":
+                    R2 = Lb - Va
+                elif op == "lt":
+                    R2 = (Lb < Va).astype(np.int64)
+                elif op == "le":
+                    R2 = (Lb <= Va).astype(np.int64)
+                elif op == "gt":
+                    R2 = (Lb > Va).astype(np.int64)
+                elif op == "ge":
+                    R2 = (Lb >= Va).astype(np.int64)
                 elif op == "floordiv":
                     safe = np.where(Va != 0, Va, 1)
-                    R2 = np.where(np.broadcast_to(Va != 0, np.broadcast_shapes(Va.shape, Lb.shape)), np.floor_divide(Lb, safe), MAG_CAP + 1)
+                    R2 = np.where(
+                        np.broadcast_to(
+                            Va != 0, np.broadcast_shapes(Va.shape, Lb.shape)
+                        ),
+                        np.floor_divide(Lb, safe),
+                        MAG_CAP + 1,
+                    )
                 elif op == "mod":
                     safe = np.where(Va != 0, Va, 1)
-                    R2 = np.where(np.broadcast_to(Va != 0, np.broadcast_shapes(Va.shape, Lb.shape)), np.mod(Lb, safe), MAG_CAP + 1)
+                    R2 = np.where(
+                        np.broadcast_to(
+                            Va != 0, np.broadcast_shapes(Va.shape, Lb.shape)
+                        ),
+                        np.mod(Lb, safe),
+                        MAG_CAP + 1,
+                    )
                 elif op == "pow_int":
                     ok_p = (Va >= 0) & (Va <= 8) & (np.abs(Lb) <= 32)
-                    sa = np.where(ok_p, Lb, 0); sb = np.where(ok_p, Va, 0)
-                    R2 = np.where(ok_p, sa ** sb, MAG_CAP + 1)
+                    sa = np.where(ok_p, Lb, 0)
+                    sb = np.where(ok_p, Va, 0)
+                    R2 = np.where(ok_p, sa**sb, MAG_CAP + 1)
                 else:
                     R2 = None
                 if R2 is not None:
                     for li in range(len(leaf_exprs)):
-                        hit = register(R2[:, li:li + 1, :], lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(o, (l, B_exprs[bi])), min_b + TOKEN_BITS + L_bits[li])
+                        hit = register(
+                            R2[:, li : li + 1, :],
+                            lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(
+                                o, (l, B_exprs[bi])
+                            ),
+                            min_b + TOKEN_BITS + L_bits[li],
+                        )
                         if hit is not None:
                             return hit, total_checked
 
@@ -2652,13 +3313,18 @@ def synthesize_batched_mdl_v9(
         ok_base = np.all(np.abs(P_mat) <= 32, axis=1)
         ok_exp = np.all((P_mat >= 0) & (P_mat <= 8), axis=1)
         if np.any(ok_base) and np.any(ok_exp):
-            bases = P_mat[ok_base]; b_idxs = np.flatnonzero(ok_base)
-            exps = P_mat[ok_exp]; e_idxs = np.flatnonzero(ok_exp)
+            bases = P_mat[ok_base]
+            b_idxs = np.flatnonzero(ok_base)
+            exps = P_mat[ok_exp]
+            e_idxs = np.flatnonzero(ok_exp)
             pw = bases[:, None, :] ** exps[None, :, :]
             hits = np.all(pw == Y[None, None, :], axis=2)
             if np.any(hits):
                 bi, ei = np.argwhere(hits)[0]
-                cand = ExprV9("pow_int", (pool_exprs[int(b_idxs[bi])], pool_exprs[int(e_idxs[ei])]))
+                cand = ExprV9(
+                    "pow_int",
+                    (pool_exprs[int(b_idxs[bi])], pool_exprs[int(e_idxs[ei])]),
+                )
                 if verify_val(cand):
                     return cand, total_checked
 
@@ -2668,6 +3334,7 @@ def synthesize_batched_mdl_v9(
 # ==============================================================================
 # 10. ExpertV9, TheoremMinerV9, Structural Call-DAG Unification & Processor
 # ==============================================================================
+
 
 @dataclass
 class ExpertV9:
@@ -2693,8 +3360,11 @@ class ExpertV9:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name, "family": self.family, "program": self.program.to_dict(),
-            "domains": [list(d) for d in self.domains], "valid_rule": self.valid_rule,
+            "name": self.name,
+            "family": self.family,
+            "program": self.program.to_dict(),
+            "domains": [list(d) for d in self.domains],
+            "valid_rule": self.valid_rule,
             "code_length": self.code_length,
             "adapter": self.adapter.to_dict() if self.adapter else None,
             "parents": list(self.parents),
@@ -2703,11 +3373,17 @@ class ExpertV9:
     @staticmethod
     def from_dict(d: dict[str, Any], core: "FactorizedSharedCoreV9") -> "ExpertV9":
         return ExpertV9(
-            name=str(d["name"]), family=str(d["family"]),
+            name=str(d["name"]),
+            family=str(d["family"]),
             program=ProgramV9.from_dict(d["program"]),
             domains=tuple(tuple(int(v) for v in dom) for dom in d["domains"]),
-            valid_rule=str(d["valid_rule"]), code_length=int(d["code_length"]),
-            adapter=FactorizedAdapterV9.from_dict(d["adapter"], core) if d.get("adapter") else None,
+            valid_rule=str(d["valid_rule"]),
+            code_length=int(d["code_length"]),
+            adapter=(
+                FactorizedAdapterV9.from_dict(d["adapter"], core)
+                if d.get("adapter")
+                else None
+            ),
             parents=tuple(str(p) for p in d.get("parents", [])),
         )
 
@@ -2736,9 +3412,19 @@ class TheoremMinerV9:
                     nm = f"commutativity({e.name})"
                     if nm not in known:
                         try:
-                            if all(e.program.eval((x, y), env) == e.program.eval((y, x), env) for x, y in swapped):
-                                th = Theorem(nm, f"for all supported pairs: {e.name}(x,y)={e.name}(y,x)", len(swapped))
-                                model.theorems.append(th); found.append(th); known.add(nm)
+                            if all(
+                                e.program.eval((x, y), env)
+                                == e.program.eval((y, x), env)
+                                for x, y in swapped
+                            ):
+                                th = Theorem(
+                                    nm,
+                                    f"for all supported pairs: {e.name}(x,y)={e.name}(y,x)",
+                                    len(swapped),
+                                )
+                                model.theorems.append(th)
+                                found.append(th)
+                                known.add(nm)
                         except Exception:
                             pass
                 self_pairs = [x for x in dx if x in dy and e.supports((x, x))]
@@ -2746,8 +3432,14 @@ class TheoremMinerV9:
                 if self_pairs and len(self_pairs) == len(dx) and nm not in known:
                     try:
                         if all(e.program.eval((x, x), env) == x for x in self_pairs):
-                            th = Theorem(nm, f"for all overlapping x: {e.name}(x,x)=x", len(self_pairs))
-                            model.theorems.append(th); found.append(th); known.add(nm)
+                            th = Theorem(
+                                nm,
+                                f"for all overlapping x: {e.name}(x,x)=x",
+                                len(self_pairs),
+                            )
+                            model.theorems.append(th)
+                            found.append(th)
+                            known.add(nm)
                     except Exception:
                         pass
                 zero_pairs = [x for x in dx if 0 in dy and e.supports((x, 0))]
@@ -2755,8 +3447,12 @@ class TheoremMinerV9:
                 if zero_pairs and len(zero_pairs) == len(dx) and nm not in known:
                     try:
                         if all(e.program.eval((x, 0), env) == x for x in zero_pairs):
-                            th = Theorem(nm, f"for all x: {e.name}(x,0)=x", len(zero_pairs))
-                            model.theorems.append(th); found.append(th); known.add(nm)
+                            th = Theorem(
+                                nm, f"for all x: {e.name}(x,0)=x", len(zero_pairs)
+                            )
+                            model.theorems.append(th)
+                            found.append(th)
+                            known.add(nm)
                     except Exception:
                         pass
             elif e.program.arity == 1:
@@ -2767,21 +3463,36 @@ class TheoremMinerV9:
                     for x in dom:
                         y = int(e.program.eval((x,), env))
                         if not e.supports((y,)):
-                            closed = False; break
+                            closed = False
+                            break
                         img[x] = y
                 except Exception:
                     closed = False
                 if closed:
                     for prop, fn in (
-                        ("involutivity", lambda: all(e.program.eval((img[x],), env) == x for x in dom)),
-                        ("idempotence", lambda: all(e.program.eval((img[x],), env) == img[x] for x in dom)),
+                        (
+                            "involutivity",
+                            lambda: all(
+                                e.program.eval((img[x],), env) == x for x in dom
+                            ),
+                        ),
+                        (
+                            "idempotence",
+                            lambda: all(
+                                e.program.eval((img[x],), env) == img[x] for x in dom
+                            ),
+                        ),
                     ):
                         nm = f"{prop}({e.name})"
                         if nm not in known:
                             try:
                                 if fn():
-                                    th = Theorem(nm, f"{prop} on certified domain", len(dom))
-                                    model.theorems.append(th); found.append(th); known.add(nm)
+                                    th = Theorem(
+                                        nm, f"{prop} on certified domain", len(dom)
+                                    )
+                                    model.theorems.append(th)
+                                    found.append(th)
+                                    known.add(nm)
                             except Exception:
                                 pass
                 if all((-x) in dom for x in dom):
@@ -2789,15 +3500,27 @@ class TheoremMinerV9:
                         nm = f"{sym_name}({e.name})"
                         if nm not in known:
                             try:
-                                if all(e.program.eval((-x,), env) == sgn * e.program.eval((x,), env) for x in dom):
-                                    th = Theorem(nm, f"{e.name}(-x)={'+' if sgn == 1 else '-'}{e.name}(x)", len(dom))
-                                    model.theorems.append(th); found.append(th); known.add(nm)
+                                if all(
+                                    e.program.eval((-x,), env)
+                                    == sgn * e.program.eval((x,), env)
+                                    for x in dom
+                                ):
+                                    th = Theorem(
+                                        nm,
+                                        f"{e.name}(-x)={'+' if sgn == 1 else '-'}{e.name}(x)",
+                                        len(dom),
+                                    )
+                                    model.theorems.append(th)
+                                    found.append(th)
+                                    known.add(nm)
                             except Exception:
                                 pass
         return found
 
 
-def _match_pattern(pattern: ExprV9, target: ExprV9, env_bind: dict[int, ExprV9]) -> bool:
+def _match_pattern(
+    pattern: ExprV9, target: ExprV9, env_bind: dict[int, ExprV9]
+) -> bool:
     """Structural unification: match pattern AST (with var(i) holes) against target subtree."""
     if pattern.op == "var":
         idx = int(pattern.value or 0)
@@ -2805,9 +3528,15 @@ def _match_pattern(pattern: ExprV9, target: ExprV9, env_bind: dict[int, ExprV9])
             return env_bind[idx] == target
         env_bind[idx] = target
         return True
-    if pattern.op != target.op or pattern.value != target.value or len(pattern.args) != len(target.args):
+    if (
+        pattern.op != target.op
+        or pattern.value != target.value
+        or len(pattern.args) != len(target.args)
+    ):
         return False
-    return all(_match_pattern(pa, ta, env_bind) for pa, ta in zip(pattern.args, target.args))
+    return all(
+        _match_pattern(pa, ta, env_bind) for pa, ta in zip(pattern.args, target.args)
+    )
 
 
 def _dag_reaches(experts: dict[str, ExpertV9], start: str, target: str) -> bool:
@@ -2829,8 +3558,14 @@ def _dag_reaches(experts: dict[str, ExpertV9], start: str, target: str) -> bool:
 class GrowingHagiProcessorV9:
     """Unified HAGI v9.0 Self-Developing Processor with Full Governance."""
 
-    def __init__(self, seed: int = 42, node_budget: int = 8000, delta_total: float = 0.05,
-                 compute_budget: float = 1000.0, risk_limit: float = 10.0):
+    def __init__(
+        self,
+        seed: int = 42,
+        node_budget: int = 8000,
+        delta_total: float = 0.05,
+        compute_budget: float = 1000.0,
+        risk_limit: float = 10.0,
+    ):
         self.core = FactorizedSharedCoreV9(seed=seed, width=48)
         self.node_budget = int(node_budget)
         self.experts: dict[str, ExpertV9] = {}
@@ -2857,7 +3592,10 @@ class GrowingHagiProcessorV9:
                 for c in ex.program.expr.callees():
                     if c in counts:
                         counts[c] += 1
-        ordered = sorted(self.experts.keys(), key=lambda nm: (-counts[nm], self.experts[nm].code_length, nm))
+        ordered = sorted(
+            self.experts.keys(),
+            key=lambda nm: (-counts[nm], self.experts[nm].code_length, nm),
+        )
         return {nm: i for i, nm in enumerate(ordered)}
 
     def _snapshot_state_with_optimizer(self) -> dict[str, Any]:
@@ -2873,7 +3611,9 @@ class GrowingHagiProcessorV9:
         self.router.restore(snap["router"])
         self.ram.restore(snap["ram"])
 
-    def _record_ram_fingerprint(self, name: str, domain: list[tuple[int, ...]], ys: dict[tuple[int, ...], int]) -> None:
+    def _record_ram_fingerprint(
+        self, name: str, domain: list[tuple[int, ...]], ys: dict[tuple[int, ...], int]
+    ) -> None:
         vals = [ys[r] for r in domain[:32]]
         chunks = boundary_chunks(lambda v: v == 0 or abs(v) > 4, vals)
         heads = boundary_heads(lambda v: v == 0 or abs(v) > 4, vals)
@@ -2896,8 +3636,13 @@ class GrowingHagiProcessorV9:
         deadline: Optional[float] = None,
     ) -> dict[str, Any]:
         if spec.name in self.experts:
-            return {"version": self.version, "task": spec.name, "action": "REUSE",
-                    "reason": "already learned", "code_length": self.experts[spec.name].code_length}
+            return {
+                "version": self.version,
+                "task": spec.name,
+                "action": "REUSE",
+                "reason": "already learned",
+                "code_length": self.experts[spec.name].code_length,
+            }
         domain = spec.inputs()
         if not domain:
             return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)
@@ -2906,10 +3651,14 @@ class GrowingHagiProcessorV9:
 
         rng = np.random.default_rng(seed)
         perm = rng.permutation(len(domain))
-        if spec.family == "BoolVenn" or (all(set(d) <= {0, 1} for d in spec.domains) and len(domain) <= 16):
+        if spec.family == "BoolVenn" or (
+            all(set(d) <= {0, 1} for d in spec.domains) and len(domain) <= 16
+        ):
             n_train = max(1, len(domain) - 1)
         else:
-            n_train = max(1, min(len(domain) - 1, int(round(len(domain) * train_fraction))))
+            n_train = max(
+                1, min(len(domain) - 1, int(round(len(domain) * train_fraction)))
+            )
         train_x = [domain[int(i)] for i in perm[:n_train]]
         val_x = [domain[int(i)] for i in perm[n_train:]]
         all_y = {xs: int(spec.teacher(*xs)) for xs in domain}
@@ -2921,7 +3670,9 @@ class GrowingHagiProcessorV9:
         if poison_one_label and train_y:
             self.ledger.record_reject(spec.name)
             self._restore_state_with_optimizer(opt_snap)
-            return self._hold(spec, "POISONED_LABEL_INJECTION", len(train_x), len(val_x))
+            return self._hold(
+                spec, "POISONED_LABEL_INJECTION", len(train_x), len(val_x)
+            )
 
         alpha_step = min(0.0005, self.ledger.remaining() * 0.5)
         ok_alpha, _radius = self.ledger.spend_anytime(spec.name, alpha_step, len(val_x))
@@ -2931,7 +3682,9 @@ class GrowingHagiProcessorV9:
 
         adapter: Optional[FactorizedAdapterV9] = None
         if train_neural and val_x and spec.family != "BoolVenn":
-            adapter = self.core.fit_residual(train_x, train_y, val_x, val_y, router=self.router)
+            adapter = self.core.fit_residual(
+                train_x, train_y, val_x, val_y, router=self.router
+            )
 
         ex_idx = self._expert_index()
 
@@ -2942,9 +3695,15 @@ class GrowingHagiProcessorV9:
                 continue
             self.evals += len(train_x)
             try:
-                if any(ex.program.eval(xs, self.experts) != yy for xs, yy in zip(train_x, train_y)):
+                if any(
+                    ex.program.eval(xs, self.experts) != yy
+                    for xs, yy in zip(train_x, train_y)
+                ):
                     continue
-                if any(ex.program.eval(xs, self.experts) != yy for xs, yy in zip(val_x, val_y)):
+                if any(
+                    ex.program.eval(xs, self.experts) != yy
+                    for xs, yy in zip(val_x, val_y)
+                ):
                     continue
                 if any(ex.program.eval(xs, self.experts) != all_y[xs] for xs in domain):
                     continue
@@ -2952,29 +3711,49 @@ class GrowingHagiProcessorV9:
                 continue
             ref_bits = TOKEN_BITS + gamma_bits(ex_idx[nm] + 1)
             ev = {
-                "version": self.version, "task": spec.name, "action": "REUSE",
-                "reason": f"verified-expert-coverage:{nm}", "program": ex.program.pretty(),
-                "code_length": ref_bits, "train_examples": len(train_x), "validation_examples": len(val_x),
+                "version": self.version,
+                "task": spec.name,
+                "action": "REUSE",
+                "reason": f"verified-expert-coverage:{nm}",
+                "program": ex.program.pretty(),
+                "code_length": ref_bits,
+                "train_examples": len(train_x),
+                "validation_examples": len(val_x),
                 "exact_accuracy": 1.0,
             }
             self.growth_log.append(ev)
             self.ledger.record_floor(spec.name, 1.0)
             return ev
 
-        def try_commit(program: ProgramV9, reason: str, parents: tuple[str, ...] = ()) -> Optional[dict[str, Any]]:
+        def try_commit(
+            program: ProgramV9, reason: str, parents: tuple[str, ...] = ()
+        ) -> Optional[dict[str, Any]]:
             try:
                 self.evals += len(train_x)
-                if any(program.eval(xs, self.experts) != yy for xs, yy in zip(train_x, train_y)):
+                if any(
+                    program.eval(xs, self.experts) != yy
+                    for xs, yy in zip(train_x, train_y)
+                ):
                     return None
-                if val_x and any(program.eval(xs, self.experts) != yy for xs, yy in zip(val_x, val_y)):
+                if val_x and any(
+                    program.eval(xs, self.experts) != yy for xs, yy in zip(val_x, val_y)
+                ):
                     return None
                 if any(program.eval(xs, self.experts) != all_y[xs] for xs in domain):
                     return None
             except Exception:
                 return None
             bits = program.bits(ex_idx)
-            expert = ExpertV9(spec.name, spec.family, program, spec.domains, spec.valid_rule,
-                              bits, adapter, parents)
+            expert = ExpertV9(
+                spec.name,
+                spec.family,
+                program,
+                spec.domains,
+                spec.valid_rule,
+                bits,
+                adapter,
+                parents,
+            )
             self.experts[spec.name] = expert
             self.version += 1
             self.total_commits += 1
@@ -2992,19 +3771,31 @@ class GrowingHagiProcessorV9:
             self.risk_rem -= r_spend
             floors_ok = self.ledger.record_floor(spec.name, 1.0)
             cert = CertStepGen(
-                version=self.version, task=spec.name, action="COMMIT",
-                obj_before=self.unsolved_objective, obj_after=obj_after, drop=drop,
-                budget_rem=self.compute_budget, budget_spend=b_spend,
-                risk_rem=self.risk_rem, risk_spend=r_spend,
-                delta_rem=self.ledger.remaining(), delta_spend=alpha_step,
+                version=self.version,
+                task=spec.name,
+                action="COMMIT",
+                obj_before=self.unsolved_objective,
+                obj_after=obj_after,
+                drop=drop,
+                budget_rem=self.compute_budget,
+                budget_spend=b_spend,
+                risk_rem=self.risk_rem,
+                risk_spend=r_spend,
+                delta_rem=self.ledger.remaining(),
+                delta_spend=alpha_step,
                 floors_kept=floors_ok,
             )
             self.unsolved_objective = obj_after
             self.cert_log.append(cert)
             ev = {
-                "version": self.version, "task": spec.name, "action": "COMMIT",
-                "reason": reason, "program": program.pretty(), "code_length": bits,
-                "train_examples": len(train_x), "validation_examples": len(val_x),
+                "version": self.version,
+                "task": spec.name,
+                "action": "COMMIT",
+                "reason": reason,
+                "program": program.pretty(),
+                "code_length": bits,
+                "train_examples": len(train_x),
+                "validation_examples": len(val_x),
                 "exact_accuracy": 1.0,
             }
             self.growth_log.append(ev)
@@ -3023,7 +3814,7 @@ class GrowingHagiProcessorV9:
                 missing = [r for r in full_inputs if r not in train_map]
                 if len(missing) <= 1:
                     anf_cands = []
-                    for fill in ((0,) if not missing else (0, 1)):
+                    for fill in (0,) if not missing else (0, 1):
                         tt = [train_map.get(r, fill) for r in full_inputs]
                         coeffs = anf_transform(tt)
                         active_s = [s for s, c in enumerate(coeffs) if c]
@@ -3047,30 +3838,49 @@ class GrowingHagiProcessorV9:
             if spec.arity == 1:
                 coeffs = _exact_poly_fit([r[0] for r in train_x], train_y, max_degree=5)
                 if coeffs is not None:
-                    ev = try_commit(ProgramV9(1, ExprV9("poly", (ExprV9.var(0),), coeffs)), "exact-rational-poly+full-support")
+                    ev = try_commit(
+                        ProgramV9(1, ExprV9("poly", (ExprV9.var(0),), coeffs)),
+                        "exact-rational-poly+full-support",
+                    )
                     if ev is not None:
                         return ev
             else:
-                terms = _exact_multivariate_poly_fit(train_x, train_y, spec.arity, max_degree=4)
+                terms = _exact_multivariate_poly_fit(
+                    train_x, train_y, spec.arity, max_degree=4
+                )
                 if terms is not None:
-                    ev = try_commit(ProgramV9(spec.arity, ExprV9("poly_nd", (), terms)), "exact-multivar-poly+full-support")
+                    ev = try_commit(
+                        ProgramV9(spec.arity, ExprV9("poly_nd", (), terms)),
+                        "exact-multivar-poly+full-support",
+                    )
                     if ev is not None:
                         return ev
 
         pw = exact_piecewise_poly_fit(train_x, train_y)
         if pw is not None:
-            ev = try_commit(ProgramV9(spec.arity, pw), "exact-piecewise-poly+full-support")
+            ev = try_commit(
+                ProgramV9(spec.arity, pw), "exact-piecewise-poly+full-support"
+            )
             if ev is not None:
                 return ev
 
         lib_list = [(ex_idx[nm], nm, self.experts[nm]) for nm in self.experts]
         hit_expr, n_chk = synthesize_batched_mdl_v9(
-            spec.arity, train_x, train_y, val_x, val_y,
-            library_experts=lib_list, max_evals=self.node_budget, max_bits=160, deadline=deadline,  # 64-bit headroom (gamma-coded)
+            spec.arity,
+            train_x,
+            train_y,
+            val_x,
+            val_y,
+            library_experts=lib_list,
+            max_evals=self.node_budget,
+            max_bits=160,
+            deadline=deadline,  # 64-bit headroom (gamma-coded)
         )
         self.candidates_generated += n_chk
         if hit_expr is not None:
-            ev = try_commit(ProgramV9(spec.arity, hit_expr), "batched-mdl-mitm-dag+full-support")
+            ev = try_commit(
+                ProgramV9(spec.arity, hit_expr), "batched-mdl-mitm-dag+full-support"
+            )
             if ev is not None:
                 return ev
 
@@ -3078,21 +3888,36 @@ class GrowingHagiProcessorV9:
         self.ledger.record_reject(spec.name)
         return self._hold(spec, "NO_VALIDATED_PROGRAM", len(train_x), len(val_x))
 
-    def _hold(self, spec: TaskSpec, reason: str, ntrain: int, nval: int) -> dict[str, Any]:
+    def _hold(
+        self, spec: TaskSpec, reason: str, ntrain: int, nval: int
+    ) -> dict[str, Any]:
         self.total_holds += 1
         cert = CertStepGen(
-            version=self.version, task=spec.name, action="HOLD",
-            obj_before=self.unsolved_objective, obj_after=self.unsolved_objective, drop=0.0,
-            budget_rem=self.compute_budget, budget_spend=0.0,
-            risk_rem=self.risk_rem, risk_spend=0.0,
-            delta_rem=self.ledger.remaining(), delta_spend=0.0,
+            version=self.version,
+            task=spec.name,
+            action="HOLD",
+            obj_before=self.unsolved_objective,
+            obj_after=self.unsolved_objective,
+            drop=0.0,
+            budget_rem=self.compute_budget,
+            budget_spend=0.0,
+            risk_rem=self.risk_rem,
+            risk_spend=0.0,
+            delta_rem=self.ledger.remaining(),
+            delta_spend=0.0,
             floors_kept=True,
         )
         self.cert_log.append(cert)
         ev = {
-            "version": self.version, "task": spec.name, "action": "HOLD",
-            "reason": reason, "program": "", "code_length": 0,
-            "train_examples": ntrain, "validation_examples": nval, "exact_accuracy": 0.0,
+            "version": self.version,
+            "task": spec.name,
+            "action": "HOLD",
+            "reason": reason,
+            "program": "",
+            "code_length": 0,
+            "train_examples": ntrain,
+            "validation_examples": nval,
+            "exact_accuracy": 0.0,
         }
         self.growth_log.append(ev)
         return ev
@@ -3109,10 +3934,18 @@ class GrowingHagiProcessorV9:
             if target_ex.program.expr is None:
                 continue
             cur_expr = target_ex.program.expr
-            subs = [s for s in cur_expr.subtrees() if s.op not in ("var", "const", "call") and s.cost >= 2]
+            subs = [
+                s
+                for s in cur_expr.subtrees()
+                if s.op not in ("var", "const", "call") and s.cost >= 2
+            ]
             if not subs:
                 continue
-            domain = [xs for xs in itertools.product(*target_ex.domains) if target_ex.supports(xs)]
+            domain = [
+                xs
+                for xs in itertools.product(*target_ex.domains)
+                if target_ex.supports(xs)
+            ]
             for sub in subs:
                 for lib_name, lib_ex in list(self.experts.items()):
                     if lib_name == target_name or lib_ex.program.expr is None:
@@ -3134,7 +3967,11 @@ class GrowingHagiProcessorV9:
                     if new_bits >= target_ex.code_length:
                         continue
                     try:
-                        if all(cand_prog.eval(xs, self.experts) == target_ex.program.eval(xs, self.experts) for xs in domain):
+                        if all(
+                            cand_prog.eval(xs, self.experts)
+                            == target_ex.program.eval(xs, self.experts)
+                            for xs in domain
+                        ):
                             target_ex.program = cand_prog
                             target_ex.code_length = new_bits
                             cur_expr = cand_expr
@@ -3146,7 +3983,11 @@ class GrowingHagiProcessorV9:
         for ex in self.experts.values():
             ex.code_length = ex.program.bits(ex_idx)
         after_bits = sum(e.code_length for e in self.experts.values())
-        return {"before_bits": before_bits, "after_bits": after_bits, "refactored": refactored}
+        return {
+            "before_bits": before_bits,
+            "after_bits": after_bits,
+            "refactored": refactored,
+        }
 
     def predict(self, name: str, *xs: int, mode: str = "exact") -> dict[str, Any]:
         ex = self.experts.get(name)
@@ -3155,16 +3996,28 @@ class GrowingHagiProcessorV9:
         if not ex.supports(xs):
             return {"status": "ABSTAIN", "reason": "outside certified finite domain"}
         if mode == "exact":
-            return {"status": "OK", "value": ex.program.eval(xs, self.experts),
-                    "source": "verified-symbolic-dag", "model_version": self.version}
+            return {
+                "status": "OK",
+                "value": ex.program.eval(xs, self.experts),
+                "source": "verified-symbolic-dag",
+                "model_version": self.version,
+            }
         if mode == "neural":
             if ex.adapter is None:
                 if ex.program.venn_mask is not None:
-                    return {"status": "APPROXIMATE", "value": float(venn_head_eval(ex.program.venn_mask, xs)),
-                            "source": "venn-head-exact-ternary", "model_version": self.version}
+                    return {
+                        "status": "APPROXIMATE",
+                        "value": float(venn_head_eval(ex.program.venn_mask, xs)),
+                        "source": "venn-head-exact-ternary",
+                        "model_version": self.version,
+                    }
                 return {"status": "ABSTAIN", "reason": "neural adapter unavailable"}
-            return {"status": "APPROXIMATE", "value": ex.adapter.predict(self.core, xs),
-                    "source": "factorized-core-bitalloc-rvq", "model_version": self.version}
+            return {
+                "status": "APPROXIMATE",
+                "value": ex.adapter.predict(self.core, xs),
+                "source": "factorized-core-bitalloc-rvq",
+                "model_version": self.version,
+            }
         raise ValueError("mode must be exact or neural")
 
     def verify_all(self, specs: Sequence[TaskSpec]) -> dict[str, Any]:
@@ -3174,20 +4027,37 @@ class GrowingHagiProcessorV9:
             if ex is None:
                 continue
             rows = sp.inputs()
-            ok = sum(int(ex.program.eval(xs, self.experts) == int(sp.teacher(*xs))) for xs in rows)
+            ok = sum(
+                int(ex.program.eval(xs, self.experts) == int(sp.teacher(*xs)))
+                for xs in rows
+            )
             total += len(rows)
             correct += ok
-        return {"checked": total, "correct": correct, "accuracy": correct / max(1, total), "committed": len(self.experts)}
+        return {
+            "checked": total,
+            "correct": correct,
+            "accuracy": correct / max(1, total),
+            "committed": len(self.experts),
+        }
 
     def verify_certificates(self) -> dict[str, Any]:
         """CertStepGen telescope, HoldStep immutability, AuditLedger disjointness, HedgeRouter floor."""
         obj0 = self.cert_log[0].obj_before if self.cert_log else self.unsolved_objective
         total_drops = sum(c.drop for c in self.cert_log)
         telescope_ok = self.unsolved_objective <= obj0 - total_drops + 1e-9
-        holds_ok = all(c.drop == 0.0 and c.obj_after == c.obj_before and c.budget_spend == 0.0
-                       for c in self.cert_log if c.action == "HOLD")
-        commits_ok = all(c.drop > 0.0 and c.budget_rem >= -1e-12 and c.risk_rem >= -1e-12 and c.floors_kept
-                         for c in self.cert_log if c.action == "COMMIT")
+        holds_ok = all(
+            c.drop == 0.0 and c.obj_after == c.obj_before and c.budget_spend == 0.0
+            for c in self.cert_log
+            if c.action == "HOLD"
+        )
+        commits_ok = all(
+            c.drop > 0.0
+            and c.budget_rem >= -1e-12
+            and c.risk_rem >= -1e-12
+            and c.floors_kept
+            for c in self.cert_log
+            if c.action == "COMMIT"
+        )
         ledger_ok = self.ledger.verify_disjoint_and_clean()
         return {
             "telescope_ok": telescope_ok,
@@ -3198,13 +4068,27 @@ class GrowingHagiProcessorV9:
         }
 
     def total_neural_bytes(self) -> int:
-        venn_bytes = 13 if any(e.family == "BoolVenn" for e in self.experts.values()) else 0
-        adapter_bytes = sum(e.adapter.compressed_bytes for e in self.experts.values() if e.adapter is not None)
+        venn_bytes = (
+            13 if any(e.family == "BoolVenn" for e in self.experts.values()) else 0
+        )
+        adapter_bytes = sum(
+            e.adapter.compressed_bytes
+            for e in self.experts.values()
+            if e.adapter is not None
+        )
         return self.core.core_bytes + venn_bytes + adapter_bytes
 
     def neural_quality_summary(self) -> dict[str, float]:
-        accs = [e.adapter.val_exact_acc_quant for e in self.experts.values() if e.adapter is not None]
-        mses = [e.adapter.val_mse_quant for e in self.experts.values() if e.adapter is not None]
+        accs = [
+            e.adapter.val_exact_acc_quant
+            for e in self.experts.values()
+            if e.adapter is not None
+        ]
+        mses = [
+            e.adapter.val_mse_quant
+            for e in self.experts.values()
+            if e.adapter is not None
+        ]
         return {
             "num_adapters": len(accs),
             "mean_val_exact_acc": float(np.mean(accs)) if accs else 0.0,
@@ -3214,10 +4098,14 @@ class GrowingHagiProcessorV9:
 
     def save(self, path: str | Path) -> None:
         data = {
-            "format": "HAGI-V9", "version": V9_VERSION,
-            "core_seed": self.core.seed, "core_width": self.core.width,
-            "model_version": self.version, "node_budget": self.node_budget,
-            "total_commits": self.total_commits, "total_holds": self.total_holds,
+            "format": "HAGI-V9",
+            "version": V9_VERSION,
+            "core_seed": self.core.seed,
+            "core_width": self.core.width,
+            "model_version": self.version,
+            "node_budget": self.node_budget,
+            "total_commits": self.total_commits,
+            "total_holds": self.total_holds,
             "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},
             "theorems": [vars(t) for t in self.theorems],
             "growth_log": self.growth_log,
@@ -3231,11 +4119,16 @@ class GrowingHagiProcessorV9:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
         if d.get("format") != "HAGI-V9":
             raise ValueError("not a HAGI-V9 model file")
-        m = cls(seed=int(d.get("core_seed", 42)), node_budget=int(d.get("node_budget", 8000)))
+        m = cls(
+            seed=int(d.get("core_seed", 42)),
+            node_budget=int(d.get("node_budget", 8000)),
+        )
         m.version = int(d.get("model_version", 0))
         m.total_commits = int(d.get("total_commits", 0))
         m.total_holds = int(d.get("total_holds", 0))
-        m.experts = {k: ExpertV9.from_dict(v, m.core) for k, v in d.get("experts", {}).items()}
+        m.experts = {
+            k: ExpertV9.from_dict(v, m.core) for k, v in d.get("experts", {}).items()
+        }
         m.theorems = [Theorem(**t) for t in d.get("theorems", [])]
         m.growth_log = d.get("growth_log", [])
         return m
@@ -3245,16 +4138,25 @@ class GrowingHagiProcessorV9:
 # 11. Non-Circular Diverse Self-Developing Curriculum & Growth Loop
 # ==============================================================================
 
+
 def propose_noncircular_task_v9(
-    experts: dict[str, ExpertV9], rng: np.random.Generator, round_idx: int,
+    experts: dict[str, ExpertV9],
+    rng: np.random.Generator,
+    round_idx: int,
     seen_sigs: Optional[set[tuple[Any, ...]]] = None,
     seen_sigs_names: Optional[set[str]] = None,
 ) -> Optional[tuple[TaskSpec, tuple[str, ...]]]:
     """Propose diverse, non-degenerate, novel composed tasks WITHOUT leaking ASTs to learn()."""
     seen_sigs_names = seen_sigs_names if seen_sigs_names is not None else set()
-    arith2 = [e for e in experts.values() if e.program.arity == 2 and e.family != "BoolVenn"]
-    arith1 = [e for e in experts.values() if e.program.arity == 1 and e.family != "BoolVenn"]
-    bool2 = [e for e in experts.values() if e.program.arity == 2 and e.family == "BoolVenn"]
+    arith2 = [
+        e for e in experts.values() if e.program.arity == 2 and e.family != "BoolVenn"
+    ]
+    arith1 = [
+        e for e in experts.values() if e.program.arity == 1 and e.family != "BoolVenn"
+    ]
+    bool2 = [
+        e for e in experts.values() if e.program.arity == 2 and e.family == "BoolVenn"
+    ]
     if not arith2:
         return None
     pool = arith2 + arith1
@@ -3264,88 +4166,164 @@ def propose_noncircular_task_v9(
             f_ex = bool2[int(rng.choice(len(bool2)))]
             g_ex = bool2[int(rng.choice(len(bool2)))]
             h_ex = bool2[int(rng.choice(len(bool2)))]
-            teacher = (lambda x, y, z, f=f_ex, g=g_ex, h=h_ex, env=experts:
-                       f.program.eval((g.program.eval((int(x), int(y)), env),
-                                       h.program.eval((int(y), int(z)), env)), env))
+            teacher = (
+                lambda x, y, z, f=f_ex, g=g_ex, h=h_ex, env=experts: f.program.eval(
+                    (
+                        g.program.eval((int(x), int(y)), env),
+                        h.program.eval((int(y), int(z)), env),
+                    ),
+                    env,
+                )
+            )
             vals = {teacher(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)}
             if len(vals) <= 1:
                 continue
-            sig = ("b3", tuple(teacher(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)))
+            sig = (
+                "b3",
+                tuple(teacher(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)),
+            )
             if seen_sigs is not None and sig in seen_sigs:
                 continue
             if seen_sigs is not None:
                 seen_sigs.add(sig)
-            sp = TaskSpec(f"V9_BOOL3_R{round_idx}_{attempt}", 3, ((0, 1), (0, 1), (0, 1)),
-                          teacher, family="auto-bool3")
+            sp = TaskSpec(
+                f"V9_BOOL3_R{round_idx}_{attempt}",
+                3,
+                ((0, 1), (0, 1), (0, 1)),
+                teacher,
+                family="auto-bool3",
+            )
             return sp, (f_ex.name, g_ex.name, h_ex.name)
 
         outer = arith2[int(rng.choice(len(arith2)))]
         inner = pool[int(rng.choice(len(pool)))]
         if inner.program.arity == 1:
-            xs = tuple(x for x in inner.domains[0] if abs(x) <= 6 and inner.supports((x,))
-                       and inner.program.eval((x,), experts) in outer.domains[0])
-            ys = tuple(y for y in outer.domains[1] if abs(y) <= 6
-                       and all(outer.supports((inner.program.eval((x,), experts), y)) for x in xs))
+            xs = tuple(
+                x
+                for x in inner.domains[0]
+                if abs(x) <= 6
+                and inner.supports((x,))
+                and inner.program.eval((x,), experts) in outer.domains[0]
+            )
+            ys = tuple(
+                y
+                for y in outer.domains[1]
+                if abs(y) <= 6
+                and all(
+                    outer.supports((inner.program.eval((x,), experts), y)) for x in xs
+                )
+            )
             if len(xs) < 3 or len(ys) < 3:
                 continue
-            tt = tuple((x, y, outer.program.eval((inner.program.eval((x,), experts), y), experts))
-                       for x in xs for y in ys)
+            tt = tuple(
+                (
+                    x,
+                    y,
+                    outer.program.eval((inner.program.eval((x,), experts), y), experts),
+                )
+                for x in xs
+                for y in ys
+            )
             vals = {v for _, _, v in tt}
-            if len(vals) <= 2 or all(v == x for x, _, v in tt) or all(v == y for _, y, v in tt):
+            if (
+                len(vals) <= 2
+                or all(v == x for x, _, v in tt)
+                or all(v == y for _, y, v in tt)
+            ):
                 continue
             sig = ("a2", xs, ys, tt)
             if seen_sigs is not None and sig in seen_sigs:
                 continue
             if seen_sigs is not None:
                 seen_sigs.add(sig)
-            teacher = (lambda x, y, o=outer, i=inner, env=experts:
-                       o.program.eval((i.program.eval((int(x),), env), int(y)), env))
-            sp = TaskSpec(_short_auto_name(round_idx, attempt, inner.name, outer.name, seen_sigs_names),
-                          2,
-                          (xs, ys), teacher, valid_rule=outer.valid_rule, family="auto-composed")
+            teacher = lambda x, y, o=outer, i=inner, env=experts: o.program.eval(
+                (i.program.eval((int(x),), env), int(y)), env
+            )
+            sp = TaskSpec(
+                _short_auto_name(
+                    round_idx, attempt, inner.name, outer.name, seen_sigs_names
+                ),
+                2,
+                (xs, ys),
+                teacher,
+                valid_rule=outer.valid_rule,
+                family="auto-composed",
+            )
             return sp, (outer.name, inner.name)
         else:
-            xs = tuple(x for x in inner.domains[0] if abs(x) <= 5 and x in outer.domains[0])
+            xs = tuple(
+                x for x in inner.domains[0] if abs(x) <= 5 and x in outer.domains[0]
+            )
             ys_cand = tuple(y for y in inner.domains[1] if abs(y) <= 5)
-            ys = tuple(y for y in ys_cand if all(
-                inner.supports((x, y)) and outer.supports((x, inner.program.eval((x, y), experts)))
-                for x in xs
-            ))
+            ys = tuple(
+                y
+                for y in ys_cand
+                if all(
+                    inner.supports((x, y))
+                    and outer.supports((x, inner.program.eval((x, y), experts)))
+                    for x in xs
+                )
+            )
             if len(xs) < 3 or len(ys) < 3:
                 continue
-            tt = tuple((x, y, outer.program.eval((x, inner.program.eval((x, y), experts)), experts))
-                       for x in xs for y in ys)
+            tt = tuple(
+                (
+                    x,
+                    y,
+                    outer.program.eval(
+                        (x, inner.program.eval((x, y), experts)), experts
+                    ),
+                )
+                for x in xs
+                for y in ys
+            )
             vals = {v for _, _, v in tt}
-            if len(vals) <= 2 or all(v == x for x, _, v in tt) or all(v == y for _, y, v in tt):
+            if (
+                len(vals) <= 2
+                or all(v == x for x, _, v in tt)
+                or all(v == y for _, y, v in tt)
+            ):
                 continue
             sig = ("a2", xs, ys, tt)
             if seen_sigs is not None and sig in seen_sigs:
                 continue
             if seen_sigs is not None:
                 seen_sigs.add(sig)
-            teacher = (lambda x, y, o=outer, i=inner, env=experts:
-                       o.program.eval((int(x), i.program.eval((int(x), int(y)), env)), env))
-            sp = TaskSpec(_short_auto_name(round_idx, attempt, inner.name, outer.name, seen_sigs_names),
-                          2,
-                          (xs, ys), teacher, valid_rule=inner.valid_rule, family="auto-composed")
+            teacher = lambda x, y, o=outer, i=inner, env=experts: o.program.eval(
+                (int(x), i.program.eval((int(x), int(y)), env)), env
+            )
+            sp = TaskSpec(
+                _short_auto_name(
+                    round_idx, attempt, inner.name, outer.name, seen_sigs_names
+                ),
+                2,
+                (xs, ys),
+                teacher,
+                valid_rule=inner.valid_rule,
+                family="auto-composed",
+            )
             return sp, (outer.name, inner.name)
     return None
 
 
-def _short_auto_name(round_idx: int, attempt: int, inner: str, outer: str,
-                     seen: set | None = None) -> str:
+def _short_auto_name(
+    round_idx: int, attempt: int, inner: str, outer: str, seen: set | None = None
+) -> str:
     """Short unique name for auto-composed tasks: strip V9_AUTO_
     boilerplate, keep the semantic core, dedupe with a counter."""
+
     def core(n: str) -> str:
         for part in ("V9_AUTO_", "V9_BOOL3_"):
             while n.startswith(part):
-                n = n[len(part):]
+                n = n[len(part) :]
         # drop R<digits>_ and stray round/attempt index segments
         import re as _re
+
         n = _re.sub(r"R\d+_", "", n)
         n = _re.sub(r"^\d+_", "", n)
         n = _re.sub(r"_\d+(_\d+)$", r"\1", n)
         return n
+
     base = f"{core(inner)}_{core(outer)}"[:48]
     name = base
     k = 2
@@ -3357,8 +4335,13 @@ def _short_auto_name(round_idx: int, attempt: int, inner: str, outer: str,
     return name
 
 
-def grow_v9(model: GrowingHagiProcessorV9, suite: Sequence[TaskSpec], max_rounds: int = 3,
-            train_neural: bool = True, out_dir: str = ".omc/v9_grow") -> dict[str, Any]:
+def grow_v9(
+    model: GrowingHagiProcessorV9,
+    suite: Sequence[TaskSpec],
+    max_rounds: int = 3,
+    train_neural: bool = True,
+    out_dir: str = ".omc/v9_grow",
+) -> dict[str, Any]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     rnd = np.random.default_rng(20260101)
@@ -3368,7 +4351,9 @@ def grow_v9(model: GrowingHagiProcessorV9, suite: Sequence[TaskSpec], max_rounds
         t0 = time.time()
         commits = 0
         for sp in suite:
-            ev = model.learn(sp, seed=10_000 + r * 7919 + len(sp.name), train_neural=train_neural)
+            ev = model.learn(
+                sp, seed=10_000 + r * 7919 + len(sp.name), train_neural=train_neural
+            )
             if ev["action"] == "COMMIT":
                 commits += 1
         proposed = 0
@@ -3380,32 +4365,54 @@ def grow_v9(model: GrowingHagiProcessorV9, suite: Sequence[TaskSpec], max_rounds
             if sp.name in model.experts:
                 continue
             proposed += 1
-            ev = model.learn(sp, seed=500_000 + r * 104_729 + k, train_neural=train_neural)
+            ev = model.learn(
+                sp, seed=500_000 + r * 104_729 + k, train_neural=train_neural
+            )
             if ev["action"] == "COMMIT":
                 commits += 1
         comp = model.compress_library_mdl()
         new_th = TheoremMinerV9().mine(model)
         nq = model.neural_quality_summary()
-        rounds.append({
-            "round": r, "experts": len(model.experts), "commits": commits, "proposed": proposed,
-            "theorems_total": len(model.theorems), "theorems_new": len(new_th),
-            "sym_bits": comp["after_bits"], "dag_refactored": comp["refactored"],
-            "neural_bytes": nq["total_neural_bytes"],
-            "neural_val_acc": round(nq["mean_val_exact_acc"], 4),
-            "neural_val_mse": round(nq["mean_val_mse"], 4),
-            "certs_ok": model.verify_certificates()["all_ok"],
-            "ram_avail_gb": round(ram_available_bytes() / 2**30, 2),
-            "elapsed": round(time.time() - t0, 3),
-        })
-        (out / f"model_r{r}.json").write_text(json.dumps(
-            {"round": r, "experts": {n: e.to_dict() for n, e in model.experts.items()},
-             "theorems": [vars(t) for t in model.theorems]}, indent=2), encoding="utf-8")
-    return {"rounds": rounds, "experts": len(model.experts), "theorems": len(model.theorems)}
+        rounds.append(
+            {
+                "round": r,
+                "experts": len(model.experts),
+                "commits": commits,
+                "proposed": proposed,
+                "theorems_total": len(model.theorems),
+                "theorems_new": len(new_th),
+                "sym_bits": comp["after_bits"],
+                "dag_refactored": comp["refactored"],
+                "neural_bytes": nq["total_neural_bytes"],
+                "neural_val_acc": round(nq["mean_val_exact_acc"], 4),
+                "neural_val_mse": round(nq["mean_val_mse"], 4),
+                "certs_ok": model.verify_certificates()["all_ok"],
+                "ram_avail_gb": round(ram_available_bytes() / 2**30, 2),
+                "elapsed": round(time.time() - t0, 3),
+            }
+        )
+        (out / f"model_r{r}.json").write_text(
+            json.dumps(
+                {
+                    "round": r,
+                    "experts": {n: e.to_dict() for n, e in model.experts.items()},
+                    "theorems": [vars(t) for t in model.theorems],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return {
+        "rounds": rounds,
+        "experts": len(model.experts),
+        "theorems": len(model.theorems),
+    }
 
 
 # ==============================================================================
 # 12. Comprehensive Self-Test
 # ==============================================================================
+
 
 def self_test_v9() -> None:
     t0 = time.time()
@@ -3420,10 +4427,14 @@ def self_test_v9() -> None:
 
     pm = GrowingHagiProcessorV9()
     snap_before = pm._snapshot_state_with_optimizer()
-    pev = pm.learn(next(s for s in suite if s.name == "ADD"), seed=77, poison_one_label=True)
+    pev = pm.learn(
+        next(s for s in suite if s.name == "ADD"), seed=77, poison_one_label=True
+    )
     assert pev["action"] == "HOLD"
     snap_after = pm._snapshot_state_with_optimizer()
-    assert np.array_equal(snap_before["core"]["gpm"]["W"], snap_after["core"]["gpm"]["W"])
+    assert np.array_equal(
+        snap_before["core"]["gpm"]["W"], snap_after["core"]["gpm"]["W"]
+    )
     assert np.array_equal(snap_before["router"][0], snap_after["router"][0])
 
     rep = grow_v9(model, suite, max_rounds=2, out_dir="/tmp/v9_grow_test")
@@ -3448,7 +4459,9 @@ def self_test_v9() -> None:
         for y in (0, 1):
             assert anf_eval(c3, 2, (x, y)) == ((x & y) | (x ^ y))
 
-    col = CRAMEngineV9.solve_coloring([(0, 1), (1, 2), (2, 3), (3, 0)], 4, 2, givens={0: 1})
+    col = CRAMEngineV9.solve_coloring(
+        [(0, 1), (1, 2), (2, 3), (3, 0)], 4, 2, givens={0: 1}
+    )
     assert col["validity_certificate"] and col["givens_respected"]
     adj_m = [[1], [0, 2], [1, 3], [2]]
     lz = CRAMEngineV9.solve_latent_maze(4, adj_m, goal=0)
@@ -3461,7 +4474,9 @@ def self_test_v9() -> None:
     assert mf["monotonic"]
     alt = CRAMEngineV9.alternating_latent_visible_solve(4, adj_m, goal=0, num_colors=2)
     assert alt["monotone_drop"]
-    pl = CRAMEngineV9.train_cram_pseudolikelihood(np.array([[0, 1], [0, 1], [1, 0]]), num_colors=2)
+    pl = CRAMEngineV9.train_cram_pseudolikelihood(
+        np.array([[0, 1], [0, 1], [1, 0]]), num_colors=2
+    )
     assert pl["mean_pl_loss"] < 0.7
 
     gpm = ContinualGPMMemoryV9(6, 2, seed=1)
@@ -3508,11 +4523,10 @@ def self_test_v9() -> None:
     )
 
 
-
-
 # ==============================================================================
 # UNIFIED CLI
 # ==============================================================================
+
 
 def _benchmark() -> None:
     """v9 benchmark: exact symbolic suite + neural adapter quality + memory footprint.
@@ -3521,6 +4535,7 @@ def _benchmark() -> None:
     seed-compressed neural_bytes payload), wall time, and exact accuracy.
     """
     import statistics as _stat
+
     suite = make_task_suite()
     model = GrowingHagiProcessorV9(node_budget=8000)
     t0 = time.time()
@@ -3532,17 +4547,22 @@ def _benchmark() -> None:
     rep = grow_v9(model, suite, max_rounds=2, out_dir=".omc/v9_bench")
     grow_elapsed = time.time() - t0
     nq = model.neural_quality_summary()
-    resident = sum(int(v.nbytes) for v in model.__dict__.values()
-                   if isinstance(v, np.ndarray))
+    resident = sum(
+        int(v.nbytes) for v in model.__dict__.values() if isinstance(v, np.ndarray)
+    )
     core = model.core
-    resident_core = sum(int(a.nbytes) for a in vars(core).values()
-                        if isinstance(a, np.ndarray))
-    resident_core += sum(int(a.nbytes) for a in vars(core.gpm).values()
-                         if isinstance(a, np.ndarray))
+    resident_core = sum(
+        int(a.nbytes) for a in vars(core).values() if isinstance(a, np.ndarray)
+    )
+    resident_core += sum(
+        int(a.nbytes) for a in vars(core.gpm).values() if isinstance(a, np.ndarray)
+    )
     result = {
         "version": V9_VERSION,
-        "exact_committed": check["committed"], "exact_accuracy": check["accuracy"],
-        "experts_after_growth": rep["experts"], "theorems": rep["theorems"],
+        "exact_committed": check["committed"],
+        "exact_accuracy": check["accuracy"],
+        "experts_after_growth": rep["experts"],
+        "theorems": rep["theorems"],
         "neural_val_acc": round(nq["mean_val_exact_acc"], 4),
         "neural_val_mse": round(nq["mean_val_mse"], 4),
         "neural_payload_bytes": nq["total_neural_bytes"],
@@ -3557,35 +4577,46 @@ def _benchmark() -> None:
 
 
 def _cli() -> None:
-        _p = argparse.ArgumentParser(description="HAGI unified single-file build (v5+v7.4+v8.4+v9)")
-        _p.add_argument("--self-test", action="store_true", help="v8.4 self-test")
-        _p.add_argument("--self-test-v9", action="store_true", help="v9.0 self-test")
-        _p.add_argument("--self-test-v7", action="store_true", help="v7.4 self-test")
-        _p.add_argument("--self-test-v5", action="store_true", help="v5 self-test")
-        _p.add_argument("--grow", action="store_true", help="v8.4 growth loop")
-        _p.add_argument("--grow-v9", action="store_true", help="v9.0 growth loop")
-        _p.add_argument("--benchmark-v9", action="store_true", help="v9.0 benchmark")
-        _p.add_argument("--max-rounds", type=int, default=4)
-        _p.add_argument("--out-dir", default="grow_out")
-        _a = _p.parse_args()
-        if _a.self_test:
-            self_test_v8()
-        elif _a.self_test_v9:
-            self_test_v9()
-        elif _a.self_test_v7:
-            self_test_v7()
-        elif _a.self_test_v5:
-            self_test()
-        elif _a.grow:
-            _suite = make_task_suite()
-            _m = GrowingHagiProcessorV8()
-            print(json.dumps(grow_v8(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir), indent=2))
-        elif _a.grow_v9:
-            _suite = make_task_suite()
-            _m = GrowingHagiProcessorV9()
-            print(json.dumps(grow_v9(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir), indent=2))
-        elif _a.benchmark_v9:
-            _benchmark()
-        else:
-            _p.print_help()
-
+    _p = argparse.ArgumentParser(
+        description="HAGI unified single-file build (v5+v7.4+v8.4+v9)"
+    )
+    _p.add_argument("--self-test", action="store_true", help="v8.4 self-test")
+    _p.add_argument("--self-test-v9", action="store_true", help="v9.0 self-test")
+    _p.add_argument("--self-test-v7", action="store_true", help="v7.4 self-test")
+    _p.add_argument("--self-test-v5", action="store_true", help="v5 self-test")
+    _p.add_argument("--grow", action="store_true", help="v8.4 growth loop")
+    _p.add_argument("--grow-v9", action="store_true", help="v9.0 growth loop")
+    _p.add_argument("--benchmark-v9", action="store_true", help="v9.0 benchmark")
+    _p.add_argument("--max-rounds", type=int, default=4)
+    _p.add_argument("--out-dir", default="grow_out")
+    _a = _p.parse_args()
+    if _a.self_test:
+        self_test_v8()
+    elif _a.self_test_v9:
+        self_test_v9()
+    elif _a.self_test_v7:
+        self_test_v7()
+    elif _a.self_test_v5:
+        self_test()
+    elif _a.grow:
+        _suite = make_task_suite()
+        _m = GrowingHagiProcessorV8()
+        print(
+            json.dumps(
+                grow_v8(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir),
+                indent=2,
+            )
+        )
+    elif _a.grow_v9:
+        _suite = make_task_suite()
+        _m = GrowingHagiProcessorV9()
+        print(
+            json.dumps(
+                grow_v9(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir),
+                indent=2,
+            )
+        )
+    elif _a.benchmark_v9:
+        _benchmark()
+    else:
+        _p.print_help()
