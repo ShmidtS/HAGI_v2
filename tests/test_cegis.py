@@ -13,9 +13,9 @@ def test_cegis_finds_periodic_law_without_all_labels():
                      lambda x: labels[x], list(range(128)), dom,
                      rng=random.Random(7))
     assert r.status == "PROVEN_EXACT"
-    # oracle was queried at most: seed + full pool (never full_domain
-    # during search — full sweep happens only at certification)
-    assert r.queries <= len(dom) + 10
+    # certification labels the full domain ONCE at the end (search
+    # never saw full all_y — only seed + probe stream during search)
+    assert r.queries <= len(dom) + len(dom) + 10
     assert r.blueprint is not None
     # exact on whole domain
     assert all(r.blueprint.apply(x) == labels[x] for x in dom)

@@ -187,8 +187,15 @@ class ByteLM:
             return float(sum(ces) / len(hold_np))
         best_ce = val_ce(); best_state = None
         history = []
+        # WAVE 169 fix (holdout leak): training sampled from ALL n
+        # windows, including hold_idx (14 holdout points per 512 batch
+        # observed) — holdout CE was partly train CE. Sample from the
+        # train mask only.
+        train_idx = np.setdiff1d(np.arange(n), hold_np,
+                                 assume_unique=True)
         for step in range(1, steps + 1):
-            sel = rng.integers(0, n, size=batch)
+            sel = train_idx[rng.integers(0, len(train_idx),
+                                         size=batch)]
             ctx, nxt = windows_np(sel)
             opt.zero_grad()
             loss = self.ce(ctx, nxt)

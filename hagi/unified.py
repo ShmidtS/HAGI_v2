@@ -221,11 +221,18 @@ class Unified:
         W1 = self.model.W1.detach()
         scale = W1.abs().mean() * 2 + 1e-12
         tern = torch.round(W1 / scale).clamp(-1, 1).int()
+        # WAVE 169 fix: return the PAYLOAD (mask+scale), not only stats —
+        # the committed symbolic artifact must be reconstructible.
         return {
             "shape": list(W1.shape),
             "scale": scale.item(),
             "ternary_nonzeros": int((tern != 0).sum()),
             "density": round(float((tern != 0).float().mean()), 4),
+            "payload": {
+                "mask": tern.tolist(),          # {-1,0,+1} per weight
+                "scale": scale.item(),
+                "schema": "W ~ mask * scale (per-matrix scalar scale)",
+            },
         }
 
     # ---- self-evolution cycle ----

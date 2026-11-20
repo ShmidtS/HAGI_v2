@@ -483,10 +483,12 @@ def evolve(
     log: bool = True,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
-    population = [
-        (fitness(random_genome(rng), profile), random_genome(rng))
-        for _ in range(pop_size)
-    ]
+    # WAVE 169 fix: fitness was scored on one random genome but a
+    # DIFFERENT one was stored in the population (score/genome mismatch).
+    population = []
+    for _ in range(pop_size):
+        g = random_genome(rng)
+        population.append((fitness(g, profile), g))
     population = [(s, g) for s, g in population if s is not None]
     if not population:
         raise RuntimeError("no genome passed the certified gate — bug")

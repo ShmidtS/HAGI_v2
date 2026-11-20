@@ -52,7 +52,7 @@ def test_invents_counter_mod():
     bp = synthesize_blueprint(pairs)
     assert bp is not None
     assert all(bp.apply(x) == y for x, y in pairs)
-    proof = verify_blueprint(bp, pairs)
+    proof = verify_blueprint(bp, pairs, full_domain=range(16))
     assert proof["status"] == "PROVEN_EXACT"
 
 

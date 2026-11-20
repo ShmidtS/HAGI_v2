@@ -246,6 +246,16 @@ class ParallelLearner:
 
     def _merge(self, d: dict[str, Any]) -> None:
         p = self.proc
+        # WAVE 169 (double-apply guard): in-process workers already
+        # applied the diff to the shared proc. A diff whose certs are
+        # already present in cert_log is a REPLAYED snapshot — merging
+        # it again doubled version/cert_log/objective (ADD: 1 commit
+        # became 2). Identity = first cert entry (task+round).
+        if d["certs"]:
+            first = d["certs"][0]
+            if any(c.version == first.version and c.task == first.task
+                   for c in p.cert_log):
+                return  # already applied
         p.experts.update(d["new_experts"])
         p.growth_log.extend(d["growth_log"])
         p.cert_log.extend(d["certs"])
@@ -379,10 +389,20 @@ def run_stream(proc, segments: list[tuple[int, int]],
                         cache.put(pos, budget, d)
             else:
                 diffs = []
-            # merge in original batch order: substitute diffs for their slots
+            # WAVE 169 fix (double-apply): fresh (slot None) diffs were
+            # applied IN-PROCESS by the worker on the shared proc —
+            # merging them again doubled version/cert_log/objective.
+            # Only CACHE-HIT diffs (learned on a different proc state)
+            # need merging. Merge in original batch order.
             it = iter(diffs)
             for slot in hits:
-                d = next(it) if slot is None else slot
+                if slot is None:
+                    d = next(it)
+                    if actions is not None:
+                        actions.append(("seg", d["ev"]["task"],
+                                        d["ev"]["action"]))
+                    continue  # already applied by the worker
+                d = slot
                 learner._merge(d)
                 if actions is not None:
                     actions.append(("seg", d["ev"]["task"], d["ev"]["action"]))

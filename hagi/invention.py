@@ -384,18 +384,32 @@ def verify_blueprint(
     pairs: list[tuple[int, int]],
     full_domain: Optional[range] = None,
 ) -> dict:
-    """PROVEN_EXACT over full domain or HOLD_COUNTEREXAMPLE."""
+    """PROVEN_EXACT only with FULL labeled coverage of the domain:
+    every domain point must carry a label and match. Unlabeled points
+    are NOT skipped (a 'PROVEN' over gaps would be a forged certificate
+    — wave 169 fix). Partial coverage -> PARTIAL_COVERAGE (never a
+    proof). Missing labels entirely -> HOLD_COUNTEREXAMPLE.
+    """
     # sampled first
-    if not all(bp.apply(x) == y for x, y in pairs):
-        for x, y in pairs:
-            if bp.apply(x) != y:
-                return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, y)}
-    if full_domain is not None:
-        for x in full_domain:
-            want = next((y for xx, y in pairs if xx == x), None)
-            if want is not None and bp.apply(x) != want:
-                return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, want)}
-    return {"status": "PROVEN_EXACT", "checked": len(pairs)}
+    for x, y in pairs:
+        if bp.apply(x) != y:
+            return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, y)}
+    if full_domain is None:
+        return {"status": "PARTIAL_COVERAGE", "checked": len(pairs),
+                "note": "no domain given — cannot prove"}
+    table = dict(pairs)
+    unlabeled = [x for x in full_domain if x not in table]
+    if unlabeled:
+        return {"status": "PARTIAL_COVERAGE",
+                "checked": len(table),
+                "unlabeled": len(unlabeled),
+                "note": f"{len(unlabeled)} domain points without labels"}
+    for x in full_domain:
+        if bp.apply(x) != table[x]:
+            return {"status": "HOLD_COUNTEREXAMPLE",
+                    "cex": (x, table[x])}
+    return {"status": "PROVEN_EXACT", "checked": len(table),
+            "coverage": "full"}
 
 
 # --------------------------------------------------------------------------
@@ -475,7 +489,9 @@ def invent_blueprint(
             "q_name": best_common["q_name"],
         }
     proofs = [
-        verify_blueprint(bp, pairs)
+        verify_blueprint(bp, pairs,
+                         full_domain=range(min(x for x, _ in pairs),
+                                           max(x for x, _ in pairs) + 1))
         for bp, pairs in zip(best_common["blueprints"], cluster_pairs)
     ]
     if any(p["status"] != "PROVEN_EXACT" for p in proofs):

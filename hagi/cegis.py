@@ -108,7 +108,16 @@ def cegis_invent(train_x: list[int],
                 if query_budget is not None and queries >= query_budget:
                     return CegisResult("HOLD_CEGIS_BUDGET", bp, round_i,
                                        queries, len(train))
-                # candidate survived the whole disjoint probe stream
+                # CERTIFICATION phase: label the FULL domain (wave 169:
+                # PROVEN_EXACT requires full labeled coverage; certifying
+                # labels are not search leakage — search already froze
+                # the candidate)
+                for x in full_domain:
+                    if x not in train:
+                        y = query(x)
+                        queries += 1
+                        if y is not None:
+                            train[x] = y
                 sweep = verify_blueprint(bp, sorted(train.items()),
                                          full_domain)
                 return CegisResult(sweep["status"], bp, round_i, queries,

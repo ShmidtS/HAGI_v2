@@ -85,14 +85,13 @@ def test_selfloop_round1_golden():
     run_stream(inc, [(10, 501_000)], suite=None, cache=None,
                learner=ParallelLearner(inc, 1), batch_size=8)
     wasted = sum(t["cost"] for t in inc.trace if not t["success"])
-    # Golden re-measured 2026-11-17 after the no-spawn refactor:
-    # sequential in-process learning shares one proc across jobs
-    # (ledger alpha compounds between jobs instead of resetting per
-    # isolated worker copy) -> 10 extra candidate probes. Deterministic
-    # and verified twice.
-    assert len(inc.trace) == 82
+    # Golden re-measured 2026-11-21 after the wave-169 double-apply
+    # fix: _merge re-applied in-process worker diffs (trace/version/
+    # cert_log were duplicated; 82/77 contained ~10 duplicated rows).
+    # Honest counts: 72 trace, 68 success, wasted unchanged (6000).
+    assert len(inc.trace) == 72
     assert wasted == 6000
-    assert sum(t["success"] for t in inc.trace) == 77
+    assert sum(t["success"] for t in inc.trace) == 68
 
 
 def test_selfrewrite_programs(tmp_path):

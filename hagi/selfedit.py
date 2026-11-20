@@ -218,10 +218,15 @@ def self_edit_cycle(seed: int = 0, dry: bool = False) -> dict[str, Any]:
     # complexity log(m/delta)/(2 eta^2) would need ~780 rounds for
     # eta=5%). The gate is deliberately conservative: adopt only on
     # strict positive evidence (Insight.experience_cycle_bound).
-    no_regress = (cand["adopted"] > baseline["adopted"]
-                  or cand["experts"] > baseline["experts"])
+    # WAVE 169 fix: adoption now REQUIRES the characterization gate
+    # (_gate_tests was defined but never called — patches were adopted
+    # on a single-metric improvement without any regression check).
+    improves = (cand["adopted"] > baseline["adopted"]
+                or cand["experts"] > baseline["experts"])
+    no_regress = improves and _gate_tests()
     proposal.update(decision="adopted" if no_regress else "rejected",
-                    candidate=cand, baseline=baseline)
+                    candidate=cand, baseline=baseline,
+                    gate_tests=improves)  # recorded either way
     (log["adopted"] if no_regress else log["rejected"]).append(proposal)
     EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
                         encoding="utf-8")
