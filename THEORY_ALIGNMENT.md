@@ -2058,3 +2058,14 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Честное поведение подтверждено: произвольный LUT3-кластер (не
   периодический) — COMPRESSED_ONLY/HOLD, никаких ложных STRUCTURAL.
 - INVENTED-путь (периодические семьи) покрыт test_invention.
+
+## Волна 151 (2026-11-20) — Фаза 6: инвариантные тесты изобретения
+
+- test_persistence_construct.py: construct переживает resume
+  round-trip (to_dict/from_dict через фабрику реестра), решает
+  семейство без повторного изобретения, ABSTAIN вне домена.
+- 4 инварианта закрыты: (1) честность — FULL_NOT_STRUCTURAL +
+  random-noise не INVENTED; (2) перенос без утечки — zero-shot на
+  fresh task; (3) нерегрессия+MDL — transfer_eval 4 условия;
+  (4) персистентность — resume round-trip.
+- Полный прогон: 45/45 PASS (было 24; +21 новых).
