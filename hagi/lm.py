@@ -8,7 +8,7 @@ Implements the theory's neural half at toy scale, honestly:
   §3  guarded step: an optimizer step is ACCEPTED only if the
       holdout CE does not increase (snapshot/rollback — the
       batchSampleCE_guardedBatchTrainStep_le recipe);
-  §6  ternary quantization of weight matrices (per-matrix scale,
+  §6  ternary quantization of weight matrices (b1.58 per-row scale,
       {-a, 0, +a}) with a measured CE cost report;
   §9  the whole training run is a certified chain: the deployed
       checkpoint is the best holdout-CE snapshot, never a worse one.
@@ -83,15 +83,20 @@ class ByteLM:
 
     # ---- §6 ternary quantization ------------------------------------
     def ternary_(self) -> dict[str, Any]:
-        """In-place ternary quantization of W1/W2/emb (§6): per-matrix
-        scale a = mean(|W|), values -> {-a, 0, +a}. Returns CE cost."""
+        """In-place ternary quantization of W1/W2/emb (§6), b1.58
+        per-row scheme (Energy/STEStep.lean): s = mean(|W|, dim=1)
+        per output row, Q = round(clamp(W/s, −1, +1)), W~ = Q·s.
+        Self-stabilization invariant (ternary_scale_invariance): the
+        map is invariant under W -> c·W — no spectral cap needed.
+        eps-floor guards all-zero rows (degenerate row's escape).
+        """
         t = self.t
         report = {}
         for name in ("emb", "W1", "W2"):
             W = getattr(self, name)
             with t.no_grad():
-                a = W.abs().mean()
-                q = t.sign(t.round(W / (a + 1e-12))) * a
+                s = W.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
+                q = t.round(W / s).clamp(-1.0, 1.0) * s
                 report[name] = float((q - W).abs().max())
                 W.copy_(q)
         return report
@@ -627,6 +632,21 @@ class CertifiedStepLM:
         e = self.emb[ctx]
         h = t.relu(e.reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
         return h @ self.W2 + self.b2
+
+    def ternary_(self) -> dict[str, Any]:
+        """b1.58 per-row ternary quantization (Energy/STEStep.lean):
+        s = mean(|W|, dim=1), Q = round(clamp(W/s, −1, +1))·s. The map
+        is scale-invariant (ternary_scale_invariance) — no spectral cap."""
+        t = self.t
+        report = {}
+        for name in ("emb", "W1", "W2"):
+            W = getattr(self, name)
+            with t.no_grad():
+                s = W.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
+                q = t.round(W / s).clamp(-1.0, 1.0) * s
+                report[name] = float((q - W).abs().max())
+                W.copy_(q)
+        return report
 
     def _certified_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
         """One §3.9 step on the batch. Returns the certified descent

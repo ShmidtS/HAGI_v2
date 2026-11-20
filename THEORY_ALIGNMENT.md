@@ -2141,3 +2141,16 @@ self-edit гейт работает (no-op фильтр активен), failure
   L(mid) ≤ (L1+L2)/2 + δ + δ₂/2); diag-квадратичный случай — точный
   мост C472 с кривизнным остатком (1/8)Σc_i(w2−w1)_i².
 - 3 теста; всего 64/64 PASS.
+
+## Волна 159 (2026-11-20, круг 5) — b1.58 per-row ternary (STEStep)
+
+- Сверка с Energy/STEStep.lean: РАСХОЖДЕНИЕ найдено — ternary_
+  использовал per-MATRIX scale; теория (b1.58, prescription п.1)
+  требует per-ROW (per output channel): s = mean(|W|, dim=1),
+  Q = round(clamp(W/s, −1, +1))·s.
+- Исправлено в ByteLM.ternary_ и CertifiedStepLM.ternary_ (добавлен);
+  eps-floor для нулевых строк; спектрального капа не нужно
+  (ternary_scale_invariance — проверена на уровнях).
+- Тесты: инвариант уровней Q(cW)=Q(W), точный профиль остатков
+  (r<0.5 → rs; mid ≤ s/2; sat → (r−1)s; pointwise err≤|x|).
+- 3 теста; всего 67/67 PASS.
