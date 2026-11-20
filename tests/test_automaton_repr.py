@@ -69,7 +69,8 @@ def test_factorized_artifact_json_restore_and_emitted_code():
         assert restored.eval((code,)) == artifact.eval((code,))
     ns = {}
     exec(artifact.emit_python("factor0"), ns)
-    assert ns["factor0"](encode_trace((0, 2, 1), oracle.alphabet)) == 1
+    code = encode_trace((0, 2, 1), oracle.alphabet)
+    assert ns["factor0"](code) == artifact.eval((code,))
     assert not artifact.supports((1.5,))
     assert not artifact.supports((True,))
 
