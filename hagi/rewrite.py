@@ -257,6 +257,12 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         ladder = state.get("floor_ladder") or floor_ladder or [200, 50, 20]
         booted_from = "self_state.json (the model's own rewrite)"
         prior = state
+        # reified ops survive the cold restart (Invention -> Reification
+        # closure): yesterday's inventions are tomorrow's primitives
+        from hagi.reifier import restore_reified_ops_state
+        n_reified = restore_reified_ops_state(state_dir)
+        if n_reified:
+            booted_from += f" + {n_reified} reified ops"
     else:
         ladder = floor_ladder or [200, 50, 20]
         booted_from = "cold start"
@@ -291,6 +297,12 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
 
     # the rewrite: model persists itself + its programs
     inc_path.write_bytes(pickle.dumps(final_proc))
+    # reified ops persist too (self-extension continuity)
+    try:
+        from hagi.reifier import save_reified_ops_state
+        save_reified_ops_state(state_dir)
+    except Exception:
+        pass  # no reified ops yet — nothing to persist
     # self-optimization (MDL): prune duplicates/pseudo-args, keep the
     # call DAG intact, re-validate everything exactly; full library
     # is kept as incumbent_full.pkl

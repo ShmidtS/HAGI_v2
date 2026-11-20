@@ -2192,3 +2192,23 @@ self-edit гейт работает (no-op фильтр активен), failure
   де-/квантизации; уровни меряются в собственной базе строки
   (не идемпотентно — волна 160).
 - 5 тестов; всего 73/73 PASS.
+
+## Волна 163 (2026-11-20, круг 8) — связь Диагноз→Поиск, data-born маска, персистентность reified, C479
+
+- ПРОВОД ДИАГНОЗ→ПОИСК (insight #5): _ranked_quotients(hints) —
+  ResidualProfile-сигналы переупорядочивают перебор семейств;
+  hints ломают ties в пользу подсказанного семейства, verdict/
+  биты НЕ меняются (тесты).
+- DATA-BORN МАСКА (insight #2): derive_mask_quotient — аналитический
+  вывод несмежной маски из детерминизма φ(x)=x&M (жадная минимализация
+  бит); грамматика QUOTIENTS растёт в рантайме с дедупом. Задача
+  popcount(x&5)%2 → INVENTED через mask5 (конструкта не было в меню).
+- REIFICATION ПЕРСИСТЕНТНОСТЬ (insight #3): reifier
+  save/restore_reified_ops_state (source-based, top-level def;
+  lambda — honest skip), rewrite.py --resume восстанавливает
+  REIFIED_OPS — вчерашние изобретения = завтрашние примитивы
+  после холодного перезапуска.
+- C479 FullPipeline.lean: hagi/full_pipeline.py — glue шести фаз
+  TRAIN→EF21→HADAMARD-TERN→GROW→MERGE→STOP как одна траектория
+  commit/hold (reject-hold семантика, Ville-stop блокирует коммиты).
+- 12 новых тестов; всего 85/85 PASS.

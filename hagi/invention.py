@@ -194,6 +194,7 @@ class ConstructBlueprint:
     payload: dict  # basis output (table/terms/iv/...)
     meta_bits: int
     depth: int = 1
+    total_bits: int = 0   # meta_bits + payload_bits (MDL cost)
 
     def apply(self, x: int) -> int:
         c = self.q_fn(x)
@@ -261,18 +262,39 @@ def _payload_bits(basis_name: str, payload: dict, core_size: int) -> int:
     return core_size * 4
 
 
+def _ranked_quotients(hints: Optional[dict] = None):
+    """Diagnosis→search wire: order QUOTIENTS by ResidualProfile signals
+    so likely families are tried first (δ-budget economy). Pure
+    reordering — the enumeration itself and MDL choice are unchanged,
+    so correctness never depends on the hints."""
+    if not hints:
+        return list(QUOTIENTS)
+    order = {"mod": hints.get("period_candidates"),   # autocorr_shift high
+             "xor": hints.get("xor_mask"),            # autocorr_xor high
+             "reflect": hints.get("reflect_axis")}    # autocorr_reflect high
+    def key(q):
+        name = q[0]
+        for fam, sig in order.items():
+            if sig and str(name).startswith(fam):
+                return (0, fam)   # hinted families first (stable)
+        return (1, name)
+    return sorted(QUOTIENTS, key=key)
+
+
 def synthesize_blueprint(
     pairs: list[tuple[int, int]],
     max_depth: int = 1,
     rng: Optional[random.Random] = None,
+    hints: Optional[dict] = None,
 ) -> Optional[ConstructBlueprint]:
     """Enumerate blueprints; return the one with minimal
-    meta_bits + payload_bits that fits ALL pairs exactly."""
+    meta_bits + payload_bits that fits ALL pairs exactly. hints
+    (from diagnosis.ResidualProfile) only reorder the search."""
     if max_depth < 1:
         return None
     best = None
     best_bits = None
-    for q_name, q_param, q_fn in QUOTIENTS:
+    for q_name, q_param, q_fn in _ranked_quotients(hints):
         core = [(q_fn(x), y) for x, y in pairs]
         for b_name, b_fn in BASES:
             payload = b_fn(core)
@@ -282,7 +304,8 @@ def synthesize_blueprint(
             pbits = _payload_bits(b_name, payload, core_size)
             mbits = gamma_bits(len(q_name)) + 8
             total = mbits + pbits
-            bp = ConstructBlueprint(q_name, q_param, q_fn, b_name, payload, mbits)
+            bp = ConstructBlueprint(q_name, q_param, q_fn, b_name, payload,
+                                    mbits, total_bits=total)
             if all(bp.apply(x) == y for x, y in pairs):
                 if best_bits is None or total < best_bits:
                     best, best_bits = bp, total
@@ -384,17 +407,22 @@ def invent_blueprint(
     cluster_pairs: list[list[tuple[int, int]]],
     rng: Optional[random.Random] = None,
     max_attempts: int = 200,
+    hints: Optional[dict] = None,
 ) -> Optional[dict]:
     """Find ONE blueprint that fits ALL tasks of the cluster exactly,
-    beats matched-null (STRUCTURAL), and yields positive NetGain."""
+    beats matched-null (STRUCTURAL), and yields positive NetGain.
+    hints (ResidualProfile signals) reorder the family search."""
     rng = rng or random.Random(0)
     if not cluster_pairs:
         return None
+    # self-extension: derive data-born masks first (grammar grows);
+    # derived masks are tried first because they are ANALYTICAL
+    register_derived_masks(cluster_pairs[0])
     # blueprint must fit every task in the cluster (through its own
     # quotient parametrization the SAME construction generalizes)
     attempts = 0
     best_common = None
-    for q_name, q_param, q_fn in QUOTIENTS:
+    for q_name, q_param, q_fn in _ranked_quotients(hints):
         attempts += 1
         if attempts > max_attempts:
             break
@@ -410,10 +438,11 @@ def invent_blueprint(
                 payload = b_fn(core)
                 if payload is None:
                     continue
-                bp = ConstructBlueprint(q_name, q_param, q_fn, b_name, payload, meta)
+                b_bits = _payload_bits(b_name, payload, len(core))
+                bp = ConstructBlueprint(q_name, q_param, q_fn, b_name, payload,
+                                        meta, total_bits=b_bits + meta)
                 if not all(bp.apply(x) == y for x, y in pairs):
                     continue
-                b_bits = _payload_bits(b_name, payload, len(core))
                 if best_b is None or b_bits + meta < best_b:
                     found, best_b = bp, b_bits + meta
             if found is None:
@@ -459,3 +488,62 @@ def invent_blueprint(
         "verdict": verdict,
         "attempts": attempts,
     }
+
+
+# --------------------------------------------------------------------------
+# Data-born quotient: analytical mask from XOR-difference clusters
+# --------------------------------------------------------------------------
+
+def derive_mask_quotient(pairs: list[tuple[int, int]],
+                         max_masks: int = 4) -> list[tuple[str, object, Callable]]:
+    """Infer a NON-adjacent-bit mask M analytically: phi(x) = x & M must
+    DETERMINE y (whenever phi collides, y agrees) and be MINIMAL (no
+    bit can be dropped). Discovered from data, not from a menu —
+    user insight #2: constructs born from the error structure.
+    Returns candidate (name, param, fn) quotients; empty if no mask fits.
+    """
+    if len(pairs) < 4:
+        return []
+    hi = max(x for x, _ in pairs)
+    nbits = max(1, hi.bit_length())
+    full = (1 << nbits) - 1
+
+    def determines(M: int) -> bool:
+        seen: dict[int, int] = {}
+        for x, y in pairs:
+            phi = x & M
+            if phi in seen and seen[phi] != y:
+                return False
+            seen[phi] = y
+        return True
+
+    if not determines(full):
+        return []  # even the full mask cannot be: not a well-defined
+                   # function of x on this sample
+    # greedy drop bits while determinism holds (minimal mask)
+    M = full
+    for b in range(nbits):
+        cand = M & ~(1 << b)
+        if cand and determines(cand):
+            M = cand
+    if M == 0 or (M & (M - 1)) == 0:
+        return []  # trivial: full drop, single bit (var itself)
+    if M & (M << 1):
+        return []  # adjacent bits — fixed menu already covers via xor
+
+    def q_mask(x: int, M=M) -> int:
+        return x & M
+
+    return [(f"mask{M}", M, q_mask)]
+
+
+def register_derived_masks(pairs: list[tuple[int, int]]) -> int:
+    """Derive masks from data and append to QUOTIENTS (dedup by name).
+    Returns count added. Self-extension: the grammar GROWS at runtime."""
+    added = 0
+    existing = {q[0] for q in QUOTIENTS}
+    for cand in derive_mask_quotient(pairs):
+        if cand[0] not in existing:
+            QUOTIENTS.append(cand)
+            added += 1
+    return added
