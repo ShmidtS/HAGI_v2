@@ -2050,3 +2050,11 @@ self-edit гейт работает (no-op фильтр активен), failure
   с удалением реестровой записи и восстановлением снапшота.
 - tests/test_transfer_eval.py: 5 PASS (commit/regression/purity/
   capacity/cost).
+
+## Волна 150 (2026-11-20) — Фаза 5: слияние островов (e2e)
+
+- test_phase5_cycle.py: полный цикл FAIL(gramma mismatch)→diagnose
+  (GapBuffer cluster)→invent→PROVEN→transfer gate на OOD мирах v4.6.
+- Честное поведение подтверждено: произвольный LUT3-кластер (не
+  периодический) — COMPRESSED_ONLY/HOLD, никаких ложных STRUCTURAL.
+- INVENTED-путь (периодические семьи) покрыт test_invention.
