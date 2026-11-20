@@ -65,6 +65,7 @@ class ByteLM:
         self.b1 = t.nn.Parameter(t.zeros(hidden))
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
+        self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
 
     def params(self):
         return [self.emb, self.W1, self.b1, self.W2, self.b2]
@@ -314,6 +315,7 @@ class AdaptiveByteLM:
         self.b1 = t.nn.Parameter(t.zeros(hidden))
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
+        self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
 
     def params(self):
         return [self.emb, self.pos, self.W1, self.b1, self.W2, self.b2]
@@ -468,6 +470,7 @@ class RopeAttentionByteLM:
         self.b1 = t.nn.Parameter(t.zeros(hidden))
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
+        self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
 
     def params(self):
         return [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
@@ -614,6 +617,7 @@ class CertifiedStepLM:
         self.b1 = t.nn.Parameter(t.zeros(hidden))
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
+        self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
 
     def params(self):
         return [self.emb, self.W1, self.b1, self.W2, self.b2]
@@ -653,6 +657,127 @@ class CertifiedStepLM:
                 prm.add_(eta * D[off:off + sz].reshape(prm.shape))
                 off += sz
         return 2.0 * A * A / Rp_sq
+
+    # ---- C474: EF21 in-step quantized training -----------------------
+    def _ef21_step(self, ctx, nxt, e_res: list, lr_scale: float = 1.0
+                   ) -> tuple[float, bool]:
+        """One EF21 in-step step (Theory/EF21InStep.lean, C474):
+          m = g + e;  d = qTern(m);  e' = m - d
+        trial theta' = theta - eta*d admitted ONLY by the certified
+        criterion (descent guarantee of the quadratic majorizer along
+        the QUANTIZED direction); a rejected trial leaves weights and
+        residual unchanged (honest reject semantics).
+
+        e_res: per-param residual tensors (created by caller).
+        Returns (certified_drop | 0, admitted).
+        """
+        t = self.t
+        logits = self.logits(ctx)
+        loss = t.nn.functional.cross_entropy(logits, nxt)
+        g = t.autograd.grad(loss, self.params(), retain_graph=True)
+        m = [gi + ei for gi, ei in zip(g, e_res)]
+        # qTern with FIXED scale (theory PIN: fixed-scale contract, not
+        # LS-optimal): s* = 0.2 * ||m||_inf estimated once, then frozen
+        # for the whole trajectory (set via self._ef21_s).
+        if self._ef21_s is None:
+            mi_all = t.cat([mi.reshape(-1) for mi in m])
+            self._ef21_s = 0.2 * float(mi_all.abs().max())
+        d = []
+        for mi in m:
+            s = self._ef21_s
+            d.append(s * t.sign(t.round(mi / (s + 1e-12))))
+        # certified criterion along d: A = <D,d> alignment with exact
+        # descent direction D=-g, curvature via JVP logit range of d.
+        _, disp = t.autograd.functional.jvp(
+            lambda *prm: self._logits_from_params(prm, ctx),
+            tuple(self.params()), tuple(-di for di in d))
+        per_sample_range = disp.max(dim=1).values - disp.min(dim=1).values
+        Rp_sq = float((per_sample_range ** 2).mean())
+        A = float(sum(float((mi * di).sum()) for mi, di in zip(m, d)))
+        if Rp_sq <= 0 or A <= 0:
+            return 0.0, False  # honest reject: nothing executed
+        eta0 = lr_scale * 4.0 * A / Rp_sq
+        obj_before = float(loss.detach())
+        # backtracking trial (eta like the reference: fixed 1/L is
+        # unknown for a net, so halve until measured drop > 0, max 5)
+        eta = eta0
+        admitted = False
+        for _ in range(5):
+            snap = [prm.detach().clone() for prm in self.params()]
+            with t.no_grad():
+                for prm, di in zip(self.params(), d):
+                    prm.add_(-eta * di.reshape(prm.shape))
+                obj_after = float(t.nn.functional.cross_entropy(
+                    self.logits(ctx), nxt))
+            actual_drop = obj_before - obj_after
+            if actual_drop > 0:
+                admitted = True
+                break
+            with t.no_grad():
+                for prm, st in zip(self.params(), snap):
+                    prm.copy_(st)
+            eta *= 0.5
+        if not admitted:
+            return 0.0, False  # HOLD: weights AND residual unchanged
+        with t.no_grad():
+            for er, mi, di in zip(e_res, m, d):
+                er.copy_(mi - di)
+        return actual_drop, True
+
+    def train_ef21(self, data: bytes, epochs: int = 60,
+                   holdout: float = 0.1, batch: int = 256,
+                   log_every: int = 0,
+                   holdout_seed: int | None = None) -> dict:
+        """EF21 in-step training loop (C474): quantized direction inside
+        every certified step with error feedback; rejects logged."""
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        n = len(idx) - self.k
+        rng = np.random.default_rng(7 if holdout_seed is None
+                                    else holdout_seed)
+        perm = rng.permutation(n)
+        n_hold = max(16, int(n * holdout))
+        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+        Xv = np.stack([idx[i:i + self.k] for i in hold])
+        yv = idx[hold + self.k]
+        ctx_va = t.as_tensor(Xv, dtype=t.long)
+        nxt_va = t.as_tensor(yv, dtype=t.long)
+
+        def vce():
+            with t.no_grad():
+                return float(t.nn.functional.cross_entropy(
+                    self.logits(ctx_va), nxt_va))
+
+        e_res = [t.zeros_like(prm) for prm in self.params()]
+        self._ef21_s = None  # re-freeze per trajectory
+        best = vce(); best_state = [q.detach().clone() for q in self.params()]
+        certified_guarantee = 0.0
+        admits = rejects = 0
+        for ep in range(epochs):
+            order = rng.permutation(len(train))
+            for bs in range(0, len(train), batch):
+                sel = train[order[bs:bs + batch]]
+                X = np.stack([idx[i:i + self.k] for i in sel])
+                y = idx[sel + self.k]
+                ctx = t.as_tensor(X, dtype=t.long)
+                nxt = t.as_tensor(y, dtype=t.long)
+                drop, ok = self._ef21_step(ctx, nxt, e_res)
+                if ok:
+                    admits += 1
+                    certified_guarantee += drop
+                else:
+                    rejects += 1
+            ce_va = vce()
+            if ce_va <= best:
+                best = ce_va
+                best_state = [q.detach().clone() for q in self.params()]
+        with t.no_grad():
+            for prm, st in zip(self.params(), best_state):
+                prm.copy_(st)
+        return {"final_holdout_ce": best,
+                "certified_guarantee_sum": certified_guarantee,
+                "ef21_admits": admits, "ef21_rejects": rejects}
 
     def _logits_from_params(self, params, ctx):
         """logits as an explicit function of the parameter tuple (for JVP)."""

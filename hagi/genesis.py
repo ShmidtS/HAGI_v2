@@ -13,7 +13,6 @@ Runtime library for winning EC genomes: hagi.ec_lib
 (re-exported below as ec_lib names).
 """
 
-
 import json
 import time
 from pathlib import Path
@@ -26,19 +25,19 @@ GENESIS_LOG = ROOT / "checkpoints" / "self" / "archgenesis.json"
 # Each knob: list of legal values. The CURRENT value is excluded at
 # propose time (no-op wastes the gate budget — ProxyGap T<=eps/c).
 ARCH_SPACE: dict[str, list[Any]] = {
-    "workers": [4, 8, 12, 16],          # parallel lanes (serial_divergence_cap:
-                                        # parallel = thermodynamically sound axis)
-    "batch_size": [8, 12, 16],          # work chunk per step
-    "proposals_per_round": [8, 10, 12], # candidates per round
-    "max_rounds": [2, 3, 4],            # pipeline depth per genesis probe
+    "workers": [4, 8, 12, 16],  # parallel lanes (serial_divergence_cap:
+    # parallel = thermodynamically sound axis)
+    "batch_size": [8, 12, 16],  # work chunk per step
+    "proposals_per_round": [8, 10, 12],  # candidates per round
+    "max_rounds": [2, 3, 4],  # pipeline depth per genesis probe
 }
 
 # --- Task profiles: what "best" means depends on the workload ---
 # weights sum to 1; higher weight = more important for this profile.
 PROFILES: dict[str, dict[str, float]] = {
     "throughput": {"experts": 0.5, "speed": 0.3, "relief": 0.2},
-    "latency":    {"speed": 0.6, "relief": 0.25, "experts": 0.15},
-    "memory":     {"economy": 0.5, "experts": 0.3, "speed": 0.2},
+    "latency": {"speed": 0.6, "relief": 0.25, "experts": 0.15},
+    "memory": {"economy": 0.5, "experts": 0.3, "speed": 0.2},
 }
 
 # no-regression margin on non-target profiles (robust radius, cycle 47)
@@ -57,19 +56,19 @@ def _load_log() -> dict[str, Any]:
 
 def _save_log(log: dict[str, Any]) -> None:
     GENESIS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    GENESIS_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
+    GENESIS_LOG.write_text(
+        json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
 
 
 def current_config() -> dict[str, Any]:
     """Live production config: loop defaults overridden by adopted
     archgenesis and self-edit settings."""
     from hagi import selfedit as se
-    cur = {"workers": 8, "batch_size": 8, "proposals_per_round": 10,
-           "max_rounds": 4}
+
+    cur = {"workers": 8, "batch_size": 8, "proposals_per_round": 10, "max_rounds": 4}
     try:
-        cur.update({k: v for k, v in se.adopted_settings().items()
-                    if k in cur})
+        cur.update({k: v for k, v in se.adopted_settings().items() if k in cur})
     except Exception:
         pass
     return cur
@@ -80,14 +79,18 @@ def benchmark_config(cfg: dict[str, Any]) -> dict[str, float]:
     raw metrics: experts adopted, wall seconds, relief, economy."""
     import os
     from hagi import loop as sl
-    workers = min(int(cfg.get("workers", 8)),
-                  12 if len(sl.__dict__.get("_seg_est", [0] * 901)) > 900 else 16)
+
+    workers = min(
+        int(cfg.get("workers", 8)),
+        12 if len(sl.__dict__.get("_seg_est", [0] * 901)) > 900 else 16,
+    )
     t0 = time.perf_counter()
     rep = sl.run_self_development(
         max_rounds=int(cfg.get("max_rounds", 2)),
         workers=workers,
         batch_size=int(cfg.get("batch_size", 8)),
-        proposals_per_round=int(cfg.get("proposals_per_round", 10)))
+        proposals_per_round=int(cfg.get("proposals_per_round", 10)),
+    )
     dt = time.perf_counter() - t0
     fin = rep["final"]
     adopted = max(1, fin["adopted_rounds"])
@@ -95,9 +98,13 @@ def benchmark_config(cfg: dict[str, Any]) -> dict[str, float]:
     relief = adopted / (adopted + fin.get("wasted_candidates_on_holds", 0))
     # FlopsEconomy economy metric: adopted experts per second of work
     economy = adopted / max(dt, 1e-9)
-    return {"experts": float(experts), "speed": 1.0 / max(dt, 1e-9),
-            "relief": float(relief), "economy": float(economy),
-            "seconds": dt}
+    return {
+        "experts": float(experts),
+        "speed": 1.0 / max(dt, 1e-9),
+        "relief": float(relief),
+        "economy": float(economy),
+        "seconds": dt,
+    }
 
 
 def score(profile: str, m: dict[str, float]) -> float:
@@ -109,6 +116,7 @@ def score(profile: str, m: dict[str, float]) -> float:
 def propose_mutation(rng, cur: dict[str, Any]) -> dict[str, Any] | None:
     """One-knob change within ARCH_SPACE, never equal to current."""
     import random
+
     keys = list(ARCH_SPACE.keys())
     rng.shuffle(keys)
     for knob in keys:
@@ -118,8 +126,9 @@ def propose_mutation(rng, cur: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def genesis_cycle(seed: int = 0, profile: str = "throughput",
-                  dry: bool = False) -> dict[str, Any]:
+def genesis_cycle(
+    seed: int = 0, profile: str = "throughput", dry: bool = False
+) -> dict[str, Any]:
     """One design->test->decide cycle of Architecture Genesis.
 
     Certified decision: adopt only if target-profile score strictly
@@ -135,9 +144,13 @@ def genesis_cycle(seed: int = 0, profile: str = "throughput",
     cand_cfg = dict(cur)
     cand_cfg[mut["knob"]] = mut["value"]
 
-    entry: dict[str, Any] = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                             "profile": profile,
-                             "mutation": mut, "from": cur, "to": cand_cfg}
+    entry: dict[str, Any] = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "profile": profile,
+        "mutation": mut,
+        "from": cur,
+        "to": cand_cfg,
+    }
     if dry:
         entry["decision"] = "dry"
         return entry
@@ -156,8 +169,10 @@ def genesis_cycle(seed: int = 0, profile: str = "throughput",
         rel = (b - c) / max(abs(b), 1e-9)
         regressions[p] = round(rel, 4)
     worst_regression = max(regressions.values(), default=0.0)
-    entry["scores"] = {"base": {k: round(v, 4) for k, v in base_scores.items()},
-                       "cand": {k: round(v, 4) for k, v in cand_scores.items()}}
+    entry["scores"] = {
+        "base": {k: round(v, 4) for k, v in base_scores.items()},
+        "cand": {k: round(v, 4) for k, v in cand_scores.items()},
+    }
     entry["target_gain"] = round(target_gain, 6)
     entry["regressions"] = regressions
     rel_gain = target_gain / max(abs(base_scores[profile]), 1e-9)
@@ -220,11 +235,29 @@ EVO_LOG = ROOT / "checkpoints" / "self" / "ec_evolution.json"
 EC_P = 9739
 EC_A = 497
 EC_B = 1768
-EC_G = (1804, 5368)       # generator
-EC_N = 9735               # point order (verified: EC_N * EC_G = identity)
+EC_G = (1804, 5368)  # generator
+EC_N = 9735  # point order (verified: EC_N * EC_G = identity)
 
-PROBE_SCALARS = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
-                 1234, 4321, 5678, 8765, 9734, 9735]
+PROBE_SCALARS = [
+    1,
+    2,
+    3,
+    5,
+    7,
+    11,
+    13,
+    17,
+    19,
+    23,
+    29,
+    31,
+    1234,
+    4321,
+    5678,
+    8765,
+    9734,
+    9735,
+]
 
 # --- Genome space (declared) ---
 GENE_SPACE: dict[str, list[Any]] = {
@@ -244,6 +277,7 @@ GENE_SPACE: dict[str, list[Any]] = {
 # ======================================================================
 # The virtual EC processor: parameterized by the genome
 # ======================================================================
+
 
 def _inv(x: int, p: int, genome: dict) -> int:
     if genome["mod_strategy"] == "barrett":
@@ -279,9 +313,6 @@ def _add(Pt, Qt, genome: dict, stats: dict) -> tuple | None:
 
 def _mul_scalar(k: int, Pt, genome: dict, stats: dict) -> tuple | None:
     """Scalar multiply per the genome's strategy."""
-    if genome["mul_strategy"] == "ladder":
-        return _mul_ladder(k, Pt, genome, stats)
-    return _mul_double_add(k, Pt, genome, stats)
     if genome["mul_strategy"] == "ladder":
         return _mul_ladder(k, Pt, genome, stats)
     return _mul_double_add(k, Pt, genome, stats)
@@ -352,6 +383,7 @@ def _mul_ladder(k: int, Pt, genome: dict, stats: dict) -> tuple | None:
 # Certified fitness: correctness first, then cost
 # ======================================================================
 
+
 def certified_correct(genome: dict) -> tuple[bool, str]:
     """Group-law invariants on the probe set — hard gate."""
     try:
@@ -362,9 +394,12 @@ def certified_correct(genome: dict) -> tuple[bool, str]:
         # associativity probe: (r+s)G == rG + sG
         for r, s in ((2, 3), (5, 7), (11, 13)):
             lhs = _mul_scalar(r + s, EC_G, genome, {"modmul": 0, "add": 0})
-            rhs = _add(_mul_scalar(r, EC_G, genome, {"modmul": 0, "add": 0}),
-                       _mul_scalar(s, EC_G, genome, {"modmul": 0, "add": 0}),
-                       genome, {"modmul": 0, "add": 0})
+            rhs = _add(
+                _mul_scalar(r, EC_G, genome, {"modmul": 0, "add": 0}),
+                _mul_scalar(s, EC_G, genome, {"modmul": 0, "add": 0}),
+                genome,
+                {"modmul": 0, "add": 0},
+            )
             if lhs != rhs:
                 return False, f"({r}+{s})EC_G mismatch"
         # homogeneity: (k*n)*G == None for the group order
@@ -386,8 +421,7 @@ def measure(genome: dict, probes: int = 10) -> dict[str, float]:
         total_mul += st["modmul"]
     dt = time.perf_counter() - t0
     n = len(PROBE_SCALARS[:probes])
-    return {"modmul_per_mul": total_mul / n,
-            "time_per_mul_us": dt / n * 1e6}
+    return {"modmul_per_mul": total_mul / n, "time_per_mul_us": dt / n * 1e6}
 
 
 def fitness(genome: dict, profile: str = "throughput") -> float | None:
@@ -411,6 +445,7 @@ def fitness(genome: dict, profile: str = "throughput") -> float | None:
 # Evolution engine
 # ======================================================================
 
+
 def random_genome(rng: random.Random) -> dict[str, Any]:
     return {g: rng.choice(vals) for g, vals in GENE_SPACE.items()}
 
@@ -433,18 +468,25 @@ def crossover(a: dict, b: dict, rng: random.Random) -> dict:
     return child
 
 
-def tournament(pop_scores: list[tuple[float, dict]],
-               rng: random.Random, k: int = 3) -> dict:
+def tournament(
+    pop_scores: list[tuple[float, dict]], rng: random.Random, k: int = 3
+) -> dict:
     challengers = rng.sample(pop_scores, min(k, len(pop_scores)))
     return min(challengers, key=lambda t: t[0])[1]
 
 
-def evolve(pop_size: int = 12, generations: int = 8,
-           profile: str = "throughput", seed: int = 7,
-           log: bool = True) -> dict[str, Any]:
+def evolve(
+    pop_size: int = 12,
+    generations: int = 8,
+    profile: str = "throughput",
+    seed: int = 7,
+    log: bool = True,
+) -> dict[str, Any]:
     rng = random.Random(seed)
-    population = [(fitness(random_genome(rng), profile),
-                   random_genome(rng)) for _ in range(pop_size)]
+    population = [
+        (fitness(random_genome(rng), profile), random_genome(rng))
+        for _ in range(pop_size)
+    ]
     population = [(s, g) for s, g in population if s is not None]
     if not population:
         raise RuntimeError("no genome passed the certified gate — bug")
@@ -452,9 +494,8 @@ def evolve(pop_size: int = 12, generations: int = 8,
     for gen in range(generations):
         population.sort(key=lambda t: t[0])
         best_s, best_g = population[0]
-        history.append({"gen": gen, "best": best_g,
-                        "fitness": round(best_s, 2)})
-        elite = population[:max(2, pop_size // 4)]
+        history.append({"gen": gen, "best": best_g, "fitness": round(best_s, 2)})
+        elite = population[: max(2, pop_size // 4)]
         pool = [(s, g) for s, g in population]
         children: list[tuple[float, dict]] = []
         while len(children) < pop_size - len(elite):
@@ -467,21 +508,26 @@ def evolve(pop_size: int = 12, generations: int = 8,
         population = elite + children
     population.sort(key=lambda t: t[0])
     best_s, best_g = population[0]
-    result = {"profile": profile, "seed": seed,
-              "best_genome": best_g, "best_fitness": round(best_s, 2),
-              "history": history, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    result = {
+        "profile": profile,
+        "seed": seed,
+        "best_genome": best_g,
+        "best_fitness": round(best_s, 2),
+        "history": history,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
     if log:
         lp = EVO_LOG
         lp.parent.mkdir(parents=True, exist_ok=True)
         prev = json.loads(lp.read_text(encoding="utf-8")) if lp.exists() else []
         prev.append(result)
-        lp.write_text(json.dumps(prev, ensure_ascii=False, indent=1),
-                      encoding="utf-8")
+        lp.write_text(json.dumps(prev, ensure_ascii=False, indent=1), encoding="utf-8")
     return result
 
 
 def main() -> None:
     import sys
+
     profile = sys.argv[1] if len(sys.argv) > 1 else "throughput"
     gens = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     res = evolve(generations=gens, profile=profile)

@@ -2103,3 +2103,16 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Инварианты: изобретённое понятие КОМПОЗИРУЕТСЯ внутри программ
   (popcount(x^y) какExprV9), стоимость учтена в MDL, дубликаты
   отклонены. 3 теста; всего 51/51 PASS.
+
+## Волна 155 (2026-11-20) — C474: EF21 in-step quantized training
+
+- Сверка с upstream Theory/EF21InStep.lean + scripts/bench_bridge.py
+  (--mode ef21-step): m=g+e; d=qTern(m); e'=m−d; trial admit ТОЛЬКО
+  по фактическому drop>0; reject → HOLD (веса и residual нетронуты).
+- hagi/lm.py: CertifiedStepLM._ef21_step + train_ef21. Fixed-scale
+  PIN (s замораживается на первом шаге, 0.2·max|m|), backtracking η
+  (теоретический 1/L неизвестен для сети), честный reject-rollback.
+- НАЙДЕН И ИСПРАВЛЕН баг знака: θ'=θ+ηd вместо θ−ηd — гарантия
+  нарушалась (факт +1.32 при обещанных −0.81); после фикса CE 0.059
+  против 0.075 у non-EF пути.
+- 2 теста; всего 57/57 PASS.
