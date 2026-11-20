@@ -27,8 +27,6 @@ families (the space of "thinkable" constructions), not from the task
 bank; discovery over a world outside ALL families ends in HOLD.
 """
 from __future__ import annotations
-import random
-from dataclasses import dataclass, field
 
 N_BITS = 4
 N_STATES = 1 << N_BITS

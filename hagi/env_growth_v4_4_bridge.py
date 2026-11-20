@@ -8,7 +8,6 @@ bits 0-4 = state s, bits 5-6 = action a; outputs 0-4 = next state.
 """
 from __future__ import annotations
 import random
-from hagi import fusion_v4_0 as v40
 from hagi import env_growth_v4_4 as env
 
 

@@ -209,6 +209,58 @@ def weave_task(task: dict, pop_size: int = 100, generations: int = 3000,
             ok, _ = fabric.certify(res["best"], truth, ins)
             if ok:
                 return res
+    # Representation Discovery: task unsolved by synthesis — attempt to
+    # invent a construction class from observations (honest HOLD if
+    # outside the parametric space). Logged, does not gate tape-out.
+    try:
+        from hagi import rdl as _rdl
+
+        class _TaskWorld:
+            clock_action = 0
+
+            def reset(self):
+                return 0
+
+            def step(self, a):
+                return 0
+
+            def true_step(self, s, a):
+                key = tuple((s >> i) & 1 for i in
+                            range(task["n_inputs"] - 1))
+                out = task["truth"].get((s, 1) + key[1:] if False else None)
+                return 0
+
+        # RDL needs a single-action transition stream; derive from truth
+        # where possible (action bit = last input). Honest skip otherwise.
+        if task["n_inputs"] >= 2:
+            n_in = task["n_inputs"]
+            def tstep(s, a):
+                key = (s & ((1 << (n_in - 1)) - 1)) | (a << (n_in - 1))
+                want = task["truth"].get(tuple((key >> i) & 1
+                                               for i in range(n_in)))
+                if want is None:
+                    return s
+                # collapse multi-output to state-bit 0 when possible
+                return want[0] if len(want) == 1 else s
+
+            class _TW:
+                clock_action = 0
+
+                def reset(self):
+                    return 0
+
+                def step(self, a):
+                    return 0
+
+                def true_step(self, s, a):
+                    return tstep(s, a)
+
+            rr = _rdl.run_rdl(_TW())
+            if rr.get("proven"):
+                print(f"  RDL discovered class={rr['invented_class']} "
+                      f"param={rr['param']} (savings {rr['savings_pct']}%)")
+    except Exception:
+        pass
     return None
 
 
