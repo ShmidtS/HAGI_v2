@@ -2134,3 +2134,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   капе — adaptive-ветка (A²/4C), иначе range-bound §3.9 (2A²/R'²,
   всегда сертифицирован). На 20 шагах CE 5.55→0.072.
 - 1 тест; всего 61/61 PASS.
+
+## Волна 158 (2026-11-20) — NonlinearMerge: certified checkpoint merge
+
+- hagi/merge.py: nonlinear_merge_bound (δ на mid, δ₂ на конце,
+  L(mid) ≤ (L1+L2)/2 + δ + δ₂/2); diag-квадратичный случай — точный
+  мост C472 с кривизнным остатком (1/8)Σc_i(w2−w1)_i².
+- 3 теста; всего 64/64 PASS.
