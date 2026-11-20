@@ -403,8 +403,8 @@ class AdaptiveByteLM:
             X = np.zeros((len(xs), pad), dtype=np.int64)
             for j, x in enumerate(xs):
                 X[j, :len(x)] = x
-            return (t.as_tensor(X, dtype=t.long),
-                    t.as_tensor(ys, dtype=t.long))
+            return (t.as_tensor(X, dtype=t.long, device=self.device),
+                    t.as_tensor(ys, dtype=t.long, device=self.device))
 
         ctx_va, nxt_va = windows(hold, fixed_len=self.max_train_ctx)
         opt = t.optim.Adam(self.params(), lr=lr)
@@ -533,6 +533,8 @@ class RopeAttentionByteLM:
     def logits(self, ctx):
         """ctx: (B, L) newest-first. Full attention over all positions."""
         t = self.t
+        if ctx.device != self.device:
+            ctx = ctx.to(self.device)
         B, L = ctx.shape
         e = self.emb[ctx]                          # (B, L, dim)
         e = self._rope(e, L, ctx.device)           # C308
@@ -542,6 +544,23 @@ class RopeAttentionByteLM:
             L, device=ctx.device, dtype=t.float32)  # A8 heat-bath recency
         p = t.softmax(scores, dim=-1)               # (B, L)
         h = t.relu((p[..., None] * e).sum(dim=1) @ self.W1 + self.b1)
+        return h @ self.W2 + self.b2
+
+    def full_logits(self, ctx):
+        t = self.t
+        if ctx.device != self.device:
+            ctx = ctx.to(self.device)
+        B, L = ctx.shape
+        e = self.emb[ctx]
+        e = self._rope(e, L, ctx.device)
+        q = self.q
+        scores = (e @ q) / (self.dim ** 0.5) - self.lam * t.arange(
+            L, device=ctx.device, dtype=t.float32)
+        j_idx = t.arange(L, device=ctx.device)
+        mask = j_idx[None, :, None] >= j_idx[None, None, :]
+        sc = scores.unsqueeze(-1).masked_fill(~mask, float("-inf"))
+        pp = t.softmax(sc, dim=1)
+        h = t.relu(t.einsum("blj,bjd->bld", pp, e) @ self.W1 + self.b1)
         return h @ self.W2 + self.b2
 
     def ce(self, ctx, nxt):
@@ -600,13 +619,14 @@ class RopeAttentionByteLM:
                  seed: int = 1) -> str:
         t = self.t
         with t.no_grad():
-            g = t.Generator().manual_seed(seed)
+            g = t.Generator(device=self.device).manual_seed(seed)
             ctx = list(prompt.encode("utf-8"))
             out = bytearray()
             for _ in range(n_bytes):
-                x = t.as_tensor([ctx[::-1]], dtype=t.long)
-                probs = t.softmax(self.logits(x)[0] / max(temp, 1e-3),
-                                  dim=-1)
+                x = t.as_tensor([ctx[::-1]], dtype=t.long,
+                                device=self.device)
+                probs = t.softmax(self.full_logits(x)[0, -1] /
+                                  max(temp, 1e-3), dim=-1)
                 b = int(t.multinomial(probs, 1, generator=g))
                 out.append(b); ctx.append(b)
         return (prompt.encode("utf-8") + bytes(out)).decode(

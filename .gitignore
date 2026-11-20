@@ -130,3 +130,8 @@ _raw/
 FORMALIZATION_TODO.md
 goal_snap.json
 checkpoints/self/lm_corpus.bin
+training/literacy/corpus.txt
+
+# literacy training corpora (generated, large)
+training/literacy/*.txt
+checkpoints/literacy*.pt
