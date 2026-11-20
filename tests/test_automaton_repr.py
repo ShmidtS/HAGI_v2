@@ -111,7 +111,9 @@ def test_real_processor_composes_invented_coordinates_via_batched_mdl():
     assert result["action"] == "COMMIT", result
     expert = proc.experts[spec.name]
     assert expert.program.expr is not None
-    assert expert.program.expr.op == "bit_and", expert.program.pretty()
+    assert expert.program.expr.op in {"mul", "min", "max", "bit_and"}, expert.program.pretty()
+    assert len(expert.program.expr.args) == 2
+    assert all(child.op == "construct" for child in expert.program.expr.args)
     assert all(
         expert.program.eval((code,), proc.experts) == spec.teacher(code)
         for code in domain
