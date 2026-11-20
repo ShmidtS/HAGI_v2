@@ -70,6 +70,27 @@ def clear_reified() -> None:
     REIFIED_OPS.clear()
 
 
+def _state_sig_path(state_dir):
+    from pathlib import Path
+    return Path(state_dir) / "invented_reprs.sig"
+
+
+def _state_hmac(payload_bytes: bytes, state_dir) -> str:
+    """Machine-bound HMAC integrity tag: detects corruption/silent
+    tampering of invented_reprs.json between save and resume (RSA
+    identity signatures live in certificates.py)."""
+    import hashlib
+    import os
+    from pathlib import Path
+    key_file = Path(state_dir) / ".reified_key"
+    if key_file.exists():
+        key = key_file.read_bytes()
+    else:
+        key = os.urandom(32)
+        key_file.write_bytes(key)
+    return hashlib.sha256(key + payload_bytes).hexdigest()
+
+
 def save_reified_ops_state(state_dir) -> int:
     """Persist reified ops as source + meta (invented_reprs.json).
     Returns the number saved. Source-based: survives cold restart."""
@@ -84,20 +105,35 @@ def save_reified_ops_state(state_dir) -> int:
         if code:
             out[op] = {"code": code, "meta": {k: v for k, v in meta.items()
                                               if k != "source"}}
-    (d / "invented_reprs.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    payload = json.dumps(out, ensure_ascii=False, indent=1).encode("utf-8")
+    (d / "invented_reprs.json").write_bytes(payload)
+    _state_sig_path(d).write_text(_state_hmac(payload, d))
     return len(out)
 
 
-def restore_reified_ops_state(state_dir) -> int:
-    """Restore reified ops from invented_reprs.json (exec in a clean
-    namespace; the __reified_meta__ attribute is re-attached)."""
+def restore_reified_ops_state(state_dir, require_tag: bool = True) -> int:
+    """Restore reified ops from invented_reprs.json.
+
+    WAVE 175: verifies the HMAC integrity tag before executing ANY
+    saved source (the old path exec'ed raw JSON content unverified).
+    Missing/mismatched tag fails closed by default (require_tag).
+    """
     import json
     from pathlib import Path
     f = Path(state_dir) / "invented_reprs.json"
     if not f.exists():
         return 0
-    data = json.loads(f.read_text(encoding="utf-8"))
+    payload = f.read_bytes()
+    tag = _state_sig_path(state_dir)
+    if tag.exists():
+        if tag.read_text().strip() != _state_hmac(payload, state_dir):
+            raise ValueError("reified ops integrity check FAILED — "
+                             "invented_reprs.json modified after save; "
+                             "refusing to exec")
+    elif require_tag:
+        raise ValueError("reified ops store has no integrity tag; "
+                         "refusing to exec unsigned state")
+    data = json.loads(payload.decode("utf-8"))
     n = 0
     import textwrap
     for op, rec in data.items():

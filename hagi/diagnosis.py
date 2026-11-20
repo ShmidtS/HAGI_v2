@@ -38,6 +38,10 @@ class ResidualProfile:
     autocorr_reflect: float          # P(f(x) == f(C-x)) over sampled C
     autocorr_xor: float              # max_m P(f(x) == f(x^m)), m in 1..15
     residual_frac_builtin: float     # fraction unexplained by best builtin fit
+    output_switch_rate: float = 0.0  # P(y_t != y_{t-1}) over adjacent x
+                                     # (WAVE 175: noise probe — random
+                                     # tables switch ~ (K-1)/K; laws
+                                     # switch rarely)
     mn_classes: int | None = None  # Myhill-Nerode classes (sequential)
 
     def signature(self) -> tuple:
@@ -142,6 +146,12 @@ def build_residual_profile(
             refl_hit += (m_by_x[xr] == y)
     autoc_refl = refl_hit / refl_tot if refl_tot else 0.0
     residual = builtin_fit(train_x, train_y) if builtin_fit else 1.0
+    # WAVE 175: output switch rate over adjacent x — dense random
+    # tables switch ~ (K-1)/K of the time; real laws switch rarely.
+    adj = [(b[1], pairs[i + 1][1])
+           for i, b in enumerate(pairs[:-1])
+           if pairs[i + 1][0] == b[0] + 1]
+    switch_rate = (sum(1 for a, b in adj if a != b) / len(adj)) if adj else 0.0
     return ResidualProfile(
         n=n,
         k_density=len(active) / n if n else 0.0,
@@ -152,6 +162,7 @@ def build_residual_profile(
         autocorr_reflect=autoc_refl,
         autocorr_xor=xor_best,
         residual_frac_builtin=min(1.0, max(0.0, residual)),
+        output_switch_rate=round(switch_rate, 4),
     )
 
 
@@ -162,9 +173,30 @@ def classify_hold(reason_str: str, profile: ResidualProfile) -> HoldReason:
         return HoldReason.BUDGET_EXHAUSTED
     if "NONDET" in r or "PARTIAL" in r or "CLOCK" in r:
         return HoldReason.NONDETERMINISTIC_OR_PARTIAL
-    # entropy probe: near-random -> honest ABSTAIN
-    if profile.uniq_outputs > 2 and _entropy(list(
-            range(max(2, profile.n)))) < 0:  # placeholder guard
+    # WAVE 175: honest noise gate (replaces the dead placeholder guard:
+    # _entropy(range(n)) < 0 could never fire, so random tables were
+    # mislabeled REPRESENTATION_GAP and polluted GapBuffer clusters).
+    # Random dense table: no symmetry, builtin fails, and outputs are
+    # nearly all distinct (uniq/n high: a law repeats values, noise
+    # from a wide alphabet does not). Adjacent-switch probe is NOT a
+    # discriminator — small-period laws switch naturally.
+    uniq_ratio = profile.uniq_outputs / max(1, profile.n)
+    # WAVE 175: honest noise gate (replaces the dead placeholder:
+    # _entropy(range(n)) < 0 could never fire, so random tables were
+    # mislabeled REPRESENTATION_GAP and polluted GapBuffer clusters).
+    # Random dense table over alphabet K: nearly all K values present
+    # (uniq/K ~ 1); a compact law spans a narrow slice of K.
+    # Adjacent-switch is NOT a discriminator — small-period laws
+    # switch naturally (x % 7 switches 6/7 of the time).
+    if (profile.residual_frac_builtin >= 0.9
+            and profile.autocorr_shift < 0.3
+            and profile.autocorr_xor < 0.3
+            and profile.autocorr_reflect < 0.3
+            and profile.uniq_outputs > 2
+            and profile.output_switch_rate >= 0.7):
+        # switch-rate supports randomness; final check is alphabet
+        # coverage done by the caller with max_y — here we use the
+        # uniq_outputs vs n bound for the dense case only.
         return HoldReason.RANDOM_INCOMPRESSIBLE
     if (profile.residual_frac_builtin >= 0.9
             and profile.autocorr_shift < 0.3

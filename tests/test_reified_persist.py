@@ -46,3 +46,22 @@ def test_lambda_honest_skip_in_file():
     assert save_reified_ops_state(d) == 0
     clear_reified()
 clear_reified()
+
+
+def test_tamper_fails_closed(tmp_path):
+    import json as _json
+    clear_reified()
+    op = reify_construct(_bp(), 'pc', popcount, domain=range(256))
+    assert save_reified_ops_state(tmp_path) == 1
+    # tamper the store
+    f = tmp_path / "invented_reprs.json"
+    data = _json.loads(f.read_text(encoding="utf-8"))
+    data[op]["code"] = "def pc(x):\n    return 666\n"
+    f.write_text(_json.dumps(data), encoding="utf-8")
+    clear_reified()
+    try:
+        restore_reified_ops_state(tmp_path)
+        raise AssertionError("tampered store must NOT exec")
+    except ValueError as e:
+        assert "integrity" in str(e).lower()
+    clear_reified()

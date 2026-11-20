@@ -40,6 +40,8 @@ class CegisResult:
     queries: int                # oracle label budget spent
     train_size: int             # final train size (init + counterexamples)
     final_sweep: dict | None = None   # full-domain certificate result
+    cert_queries: int = 0   # WAVE 175: full-domain labeling, tracked
+                            # separately from the search budget
 
 
 def cegis_invent(train_x: list[int],
@@ -108,20 +110,31 @@ def cegis_invent(train_x: list[int],
                 if query_budget is not None and queries >= query_budget:
                     return CegisResult("HOLD_CEGIS_BUDGET", bp, round_i,
                                        queries, len(train))
-                # CERTIFICATION phase: label the FULL domain (wave 169:
-                # PROVEN_EXACT requires full labeled coverage; certifying
-                # labels are not search leakage — search already froze
-                # the candidate)
+                # CERTIFICATION phase (wave 169 + WAVE 175): label the
+                # FULL domain; cert_queries tracked separately from the
+                # search budget. A certification counterexample with
+                # rounds remaining feeds back into train (refine), not
+                # a dead-end HOLD.
+                cert_queries = 0
                 for x in full_domain:
                     if x not in train:
                         y = query(x)
+                        cert_queries += 1
                         queries += 1
                         if y is not None:
                             train[x] = y
                 sweep = verify_blueprint(bp, sorted(train.items()),
                                          full_domain)
+                if (sweep["status"] == "HOLD_COUNTEREXAMPLE"
+                        and round_i < max_rounds):
+                    cex = sweep["cex"]
+                    train.setdefault(cex[0], cex[1])
+                    mem.add(cex[0], cex[1])
+                    best = bp
+                    continue
                 return CegisResult(sweep["status"], bp, round_i, queries,
-                                   len(train), final_sweep=sweep)
+                                   len(train), final_sweep=sweep,
+                                   cert_queries=cert_queries)
             train[ce[0]] = ce[1]
             best = bp
 

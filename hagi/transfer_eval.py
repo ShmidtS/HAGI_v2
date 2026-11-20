@@ -71,9 +71,13 @@ class CapabilityMeter:
         m["delta_capacity"] = delta
         if delta <= 0:
             reasons.append(f"NO_CAPACITY_GAIN: delta={delta}")
-        # 3. matched-controls purity
+        # 3. matched-controls purity (WAVE 175): ANY structural claim on
+        # a random control is false — including solved=True cases, where
+        # the construct memorized/overfit noise and "passed" it. The old
+        # `structural and not solved` condition silently skipped exactly
+        # those.
         false_structural = sum(
-            1 for r in matched_control_results if r.structural and not r.solved
+            1 for r in matched_control_results if r.structural
         )
         m["false_structural_controls"] = false_structural
         if false_structural > self.alpha_fdr:

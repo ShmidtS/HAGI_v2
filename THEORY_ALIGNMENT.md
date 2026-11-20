@@ -2385,3 +2385,27 @@ self-edit гейт работает (no-op фильтр активен), failure
   стиль пользователя, заморожено); F401 в legacy (заморожено);
   certificates _gamma_bits/_zigzag — намеренная stdlib-изоляция.
 - 112/112 PASS.
+
+## Волна 175 (2026-11-21) — аудит надёжности round 2: 4 из 5 подтверждены и исправлены
+
+- #1.1 matched_null пропускает разреженный шум: НЕ воспроизведено
+  (0/30 ложных INVENTED на плотном/разреженном/двоичном шуме после
+  волн 169/163). Защита уже на месте.
+- #1.2 CapabilityMeter ПОДТВЕРЖДЁН: `structural and not solved`
+  пропускал подгонку шума (solved=True). Фикс: ANY structural на
+  контроле = ложный → ROLLBACK.
+- #1.3 diagnosis ПОДТВЕРЖДЁН: dead placeholder guard (entropy<0
+  никогда) → шум шёл в GapBuffer как REPRESENTATION_GAP, склеивая
+  кластеры. Фикс: honest noise gate — residual≥0.9, нет симметрий,
+  switch-rate≥0.7 (плотный шум ~0.9; периодика mod7 имеет 1.0 —
+  switch НЕ дискриминатор, но uniq/K-покрытие и отсутствие
+  симметрий отсекают). Периодика mod7 корректно остаётся
+  REPRESENTATION_GAP.
+- #1.4 cegis ПОДТВЕРЖДЁН: cert_queries теперь отдельный счётчик;
+  контрпример из финального аудита при оставшихся раундах →
+  feedback в train (не dead-end HOLD).
+- #1.5 reifier ПОДТВЕРЖДЁН: exec сырого JSON без проверки. Фикс:
+  HMAC integrity tag при save (machine-bound), fail-closed при
+  restore (require_tag=True); tamper-тест — подменённый store не
+  исполняется.
+- 113/113 PASS.
