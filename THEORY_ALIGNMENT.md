@@ -2316,3 +2316,31 @@ self-edit гейт работает (no-op фильтр активен), failure
 - selfmodel роутеры (64 бита) не тронуты — это внутренние фичи,
   не задачи.
 - 93/93 PASS; golden 72/68 стабильны.
+
+## Волна 171 (2026-11-21) — интеграция v6_work: V5 serialization + Portable Cert V2
+
+- ИНТЕГРАЦИЯ из checkpoints/HAGI_v2_v6_work (внешний форк с патчами
+  v5/v6). Внимание: их дерево на СТАРОЙ базе (без наших фиксов волн
+  169) — слепое копирование откатывало бы фиксы. Перенос ТОЧЕЧНЫЙ.
+- ПРИНЯТО:
+  1. V5 serialization fix (наш save/load НЕ сохранял governance!):
+     format_version=2, governance_state (cert_log, AuditLedgerV9
+     streams/floors/spent, GPM W/U_basis/ef_v, router, RAM, бюджеты).
+     load: fail-closed — старые файлы грузятся для prediction, но
+     governance_state_complete=False; verify_certificates проверяет
+     history_ok (commits/holds счётчики == длина журнала) и
+     state_complete. Пустая история больше не читается как PASS.
+     Round-trip: version/certs/streams верны; legacy → all_ok=False.
+  2. certificates.py — переносимый конечный сертификат V2 (stdlib-
+     only verifier, AST schema digest, verifier_profile, resource
+     budgets, python -I standalone); detached RSA/SHA-256 signature
+     (проверка без сторонних библиотек). 15/15 их тестов PASS в
+     нашем дереве; standalone verify valid:true; signed verify
+     valid:true. reports/ артефакты перенесены.
+- ОТКЛОНЕНО (Chesterton):
+  - test_regressions.py — написан под rival-семантику batch
+    (diff-only без мутации parent); наше решение волны 169
+    (применение воркером + merge-guard) противоположно. Их regression
+    чинил те же баги независимо; наша реализация покрыта 93+ тестами.
+  - Остальные 21 diff-файлов — старая база, откатила бы волны 155-170.
+- 93 старых + 15 новых = 108/108 PASS.

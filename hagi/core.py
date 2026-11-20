@@ -3605,6 +3605,10 @@ class GrowingHagiProcessorV9:
         self.total_holds = 0
         self.growth_log: list[dict[str, Any]] = []
         self.cert_log: list[CertStepGen] = []
+        # WAVE 171 (V5 port): serialization completeness sentinel - an
+        # old save() that dropped governance history must not read as
+        # a successful empty proof.
+        self.governance_state_complete = True
         self.theorems: list[Theorem] = []
         self.ledger = AuditLedgerV9(delta_total=delta_total)
         self.router = HedgeRouterV9(len(FactorizedSharedCoreV9.BRANCHES), eta=0.5)
@@ -4090,12 +4094,26 @@ class GrowingHagiProcessorV9:
             if c.action == "COMMIT"
         )
         ledger_ok = self.ledger.verify_disjoint_and_clean()
+        # WAVE 171 (V5 port): history completeness — an emptied cert_log
+        # must not read as a successful proof.
+        state_complete = bool(getattr(self, "governance_state_complete", False))
+        logged_commits = sum(c.action == "COMMIT" for c in self.cert_log)
+        logged_holds = sum(c.action == "HOLD" for c in self.cert_log)
+        history_ok = (
+            logged_commits == self.total_commits
+            and logged_holds == self.total_holds
+            and len(self.cert_log) == self.total_commits + self.total_holds
+        )
+        all_ok = (telescope_ok and holds_ok and commits_ok and ledger_ok
+                  and state_complete and history_ok)
         return {
             "telescope_ok": telescope_ok,
             "holds_ok": holds_ok,
             "commits_ok": commits_ok,
             "ledger_ok": ledger_ok,
-            "all_ok": telescope_ok and holds_ok and commits_ok and ledger_ok,
+            "state_complete": state_complete,
+            "history_ok": history_ok,
+            "all_ok": all_ok,
         }
 
     def total_neural_bytes(self) -> int:
@@ -4128,8 +4146,51 @@ class GrowingHagiProcessorV9:
         }
 
     def save(self, path: str | Path) -> None:
+        """Save experts AND runtime-governance state (WAVE 171, V5 port).
+
+        Symbolic experts suffice for prediction, but not to reconstruct
+        CertStepGen/AuditLedger proof history. format_version=2 preserves
+        those records for faithful continuation of learning.
+        """
+        gpm = self.core.gpm.snapshot_optimizer()
+        router_weights, router_loss = self.router.snapshot()
+        ledger = self.ledger
+        governance_state = {
+            "schema": 1,
+            "cert_log": [vars(c) for c in self.cert_log],
+            "ledger": {
+                "delta_total": ledger.delta_total,
+                "spent": dict(ledger.spent),
+                "streams": {k: vars(v) for k, v in sorted(ledger.streams.items())},
+                "floors": dict(ledger.floors),
+                "rejected_tasks": sorted(ledger.rejected_tasks),
+                "final_test_lo": ledger.final_test_lo,
+                "final_test_hi": ledger.final_test_hi,
+                "final_test_touched": ledger.final_test_touched,
+                "next_cursor_base": ledger.next_cursor_base,
+            },
+            "compute_budget": self.compute_budget,
+            "risk_rem": self.risk_rem,
+            "unsolved_objective": self.unsolved_objective,
+            "evals": self.evals,
+            "candidates_generated": self.candidates_generated,
+            "core_gpm": {
+                "W": gpm["W"].tolist(),
+                "U_basis": gpm["U_basis"].tolist(),
+                "ef_v": gpm["ef_v"].tolist(),
+                "core_bytes": int(self.core.core_bytes),
+            },
+            "router": {
+                "K": int(self.router.K),
+                "eta": float(self.router.eta),
+                "weights": router_weights.tolist(),
+                "cum_loss": router_loss.tolist(),
+            },
+            "ram": self.ram.snapshot().tolist(),
+        }
         data = {
             "format": "HAGI-V9",
+            "format_version": 2,
             "version": V9_VERSION,
             "core_seed": self.core.seed,
             "core_width": self.core.width,
@@ -4140,10 +4201,13 @@ class GrowingHagiProcessorV9:
             "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},
             "theorems": [vars(t) for t in self.theorems],
             "growth_log": self.growth_log,
+            "governance_state": governance_state,
+            "governance_state_complete": bool(self.governance_state_complete),
         }
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        p.write_text(json.dumps(data, indent=2, sort_keys=True, allow_nan=False),
+                     encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> "GrowingHagiProcessorV9":
@@ -4162,6 +4226,80 @@ class GrowingHagiProcessorV9:
         }
         m.theorems = [Theorem(**t) for t in d.get("theorems", [])]
         m.growth_log = d.get("growth_log", [])
+        gs = d.get("governance_state")
+        if (d.get("governance_state_complete") is not True
+                or not isinstance(gs, dict) or gs.get("schema") != 1):
+            # Backwards-compatible prediction loading, but absent audit
+            # history is NOT a successful empty proof.
+            m.governance_state_complete = False
+            return m
+        ledger_data = gs.get("ledger")
+        router_data = gs.get("router")
+        core_data = gs.get("core_gpm")
+        ram_data = gs.get("ram")
+        if not all(isinstance(x, dict) for x in (ledger_data, router_data, core_data)):
+            raise ValueError("malformed governance state")
+        m.cert_log = [CertStepGen(**row) for row in gs.get("cert_log", [])]
+        streams = {
+            str(k): AuditStream(**v)
+            for k, v in ledger_data.get("streams", {}).items()
+        }
+        m.ledger = AuditLedgerV9(
+            delta_total=float(ledger_data["delta_total"]),
+            spent={str(k): float(v) for k, v in ledger_data.get("spent", {}).items()},
+            streams=streams,
+            floors={str(k): float(v) for k, v in ledger_data.get("floors", {}).items()},
+            rejected_tasks=set(str(x) for x in ledger_data.get("rejected_tasks", [])),
+            final_test_lo=int(ledger_data.get("final_test_lo", 10_000_000)),
+            final_test_hi=int(ledger_data.get("final_test_hi", 20_000_000)),
+            final_test_touched=bool(ledger_data.get("final_test_touched", False)),
+            next_cursor_base=int(ledger_data.get("next_cursor_base", 0)),
+        )
+        router_k = int(router_data["K"])
+        if router_k != m.router.K:
+            raise ValueError("router expert count mismatch")
+        weights = np.asarray(router_data["weights"], dtype=np.float64)
+        cum_loss = np.asarray(router_data["cum_loss"], dtype=np.float64)
+        if weights.shape != m.router.weights.shape or cum_loss.shape != m.router.cum_loss.shape:
+            raise ValueError("router state shape mismatch")
+        if not np.all(np.isfinite(weights)) or not np.all(np.isfinite(cum_loss)):
+            raise ValueError("non-finite router state")
+        m.router.eta = float(router_data["eta"])
+        m.router.restore((weights, cum_loss))
+        ram = np.asarray(ram_data, dtype=np.float64)
+        if ram.shape != m.ram.mem.shape or not np.all(np.isfinite(ram)):
+            raise ValueError("RAM state shape/non-finite mismatch")
+        m.ram.restore(ram)
+        gpm_snapshot = {
+            "W": np.asarray(core_data["W"], dtype=np.float64),
+            "U_basis": np.asarray(core_data["U_basis"], dtype=np.float64),
+            "ef_v": np.asarray(core_data["ef_v"], dtype=np.float64),
+        }
+        expected_gpm = m.core.gpm.snapshot_optimizer()
+        for key in ("W", "ef_v"):
+            if gpm_snapshot[key].shape != expected_gpm[key].shape:
+                raise ValueError(f"core GPM state shape mismatch: {key}")
+            if not np.all(np.isfinite(gpm_snapshot[key])):
+                raise ValueError(f"non-finite core GPM state: {key}")
+        # U_basis is dynamic-width (consolidation appends directions).
+        u_basis = gpm_snapshot["U_basis"]
+        if (u_basis.ndim != 2 or u_basis.shape[0] != expected_gpm["U_basis"].shape[0]
+                or u_basis.shape[1] > u_basis.shape[0]):
+            raise ValueError("core GPM U_basis shape mismatch")
+        if not np.all(np.isfinite(u_basis)):
+            raise ValueError("non-finite core GPM state: U_basis")
+        if u_basis.shape[1]:
+            gram = u_basis.T @ u_basis
+            if not np.allclose(gram, np.eye(u_basis.shape[1]), atol=1e-7, rtol=0):
+                raise ValueError("core GPM U_basis is not orthonormal")
+        m.core.gpm.restore_optimizer(gpm_snapshot)
+        m.core.core_bytes = int(core_data.get("core_bytes", m.core.core_bytes))
+        m.compute_budget = float(gs["compute_budget"])
+        m.risk_rem = float(gs["risk_rem"])
+        m.unsolved_objective = float(gs["unsolved_objective"])
+        m.evals = int(gs.get("evals", 0))
+        m.candidates_generated = int(gs.get("candidates_generated", 0))
+        m.governance_state_complete = True
         return m
 
 
