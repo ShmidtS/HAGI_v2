@@ -18,6 +18,22 @@ from hagi.invention import ConstructBlueprint
 REIFIED_OP_COST_BITS = 12
 
 
+def _normalize_domain(domain: Any, arity: int):
+    """WAVE 179 (from local-refactor fork): certified support as a
+    frozenset of tuples, arity-checked."""
+    if domain is None:
+        return None
+    support = set()
+    for point in domain:
+        key = (tuple(int(v) for v in point)
+               if isinstance(point, (tuple, list)) else (int(point),))
+        if len(key) != arity:
+            raise ValueError(
+                f"domain point {point!r} has arity {len(key)}, expected {arity}")
+        support.add(key)
+    return frozenset(support)
+
+
 def reify_construct(bp: ConstructBlueprint, name: str,
                     fn: Callable[..., int],
                     arity: int = 1,
@@ -25,18 +41,25 @@ def reify_construct(bp: ConstructBlueprint, name: str,
     """Register `fn` under op-name `reified:<name>`; return the op name.
 
     fn(*vals) -> int must be a pure certified function (verified by the
-    transfer gate before this call). domain = certified support set
-    (optional; enforcement happens at artifact level, the op itself is
-    a pure arithmetic map).
+    transfer gate before this call). domain = certified support set:
+    WAVE 179 — enforced at runtime (calls outside certified support
+    raise, instead of silently returning a number outside the
+    certificate's validity).
     """
     op_name = f"reified:{name}"
     if op_name in REIFIED_OPS:
         raise ValueError(f"reified op already exists: {op_name}")
 
+    support = _normalize_domain(domain, arity)
+
     def _wrapped(*vals: int) -> int:
         if len(vals) != arity:
             raise ValueError(f"{op_name} expects {arity} args, got {len(vals)}")
-        return int(fn(*vals))
+        key = tuple(int(v) for v in vals)
+        if support is not None and key not in support:
+            raise ValueError(
+                f"{op_name} outside certified support: {key}")
+        return int(fn(*key))
 
     _wrapped.__name__ = op_name
     import inspect
