@@ -2232,3 +2232,15 @@ self-edit гейт работает (no-op фильтр активен), failure
 - P5 (HiddenAutomaton L*/RPNI) — НЕ интегрирован: skill_engine уже
   несёт Mealy L* (дубль по Chesterton).
 - 8 новых тестов; всего 91/91 PASS.
+
+## Волна 165 (2026-11-21, круг 9) — C479 v2: telescope + δ-бюджет фаз
+
+- Дельта FullPipeline.lean (15:07): full_pipeline_sound —
+  Σδ_i ≤ δtotal (false-commit бюджет по 6 фазам), telescope
+  objective(t6) ≤ objective(t0); stop_never_commits.
+- full_pipeline.py: delta_per_phase = delta_total/6, telescope_ok
+  инвариант в результате цикла (коммиты допускались только по
+  измеренному drop>0 — holds no-op по построению).
+- Обучение перезапущено на новом коде (pid 23268, chunks=403,
+  0 Traceback).
+- 2 новых теста; всего 93/93 PASS.

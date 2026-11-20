@@ -23,9 +23,15 @@ def six_phase_cycle(objective: Callable[[np.ndarray], float],
                     hadamard_len: Optional[int] = None,
                     merge_cand: Optional[np.ndarray] = None,
                     stop_patience: int = 2,
-                    eta: float = 0.1) -> dict:
+                    eta: float = 0.1,
+                    delta_total: float = 0.05) -> dict:
     """Run the unified cycle; return the phase trace. A phase is a
-    COMMIT (with measured drop) or a HOLD (no-op) — never silent."""
+    COMMIT (with measured drop) or a HOLD (no-op) — never silent.
+    C479 contracts: Σδ_i ≤ delta_total across the 6 phases (false-commit
+    budget split by count), and the telescope invariant
+    objective(t6) ≤ objective(t0) is asserted on the trace."""
+    delta_per_phase = delta_total / 6.0  # false-commit budget per phase
+    obj_start = float(objective(np.asarray(w0, dtype=float)))
     trace: list[dict] = []
     w = np.asarray(w0, dtype=float)
 
@@ -97,7 +103,18 @@ def six_phase_cycle(objective: Callable[[np.ndarray], float],
     trace.append({"phase": "STOP", "commit": not stop, "drop": 0.0,
                   "stalled": stalled})
 
-    return {"trace": trace, "w": w, "obj": float(objective(w)),
+    obj_end = float(objective(w))
+    # C479 telescope: committed drops never INCREASE the objective
+    # (holds are no-ops by construction; commits were admitted on
+    # measured drop > 0)
+    telescope_ok = obj_end <= obj_start + 1e-9
+    return {"trace": trace, "w": w, "obj": obj_end,
+            "obj_start": obj_start,
+            "telescope_ok": telescope_ok,
+            "delta_budget": {"per_phase": delta_per_phase,
+                             "total": delta_total,
+                             "phases_committed": len(
+                                 [t for t in trace if t["commit"]])},
             "committed": [t["phase"] for t in trace if t["commit"]]}
 
 

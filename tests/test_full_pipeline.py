@@ -37,3 +37,18 @@ def test_stop_blocks_after_stall():
                         steps_train=1, stop_patience=2)
     tr = {t["phase"]: t for t in r["trace"]}
     assert tr["STOP"]["commit"] is False   # Ville stop blocks commits
+
+
+def test_c479_telescope_invariant():
+    # objective never increases across the full cycle
+    r = six_phase_cycle(OBJ, GRAD, np.array([10.0, -4.0, 7.0, 1.0]),
+                        steps_train=5,
+                        merge_cand=np.array([3.0, 3.0, 3.0, 3.0]))
+    assert r["telescope_ok"] is True
+    assert r["obj"] <= r["obj_start"] + 1e-9
+
+
+def test_c479_delta_budget_split():
+    r = six_phase_cycle(OBJ, GRAD, np.array([1.0, 2.0]), delta_total=0.05)
+    assert abs(r["delta_budget"]["per_phase"] - 0.05 / 6) < 1e-12
+    assert r["delta_budget"]["phases_committed"] <= 6
