@@ -715,6 +715,37 @@ class CertifiedStepLM:
         return drop
 
     # ---- C474: EF21 in-step quantized training -----------------------
+    def _train_split(self, data: bytes, holdout: float,
+                     holdout_seed: int | None):
+        """Common train/holdout split + validation tensors.
+        Rotating holdout: fixed seed freezes the record forever and
+        blocks further learning on replay (stagnation fix)."""
+        import numpy as np
+        t = self.t
+        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+        n = len(idx) - self.k
+        rng = np.random.default_rng(7 if holdout_seed is None
+                                    else holdout_seed)
+        perm = rng.permutation(n)
+        n_hold = max(16, int(n * holdout))
+        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+        Xv = np.stack([idx[i:i + self.k] for i in hold])
+        yv = idx[hold + self.k]
+        ctx_va = t.as_tensor(Xv, dtype=t.long)
+        nxt_va = t.as_tensor(yv, dtype=t.long)
+
+        def vce():
+            with t.no_grad():
+                return float(t.nn.functional.cross_entropy(
+                    self.logits(ctx_va), nxt_va))
+
+        def make_batch(sel):
+            X = np.stack([idx[i:i + self.k] for i in sel])
+            y = idx[sel + self.k]
+            return (t.as_tensor(X, dtype=t.long),
+                    t.as_tensor(y, dtype=t.long))
+        return rng, train, vce, make_batch
+
     def _ef21_step(self, ctx, nxt, e_res: list, lr_scale: float = 1.0
                    ) -> tuple[float, bool]:
         """One EF21 in-step step (Theory/EF21InStep.lean, C474):
@@ -786,25 +817,9 @@ class CertifiedStepLM:
                    holdout_seed: int | None = None) -> dict:
         """EF21 in-step training loop (C474): quantized direction inside
         every certified step with error feedback; rejects logged."""
-        import numpy as np
         t = self.t
-        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
-        n = len(idx) - self.k
-        rng = np.random.default_rng(7 if holdout_seed is None
-                                    else holdout_seed)
-        perm = rng.permutation(n)
-        n_hold = max(16, int(n * holdout))
-        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
-        Xv = np.stack([idx[i:i + self.k] for i in hold])
-        yv = idx[hold + self.k]
-        ctx_va = t.as_tensor(Xv, dtype=t.long)
-        nxt_va = t.as_tensor(yv, dtype=t.long)
-
-        def vce():
-            with t.no_grad():
-                return float(t.nn.functional.cross_entropy(
-                    self.logits(ctx_va), nxt_va))
-
+        rng, train, vce, make_batch = self._train_split(data, holdout,
+                                                   holdout_seed)
         e_res = [t.zeros_like(prm) for prm in self.params()]
         self._ef21_s = None  # re-freeze per trajectory
         best = vce(); best_state = [q.detach().clone() for q in self.params()]
@@ -813,11 +828,7 @@ class CertifiedStepLM:
         for ep in range(epochs):
             order = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
-                sel = train[order[bs:bs + batch]]
-                X = np.stack([idx[i:i + self.k] for i in sel])
-                y = idx[sel + self.k]
-                ctx = t.as_tensor(X, dtype=t.long)
-                nxt = t.as_tensor(y, dtype=t.long)
+                ctx, nxt = make_batch(train[order[bs:bs + batch]])
                 drop, ok = self._ef21_step(ctx, nxt, e_res)
                 if ok:
                     admits += 1
@@ -847,35 +858,15 @@ class CertifiedStepLM:
                         holdout: float = 0.1, batch: int = 256,
                         log_every: int = 0,
                         holdout_seed: int | None = None) -> dict:
-        import numpy as np
         t = self.t
-        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
-        n = len(idx) - self.k
-        # rotating holdout: fixed seed freezes the record forever and
-        # blocks all further learning when replay repeats (stagnation
-        # fix); rotating the split keeps the certified-selection
-        # semantics (best on ITS holdout) while letting the model move.
-        rng = np.random.default_rng(7 if holdout_seed is None
-                                    else holdout_seed)
-        perm = rng.permutation(n)
-        n_hold = max(16, int(n * holdout))
-        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
-        Xv = np.stack([idx[i:i + self.k] for i in hold])
-        yv = idx[hold + self.k]
-        ctx_va = t.as_tensor(Xv, dtype=t.long); nxt_va = t.as_tensor(yv, dtype=t.long)
-        def vce():
-            with t.no_grad():
-                return float(t.nn.functional.cross_entropy(
-                    self.logits(ctx_va), nxt_va))
+        rng, train, vce, make_batch = self._train_split(data, holdout,
+                                                   holdout_seed)
         best = vce(); best_state = [q.detach().clone() for q in self.params()]
         certified_guarantee = 0.0
         for ep in range(epochs):
             order = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
-                sel = train[order[bs:bs + batch]]
-                X = np.stack([idx[i:i + self.k] for i in sel])
-                y = idx[sel + self.k]
-                ctx = t.as_tensor(X, dtype=t.long); nxt = t.as_tensor(y, dtype=t.long)
+                ctx, nxt = make_batch(train[order[bs:bs + batch]])
                 certified_guarantee += self._certified_step(ctx, nxt)
             ce_va = vce()
             if ce_va <= best:
