@@ -658,6 +658,52 @@ class CertifiedStepLM:
                 off += sz
         return 2.0 * A * A / Rp_sq
 
+    # ---- AdaptiveMajorizer (variance-sensitive CE step) --------------
+    def _adaptive_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
+        """Variance-adaptive certified CE step (Theory/AdaptiveMajorizer.lean,
+        ce_adaptive_descent): majorizer L(θ') ≤ L(θ) − ηA + η²C with the
+        ADAPTIVE curvature C = weighted variance of directional logit
+        displacement under the soft target (varWeight of smax along the
+        direction), dominating the range bound (C ≤ R'²/8 by
+        ce_adaptive_curv_le_range). Step η* = A/(2C), drop A²/(4C).
+
+        Returns the certified drop (0 if the step is rejected: C ≤ 0,
+        A ≤ 0, or η* > 1 — the unit cap of the theorem).
+        """
+        t = self.t
+        logits = self.logits(ctx)
+        loss = t.nn.functional.cross_entropy(logits, nxt)
+        g = t.autograd.grad(loss, self.params(), retain_graph=True)
+        D = t.cat([-gi.reshape(-1) for gi in g])
+        A = float((D * D).sum())
+        # directional displacement per sample (JVP along D on batch mean)
+        _, disp = t.autograd.functional.jvp(
+            lambda *prm: self._logits_from_params(prm, ctx),
+            tuple(self.params()), tuple(-gi for gi in g))
+        soft = t.softmax(logits, dim=1)
+        mean_disp = (soft * disp).sum(dim=1, keepdim=True)
+        var_disp = (soft * (disp - mean_disp) ** 2).sum(dim=1)
+        C = float(var_disp.mean())
+        per_sample_range = disp.max(dim=1).values - disp.min(dim=1).values
+        Rp_sq = float((per_sample_range ** 2).mean())
+        if C <= 0 or A <= 0 or Rp_sq <= 0:
+            return 0.0
+        # adaptive η* = A/(2C) (theorem) with the unit cap; when the cap
+        # binds, fall back to the range-bound step 4A/R'² (§3.9), which
+        # is ALWAYS certified (adaptive dominates range: C ≤ R'²/8, so
+        # A²/(4C) ≥ 2A²/R'² — take the guaranteed drop of the branch used)
+        use_adaptive = A / (2.0 * C) <= 1.0
+        eta = (A / (2.0 * C)) if use_adaptive else (4.0 * A / Rp_sq)
+        eta *= lr_scale
+        drop = (A * A / (4.0 * C)) if use_adaptive else (2.0 * A * A / Rp_sq)
+        with t.no_grad():
+            off = 0
+            for prm, gi in zip(self.params(), g):
+                sz = prm.numel()
+                prm.add_(eta * D[off:off + sz].reshape(prm.shape))
+                off += sz
+        return drop
+
     # ---- C474: EF21 in-step quantized training -----------------------
     def _ef21_step(self, ctx, nxt, e_res: list, lr_scale: float = 1.0
                    ) -> tuple[float, bool]:

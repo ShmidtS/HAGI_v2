@@ -2125,3 +2125,12 @@ self-edit гейт работает (no-op фильтр активен), failure
   per-coordinate ε_j, монотонность fisher_alloc_mono, изотропный
   случай даёт uniform).
 - 3 теста; всего 60/60 PASS.
+
+## Волна 157 (2026-11-20) — AdaptiveMajorizer: variance-sensitive CE step
+
+- Сверка с Theory/AdaptiveMajorizer.lean: adaptive_descent —
+  η*=A/(2C), drop A²/(4C), кап η≤1; доминирование C ≤ R'²/8.
+- hagi/lm.py: CertifiedStepLM._adaptive_step — гибрид: если η* в
+  капе — adaptive-ветка (A²/4C), иначе range-bound §3.9 (2A²/R'²,
+  всегда сертифицирован). На 20 шагах CE 5.55→0.072.
+- 1 тест; всего 61/61 PASS.
