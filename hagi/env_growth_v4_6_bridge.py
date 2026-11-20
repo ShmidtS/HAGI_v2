@@ -9,38 +9,8 @@ Encoding: bits 0-3 = state s, bits 4-5 = action a; outputs 0-3 = next
 state.
 """
 from __future__ import annotations
-from hagi import fusion_v4_0 as v40
 from hagi import env_growth_v4_6 as env
-
-
-def _compile_table(table: dict, n_bits: int = 4, n_act_bits: int = 2) -> dict:
-    n = n_bits + n_act_bits
-    n_states, n_actions = 1 << n_bits, 1 << n_act_bits
-    rows: list = [None] * (n_states * n_actions)
-    for s in range(n_states):
-        for a in range(n_actions):
-            ns = table[s][a]
-            rows[s | (a << n_bits)] = tuple(((ns >> i) & 1)
-                                            for i in range(n_bits))
-    anf = v40.mobius(rows, n)
-    net = v40.ProofCarryingANFLearner.compile_optimal(n, anf)
-
-    def ev(s, a):
-        wv = [(s >> i) & 1 for i in range(n_bits)] + \
-             [(a >> i) & 1 for i in range(n_act_bits)]
-        for g in net["gates"]:
-            x, y, m = wv[g["a"]], wv[g["b"]], g["mask"]
-            wv.append(0 if m == 0 else (1 if m == 15 else
-                     (x ^ y if m == 6 else x & y)))
-        return sum(wv[net["outs"][o]] << o for o in range(n_bits))
-
-    ok = all(ev(s, a) == table[s][a]
-             for s in range(n_states) for a in range(n_actions))
-    if not ok:
-        raise RuntimeError("bridge netlist behavioral mismatch")
-    return {"net": net, "table": table, "anf": anf,
-            "gates": len(net["gates"]), "depth": net["metrics"]["depth"],
-            "behavioral_exact": ok}
+from hagi.env_table_compiler import compile_transition_table
 
 
 def env_model_to_netlist(seed: int = 777, ood: bool = False) -> dict:
@@ -62,5 +32,5 @@ def env_model_to_netlist(seed: int = 777, ood: bool = False) -> dict:
         out["proven"] = False
         rule = env.infer_deep_ood_rule(table, res["clock_action"])
         out["inferred_ood_rule"] = rule
-    out.update(_compile_table(table))
+    out.update(compile_transition_table(table, n_bits=4, n_act_bits=2))
     return out

@@ -22,27 +22,10 @@ def env_model_to_netlist(model_id: int, clock_action: int | None = None,
     res = agent.run_task(w, random.Random(1))
     cand = env.candidate_records(res["clock_action"])[res["model_id"]]
     table = env.build_candidate_table(cand, res["clock_action"], bank)
-    n = 7  # 5 state bits + 2 action bits
-    rows: list = [None] * 128
-    for s in range(32):
-        for a in range(4):
-            rows[s | (a << 5)] = tuple(((table[s][a] >> i) & 1)
-                                       for i in range(5))
-    anf = v40.mobius(rows, n)
-    net = v40.ProofCarryingANFLearner.compile_optimal(n, anf)
-
-    def ev(s, a):
-        wv = [(s >> i) & 1 for i in range(5)] + [(a >> i) & 1
-                                                 for i in range(2)]
-        for g in net["gates"]:
-            x, y, m = wv[g["a"]], wv[g["b"]], g["mask"]
-            wv.append(0 if m == 0 else (1 if m == 15 else
-                     (x ^ y if m == 6 else x & y)))
-        return sum(wv[net["outs"][o]] << o for o in range(5))
-
-    ok = all(ev(s, a) == table[s][a] for s in range(32) for a in range(4))
-    if not ok:
-        raise RuntimeError("bridge netlist behavioral mismatch")
+    from hagi.env_table_compiler import compile_transition_table
+    compiled = compile_transition_table(table, n_bits=5, n_act_bits=2)
+    net = compiled["net"]
     return {"net": net, "table": table, "model_id": res["model_id"],
-            "learn_mode": res["mode"], "anf": anf,
-            "gates": len(net["gates"]), "depth": net["metrics"]["depth"]}
+            "learn_mode": res["mode"], "anf": compiled["anf"],
+            "gates": compiled["gates"], "depth": compiled["depth"],
+            "behavioral_exact": compiled["behavioral_exact"]}
