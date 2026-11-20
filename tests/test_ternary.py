@@ -52,3 +52,19 @@ def test_ternary_levels_ternary():
         s = W0s[name].abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
         lvls = torch.round(q / s)
         assert float(lvls.abs().max()) <= 1.0 + 1e-6  # tern() grid only
+
+
+def test_ternary_levels_stable_under_requantization():
+    # repeated quantization keeps the LEVEL grid {-1,0,+1} (s may move,
+    # but normalized levels stay ternary — gridQ_idem is for fixed-Δ)
+    lm = CertifiedStepLM(k=4, dim=16, hidden=32, seed=1)
+    W0 = lm.W1.detach().clone()
+    lm.ternary_()
+    q1 = lm.W1.detach().clone()
+    s1 = W0.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
+    lm.ternary_()
+    q2 = lm.W1.detach().clone()
+    s2 = q1.abs().mean(dim=1, keepdim=True).clamp_min(1e-12)
+    assert torch.allclose(torch.round(q1 / s1), torch.round(q2 / s2))
+    # energy does not grow: |q2| <= |q1| rowwise RMS (levels shrink-or-equal)
+    assert float(q2.abs().mean()) <= float(q1.abs().mean()) + 1e-6

@@ -89,6 +89,11 @@ class ByteLM:
         Self-stabilization invariant (ternary_scale_invariance): the
         map is invariant under W -> c·W — no spectral cap needed.
         eps-floor guards all-zero rows (degenerate row's escape).
+        Note: per-row scheme is NOT idempotent (a second call re-estimates
+        s from the already-quantized weights); gridQ_idem applies to the
+        fixed-Δ grid quantizer, not this scheme. The STE cached form
+        (one quantization per optimizer step) is the contract — call
+        once per step, cache s alongside if dequantization is needed.
         """
         t = self.t
         report = {}
