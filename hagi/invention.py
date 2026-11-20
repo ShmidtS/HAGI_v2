@@ -323,19 +323,55 @@ def matched_null_verdict(bp: ConstructBlueprint,
 
 def verify_blueprint(bp: ConstructBlueprint,
                      pairs: list[tuple[int, int]],
-                     full_domain: Optional[range] = None) -> dict:
-    """PROVEN_EXACT over full domain or HOLD_COUNTEREXAMPLE."""
-    # sampled first
-    if not all(bp.apply(x) == y for x, y in pairs):
-        for x, y in pairs:
-            if bp.apply(x) != y:
-                return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, y)}
-    if full_domain is not None:
-        for x in full_domain:
-            want = next((y for xx, y in pairs if xx == x), None)
-            if want is not None and bp.apply(x) != want:
-                return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, want)}
-    return {"status": "PROVEN_EXACT", "checked": len(pairs)}
+                     full_domain: Optional[Iterable[int]] = None,
+                     oracle: Optional[Callable[[int], Optional[int]]] = None) -> dict:
+    """Verify observed samples, or prove the complete finite domain.
+
+    Without full_domain this returns VERIFIED_SAMPLES, never PROVEN_EXACT.
+    A full-domain proof requires a label for EVERY point, supplied either
+    in pairs or by oracle. Missing and conflicting labels are explicit HOLDs.
+    """
+    known: dict[int, int] = {}
+    for raw_x, raw_y in pairs:
+        x, y = int(raw_x), int(raw_y)
+        if x in known and known[x] != y:
+            return {"status": "HOLD_LABEL_CONFLICT", "cex": (x, known[x], y),
+                    "checked": len(known)}
+        known[x] = y
+        if int(bp.apply(x)) != y:
+            return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, y),
+                    "checked": len(known)}
+
+    if full_domain is None:
+        return {"status": "VERIFIED_SAMPLES", "checked": len(known),
+                "scope": "observed_pairs"}
+
+    checked = 0
+    missing: list[int] = []
+    for raw_x in full_domain:
+        x = int(raw_x)
+        if x in known:
+            want = known[x]
+        elif oracle is not None:
+            want = oracle(x)
+            if want is None:
+                return {"status": "HOLD_UNLABELED", "checked": checked,
+                        "first_unlabeled": x}
+            want = int(want)
+            known[x] = want
+        else:
+            missing.append(x)
+            continue
+        if int(bp.apply(x)) != want:
+            return {"status": "HOLD_COUNTEREXAMPLE", "cex": (x, want),
+                    "checked": checked}
+        checked += 1
+
+    if missing:
+        return {"status": "HOLD_INCOMPLETE_DOMAIN", "checked": checked,
+                "missing_count": len(missing), "first_missing": missing[0]}
+    return {"status": "PROVEN_EXACT", "checked": checked,
+            "scope": "full_domain"}
 
 
 # --------------------------------------------------------------------------
@@ -346,8 +382,11 @@ def invent_blueprint(cluster_pairs: list[list[tuple[int, int]]],
                      rng: Optional[random.Random] = None,
                      max_attempts: int = 200,
                      ) -> Optional[dict]:
-    """Find ONE blueprint that fits ALL tasks of the cluster exactly,
-    beats matched-null (STRUCTURAL), and yields positive NetGain."""
+    """Find a structural candidate that fits all supplied cluster samples.
+
+    INVENTED describes a structural hypothesis, not a full-domain
+    certificate; exactness is added only by verify_blueprint(full_domain=...).
+    """
     rng = rng or random.Random(0)
     if not cluster_pairs:
         return None
@@ -400,9 +439,11 @@ def invent_blueprint(cluster_pairs: list[list[tuple[int, int]]],
                 "q_name": best_common["q_name"]}
     proofs = [verify_blueprint(bp, pairs)
               for bp, pairs in zip(best_common["blueprints"], cluster_pairs)]
-    if any(p["status"] != "PROVEN_EXACT" for p in proofs):
+    if any(p["status"] != "VERIFIED_SAMPLES" for p in proofs):
         return {"status": "HOLD_COUNTEREXAMPLE", "proofs": proofs}
     return {"status": "INVENTED", "q_name": best_common["q_name"],
             "q_param": best_common["q_param"],
             "blueprints": best_common["blueprints"],
-            "verdict": verdict, "attempts": attempts}
+            "verdict": verdict, "attempts": attempts,
+            "certified_exact": False,
+            "proof_scope": "observed_cluster_pairs"}
