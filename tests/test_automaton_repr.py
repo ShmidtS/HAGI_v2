@@ -50,9 +50,13 @@ def test_factorizer_recovers_hidden_coordinates_and_exact_output():
     for word in words_upto(oracle.alphabet, 4):
         code = encode_trace(word, oracle.alphabet)
         state = oracle.run_state(word)
+        sizes = learned["factor_ir"].sizes
+        # Orbit-coordinate order is inferred, not tied to oracle variable names.
+        expected0 = state[0] == 0 if sizes[0] == 3 else state[1] == 0
+        expected1 = state[1] == 0 if sizes[1] == 2 else state[0] == 0
         assert arts["observed_output"].eval((code,)) == oracle.membership(word)
-        assert arts["factor_0_initial"].eval((code,)) == int(state[0] == 0)
-        assert arts["factor_1_initial"].eval((code,)) == int(state[1] == 0)
+        assert arts["factor_0_initial"].eval((code,)) == int(expected0)
+        assert arts["factor_1_initial"].eval((code,)) == int(expected1)
         assert arts["all_initial"].eval((code,)) == oracle.membership(word)
 
 
