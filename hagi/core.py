@@ -2942,8 +2942,8 @@ def synthesize_batched_mdl_v9(
     val_x: Sequence[tuple[int, ...]],
     val_y: Sequence[int],
     library_experts: Sequence[tuple[int, str, "ExpertV9"]] = (),
-    max_evals: int = 8000,
-    max_bits: int = 92,
+    max_evals: int = 20000,  # WAVE 170: deeper search for the wider budget
+    max_bits: int = 128,   # WAVE 170 (user decision): MDL budget 92 -> 128
     deadline: Optional[float] = None,
 ) -> tuple[Optional[ExprV9], int]:
     """Vectorized Batched MDL + O(1) Meet-in-the-Middle + Call-DAG Synthesis."""
