@@ -40,3 +40,23 @@ def test_cegis_budget_is_honest():
     # budget too small for mod-5 -> honest HOLD, never silent guess
     assert r.status == "HOLD_CEGIS_BUDGET"
     assert r.queries <= 20
+
+
+
+def test_cegis_final_audit_labels_points_missing_from_probe_pool():
+    dom = range(128)
+    labels = {x: mk_cnt_mod(5)(x) for x in dom}
+    asked = []
+
+    def oracle(x):
+        asked.append(x)
+        return labels[x]
+
+    # The search pool deliberately covers only half of the full domain.
+    r = cegis_invent([3, 17, 44, 90, 101, 112, 120],
+                     oracle, list(range(0, 128, 2)), dom,
+                     query_budget=128, rng=random.Random(7))
+    assert r.status == "PROVEN_EXACT", r
+    assert r.final_sweep["checked"] == len(dom)
+    assert r.queries == len(asked)
+    assert set(asked) == set(dom)
