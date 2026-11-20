@@ -1,0 +1,32 @@
+name: HAGI factorized automata and CEGIS safety
+
+on:
+  pull_request:
+    paths:
+      - "hagi/**"
+      - "tests/**"
+      - ".github/workflows/automaton-integration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  representation-and-proof-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal test runtime
+        run: |
+          python -m pip install --disable-pip-version-check numpy pytest
+          python -m pip install --no-deps -e .
+      - name: Compile changed modules
+        run: |
+          python -m py_compile hagi/automaton_repr.py hagi/representations.py hagi/invention.py hagi/cegis.py hagi/core.py
+      - name: Run focused proof and integration tests
+        run: |
+          pytest -q tests/test_cegis.py tests/test_invention.py tests/test_reifier.py tests/test_representations.py tests/test_persistence_construct.py tests/test_automaton_repr.py
