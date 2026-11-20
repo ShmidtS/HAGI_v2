@@ -2543,6 +2543,37 @@ class AuditLedgerV9:
         st = self.streams[task]
         st.cursor = min(st.hi, st.cursor + max(0, int(count)))
 
+    def draw_disjoint_splits(
+        self,
+        task: str,
+        domain: list,
+        seed: int = 0,
+        train_frac: float = 0.35,
+        cegis_frac: float = 0.43,
+    ) -> tuple[list, list, list]:
+        """Split a domain into disjoint train / cegis / val streams from
+        ONE allocated audit stream (no overlap by construction; cursor
+        consumes the whole stream). Small domains degrade honestly:
+        tiny -> almost everything to train (no cegis budget)."""
+        n = len(domain)
+        st = self.allocate_stream(task, n)
+        rng = np.random.default_rng(seed + (sum(map(ord, task)) % 10000))
+        perm = rng.permutation(n)
+        if n <= 8:
+            n_tr, n_ceg = max(1, n - 1), 0
+        elif n <= 16:
+            n_tr, n_ceg = max(2, n - 3), 1
+        else:
+            n_tr = max(6, int(round(n * train_frac)))
+            n_ceg = max(4, int(round(n * cegis_frac)))
+            if n_tr + n_ceg >= n:
+                n_ceg = max(1, (n - n_tr) // 2)
+        tr = [domain[int(i)] for i in perm[:n_tr]]
+        ceg = [domain[int(i)] for i in perm[n_tr:n_tr + n_ceg]]
+        val = [domain[int(i)] for i in perm[n_tr + n_ceg:]]
+        st.cursor = min(st.hi, st.lo + len(tr) + len(ceg) + len(val))
+        return tr, ceg, val
+
     @staticmethod
     def hoeffding_radius(alpha: float, n: int) -> float:
         if n <= 0 or alpha <= 0.0:

@@ -2212,3 +2212,23 @@ self-edit гейт работает (no-op фильтр активен), failure
   TRAIN→EF21→HADAMARD-TERN→GROW→MERGE→STOP как одна траектория
   commit/hold (reject-hold семантика, Ville-stop блокирует коммиты).
 - 12 новых тестов; всего 85/85 PASS.
+
+## Волна 164 (2026-11-21) — интеграция 4 проводов из внешнего анализа
+
+- P1 REIFIED-ЛИСТЬЯ BatchedMDL: synthesize_batched_mdl_v8(+reified_ops)
+  — изобретённые опы как листья V8-синтеза (REIFIED_V8 реестр,
+  ExprV8 op='reified' leaf-eval по raw inputs); 2*popcount(x)
+  синтезируется за 235 evals. Замыкание Invention→Reification в ЯЗЫКЕ.
+- P2 draw_disjoint_splits: AuditLedgerV9 — train/cegis/val из ОДНОГО
+  потока, disjoint by construction, малые домены деградируют честно
+  (всё в train), детерминизм по (task, seed).
+- P3 WhileLoopIR: hagi/while_loop.py — Bellman-детектор (y(x)−y(step)=1
+  / орбит-инвариантность), аналитический stop из границы нулей,
+  emit_python с сертифицированным доменом; halve-steps и drop_lsb
+  решаются; шум не сертифицируется на held-out.
+- P4 NeuralProposalPrior: hagi/prior.py — 10-фич вектор из
+  ResidualProfile, softmax-роутер по семействам, hints_from_profile
+  мост в _ranked_quotients; обучение на wins (top-1 hint).
+- P5 (HiddenAutomaton L*/RPNI) — НЕ интегрирован: skill_engine уже
+  несёт Mealy L* (дубль по Chesterton).
+- 8 новых тестов; всего 91/91 PASS.

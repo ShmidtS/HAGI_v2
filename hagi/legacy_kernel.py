@@ -4254,6 +4254,13 @@ class ExprV8:
             if value < 0:
                 raise ValueError("isqrt is undefined for negative integers")
             return math.isqrt(value)
+        if self.op == "reified":
+            rfn = REIFIED_V8.get(str(self.value))
+            if rfn is None:
+                raise ValueError(f"reified op not registered: {self.op}")
+            # leaf macro over the RAW inputs (args empty at leaf level;
+            # composition happens by wrapping in arithmetic ops)
+            return int(rfn(*[int(v) for v in xs]))
         fn = h5.OPS.get(self.op)
         if fn is None:
             raise ValueError(f"unsupported op: {self.op}")
@@ -5538,6 +5545,22 @@ def _fit_poly_or_const(pts: list[tuple[int, int]]) -> Optional[ExprV8]:
     return None
 
 
+# V10 Reification wire: invented ops promoted into V8 batched synthesis
+# live here (registered per synthesis call; core mirrors from REIFIED_OPS).
+REIFIED_V8: dict = {}
+
+
+def _leaf_iter(leaf_exprs, reified_leaf_fns):
+    """Yield (leaf, reified_fn_or_None) aligned with leaf_exprs."""
+    ri = 0
+    for lf in leaf_exprs:
+        if lf.op == "reified":
+            yield lf, reified_leaf_fns[ri]
+            ri += 1
+        else:
+            yield lf, None
+
+
 def synthesize_batched_mdl_v8(
     arity: int,
     train_x: Sequence[tuple[int, ...]],
@@ -5548,7 +5571,11 @@ def synthesize_batched_mdl_v8(
     max_evals: int = 4000,
     max_bits: int = 84,
     deadline: Optional[float] = None,
+    reified_ops: Optional[dict] = None,
 ) -> tuple[Optional[ExprV8], int]:
+    """reified_ops: optional {name: (fn_1d, cost_bits)} — invented ops
+    exposed as extra LEAVES of the batched synthesis (Reification wire:
+    yesterday's invention composes inside tomorrow's programs)."""
     """Batched NumPy int64 synthesis with dedup and Call-DAG library references."""
     try:
         X = np.asarray(train_x, dtype=np.int64)
@@ -5573,17 +5600,29 @@ def synthesize_batched_mdl_v8(
     leaf_exprs = [ExprV8.var(i) for i in range(arity)] + [
         ExprV8.const(c) for c in hagi_v7.CONSTS
     ]
+    # reified leaves: invented ops as unary macros (vectorized over rows)
+    reified_leaf_fns = []
+    if reified_ops:
+        for rname, (rfn, rcost) in reified_ops.items():
+            full = f"reified:{rname}"
+            REIFIED_V8[full] = rfn
+            leaf_exprs.append(ExprV8("reified", (), full))
+            reified_leaf_fns.append(rfn)
     L_arr = np.stack(
-        [
-            (
-                np.ascontiguousarray(X[:, int(lf.value or 0)])
-                if lf.op == "var"
-                else np.full(N, int(lf.value), dtype=np.int64)
-            )
-            for lf in leaf_exprs
+        [np.ascontiguousarray(X[:, int(lf.value or 0)])
+         if lf.op == "var"
+         else (np.array([int(rfn(*[int(v) for v in r])) for r in X],
+                    dtype=np.int64)
+               if lf.op == "reified"
+               else np.full(N, int(lf.value), dtype=np.int64))
+         for lf, rfn in _leaf_iter(leaf_exprs, reified_leaf_fns)
         ]
     )
-    L_bits = [lf.bits() for lf in leaf_exprs]
+    L_bits = [
+        (reified_ops[lf.value.split(":", 1)[1]][1]
+         if lf.op == "reified" else lf.bits())
+        for lf in leaf_exprs
+    ]
 
     for i, lf in enumerate(leaf_exprs):
         if np.array_equal(L_arr[i], Y):
