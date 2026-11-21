@@ -1,7 +1,7 @@
 """V10-1: Active CEGIS invariant tests."""
 import random
 import sys, os
-from hagi.cegis import cegis_invent
+from hagi.invention import cegis_invent
 from hagi.rdl import mk_cnt_mod
 
 

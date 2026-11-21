@@ -28,7 +28,8 @@ import numpy as np
 
 from hagi.diagnosis import (GapBuffer, GapRecord, HoldReason,
                             build_residual_profile, classify_hold)
-from hagi.invention import invent_blueprint, verify_blueprint
+from hagi.invention import (cegis_invent, invent_blueprint,
+                            verify_blueprint)
 from hagi.reifier import reify_construct
 
 
@@ -73,7 +74,6 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
         # WAVE 187: second path — Active CEGIS (query-driven proof).
         # The oracle is the relation itself (xs->ys map); budget
         # honest: it probes only the domain we already possess.
-        from hagi.cegis import cegis_invent
         oracle_map = dict(pairs)
         oracle = lambda x: oracle_map.get(x)
         try:

@@ -1,6 +1,6 @@
 """C479: unified six-phase cycle — glue semantics (commit/hold honesty)."""
 import numpy as np
-from hagi.full_pipeline import six_phase_cycle
+from hagi.trunk_ops import six_phase_cycle
 
 OBJ = lambda w: float(0.5 * np.sum((w - 3.0) ** 2))
 GRAD = lambda w: (w - 3.0)

@@ -1,6 +1,6 @@
 """C477: Hadamard incoherence gate (Theory/HadamardIncoherence.lean)."""
 import numpy as np
-from hagi.hadamard import sylvester, coh_sq, rotate_gate, quantize_rows_with_gate
+from hagi.trunk_ops import sylvester, coh_sq, rotate_gate, quantize_rows_with_gate
 
 
 def test_sylvester_parseval():

@@ -1,9 +1,9 @@
 """Integration wires: disjoint splits, WhileLoopIR, neural prior."""
 import numpy as np
 from hagi.core import AuditLedger
-from hagi.while_loop import (discover_while_loop_candidates,
+from hagi.invention import (discover_while_loop_candidates,
                              synthesize_while_loop)
-from hagi.prior import NeuralProposalPrior, profile_features, FAMILIES
+from hagi.invention import NeuralProposalPrior, profile_features, FAMILIES
 from hagi.diagnosis import ResidualProfile
 
 

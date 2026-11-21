@@ -564,3 +564,258 @@ def register_derived_masks(pairs: list[tuple[int, int]]) -> int:
             QUOTIENTS.append(cand)
             added += 1
     return added
+
+
+# ============================================================
+# ACTIVE CEGIS (counterexample-guided synthesis)
+# ============================================================
+
+import random
+from dataclasses import dataclass, field
+from typing import Callable
+from hagi.invention import ConstructBlueprint, synthesize_blueprint
+@dataclass
+class CounterexampleMemory:
+    """Known hard points; every new candidate is checked here first."""
+    points: dict[int, int] = field(default_factory=dict)
+
+    def add(self, x: int, y: int) -> None:
+        self.points[x] = y
+
+    def violations(self, bp: ConstructBlueprint) -> list[tuple[int, int]]:
+        return [(x, y) for x, y in self.points.items() if bp.apply(x) != y]
+@dataclass
+class CegisResult:
+    status: str
+    blueprint: ConstructBlueprint | None
+    rounds: int
+    queries: int
+    train_size: int
+    final_sweep: dict | None = None
+    cert_queries: int = 0
+def cegis_invent(train_x: list[int], query: Callable[[int], int | None], cegis_pool: list[int], full_domain: range, max_rounds: int=6, init_frac: float=0.25, query_budget: int | None=None, rng: random.Random | None=None) -> CegisResult:
+    """Active CEGIS: synthesize on train, refine on counterexamples from
+    cegis_pool, certify on full_domain at the end.
+
+    - init train = first init_frac of train_x (small induction seed)
+    - each round: candidate fails on cegis_pool or memory -> add the
+      counterexample labels to train and re-synthesize
+    - queries counts ONLY points whose labels the loop actually asked
+      for (never full_domain during search).
+    """
+    rng = rng or random.Random(0)
+    if not train_x:
+        return CegisResult('HOLD_NO_CANDIDATE', None, 0, 0, 0)
+    k0 = max(2, int(len(train_x) * init_frac))
+    train = dict(((x, query(x)) for x in train_x[:k0]))
+    queries = len(train)
+    mem = CounterexampleMemory()
+    pool = list(cegis_pool)
+    rng.shuffle(pool)
+    best: ConstructBlueprint | None = None
+    for round_i in range(1, max_rounds + 1):
+        pairs = sorted(train.items())
+        bp = synthesize_blueprint(pairs, rng=rng)
+        if bp is None:
+            if not pool and (not mem.points):
+                return CegisResult('HOLD_NO_CANDIDATE', None, round_i, queries, len(train))
+            best = None
+        else:
+            bad = mem.violations(bp)
+            if bad:
+                for x, y in bad:
+                    train[x] = y
+                best = bp
+                continue
+            ce = None
+            while pool:
+                if query_budget is not None and queries >= query_budget:
+                    break
+                x = pool.pop()
+                y = query(x)
+                queries += 1
+                if y is None:
+                    continue
+                mem.add(x, y)
+                if bp.apply(x) != y:
+                    ce = (x, y)
+                    break
+            if ce is None:
+                if query_budget is not None and queries >= query_budget:
+                    return CegisResult('HOLD_CEGIS_BUDGET', bp, round_i, queries, len(train))
+                cert_queries = 0
+                for x in full_domain:
+                    if x not in train:
+                        y = query(x)
+                        cert_queries += 1
+                        queries += 1
+                        if y is not None:
+                            train[x] = y
+                sweep = verify_blueprint(bp, sorted(train.items()), full_domain)
+                if sweep['status'] == 'HOLD_COUNTEREXAMPLE' and round_i < max_rounds:
+                    cex = sweep['cex']
+                    train.setdefault(cex[0], cex[1])
+                    mem.add(cex[0], cex[1])
+                    best = bp
+                    continue
+                return CegisResult(sweep['status'], bp, round_i, queries, len(train), final_sweep=sweep, cert_queries=cert_queries)
+            train[ce[0]] = ce[1]
+            best = bp
+    return CegisResult('HOLD_CEGIS_EXHAUSTED', best, max_rounds, queries, len(train))
+from hagi.invention import verify_blueprint
+
+# ============================================================
+# NEURAL PROPOSAL PRIOR
+# ============================================================
+
+import numpy as np
+from hagi.diagnosis import ResidualProfile
+FAMILIES = ('mod', 'xor', 'reflect', 'mask', 'shift')
+def profile_features(p: ResidualProfile) -> np.ndarray:
+    """10-dim structural feature vector from a ResidualProfile."""
+    return np.array([1.0, p.autocorr_shift, p.autocorr_xor, p.autocorr_reflect, float(p.mn_classes is not None), p.sparsity_gaps_entropy, p.n_runs / max(1.0, p.n), p.k_density, p.uniq_outputs / max(1.0, p.n), p.residual_frac_builtin], dtype=np.float64)
+class NeuralProposalPrior:
+
+    def __init__(self, lr: float=0.8):
+        self.lr = lr
+        self.W = np.zeros((len(FAMILIES), 10), dtype=np.float64)
+
+    def predict_probs(self, feat: np.ndarray) -> dict[str, float]:
+        logits = self.W @ feat
+        logits -= logits.max()
+        exps = np.exp(logits)
+        probs = exps / exps.sum()
+        return {f: float(p) for f, p in zip(FAMILIES, probs)}
+
+    def update(self, feat: np.ndarray, winner: str, epochs: int=12) -> None:
+        if winner not in FAMILIES:
+            return
+        tgt = FAMILIES.index(winner)
+        for _ in range(epochs):
+            logits = self.W @ feat
+            logits -= logits.max()
+            probs = np.exp(logits)
+            probs /= probs.sum()
+            grad = probs.copy()
+            grad[tgt] -= 1.0
+            self.W -= self.lr * np.outer(grad, feat)
+
+    def hints_from_profile(self, p: ResidualProfile) -> dict:
+        """Bridge to invention._ranked_quotients: top-1 family becomes
+        the hint flag (order wire, never the certified choice)."""
+        probs = self.predict_probs(profile_features(p))
+        best = max(probs, key=probs.get)
+        flag = {fam: False for fam in FAMILIES}
+        flag[best] = True
+        return flag
+DEFAULT_PRIOR = NeuralProposalPrior()
+
+# ============================================================
+# WHILE-LOOP DISCOVERY (Bellman/orbit)
+# ============================================================
+
+from dataclasses import dataclass
+from typing import Callable, Sequence
+def _digit_sum10(x: int) -> int:
+    x = abs(int(x))
+    s = 0
+    while x > 0:
+        s += x % 10
+        x //= 10
+    return s
+STEP_PRIMITIVES: dict[str, tuple[Callable[[int], int], str, int]] = {'popcount': (lambda s: int(s).bit_count(), 'int(s).bit_count()', 8), 'digit_sum10': (_digit_sum10, 'sum(int(c) for c in str(abs(int(s))))', 12), 'halve': (lambda s: int(s) // 2, 's // 2', 8), 'drop_lsb': (lambda s: int(s) & int(s) - 1, 's & (s - 1)', 12), 'even_halve_odd_inc1': (lambda s: s // 2 if s % 2 == 0 else s + 1, '(s // 2) if (s & 1) == 0 else (s + 1)', 16), 'even_halve_odd_3x1': (lambda s: s // 2 if s % 2 == 0 else 3 * s + 1, '(s // 2) if (s & 1) == 0 else (3 * s + 1)', 20)}
+@dataclass(frozen=True)
+class WhileLoopBlueprint:
+    step_name: str
+    mode: str
+
+    @property
+    def meta_bits(self) -> int:
+        return 2 * 8 + STEP_PRIMITIVES[self.step_name][2]
+@dataclass
+class WhileLoopArtifact:
+    step_name: str
+    stop_le: int
+    mode: str
+    domain: frozenset
+    bits_val: int
+    max_iters: int = 256
+
+    def supports(self, x: int) -> bool:
+        return int(x) in self.domain
+
+    def eval(self, x: int) -> int:
+        x = int(x)
+        if x not in self.domain:
+            raise ValueError('outside certified domain')
+        s = x
+        fn = STEP_PRIMITIVES[self.step_name][0]
+        steps = 0
+        while s > self.stop_le:
+            s = fn(s)
+            steps += 1
+            if steps > self.max_iters:
+                raise ValueError('loop exceeded certified iteration cap')
+        return steps if self.mode == 'steps' else s
+
+    def emit_python(self, fn_name: str) -> str:
+        py = STEP_PRIMITIVES[self.step_name][1]
+        ret = 'steps' if self.mode == 'steps' else 's'
+        return '\n'.join([f'def {fn_name}(x0: int) -> int:', f'    _DOM = {sorted(self.domain)!r}', "    if int(x0) not in _DOM: raise ValueError('outside domain')", '    s = int(x0)', '    steps = 0', f'    while s > {self.stop_le}:', f'        s = {py}', '        steps += 1', f'    return {ret}'])
+def discover_while_loop_candidates(xs: Sequence[int], ys: Sequence[int]) -> list[tuple[float, WhileLoopBlueprint]]:
+    """Bellman / orbit-invariance detector: walk ONE step from each
+    observed x; a family qualifies only if the relation holds for ALL
+    observed transition pairs (analytical, no threshold search)."""
+    obs = {int(x): int(y) for x, y in zip(xs, ys)}
+    if any((v < 0 for v in obs)):
+        return []
+    scored = []
+    for name, (sfn, _, _) in STEP_PRIMITIVES.items():
+        bell_ok = bell_tot = fp_ok = fp_tot = 0
+        for x, y in obs.items():
+            nxt = sfn(x)
+            if nxt == x or nxt not in obs:
+                continue
+            if y > 0:
+                bell_tot += 1
+                if y - obs[nxt] == 1:
+                    bell_ok += 1
+            if x != nxt:
+                fp_tot += 1
+                if y == obs[nxt]:
+                    fp_ok += 1
+        if bell_tot >= 4 and bell_ok == bell_tot and (len(set(ys)) >= 3):
+            scored.append((1.0 + 0.01 * bell_tot, WhileLoopBlueprint(name, 'steps')))
+        if fp_tot >= 4 and fp_ok == fp_tot and (len(set(ys)) >= 3):
+            if any((x == y for x, y in obs.items())):
+                scored.append((1.0 + 0.01 * fp_tot, WhileLoopBlueprint(name, 'final')))
+    scored.sort(key=lambda t: (-t[0], t[1].meta_bits))
+    return scored
+def synthesize_while_loop(bp: WhileLoopBlueprint, pairs: list[tuple[int, int]], domain: Sequence[int]) -> WhileLoopArtifact | None:
+    """Infer stop_le analytically from the boundary between zeros/fixed
+    points and the rest; then verify exactly on all pairs."""
+    obs = {int(x): int(y) for x, y in pairs}
+    if not obs or any((v < 0 for v in obs)):
+        return None
+    if bp.mode == 'steps':
+        anchors = [x for x, y in obs.items() if y == 0]
+        others = [x for x, y in obs.items() if y > 0]
+    else:
+        anchors = [x for x, y in obs.items() if x == y]
+        others = [x for x, y in obs.items() if x != y]
+    if not anchors or not others:
+        cands = [0, 1]
+    else:
+        lo, hi = (max(anchors), min(others) - 1)
+        if lo > hi:
+            return None
+        cands = list(range(lo, min(hi + 1, lo + 16)))
+    for stop_le in cands:
+        bits = bp.meta_bits + 2 * (max(1, stop_le + 1).bit_length() - 1) + 1
+        art = WhileLoopArtifact(bp.step_name, stop_le, bp.mode, frozenset((int(v) for v in domain)), bits)
+        try:
+            if all((art.eval(x) == y for x, y in pairs)):
+                return art
+        except (ValueError, RecursionError):
+            continue
+    return None

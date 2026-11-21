@@ -1,6 +1,6 @@
 """NonlinearMerge: certified checkpoint-merge bound."""
 import numpy as np
-from hagi.merge import merge_bound, diag_quadratic_merge
+from hagi.trunk_ops import merge_bound, diag_quadratic_merge
 
 
 def test_merge_bound_holds_on_quadratic():
