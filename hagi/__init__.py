@@ -1,25 +1,40 @@
-"""HAGI — hierarchical growing model.
+"""HAGI — self-developing neuro-symbolic processor.
 
-Consolidated layout (2026-11-17 refactor):
-  hagi.core      — canonical kernel
-  hagi.legacy_kernel — frozen V5-V8 body (star-imported by core)
-  hagi.genesis   — Architecture Genesis: loop-config evolution (part 1)
-                   and EC-processor genome evolution (part 2)
-  hagi.logic     — logic basis: Venn head + ANF/Zhegalkin
-  hagi.lm        — byte-LM neural body (ByteLM, CertifiedStepLM, ...)
-  hagi.lessons   — Nadya's school (cumulative curriculum, from-scratch)
-  hagi.school    — lessons + curriculum + mind
-  hagi.loop      — certified self-development loop
-  hagi.selfedit  — certified knob self-editing
-  hagi.rewrite   — forever driver (+ watchdog in watchdog.pyw)
-  hagi.mdl       — MDL-prune of the expert library
-  hagi.selfmodel / hagi.experiment / hagi.controller — self-model,
-                   experiments, v10 controller
-  hagi.ingest    — learn from arbitrary data files
-  hagi.execute   — run the programs the model wrote
-  
-`from hagi import *` exposes the core namespace (same as before the
-refactor).
+Layout (WAVE 195 refactor: 55 -> 32 files, merged by meaning):
+  Entry points
+    hagi.cli        — unified CLI: python -m hagi.cli <cmd>
+    hagi.pipeline   — THE pipeline: ingest -> LM -> diagnose ->
+                      invent -> gate -> reify (HAGI_SYMBOLIC=1)
+  Kernel & body
+    hagi.core       — canonical kernel (legacy body star-imported)
+    hagi.legacy_kernel — frozen legacy body
+    hagi.lm         — byte-LM (CertifiedStepLM, RopeAttentionByteLM)
+    hagi.unified    — ONE model: ingest + ledger
+    hagi.gpu        — CUDA/ROCm backend
+  Construct discovery
+    hagi.invention  — blueprints + CEGIS + prior + while-loops + RDL
+    hagi.representations — representation registry + reifier
+    hagi.fabric     — Venn-cloth genome evolution
+    hagi.skill_engine / anf_frontend — proof-carrying ANF synthesis
+  Measurement
+    hagi.measurement — transfer meter, capability, budget, oracle, QBC
+    hagi.diagnosis  — residual profiles, hold classification
+  Trunk ops
+    hagi.trunk_ops  — six-phase cycle, merge, Hadamard, growth
+  Theory bridges
+    hagi.sandwich   — certified softmax argmax (C489-C502)
+  Environments
+    hagi.env_lut / env_temporal — worlds + bridges + verifiers
+  Self development
+    hagi.selfmodel  — self-model + controller + experiment + selfedit
+    hagi.loop / rewrite — growth loops
+    hagi.genesis    — architecture genesis + EC library
+    hagi.school     — lessons, curriculum, mind
+  Misc
+    hagi.certificates — portable certificate suite
+    hagi.cli        — see Entry points
+
+`from hagi import *` exposes the core namespace.
 """
 from .core import *  # noqa: F401,F403
 from . import genesis, logic  # noqa: F401

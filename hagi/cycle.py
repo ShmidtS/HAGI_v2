@@ -140,15 +140,8 @@ def fusion_fastpath(task: dict) -> dict | None:
     (honest: the task IS the spec, so max degree is computed from truth
     by exact Mobius). Falls back to GA when n exceeds the full-support
     cap or the fit HOLDs."""
-    try:
-        from hagi.skill_engine import (ProofCarryingANFLearner,
-                                      ExactMDLLibrary)
-    except ImportError:
-        try:
-            from hagi.anf_frontend import (ProofCarryingANFLearner,
-                                         ExactMDLLibrary)
-        except ImportError:
-            return None
+    from hagi.skill_engine import (ProofCarryingANFLearner,
+                                   ExactMDLLibrary)
     n = task["n_inputs"]
     if n < 1 or n > 14:
         return None

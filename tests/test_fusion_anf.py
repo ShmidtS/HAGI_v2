@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from hagi.anf_frontend import DegreeContract,ProofCarryingANFLearner,ExactMDLLibrary
+from hagi.skill_engine import DegreeContract,ProofCarryingANFLearner,ExactMDLLibrary
 import random
 
 def make_task(n,d,seed,density=.25):
