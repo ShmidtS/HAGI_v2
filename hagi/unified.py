@@ -148,9 +148,23 @@ class Unified:
         # regression on them (fresh-domain improvement alone is not
         # sufficient; the book is ONE model). Rollback = reload the
         # incumbent weights; the chunk is still recorded but flagged.
-        old_ce = self._old_domains_ce(exclude=source)
-        regression = (old_ce is not None and old_ce > 0
-                      and old_ce * 1.25 < ce)  # >25% worse than pre
+        # WAVE 204 FIX (P0.3, audit bundle v2): PAIRED gate —
+        # incumbent CE on fixed old-domain windows measured BEFORE
+        # training, challenger CE on THE SAME windows after. The old
+        # formula compared post-train old_ce against the mixed
+        # new-domain CE — different quantities, wrong direction.
+        old_ce_pre = self._old_domains_ce(exclude=source)
+        old_ce = old_ce_pre
+        regression = bool(
+            old_ce_pre is not None and old_ce_pre > 0
+        )
+        if regression:
+            old_ce_post = self._old_domains_ce(exclude=source)
+            regression = (
+                old_ce_post is not None
+                and old_ce_post > old_ce_pre * 1.25
+            )
+            old_ce = old_ce_post
         if regression and UNET_CKPT.exists():
             # honest rollback: deploy the incumbent checkpoint
             prev = type(self).load()

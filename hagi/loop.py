@@ -535,7 +535,11 @@ def run_self_development(max_rounds: int = 4,
         opt_names = set(opt.experts.keys())
         experts_ok = opt_names >= base_names
         check = opt.verify_all(suite)
-        floors_ok = check["accuracy"] == 1.0 and check["committed"] >= len(suite)
+        # WAVE 204 (P0.2): gate on real suite coverage, not expert count.
+        floors_ok = (
+            check["accuracy"] == 1.0
+            and check.get("suite_complete", False)
+        )
         improved = opt_wasted <= int(incumbent_wasted * (1.0 - MIN_RELIEF))
         # certified-convergence margin: micro-improvements below MIN_RELIEF
         # per round are not certified growth — stop instead of accumulating

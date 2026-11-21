@@ -4115,9 +4115,15 @@ class GrowingHagiProcessor:
         for ev in self.growth_log:
             if ev.get("action") == "REUSE" and "verified-expert-coverage:" in ev.get("reason", ""):
                 coverage[ev["task"]] = ev["reason"].split(":", 1)[1]
+        # WAVE 204 FIX (P0.2, audit bundle v2): an uncovered task must
+        # COUNT against accuracy, not be skipped — the old `continue`
+        # let a suite {A,B} with experts {A,UNRELATED} report accuracy
+        # 1.0. Covered = committed expert OR verified REUSE coverage.
+        missing: list[str] = []
         for sp in specs:
             ex = self.experts.get(sp.name) or self.experts.get(coverage.get(sp.name, ""))
             if ex is None:
+                missing.append(sp.name)
                 continue
             rows = sp.inputs()
             ok = sum(
@@ -4131,6 +4137,10 @@ class GrowingHagiProcessor:
             "correct": correct,
             "accuracy": correct / max(1, total),
             "committed": len(self.experts),
+            "expected_tasks": len(specs),
+            "covered_tasks": len(specs) - len(missing),
+            "missing_tasks": missing,
+            "suite_complete": not missing,
         }
 
     def verify_certificates(self) -> dict[str, Any]:

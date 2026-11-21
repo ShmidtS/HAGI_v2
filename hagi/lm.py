@@ -547,11 +547,18 @@ class RopeAttentionByteLM:
         """C308 isometry: rotate each positional slot by theta_i = i*theta0
         (pairwise (cos,sin) — exact norm preservation)."""
         t = self.t
-        # angles for DIMENSION PAIRS (RoPE): pair j rotates by j*theta0;
-        # same rotation for every position -> exact isometry per slot
+        # WAVE 204 FIX (P1.1.1, audit v2): TRUE RoPE — the angle
+        # depends on the PAIR (position, frequency):
+        # theta_{pos,j} = pos * theta0 * freq_j, freq_j geometric.
+        # The old code rotated pair j by j*theta0 at EVERY position —
+        # an orthogonal feature transform, not position encoding.
         half = self.dim // 2
-        th = t.arange(half, device=device, dtype=t.float32) * self.theta0
-        cs, sn = t.cos(th), t.sin(th)
+        L = e.shape[-2]
+        freq = self.theta0 ** (-2.0 * t.arange(half, device=device,
+                                               dtype=t.float32) / half)
+        pos = t.arange(L, device=device, dtype=t.float32)
+        th = pos[:, None] * freq[None, :]          # (L, half)
+        cs, sn = t.cos(th), t.sin(th)              # broadcast over batch
         a, b = e[..., 0::2], e[..., 1::2]
         r = t.empty_like(e)
         r[..., 0::2] = a * cs - b * sn
@@ -587,7 +594,11 @@ class RopeAttentionByteLM:
         j_idx = t.arange(L, device=ctx.device)
         mask = j_idx[None, :, None] >= j_idx[None, None, :]
         sc = scores.unsqueeze(-1).masked_fill(~mask, float("-inf"))
-        pp = t.softmax(sc, dim=1)
+        # WAVE 204 FIX (P1.1.2, audit v2): softmax over the KEY axis
+        # (dim=-1), not the query axis — dim=1 normalized across
+        # queries, leaking future tokens into earlier positions'
+        # denominators.
+        pp = t.softmax(sc, dim=-1)
         h = t.relu(t.einsum("blj,bjd->bld", pp, e) @ self.W1 + self.b1)
         return h @ self.W2 + self.b2
 

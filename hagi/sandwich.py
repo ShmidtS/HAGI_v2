@@ -73,17 +73,25 @@ def certified_argmax(z, nm: int = DEFAULT_NM, nm_max: int = EVAL_NM_MAX):
             # of HOLDing separable logits like [10, 0, 0].
             nm *= 2
             continue
-        order = sorted(range(len(z)), key=lambda i: mid[i], reverse=True)
-        a, b = order[0], order[1]
-        # certified separation: mid a > mid b + band width (C495
-        # certified_pred via disjoint intervals)
+        # WAVE 204 FIX (P1.5, audit bundle v2): correct probability
+        # bounds. lo_i/sum(lo) was NOT a valid lower bound — the
+        # denominator must use the OPPOSITE extremes of the rest:
+        #   L_i = l_i / (l_i + sum_{j!=i} u_j)
+        #   U_i = u_i / (u_i + sum_{j!=i} l_j)
+        # A tie (e.g. [3,3,0]) can no longer be falsely certified.
         t = sandwich_terms(z, nm)
+        if t is None:
+            nm *= 2
+            continue
         lo, hi = t
-        slo, shi = sum(lo, type(lo[0])(0)), sum(hi, type(hi[0])(0))
-        width_a = hi[a] / shi - lo[a] / slo
-        width_b = hi[b] / shi - lo[b] / slo
-        half = max(width_a, width_b) / 2
-        if mid[a] - mid[b] > 2 * half:
+        n = len(z)
+        order = sorted(range(n), key=lambda i: mid[i], reverse=True)
+        L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))
+             for i in range(n)]
+        U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))
+             for i in range(n)]
+        a = order[0]
+        if all(L[a] > U[j] for j in range(n) if j != a):
             return a, nm
         nm *= 2
     return None, None
