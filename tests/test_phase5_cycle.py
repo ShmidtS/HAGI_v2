@@ -12,7 +12,7 @@ from hagi.diagnosis import GapBuffer, GapRecord, HoldReason, build_residual_prof
 from hagi.env_lut_bridge import env_model_to_netlist
 from hagi.invention import invent_blueprint
 from hagi.representations import register_artifact_factory
-from hagi.transfer_eval import CapabilityMeter, TaskResult
+from hagi.measurement import CapabilityMeter, TaskResult
 
 
 class _PeriodArtifact:
@@ -89,7 +89,7 @@ def test_full_invention_cycle():
     r3 = env_model_to_netlist(999, ood=True)
     ys3 = [r3["table"][s][3] for s in range(16)]
     meter = CapabilityMeter(alpha_fdr=0.0)
-    from hagi.transfer_eval import TaskResult
+    from hagi.measurement import TaskResult
     # does the invented OUT_PERIOD solve the fresh world?
     def _solve(yrow):
         for p2 in range(2, 17):

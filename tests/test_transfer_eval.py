@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Transfer gate tests (Phase 4): the 4 COMMIT conditions + rollback."""
 
-from hagi.transfer_eval import CapabilityMeter, TaskResult
+from hagi.measurement import CapabilityMeter, TaskResult
 
 
 def _held_out_good():

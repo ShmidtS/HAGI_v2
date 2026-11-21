@@ -1,6 +1,6 @@
 """C428/C472: closed-form bit-budget allocation."""
 import math
-from hagi.budget import weighted_exp_allocation, fisher_tolerances
+from hagi.measurement import weighted_exp_allocation, fisher_tolerances
 
 
 def test_allocation_satisfies_budget():

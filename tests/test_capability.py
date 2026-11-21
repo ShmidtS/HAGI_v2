@@ -1,5 +1,5 @@
 """V10-3: two-part MDL capability gate."""
-from hagi.capability import (CapabilitySnapshot, capability_delta,
+from hagi.measurement import (CapabilitySnapshot, capability_delta,
                              total_mdl, heldout_suite, noise_panel)
 
 
