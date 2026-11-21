@@ -351,8 +351,6 @@ def main_experiment() -> None:
         print(f"ADOPTED: policy '{d['adopted_policy']}' (wasted {rep['gate']['baseline']['mean_wasted']} -> {rep['gate'][d['adopted_policy']]['mean_wasted']})")
     else:
         print('GATE HOLD: ' + d['reason'])
-if __name__ == '__main__':
-    main()
 
 # ============================================================
 # GATED SELF-EDIT LOG
@@ -506,8 +504,6 @@ def main_selfedit() -> None:
     ap.add_argument('--dry', action='store_true')
     a = ap.parse_args()
     print(json.dumps(self_edit_cycle(seed=a.seed, dry=a.dry), ensure_ascii=False, indent=1))
-if __name__ == '__main__':
-    main()
 
 # ============================================================
 # SELF-MODEL: TRACE->DERIVE->OPTIMIZE->GATE (anchor module)

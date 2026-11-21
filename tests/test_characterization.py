@@ -134,7 +134,7 @@ def test_neural_gpu_backend():
 def test_execute_programs(tmp_path):
     """The model's executor: runs the programs it wrote — byte-level UTF-8
     ciphers stream real text; XOR round-trips; integer programs callable."""
-    from hagi import execute as hx
+    from hagi.io import execute as hx
     from hagi.rewrite import export_programs
     p = hagi.GrowingHagiProcessor(node_budget=20000)
     for sp in hagi.make_task_suite():

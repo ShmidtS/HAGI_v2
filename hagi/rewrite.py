@@ -329,7 +329,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         "wasted": total["final"]["wasted_candidates_on_holds"],
     }
     # curriculum phase accounting (primes CurriculumCert, order-free)
-    import curriculum as _curr
+    from hagi.school import certificate as _certificate
     adopted = total["final"]["adopted_rounds"] or 1
     relief = adopted / (adopted + total["final"]["wasted_candidates_on_holds"])
     prior_curr = (prior or {}).get("curriculum", [])
@@ -337,7 +337,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
                        "delta": round(relief, 4),
                        "d_cert": 0.02, "steps": adopted})
     state["curriculum"] = prior_curr
-    _curr.certificate(state)
+    _certificate(state)
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False),
                           encoding="utf-8")
     report["self_state"] = {k: (v if k != "segments" else len(v))
