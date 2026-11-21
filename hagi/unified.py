@@ -143,7 +143,21 @@ class Unified:
                 )
             )
         ce = min(r.get("best_holdout_ce", 99) for r in reps)
+        # WAVE 199 (candidate-vs-incumbent gate): measured CE on a
+        # sample of OLD domains — accept only without impermissible
+        # regression on them (fresh-domain improvement alone is not
+        # sufficient; the book is ONE model). Rollback = reload the
+        # incumbent weights; the chunk is still recorded but flagged.
+        old_ce = self._old_domains_ce(exclude=source)
+        regression = (old_ce is not None and old_ce > 0
+                      and old_ce * 1.25 < ce)  # >25% worse than pre
+        if regression and UNET_CKPT.exists():
+            # honest rollback: deploy the incumbent checkpoint
+            prev = type(self).load()
+            self.model = prev.model
         entry["ce"] = ce
+        entry["old_ce"] = old_ce
+        entry["regression"] = bool(regression)
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.save()
         return {
@@ -153,6 +167,8 @@ class Unified:
             "replay_domains": len(self.domains),
             "replay_bytes": len(combined),
             "holdout_ce": ce,
+            "old_ce": entry.get("old_ce"),
+            "regression": entry.get("regression", False),
             "seconds": round(time.perf_counter() - t0, 1),
         }
 
@@ -160,6 +176,38 @@ class Unified:
         """Bytes for a domain — from disk cache (data kept per domain)."""
         p = CKPT_DIR / "domains" / f"{name}.bin"
         return p.read_bytes() if p.exists() else b""
+
+    def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
+        """WAVE 199: measured CE on a sample of OLD domains (the
+        candidate-vs-incumbent gate-val). None when no old domains.
+        Pure CE measurement — no training happens here."""
+        import numpy as np
+        names = [n for n in self.domains if n != exclude]
+        if not names:
+            return None
+        rng = np.random.default_rng(11)
+        sample = list(rng.choice(names, min(max_domains, len(names)),
+                                 replace=False))
+        t = self.model.t
+        ces = []
+        with t.no_grad():
+            for name in sample:
+                d = self._domain_bytes(name, self.domains[name])
+                idx = np.frombuffer(d, dtype=np.uint8).astype(np.int64)
+                if len(idx) < self.model.k + 64:
+                    continue
+                k = self.model.k
+                n = len(idx) - k
+                step = max(1, n // 256)
+                sel = np.arange(0, n, step)[:256]
+                X = np.stack([idx[i:i + k] for i in sel])
+                y = idx[sel + k]
+                dev = getattr(self.model, "device", "cpu")
+                ctx = t.as_tensor(X, dtype=t.long, device=dev)
+                nxt = t.as_tensor(y, dtype=t.long, device=dev)
+                ces.append(float(t.nn.functional.cross_entropy(
+                    self.model.logits(ctx), nxt)))
+        return sum(ces) / len(ces) if ces else None
 
     def ingest_file(self, path: Path, epochs: int = 200, repeat: int = 2) -> dict:
         data = path.read_bytes()
