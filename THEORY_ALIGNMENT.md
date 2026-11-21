@@ -2458,3 +2458,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   между событиями certified-обучение ТОЛЬКО нового блока (старые
   frozen). hagi/growth.py дополнен trainable_blocks() — freeze
   семантика. Repeated grow проверен в волне 184.
+
+## Волна 190 — дериверсификация и единый вход
+- Все -V9 суффиксы классов/функций сняты (Expr, Program, Expert,
+  AuditLedger, GrowingHagiProcessor, synthesize_batched_mdl и др.).
+- CLI: python -m hagi.cli <cmd> — единый вход (8 команд).
+- Дисковые wire-форматы (HAGI-V9 тег, CERT протокол) сохранены —
+  это форматы данных, не версии проекта.
