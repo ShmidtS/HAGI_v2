@@ -28,13 +28,38 @@
 | `controller.py`, `selfmodel.py`, `experiment.py` | v10 controller, self-model, A/B эксперименты |
 | `curriculum.py`, `lessons.py`, `ingest.py`, `execute.py`, `mind.py` | учебный контур и интерфейс |
 
-## Нейро-символьный цикл (production)
+## ЕДИНЫЙ КОНВЕЙЕР (волна 185 — одна точка входа)
+
+```
+hagi/pipeline.py: unified_ingest(u, source, data)
+  1. НЕЙРО:   u.ingest → certified LM step (eta=4A/R'²)
+  2. ДИАГНОЗ: residual profile → classify_hold (шум отсекается)
+  3. ИЗОБРЕТ: invent_blueprint на гэпе (data-born грамматика)
+  4. ГЕЙТ:    verify_blueprint STRICT (PROVEN_EXACT на всём домене)
+  5. ПРИЁМ:   reify_construct → операция доступна следующим доменам
+```
+
+- `HAGI_SYMBOLIC=1` включает шаги 2–5 (default off — быстрый
+  реплей); `HAGI_CKPT_DIR` — все записи чекпоинтов (guard).
+- scripts/neuro_symbolic_cycle.py вызывает unified_ingest когда
+  HAGI_SYMBOLIC=1 — тот же конвейер, что и в тестах/скриптах.
+- GapBuffer накапливает REPRESENTATION_GAP профили между доменами:
+  кластеры готовы к изобретению по K_min образцам.
+
+### Модули теории (primes-мосты, каждая формула из Lean)
+| Модуль | Теория |
+|---|---|
+| `sandwich.py` | C489/C495/C502 certified softmax argmax |
+| `growth.py` | C450/C504 residual-block growth (γ=0 identity) |
+| `full_pipeline.py` | C479 six-phase canonical chain |
+| `merge.py` | C479v2 telescope merge |
+
+## Классический цикл (fabric tape-out)
 
 ```
 scripts/neuro_symbolic_cycle.py <minutes>
-свип C:/ (fresh-first) → certified train (eta=4A/R'²) →
-derived tasks → fusion fast-path (v4.0→v2.1→GA) →
-TAPE-OUT processor_netlist.json (exhaustive PASS)
+свип C:/ → unified_ingest → derived tasks →
+fusion fast-path (ANF→GA) → processor_netlist.json
 ```
 
 Запуск: 1-поточный OpenBLAS (`OPENBLAS_NUM_THREADS=1` + `MAIN_FREE=1`)

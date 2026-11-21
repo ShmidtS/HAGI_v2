@@ -358,7 +358,16 @@ def main() -> None:
         # WAVE 168 (user decision): replay cap REMOVED — full-book
         # replay on every ingest (no forgetting at all; time cost is
         # accepted by the user)
-        r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)
+        # WAVE 185: unified pipeline — neural + symbolic halves.
+        # HAGI_SYMBOLIC=1 adds diagnose->invent->gate->reify after
+        # the certified LM step; default keeps the replay loop fast.
+        import os as _os
+        if _os.environ.get("HAGI_SYMBOLIC") == "1":
+            from hagi.pipeline import unified_ingest
+            r = unified_ingest(u, cid, blob, epochs=2, repeat=1,
+                               replay_cap=None)
+        else:
+            r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "

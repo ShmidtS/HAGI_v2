@@ -103,6 +103,30 @@ EF21-Muon GPM + Hedge-router) обучается вместе с каждым к
 
 ## Быстрый старт
 
+### Единый конвейер (нейро + символ, волна 185)
+
+```python
+import os
+os.environ["HAGI_CKPT_DIR"] = "checkpoints"   # путь чекпоинтов
+os.environ["HAGI_SYMBOLIC"] = "1"             # вкл. символьную фазу
+from hagi.pipeline import unified_ingest
+from hagi.unified import Unified
+from hagi.diagnosis import GapBuffer
+
+u = Unified.load()          # ОДНА модель
+r = unified_ingest(u, "my_domain", data_bytes,
+                   gap_buffer=GapBuffer())
+# r["holdout_ce"]  — нейронная фаза (certified LM)
+# r["symbolic"]    — diagnose -> invent -> gate -> reify
+```
+
+Каждый ingest: certified обучение LM → диагноз остатка →
+изобретение представления на гэпе → строгий гейт (PROVEN_EXACT) →
+реификация в библиотеку операций. Шум честно отсекается
+(RANDOM_INCOMPRESSIBLE).
+
+### Классические точки входа
+
 ```bash
 python -m hagi --self-test-v9      # self-test ядра
 python -m pytest                   # characterization-гварды

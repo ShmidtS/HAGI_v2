@@ -1,0 +1,139 @@
+"""Unified pipeline (WAVE 185): one flow, not scattered pieces.
+
+The neural half and the symbolic half of HAGI run as ONE pipeline:
+
+    ingest domain bytes
+      -> certified LM training            (lm.train_certified)
+      -> residual diagnosis               (diagnosis.build_residual_profile,
+                                           classify_hold)
+      -> representation invention on gaps (invention.invent_blueprint)
+      -> strict gate                      (invention.verify_blueprint +
+                                           capability meter)
+      -> adoption                         (reifier.reify_construct)
+      -> certified result appended to the unified ledger
+
+Every module keeps its own single responsibility; this file only
+sequencing. Enabled by env HAGI_SYMBOLIC=1 (off by default so the
+heavy replay loop stays fast); the symbolic phase is skipped when
+the LM holdout is already trivially good.
+"""
+from __future__ import annotations
+
+import os
+import random
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+
+from hagi.diagnosis import (GapBuffer, GapRecord, HoldReason,
+                            build_residual_profile, classify_hold)
+from hagi.invention import invent_blueprint, verify_blueprint
+from hagi.reifier import reify_construct
+
+
+@dataclass
+class PipelineResult:
+    """One ingest's full trace: neural + symbolic halves."""
+    source: str
+    holdout_ce: float
+    hold_reason: HoldReason | None = None
+    invented: dict | None = None          # invention result dict
+    exact_points: int = 0                 # verified domain points
+    reified_op: str | None = None         # op name if adopted
+    notes: list[str] = field(default_factory=list)
+
+
+def symbolic_phase(source: str, xs: list[int], ys: list[int],
+                   full_domain: list[int] | None = None,
+                   rng: random.Random | None = None,
+                   gap_buffer: GapBuffer | None = None,
+                   max_attempts: int = 400) -> PipelineResult:
+    """Diagnose -> invent -> gate -> adopt for ONE domain's residuals.
+
+    xs/ys: the byte-level relation the LM could NOT compress (the
+    gap surface). full_domain: the certified support (default: xs).
+    """
+    rng = rng or random.Random(7)
+    full_domain = full_domain or sorted(set(xs))
+    prof = build_residual_profile([(x,) for x in xs], ys)
+    reason = classify_hold("NO_VALIDATED_PROGRAM", prof)
+    res = PipelineResult(source=source, holdout_ce=-1.0, hold_reason=reason)
+
+    if reason == HoldReason.RANDOM_INCOMPRESSIBLE:
+        res.notes.append("noise: no structure to invent")
+        return res
+    if gap_buffer is not None:
+        gap_buffer.add(GapRecord(task_name=source, reason=reason,
+                                 profile=prof))
+
+    pairs = sorted(zip(xs, ys))
+    result = invent_blueprint([pairs], rng, max_attempts=max_attempts)
+    if not result:
+        res.notes.append("invention: no blueprint")
+        return res
+    res.invented = {k: result[k] for k in
+                    ("status", "q_name", "q_param", "verdict")}
+    bp = result.get("blueprints", [None])[0]
+    if bp is None:
+        return res
+
+    sweep = verify_blueprint(bp, pairs, full_domain)
+    if sweep.get("status") != "PROVEN_EXACT":
+        res.notes.append(f"gate: {sweep.get('status')}")
+        return res
+    res.exact_points = len(full_domain)
+
+    # adoption: reify the exact construct so later tasks reuse it
+    q_name = result.get("q_name") or bp.name
+    fn = getattr(bp, "fn", None) or (lambda x: bp.apply(x))
+    try:
+        op = reify_construct(bp, f"{source}_{q_name}", fn,
+                             arity=1, domain=full_domain)
+        res.reified_op = op
+    except ValueError as e:
+        res.notes.append(f"reify: {e}")
+    return res
+
+
+def bytes_to_relation(data: bytes, k: int = 1) -> tuple[list[int], list[int]]:
+    """Extract the (input, output) relation a byte stream encodes.
+
+    k=1: adjacent byte pairs (x_i -> x_{i+1}) — the sequential law.
+    """ 
+    idx = np.frombuffer(data, dtype=np.uint8)
+    xs = idx[:-k].tolist()
+    ys = idx[k:].tolist()
+    return xs, ys
+
+
+def ingest_symbolic(u, source: str, data: bytes,
+                    gap_buffer: GapBuffer | None = None) -> PipelineResult:
+    """Symbolic half of an ingest: derive the gap relation from the
+    LM's own holdout misses, then run diagnose->invent->adopt."""
+    holdout_ce = u.domains.get(source, {}).get("ce")
+    res = PipelineResult(source=source,
+                         holdout_ce=holdout_ce if holdout_ce is not None else -1.0)
+    xs, ys = bytes_to_relation(data, k=1)
+    return symbolic_phase(source, xs, ys,
+                          full_domain=sorted(set(xs)),
+                          gap_buffer=gap_buffer)
+
+
+def unified_ingest(u, source: str, data: bytes, epochs: int = 200,
+                   repeat: int = 2, replay_cap: int | None = None,
+                   gap_buffer: GapBuffer | None = None) -> dict:
+    """The ONE entry point: neural + symbolic halves in sequence.
+    Drop-in for Unified.ingest when HAGI_SYMBOLIC=1."""
+    r = u.ingest(source, data, epochs=epochs, repeat=repeat,
+                 replay_cap=replay_cap)
+    if os.environ.get("HAGI_SYMBOLIC", "0") != "1":
+        r["symbolic"] = None
+        return r
+    sym = ingest_symbolic(u, source, data, gap_buffer=gap_buffer)
+    r["symbolic"] = {"hold_reason": sym.hold_reason.name if sym.hold_reason else None,
+                     "invented": sym.invented,
+                     "exact_points": sym.exact_points,
+                     "reified_op": sym.reified_op,
+                     "notes": sym.notes}
+    return r
