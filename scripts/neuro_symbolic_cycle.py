@@ -27,7 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hagi import fabric, unified  # noqa: E402
-from hagi.cycle import derive_tasks, fusion_fastpath, weave_task  # noqa: E402
+from hagi.cycle import (compose_adder2, commit, derive_tasks,  # noqa: E402
+                        fusion_fastpath, weave_task)
+from hagi.util import CKPT_DIR
 from scripts.feed_all_c import (CHUNK_TARGET, SKIP_DIRS, iter_files,
                                 load_state, save_state, sample_bytes)  # noqa: E402
 
@@ -82,7 +84,7 @@ def main() -> None:
             break
         blob = b"\n\x00FILE\x00\n".join(chunk)
         cid = f"ns_{st['chunks']:04d}"
-        (ROOT / "checkpoints" / "domains" / f"{cid}.bin").write_bytes(blob)
+        (CKPT_DIR / "domains" / f"{cid}.bin").write_bytes(blob)
         # ---- neural training on cumulative corpus ----
         # WAVE 168 (user decision): replay cap REMOVED — full-book
         # replay on every ingest (no forgetting at all; time cost is
@@ -110,7 +112,7 @@ def main() -> None:
         # dedup: truth-table hash — same boolean problem = same circuit;
         # honest "reused" instead of wasting search budget
         solved = {}
-        netlist_path = ROOT / "checkpoints" / "processor_netlist.json"
+        netlist_path = CKPT_DIR / "processor_netlist.json"
         if netlist_path.exists():
             for tape in json.loads(netlist_path.read_text(encoding="utf-8")):
                 for c in tape["circuits"]:
@@ -119,7 +121,7 @@ def main() -> None:
         seen_tables = {}
         # index: truth-hash → certified circuit from past tape-outs
         solved_tables = {}
-        netlist_path = ROOT / "checkpoints" / "processor_netlist.json"
+        netlist_path = CKPT_DIR / "processor_netlist.json"
         if netlist_path.exists():
             for tape in json.loads(
                     netlist_path.read_text(encoding="utf-8")):
@@ -138,7 +140,7 @@ def main() -> None:
                     res["profile"] = f"{task['name']}_{thash}"
                     circuits.append(res)
                     # ladder advance: stage 1 composed ONCE → stage 2
-                    sf = ROOT / "checkpoints" / "ladder_stage.json"
+                    sf = CKPT_DIR / "ladder_stage.json"
                     if json.loads(sf.read_text(encoding="utf-8")).get("stage", 0) == 1:
                         sf.write_text(json.dumps({"stage": 2}),
                                       encoding="utf-8")
@@ -175,7 +177,7 @@ def main() -> None:
                 res["truth_hash"] = thash
                 # ladder: certified stage task → advance complexity
                 stage = task.get("meta", {}).get("stage", 0)
-                sf = ROOT / "checkpoints" / "ladder_stage.json"
+                sf = CKPT_DIR / "ladder_stage.json"
                 sf.write_text(json.dumps({"stage": stage + 1}),
                               encoding="utf-8")
                 print(f"  LADDER: stage {stage} solved → stage "
