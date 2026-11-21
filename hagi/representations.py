@@ -362,11 +362,28 @@ def restore_reified_ops_state(state_dir, require_tag: bool=True) -> int:
         pure = fns[0]
         meta = rec.get('meta', {})
         arity = int(meta.get('arity', 1))
+        # WAVE 196 FIX (P0, locally reproduced): restore lost the
+        # certified-support guard — pre-restore calls outside the
+        # domain raised ValueError, post-restore they returned a
+        # number. Rebuild the support closure from meta['domain'].
+        domain = meta.get('domain')
+        if domain is not None:
+            support = frozenset(
+                (tuple(int(v) for v in pt)
+                 if isinstance(pt, (tuple, list)) else (int(pt),))
+                for pt in domain)
+        else:
+            support = None
 
-        def _wrapped(*vals: int, _p=pure, _a=arity, _op=op):
+        def _wrapped(*vals: int, _p=pure, _a=arity, _op=op,
+                     _s=support):
             if len(vals) != _a:
                 raise ValueError(f'{_op} expects {_a} args, got {len(vals)}')
-            return int(_p(*vals))
+            key = tuple(int(v) for v in vals)
+            if _s is not None and key not in _s:
+                raise ValueError(
+                    f'{_op} outside certified support: {key}')
+            return int(_p(*key))
         _wrapped.__name__ = op
         _wrapped.reified_meta = dict(meta)
         REIFIED_OPS[op] = _wrapped

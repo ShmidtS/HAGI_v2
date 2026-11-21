@@ -65,6 +65,16 @@ class Unified:
         single source of truth)."""
         import numpy as np
 
+        # WAVE 196 FIX (P0): path traversal — source like
+        # "../../evil" escaped CKPT_DIR/domains (verified locally:
+        # file landed outside the sandbox). Domain ids are safe
+        # names only.
+        import re as _re
+        safe = _re.sub(r"[^A-Za-z0-9_.-]", "_", source)
+        safe = safe.strip("._") or "unnamed"
+        if safe != source:
+            source = safe
+
         sha = _sha(data)
         entry = self.domains.setdefault(source, {"sha": sha, "bytes": 0, "ce": None})
         is_new = entry["sha"] != sha

@@ -147,7 +147,11 @@ class ByteLM:
         ctx_va, nxt_va = windows(hold)
         opt = t.optim.Adam(self.params(), lr=lr)
         best_ce = float(self.ce(ctx_va, nxt_va).detach())
-        best_state = None
+        # WAVE 196 FIX (P0): initial snapshot IS the initial best —
+        # if no epoch improves, deploy the initial weights (not the
+        # LAST epoch, which can be worse while best_ce still reports
+        # the initial value).
+        best_state = [p.detach().clone() for p in self.params()]
         history = []
         for ep in range(epochs):
             opt.zero_grad()
@@ -204,7 +208,11 @@ class ByteLM:
                     ces.append(self.ce(ctx_va[i:i+8192], nxt_va[i:i+8192])
                                * len(ctx_va[i:i+8192]))
             return float(sum(ces) / len(hold_np))
-        best_ce = val_ce(); best_state = None
+        best_ce = val_ce()
+        # WAVE 196 FIX (P0): initial snapshot is the initial best
+        # (same as train_guarded — no-improvement run must deploy
+        # initial weights, not the last ones).
+        best_state = [p_.detach().clone() for p_ in self.params()]
         history = []
         # WAVE 169 fix (holdout leak): training sampled from ALL n
         # windows, including hold_idx (14 holdout points per 512 batch
@@ -409,7 +417,8 @@ class AdaptiveByteLM:
 
         ctx_va, nxt_va = windows(hold, fixed_len=self.max_train_ctx)
         opt = t.optim.Adam(self.params(), lr=lr)
-        best = float(self.ce(ctx_va, nxt_va)); best_state = None
+        best = float(self.ce(ctx_va, nxt_va))
+        best_state = [p.detach().clone() for p in self.params()]  # WAVE 196: initial IS best
         for ep in range(epochs):
             for batch_start in range(0, len(train), 256):
                 ctx, nxt = windows(train[batch_start:batch_start + 256])
@@ -596,7 +605,8 @@ class RopeAttentionByteLM:
 
         ctx_va, nxt_va = windows(hold, fixed_len=max_train_ctx)
         opt = t.optim.Adam(self.params(), lr=lr)
-        best = float(self.ce(ctx_va, nxt_va).detach()); best_state = None
+        best = float(self.ce(ctx_va, nxt_va).detach())
+        best_state = [p.detach().clone() for p in self.params()]  # WAVE 196: initial IS best
         for ep in range(epochs):
             perm2 = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
