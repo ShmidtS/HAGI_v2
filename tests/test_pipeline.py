@@ -12,8 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def _fresh_unified():
     os.environ["HAGI_CKPT_DIR"] = tempfile.mkdtemp()
     import importlib
+    import hagi.util as _util
+    importlib.reload(_util)   # SSOT first: CKPT_DIR from the env
     import hagi.unified as U
-    importlib.reload(U)
+    importlib.reload(U)       # then consumers pick the sandbox up
+    import hagi.pipeline as _pipe
+    importlib.reload(_pipe)
     return U.Unified(k=4, dim=32, hidden=64)
 
 
