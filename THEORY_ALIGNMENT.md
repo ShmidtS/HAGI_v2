@@ -2426,3 +2426,18 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Честные пины upstream приняты: не-Serfling (потраекторный бюджет
   Freedman), k=N тривиально исключён, uniformity перестановок —
   bridge-лемма не формализована (на концентрацию не влияет).
+
+## Сверка primes 2026-11-21 круг 15 (волна 182, C494–C502)
+- 8 новых коммитов: SandwichMonotone (C495), RationalSoftmax (C489),
+  BandTightening (C502), GPMRelaxed (C498), MiniHagi/2, bench updates.
+- Sandwich certification: перенесена как hagi/sandwich.py —
+  lo=(1+sv/nm)^n, hi=(1-sv/nm)^(-nm), certified argmax с adaptive
+  nm-удвоением (cert_pred_adaptive). Верифицирован на Lean-примере
+  z=(0,1,2), n=m=10 → класс 2 сертифицирован.
+- GPM: наш production (energy_thresh=0.995, rank-truncation) СООТВЕТСТВУЕТ
+  C498 rank-truncated GPM с tail leakage; C485 full-span (thresh>=1.0)
+  остаётся как точный режим. Cert-rule upstream (min k с
+  max_old sigmaTail² ≤ ε²) — bench-side пин, наш энергетический
+  критерий допустим. A-GEM conditional — опция, наша per-step
+  ортогонализация строже. Расхождений нет.
+- Bernoulli mono (C489 pin закрыт upstream): отражён в adaptive nm.
