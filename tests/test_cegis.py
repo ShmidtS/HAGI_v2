@@ -2,7 +2,7 @@
 import random
 import sys, os
 from hagi.invention import cegis_invent
-from hagi.rdl import mk_cnt_mod
+from hagi.invention import mk_cnt_mod
 
 
 def test_cegis_finds_periodic_law_without_all_labels():

@@ -2,7 +2,7 @@
 never change the chosen blueprint (MDL criterion is order-free)."""
 import os, sys, random
 from hagi.invention import invent_blueprint, synthesize_blueprint
-from hagi.rdl import mk_cnt_mod
+from hagi.invention import mk_cnt_mod
 
 
 def _cluster():

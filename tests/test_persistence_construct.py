@@ -6,7 +6,7 @@ import json
 
 from hagi.core import Expr
 from hagi.invention import invent_blueprint, verify_blueprint
-from hagi.rdl import mk_cnt_mod
+from hagi.invention import mk_cnt_mod
 from hagi.representations import register_artifact_factory
 
 

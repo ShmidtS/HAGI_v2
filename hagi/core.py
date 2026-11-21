@@ -316,7 +316,7 @@ def make_task_suite() -> list[TaskSpec]:
 
 # V10-2: Reified operator registry — invented coordinates promoted to
 # first-class unary/binary macro-ops usable inside Expr programs.
-# Filled by hagi.reifier.reify_construct(); persists via to_state().
+# Filled by hagi.representations.reify_construct(); persists via to_state().
 REIFIED_OPS: dict = {}
 
 

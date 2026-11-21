@@ -210,7 +210,7 @@ def weave_task(task: dict, pop_size: int = 100, generations: int = 3000,
     # invent a construction class from observations (honest HOLD if
     # outside the parametric space). Logged, does not gate tape-out.
     try:
-        from hagi import rdl as _rdl
+        from hagi import invention as _rdl
 
         class _TaskWorld:
             clock_action = 0

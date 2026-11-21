@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RDL (Representation Discovery Loop) tests: invent-a-construction cycle."""
 
-from hagi import rdl
+from hagi import invention
 
 
 class ModWorld:
@@ -19,14 +19,14 @@ class ModWorld:
         if a == 0:
             self._s = (self._s + 1) % 16
         elif a == 1:
-            self._s = rdl.mk_cnt_mod(self._n)(self._s)
+            self._s = invention.mk_cnt_mod(self._n)(self._s)
         return self._s
 
     def true_step(self, s, a):
         if a == 0:
             return (s + 1) % 16
         if a == 1:
-            return rdl.mk_cnt_mod(self._n)(s)
+            return invention.mk_cnt_mod(self._n)(s)
         return s
 
 
@@ -45,19 +45,19 @@ class LfsrWorld:
         if a == 0:
             self._s = (self._s + 1) % 16
         elif a == 1:
-            self._s = rdl.mk_lfsr(self._p)(self._s)
+            self._s = invention.mk_lfsr(self._p)(self._s)
         return self._s
 
     def true_step(self, s, a):
         if a == 0:
             return (s + 1) % 16
         if a == 1:
-            return rdl.mk_lfsr(self._p)(s)
+            return invention.mk_lfsr(self._p)(s)
         return s
 
 
 def test_rdl_discovers_counter_mod5():
-    r = rdl.run_rdl(ModWorld(5))
+    r = invention.run_rdl(ModWorld(5))
     assert r["proven"], r
     assert r["invented_class"] == "cnt_mod"
     assert r["param"] == 5
@@ -65,7 +65,7 @@ def test_rdl_discovers_counter_mod5():
 
 
 def test_rdl_discovers_lfsr():
-    r = rdl.run_rdl(LfsrWorld(9))
+    r = invention.run_rdl(LfsrWorld(9))
     assert r["proven"], r
     assert r["invented_class"] == "lfsr"
     assert r["param"] == 9
@@ -85,13 +85,13 @@ def test_rdl_holds_on_unknown():
         def true_step(self, s, a):
             return (s ^ 7) if a == 1 else s
 
-    r = rdl.run_rdl(XorWorld())
+    r = invention.run_rdl(XorWorld())
     assert not r["proven"]
     assert r["invented_class"] is None
 
 
 def test_families_space():
-    fams = rdl.generate_families()
+    fams = invention.generate_families()
     assert len(fams) >= 30
     names = {n for n, _, _ in fams}
     assert {"lfsr", "cnt_mod", "sat", "gray", "shift2"} <= names

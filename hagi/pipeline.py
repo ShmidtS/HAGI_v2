@@ -9,7 +9,7 @@ The neural half and the symbolic half of HAGI run as ONE pipeline:
       -> representation invention on gaps (invention.invent_blueprint)
       -> strict gate                      (invention.verify_blueprint +
                                            capability meter)
-      -> adoption                         (reifier.reify_construct)
+      -> adoption                         (representations.reify_construct)
       -> certified result appended to the unified ledger
 
 Every module keeps its own single responsibility; this file only

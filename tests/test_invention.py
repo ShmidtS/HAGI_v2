@@ -7,7 +7,7 @@ from hagi.invention import (
     invent_blueprint, matched_null_verdict, synthesize_blueprint,
     verify_blueprint,
 )
-from hagi.rdl import mk_cnt_mod
+from hagi.invention import mk_cnt_mod
 
 
 def _cnt_mod_pairs(n: int) -> list[tuple[int, int]]:
