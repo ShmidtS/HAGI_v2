@@ -30,7 +30,7 @@ from hagi.diagnosis import (GapBuffer, GapRecord, HoldReason,
                             build_residual_profile, classify_hold)
 from hagi.invention import (cegis_invent, invent_blueprint,
                             verify_blueprint)
-from hagi.reifier import reify_construct
+from hagi.representations import reify_construct
 
 
 @dataclass

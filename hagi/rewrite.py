@@ -259,7 +259,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
         prior = state
         # reified ops survive the cold restart (Invention -> Reification
         # closure): yesterday's inventions are tomorrow's primitives
-        from hagi.reifier import restore_reified_ops_state
+        from hagi.representations import restore_reified_ops_state
         n_reified = restore_reified_ops_state(state_dir)
         if n_reified:
             booted_from += f" + {n_reified} reified ops"
@@ -299,7 +299,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
     inc_path.write_bytes(pickle.dumps(final_proc))
     # reified ops persist too (self-extension continuity)
     try:
-        from hagi.reifier import save_reified_ops_state
+        from hagi.representations import save_reified_ops_state
         save_reified_ops_state(state_dir)
     except Exception:
         pass  # no reified ops yet — nothing to persist
