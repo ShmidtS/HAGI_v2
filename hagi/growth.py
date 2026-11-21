@@ -36,8 +36,23 @@ class ResidualBlock:
 def grow_trunk(trunk: Sequence[Callable],
                h: Callable) -> list[Callable]:
     """Append a residual-zero block: trunk function preserved EXACTLY
-    (grow_block_bench_sound). Returns the new trunk."""
+    (grow_block_bench_sound). Returns the new trunk. WAVE 186
+    (C506 grow_blocks_repeat_sound): repeated appends compose —
+    each new block is the only one with gamma != 0 potential; all
+    previous blocks are FROZEN by contract (their gamma stays as
+    set; the trainer must not touch them — only the fresh block
+    enters the certified training loop)."""
     return list(trunk) + [ResidualBlock(h, gamma=0.0)]
+
+
+def trainable_blocks(trunk: Sequence["ResidualBlock"],
+                     grown_index: int | None = None):
+    """C506: only the LAST (fresh) block trains; the rest frozen.
+    Returns the block(s) allowed into the certified step."""
+    if grown_index is None:
+        grown_index = len(trunk) - 1
+    return [b for i, b in enumerate(trunk)
+            if isinstance(b, ResidualBlock) and i == grown_index]
 
 
 def run_trunk(trunk: Sequence[Callable], x):

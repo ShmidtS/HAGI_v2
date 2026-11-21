@@ -2451,3 +2451,10 @@ self-edit гейт работает (no-op фильтр активен), failure
   Lipschitz не утверждается при γ=0.
 - Ключевой пин upstream: rms-норма НЕ даёт identity (1000/1001≠1) —
   identity ТОЛЬКО через residual-zero гейт. Зафиксировано в докстринге.
+
+## Сверка primes круг 17 (волна 186, C506)
+- 48070b1b: повторяемый grow-цикл (grow_blocks_repeat_sound):
+  2 identity-добавления подряд сохраняют trunk-функцию точно;
+  между событиями certified-обучение ТОЛЬКО нового блока (старые
+  frozen). hagi/growth.py дополнен trainable_blocks() — freeze
+  семантика. Repeated grow проверен в волне 184.
