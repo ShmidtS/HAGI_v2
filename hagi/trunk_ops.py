@@ -213,3 +213,32 @@ def obj_invariant_check(trunk_old: Sequence[Callable], trunk_new: Sequence[Calla
     output is unchanged by the append (exact float equality here —
     the Fraction-exact form lives in the bench)."""
     return all((obj(run_trunk(trunk_old, x)) == obj(run_trunk(trunk_new, x)) for x in xs))
+
+# ==================================================================
+# GROW SNAP (C521): certified snap to q/2^k grid at grow boundaries.
+
+from fractions import Fraction as _Fr
+
+
+def snap_rational(value, k: int) -> _Fr:
+    """Snap a rational/float to the q/2^k grid (banker's rounding).
+    Per-value error <= 2^-(k+1) (half-cell)."""
+    f = _Fr(value)
+    scaled = f * (1 << k)
+    q = (scaled.numerator * 2 + scaled.denominator) // (2 * scaled.denominator)
+    return _Fr(q, 1 << k)
+
+
+def snap_denominator_reset(x, k: int):
+    """Snap values (scalar or sequence) so every denominator <= 2^k
+    (C521 snap_denominator_reset)."""
+    if isinstance(x, (list, tuple)):
+        return type(x)(snap_rational(v, k) for v in x)
+    return snap_rational(x, k)
+
+
+def snap_obj_bound(s_err: float, ds: float) -> float:
+    """Certified per-point objective degradation bound for snapping
+    features by ds: |(s+ds-y)^2 - (s-y)^2| <= (2|s-y| + |ds|)*|ds|
+    (C521 snap_preserves_objective_bound, exact in Fraction)."""
+    return (2 * abs(s_err) + abs(ds)) * abs(ds)
