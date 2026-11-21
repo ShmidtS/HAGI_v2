@@ -21,13 +21,10 @@ CLI: --self-test (v8.4) | --self-test-v9 | --self-test-v7 | --self-test-v5 |
      --grow (v8.4 loop) | --grow-v9 | --benchmark-v9 [--max-rounds N] [--out-dir DIR]
 """
 import argparse
-import ast
 import copy
-import heapq
 import itertools
 import json
 import math
-import os
 import random
 import statistics
 import sys
@@ -4712,7 +4709,6 @@ def _benchmark() -> None:
     Reports file-size, resident tensor bytes (real parameter memory, unlike the
     seed-compressed neural_bytes payload), wall time, and exact accuracy.
     """
-    import statistics as _stat
 
     suite = make_task_suite()
     model = GrowingHagiProcessorV9(node_budget=8000)

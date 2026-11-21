@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import sys
 from pathlib import Path
 
 DEFAULT_PROGRAMS = Path("checkpoints/self/generated_programs.py")

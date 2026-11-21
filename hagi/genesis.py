@@ -77,7 +77,6 @@ def current_config() -> dict[str, Any]:
 def benchmark_config(cfg: dict[str, Any]) -> dict[str, float]:
     """Run the micro-benchmark (2 rounds, small workers) and return
     raw metrics: experts adopted, wall seconds, relief, economy."""
-    import os
     from hagi import loop as sl
 
     workers = min(

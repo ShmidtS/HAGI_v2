@@ -36,7 +36,6 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any, Optional

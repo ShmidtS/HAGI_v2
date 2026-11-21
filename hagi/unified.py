@@ -87,7 +87,6 @@ class Unified:
         # WAVE 168: default replay_cap=None = FULL-BOOK replay (no cap,
         # user decision) — the book IS the model, nothing is forgotten.
         # An integer cap remains available for quick tests only.
-        import numpy as _np
 
         parts = []
         total_cap = replay_cap  # TOTAL budget for all past domains
