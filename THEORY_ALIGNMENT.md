@@ -2472,3 +2472,17 @@ self-edit гейт работает (no-op фильтр активен), failure
   orthogonality) строже A-GEM conditional — теория описывает обе
   конфигурации, наша валидна (zero forgetting полнее AGEM-гарантии).
   Расхождений нет.
+
+## Волна 196 — P0/P1 аудит из research-папки (пользователь)
+- P0×3 подтверждены и исправлены: train initial-best snapshot (4
+  класса), reifier restore support-guard, ingest path traversal.
+- P1: holdout block-split (disjoint blocks), pipeline на реальных
+  LM-остатках (не соседние байты), zero-coverage holdout gate.
+- P1-6 ParallelLearner sequential — осознанное решение 2026-11-17
+  (no-spawn, детерминизм), не баг.
+- Архитектурная рекомендация отчёта (общий протокол задач/
+  кандидатов/доказательств, независимый verifier, J(a)=LCB-∆Q-
+  затраты) соответствует текущему направлению pipeline/trunk_ops.
+- mod-affine front-end прототип (62 задач: 59 COMMIT/1 REUSE/
+  2 HOLD, 1.3s) — принят как направление специализированных
+  поисков (грамматика); не в production до отдельного решения.
