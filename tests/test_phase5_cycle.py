@@ -9,7 +9,7 @@ Full cycle on synthetic mod-N worlds (v4.6-style OOD):
 
 from hagi import env_lut as env
 from hagi.diagnosis import GapBuffer, GapRecord, HoldReason, build_residual_profile
-from hagi.env_lut_bridge import env_model_to_netlist
+from hagi.env_lut import env_model_to_netlist
 from hagi.invention import invent_blueprint
 from hagi.representations import register_artifact_factory
 from hagi.measurement import CapabilityMeter, TaskResult
