@@ -359,9 +359,10 @@ def matched_null_verdict(
     fam_sizes = {"OUT_PERIOD": 256, "POLY_LIN": 256, "SPARSE": None}
     kind = bp.payload.get("kind", "")
     F = fam_sizes.get(kind)
-    table_space = (max_y + 1) ** n
-    if F is not None and table_space > 0:
-        sig_bits = math.log2(table_space / F)
+    if F is not None and n > 0:
+        # WAVE 183: log2(T/F) = n*log2(K) - log2(F) — no giant-int
+        # division (table_space = K**n overflows float at n > ~250).
+        sig_bits = n * math.log2(max_y + 1) - math.log2(F)
     else:
         sig_bits = null_bits - bp_bits
     verdict = "STRUCTURAL" if sig_bits >= z_threshold else "COMPRESSED"

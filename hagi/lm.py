@@ -960,13 +960,13 @@ class CertifiedStepLM:
                  seed: int = 1) -> str:
         t = self.t
         with t.no_grad():
-            g = t.Generator().manual_seed(seed)
+            g = t.Generator(device=self.device).manual_seed(seed)
             ctx = list(prompt.encode("utf-8"))[-self.k:]
             if len(ctx) < self.k:
                 ctx = [32] * (self.k - len(ctx)) + ctx
             out = bytearray()
             for _ in range(n_bytes):
-                x = t.as_tensor([ctx], dtype=t.long)
+                x = t.as_tensor([ctx], dtype=t.long, device=self.device)
                 probs = t.softmax(self.logits(x)[0] / max(temp, 1e-3), dim=-1)
                 b = int(t.multinomial(probs, 1, generator=g))
                 out.append(b); ctx = ctx[1:] + [b]
