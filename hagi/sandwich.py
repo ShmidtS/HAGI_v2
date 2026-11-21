@@ -65,7 +65,14 @@ def certified_argmax(z, nm: int = DEFAULT_NM, nm_max: int = EVAL_NM_MAX):
     while nm <= nm_max:
         mid = sandwich_mid(z, nm)
         if mid is None:
-            return None, None
+            # WAVE 203 FIX (P0, research report): the range guard
+            # (-min(s) >= nm) failing at the CURRENT nm does NOT mean
+            # the certificate is impossible — C502 BandTightening
+            # guarantees larger nm tightens the band AND relaxes the
+            # guard (guard is -min(s) < nm). Double and retry instead
+            # of HOLDing separable logits like [10, 0, 0].
+            nm *= 2
+            continue
         order = sorted(range(len(z)), key=lambda i: mid[i], reverse=True)
         a, b = order[0], order[1]
         # certified separation: mid a > mid b + band width (C495

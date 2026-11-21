@@ -166,11 +166,13 @@ from pathlib import Path
 from hagi.util import CKPT_DIR as _CKPT
 DEFAULT_PROGRAMS = _CKPT / 'self' / 'generated_programs.py'
 _mod = None
+_load_path: Path | None = None
 def _load(path: Path | None=None):
-    global _mod
-    if _mod is not None:
+    global _mod, _load_path
+    if _mod is not None and (path or DEFAULT_PROGRAMS) == _load_path:
         return _mod
     p = path or DEFAULT_PROGRAMS
+    _load_path = p
     if not p.exists():
         raise FileNotFoundError(f'{p} not found — run hagi_selfrewrite first so the model writes its programs')
     spec = importlib.util.spec_from_file_location('hagi_generated', p)
@@ -180,10 +182,10 @@ def _load(path: Path | None=None):
     spec.loader.exec_module(mod)
     _mod = mod
     return mod
-def available() -> list[str]:
-    return [n for n in dir(_load()) if not n.startswith('_') and n != 'hagi_generated']
-def execute(name: str, *args: int) -> int:
-    fn = getattr(_load(), name, None)
+def available(path: Path | None=None) -> list[str]:
+    return [n for n in dir(_load(path)) if not n.startswith('_') and n != 'hagi_generated']
+def execute(name: str, *args: int, programs: Path | None=None) -> int:
+    fn = getattr(_load(programs), name, None)
     if fn is None:
         raise KeyError(f'no program named {name!r} (model has {len(available())})')
     return int(fn(*args))
@@ -205,7 +207,7 @@ def execute_main() -> None:
     p.add_argument('values', nargs='*', type=int, help='direct integer arguments, e.g. --task GCD 12 18')
     a = p.parse_args()
     if a.list:
-        names = available()
+        names = available(a.programs)
         print(f'{len(names)} programs:')
         for n in sorted(names):
             print(' ', n)
@@ -215,6 +217,6 @@ def execute_main() -> None:
     if a.text is not None:
         print(execute_text(a.task, a.text, a.key))
     else:
-        print(execute(a.task, *a.values))
+        print(execute(a.task, *a.values, programs=a.programs))
 if __name__ == '__main__':
     main()

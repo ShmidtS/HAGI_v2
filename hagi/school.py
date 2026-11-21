@@ -76,7 +76,8 @@ from typing import Any, Callable
 from pathlib import Path
 from hagi.io import execute, execute_text
 from hagi import lm
-SELF_SOURCES = ['generated_programs.py', 'lm.py', 'execute.py', 'ingest.py', 'loop.py', 'rewrite.py']
+# WAVE 203: actual module layout after merges (io absorbed execute+ingest; generated_programs lives in scripts/ if present)
+SELF_SOURCES = ['lm.py', 'io.py', 'loop.py', 'rewrite.py']
 _ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {'^(?:чему равен )?gcd (\\d+) (\\d+)$': ('GCD', lambda m: (int(m[1]), int(m[2]))), '^(?:чему равен )?нок (\\d+) (\\d+)$': ('LCM', lambda m: (int(m[1]), int(m[2]))), '^abs (-?\\d+)$': ('ABS', lambda m: (int(m[1]),)), '^square (-?\\d+)$': ('SQUARE', lambda m: (int(m[1]),)), '^cube (-?\\d+)$': ('CUBE', lambda m: (int(m[1]),)), '^mul (-?\\d+) (-?\\d+)$': ('MUL', lambda m: (int(m[1]), int(m[2]))), '^add (-?\\d+) (-?\\d+)$': ('ADD', lambda m: (int(m[1]), int(m[2]))), '^xor (.+) (-?\\d+)$': ('LANG8_XOR_CIPHER', lambda m: (m[1], int(m[2]))), '^caesar (.+)$': ('LANG8_CAESAR1', lambda m: (m[1],))}
 def _exact_answer(query: str) -> tuple[str, str] | None:
     q = query.strip().lower()
@@ -109,7 +110,8 @@ def retrain() -> str:
     pkg = root / 'hagi'
     from hagi.util import CKPT_DIR
     base = CKPT_DIR / 'self'
-    files = [base / 'generated_programs.py'] + [root / f for f in SELF_SOURCES[1:]] + [root / 'README.md', root / 'THEORY_ALIGNMENT.md']
+    gen_prog = root / 'scripts' / 'generated_programs.py'
+    files = ([gen_prog] if gen_prog.exists() else []) + [root / f for f in SELF_SOURCES[1:]] + [root / 'README.md', root / 'THEORY_ALIGNMENT.md']
     files = [f for f in files if f.exists()]
     data = b''.join((f.read_bytes() for f in files))
     model = lm.ByteLM(k=10, dim=96, hidden=192)

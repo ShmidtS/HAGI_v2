@@ -65,7 +65,7 @@ def _save_log(log: dict[str, Any]) -> None:
 def current_config() -> dict[str, Any]:
     """Live production config: loop defaults overridden by adopted
     archgenesis and self-edit settings."""
-    from hagi import selfedit as se
+    from hagi import selfmodel as se  # selfedit merged here (wave194)
 
     cur = {"workers": 8, "batch_size": 8, "proposals_per_round": 10, "max_rounds": 4}
     try:

@@ -39,16 +39,16 @@ def q_ident(s: int) -> int:
     return s
 
 
-def q_shift(d: int) -> Callable[[int], int]:
+def q_shift(d: int, m: int = 16) -> Callable[[int], int]:
     def f(s):
-        return (s - d) % 16
+        return (s - d) % m
 
     return f
 
 
-def q_reflect(c: int) -> Callable[[int], int]:
+def q_reflect(c: int, m: int = 16) -> Callable[[int], int]:
     def f(s):
-        return (c - s) % 16
+        return (c - s) % m
 
     return f
 
@@ -143,7 +143,10 @@ def basis_out_period(core_pairs: list[tuple[int, int]]) -> dict | None:
     if len(core_pairs) < 3:
         return None
     (x0, y0) = core_pairs[0]
-    for p_ in range(2, 17):
+    # WAVE 203: modulus search bounded by the byte domain (256) so
+    # alphabets of any size (26-letter, bytes) are covered — was
+    # hardwired range(2, 17).
+    for p_ in range(2, 257):
         for o in range(p_):
             if all((x + o) % p_ == y for x, y in core_pairs):
                 return {"kind": "OUT_PERIOD", "p": p_, "o": o}

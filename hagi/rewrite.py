@@ -307,7 +307,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,
     # call DAG intact, re-validate everything exactly; full library
     # is kept as incumbent_full.pkl
     try:
-        import mdl as _opt
+        from hagi import selfmodel as _opt  # mdl merged here (wave200)
         _res = _opt.prune_library(final_proc)
         _new, _fails = _opt.apply_prune(final_proc, _res["keep"])
         if _fails == 0 and len(_new.experts) < len(final_proc.experts):
@@ -398,7 +398,7 @@ def _retrain_lm_guarded(state_dir: Path) -> None:
     """Each forever cycle: the byte LM retrains on the model's own
     artifacts (self-referential neural growth, §3/§9 guarded)."""
     try:
-        from hagi import mind
+        from hagi import school as mind  # mind merged here (wave194)
         print("[lm]", mind.retrain(), flush=True)
     except Exception as e:  # neural body failure never stops the loop
         print(f"[lm] retrain skipped: {e!r}", flush=True)

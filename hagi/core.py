@@ -396,6 +396,17 @@ class Expr:
             return min(max(vals[0], -3), 3)
         if self.op == "mul3":
             return vals[0] * vals[1] * vals[2]
+        if self.op == "in_set":
+            # WAVE 203: parity with certificates.py hagi.expr.v1 —
+            # membership in a strictly increasing finite set. Sparse
+            # memoization is admitted ONLY for language-family specs
+            # (commit-side guard), never as a general law finder.
+            return int(vals[0] in set(self.value or ()))
+        if self.op == "in_ranges":
+            # inclusive membership in sorted disjoint non-adjacent
+            # intervals ((lo, hi) pairs).
+            v = vals[0]
+            return int(any(lo <= v <= hi for lo, hi in (self.value or ())))
         if self.op == "construct":
             from hagi.representations import construct_eval
 
@@ -548,7 +559,7 @@ class Expr:
                     if p == 0:
                         continue
                     nm = VAR_NAMES[idx] if idx < len(VAR_NAMES) else f"x{idx}"
-
+                    factors.append(f"{nm}^{p}" if p != 1 else nm)
                 body = "*".join(factors) if factors else str(abs(c))
                 if factors and abs(c) != 1:
                     body = f"{abs(c)}*{body}"
@@ -569,6 +580,10 @@ class Expr:
             return f"median({', '.join(a.pretty() for a in self.args)})"
         if self.op == "mul3":
             return " * ".join(a.pretty() for a in self.args)
+        if self.op == "in_set":
+            return f"in_set({sorted(set(self.value or ()))})"
+        if self.op == "in_ranges":
+            return f"in_ranges({self.value})"
         if len(self.args) == 1:
             return f"{self.op}({self.args[0].pretty()})"
         if len(self.args) == 2:
@@ -781,6 +796,17 @@ def eval_expr_vec(
         res = np.minimum(np.maximum(vs[0], vs[1]), vs[2])
     elif op == "median3":
         res = np.sort(np.stack(vs, axis=0), axis=0)[1]
+    elif op == "in_set":
+        table = np.zeros(1 << 12, dtype=bool)
+        for v in (expr.value or ()):
+            if 0 <= int(v) < table.size:
+                table[int(v)] = True
+        res = table[np.clip(vs[0], 0, table.size - 1)]
+    elif op == "in_ranges":
+        res = np.zeros_like(vs[0], dtype=bool)
+        for lo, hi in (expr.value or ()):
+            res |= (vs[0] >= int(lo)) & (vs[0] <= int(hi))
+        res = res.astype(vs[0].dtype)
     elif op == "mul3":
         ok &= (
             (np.abs(vs[0]) <= 1024) & (np.abs(vs[1]) <= 1024) & (np.abs(vs[2]) <= 1024)
@@ -4081,8 +4107,16 @@ class GrowingHagiProcessor:
 
     def verify_all(self, specs: Sequence[TaskSpec]) -> dict[str, Any]:
         total = correct = 0
+        # WAVE 203 FIX: REUSE-coverage — a task covered by a reused
+        # verified expert has NO entry in self.experts; without this
+        # map verify_all (and floors_ok downstream) undercounted
+        # coverage (61 experts / 62 covered tasks mismatch).
+        coverage: dict[str, str] = {}
+        for ev in self.growth_log:
+            if ev.get("action") == "REUSE" and "verified-expert-coverage:" in ev.get("reason", ""):
+                coverage[ev["task"]] = ev["reason"].split(":", 1)[1]
         for sp in specs:
-            ex = self.experts.get(sp.name)
+            ex = self.experts.get(sp.name) or self.experts.get(coverage.get(sp.name, ""))
             if ex is None:
                 continue
             rows = sp.inputs()
