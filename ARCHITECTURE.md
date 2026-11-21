@@ -50,12 +50,14 @@ hagi/pipeline.py: unified_ingest(u, source, data)
   кластеры готовы к изобретению по K_min образцам.
 
 ### Модули теории (primes-мосты, каждая формула из Lean)
-| Модуль | Теория |
-|---|---|
-| `sandwich.py` | C489/C495/C502 certified softmax argmax |
-| `growth.py` | C450/C504 residual-block growth (γ=0 identity) |
-| `full_pipeline.py` | C479 six-phase canonical chain |
-| `merge.py` | C479v2 telescope merge |
+| Модуль | Теория | Подключение |
+|---|---|---|
+| `pipeline.py` | единый конвейер | unified_ingest — ГЛАВНЫЙ вход |
+| `cycle.py` | C492/C504/C506 derive/weave/grow | neuro_symbolic_cycle CLI |
+| `sandwich.py` | C489/C495/C502 certified argmax | готов (ждёт потребителя) |
+| `growth.py` | C450/C504/C506 residual growth | готов (ждёт стековый носитель) |
+| `full_pipeline.py` | C479 six-phase chain | bench/tests |
+| `merge.py` | C479v2 telescope merge | bench/tests |
 
 ## Классический цикл (fabric tape-out)
 
