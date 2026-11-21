@@ -356,23 +356,59 @@ def matched_null_verdict(
     # Combinatorial significance: how many tables of this family exist
     # vs. all possible tables? A 16-point exact fit by a family of size F
     # over table-space T has p = F/T; significance bits = log2(T/F).
-    fam_sizes = {"OUT_PERIOD": 256, "POLY_LIN": 256, "SPARSE": None}
+    # WAVE 197 (research-diff applied, with the wave-183 overflow fix
+    # PRESERVED: the naive form table_space = K**n; T/F overflows
+    # float at n > ~250 — empirically re-verified). Two-stage null:
+    # stage 1 Occam bound for known-size families, stage 2 matched
+    # Monte-Carlo (same synthesizer on permuted outputs) for the rest.
     kind = bp.payload.get("kind", "")
-    F = fam_sizes.get(kind)
+    F = {"OUT_PERIOD": 256, "POLY_LIN": 256}.get(kind)
     if F is not None and n > 0:
-        # WAVE 183: log2(T/F) = n*log2(K) - log2(F) — no giant-int
-        # division (table_space = K**n overflows float at n > ~250).
         sig_bits = n * math.log2(max_y + 1) - math.log2(F)
-    else:
-        sig_bits = null_bits - bp_bits
-    verdict = "STRUCTURAL" if sig_bits >= z_threshold else "COMPRESSED"
-    return {
-        "verdict": verdict,
-        "z": round(sig_bits, 2),
-        "null_bits": round(null_bits, 1),
-        "bp_bits": bp_bits,
-        "significance_bits": round(sig_bits, 2),
-    }
+        verdict = "STRUCTURAL" if sig_bits >= z_threshold else "COMPRESSED"
+        return {"verdict": verdict, "z": round(sig_bits, 2),
+                "null_bits": round(null_bits, 1), "bp_bits": bp_bits,
+                "significance_bits": round(sig_bits, 2), "stage": "occam"}
+    analytic = null_bits - bp_bits
+    if analytic < z_threshold:
+        return {"verdict": "COMPRESSED", "z": round(analytic, 2),
+                "null_bits": round(null_bits, 1), "bp_bits": bp_bits,
+                "significance_bits": round(analytic, 2), "stage": "analytic"}
+    # stage 2: matched Monte-Carlo null (research diff; see test S1)
+    rng = rng or random.Random(0)
+
+    def _comparable_bits(cand_bp):
+        return 9 + _payload_bits(cand_bp.payload.get("kind", ""),
+                                 cand_bp.payload, n)
+
+    xs = [x for x, _ in pairs]
+    ys = [y for _, y in pairs]
+    obs = _comparable_bits(bp)
+    max_hits = int(alpha * (n_mc + 1)) - 1
+    nulls: list = []
+    hits = 0
+    for _ in range(n_mc):
+        perm = ys[:]
+        rng.shuffle(perm)
+        nb = synthesize_blueprint(list(zip(xs, perm)))
+        nbits = (_comparable_bits(nb) if nb is not None
+                 else int(null_bits))
+        nulls.append(nbits)
+        if nbits <= obs:
+            hits += 1
+            if hits > max_hits:
+                break
+    mu = sum(nulls) / len(nulls)
+    sd = max(math.sqrt(sum((v - mu) ** 2 for v in nulls) / len(nulls)),
+             1.0)  # 1-bit floor (MDL granularity)
+    z = (mu - obs) / sd
+    p = (1 + hits) / (len(nulls) + 1)
+    structural = z >= z_threshold and hits <= max_hits
+    return {"verdict": "STRUCTURAL" if structural else "COMPRESSED",
+            "z": round(z, 2), "null_bits": round(mu, 1),
+            "bp_bits": obs, "significance_bits": round(analytic, 2),
+            "p": round(p, 4), "n_null": len(nulls),
+            "stage": "matched_mc"}
 
 
 # --------------------------------------------------------------------------
