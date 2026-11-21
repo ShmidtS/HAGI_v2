@@ -414,8 +414,12 @@ def main() -> None:
                         "stopped; every cycle rewrites self_state.json "
                         "and generated_programs.py")
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--state-dir", type=Path, default=Path("checkpoints/self"))
+    p.add_argument("--state-dir", type=Path,
+                  default=None)  # resolved from hagi.util.CKPT_DIR
     a = p.parse_args()
+    if a.state_dir is None:
+        from hagi.util import CKPT_DIR
+        a.state_dir = CKPT_DIR / "self"
     if a.forever:
         import time as _time
         cycle = 0

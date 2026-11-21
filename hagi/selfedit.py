@@ -34,8 +34,9 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent  # repo root
-EDIT_LOG = ROOT / "checkpoints/self/self_edits.json"
-BASELINE_PATH = ROOT / "checkpoints/self/edit_baseline.json"
+from hagi.util import CKPT_DIR as _CKPT
+EDIT_LOG = _CKPT / "self" / "self_edits.json"
+BASELINE_PATH = _CKPT / "self" / "edit_baseline.json"
 
 # Declared safe knobs (name, candidates to try when exploring)
 KNOBS = {

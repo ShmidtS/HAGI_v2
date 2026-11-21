@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-GENESIS_LOG = ROOT / "checkpoints" / "self" / "archgenesis.json"
+from hagi.util import CKPT_DIR as _CKPT
+GENESIS_LOG = _CKPT / "self" / "archgenesis.json"
 
 # --- Declared architecture space (safe knobs only) ---
 # Each knob: list of legal values. The CURRENT value is excluded at
@@ -228,7 +229,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-EVO_LOG = ROOT / "checkpoints" / "self" / "ec_evolution.json"
+EVO_LOG = _CKPT / "self" / "ec_evolution.json"
 
 # --- Certified task: a fixed short-Weierstrass curve ---
 EC_P = 9739

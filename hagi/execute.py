@@ -24,7 +24,8 @@ import argparse
 import importlib.util
 from pathlib import Path
 
-DEFAULT_PROGRAMS = Path("checkpoints/self/generated_programs.py")
+from hagi.util import CKPT_DIR as _CKPT
+DEFAULT_PROGRAMS = _CKPT / "self" / "generated_programs.py"
 
 _mod = None
 

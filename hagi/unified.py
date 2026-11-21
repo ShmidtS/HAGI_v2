@@ -27,11 +27,9 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-# WAVE 178 (save-guard, backlog item from the smoke-accident):
-# HAGI_CKPT_DIR redirects ALL checkpoint writes (model, ledger,
-# domain bins) — tests/smoke models can never touch production.
-import os as _os
-CKPT_DIR = Path(_os.environ.get("HAGI_CKPT_DIR", str(ROOT / "checkpoints")))
+# WAVE 178/185c: CKPT_DIR lives in hagi.util (SSOT) — every module
+# routes checkpoint writes through it; HAGI_CKPT_DIR redirects all.
+from hagi.util import CKPT_DIR
 UNET_CKPT = CKPT_DIR / "unified.pt"
 LEDGER = CKPT_DIR / "unified_ledger.json"
 

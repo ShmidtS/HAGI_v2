@@ -87,7 +87,8 @@ def ask(query: str) -> str:
 def retrain() -> str:
     root = Path(__file__).resolve().parent.parent   # repo root
     pkg = root / "hagi"
-    base = root / "checkpoints" / "self"
+    from hagi.util import CKPT_DIR
+    base = CKPT_DIR / "self"
     files = [base / "generated_programs.py"] + \
             [root / f for f in SELF_SOURCES[1:]] + \
             [root / "README.md", root / "THEORY_ALIGNMENT.md"]

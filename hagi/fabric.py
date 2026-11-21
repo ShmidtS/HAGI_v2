@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-FABRIC_LOG = ROOT / "checkpoints" / "self" / "fabric.json"
+from hagi.util import CKPT_DIR as _CKPT
+FABRIC_LOG = _CKPT / "self" / "fabric.json"
 
 # --- 16 Venn opcodes as 4-bit masks, order (++),(+-),(-+),(--) in bits
 # 3,2,1,0 (bit 3 = value at (T,T), bit 0 = (F,F)) ---

@@ -49,7 +49,8 @@ def _resolve_device(t, dim: int = 0, hidden: int = 0) -> str:
     return "cuda" if cuda_ok and dim * hidden >= 8192 else "cpu"
 
 
-CKPT = Path("checkpoints/lm_byte.pt")
+from hagi.util import CKPT_DIR as _CKPT
+CKPT = _CKPT / "lm_byte.pt"
 
 
 def _torch_and_device():

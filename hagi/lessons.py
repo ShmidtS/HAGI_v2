@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-BOOK = Path("checkpoints/nadya_lessons.json")
+from hagi.util import CKPT_DIR as _CKPT
+BOOK = _CKPT / "nadya_lessons.json"
 
 
 def load_book() -> dict[str, str]:
@@ -31,7 +32,7 @@ def corpus() -> bytes:
     return " ".join(load_book().values()).encode("utf-8")
 
 
-SCHOOL_CKPT = Path("checkpoints/nadya_school.pt")
+SCHOOL_CKPT = _CKPT / "nadya_school.pt"
 
 
 def teach_school(epochs: int = 120, k: int = 10, dim: int = 96,

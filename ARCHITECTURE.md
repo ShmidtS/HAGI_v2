@@ -40,7 +40,10 @@ hagi/pipeline.py: unified_ingest(u, source, data)
 ```
 
 - `HAGI_SYMBOLIC=1` включает шаги 2–5 (default off — быстрый
-  реплей); `HAGI_CKPT_DIR` — все записи чекпоинтов (guard).
+  реплей); `HAGI_CKPT_DIR` — все записи чекпоинтов через SSOT
+  `hagi.util.CKPT_DIR` (волна 185c: fabric/genesis/lessons/lm/
+  selfedit/execute/mind/rewrite/selfedit — все переведены, прямые
+  пути "checkpoints/..." в пакете запрещены).
 - scripts/neuro_symbolic_cycle.py вызывает unified_ingest когда
   HAGI_SYMBOLIC=1 — тот же конвейер, что и в тестах/скриптах.
 - GapBuffer накапливает REPRESENTATION_GAP профили между доменами:
