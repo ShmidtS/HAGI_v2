@@ -134,11 +134,14 @@ python -X utf8 -u hagi/loop.py --max-rounds 24 --workers 32
 python -X utf8 -u hagi/selfmodel.py           # одношаговый self-model
 python -X utf8 -u hagi/rewrite.py --rounds 10      # рост + self-rewrite
 python -X utf8 -u hagi/rewrite.py --resume --rounds 10  # автономный рестарт
-python -m hagi.hagi.execute --list                        # все написанные программы
-python -m hagi.hagi.execute --task LANG8_XOR_CIPHER --text "привет" --key 42
-python -m hagi.hagi.ingest path/to/data.csv      # учиться на любых данных
-python -m hagi.hagi.lm train README.md --ternary # нейро-тело (CE + генерация)
-python -m hagi.hagi.lm generate "HAGI — " --n 120
+# Единый CLI (волна 190): одна точка входа для всех инструментов
+python -m hagi.cli --help                          # список команд
+python -m hagi.cli core --self-test-core           # self-test ядра
+python -m hagi.cli execute --list                  # все программы
+python -m hagi.cli execute --task LANG8_XOR_CIPHER --text "привет" --key 42
+python -m hagi.cli ingest path/to/data.csv         # учиться на данных
+python -m hagi.cli lm train README.md --ternary    # нейро-тело
+python -m hagi.cli lm generate "HAGI — " --n 120   # генерация
 ```
 
 ## Принципы

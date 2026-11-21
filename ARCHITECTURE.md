@@ -28,6 +28,12 @@
 | `controller.py`, `selfmodel.py`, `experiment.py` | v10 controller, self-model, A/B эксперименты |
 | `curriculum.py`, `lessons.py`, `ingest.py`, `execute.py`, `mind.py` | учебный контур и интерфейс |
 
+## ЕДИНЫЙ CLI (волна 190)
+
+`python -m hagi.cli <command>` — шлюз ко всем инструментам
+(core/lm/ingest/execute/loop/rewrite/genesis/certificates);
+старые `python -m hagi.<mod>` сохранены как тонкие обёртки.
+
 ## ЕДИНЫЙ КОНВЕЙЕР (волна 185 — одна точка входа)
 
 ```
