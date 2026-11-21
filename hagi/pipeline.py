@@ -114,25 +114,51 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
     return res
 
 
-def bytes_to_relation(data: bytes, k: int = 1) -> tuple[list[int], list[int]]:
-    """Extract the (input, output) relation a byte stream encodes.
-
-    k=1: adjacent byte pairs (x_i -> x_{i+1}) — the sequential law.
-    """ 
-    idx = np.frombuffer(data, dtype=np.uint8)
-    xs = idx[:-k].tolist()
-    ys = idx[k:].tolist()
-    return xs, ys
+def lm_residual_relation(u, source: str, data: bytes
+                         ) -> tuple[list[int], list[int]]:
+    """WAVE 196 FIX (P1): the symbolic phase previously used ADJACENT
+    byte pairs (x_i -> x_{i+1}) — a law of the data, NOT of the LM.
+    Now: sample real LM errors — contexts where the model's argmax
+    prediction missed the actual next byte. The relation handed to
+    invention is (context -> actual byte) on the model's OWN gaps.
+    """
+    import torch as _t
+    model = u.model
+    dev = getattr(model, "device", "cpu")
+    idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+    n = len(idx) - u.k
+    if n <= 0:
+        return [], []
+    misses_x: list[int] = []
+    misses_y: list[int] = []
+    step = max(1, n // 512)          # sample, bounded work
+    with _t.no_grad():
+        for i in range(0, n, step):
+            ctx = idx[i:i + u.k]
+            nxt = int(idx[i + u.k])
+            x = _t.as_tensor([ctx.tolist()], dtype=_t.long, device=dev)
+            try:
+                logits = model.logits(x)[0]
+                pred = int(logits.argmax())
+            except Exception:
+                continue
+            if pred != nxt:
+                misses_x.append(int(ctx[-1]))
+                misses_y.append(nxt)
+    return misses_x, misses_y
 
 
 def ingest_symbolic(u, source: str, data: bytes,
                     gap_buffer: GapBuffer | None = None) -> PipelineResult:
-    """Symbolic half of an ingest: derive the gap relation from the
-    LM's own holdout misses, then run diagnose->invent->adopt."""
+    """Symbolic half of an ingest: the gap relation is the LM's OWN
+    holdout misses (P1 fix), then diagnose->invent->adopt."""
     holdout_ce = u.domains.get(source, {}).get("ce")
     res = PipelineResult(source=source,
                          holdout_ce=holdout_ce if holdout_ce is not None else -1.0)
-    xs, ys = bytes_to_relation(data, k=1)
+    xs, ys = lm_residual_relation(u, source, data)
+    if not xs:
+        res.notes.append("no LM residuals sampled")
+        return res
     return symbolic_phase(source, xs, ys,
                           full_domain=sorted(set(xs)),
                           gap_buffer=gap_buffer)

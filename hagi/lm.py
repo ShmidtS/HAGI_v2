@@ -131,17 +131,35 @@ class ByteLM:
         n = len(idx) - self.k
         if n < 64:
             raise ValueError(f"need >= {self.k + 64} bytes, got {len(idx)}")
+        # WAVE 196 FIX (P1): random window split leaks context —
+        # windows i and i+1 share k-1 bytes, so holdout windows had
+        # their contexts (partly) seen in train. Split by CONTIGUOUS
+        # blocks instead: holdout blocks are disjoint from train.
         rng = np.random.default_rng(7)
-        perm = rng.permutation(n)
-        n_hold = max(8, int(n * holdout))
-        hold = np.sort(perm[:n_hold])
-        train = np.sort(perm[n_hold:])
+        block = self.k + 1                  # one full window per block
+        n_blocks = n // block
+        n_hold_blocks = max(1, int(n_blocks * holdout))
+        hold_blocks = rng.choice(n_blocks, n_hold_blocks, replace=False)
+        hold_mask = np.zeros(n_blocks, dtype=bool)
+        hold_mask[hold_blocks] = True
+        positions = np.arange(n_blocks) * block
+        hold = np.concatenate([positions[b] + np.arange(block - self.k)
+                               for b in np.where(hold_mask)[0]])
+        train = np.concatenate([
+            np.concatenate([positions[b] + np.arange(block - self.k)
+                            for b in np.where(~hold_mask)[0]])]) if (~hold_mask).any() else np.array([], dtype=np.int64)
+        # train_guarded uses windows(train) with full-size batches —
+        # ensure at least one train window:
+        if len(train) == 0:
+            train = hold[:1]  # degenerate; holdout-only data is pathological
+
+        dev = getattr(self, "device", "cpu")
 
         def windows(sel):
             x = np.stack([idx[i:i + self.k] for i in sel])
             y = idx[sel + self.k]
-            return (t.as_tensor(x, dtype=t.long),
-                    t.as_tensor(y, dtype=t.long))
+            return (t.as_tensor(x, dtype=t.long, device=dev),
+                    t.as_tensor(y, dtype=t.long, device=dev))
 
         ctx_tr, nxt_tr = windows(train)
         ctx_va, nxt_va = windows(hold)

@@ -120,9 +120,15 @@ def holdout_validate(trace: list[dict[str, Any]],
                 unknown_safe += 1
         elif pred != truth:
             confident_wrong += 1
+    # WAVE 196 FIX (P1): a model with ZERO coverage (predicts None
+    # for every holdout item) trivially has confident_wrong == 0 —
+    # it passed the gate while predicting nothing. Coverage is now
+    # required for the "exact" verdict.
+    covered = sum(1 for t in hold if m.predict_success(t) is not None)
+    coverage = covered / len(hold) if hold else 0.0
     return {"holdout_size": len(hold), "confident_wrong": confident_wrong,
-            "unknown_safe": unknown_safe,
-            "exact": confident_wrong == 0}
+            "unknown_safe": unknown_safe, "coverage": round(coverage, 4),
+            "exact": confident_wrong == 0 and coverage > 0.0}
 
 
 # ---------------------------------------------------------- policy processor --
