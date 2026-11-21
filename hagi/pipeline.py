@@ -69,16 +69,34 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
 
     pairs = sorted(zip(xs, ys))
     result = invent_blueprint([pairs], rng, max_attempts=max_attempts)
-    if not result:
-        res.notes.append("invention: no blueprint")
-        return res
-    res.invented = {k: result[k] for k in
-                    ("status", "q_name", "q_param", "verdict")}
-    bp = result.get("blueprints", [None])[0]
-    if bp is None:
-        return res
-
-    sweep = verify_blueprint(bp, pairs, full_domain)
+    if not result or not result.get("blueprints"):
+        # WAVE 187: second path — Active CEGIS (query-driven proof).
+        # The oracle is the relation itself (xs->ys map); budget
+        # honest: it probes only the domain we already possess.
+        from hagi.cegis import cegis_invent
+        oracle_map = dict(pairs)
+        oracle = lambda x: oracle_map.get(x)
+        try:
+            cegis = cegis_invent(sorted(set(xs)), oracle,
+                                 cegis_pool=sorted(set(xs))[:64],
+                                 full_domain=full_domain,
+                                 max_rounds=4, query_budget=400,
+                                 rng=rng)
+        except Exception as e:
+            res.notes.append(f"cegis error: {e}")
+            return res
+        res.invented = {"status": cegis.status, "path": "cegis",
+                        "queries": cegis.queries}
+        if cegis.status != "PROVEN_EXACT" or cegis.blueprint is None:
+            res.notes.append(f"cegis: {cegis.status}")
+            return res
+        bp = cegis.blueprint
+        sweep = {"status": "PROVEN_EXACT"}  # cert-phase already swept
+    else:
+        bp = result.get("blueprints", [None])[0]
+        res.invented = {k: result[k] for k in
+                        ("status", "q_name", "q_param", "verdict")}
+        sweep = verify_blueprint(bp, pairs, full_domain)
     if sweep.get("status") != "PROVEN_EXACT":
         res.notes.append(f"gate: {sweep.get('status')}")
         return res
