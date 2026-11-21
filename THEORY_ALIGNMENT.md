@@ -2441,3 +2441,13 @@ self-edit гейт работает (no-op фильтр активен), failure
   критерий допустим. A-GEM conditional — опция, наша per-step
   ортогонализация строже. Расхождений нет.
 - Bernoulli mono (C489 pin закрыт upstream): отражён в adaptive nm.
+
+## Сверка primes круг 16 (волна 184, C504)
+- GrowTrunkBlock.lean: рост trunk ЦЕЛЫМ residual-блоком y=x+γ·h(x);
+  γ=0 — точная identity (benchResidual_zero), obj инвариантен,
+  польза только из последующего certified обучения. Перенесено как
+  hagi/growth.py (ResidualBlock + grow_trunk + obj_invariant_check,
+  60 строк). Honest pins приняты: нейтральная адмиссия шага 0,
+  Lipschitz не утверждается при γ=0.
+- Ключевой пин upstream: rms-норма НЕ даёт identity (1000/1001≠1) —
+  identity ТОЛЬКО через residual-zero гейт. Зафиксировано в докстринге.
