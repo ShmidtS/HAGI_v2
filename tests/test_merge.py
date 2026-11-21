@@ -1,6 +1,4 @@
 """NonlinearMerge: certified checkpoint-merge bound."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.merge import merge_bound, diag_quadratic_merge
 

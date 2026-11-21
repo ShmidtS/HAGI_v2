@@ -1,6 +1,4 @@
 """AdaptiveMajorizer: variance-sensitive certified CE step."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, torch
 from hagi.lm import CertifiedStepLM
 

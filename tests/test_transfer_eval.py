@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 """Transfer gate tests (Phase 4): the 4 COMMIT conditions + rollback."""
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hagi.transfer_eval import CapabilityMeter, TaskResult
 

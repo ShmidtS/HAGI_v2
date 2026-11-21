@@ -6,9 +6,6 @@ Full cycle on synthetic mod-N worlds (v4.6-style OOD):
   invent (OUT_PERIOD blueprint) -> PROVEN_EXACT ->
   zero-shot transfer gate -> COMMIT as registered Representation.
 """
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hagi import env_lut as env
 from hagi.diagnosis import GapBuffer, GapRecord, HoldReason, build_residual_profile

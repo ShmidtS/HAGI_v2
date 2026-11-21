@@ -4,8 +4,6 @@ Contract: after consolidate_subspace(X_A) with full span, training
 task B leaves loss(A) EXACTLY invariant (gpm_zero_forgetting):
 Delta_W lives in null(U^T) => X_A @ Delta_W = 0.
 """
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.core import ContinualGPMMemory
 

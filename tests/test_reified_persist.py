@@ -1,7 +1,6 @@
 """Reification persistence: invented ops survive cold restart."""
 import os, sys, tempfile
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hagi.core import Expr, REIFIED_OPS
 from hagi.invention import ConstructBlueprint
 from hagi.reifier import (reify_construct, clear_reified,

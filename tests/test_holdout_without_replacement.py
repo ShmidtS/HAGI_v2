@@ -7,8 +7,6 @@ variance condition holds; otherwise it is the standard WR bound
 itself, still valid for i.i.d. surrogate. The sampling itself must
 be strictly without replacement.
 """
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.core import AuditLedger
 

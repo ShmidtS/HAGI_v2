@@ -1,6 +1,4 @@
 """C474: EF21 in-step quantized certified training (Theory/EF21InStep)."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.lm import CertifiedStepLM
 

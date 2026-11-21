@@ -1,6 +1,4 @@
 """C479: unified six-phase cycle — glue semantics (commit/hold honesty)."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.full_pipeline import six_phase_cycle
 

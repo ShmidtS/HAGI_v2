@@ -1,7 +1,6 @@
 """Diagnosis→search wire: hints reorder the family enumeration but
 never change the chosen blueprint (MDL criterion is order-free)."""
 import os, sys, random
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hagi.invention import invent_blueprint, synthesize_blueprint
 from hagi.rdl import mk_cnt_mod
 

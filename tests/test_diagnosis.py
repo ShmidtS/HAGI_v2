@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 """Gap diagnosis tests (Phase 2)."""
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hagi.diagnosis import (
     GapBuffer, HoldReason, build_residual_profile, classify_hold,

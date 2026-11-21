@@ -17,7 +17,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import hagi  # noqa: E402
 
 GOLD = {

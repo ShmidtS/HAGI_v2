@@ -1,6 +1,4 @@
 """Integration wires: disjoint splits, WhileLoopIR, neural prior."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.core import AuditLedger
 from hagi.while_loop import (discover_while_loop_candidates,

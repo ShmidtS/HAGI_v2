@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Invention MetaGrammar tests (Phase 3) — the 4 invariant properties."""
 import random
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hagi import invention as inv
 from hagi.invention import (

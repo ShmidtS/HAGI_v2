@@ -3,9 +3,6 @@
 round-trip (save state with the construct, reload, solve from the same
 family on first attempt, without re-invention)."""
 import json
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hagi.core import Expr
 from hagi.invention import invent_blueprint, verify_blueprint

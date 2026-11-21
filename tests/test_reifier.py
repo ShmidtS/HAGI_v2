@@ -1,6 +1,4 @@
 """V10-2: reification — invented concepts become composable ops."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hagi.core import Expr, REIFIED_OPS
 from hagi.invention import ConstructBlueprint
 from hagi.reifier import (reify_construct, snapshot_reified, clear_reified)

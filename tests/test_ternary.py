@@ -1,6 +1,4 @@
 """b1.58 per-row ternary quantization (Energy/STEStep.lean contracts)."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from hagi.lm import CertifiedStepLM
 

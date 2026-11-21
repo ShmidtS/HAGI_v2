@@ -1,6 +1,4 @@
 """V10-3: two-part MDL capability gate."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hagi.capability import (CapabilitySnapshot, capability_delta,
                              total_mdl, heldout_suite, noise_panel)
 

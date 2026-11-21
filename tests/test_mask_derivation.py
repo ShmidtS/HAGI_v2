@@ -1,7 +1,6 @@
 """Data-born quotients: analytical mask derivation from XOR-difference
 structure (user insight: construct born from the data, not the menu)."""
 import os, sys, random
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hagi.invention import (derive_mask_quotient, invent_blueprint,
                             QUOTIENTS)
 

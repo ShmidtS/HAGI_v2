@@ -1,6 +1,4 @@
 """C477: Hadamard incoherence gate (Theory/HadamardIncoherence.lean)."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from hagi.hadamard import sylvester, coh_sq, rotate_gate, quantize_rows_with_gate
 

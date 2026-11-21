@@ -1,6 +1,4 @@
 """C428/C472: closed-form bit-budget allocation."""
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import math
 from hagi.budget import weighted_exp_allocation, fisher_tolerances
 
