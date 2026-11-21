@@ -117,9 +117,10 @@ def main():
     for nm in lm2.params():
         nm.data = nm.data.to(lm2.device)
     ok = 0
-    tests = [("0 XOR 0 = ", "0"), ("1 XOR 1 = ", "0"),
-             ("12 XOR 10 = ", "6"), ("6 & 3 = ", "2"),
-             ("12 & 10 = ", "8"), ("CHR 61 = ", "DEC 97")]
+    # WAVE 181: format matches the generated corpus (4-bit tables)
+    tests = [("0101 XOR 0011 = ", "0110"), ("0101 AND 0011 = ", "0001"),
+             ("1100 XOR 1010 = ", "0110"), ("NOT 0101 = ", "1010"),
+             ("6 XOR 3 = ", "5"), ("CHR 97 ", "HEX 61")]
     for tt, want in tests:
         out = lm2.generate(tt, n_bytes=len(want)+2, temp=0.1)
         gen = out[len(tt):].strip()
