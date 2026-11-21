@@ -211,7 +211,7 @@ class ParallelLearner:
     their commits are merged into the parent in stream order (batch
     semantics, identical for growth and replay -> deterministic).
     With train_neural=True every learn also fits the neural core
-    (FactorizedSharedCoreV9 adapters); core/router states ride the diff
+    (FactorizedSharedCore adapters); core/router states ride the diff
     and are restored in stream order. Exact outcomes are unaffected
     (commit gate uses exact programs only), so determinism holds."""
 
@@ -344,7 +344,7 @@ def run_stream(proc, segments: list[tuple[int, int]],
             # generate one batch of proposals from the current snapshot
             batch: list[tuple[Any, int]] = []
             while k < n_prop and len(batch) < batch_size:
-                prop = hagi.propose_noncircular_task_v9(proc.experts, rng, 0, seen)
+                prop = hagi.propose_noncircular_task(proc.experts, rng, 0, seen)
                 if prop is None:
                     k = n_prop
                     break

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hagi.core import ExprV9
+from hagi.core import Expr
 from hagi.invention import invent_blueprint, verify_blueprint
 from hagi.rdl import mk_cnt_mod
 from hagi.representations import register_artifact_factory
@@ -48,12 +48,12 @@ def test_invented_construct_survives_resume(tmp_path=None):
     assert r is not None and r["status"] == "INVENTED"
     bp = r["blueprints"][0]
     p, o = bp.payload["p"], bp.payload["o"]
-    e = ExprV9("construct", (), {"repr_id": "out_period",
+    e = Expr("construct", (), {"repr_id": "out_period",
                                  "artifact": PeriodArtifact(p, o, range(16))})
     # save (resume round-trip via JSON)
     state = json.dumps({"expr": e.to_dict()})
     loaded = json.loads(state)
-    e2 = ExprV9.from_dict(loaded["expr"])
+    e2 = Expr.from_dict(loaded["expr"])
     # after "resume": solve the same family on a FRESH task without
     # re-invention — the restored construct evaluates new mod-N tasks?
     # Honest: the construct is p/o-specific; the FAMILY knowledge means

@@ -6,9 +6,9 @@ Phase 1 of the representation-invention refactor. Provides:
 - Representation protocol: builtin and invented solvers behind one
   interface (supports_task / probe_potential / synthesize).
 - Artifact protocol: eval / supports / bits / verify_contract /
-  to_dict / emit_python — what ExpertV9, rewrite.py, mdl.py and
+  to_dict / emit_python — what Expert, rewrite.py, mdl.py and
   execute.py consume.
-- REPR_REGISTRY: id -> Representation. ExprV9 gains a delegating
+- REPR_REGISTRY: id -> Representation. Expr gains a delegating
   "construct" op via CONSTRUCT_HOOK (evaluated by registry, zero
   edits to core.py if-elif ladder: the hook is invoked from the OPS
   fallback through construct_eval).
@@ -70,7 +70,7 @@ def get(repr_id: str) -> Representation:
 
 
 # --------------------------------------------------------------------------
-# ExprV9 construct-op delegation (invoked from core via construct_eval)
+# Expr construct-op delegation (invoked from core via construct_eval)
 # --------------------------------------------------------------------------
 
 def construct_eval(value: Any, xs: Sequence[int],
@@ -224,7 +224,7 @@ def artifact_from_payload(payload: dict) -> dict:
     return {"repr_id": rid, "artifact": factory(payload["artifact"])}
 
 
-# ExprV9 helpers for construct nodes (called from core to_dict/from_dict)
+# Expr helpers for construct nodes (called from core to_dict/from_dict)
 
 def construct_to_dict_safe(value: dict) -> dict:
     return artifact_to_payload(value)

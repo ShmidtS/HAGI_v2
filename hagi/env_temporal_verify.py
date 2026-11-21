@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent verifier for HAGI Environment Growth v4.4.
+"""Independent verifier for HAGI Environment Growth.
 
 Does not import the learner/agent module. Recomputes hidden transition tables from
 serialized audit facts, checks all plans, query traces, model mappings, checkpoints,

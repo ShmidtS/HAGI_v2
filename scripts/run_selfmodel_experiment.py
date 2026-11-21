@@ -40,7 +40,7 @@ def main() -> int:
         for spec in hagi.make_task_suite():
             tracer.learn(spec, seed=10_000, train_neural=False)
         for k in range(10):
-            proposal = hagi.propose_noncircular_task_v9(tracer.experts, rng, 0, seen)
+            proposal = hagi.propose_noncircular_task(tracer.experts, rng, 0, seen)
             if proposal is None:
                 continue
             spec, _parents = proposal

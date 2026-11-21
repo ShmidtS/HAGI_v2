@@ -1,7 +1,7 @@
 """HAGI core — single-module kernel (merged _legacy + _v9).
 
 Merge preserves the historical override semantics exactly: the whole
-V5-V8 legacy body executes first, then the V9 canonical body — later
+legacy body executes first, then the canonical body — later
 definitions win for the ~28 shared names, and V9 top-level code sees
 the legacy versions of helpers at module-execution time, same as the
 old star-import chain.
@@ -17,8 +17,8 @@ Canonical merged build. Sources: .omc/hagi_v8_4.py (Parts I-III) +
 helpers — v9 carries the pivot_rows guard in exact poly induction and
 other refinements; class names are suffixed so both lineages coexist.
 
-CLI: --self-test (v8.4) | --self-test-v9 | --self-test-v7 | --self-test-v5 |
-     --grow (v8.4 loop) | --grow-v9 | --benchmark-v9 [--max-rounds N] [--out-dir DIR]
+CLI: --self-test-core | --self-test-v7 | --self-test-v5 |
+     --grow (legacy loop) | --grow-deep | --benchmark-core [--max-rounds N] [--out-dir DIR]
 """
 import argparse
 import copy
@@ -311,31 +311,31 @@ def make_task_suite() -> list[TaskSpec]:
 
 
 # ==============================================================================
-# 3. Call-DAG AST, ProgramV9 & Vectorized Evaluator
+# 3. Call-DAG AST, Program & Vectorized Evaluator
 # ==============================================================================
 
 # V10-2: Reified operator registry — invented coordinates promoted to
-# first-class unary/binary macro-ops usable inside ExprV9 programs.
+# first-class unary/binary macro-ops usable inside Expr programs.
 # Filled by hagi.reifier.reify_construct(); persists via to_state().
 REIFIED_OPS: dict = {}
 
 
 @dataclass(frozen=True)
-class ExprV9:
+class Expr:
     op: str
-    args: tuple["ExprV9", ...] = ()
+    args: tuple["Expr", ...] = ()
     value: Optional[Any] = None
 
     @staticmethod
-    def var(i: int) -> "ExprV9":
-        return ExprV9("var", (), int(i))
+    def var(i: int) -> "Expr":
+        return Expr("var", (), int(i))
 
     @staticmethod
-    def const(v: int) -> "ExprV9":
-        return ExprV9("const", (), int(v))
+    def const(v: int) -> "Expr":
+        return Expr("const", (), int(v))
 
     def eval(
-        self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None
+        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None
     ) -> int:
         if self.op == "var":
             return int(xs[int(self.value)])
@@ -468,28 +468,28 @@ class ExprV9:
             out |= a.callees()
         return out
 
-    def substitute(self, mapping: dict[int, "ExprV9"]) -> "ExprV9":
+    def substitute(self, mapping: dict[int, "Expr"]) -> "Expr":
         if self.op == "var":
             idx = int(self.value or 0)
             return mapping.get(idx, self)
         if not self.args:
             return self
-        return ExprV9(
+        return Expr(
             self.op, tuple(a.substitute(mapping) for a in self.args), self.value
         )
 
-    def subtrees(self) -> list["ExprV9"]:
+    def subtrees(self) -> list["Expr"]:
         out = [self]
         for a in self.args:
             out.extend(a.subtrees())
         return out
 
-    def replace_subtree(self, target: "ExprV9", replacement: "ExprV9") -> "ExprV9":
+    def replace_subtree(self, target: "Expr", replacement: "Expr") -> "Expr":
         if self == target:
             return replacement
         if not self.args:
             return self
-        return ExprV9(
+        return Expr(
             self.op,
             tuple(a.replace_subtree(target, replacement) for a in self.args),
             self.value,
@@ -586,7 +586,7 @@ class ExprV9:
         return {"op": self.op, "value": val, "args": [a.to_dict() for a in self.args]}
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ExprV9":
+    def from_dict(d: dict[str, Any]) -> "Expr":
         op = str(d["op"])
         val = d.get("value")
         if op == "poly" and val is not None:
@@ -599,13 +599,13 @@ class ExprV9:
             from hagi.representations import construct_from_dict_safe
 
             val = construct_from_dict_safe(val)
-        return ExprV9(op, tuple(ExprV9.from_dict(a) for a in d.get("args", [])), val)
+        return Expr(op, tuple(Expr.from_dict(a) for a in d.get("args", [])), val)
 
 
 @dataclass(frozen=True)
-class ProgramV9:
+class Program:
     arity: int
-    expr: Optional[ExprV9] = None
+    expr: Optional[Expr] = None
     venn_mask: Optional[int] = None
 
     @property
@@ -624,7 +624,7 @@ class ProgramV9:
         return self.expr.bits(expert_index)
 
     def eval(
-        self, xs: Sequence[int], env: Optional[dict[str, "ExpertV9"]] = None
+        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None
     ) -> int:
         if len(xs) != self.arity:
             raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")
@@ -650,10 +650,10 @@ class ProgramV9:
         }
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ProgramV9":
-        return ProgramV9(
+    def from_dict(d: dict[str, Any]) -> "Program":
+        return Program(
             int(d["arity"]),
-            ExprV9.from_dict(d["expr"]) if d.get("expr") else None,
+            Expr.from_dict(d["expr"]) if d.get("expr") else None,
             d.get("venn_mask"),
         )
 
@@ -662,7 +662,7 @@ _VEC_MAG_LIMIT = 1 << 28
 
 
 def eval_expr_vec(
-    expr: ExprV9, X: np.ndarray, env: Optional[dict[str, "ExpertV9"]] = None
+    expr: Expr, X: np.ndarray, env: Optional[dict[str, "Expert"]] = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Conservative vectorized int64 evaluator (ok=False lanes -> scalar authority)."""
     N = X.shape[0]
@@ -849,38 +849,38 @@ def eval_expr_vec(
     return res, ok
 
 
-def candidate_programs_v9(arity: int) -> list[ProgramV9]:
-    v = [ExprV9.var(i) for i in range(arity)]
-    cands: list[ExprV9] = []
+def candidate_programs(arity: int) -> list[Program]:
+    v = [Expr.var(i) for i in range(arity)]
+    cands: list[Expr] = []
     if arity == 1:
         x = v[0]
         cands += [
-            ExprV9("neg", (x,)),
-            ExprV9("abs", (x,)),
-            ExprV9("sign", (x,)),
-            ExprV9("bit_not8", (x,)),
-            ExprV9("square", (x,)),
-            ExprV9("cube", (x,)),
-            ExprV9("clamp3", (x,)),
+            Expr("neg", (x,)),
+            Expr("abs", (x,)),
+            Expr("sign", (x,)),
+            Expr("bit_not8", (x,)),
+            Expr("square", (x,)),
+            Expr("cube", (x,)),
+            Expr("clamp3", (x,)),
         ]
     elif arity == 2:
         x, y = v
         for op in BINARY_OPS:
-            cands.append(ExprV9(op, (x, y)))
-        cands.extend([ExprV9("sub", (y, x)), ExprV9("absdiff", (x, y))])
+            cands.append(Expr(op, (x, y)))
+        cands.extend([Expr("sub", (y, x)), Expr("absdiff", (x, y))])
     elif arity == 3:
         x, y, z = v
         cands += [
-            ExprV9("fma", (x, y, z)),
-            ExprV9("clamp", (x, y, z)),
-            ExprV9("median3", (x, y, z)),
-            ExprV9("mul3", (x, y, z)),
+            Expr("fma", (x, y, z)),
+            Expr("clamp", (x, y, z)),
+            Expr("median3", (x, y, z)),
+            Expr("mul3", (x, y, z)),
         ]
     by_text = {}
     for e in cands:
         by_text.setdefault(e.pretty(), e)
     return [
-        ProgramV9(arity, e)
+        Program(arity, e)
         for e in sorted(by_text.values(), key=lambda e: (e.cost, e.pretty()))
     ]
 
@@ -988,30 +988,30 @@ def anf_support_vars(coeffs: Sequence[int], n_vars: int) -> tuple[int, ...]:
     return tuple(i for i in range(n_vars) if (used >> (n_vars - 1 - i)) & 1)
 
 
-def anf_to_expr_v9(coeffs: Sequence[int], n_vars: int) -> ExprV9:
+def anf_to_expr(coeffs: Sequence[int], n_vars: int) -> Expr:
     sparse = tuple((s, 1) for s, c in enumerate(coeffs) if c)
     if len(sparse) == 0:
-        return ExprV9.const(0)
+        return Expr.const(0)
     if len(sparse) == 1 and sparse[0][0] == 0:
-        return ExprV9.const(1)
+        return Expr.const(1)
     if len(sparse) <= 4:
         mons = []
         for s, _ in sparse:
             if s == 0:
-                mons.append(ExprV9.const(1))
+                mons.append(Expr.const(1))
             else:
                 vs = [
-                    ExprV9.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1
+                    Expr.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1
                 ]
                 t = vs[0]
                 for v in vs[1:]:
-                    t = ExprV9("bit_and", (t, v))
+                    t = Expr("bit_and", (t, v))
                 mons.append(t)
         res = mons[0]
         for m in mons[1:]:
-            res = ExprV9("bit_xor", (res, m))
+            res = Expr("bit_xor", (res, m))
         return res
-    return ExprV9("anf", (), (n_vars, sparse))
+    return Expr("anf", (), (n_vars, sparse))
 
 
 _HADAMARD_CACHE: dict[int, np.ndarray] = {}
@@ -1314,7 +1314,7 @@ def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 4) -> np.ndarray:
     return X.T if transposed else X
 
 
-class ContinualGPMMemoryV9(GpuGpmMixin):
+class ContinualGPMMemory(GpuGpmMixin):
     """GPM + SpaceDecoupling (P_R = I - UU^T) + EF21Markov + Newton-Schulz Muon.
 
     train_task_ef21_muon / consolidate_subspace dispatch to the GPU
@@ -1520,7 +1520,7 @@ def _press_score_ridge(
     return loo_mse, loo_acc
 
 
-class FactorizedSharedCoreV9:
+class FactorizedSharedCore:
     """Minimal-volume shared core (Hadamard+SwiGLU+Fourier + Continual GPM)."""
 
     BRANCHES = ("poly", "hinge", "bit", "core")
@@ -1540,7 +1540,7 @@ class FactorizedSharedCoreV9:
         self.W2g = Q2g * 1.3
         self.b2g = rng.uniform(-0.8, 0.8, (1, width))
         self.H8 = sylvester_hadamard(3)
-        self.gpm = ContinualGPMMemoryV9(d_in=16, d_out=1, seed=seed + 7)
+        self.gpm = ContinualGPMMemory(d_in=16, d_out=1, seed=seed + 7)
         self.core_bytes = 8
 
     def snapshot(self) -> dict[str, Any]:
@@ -1736,8 +1736,8 @@ class FactorizedSharedCoreV9:
         train_y: Sequence[int],
         val_x: Sequence[Sequence[int]],
         val_y: Sequence[int],
-        router: Optional["HedgeRouterV9"] = None,
-    ) -> "FactorizedAdapterV9":
+        router: Optional["HedgeRouter"] = None,
+    ) -> "FactorizedAdapter":
         tx = np.asarray(train_x, dtype=np.float64)
         ty = np.asarray(train_y, dtype=np.float64)
         vx = np.asarray(val_x, dtype=np.float64) if val_x else tx
@@ -1933,7 +1933,7 @@ class FactorizedSharedCoreV9:
             pred_q = (_align_cols(Phi_va, len(wq)) @ wq) * sy
             nb_total = 6 + len(packed)
 
-        return FactorizedAdapterV9(
+        return FactorizedAdapter(
             arity=d,
             branch=bname,
             mode=mode,
@@ -1950,7 +1950,7 @@ class FactorizedSharedCoreV9:
 
 
 @dataclass
-class FactorizedAdapterV9:
+class FactorizedAdapter:
     arity: int
     branch: str
     mode: str
@@ -1964,7 +1964,7 @@ class FactorizedAdapterV9:
     val_exact_acc_quant: float
     val_mse_quant: float
 
-    def predict(self, core: FactorizedSharedCoreV9, xs: Sequence[int]) -> float:
+    def predict(self, core: FactorizedSharedCore, xs: Sequence[int]) -> float:
         x = np.asarray(xs, dtype=np.float64).reshape(1, -1)
         Phi = core.features(self.branch, x, self.sx)
         if self.mode == "ce" and self.ce_meta is not None:
@@ -2012,8 +2012,8 @@ class FactorizedAdapterV9:
 
     @staticmethod
     def from_dict(
-        d: dict[str, Any], core: "FactorizedSharedCoreV9"
-    ) -> "FactorizedAdapterV9":
+        d: dict[str, Any], core: "FactorizedSharedCore"
+    ) -> "FactorizedAdapter":
         arity = int(d["arity"])
         branch = str(d["branch"])
         mode = str(d["mode"])
@@ -2049,7 +2049,7 @@ class FactorizedAdapterV9:
                     "b2": all_wq[p3:].reshape(sb2),
                     "packed": mp,
                 }
-        return FactorizedAdapterV9(
+        return FactorizedAdapter(
             arity=arity,
             branch=branch,
             mode=mode,
@@ -2070,7 +2070,7 @@ class FactorizedAdapterV9:
 # ==============================================================================
 
 
-class CRAMEngineV9:
+class CRAMEngine:
     @staticmethod
     def solve_coloring(
         edges: Sequence[tuple[int, int]],
@@ -2307,7 +2307,7 @@ class CRAMEngineV9:
         seed: int = 42,
     ) -> dict[str, Any]:
         """B4 Alternating (z, y)-Rounds: settle latent z -> attention coupling -> guarded visible descent."""
-        res_z = CRAMEngineV9.solve_latent_maze(n_nodes, adj, goal, eps_z=1e-6)
+        res_z = CRAMEngine.solve_latent_maze(n_nodes, adj, goal, eps_z=1e-6)
         z = res_z["z"]
         rng = np.random.default_rng(seed)
         kappa = np.zeros((n_nodes, n_nodes), dtype=np.float64)
@@ -2316,7 +2316,7 @@ class CRAMEngineV9:
                 kappa[i, j] = 1.0
         f_compat = np.eye(num_colors, dtype=np.float64)
         scores_z = np.outer(z, z) * 4.0
-        K = CRAMEngineV9.attention_coupling_matrix(kappa, scores_z, f_compat)
+        K = CRAMEngine.attention_coupling_matrix(kappa, scores_z, f_compat)
         assert np.allclose(K, K.transpose(1, 0, 3, 2))
         y = [int(rng.integers(0, num_colors)) for _ in range(n_nodes)]
 
@@ -2415,7 +2415,7 @@ def boundary_heads(boundary: Callable[[Any], bool], xs: Sequence[Any]) -> list[A
     return [c[0] for c in boundary_chunks(boundary, xs)]
 
 
-class GDNRAMV9:
+class GDNRAM:
     """Lag-1 associative store/load with verified roundtrip, slot isolation, stutter normalization."""
 
     def __init__(self, n_slots: int, dim: int):
@@ -2474,7 +2474,7 @@ class CertStepGen:
     floors_kept: bool
 
 
-class HedgeRouterV9:
+class HedgeRouter:
     """Bounded-loss Hedge router with verified ewNorm anti-lock-in floor."""
 
     def __init__(self, n_experts: int, eta: float = 0.5):
@@ -2516,7 +2516,7 @@ class AuditStream:
 
 
 @dataclass
-class AuditLedgerV9:
+class AuditLedger:
     """C264/C274 AuditLedger: disjoint streams, alpha spending, floors, final_test_untouched."""
 
     delta_total: float = 0.05
@@ -2860,19 +2860,19 @@ def _exact_multivariate_poly_fit(
     return None
 
 
-def _fit_poly_or_const(pts: list[tuple[int, int]]) -> Optional[ExprV9]:
+def _fit_poly_or_const(pts: list[tuple[int, int]]) -> Optional[Expr]:
     ys = {y for _, y in pts}
     if len(ys) == 1:
-        return ExprV9.const(next(iter(ys)))
+        return Expr.const(next(iter(ys)))
     coeffs = _exact_poly_fit([x for x, _ in pts], [y for _, y in pts], max_degree=3)
     if coeffs is not None:
-        return ExprV9("poly", (ExprV9.var(0),), coeffs)
+        return Expr("poly", (Expr.var(0),), coeffs)
     return None
 
 
 def exact_piecewise_poly_fit(
     train_x: Sequence[tuple[int, ...]], train_y: Sequence[int]
-) -> Optional[ExprV9]:
+) -> Optional[Expr]:
     """Exact rational piecewise polynomial / modular residue / generalized predicate discovery."""
     arity = len(train_x[0])
     if arity == 1:
@@ -2883,7 +2883,7 @@ def exact_piecewise_poly_fit(
                 buckets.setdefault(x % m, set()).add(y)
             if all(len(vs) == 1 for vs in buckets.values()) and len(buckets) >= 2:
                 if m == 2 and buckets.get(0) == {0} and buckets.get(1) == {1}:
-                    return ExprV9("bit_and", (ExprV9.var(0), ExprV9.const(1)))
+                    return Expr("bit_and", (Expr.var(0), Expr.const(1)))
         for thr in (-3, -2, -1, 0, 1, 2, 3):
             left = [(x, y) for x, y in zip(xs, train_y) if x < thr]
             right = [(x, y) for x, y in zip(xs, train_y) if x >= thr]
@@ -2891,26 +2891,26 @@ def exact_piecewise_poly_fit(
                 cl = _fit_poly_or_const(left)
                 cr = _fit_poly_or_const(right)
                 if cl is not None and cr is not None and cl != cr:
-                    return ExprV9(
+                    return Expr(
                         "if_cond",
-                        (ExprV9("lt", (ExprV9.var(0), ExprV9.const(thr))), cl, cr),
+                        (Expr("lt", (Expr.var(0), Expr.const(thr))), cl, cr),
                     )
     elif 2 <= arity <= 3:
-        preds: list[tuple[ExprV9, Callable[[tuple[int, ...]], bool]]] = [
-            (ExprV9("lt", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] < r[1]),
-            (ExprV9("le", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] <= r[1]),
-            (ExprV9("eq", (ExprV9.var(0), ExprV9.var(1))), lambda r: r[0] == r[1]),
+        preds: list[tuple[Expr, Callable[[tuple[int, ...]], bool]]] = [
+            (Expr("lt", (Expr.var(0), Expr.var(1))), lambda r: r[0] < r[1]),
+            (Expr("le", (Expr.var(0), Expr.var(1))), lambda r: r[0] <= r[1]),
+            (Expr("eq", (Expr.var(0), Expr.var(1))), lambda r: r[0] == r[1]),
             (
-                ExprV9("bit_and", (ExprV9.var(0), ExprV9.const(1))),
+                Expr("bit_and", (Expr.var(0), Expr.const(1))),
                 lambda r: (r[0] & 1) != 0,
             ),
         ]
         if arity == 2:
             preds.append(
-                (ExprV9("lt", (ExprV9.var(0), ExprV9.const(0))), lambda r: r[0] < 0)
+                (Expr("lt", (Expr.var(0), Expr.const(0))), lambda r: r[0] < 0)
             )
             preds.append(
-                (ExprV9("lt", (ExprV9.var(1), ExprV9.const(0))), lambda r: r[1] < 0)
+                (Expr("lt", (Expr.var(1), Expr.const(0))), lambda r: r[1] < 0)
             )
         for cond_expr, fn in preds:
             true_pts = [(r, y) for r, y in zip(train_x, train_y) if fn(r)]
@@ -2928,30 +2928,30 @@ def exact_piecewise_poly_fit(
             )
             if tl is not None and tr is not None and tl != tr:
                 eb1 = (
-                    ExprV9.const(tl[0][0])
+                    Expr.const(tl[0][0])
                     if (len(tl) == 1 and sum(tl[0][1]) == 0)
-                    else ExprV9("poly_nd", (), tl)
+                    else Expr("poly_nd", (), tl)
                 )
                 eb2 = (
-                    ExprV9.const(tr[0][0])
+                    Expr.const(tr[0][0])
                     if (len(tr) == 1 and sum(tr[0][1]) == 0)
-                    else ExprV9("poly_nd", (), tr)
+                    else Expr("poly_nd", (), tr)
                 )
-                return ExprV9("if_cond", (cond_expr, eb1, eb2))
+                return Expr("if_cond", (cond_expr, eb1, eb2))
     return None
 
 
-def synthesize_batched_mdl_v9(
+def synthesize_batched_mdl(
     arity: int,
     train_x: Sequence[tuple[int, ...]],
     train_y: Sequence[int],
     val_x: Sequence[tuple[int, ...]],
     val_y: Sequence[int],
-    library_experts: Sequence[tuple[int, str, "ExpertV9"]] = (),
+    library_experts: Sequence[tuple[int, str, "Expert"]] = (),
     max_evals: int = 20000,  # WAVE 170: deeper search for the wider budget
     max_bits: int = 128,   # WAVE 170 (user decision): MDL budget 92 -> 128
     deadline: Optional[float] = None,
-) -> tuple[Optional[ExprV9], int]:
+) -> tuple[Optional[Expr], int]:
     """Vectorized Batched MDL + O(1) Meet-in-the-Middle + Call-DAG Synthesis."""
     X = np.asarray(train_x, dtype=np.int64)
     Y = np.asarray(train_y, dtype=np.int64)
@@ -2960,8 +2960,8 @@ def synthesize_batched_mdl_v9(
         # (0x400..) must pass; intermediate-value safety stays with MAG_CAP
         return None, 0
     N = X.shape[0]
-    leaf_exprs = [ExprV9.var(i) for i in range(arity)] + [
-        ExprV9.const(c) for c in CONSTS
+    leaf_exprs = [Expr.var(i) for i in range(arity)] + [
+        Expr.const(c) for c in CONSTS
     ]
     L_arr = np.stack(
         [
@@ -2988,7 +2988,7 @@ def synthesize_batched_mdl_v9(
         if N > 0
         else False
     )
-    useful_libs: list[tuple[int, str, ExpertV9]] = []
+    useful_libs: list[tuple[int, str, Expert]] = []
     for idx, nm, ex in library_experts:
         if ex.program.arity > arity or ex.program.expr is None:
             continue
@@ -3005,10 +3005,10 @@ def synthesize_batched_mdl_v9(
     useful_libs = useful_libs[:32]
 
     seen_sigs: dict[bytes, int] = {}
-    pool_hash: dict[bytes, ExprV9] = {}
-    pool_exprs: list[ExprV9] = []
+    pool_hash: dict[bytes, Expr] = {}
+    pool_exprs: list[Expr] = []
     pool_vals: list[np.ndarray] = []
-    buckets: dict[int, list[tuple[ExprV9, np.ndarray]]] = {}
+    buckets: dict[int, list[tuple[Expr, np.ndarray]]] = {}
 
     for i, lf in enumerate(leaf_exprs):
         key = L_arr[i].tobytes()
@@ -3021,7 +3021,7 @@ def synthesize_batched_mdl_v9(
     total_checked = len(leaf_exprs)
     MAG_CAP = 1 << 28
 
-    def verify_val(cand: ExprV9) -> bool:
+    def verify_val(cand: Expr) -> bool:
         try:
             return all(cand.eval(r, env) == y for r, y in zip(val_x, val_y))
         except Exception:
@@ -3042,8 +3042,8 @@ def synthesize_batched_mdl_v9(
         V = np.stack([x[1] for x in batch])
 
         def register(
-            res_arr: np.ndarray, builder_fn: Callable[[int, int], ExprV9], new_bits: int
-        ) -> Optional[ExprV9]:
+            res_arr: np.ndarray, builder_fn: Callable[[int, int], Expr], new_bits: int
+        ) -> Optional[Expr]:
             nonlocal total_checked
             if new_bits > max_bits:
                 return None
@@ -3089,7 +3089,7 @@ def synthesize_batched_mdl_v9(
             ("cube", V_cb_ok),
         ):
             hit = register(
-                ures, lambda bi, _, o=uop: ExprV9(o, (B_exprs[bi],)), min_b + TOKEN_BITS
+                ures, lambda bi, _, o=uop: Expr(o, (B_exprs[bi],)), min_b + TOKEN_BITS
             )
             if hit is not None:
                 return hit, total_checked
@@ -3115,7 +3115,7 @@ def synthesize_batched_mdl_v9(
                         final_idxs = ok_idxs[ok_row_mask]
                         hit = register(
                             res_2d[ok_row_mask],
-                            lambda bi, _, o=ename, idxs=final_idxs: ExprV9(
+                            lambda bi, _, o=ename, idxs=final_idxs: Expr(
                                 "call", (B_exprs[int(idxs[bi])],), o
                             ),
                             min_b + cbits,
@@ -3169,7 +3169,7 @@ def synthesize_batched_mdl_v9(
                             hit = register(
                                 res_2d[ok_row_mask],
                                 (
-                                    lambda bi, _, o=ename, l=lf, idxs=final_idxs, oi=order_idx: ExprV9(
+                                    lambda bi, _, o=ename, l=lf, idxs=final_idxs, oi=order_idx: Expr(
                                         "call",
                                         (
                                             (B_exprs[int(idxs[bi])], l)
@@ -3255,7 +3255,7 @@ def synthesize_batched_mdl_v9(
             for li in range(len(leaf_exprs)):
                 hit = register(
                     R[:, li : li + 1, :],
-                    lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(o, (B_exprs[bi], l)),
+                    lambda bi, _, o=op, l=leaf_exprs[li]: Expr(o, (B_exprs[bi], l)),
                     min_b + TOKEN_BITS + L_bits[li],
                 )
                 if hit is not None:
@@ -3300,7 +3300,7 @@ def synthesize_batched_mdl_v9(
                     for li in range(len(leaf_exprs)):
                         hit = register(
                             R2[:, li : li + 1, :],
-                            lambda bi, _, o=op, l=leaf_exprs[li]: ExprV9(
+                            lambda bi, _, o=op, l=leaf_exprs[li]: Expr(
                                 o, (l, B_exprs[bi])
                             ),
                             min_b + TOKEN_BITS + L_bits[li],
@@ -3310,7 +3310,7 @@ def synthesize_batched_mdl_v9(
 
         if len(pool_vals) >= 4 and min_b >= 19:
             P_mat = np.stack(pool_vals)
-            mitm_hits: list[tuple[int, ExprV9]] = []
+            mitm_hits: list[tuple[int, Expr]] = []
             for op_name, mat, rev in (
                 ("add", Y[None, :] - P_mat, False),
                 ("sub", P_mat - Y[None, :], False),
@@ -3322,7 +3322,7 @@ def synthesize_batched_mdl_v9(
                     if k in pool_hash:
                         e1 = pool_exprs[idx_p]
                         e2 = pool_hash[k]
-                        cand = ExprV9(op_name, (e2, e1) if rev else (e1, e2))
+                        cand = Expr(op_name, (e2, e1) if rev else (e1, e2))
                         cb = cand.bits(ex_idx)
                         if cb <= max_bits and verify_val(cand):
                             mitm_hits.append((cb, cand))
@@ -3337,7 +3337,7 @@ def synthesize_batched_mdl_v9(
                     if k in pool_hash:
                         e1 = pool_exprs[int(nz_idxs[loc_i])]
                         e2 = pool_hash[k]
-                        cand = ExprV9("mul", (e1, e2))
+                        cand = Expr("mul", (e1, e2))
                         cb = cand.bits(ex_idx)
                         if cb <= max_bits and verify_val(cand):
                             mitm_hits.append((cb, cand))
@@ -3358,7 +3358,7 @@ def synthesize_batched_mdl_v9(
             hits = np.all(pw == Y[None, None, :], axis=2)
             if np.any(hits):
                 bi, ei = np.argwhere(hits)[0]
-                cand = ExprV9(
+                cand = Expr(
                     "pow_int",
                     (pool_exprs[int(b_idxs[bi])], pool_exprs[int(e_idxs[ei])]),
                 )
@@ -3369,19 +3369,19 @@ def synthesize_batched_mdl_v9(
 
 
 # ==============================================================================
-# 10. ExpertV9, TheoremMinerV9, Structural Call-DAG Unification & Processor
+# 10. Expert, TheoremMiner, Structural Call-DAG Unification & Processor
 # ==============================================================================
 
 
 @dataclass
-class ExpertV9:
+class Expert:
     name: str
     family: str
-    program: ProgramV9
+    program: Program
     domains: tuple[tuple[int, ...], ...]
     valid_rule: str
     code_length: int
-    adapter: Optional[FactorizedAdapterV9] = None
+    adapter: Optional[FactorizedAdapter] = None
     parents: tuple[str, ...] = ()
 
     def supports(self, xs: Sequence[int]) -> bool:
@@ -3408,16 +3408,16 @@ class ExpertV9:
         }
 
     @staticmethod
-    def from_dict(d: dict[str, Any], core: "FactorizedSharedCoreV9") -> "ExpertV9":
-        return ExpertV9(
+    def from_dict(d: dict[str, Any], core: "FactorizedSharedCore") -> "Expert":
+        return Expert(
             name=str(d["name"]),
             family=str(d["family"]),
-            program=ProgramV9.from_dict(d["program"]),
+            program=Program.from_dict(d["program"]),
             domains=tuple(tuple(int(v) for v in dom) for dom in d["domains"]),
             valid_rule=str(d["valid_rule"]),
             code_length=int(d["code_length"]),
             adapter=(
-                FactorizedAdapterV9.from_dict(d["adapter"], core)
+                FactorizedAdapter.from_dict(d["adapter"], core)
                 if d.get("adapter")
                 else None
             ),
@@ -3433,10 +3433,10 @@ class Theorem:
     verified: bool = True
 
 
-class TheoremMinerV9:
+class TheoremMiner:
     """Exhaustive finite-domain theorem discovery across ALL experts (no truncation)."""
 
-    def mine(self, model: "GrowingHagiProcessorV9") -> list[Theorem]:
+    def mine(self, model: "GrowingHagiProcessor") -> list[Theorem]:
         found: list[Theorem] = []
         known = {t.name for t in model.theorems}
         env = model.experts
@@ -3556,7 +3556,7 @@ class TheoremMinerV9:
 
 
 def _match_pattern(
-    pattern: ExprV9, target: ExprV9, env_bind: dict[int, ExprV9]
+    pattern: Expr, target: Expr, env_bind: dict[int, Expr]
 ) -> bool:
     """Structural unification: match pattern AST (with var(i) holes) against target subtree."""
     if pattern.op == "var":
@@ -3576,7 +3576,7 @@ def _match_pattern(
     )
 
 
-def _dag_reaches(experts: dict[str, ExpertV9], start: str, target: str) -> bool:
+def _dag_reaches(experts: dict[str, Expert], start: str, target: str) -> bool:
     visited = set()
     stack = [start]
     while stack:
@@ -3592,7 +3592,7 @@ def _dag_reaches(experts: dict[str, ExpertV9], start: str, target: str) -> bool:
     return False
 
 
-class GrowingHagiProcessorV9:
+class GrowingHagiProcessor:
     """Unified HAGI v9.0 Self-Developing Processor with Full Governance."""
 
     def __init__(
@@ -3603,9 +3603,9 @@ class GrowingHagiProcessorV9:
         compute_budget: float = 1000.0,
         risk_limit: float = 10.0,
     ):
-        self.core = FactorizedSharedCoreV9(seed=seed, width=48)
+        self.core = FactorizedSharedCore(seed=seed, width=48)
         self.node_budget = int(node_budget)
-        self.experts: dict[str, ExpertV9] = {}
+        self.experts: dict[str, Expert] = {}
         self.version = 0
         self.total_commits = 0
         self.total_holds = 0
@@ -3616,9 +3616,9 @@ class GrowingHagiProcessorV9:
         # a successful empty proof.
         self.governance_state_complete = True
         self.theorems: list[Theorem] = []
-        self.ledger = AuditLedgerV9(delta_total=delta_total)
-        self.router = HedgeRouterV9(len(FactorizedSharedCoreV9.BRANCHES), eta=0.5)
-        self.ram = GDNRAMV9(n_slots=64, dim=8)
+        self.ledger = AuditLedger(delta_total=delta_total)
+        self.router = HedgeRouter(len(FactorizedSharedCore.BRANCHES), eta=0.5)
+        self.ram = GDNRAM(n_slots=64, dim=8)
         self.compute_budget = float(compute_budget)
         self.risk_rem = float(risk_limit)
         self.unsolved_objective = 100.0
@@ -3721,7 +3721,7 @@ class GrowingHagiProcessorV9:
             self._restore_state_with_optimizer(opt_snap)
             return self._hold(spec, "AUDIT_ALPHA_EXHAUSTED", len(train_x), len(val_x))
 
-        adapter: Optional[FactorizedAdapterV9] = None
+        adapter: Optional[FactorizedAdapter] = None
         if train_neural and val_x and spec.family != "BoolVenn":
             adapter = self.core.fit_residual(
                 train_x, train_y, val_x, val_y, router=self.router
@@ -3767,7 +3767,7 @@ class GrowingHagiProcessorV9:
             return ev
 
         def try_commit(
-            program: ProgramV9, reason: str, parents: tuple[str, ...] = ()
+            program: Program, reason: str, parents: tuple[str, ...] = ()
         ) -> Optional[dict[str, Any]]:
             try:
                 self.evals += len(train_x)
@@ -3785,7 +3785,7 @@ class GrowingHagiProcessorV9:
             except Exception:
                 return None
             bits = program.bits(ex_idx)
-            expert = ExpertV9(
+            expert = Expert(
                 spec.name,
                 spec.family,
                 program,
@@ -3844,7 +3844,7 @@ class GrowingHagiProcessorV9:
 
         if spec.family == "BoolVenn":
             for m in range(16):
-                ev = try_commit(ProgramV9(2, venn_mask=m), "boolvenn-exact")
+                ev = try_commit(Program(2, venn_mask=m), "boolvenn-exact")
                 if ev is not None:
                     return ev
 
@@ -3860,8 +3860,8 @@ class GrowingHagiProcessorV9:
                         coeffs = anf_transform(tt)
                         active_s = [s for s, c in enumerate(coeffs) if c]
                         max_deg = max((bin(s).count("1") for s in active_s), default=0)
-                        cand_e = anf_to_expr_v9(coeffs, spec.arity)
-                        cand_p = ProgramV9(spec.arity, cand_e)
+                        cand_e = anf_to_expr(coeffs, spec.arity)
+                        cand_p = Program(spec.arity, cand_e)
                         score = (max_deg, len(active_s), cand_p.bits(ex_idx))
                         anf_cands.append((score, cand_p))
                     anf_cands.sort(key=lambda it: it[0])
@@ -3870,7 +3870,7 @@ class GrowingHagiProcessorV9:
                         if ev is not None:
                             return ev
 
-        for p in candidate_programs_v9(spec.arity):
+        for p in candidate_programs(spec.arity):
             ev = try_commit(p, "direct-template+full-support")
             if ev is not None:
                 return ev
@@ -3880,7 +3880,7 @@ class GrowingHagiProcessorV9:
                 coeffs = _exact_poly_fit([r[0] for r in train_x], train_y, max_degree=5)
                 if coeffs is not None:
                     ev = try_commit(
-                        ProgramV9(1, ExprV9("poly", (ExprV9.var(0),), coeffs)),
+                        Program(1, Expr("poly", (Expr.var(0),), coeffs)),
                         "exact-rational-poly+full-support",
                     )
                     if ev is not None:
@@ -3891,7 +3891,7 @@ class GrowingHagiProcessorV9:
                 )
                 if terms is not None:
                     ev = try_commit(
-                        ProgramV9(spec.arity, ExprV9("poly_nd", (), terms)),
+                        Program(spec.arity, Expr("poly_nd", (), terms)),
                         "exact-multivar-poly+full-support",
                     )
                     if ev is not None:
@@ -3900,13 +3900,13 @@ class GrowingHagiProcessorV9:
         pw = exact_piecewise_poly_fit(train_x, train_y)
         if pw is not None:
             ev = try_commit(
-                ProgramV9(spec.arity, pw), "exact-piecewise-poly+full-support"
+                Program(spec.arity, pw), "exact-piecewise-poly+full-support"
             )
             if ev is not None:
                 return ev
 
         lib_list = [(ex_idx[nm], nm, self.experts[nm]) for nm in self.experts]
-        hit_expr, n_chk = synthesize_batched_mdl_v9(
+        hit_expr, n_chk = synthesize_batched_mdl(
             spec.arity,
             train_x,
             train_y,
@@ -3920,7 +3920,7 @@ class GrowingHagiProcessorV9:
         self.candidates_generated += n_chk
         if hit_expr is not None:
             ev = try_commit(
-                ProgramV9(spec.arity, hit_expr), "batched-mdl-mitm-dag+full-support"
+                Program(spec.arity, hit_expr), "batched-mdl-mitm-dag+full-support"
             )
             if ev is not None:
                 return ev
@@ -3993,17 +3993,17 @@ class GrowingHagiProcessorV9:
                         continue
                     if _dag_reaches(self.experts, lib_name, target_name):
                         continue
-                    bindings: dict[int, ExprV9] = {}
+                    bindings: dict[int, Expr] = {}
                     if not _match_pattern(lib_ex.program.expr, sub, bindings):
                         continue
                     if any(i not in bindings for i in range(lib_ex.program.arity)):
                         continue
                     call_args = tuple(bindings[i] for i in range(lib_ex.program.arity))
-                    call_e = ExprV9("call", call_args, lib_name)
+                    call_e = Expr("call", call_args, lib_name)
                     if call_e.bits(ex_idx) >= sub.bits(ex_idx):
                         continue
                     cand_expr = cur_expr.replace_subtree(sub, call_e)
-                    cand_prog = ProgramV9(target_ex.program.arity, cand_expr)
+                    cand_prog = Program(target_ex.program.arity, cand_expr)
                     new_bits = cand_prog.bits(ex_idx)
                     if new_bits >= target_ex.code_length:
                         continue
@@ -4216,7 +4216,7 @@ class GrowingHagiProcessorV9:
                      encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> "GrowingHagiProcessorV9":
+    def load(cls, path: str | Path) -> "GrowingHagiProcessor":
         d = json.loads(Path(path).read_text(encoding="utf-8"))
         if d.get("format") != "HAGI-V9":
             raise ValueError("not a HAGI-V9 model file")
@@ -4228,7 +4228,7 @@ class GrowingHagiProcessorV9:
         m.total_commits = int(d.get("total_commits", 0))
         m.total_holds = int(d.get("total_holds", 0))
         m.experts = {
-            k: ExpertV9.from_dict(v, m.core) for k, v in d.get("experts", {}).items()
+            k: Expert.from_dict(v, m.core) for k, v in d.get("experts", {}).items()
         }
         m.theorems = [Theorem(**t) for t in d.get("theorems", [])]
         m.growth_log = d.get("growth_log", [])
@@ -4250,7 +4250,7 @@ class GrowingHagiProcessorV9:
             str(k): AuditStream(**v)
             for k, v in ledger_data.get("streams", {}).items()
         }
-        m.ledger = AuditLedgerV9(
+        m.ledger = AuditLedger(
             delta_total=float(ledger_data["delta_total"]),
             spent={str(k): float(v) for k, v in ledger_data.get("spent", {}).items()},
             streams=streams,
@@ -4314,8 +4314,8 @@ class GrowingHagiProcessorV9:
 # ==============================================================================
 
 
-def propose_noncircular_task_v9(
-    experts: dict[str, ExpertV9],
+def propose_noncircular_task(
+    experts: dict[str, Expert],
     rng: np.random.Generator,
     round_idx: int,
     seen_sigs: Optional[set[tuple[Any, ...]]] = None,
@@ -4510,8 +4510,8 @@ def _short_auto_name(
     return name
 
 
-def grow_v9(
-    model: GrowingHagiProcessorV9,
+def grow_deep(
+    model: GrowingHagiProcessor,
     suite: Sequence[TaskSpec],
     max_rounds: int = 3,
     train_neural: bool = True,
@@ -4533,7 +4533,7 @@ def grow_v9(
                 commits += 1
         proposed = 0
         for k in range(8):
-            prop = propose_noncircular_task_v9(model.experts, rnd, r, seen_sigs)
+            prop = propose_noncircular_task(model.experts, rnd, r, seen_sigs)
             if prop is None:
                 continue
             sp, _ = prop
@@ -4546,7 +4546,7 @@ def grow_v9(
             if ev["action"] == "COMMIT":
                 commits += 1
         comp = model.compress_library_mdl()
-        new_th = TheoremMinerV9().mine(model)
+        new_th = TheoremMiner().mine(model)
         nq = model.neural_quality_summary()
         rounds.append(
             {
@@ -4589,10 +4589,10 @@ def grow_v9(
 # ==============================================================================
 
 
-def self_test_v9() -> None:
+def self_test_core() -> None:
     t0 = time.time()
     suite = make_task_suite()
-    model = GrowingHagiProcessorV9(node_budget=8000)
+    model = GrowingHagiProcessor(node_budget=8000)
     for i, sp in enumerate(suite):
         ev = model.learn(sp, seed=10_000 + i, train_neural=True)
         assert ev["action"] in ("COMMIT", "REUSE"), (sp.name, ev)
@@ -4600,7 +4600,7 @@ def self_test_v9() -> None:
     assert check["accuracy"] == 1.0 and check["committed"] == len(suite), check
     assert model.predict("ADD", 100, 3)["status"] == "ABSTAIN"
 
-    pm = GrowingHagiProcessorV9()
+    pm = GrowingHagiProcessor()
     snap_before = pm._snapshot_state_with_optimizer()
     pev = pm.learn(
         next(s for s in suite if s.name == "ADD"), seed=77, poison_one_label=True
@@ -4612,7 +4612,7 @@ def self_test_v9() -> None:
     )
     assert np.array_equal(snap_before["router"][0], snap_after["router"][0])
 
-    rep = grow_v9(model, suite, max_rounds=2, out_dir="/tmp/v9_grow_test")
+    rep = grow_deep(model, suite, max_rounds=2, out_dir="/tmp/grow_test")
     assert rep["experts"] > len(suite), rep
     assert model.verify_certificates()["all_ok"], model.verify_certificates()
 
@@ -4628,33 +4628,33 @@ def self_test_v9() -> None:
                 assert venn_head_eval(m, (x, y)) == ((m >> ((x << 1) | y)) & 1)
 
     tt = anf_transform([0, 1, 1, 0])
-    assert anf_to_expr_v9(tt, 2).eval((1, 0)) == 1
+    assert anf_to_expr(tt, 2).eval((1, 0)) == 1
     c3 = anf_compose3(lambda a, b: a | b, [0, 0, 0, 1], [0, 1, 1, 0])
     for x in (0, 1):
         for y in (0, 1):
             assert anf_eval(c3, 2, (x, y)) == ((x & y) | (x ^ y))
 
-    col = CRAMEngineV9.solve_coloring(
+    col = CRAMEngine.solve_coloring(
         [(0, 1), (1, 2), (2, 3), (3, 0)], 4, 2, givens={0: 1}
     )
     assert col["validity_certificate"] and col["givens_respected"]
     adj_m = [[1], [0, 2], [1, 3], [2]]
-    lz = CRAMEngineV9.solve_latent_maze(4, adj_m, goal=0)
+    lz = CRAMEngine.solve_latent_maze(4, adj_m, goal=0)
     assert abs(lz["z"][0] - 21.0 / 55.0) < 1e-4
-    mf = CRAMEngineV9.mean_field_kl_step(
+    mf = CRAMEngine.mean_field_kl_step(
         np.array([[1.0, 0.0], [0.0, 1.0]]),
         np.zeros((2, 2, 2, 2)),
         np.full((2, 2), 0.5),
     )
     assert mf["monotonic"]
-    alt = CRAMEngineV9.alternating_latent_visible_solve(4, adj_m, goal=0, num_colors=2)
+    alt = CRAMEngine.alternating_latent_visible_solve(4, adj_m, goal=0, num_colors=2)
     assert alt["monotone_drop"]
-    pl = CRAMEngineV9.train_cram_pseudolikelihood(
+    pl = CRAMEngine.train_cram_pseudolikelihood(
         np.array([[0, 1], [0, 1], [1, 0]]), num_colors=2
     )
     assert pl["mean_pl_loss"] < 0.7
 
-    gpm = ContinualGPMMemoryV9(6, 2, seed=1)
+    gpm = ContinualGPMMemory(6, 2, seed=1)
     X1 = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
     Y1 = np.array([[1.0, -1.0], [0.5, 0.5]])
     gpm.train_task_ef21_muon(X1, Y1, steps=20)
@@ -4667,7 +4667,7 @@ def self_test_v9() -> None:
     assert float(np.max(np.abs(pred1_before - pred1_after))) < 1e-10
 
     assert abs(hnet_opt_ratio(1.0, 4.0, 8.0) - 4.0) < 1e-9
-    ram = GDNRAMV9(8, 4)
+    ram = GDNRAM(8, 4)
     ram.store(2, np.array([1.0, 2.0, 3.0, 4.0]))
     ram.store(5, np.array([9.0, 8.0, 7.0, 6.0]))
     assert np.allclose(ram.load(2), [1.0, 2.0, 3.0, 4.0])
@@ -4675,7 +4675,7 @@ def self_test_v9() -> None:
 
     save_path = Path("v9_selftest_model.json")
     model.save(save_path)
-    reloaded = GrowingHagiProcessorV9.load(save_path)
+    reloaded = GrowingHagiProcessor.load(save_path)
     assert reloaded.verify_all(suite)["accuracy"] == 1.0
     assert reloaded.predict("ADD", 7, -3)["value"] == 4
     assert reloaded.predict("ADD", 99, 1)["status"] == "ABSTAIN"
@@ -4711,14 +4711,14 @@ def _benchmark() -> None:
     """
 
     suite = make_task_suite()
-    model = GrowingHagiProcessorV9(node_budget=8000)
+    model = GrowingHagiProcessor(node_budget=8000)
     t0 = time.time()
     for i, sp in enumerate(suite):
         model.learn(sp, seed=10_000 + i, train_neural=True)
     learn_elapsed = time.time() - t0
     check = model.verify_all(suite)
     t0 = time.time()
-    rep = grow_v9(model, suite, max_rounds=2, out_dir=".omc/v9_bench")
+    rep = grow_deep(model, suite, max_rounds=2, out_dir=".omc/bench")
     grow_elapsed = time.time() - t0
     nq = model.neural_quality_summary()
     resident = sum(
@@ -4755,19 +4755,19 @@ def _cli() -> None:
         description="HAGI unified single-file build (v5+v7.4+v8.4+v9)"
     )
     _p.add_argument("--self-test", action="store_true", help="v8.4 self-test")
-    _p.add_argument("--self-test-v9", action="store_true", help="v9.0 self-test")
+    _p.add_argument("--self-test-core", action="store_true", help="canonical kernel self-test")
     _p.add_argument("--self-test-v7", action="store_true", help="v7.4 self-test")
     _p.add_argument("--self-test-v5", action="store_true", help="v5 self-test")
     _p.add_argument("--grow", action="store_true", help="v8.4 growth loop")
-    _p.add_argument("--grow-v9", action="store_true", help="v9.0 growth loop")
-    _p.add_argument("--benchmark-v9", action="store_true", help="v9.0 benchmark")
+    _p.add_argument("--grow-deep", action="store_true", help="canonical growth loop")
+    _p.add_argument("--benchmark-core", action="store_true", help="canonical benchmark")
     _p.add_argument("--max-rounds", type=int, default=4)
     _p.add_argument("--out-dir", default="grow_out")
     _a = _p.parse_args()
     if _a.self_test:
         self_test_v8()
-    elif _a.self_test_v9:
-        self_test_v9()
+    elif _a.self_test_core:
+        self_test_core()
     elif _a.self_test_v7:
         self_test_v7()
     elif _a.self_test_v5:
@@ -4781,16 +4781,16 @@ def _cli() -> None:
                 indent=2,
             )
         )
-    elif _a.grow_v9:
+    elif _a.grow_deep:
         _suite = make_task_suite()
-        _m = GrowingHagiProcessorV9()
+        _m = GrowingHagiProcessor()
         print(
             json.dumps(
-                grow_v9(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir),
+                grow_deep(_m, _suite, max_rounds=_a.max_rounds, out_dir=_a.out_dir),
                 indent=2,
             )
         )
-    elif _a.benchmark_v9:
+    elif _a.benchmark_core:
         _benchmark()
     else:
         _p.print_help()

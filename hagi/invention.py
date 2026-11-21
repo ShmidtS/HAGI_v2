@@ -17,7 +17,7 @@ Verification (counterexample-driven, lesson from env_lut):
   sampled fit -> full-domain audit -> PROVEN_EXACT, else rollback.
 Overfit guard: matched-null z >= 4 (analytic bound first, Monte Carlo
 only on borderline candidates); alpha/delta budget spent per attempt
-via AuditLedgerV9-compatible spend interface.
+via AuditLedger-compatible spend interface.
 
 CompiledSolver: the accepted blueprint becomes a Representation in the
 registry (registered via representations.register_artifact_factory),

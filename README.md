@@ -1,6 +1,6 @@
 # HAGI — растущий нейро-символьный процессор
 
-HAGI — саморазвивающийся нейро-символьный процессор (V9): библиотека
+HAGI — саморазвивающийся нейро-символьный процессор: библиотека
 точных программ-экспертов, растущая через certified-цикл обучения.
 Каждая задача либо закрывается переиспользованием существующего
 эксперта, либо синтезируется новая точная программа (Venn-голова,
@@ -15,15 +15,15 @@ meet-in-the-middle DAG), либо честно HOLD'ится с откатом �
   auto выбирает по бенчмарку; параллельные воркеры — всегда CPU.
 - `hagi/` — ядро (бывший монолит `hagi.py`, разрезан с сохранением
   семантики перекрытия имён):
-  - `hagi/core.py (merged)` — поколения V5–V8 (исторические процессоры,
+  - `hagi/core.py (merged)` — исторические процессоры (замороженное
     guarded optimizer, тернарное квантование, CRAM, theorem miner);
-  - `hagi/core.py (merged)` — каноническое ядро V9: `GrowingHagiProcessorV9`,
-    точный синтез (`synthesize_batched_mdl_v9`,
+  - `hagi/core.py (merged)` — каноническое ядро: `GrowingHagiProcessor`,
+    точный синтез (`synthesize_batched_mdl`,
     `exact_piecewise_poly_fit`), Venn-голова, Hadamard-микшер,
-    `AuditLedgerV9` (Hoeffding-альфа), `CertStepGen`-сертификаты.
+    `AuditLedger` (Hoeffding-альфа), `CertStepGen`-сертификаты.
 - `hagi/hagi/selfmodel.py` — одношаговый TRACE → DERIVE → OPTIMIZE → GATE:
   модель трассирует своё обучение и пытается вывести собственный
-  предиктор успеха (ExprV9-синтез; при невозможности — честный HOLD).
+  предиктор успеха (Expr-синтез; при невозможности — честный HOLD).
 - `hagi/hagi/loop.py` — много-раундовый цикл саморазвития (см. ниже).
 - `hagi/hagi/rewrite.py` — self-rewrite: модель пишет собственные
   программы (standalone Python, точная валидация по каждому эксперту,
@@ -81,7 +81,7 @@ certified-positive действия = ресурс исчерпан).
 SHIFT mod 26) и ВЕСЬ пул UTF-8 на байтовом уровне 4/4 (ATBASH,
 Цезарь, SHIFT, XOR-шифр на 0..255 — любой юникод-текст) после
 расширения CONSTS (26, 256) и input-cap синтеза до 2048; честный
-фронт — разреженные классификаторы IS_VOWEL и RU_VOWEL (кириллица). Нейроядро (FactorizedSharedCoreV9,
+фронт — разреженные классификаторы IS_VOWEL и RU_VOWEL (кириллица). Нейроядро (FactorizedSharedCore,
 EF21-Muon GPM + Hedge-router) обучается вместе с каждым коммитом
 (66 адаптеров на 82 экспертах в 5-раундовом прогоне), с GPU-путём
 и автовыбором устройства.
@@ -128,7 +128,7 @@ r = unified_ingest(u, "my_domain", data_bytes,
 ### Классические точки входа
 
 ```bash
-python -m hagi --self-test-v9      # self-test ядра
+python -m hagi --self-test-core    # self-test ядра
 python -m pytest                   # characterization-гварды
 python -X utf8 -u hagi/loop.py --max-rounds 24 --workers 32
 python -X utf8 -u hagi/selfmodel.py           # одношаговый self-model
@@ -147,5 +147,5 @@ python -m hagi.hagi.lm generate "HAGI — " --n 120
   домена (train + val + full support).
 - Ничего не принимается без гейта: нерегрессия, качество, certified
   margin; HOLD — честный результат.
-- Аудит: каждая трата α фиксируется в `AuditLedgerV9` (Hoeffding),
+- Аудит: каждая трата α фиксируется в `AuditLedger` (Hoeffding),
   финальный тест-диапазон не трогается.

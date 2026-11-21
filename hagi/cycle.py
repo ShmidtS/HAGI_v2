@@ -134,7 +134,7 @@ def compose_adder2() -> dict:
 
 
 def fusion_fastpath(task: dict) -> dict | None:
-    """Fusion Lab v2.1 fast-path (wave 128): before the expensive GA,
+    """Fusion fast-path (before the expensive GA,
     try proof-carrying ANF interpolation. Trusted issuer = own certified
     seed-cells family; degree contract comes from the task spec itself
     (honest: the task IS the spec, so max degree is computed from truth

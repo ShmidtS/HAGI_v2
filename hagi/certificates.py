@@ -1,7 +1,7 @@
 """Portable, self-contained finite-domain certificates for HAGI-V9.
 
 This module intentionally imports only the Python standard library. It does
-not import HAGI's learner, TaskSpec, ExprV9, or teacher functions. The verifier
+not import HAGI's learner, TaskSpec, Expr, or teacher functions. The verifier
 reconstructs the declared finite input domain, evaluates a restricted integer
 AST, and compares it to the labels embedded in the certificate artifact.
 

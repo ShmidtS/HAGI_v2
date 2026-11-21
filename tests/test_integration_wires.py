@@ -2,7 +2,7 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from hagi.core import AuditLedgerV9
+from hagi.core import AuditLedger
 from hagi.while_loop import (discover_while_loop_candidates,
                              synthesize_while_loop)
 from hagi.prior import NeuralProposalPrior, profile_features, FAMILIES
@@ -10,14 +10,14 @@ from hagi.diagnosis import ResidualProfile
 
 
 def test_draw_disjoint_splits_no_overlap():
-    led = AuditLedgerV9()
+    led = AuditLedger()
     tr, ceg, val = led.draw_disjoint_splits("t", list(range(64)), seed=1)
     allpts = set(tr) | set(ceg) | set(val)
     assert len(allpts) == len(tr) + len(ceg) + len(val)
 
 
 def test_draw_disjoint_splits_deterministic():
-    led = AuditLedgerV9()
+    led = AuditLedger()
     a = led.draw_disjoint_splits("t2", list(range(64)), seed=3)
     b = led.draw_disjoint_splits("t2", list(range(64)), seed=3)
     assert a == b  # cached stream -> same permutation

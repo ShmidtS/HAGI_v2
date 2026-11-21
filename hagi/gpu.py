@@ -1,6 +1,6 @@
 """GPU (torch/CUDA-ROCm) backend for the HAGI neural core.
 
-Ports the compute-heavy parts of ContinualGPMMemoryV9 — the EF21-Muon
+Ports the compute-heavy parts of ContinualGPMMemory — the EF21-Muon
 training loop (Newton-Schulz orthogonalization + backtracking line
 search) and the SVD subspace consolidation — to torch tensors on the
 first available CUDA device.
@@ -116,7 +116,7 @@ def train_task_ef21_muon_gpu(W: np.ndarray, ef_v: np.ndarray,
                              U_basis: np.ndarray, X: np.ndarray, Y: np.ndarray,
                              steps: int = 35, lr: float = 0.2
                              ) -> tuple[np.ndarray, np.ndarray, float]:
-    """GPU EF21-Muon; mirrors ContinualGPMMemoryV9.train_task_ef21_muon.
+    """GPU EF21-Muon; mirrors ContinualGPMMemory.train_task_ef21_muon.
 
     Returns (W, ef_v, final_mse); caller writes them back into the GPM.
     """
@@ -200,7 +200,7 @@ def consolidate_subspace_gpu(X: np.ndarray, U_basis: np.ndarray,
 
 
 class GpuGpmMixin:
-    """Drop-in acceleration for ContinualGPMMemoryV9 on the resolved device."""
+    """Drop-in acceleration for ContinualGPMMemory on the resolved device."""
 
     def _use_gpu(self) -> bool:
         return resolve_device() == "cuda"

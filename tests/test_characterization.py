@@ -34,7 +34,7 @@ GOLD = {
 @pytest.fixture(scope="module")
 def trained_v9():
     suite = hagi.make_task_suite()
-    p = hagi.GrowingHagiProcessorV9(node_budget=200000)
+    p = hagi.GrowingHagiProcessor(node_budget=200000)
     for sp in suite:
         p.learn(sp, seed=10_000)
     return p, suite
@@ -57,7 +57,7 @@ def test_v9_grow_and_verify(trained_v9):
 @pytest.mark.slow
 def test_determinism_second_run():
     suite = hagi.make_task_suite()
-    p2 = hagi.GrowingHagiProcessorV9(node_budget=200000)
+    p2 = hagi.GrowingHagiProcessor(node_budget=200000)
     for sp in suite:
         p2.learn(sp, seed=10_000)
     assert len(p2.experts) == GOLD["suite_experts"]
@@ -102,7 +102,7 @@ def test_selfrewrite_programs(tmp_path):
     """The model's program export is exact: every generated standalone
     Python function equals its certified expert over the full domain."""
     from hagi.rewrite import export_programs
-    p = hagi.GrowingHagiProcessorV9(node_budget=2000)
+    p = hagi.GrowingHagiProcessor(node_budget=2000)
     for sp in hagi.make_task_suite():
         p.learn(sp, seed=10_000, train_neural=False)
     rep = export_programs(p, tmp_path)
@@ -122,7 +122,7 @@ def test_neural_gpu_backend():
     dev = resolve_device()
     assert dev in ("cpu", "cuda")
     suite = hagi.make_task_suite()
-    p = hagi.GrowingHagiProcessorV9(node_budget=200000)
+    p = hagi.GrowingHagiProcessor(node_budget=200000)
     for sp in suite:
         p.learn(sp, seed=10_000, train_neural=True)
     adapters = sum(1 for e in p.experts.values() if e.adapter is not None)
@@ -136,7 +136,7 @@ def test_execute_programs(tmp_path):
     ciphers stream real text; XOR round-trips; integer programs callable."""
     from hagi import execute as hx
     from hagi.rewrite import export_programs
-    p = hagi.GrowingHagiProcessorV9(node_budget=20000)
+    p = hagi.GrowingHagiProcessor(node_budget=20000)
     for sp in hagi.make_task_suite():
         p.learn(sp, seed=10_000, train_neural=True)
     export_programs(p, tmp_path)
@@ -161,7 +161,7 @@ def test_ingest_data(tmp_path):
     from hagi.ingest import ingest_file, tasks_from_numeric_file
     tasks = tasks_from_numeric_file(tmp_path / "s.csv")
     assert any(t.name == "INGEST_s_t_to_h" for t in tasks)
-    p = hagi.GrowingHagiProcessorV9(node_budget=200000)
+    p = hagi.GrowingHagiProcessor(node_budget=200000)
     ev = p.learn(tasks[0], seed=10_000)
     assert ev["action"] == "COMMIT"
     assert p.verify_all([tasks[0]])["accuracy"] == 1.0

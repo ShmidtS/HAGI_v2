@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent replay verifier for HAGI Environment Growth v4.6.
+"""Independent replay verifier for HAGI Environment Growth.
 Does not import the learning engine. Reconstructs deterministic worlds and checks
 all saved probes, exact transition tables, ANFs, and shortest plans.
 """

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared env-world -> GF(2) netlist compiler (used by v4.4/v4.6 bridges).
+"""Shared env-world -> GF(2) netlist compiler (used by env bridges).
 
 Compiles a transition table (n_bits state, n_act_bits action) to a
 compact proof-carrying v4.0 netlist, behaviorally exact over all

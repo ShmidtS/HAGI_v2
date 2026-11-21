@@ -7,11 +7,11 @@ Delta_W lives in null(U^T) => X_A @ Delta_W = 0.
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from hagi.core import ContinualGPMMemoryV9
+from hagi.core import ContinualGPMMemory
 
 
 def _scenario(seed: int):
-    gpm = ContinualGPMMemoryV9(d_in=16, d_out=1, seed=seed)
+    gpm = ContinualGPMMemory(d_in=16, d_out=1, seed=seed)
     XA = np.random.default_rng(seed).normal(size=(24, 16))
     YA = (XA @ gpm.W).round()
     gpm.train_task_ef21_muon(XA, YA, steps=15)
@@ -33,7 +33,7 @@ def test_zero_forgetting_exact_multi_seed():
 
 
 def test_full_span_consolidation():
-    gpm = ContinualGPMMemoryV9(d_in=16, d_out=1, seed=3)
+    gpm = ContinualGPMMemory(d_in=16, d_out=1, seed=3)
     X = np.random.default_rng(4).normal(size=(24, 16))
     gpm.consolidate_subspace(X, energy_thresh=1.0)
     # full span: rank equals d_in (no silent trailing-direction drop)

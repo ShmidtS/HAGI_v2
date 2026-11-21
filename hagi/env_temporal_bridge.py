@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge: v4.4 env-growth learned world models -> v4.0 gate netlists.
+"""Bridge: env-growth learned world models -> gate netlists.
 
 A learned 5-bit temporal world model (32 states, 4 actions) compiles to
 a compact proof-carrying GF(2) netlist (33 gates for a bank model),

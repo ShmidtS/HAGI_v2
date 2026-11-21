@@ -65,7 +65,7 @@ def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int = 8,
         m.learn(sp, seed=10_000, train_neural=False)
     for r in range(n_proposal_rounds):
         for k in range(budget_per_round):
-            prop = hagi.propose_noncircular_task_v9(m.experts, rnd, r, seen)
+            prop = hagi.propose_noncircular_task(m.experts, rnd, r, seen)
             if prop is None:
                 continue
             sp, _ = prop
@@ -167,7 +167,7 @@ def run_experiment(seeds: int = 5, policy_names: list[str] | None = None,
     for sp in hagi.make_task_suite():
         tracer.learn(sp, seed=10_000, train_neural=False)
     for k in range(10):
-        prop = hagi.propose_noncircular_task_v9(tracer.experts, rnd, 0, seen)
+        prop = hagi.propose_noncircular_task(tracer.experts, rnd, 0, seen)
         if prop is None:
             continue
         sp, _ = prop

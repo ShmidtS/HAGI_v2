@@ -86,7 +86,7 @@ def _target_features(spec, seed: int, train_fraction: float) -> tuple[int, int]:
     return (max(ys) - min(ys), len(set(ys))) if ys else (0, 0)
 
 
-class TracedProcessorV9(hagi.GrowingHagiProcessorV9):
+class TracedProcessorV9(hagi.GrowingHagiProcessor):
     stream_names: list = None  # set by selfloop (dynamic per-round streams)
     stream_actions: list = None
     """Records a (features -> outcome, cost) trace of its own learning."""
@@ -145,7 +145,7 @@ def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
             succ_expr = None
     # 2) success predictor via the model's own batched-MDL synthesis
     if succ_expr is None:
-        expr, _n = hagi.synthesize_batched_mdl_v9(
+        expr, _n = hagi.synthesize_batched_mdl(
             len(FEATURE_KEYS), rows, ys, rows, ys, max_evals=20000, max_bits=64)
         if expr is not None and all(int(expr.eval(r, {})) == y
                                     for r, y in zip(rows, ys)):
@@ -154,7 +154,7 @@ def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     costs = [t["cost"] for t in trace]
     cost_expr = None
     if len(set(costs)) > 1:
-        ce, _n = hagi.synthesize_batched_mdl_v9(
+        ce, _n = hagi.synthesize_batched_mdl(
             len(FEATURE_KEYS), rows, costs, rows, costs, max_evals=20000, max_bits=64)
         if ce is not None and all(int(ce.eval(r, {})) == c
                                   for r, c in zip(rows, costs)):
@@ -274,7 +274,7 @@ def run_self_optimization(rounds: int = 2) -> dict[str, Any]:
         tracer.learn(sp, seed=10_000, train_neural=False)
     n_prop = 0
     for k in range(10):
-        prop = hagi.propose_noncircular_task_v9(tracer.experts, rnd, 0, seen)
+        prop = hagi.propose_noncircular_task(tracer.experts, rnd, 0, seen)
         if prop is None:
             continue
         sp, _ = prop
@@ -322,7 +322,7 @@ def run_self_optimization(rounds: int = 2) -> dict[str, Any]:
         for sp in suite:
             demo.learn(sp, seed=10_000, train_neural=False)
         for k in range(10):
-            prop = hagi.propose_noncircular_task_v9(demo.experts, rnd2, 0, seen2)
+            prop = hagi.propose_noncircular_task(demo.experts, rnd2, 0, seen2)
             if prop is None:
                 continue
             sp, _ = prop
@@ -360,7 +360,7 @@ def run_self_optimization(rounds: int = 2) -> dict[str, Any]:
     for sp in suite:
         opt.learn(sp, seed=10_000, train_neural=False)
     for k in range(10):
-        prop = hagi.propose_noncircular_task_v9(opt.experts, rnd2, 0, seen2)
+        prop = hagi.propose_noncircular_task(opt.experts, rnd2, 0, seen2)
         if prop is None:
             continue
         sp, _ = prop

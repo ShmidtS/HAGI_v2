@@ -2,7 +2,7 @@
 import os, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hagi.core import ExprV9, REIFIED_OPS
+from hagi.core import Expr, REIFIED_OPS
 from hagi.invention import ConstructBlueprint
 from hagi.reifier import (reify_construct, clear_reified,
                           save_reified_ops_state, restore_reified_ops_state)
@@ -26,11 +26,11 @@ def test_roundtrip():
     assert save_reified_ops_state(d) == 1
     clear_reified()
     assert restore_reified_ops_state(d) == 1
-    e = ExprV9(op, (ExprV9.var(0),))
+    e = Expr(op, (Expr.var(0),))
     assert e.eval([13]) == 3
     # arity guard survives
     try:
-        ExprV9(op, (ExprV9.var(0), ExprV9.var(1))).eval([1, 2])
+        Expr(op, (Expr.var(0), Expr.var(1))).eval([1, 2])
         raise AssertionError("arity guard lost")
     except ValueError:
         pass

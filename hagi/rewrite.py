@@ -5,7 +5,7 @@ own state, then continues growing from what it wrote.
 Three capabilities, all under the certified-gate discipline:
 
   1. PROGRAM SYNTHESIS -> PYTHON  `transpile()` renders every expert's
-     exact ExprV9 program as a standalone Python function (no runtime
+     exact Expr program as a standalone Python function (no runtime
      deps). `export_programs()` writes them to generated_programs.py and
      validates each emitted function against its expert over the
      expert's full certified support (exact integer equality).
@@ -67,7 +67,7 @@ def _fn_hash(name: str) -> str:
 
 
 def transpile(e, names: tuple[str, ...] = VAR_NAMES) -> str:
-    """ExprV9 -> standalone Python expression (helpers _hagi_* are emitted
+    """Expr -> standalone Python expression (helpers _hagi_* are emitted
     at the top of the generated module)."""
     op = e.op
     if op == "var":

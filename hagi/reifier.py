@@ -2,7 +2,7 @@
 
 When a ConstructBlueprint is accepted (transfer gate COMMIT), its
 quotient function q(x) and composition can be exported as a REIFIED
-macro-operator: ExprV9("reified:<name>", args) evaluates via
+macro-operator: Expr("reified:<name>", args) evaluates via
 REIFIED_OPS registry (core). This lets BatchedMDL and downstream
 synthesis COMPOSE the invented concept instead of treating it as an
 opaque construct leaf.

@@ -5,7 +5,7 @@
 ### Ядро и нейрон
 | Модуль | Роль | Теория (primes) |
 |---|---|---|
-| `core.py` | merged kernel: Expr/Program/Expert V5-V8 + V9-канонический конвейер (8989 строк, later definitions win shared names) | C278, CertifiedLoop |
+| `core.py` | merged kernel: legacy + канонический конвейер (later definitions win shared names) | C278, CertifiedLoop |
 | `lm.py` | нейро-тело: CertifiedStepLM (§3.9 certified step, k=16/dim=128/hidden=256), rotating holdout | §3.9, PoEBound |
 | `unified.py` | ЕДИНАЯ модель: ingest любых байтов, fresh-first replay (contiguous ≥2KB), ledger | DataToQuality |
 | `fabric.py` | Venn-ткань: геномы, bitwise emulate, imply-оракул 256/256, GROW→OPTIMIZE | VennPacking |

@@ -1,7 +1,7 @@
 """HAGI — hierarchical growing model.
 
 Consolidated layout (2026-11-17 refactor):
-  hagi.core      — V9 canonical kernel
+  hagi.core      — canonical kernel
   hagi.legacy_kernel — frozen V5-V8 body (star-imported by core)
   hagi.genesis   — Architecture Genesis: loop-config evolution (part 1)
                    and EC-processor genome evolution (part 2)

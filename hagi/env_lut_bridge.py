@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge: v4.6 env-growth world models -> v4.0 gate netlists.
+"""Bridge: env-growth world models -> gate netlists.
 
 4-bit world (16 states, 4 actions). PROVEN_EXACT worlds compile to
 compact proof-carrying GF(2) netlists, behaviorally exact over all 64
@@ -14,7 +14,7 @@ from hagi.env_table_compiler import compile_transition_table
 
 
 def env_model_to_netlist(seed: int = 777, ood: bool = False) -> dict:
-    """Actively learn a v4.6 world, audit/fallback it, compile to v4.0."""
+    """Actively learn a world, audit/fallback it, compile to netlist."""
     w = env.make_world(seed, ood=ood)
     res = env.learn_active(w)
     out = {"learn_status": res["status"], "probes": res["queries"],

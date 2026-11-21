@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hagi.core import ExprV9
+from hagi.core import Expr
 from hagi.representations import (
     ContractResult, register_artifact_factory, verify_artifact_contract,
 )
@@ -32,7 +32,7 @@ class SqArtifact:
 
 def test_construct_node_eval_and_abstain():
     register_artifact_factory("sq", lambda payload: SqArtifact())
-    e = ExprV9("construct", (), {"repr_id": "sq", "artifact": SqArtifact()})
+    e = Expr("construct", (), {"repr_id": "sq", "artifact": SqArtifact()})
     assert e.eval([3]) == 9
     assert e.bits() > 0
     try:
@@ -44,8 +44,8 @@ def test_construct_node_eval_and_abstain():
 
 def test_construct_roundtrip():
     register_artifact_factory("sq", lambda payload: SqArtifact())
-    e = ExprV9("construct", (), {"repr_id": "sq", "artifact": SqArtifact()})
-    e2 = ExprV9.from_dict(e.to_dict())
+    e = Expr("construct", (), {"repr_id": "sq", "artifact": SqArtifact()})
+    e2 = Expr.from_dict(e.to_dict())
     assert all(e.eval([x]) == e2.eval([x]) for x in range(11))
 
 

@@ -179,7 +179,7 @@ def ingest_file(path: Path) -> list[hagi.TaskSpec]:
 
 
 def learn_from_data(paths: list[Path], budget: int = 200000) -> dict[str, Any]:
-    proc = hagi.GrowingHagiProcessorV9(node_budget=budget)
+    proc = hagi.GrowingHagiProcessor(node_budget=budget)
     report: dict[str, Any] = {"files": [], "tasks": 0, "committed": 0}
     for path in paths:
         try:
