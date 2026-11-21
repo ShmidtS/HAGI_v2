@@ -58,7 +58,7 @@ def main() -> int:
         }
 
         # Then trial measured allocation policies over independent seeds.
-        from hagi.experiment import run_experiment
+        from hagi.selfmodel import run_experiment
         selected_policies = ["baseline","online_exact_2holds_quarter","online_exact_1hold_quarter","online_exact_2holds_eighth"]
         result = run_experiment(
             seeds=20, policy_names=selected_policies, seed_start=30
