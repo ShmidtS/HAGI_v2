@@ -5,7 +5,6 @@ Consolidated layout (2026-11-17 refactor):
   hagi.legacy_kernel — frozen V5-V8 body (star-imported by core)
   hagi.genesis   — Architecture Genesis: loop-config evolution (part 1)
                    and EC-processor genome evolution (part 2)
-  hagi.ec_lib    — runtime EC-processor library (winning genomes)
   hagi.logic     — logic basis: Venn head + ANF/Zhegalkin
   hagi.lm        — byte-LM neural body (ByteLM, CertifiedStepLM, ...)
   hagi.lessons   — Nadya's school (cumulative curriculum, from-scratch)
@@ -23,4 +22,4 @@ Consolidated layout (2026-11-17 refactor):
 refactor).
 """
 from .core import *  # noqa: F401,F403
-from . import genesis, ec_lib, logic  # noqa: F401
+from . import genesis, logic  # noqa: F401
