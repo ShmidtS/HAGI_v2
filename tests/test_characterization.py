@@ -158,7 +158,7 @@ def test_ingest_data(tmp_path):
     (tmp_path / "s.csv").write_text(
         "t,h\n" + "\n".join(f"{t},{20 - 5 * t * t}" for t in range(-8, 9)),
         encoding="utf-8")
-    from hagi.ingest import ingest_file, tasks_from_numeric_file
+    from hagi.io import ingest_file, tasks_from_numeric_file
     tasks = tasks_from_numeric_file(tmp_path / "s.csv")
     assert any(t.name == "INGEST_s_t_to_h" for t in tasks)
     p = hagi.GrowingHagiProcessor(node_budget=200000)

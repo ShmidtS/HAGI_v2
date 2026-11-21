@@ -19,8 +19,8 @@ import sys
 COMMANDS = {
     "core": ("hagi.core", "_cli"),
     "lm": ("hagi.lm", "main"),
-    "ingest": ("hagi.ingest", "main"),
-    "execute": ("hagi.execute", "main"),
+    "ingest": ("hagi.io", "ingest_main"),
+    "execute": ("hagi.io", "execute_main"),
     "loop": ("hagi.loop", "main"),
     "rewrite": ("hagi.rewrite", "main"),
     "genesis": ("hagi.genesis", "main"),

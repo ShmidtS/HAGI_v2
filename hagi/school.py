@@ -74,7 +74,7 @@ import argparse
 import re
 from typing import Any, Callable
 from pathlib import Path
-from hagi import execute as hx
+from hagi.io import execute, execute_text
 from hagi import lm
 SELF_SOURCES = ['generated_programs.py', 'lm.py', 'execute.py', 'ingest.py', 'loop.py', 'rewrite.py']
 _ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {'^(?:чему равен )?gcd (\\d+) (\\d+)$': ('GCD', lambda m: (int(m[1]), int(m[2]))), '^(?:чему равен )?нок (\\d+) (\\d+)$': ('LCM', lambda m: (int(m[1]), int(m[2]))), '^abs (-?\\d+)$': ('ABS', lambda m: (int(m[1]),)), '^square (-?\\d+)$': ('SQUARE', lambda m: (int(m[1]),)), '^cube (-?\\d+)$': ('CUBE', lambda m: (int(m[1]),)), '^mul (-?\\d+) (-?\\d+)$': ('MUL', lambda m: (int(m[1]), int(m[2]))), '^add (-?\\d+) (-?\\d+)$': ('ADD', lambda m: (int(m[1]), int(m[2]))), '^xor (.+) (-?\\d+)$': ('LANG8_XOR_CIPHER', lambda m: (m[1], int(m[2]))), '^caesar (.+)$': ('LANG8_CAESAR1', lambda m: (m[1],))}
@@ -89,9 +89,9 @@ def _exact_answer(query: str) -> tuple[str, str] | None:
         prog_h = _fn_hash(prog)
         if prog in ('LANG8_XOR_CIPHER', 'LANG8_CAESAR1', 'LANG_ATBASH', 'LANG8_SHIFT'):
             text, key = args if len(args) == 2 else (args[0], None)
-            out = hx.execute_text(prog_h, text, key=key) if key is not None else hx.execute_text(prog_h, text)
+            out = execute_text(prog_h, text, key=key) if key is not None else execute_text(prog_h, text)
         else:
-            out = hx.execute(prog_h, *args)
+            out = execute(prog_h, *args)
         return (prog, str(out))
     return None
 def ask(query: str) -> str:
