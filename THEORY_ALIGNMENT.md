@@ -2465,3 +2465,10 @@ self-edit гейт работает (no-op фильтр активен), failure
 - CLI: python -m hagi.cli <cmd> — единый вход (8 команд).
 - Дисковые wire-форматы (HAGI-V9 тег, CERT протокол) сохранены —
   это форматы данных, не версии проекта.
+
+## Сверка primes круг 18 (C507, 09a76c02→9ae7a3d8)
+- 09a76c02: upstream/svd — Mathlib-кандидат (внешний), к коду не относится.
+- 9ae7a3d8: AGEM vs rank-trunc bench. Наша GPM-проекция (per-step
+  orthogonality) строже A-GEM conditional — теория описывает обе
+  конфигурации, наша валидна (zero forgetting полнее AGEM-гарантии).
+  Расхождений нет.
