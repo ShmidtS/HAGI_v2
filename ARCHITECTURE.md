@@ -55,15 +55,16 @@ hagi/pipeline.py: unified_ingest(u, source, data)
 - GapBuffer накапливает REPRESENTATION_GAP профили между доменами:
   кластеры готовы к изобретению по K_min образцам.
 
-### Модули теории (primes-мосты, каждая формула из Lean)
-| Модуль | Теория | Подключение |
+### Модули теории (primes-мосты)
+| Модуль | Теория | Статус |
 |---|---|---|
-| `pipeline.py` | единый конвейер | unified_ingest — ГЛАВНЫЙ вход |
-| `cycle.py` | C492/C504/C506 derive/weave/grow | neuro_symbolic_cycle CLI |
-| `sandwich.py` | C489/C495/C502 certified argmax | готов (ждёт потребителя) |
-| `growth.py` | C450/C504/C506 residual growth | готов (ждёт стековый носитель) |
-| `full_pipeline.py` | C479 six-phase chain | bench/tests |
-| `merge.py` | C479v2 telescope merge | bench/tests |
+| `pipeline.py` | единый конвейер | ГЛАВНЫЙ вход |
+| `cycle.py` | C492/C504/C506 derive/weave/grow | CLI-библиотека |
+| `sandwich.py` | C489/C495/C502 certified argmax | готов |
+| `trunk_ops.py` | C477/C479/C479v2/C450/C504/C506 (merge+hadamard+growth+cycle) | bench/tests |
+| `measurement.py` | measurement suite (5 бывших модулей) | тесты + core |
+| `school.py` | C330 curriculum + lessons + mind | учебный контур |
+| `io.py` | ingest + execute | CLI данных |
 
 ## Классический цикл (fabric tape-out)
 
@@ -83,6 +84,16 @@ unified_ledger.json, processor_netlist.json, domains/*.bin}.
 - v4.0 self-verify: 57 skills, DAG exact, zero-import replay, tamper reject
 - env v4.4/v4.6: independent verifiers (260/100 записей PASS)
 - OOS-бенчмарк: scripts/oos_bench.py (фикс. тексты вне обучения)
+
+## Итог рефакторинга (волны 185–195)
+
+Пакет: **55 → 30 файлов** (-45%), объединение по смыслу:
+measurement(5→1), invention(+cegis/prior/while_loop/rdl),
+representations(+reifier), trunk_ops(full_pipeline+merge+hadamard+
+growth), school(lessons+curriculum+mind), env 7→2, selfmodel
+(+controller/experiment/selfedit), genesis(+ec_lib), io(ingest+
+execute). Единый CLI, единый pipeline, единый CKPT_DIR, полная
+дериверсификация. 101 тест зелёный.
 
 ## Честные границы
 
