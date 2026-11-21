@@ -9,7 +9,7 @@ Consolidated layout (2026-11-17 refactor):
   hagi.logic     — logic basis: Venn head + ANF/Zhegalkin
   hagi.lm        — byte-LM neural body (ByteLM, CertifiedStepLM, ...)
   hagi.lessons   — Nadya's school (cumulative curriculum, from-scratch)
-  hagi.mind      — hybrid EXACT/NEURAL mind
+  hagi.school    — lessons + curriculum + mind
   hagi.loop      — certified self-development loop
   hagi.selfedit  — certified knob self-editing
   hagi.rewrite   — forever driver (+ watchdog in watchdog.pyw)
@@ -18,8 +18,7 @@ Consolidated layout (2026-11-17 refactor):
                    experiments, v10 controller
   hagi.ingest    — learn from arbitrary data files
   hagi.execute   — run the programs the model wrote
-  hagi.curriculum — order-free curriculum certificates
-
+  
 `from hagi import *` exposes the core namespace (same as before the
 refactor).
 """
