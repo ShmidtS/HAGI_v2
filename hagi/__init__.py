@@ -37,4 +37,4 @@ Layout (WAVE 195 refactor: 55 -> 32 files, merged by meaning):
 `from hagi import *` exposes the core namespace.
 """
 from .core import *  # noqa: F401,F403
-from . import genesis, logic  # noqa: F401
+from . import genesis  # noqa: F401
