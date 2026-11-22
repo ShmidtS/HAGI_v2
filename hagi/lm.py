@@ -65,6 +65,41 @@ def t_no_grad_if(fn):
     return wrapper
 
 
+def finite_displacement_ce_upper(logits_before, logits_after, targets):
+    """WAVE 208 (HAGI_v2_final patches): exact finite-shift CE upper
+    bound via the log-sum-exp range lemma:
+      CE(z+d) - CE(z) <= <softmax(z)-onehot(y), d> + range(d)^2/8.
+    Makes NO linearity assumption about logits in parameters — unlike
+    the JVP tangent bound, this certifies the ACTUAL finite step."""
+    import torch
+    F = torch.nn.functional
+    delta = logits_after - logits_before
+    p = torch.softmax(logits_before, dim=-1)
+    y = F.one_hot(targets, num_classes=logits_before.shape[-1]).to(p.dtype)
+    first_order = ((p - y) * delta).sum(dim=-1)
+    width = delta.max(dim=-1).values - delta.min(dim=-1).values
+    return (first_order + width.square() / 8.0).mean()
+
+
+def causal_tail_holdout_indices(n_windows, context, holdout_fraction=0.1):
+    """WAVE 208: chronological validation with context-width embargo.
+    Every train window's context+target bytes lie strictly before the
+    validation block — zero raw-byte overlap (audit P0.4)."""
+    import numpy as _np
+    if n_windows < 3 or context < 1:
+        raise ValueError("need >=3 windows and context>=1")
+    if not 0.0 < holdout_fraction < 0.5:
+        raise ValueError("holdout_fraction must be in (0, 0.5)")
+    n_hold = min(max(16, int(n_windows * holdout_fraction)), max(1, n_windows // 3))
+    hold_start = n_windows - n_hold
+    train_end = hold_start - context
+    if train_end < 1:
+        raise ValueError("not enough windows for a disjoint train/holdout split")
+    train = _np.arange(train_end, dtype=_np.int64)
+    valid = _np.arange(hold_start, n_windows, dtype=_np.int64)
+    return train, valid
+
+
 def ternary_quant(module) -> dict[str, Any]:
     """b1.58 per-row ternary quantization (Energy/STEStep.lean):
     s = mean(|W|, dim=1) per output row, Q = round(clamp(W/s, −1, +1))·s.
@@ -774,6 +809,54 @@ class CertifiedStepLM:
                 prm.add_(eta * D[off:off + sz].reshape(prm.shape))
                 off += sz
         return 2.0 * A * A / Rp_sq
+
+    # ---- WAVE 208: guarded FINITE step (HAGI_v2_final patches) ------
+    def _certified_finite_step(self, ctx, nxt, lr_scale: float = 1.0,
+                               max_backtracks: int = 12) -> float:
+        """Finite-displacement certified step: JVP proposes eta (scale
+        heuristic ONLY), admission tests the ACTUAL finite logit
+        displacement via finite_displacement_ce_upper (log-sum-exp
+        range lemma — no linearity assumption). A rejected trial rolls
+        back all parameters. Returns the certified drop bound (0 = HOLD).
+        Fixes the local-experiment finding that a pure-JVP step can
+        INCREASE CE on a nonlinear net."""
+        t = self.t
+        ctx, nxt = self._to_dev((ctx, nxt))
+        params = tuple(self.params())
+        snapshot = [p.detach().clone() for p in params]
+        logits_live = self.logits(ctx)
+        logits0 = logits_live.detach()
+        grads = t.autograd.grad(
+            t.nn.functional.cross_entropy(logits_live, nxt), params)
+        direction = tuple(-g.detach() for g in grads)
+        alignment = float(sum(d.square().sum() for d in direction))
+        if alignment <= 1e-24:
+            return 0.0  # HOLD: zero/invalid gradient
+        try:
+            _, tangent = t.autograd.functional.jvp(
+                lambda *ps: self._logits_from_params(ps, ctx), params,
+                direction)
+            width = tangent.max(dim=-1).values - tangent.min(dim=-1).values
+            r2 = float(width.square().mean())
+        except Exception:
+            r2 = 0.0
+        eta = lr_scale * (4.0 * alignment / r2 if r2 > 1e-24 else 1.0)
+        for _ in range(max_backtracks + 1):
+            with t.no_grad():
+                for p, old in zip(params, snapshot):
+                    p.copy_(old)
+                for p, d in zip(params, direction):
+                    p.add_(eta * d)
+                logits1 = self.logits(ctx).detach()
+            upper = float(finite_displacement_ce_upper(logits0, logits1, nxt))
+            drop = -upper
+            if drop > 1e-12:
+                return drop  # COMMIT: finite-displacement certificate
+            eta *= 0.5
+        with t.no_grad():
+            for p, old in zip(params, snapshot):
+                p.copy_(old)
+        return 0.0  # HOLD: no positive finite certificate
 
     # ---- AdaptiveMajorizer (variance-sensitive CE step) --------------
     def _adaptive_step(self, ctx, nxt, lr_scale: float = 1.0) -> float:
