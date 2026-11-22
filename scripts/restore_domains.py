@@ -15,6 +15,11 @@ def main() -> None:
     chunks = sorted(dom_dir.glob("ns_*.bin"))
     print(f"restore: {len(chunks)} domain chunks", flush=True)
     u = Unified.load() if Unified.exists() else Unified()
+    # WAVE 216 (user: учи сразу тернарную): QAT on — forward sees
+    # {-s,0,+s} throughout training; payload export round-trips
+    # without post-training surprise.
+    u.model._qat = True
+    print("QAT: on (ternary straight-through)", flush=True)
     t0 = time.perf_counter()
     # WAVE 178: resume — a chunk whose sha is already in the ledger
     # with a trained CE is already learned; skip it (idempotent
