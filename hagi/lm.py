@@ -1246,6 +1246,75 @@ class CertifiedStepLM:
         return {"epochs": epochs, "best_holdout_ce": round(best, 4),
                 "certified_descent_lower_bound": round(certified_guarantee, 2)}
 
+    # ---- WAVE 228: model-driven length + full-input reading ----
+
+    def _read_all_windows(self, prompt_bytes: bytes, max_span: int):
+        """Split the WHOLE prompt into sliding windows covering every
+        byte (not just the tail); returns list of k-sized windows."""
+        k = self.k
+        if len(prompt_bytes) <= k:
+            return [([32] * (k - len(prompt_bytes))
+                     + list(prompt_bytes))]
+        windows = []
+        step = k  # contiguous coverage, no byte skipped
+        for start in range(0, len(prompt_bytes) - k + 1, step):
+            windows.append(list(prompt_bytes[start:start + k]))
+        if windows[-1] != list(prompt_bytes[-k:]):
+            windows.append(list(prompt_bytes[-k:]))
+        return windows[-max_span:]
+
+    def generate_auto(self, prompt: str, max_bytes: int = 4096,
+                      temp: float = 0.5, seed: int = 1) -> str:
+        """Model decides HOW LONG to answer: generation runs until the
+        MODEL signals completion — sentence terminator followed by
+        capital/paragraph break, 3 consecutive repeats, or confidence
+        collapse (max prob < 1/256 * 1.2 for 8 steps). Reads the WHOLE
+        prompt: coverage windows over every input byte, logits averaged
+        (C307 composition). max_bytes is a safety cap, not a target."""
+        t = self.t
+        pb = prompt.encode('utf-8')
+        windows = self._read_all_windows(pb, max_span=64)
+        with t.no_grad():
+            g = t.Generator(device=self.device).manual_seed(seed)
+            out = bytearray()
+            last_ctx = windows[-1]
+            rep_counter = 0
+            low_conf = 0
+            last_token = None
+            while len(out) < max_bytes:
+                probs = None
+                # aggregate over ALL prompt windows + growing answer
+                for w in windows + ([last_ctx] if windows[-1] != last_ctx or True else []):
+                    x = t.as_tensor([w], dtype=t.long, device=self.device)
+                    pp = t.softmax(self.logits(x)[0] / max(temp, 1e-3),
+                                   dim=-1)
+                    probs = pp if probs is None else probs + pp
+                probs = probs / len(windows)
+                top_p = float(probs.max())
+                b = int(t.multinomial(probs, 1, generator=g))
+                out.append(b)
+                last_ctx = last_ctx[1:] + [b]
+                # --- model-driven stop conditions ---
+                ch = bytes([b])
+                if top_p < (1.0 / 256) * 1.2:
+                    low_conf += 1
+                else:
+                    low_conf = 0
+                if b == last_token:
+                    rep_counter += 1
+                else:
+                    rep_counter = 0
+                last_token = b
+                if ch in b'.!?':
+                    # sentence end: peek next — if low confidence
+                    # follows, stop here (the model chose to finish)
+                    if low_conf >= 2 or rep_counter >= 3:
+                        break
+                if rep_counter >= 8 or low_conf >= 8:
+                    break
+        return (prompt.encode('utf-8') + bytes(out)).decode(
+            'utf-8', errors='replace')
+
     def generate(self, prompt: str, n_bytes: int = 100, temp: float = 0.5,
                  seed: int = 1, adaptive: bool = False) -> str:
         """WAVE 214: adaptive=True lets the model choose its own

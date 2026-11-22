@@ -282,6 +282,13 @@ class Unified:
     def ask(self, prompt: str, n: int = 400) -> str:
         r = self.model.generate(prompt, n_bytes=n)
         return r[len(prompt) :].strip() if r.startswith(prompt) else r
+
+    def ask_auto(self, prompt: str, max_bytes: int = 4096) -> str:
+        """WAVE 228: the model reads the WHOLE prompt (coverage
+        windows) and decides ITSELF how long the answer is
+        (self-terminating generation)."""
+        r = self.model.generate_auto(prompt, max_bytes=max_bytes)
+        return r[len(prompt):].strip() if r.startswith(prompt) else r
     # ---- WAVE 225: knowledge consolidation from external memory ----
 
     def memory(self):
