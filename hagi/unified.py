@@ -136,6 +136,9 @@ class Unified:
         )
         # training (certified step path)
         t0 = time.perf_counter()
+        import torch as _t
+        incumbent_state = [q.detach().clone()
+                           for q in self.model.params()]
         reps = []
         for rep_i in range(max(1, repeat)):
             reps.append(
@@ -199,20 +202,20 @@ class Unified:
         # new-domain CE — different quantities, wrong direction.
         old_ce_pre = self._old_domains_ce(exclude=source)
         old_ce = old_ce_pre
+        # WAVE 233 (hagi_repro patch): measure post UNCONDITIONALLY —
+        # the old `> 0` placeholder made the gate train-order only.
+        old_ce_post = self._old_domains_ce(exclude=source)
         regression = bool(
-            old_ce_pre is not None and old_ce_pre > 0
+            old_ce_pre is not None and old_ce_post is not None
+            and old_ce_post > old_ce_pre * 1.25
         )
+        old_ce = old_ce_post if old_ce_post is not None else old_ce_pre
         if regression:
-            old_ce_post = self._old_domains_ce(exclude=source)
-            regression = (
-                old_ce_post is not None
-                and old_ce_post > old_ce_pre * 1.25
-            )
-            old_ce = old_ce_post
-        if regression and UNET_CKPT.exists():
-            # honest rollback: deploy the incumbent checkpoint
-            prev = type(self).load()
-            self.model = prev.model
+            # in-place rollback: Unified.load() would recreate the
+            # model object and lose adapter state / optimizer closure
+            with _t.no_grad():
+                for prm, inc in zip(self.model.params(), incumbent_state):
+                    prm.copy_(inc)
         entry["ce"] = ce
         entry["old_ce"] = old_ce
         entry["regression"] = bool(regression)
