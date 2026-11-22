@@ -87,9 +87,11 @@ class SemanticDistillHead:
     def _ensure_proj(self, hidden_dim, device, dtype):
         import torch
         if self.proj is None:
-            g = torch.Generator().manual_seed(11)
             self.proj = torch.zeros(hidden_dim, self.teacher_dim,
                                     device=device, dtype=dtype)
+            # WAVE 220: device-matched generator (cuda generator for a
+            # cuda tensor; CPU generator raised RuntimeError)
+            g = torch.Generator(device=device).manual_seed(11)                 if device != "cpu" else torch.Generator().manual_seed(11)
             self.proj.normal_(0, 0.02, generator=g)
             self.proj.requires_grad_(True)
 

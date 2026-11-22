@@ -149,7 +149,9 @@ class Unified:
         # the incumbent path; the adapter head-trains on the fresh
         # domain only. Restore runs WITHOUT the env — behavior
         # identical to wave209.
-        if os.environ.get("HAGI_DOMAIN_ADAPTERS") == "1":
+        # WAVE 220: adapters ALWAYS ON (user: все функции по
+        # умолчанию; fresh adapter = identity, путь не меняет).
+        if True:
             from hagi.trunk_ops import AdapterBank
             bank = getattr(self, "adapter_bank", None)
             if bank is None:

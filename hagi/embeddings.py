@@ -32,6 +32,13 @@ class GemmaEmbedder:
             )
         self.tok = AutoTokenizer.from_pretrained(self.snapshot)
         self.model = AutoModel.from_pretrained(self.snapshot)
+        # WAVE 220: teacher on the same GPU as the student (iGPU 96GB)
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                self.model = self.model.cuda()
+        except Exception:
+            pass  # CPU fallback (embeddings stay correct, just slower)
         self.model.eval()
 
     @classmethod
@@ -45,6 +52,8 @@ class GemmaEmbedder:
         import torch
 
         b = self.tok(texts, return_tensors="pt", padding=True, truncation=True)
+        device = next(self.model.parameters()).device
+        b = {k: v.to(device) for k, v in b.items()}
         with torch.no_grad():
             out = self.model(**b)
         mask = b["attention_mask"].unsqueeze(-1).float()

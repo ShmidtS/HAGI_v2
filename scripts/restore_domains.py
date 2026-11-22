@@ -40,7 +40,8 @@ def main() -> None:
         r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)
         # WAVE 218 (user: модель наследует семантику embeddinggemma):
         # после ingest — semantic distill на фрагментах домена.
-        if os.environ.get("HAGI_SEMANTIC") == "1":
+        # WAVE 220: semantic distill ALWAYS ON (gemma -> LM).
+        if True:
             try:
                 from hagi.lm import SemanticDistillHead
                 bank = getattr(u, "sem_head", None)
@@ -51,9 +52,11 @@ def main() -> None:
                 frags = [blob_u[i:i+200] for i in
                          range(0, min(len(blob_u), 2000), 200)][:8]
                 if frags:
+                    dev = getattr(u.model, "device", "cpu")
                     idx = torch.tensor(
                         [[(ord(c) % 256) for c in f[:u.model.k]]
-                         for f in frags], dtype=torch.long)
+                         for f in frags], dtype=torch.long,
+                        device=dev)
                     if idx.shape[1] < u.model.k:
                         pad = torch.full(
                             (idx.shape[0], u.model.k - idx.shape[1]), 32,
@@ -71,7 +74,6 @@ def main() -> None:
         # and HIP launch failures after ~1h on the iGPU. Free the
         # cached blocks and log VRAM so growth is visible.
         try:
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 mem = torch.cuda.memory_allocated() / 2**20
