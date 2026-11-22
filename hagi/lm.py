@@ -1018,8 +1018,12 @@ class RopeAttentionByteLM:
         if ad is None:
             return
         t = self.t
-        At = t.as_tensor(ad.A, device=self.device).requires_grad_(True)
-        Bt = t.as_tensor(ad.B, device=self.device).requires_grad_(True)
+        # WAVE 236: restored adapters may be float64 numpy — match
+        # the model dtype (float32) exactly.
+        At = t.as_tensor(ad.A, device=self.device,
+                         dtype=self.W1.dtype).requires_grad_(True)
+        Bt = t.as_tensor(ad.B, device=self.device,
+                         dtype=self.W1.dtype).requires_grad_(True)
         opt = t.optim.Adam([At, Bt], lr=lr)
         e = self._rope(self.emb[ctx], ctx.shape[1], ctx.device)
         pos = t.arange(ctx.shape[1], device=ctx.device, dtype=t.float32)
@@ -1038,8 +1042,11 @@ class RopeAttentionByteLM:
         loss.backward()
         opt.step()
         with t.no_grad():
-            ad.A.copy_(At.detach().cpu())
-            ad.B.copy_(Bt.detach().cpu())
+            # WAVE 236: A/B may be numpy (fresh) or torch Tensor
+            # (restored from checkpoint) — write back accordingly.
+            import numpy as _np2
+            ad.A = At.detach().cpu().numpy()
+            ad.B = Bt.detach().cpu().numpy()
 
     k = 96  # interface compat with Unified (model.k consumers)
 

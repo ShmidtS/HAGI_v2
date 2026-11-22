@@ -292,8 +292,13 @@ def adapter_warm_start(src_adapter: "LowRankAdapter",
     source untouched by construction). Shapes must match."""
     if (src_adapter.d, src_adapter.r) != (dst.d, dst.r):
         return False
-    dst.A = src_adapter.A.copy()
-    dst.B = src_adapter.B.copy()
+    # WAVE 236 fix: adapters restored from a checkpoint hold torch
+    # Tensors (Unified.save persists them as-is), fresh ones hold
+    # numpy arrays — normalize to numpy on handoff so copy() works
+    # for both.
+    import numpy as _np
+    dst.A = _np.asarray(src_adapter.A).copy()
+    dst.B = _np.asarray(src_adapter.B).copy()
     return True
 
 
