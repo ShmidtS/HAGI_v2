@@ -84,6 +84,7 @@ def main() -> None:
             break
         blob = b"\n\x00FILE\x00\n".join(chunk)
         cid = f"ns_{st['chunks']:04d}"
+        (CKPT_DIR / "domains").mkdir(parents=True, exist_ok=True)
         (CKPT_DIR / "domains" / f"{cid}.bin").write_bytes(blob)
         # ---- neural training on cumulative corpus ----
         # WAVE 168 (user decision): replay cap REMOVED — full-book
@@ -101,6 +102,34 @@ def main() -> None:
             r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
+        # WAVE 234 (user directive): semantic distill ALWAYS ON in the
+        # full-disk cycle — same protocol as restore_domains (gemma
+        # teacher -> LM hidden cosine distill on chunk fragments).
+        try:
+            from hagi.lm import SemanticDistillHead
+            bank = getattr(u, "sem_head", None)
+            if bank is None:
+                bank = u.sem_head = SemanticDistillHead(dim=0)
+            blob_u = blob.decode("utf-8", errors="ignore")
+            frags = [blob_u[i:i + 200]
+                     for i in range(0, min(len(blob_u), 2000), 200)][:8]
+            frags = [f.ljust(200) for f in frags]  # uniform length
+            if frags:
+                import torch as _th
+                dev = getattr(u.model, "device", "cpu")
+                idx = _th.tensor(
+                    [[(ord(c) % 256) for c in f[:u.model.k]]
+                     for f in frags], dtype=_th.long, device=dev)
+                if idx.shape[1] < u.model.k:
+                    pad = _th.full(
+                        (idx.shape[0], u.model.k - idx.shape[1]), 32,
+                        dtype=_th.long)
+                    idx = _th.cat([pad, idx], dim=1)
+                u.model.domain_adapter = None
+                sl = bank.align_step(u.model, idx, frags)
+                print(f"    semantic loss {sl:.3f}", flush=True)
+        except Exception as _e:
+            print(f"    semantic skipped: {_e!r}", flush=True)
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "
               f"({files_now} files) → CE {ce} "
               f"({r.get('seconds', '?')}s)", flush=True)
