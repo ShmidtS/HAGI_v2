@@ -3010,6 +3010,7 @@ def exact_piecewise_poly_fit(
 
 
 # WAVE 221 (O1/O3): exact cheap templates (research report).
+_SKETCH_CAP = 4096
 _MODULI = (16, 26, 64, 128, 256, 10, 12, 60, 100, 7, 3, 5, 8, 9, 11,
            13, 17, 19, 23, 32, 24, 36, 48, 251, 255, 257, 1000, 1024,
            2, 4, 6, 14, 15, 18, 20, 21, 22, 25, 27, 28, 30, 31)
@@ -3052,6 +3053,48 @@ def _mod_affine_expr(X, Y, arity: int):
                         return Expr("mod", (
                             Expr("add", (e, Expr.const(int(b)))),
                             Expr.const(m)))
+    # WAVE 221f: piecewise range-affine — base-offset alphabets
+    # (CAESAR on codepoints): y = (x - lo + c) % m + lo inside
+    # [lo, hi); outside the range the caller's gate rejects.
+    if arity == 1:
+        order = np.argsort(X[:, 0])
+        xs = X[order, 0]
+        ys = Y[order]
+        # contiguous runs of inputs with constant offset pattern
+        lo_i = 0
+        while lo_i < len(xs):
+            hi_i = lo_i
+            offs = (ys - xs) % 26
+            base = offs[lo_i]
+            while (hi_i + 1 < len(xs)
+                   and int(xs[hi_i + 1]) == int(xs[hi_i]) + 1
+                   and offs[hi_i + 1] == base):
+                hi_i += 1
+            if hi_i - lo_i + 1 >= 4:
+                seg_x = xs[lo_i:hi_i + 1]
+                seg_y = ys[lo_i:hi_i + 1]
+                # y = ((x - lo + c) mod m) + lo — base-offset affine
+                # (CAESAR on codepoints): try teacher-consistent forms
+                lo = int(seg_x[0])
+                for mm in (26, 256):
+                    for c in range(1, mm):
+                        cand_y = ((seg_x - lo + c) % mm) + lo
+                        if np.array_equal(cand_y, seg_y):
+                            # expr: ((x - lo + c) mod m) + lo built
+                            # from available ops: mod over add-chain
+                            shifted = Expr("add", (Expr.var(0),
+                                                   Expr.const(c - lo)))
+                            inner = Expr("mod", (shifted,
+                                                 Expr.const(mm)))
+                            inner = Expr("add", (inner,
+                                                 Expr.const(lo)))
+                            in_rng = Expr("in_ranges",
+                                          (Expr.var(0),),
+                                          ((int(seg_x[0]),
+                                            int(seg_x[-1])),))
+                            return Expr("if_cond", (in_rng, inner,
+                                                    Expr.var(0)))
+            lo_i = hi_i + 1
     return None
 
 
@@ -3102,7 +3145,7 @@ def synthesize_batched_mdl(
     # WAVE 221c: full-domain sparse candidate (learn-provided) has
     # priority — certified by try_commit on the full domain anyway.
     fc = _FULL_CAND[0]
-    if fc is not None and _CURRENT_FAMILY[0] == "language" and arity == 1:
+    if fc is not None and arity == 1:
         try:
             if all(fc.eval(r, env) == y for r, y in zip(val_x, val_y)):
                 return fc, 1
@@ -3130,6 +3173,29 @@ def synthesize_batched_mdl(
                 except Exception:
                     pass
 
+    # WAVE 221d (O2, research report): sketch-MDL for huge domains —
+    # search on a stratified subsample (<=SKETCH_CAP), then verify
+    # the candidate on FULL train (val gate stays with try_commit).
+    # Memory O(P*CAP) instead of O(P*N); LANG8_SHIFT 45k rows -> OOM
+    # eliminated.
+    N = X.shape[0]
+    if N > _SKETCH_CAP and deadline is None:
+        for cap in (_SKETCH_CAP, 2 * _SKETCH_CAP):
+            idx = np.unique((np.arange(cap) * N // cap).astype(np.int64))
+            sx = [train_x[int(i)] for i in idx]
+            sy = [int(train_y[int(i)]) for i in idx]
+            e_sk, _n = synthesize_batched_mdl(
+                arity, sx, sy, val_x, val_y, library_experts,
+                max_evals, max_bits, deadline)
+            if e_sk is None:
+                continue
+            try:
+                if all(e_sk.eval(r, env) == y
+                       for r, y in zip(train_x, train_y)):
+                    return e_sk, _n
+            except Exception:
+                continue
+        return None, 0  # sketch failed -> honest HOLD (no full O(P*N))
     N = X.shape[0]
     leaf_exprs = [Expr.var(i) for i in range(arity)] + [
         Expr.const(c) for c in CONSTS
@@ -3868,9 +3934,13 @@ class GrowingHagiProcessor:
             try:
                 yy = np.array([int(spec.teacher(*r)) for r in domain],
                               dtype=np.int64)
+                Xd = np.asarray(domain, dtype=np.int64)
                 if set(np.unique(yy)) <= {0, 1}:
-                    _FULL_CAND[0] = _sparse_membership(
-                        np.asarray(domain, dtype=np.int64), yy)
+                    _FULL_CAND[0] = _sparse_membership(Xd, yy)
+                else:
+                    # WAVE 221g: mod-affine/piecewise on the full
+                    # domain (CAESAR-class alphabets)
+                    _FULL_CAND[0] = _mod_affine_expr(Xd, yy, 1)
             except Exception:
                 _FULL_CAND[0] = None
 
