@@ -364,6 +364,14 @@ class Unified:
         for g in ("theta0", "lam"):
             if hasattr(self.model, g):
                 st[g] = float(getattr(self.model, g))
+        # WAVE 235b FIX (external audit P6): trained adapters were
+        # never serialized — every restart silently reset them to the
+        # B=0 identity. Persist A/B per domain.
+        bank = getattr(self, "adapter_bank", None)
+        if bank is not None:
+            st["adapter_bank"] = {
+                dom: {"A": ad.A, "B": ad.B}
+                for dom, ad in bank._adapters.items()}
         UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
         # WAVE 230: atomic checkpoint write — a crash mid-save must
         # not leave a truncated .pt / half-written ledger.
@@ -393,6 +401,14 @@ class Unified:
         u.model = lm_mod.RopeAttentionByteLM(
             dim=u.dim, hidden=u.hidden,
             theta0=st.get("theta0", 1.0), lam=st.get("lam", 0.05))
+        if "adapter_bank" in st:
+            from hagi.trunk_ops import AdapterBank
+            bank = u.adapter_bank = AdapterBank(
+                d=u.model.hidden, r=2)
+            for dom, ab in st["adapter_bank"].items():
+                ad = bank.get(dom)
+                ad.A = _t.as_tensor(ab["A"])
+                ad.B = _t.as_tensor(ab["B"])
         with _t.no_grad():
             for n in ("emb", "W1", "b1", "W2", "b2", "q"):
                 if hasattr(u.model, n) and n in st:

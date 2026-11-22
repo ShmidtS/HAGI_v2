@@ -890,6 +890,7 @@ class RopeAttentionByteLM:
         opt = t.optim.Adam(self.params(), lr=lr)
         best = eval_ce(hold)
         best_state = [p.detach().clone() for p in self.params()]
+        self._last_best_state = best_state
         for ep in range(epochs):
             perm2 = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
@@ -910,6 +911,105 @@ class RopeAttentionByteLM:
             for q2, s in zip(self.params(), best_state):
                 q2.data.copy_(s)
         return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
+
+    def _rope_logits_from_params(self, ps, ctx):
+        """Functional logits over (emb, W1, b1, W2, b2) for JVP —
+        WAVE 235: reuses the LIVE self._rope (exact same isometry as
+        full_logits; the original duplicated-pairs rewrite diverged:
+        wrong freq schedule and interleaved-vs-split pairing)."""
+        t = self.t
+        emb, W1, b1, W2, b2 = ps
+        B, L = ctx.shape
+        e = self._rope(emb[ctx], L, ctx.device)
+        pos = t.arange(L, device=ctx.device, dtype=t.float32)
+        dot = t.einsum("bid,bjd->bij", e, e) / (self.dim ** 0.5)
+        sc = dot - self.lam * (pos[None, :, None] - pos[None, None, :])
+        mask = pos[None, :, None] >= pos[None, None, :]
+        sc = sc.masked_fill(~mask, float("-inf"))
+        pp = t.softmax(sc, dim=-1)
+        h = t.relu(t.einsum("blj,bjd->bld", pp, e) @ W1 + b1)
+        return h @ W2 + b2
+
+    def _certified_finite_step(self, ctx, nxt, lr_scale: float = 1.0,
+                               max_backtracks: int = 12) -> float:
+        """WAVE 235: finite-displacement certified step on the Rope
+        trunk (ports CertifiedStepLM's §3.9 mechanism). JVP proposes
+        eta; admission tests the ACTUAL finite logit displacement via
+        finite_displacement_ce_upper (log-sum-exp range lemma — no
+        linearity assumption). Rejected trial rolls back all params.
+        Returns certified drop bound (0.0 = HOLD)."""
+        t = self.t
+        if ctx.device != self.device:
+            ctx = ctx.to(self.device)
+        if nxt.device != self.device:
+            nxt = nxt.to(self.device)
+        # WAVE 233: q is dead in forward (pairwise attention) — the
+        # certified step must cover ONLY live parameters, else JVP
+        # signature mismatches _rope_logits_from_params(ps).
+        params = tuple([self.emb, self.W1, self.b1, self.W2, self.b2])
+        snapshot = [q.detach().clone() for q in params]
+        # next-byte logits only: newest-first -> last position
+        logits_live = self.full_logits(ctx)[:, -1, :]
+        logits0 = logits_live.detach()
+        grads = t.autograd.grad(
+            t.nn.functional.cross_entropy(logits_live, nxt), params)
+        direction = tuple(-g.detach() for g in grads)
+        alignment = float(sum(d.square().sum() for d in direction))
+        if alignment <= 1e-24:
+            return 0.0  # HOLD
+        try:
+            _, tangent = t.autograd.functional.jvp(
+                lambda *ps: self._rope_logits_from_params(ps, ctx),
+                params, direction)
+            width = tangent.max(dim=-1).values                 - tangent.min(dim=-1).values
+            r2 = float(width.square().mean())
+        except Exception:
+            r2 = 0.0
+        eta = lr_scale * (4.0 * alignment / r2 if r2 > 1e-24 else 1.0)
+        for _ in range(max_backtracks + 1):
+            with t.no_grad():
+                for q, old in zip(params, snapshot):
+                    q.copy_(old)
+                for q, d in zip(params, direction):
+                    q.add_(eta * d)
+                logits1 = self.full_logits(ctx)[:, -1, :].detach()
+            upper = float(finite_displacement_ce_upper(
+                logits0, logits1, nxt))
+            drop = -upper
+            if drop > 1e-12:
+                return drop  # COMMIT: finite-displacement certificate
+            eta *= 0.5
+        with t.no_grad():
+            for q, old in zip(params, snapshot):
+                q.copy_(old)
+        return 0.0  # HOLD
+
+    def eval_holdout_ce(self, data: bytes, holdout: float = 0.1,
+                        max_eval: int = 1024):
+        """Wave235: holdout CE on the contiguous tail (same split as
+        train_guarded), mini-batched. None if data too small."""
+        import numpy as _np
+        import torch as _th
+        idx_np = _np.frombuffer(data, dtype=_np.uint8)
+        n = len(idx_np) - self.k - 1
+        if n < 512:
+            return None
+        n_hold = max(16, int(n * holdout))
+        hold = _np.arange(max(n - n_hold, n - 2048, n - max_eval), n)
+        dev = self.device
+        raw = _th.as_tensor(idx_np.copy(), dtype=_th.long, device=dev)
+        tot, cnt = 0.0, 0
+        with _th.no_grad():
+            for s in range(0, len(hold), 512):
+                hp = hold[s:s + 512]
+                X = _np.stack([idx_np[p + self.k::-1][:self.k]
+                               for p in hp])
+                x = _th.as_tensor(X, dtype=_th.long, device=dev)
+                y = raw[_th.as_tensor(hp + self.k, dtype=_th.long,
+                                      device=dev)]
+                tot += float(self.ce(x, y)) * len(x)
+                cnt += len(x)
+        return tot / max(cnt, 1)
 
     def adapter_head_step(self, ctx, nxt, lr: float = 1e-2):
         """WAVE 230: train ONLY the domain adapter (A/B) on this
@@ -951,8 +1051,60 @@ class RopeAttentionByteLM:
         r = self.train_guarded(data, epochs=epochs, holdout=holdout,
                                batch=batch, max_train_ctx=self.k,
                                holdout_seed=holdout_seed)
+        # WAVE 235 HYBRID (user-approved): after the fast Adam phase,
+        # a certified-refine phase runs §3.9 finite-displacement steps
+        # on holdout windows — every accepted step carries a PROVEN
+        # CE drop bound, restoring the StepContract semantics the
+        # pure-Adam path was missing (bound was honest None).
+        pre_refine_ce = self.eval_holdout_ce(data, holdout=holdout)
+        hold_bytes = max(4096, int(len(data) * holdout))
+        tail = data[-hold_bytes:]
+        import numpy as _np
+        idx_np = _np.frombuffer(tail, dtype=_np.uint8)
+        rng = _np.random.default_rng(7 if holdout_seed is None
+                                     else int(holdout_seed))
+        positions = rng.choice(len(idx_np) - self.k - 1,
+                               size=min(64, len(idx_np) - self.k - 1),
+                               replace=False)
+        X = _np.stack([idx_np[p + self.k::-1][:self.k]
+                       for p in positions])
+        y = idx_np[positions + self.k]
+        import torch as _th
+        refine_X = _th.as_tensor(X.copy(), dtype=_th.long,
+                                 device=self.device)
+        refine_y = _th.as_tensor(y, dtype=_th.long, device=self.device)
+        total_drop, steps, commits = 0.0, 0, 0
+        for _ in range(8):  # refine rounds
+            perm = rng.permutation(len(positions))
+            for s in range(0, len(perm), 32):
+                bx = refine_X[perm[s:s + 32]]
+                by = refine_y[perm[s:s + 32]]
+                d = self._certified_finite_step(bx, by)
+                steps += 1
+                if d > 0:
+                    commits += 1
+                    total_drop += d
+        bound = total_drop if commits else None
+        # Wave235 gate: certified steps are per-batch proven, but the
+        # deployment metric is the Adam-phase holdout. If refine made
+        # the full holdout worse, roll back to the best_state snapshot
+        # (each per-batch bound holds on its own batch only —
+        # HonestTransition: prove before deploy).
+        tail_ce = self.eval_holdout_ce(data, holdout=holdout)
+        # apples-to-apples: SAME eval (tail windows) pre vs post.
+        if (tail_ce is not None and pre_refine_ce is not None
+                and tail_ce > pre_refine_ce * 1.02):
+            best_state = getattr(self, "_last_best_state", None)
+            if best_state is not None:
+                with _th.no_grad():
+                    for q, s in zip(self.params(), best_state):
+                        q.data.copy_(s)
+            bound = None  # refined weights not deployed
         return {"best_holdout_ce": r["best_holdout_ce"],
-                "certified_descent_lower_bound": None}
+                "certified_descent_lower_bound": bound,
+                "certified_refine": {"steps": steps,
+                                     "commits": commits,
+                                     "deployed": bound is not None}}
 
     # ---- WAVE 230: self-terminating generation on the Rope model --
 

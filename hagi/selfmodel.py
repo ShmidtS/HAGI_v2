@@ -130,9 +130,14 @@ def guarded_optimizer_step(model: torch.nn.Module, optimizer: torch.optim.Optimi
         optimizer.load_state_dict(optim_snap)
         _zero_grads(model)
         idx = 0
+        # WAVE 235b FIX (external audit P4): backtracking scaled the
+        # REPORTED step_scale only — optimizer.step() ran at full lr
+        # every retry, so all backtrack iterations were identical.
+        # Scale the GRADIENT instead: optimizer(lr) * scale*grad ==
+        # effective step of lr*scale for SGD/Adam direction.
         for p in model.parameters():
             n = p.numel()
-            p.grad = d[idx:idx + n].view_as(p).clone()
+            p.grad = (scale * d[idx:idx + n]).view_as(p).clone()
             idx += n
         optimizer.step()
         loss_after = validation_fn(model)
