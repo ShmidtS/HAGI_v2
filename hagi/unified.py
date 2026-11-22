@@ -282,6 +282,38 @@ class Unified:
     def ask(self, prompt: str, n: int = 60) -> str:
         r = self.model.generate(prompt, n_bytes=n)
         return r[len(prompt) :].strip() if r.startswith(prompt) else r
+    # ---- WAVE 225: knowledge consolidation from external memory ----
+
+    def memory(self):
+        """SemanticMemory singleton (SQLite+FTS5+gemma archive)."""
+        from hagi.memory_store import SemanticMemory
+        import hagi.util as _u
+        if getattr(self, "_mem", None) is None:
+            self._mem = SemanticMemory(str(_u.CKPT_DIR / "memory.db"))
+        return self._mem
+
+    def remember(self, text: str) -> None:
+        """Store a conversation/fact permanently (weights untouched)."""
+        self.memory().add(text)
+
+    def consolidate(self, query: str, n_bytes: int = 200) -> str:
+        """Retrieval-augmented ask: relevant memory pages -> prompt
+        prefix -> grounded generation (labs agent pattern)."""
+        hits = self.memory().query(query, top_k=3)
+        sep = chr(10)
+        evidence = sep.join(t for _c, _pid, t in hits) if hits else ""
+        prompt = (evidence + sep + sep + query) if evidence else query
+        return self.ask(prompt, n=n_bytes)
+
+    def learn_from_dialog(self, dialog_text: str,
+                          name: str | None = None) -> dict:
+        """Full consolidation loop: dialog -> permanent memory ->
+        ingest as a training domain (model LEARNS from it)."""
+        name = name or ("dialog_"
+                        + time.strftime("%Y%m%d_%H%M%S"))
+        self.remember(dialog_text)
+        return self.ingest(name, dialog_text.encode("utf-8"),
+                           epochs=1, repeat=1)
 
     # ---- persistence ----
 
