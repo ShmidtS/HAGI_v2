@@ -1,7 +1,8 @@
 """Restore unified model by replaying ALL saved domain chunks
 (412 ns_*.bin) through ingest — same path as the original cycle.
 Run with 1-thread OpenBLAS env (see watchdog pattern)."""
-import sys, time
+import sys, time, os
+import torch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +38,32 @@ def main() -> None:
                   "(already learned, sha match)", flush=True)
             continue
         r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)
+        # WAVE 218 (user: модель наследует семантику embeddinggemma):
+        # после ingest — semantic distill на фрагментах домена.
+        if os.environ.get("HAGI_SEMANTIC") == "1":
+            try:
+                from hagi.lm import SemanticDistillHead
+                bank = getattr(u, "sem_head", None)
+                if bank is None:
+                    bank = u.sem_head = SemanticDistillHead(dim=0)
+                import random as _rd
+                blob_u = blob.decode("utf-8", errors="ignore")
+                frags = [blob_u[i:i+200] for i in
+                         range(0, min(len(blob_u), 2000), 200)][:8]
+                if frags:
+                    idx = torch.tensor(
+                        [[(ord(c) % 256) for c in f[:u.model.k]]
+                         for f in frags], dtype=torch.long)
+                    if idx.shape[1] < u.model.k:
+                        pad = torch.full(
+                            (idx.shape[0], u.model.k - idx.shape[1]), 32,
+                            dtype=torch.long)
+                        idx = torch.cat([pad, idx], dim=1)
+                    u.model.domain_adapter = None
+                    l = bank.align_step(u.model, idx, frags)
+                    print(f"    semantic loss {l:.3f}", flush=True)
+            except Exception as _e:
+                print(f"    semantic skipped: {_e!r}", flush=True)
         ce = r.get("holdout_ce", -1)
         # WAVE 205 (VRAM hygiene): the replay corpus grows with every
         # domain (full-book replay) and allocator caching fragments
