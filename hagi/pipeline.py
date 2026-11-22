@@ -143,14 +143,20 @@ def lm_residual_relation(u, source: str, data: bytes
             except Exception:
                 continue
             if pred != nxt:
-                # WAVE 235b (external audit P5): the symbolic layer
-                # synthesizes arity-1 laws from the LAST byte only.
-                # That is a documented REDUCTION: a PROVEN_EXACT
-                # verdict here certifies the last-byte law, not the
-                # full k-context law. Keep the full context alongside
-                # so a future arity-k synthesizer can use it.
+                # WAVE 235b (external audit P5 + user follow-up): the
+                # symbolic layer synthesizes arity-1 laws, so each
+                # miss is offered from TWO context positions: the last
+                # byte (ctx[-1]) and the previous byte (ctx[-2]).
+                # A PROVEN_EXACT verdict certifies the corresponding
+                # single-position law — NOT the full k-context law.
+                # Laws reachable only from earlier context positions
+                # remain an honest HOLD until the arity-k
+                # synthesizer lands.
                 misses_x.append(int(ctx[-1]))
                 misses_y.append(nxt)
+                if len(ctx) >= 2:
+                    misses_x.append(int(ctx[-2]))
+                    misses_y.append(nxt)
     return misses_x, misses_y
 
 
