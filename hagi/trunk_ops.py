@@ -368,3 +368,40 @@ def exact_ce_contribution(p_true: float) -> float:
         raise ValueError(
             "invalid exact coverage: true-byte probability must be > 0")
     return -math.log(p)
+
+
+# WAVE 214 (hagi_lab): packed 5-trit/byte codec (Ternary.lean: 3^5=243<=2^8).
+
+def pack_trits5(levels: Sequence[int]) -> tuple[bytes, int]:
+    """Pack {-1,0,+1} symbols in base-3 groups of five, one byte/group.
+
+    Mapping: -1 -> 0, 0 -> 1, +1 -> 2. Since 3**5=243 <= 256,
+    every five-trit code fits injectively in one byte.
+    """
+    vals = [int(x) for x in levels]
+    if any(x not in (-1, 0, 1) for x in vals):
+        raise ValueError("levels must be in {-1,0,+1}")
+    out = bytearray()
+    for start in range(0, len(vals), 5):
+        digits = [v+1 for v in vals[start:start+5]]
+        digits += [1] * (5-len(digits))
+        code = sum(d * (3**i) for i, d in enumerate(digits))
+        if code >= 243:
+            raise AssertionError("base-three code overflow")
+        out.append(code)
+    return bytes(out), len(vals)
+
+
+def unpack_trits5(payload: bytes, length: int) -> np.ndarray:
+    if length < 0 or len(payload) != (length+4)//5:
+        raise ValueError("payload length does not match trit count")
+    out = []
+    for code in payload:
+        if code >= 243:
+            raise ValueError("invalid packed trit byte (must be <243)")
+        n = int(code)
+        for _ in range(5):
+            out.append((n % 3)-1)
+            n //= 3
+    return np.asarray(out[:length], dtype=np.int8)
+

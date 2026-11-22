@@ -65,6 +65,91 @@ def t_no_grad_if(fn):
     return wrapper
 
 
+class AdaptiveContextSelector:
+    """WAVE 214 (user request + hagi_lab LONG_CONTEXT): the model
+    CHOOSES its own context size per input. Architecture keeps a
+    fixed window k (trained); adaptivity = the number of sliding
+    windows W aggregated (mean-logits ensemble). W is measured on
+    the prompt's own tail: more windows are accepted only while
+    self-CE improves (diminishing returns => stop). The full history
+    stays in caller's bytes — unbounded SOURCE, bounded compute."""
+
+    def __init__(self, w_choices=(1, 2, 4, 8, 16), min_tail: int = 16,
+                 tol: float = 0.01):
+        self.w_choices = sorted(w_choices)
+        self.min_tail = min_tail
+        self.tol = tol
+
+    def _ensemble_logits(self, model, rows_x):
+        """Mean-logits over W disjoint trailing windows per row-set:
+        window j covers bytes [end-k-j*k, end-j*k); W=1 is the plain
+        path. Aggregation = arithmetic mean of softmax probs (C307
+        attention-branch mean composition)."""
+        t = model.t
+        k = model.k
+        probs = None
+        used = 0
+        for j in range(max(self.w_choices)):
+            xs = []
+            for row in rows_x:
+                end = len(row)
+                start = max(0, end - k - j * k)
+                w = row[start:end - j * k] if j > 0 else row[start:end]
+                if len(w) < k:
+                    w = [32] * (k - len(w)) + w
+                else:
+                    w = w[-k:]
+                xs.append(w)
+            x = t.as_tensor(xs, dtype=t.long)
+            with t.no_grad():
+                lg = model.logits(x)
+                p = t.softmax(lg, dim=-1)
+            probs = p if probs is None else probs + p
+            used += 1
+            # caller breaks by measuring — see select()
+            yield used, probs / used
+
+    def select(self, model, prompt_bytes: bytes) -> dict:
+        """Measure self-CE of predicting the tail bytes with W
+        aggregated windows; return the SMALLEST W within tol of the
+        best (Occam: no wider ensemble without measured benefit)."""
+        t = model.t
+        tail_len = min(self.min_tail, max(1, len(prompt_bytes) // 4))
+        if len(prompt_bytes) <= tail_len + model.k:
+            return {"w": 1, "ce": None, "curve": [],
+                    "reason": "prompt too short for measurement"}
+        tail = prompt_bytes[-tail_len:]
+        pre = prompt_bytes[:-tail_len]
+        k = model.k
+        rows_x = []
+        for i in range(len(tail)):
+            end = len(pre) + i
+            start = max(0, end - k * max(self.w_choices))
+            row = list(prompt_bytes[start:end])
+            rows_x.append(row)
+        y = t.as_tensor(list(tail), dtype=t.long)
+        curve = []
+        for w, probs in self._ensemble_logits(model, rows_x):
+            if w not in self.w_choices:
+                continue
+            ce = float(t.nn.functional.cross_entropy(
+                (probs + 1e-12).log(), y))
+            curve.append((w, ce))
+            if w == max(self.w_choices):
+                break
+        if not curve:
+            return {"w": 1, "ce": None, "curve": [],
+                    "reason": "no W fits the prompt"}
+        best_ce = min(c for _, c in curve)
+        chosen = self.w_choices[0]
+        for w, c in curve:
+            if c <= best_ce * (1.0 + self.tol) + 1e-9:
+                chosen = w
+                break
+        return {"w": chosen, "ce": best_ce, "curve": curve,
+                "reason": "self-CE elbow"}
+
+
 def finite_displacement_ce_upper(logits_before, logits_after, targets):
     """WAVE 208 (HAGI_v2_final patches): exact finite-shift CE upper
     bound via the log-sum-exp range lemma:
@@ -1088,8 +1173,15 @@ class CertifiedStepLM:
                 "certified_descent_lower_bound": round(certified_guarantee, 2)}
 
     def generate(self, prompt: str, n_bytes: int = 100, temp: float = 0.5,
-                 seed: int = 1) -> str:
+                 seed: int = 1, adaptive: bool = False) -> str:
+        """WAVE 214: adaptive=True lets the model choose its own
+        effective context size (window-ensemble W measured by
+        AdaptiveContextSelector on the prompt's own tail)."""
         t = self.t
+        W = 1
+        if adaptive:
+            W = AdaptiveContextSelector().select(
+                self, prompt.encode("utf-8")).get("w", 1)
         with t.no_grad():
             g = t.Generator(device=self.device).manual_seed(seed)
             ctx = list(prompt.encode("utf-8"))[-self.k:]
@@ -1097,8 +1189,18 @@ class CertifiedStepLM:
                 ctx = [32] * (self.k - len(ctx)) + ctx
             out = bytearray()
             for _ in range(n_bytes):
-                x = t.as_tensor([ctx], dtype=t.long, device=self.device)
-                probs = t.softmax(self.logits(x)[0] / max(temp, 1e-3), dim=-1)
+                probs = None
+                for j in range(W):
+                    start = max(0, len(ctx) - self.k - j * self.k)
+                    w = ctx[start:len(ctx) - j * self.k] if j > 0 else ctx
+                    if len(w) < self.k:
+                        w = [32] * (self.k - len(w)) + w
+                    x = t.as_tensor([w[-self.k:]], dtype=t.long,
+                                    device=self.device)
+                    p = t.softmax(self.logits(x)[0] / max(temp, 1e-3),
+                                  dim=-1)
+                    probs = p if probs is None else probs + p
+                probs = probs / W
                 b = int(t.multinomial(probs, 1, generator=g))
                 out.append(b); ctx = ctx[1:] + [b]
         return (prompt.encode("utf-8") + bytes(out)).decode(
