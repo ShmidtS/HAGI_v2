@@ -35,7 +35,8 @@ class SemanticMemory:
         vecs = gemma.embed([texts[pid][:512] for pid in pids])
         import numpy as np
         for pid, v in zip(pids, vecs):
-            self._vectors[pid] = np.asarray(v)
+            self._vectors[pid] = (v.detach().cpu().numpy()
+                                  if hasattr(v, "cpu") else np.asarray(v))
         self._pages = texts
 
     def search(self, q: str, limit: int = 4):
@@ -56,6 +57,8 @@ class SemanticMemory:
         gemma = GemmaEmbedder.get()
         self._ensure_vectors()
         qv = gemma.embed([q[:512]])[0]
+        if hasattr(qv, "cpu"):
+            qv = qv.detach().cpu().numpy()
         scored = []
         for pid, v in self._vectors.items():
             cos = float(np.dot(qv, v))
