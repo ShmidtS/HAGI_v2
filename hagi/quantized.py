@@ -317,6 +317,16 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"
     class _Model:  # duck-typed for export_ternary_payload
         pass
     mm = _Model()
+    # WAVE 216: exporter hardcodes an emb spec — 1x1 zero stub (the
+    # REAL embedding travels as the FP16 tail below; QAT models are
+    # exported with ternary-consistent W1/W2 scales).
+    class _Stub:
+        class weight:  # duck for ("emb.weight", model.emb.weight)
+            pass
+    _stub = _Stub()
+    import torch as _torch
+    _stub.weight = _torch.zeros(1, 1)
+    mm.emb = _stub
     for name, attr, tr in specs_tr:
         setattr(mm, name.split('.')[0], _W(attr.detach(), tr))
     mm.context = model.k  # metadata expected by exporter
@@ -339,10 +349,10 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"
     return payload, meta
 
 
-def instantiate_hagi_lm_payload(payload: bytes):
-    """WAVE 215 (final, header-driven): restore a HAGI_v2 byte-LM
-    from packed payload ONLY. Walks header["matrices"] exact
-    offsets (packed_offset/scale_offset are body-absolute)."""
+def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):
+    """WAVE 215 (header-driven) + WAVE 216 (emb FP16 tail): restore
+    a HAGI_v2 byte-LM from payload. meta (returned by export) carries
+    emb_fp16_len — the FP16 embedding appended after biases."""
     import json as _json
     import numpy as np
     import struct as _struct
@@ -352,14 +362,17 @@ def instantiate_hagi_lm_payload(payload: bytes):
     header_len = _struct.unpack("<I", payload[len(MAGIC):len(MAGIC)+4])[0]
     start = len(MAGIC) + 4
     header = _json.loads(payload[start:start + header_len].decode("utf-8"))
+    meta = meta or {}
     body = payload[start + header_len:]
     from hagi.lm import CertifiedStepLM
     template = CertifiedStepLM(k=int(header["context"]),
                                dim=int(header["dim"]),
                                hidden=int(header["hidden"]), seed=0)
-    params = {"emb.weight": template.emb, "W1.weight": template.W1,
-              "W2.weight": template.W2}
+    params = {"emb.weight": None, "W1.weight": template.W1,
+              "W2.weight": template.W2}  # emb travels as FP16 tail
     for m in header["matrices"]:
+        if m["name"] == "emb.weight":
+            continue  # WAVE 216: stub, real emb restored below
         tgt = params[m["name"]]
         src_shape = tuple(m["source_shape"])
         rows, cols = src_shape
@@ -392,7 +405,7 @@ def instantiate_hagi_lm_payload(payload: bytes):
             tgt.copy_(torch.as_tensor(arr.astype(np.float32),
                                       dtype=tgt.dtype))
     # WAVE 215e: FP16 embedding appended after biases
-    emb_len = (header.get("hagi_lm") or {}).get("emb_fp16_len", 0)
+    emb_len = (meta.get("hagi_lm") or {}).get("emb_fp16_len", 0)
     if emb_len:
         tail = body[len(body) - emb_len:]
         emb = np.frombuffer(tail, dtype="<f2").astype(np.float32)

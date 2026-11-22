@@ -846,12 +846,28 @@ class CertifiedStepLM:
     def params(self):
         return [self.emb, self.W1, self.b1, self.W2, self.b2]
 
+    @staticmethod
+    def _ste_ternary(W, t=None):
+        """WAVE 216 (user: 'учи сразу тернарную'): straight-through
+        ternary fake-quant (labs TernaryAwareByteLM). Forward sees
+        {-s,0,+s} per-row; master weights carry the gradient."""
+        if t is None:
+            import torch as _t
+            t = _t
+        scale = W.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1e-12)
+        q = t.round(W.detach() / scale).clamp(-1, 1) * scale
+        return W + (q - W).detach()
+
     def logits(self, ctx):
         t = self.t
         if ctx.device != getattr(self, "device", ctx.device):
             ctx = ctx.to(self.device)   # WAVE 176: robust CPU input
-        e = self.emb[ctx]
-        h = t.relu(e.reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
+        e_w = (self._ste_ternary(self.emb, t)
+               if getattr(self, "_qat", False) else self.emb)
+        e = e_w[ctx]
+        h = t.relu(e.reshape(ctx.shape[0], -1) @
+                   (self._ste_ternary(self.W1, t) if getattr(self, "_qat", False)
+                    else self.W1) + self.b1)
         # WAVE 210: optional per-domain low-rank adapter on the hidden
         # head (AdapterBank.get(domain)) — C532 form x + B(A x); with
         # B=0 EXACT identity, so a fresh adapter never changes logits.
@@ -860,7 +876,9 @@ class CertifiedStepLM:
             At = t.as_tensor(ad.A, device=h.device, dtype=h.dtype)
             Bt = t.as_tensor(ad.B, device=h.device, dtype=h.dtype)
             h = h + (h @ At.T) @ Bt.T
-        return h @ self.W2 + self.b2
+        w2 = (self._ste_ternary(self.W2, t) if getattr(self, "_qat", False)
+              else self.W2)
+        return h @ w2 + self.b2
 
     def ternary_(self) -> dict[str, Any]:
         return ternary_quant(self)
