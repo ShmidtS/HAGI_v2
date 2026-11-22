@@ -887,7 +887,12 @@ class RopeAttentionByteLM:
                     cnt += len(X)
             return tot / max(cnt, 1)
 
-        opt = t.optim.Adam(self.params(), lr=lr)
+        # WAVE 239: exclude dead q from the optimizer (gradient
+        # is always None since pairwise attention; q stays in
+        # checkpoints for backward compat only).
+        live_params = [self.emb, self.W1, self.b1, self.W2,
+                       self.b2]
+        opt = t.optim.Adam(live_params, lr=lr)
         best = eval_ce(hold)
         best_state = [p.detach().clone() for p in self.params()]
         self._last_best_state = best_state
@@ -910,7 +915,14 @@ class RopeAttentionByteLM:
         if best_state is not None:
             for q2, s in zip(self.params(), best_state):
                 q2.data.copy_(s)
-        return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
+        # WAVE 239 (external review): best_holdout_ce is a
+        # SELECTION score (max over epochs on the checkpoint-
+        # selection split) — optimistic as a quality estimate. The
+        # key name is kept for checkpoint/ledger compatibility; the
+        # semantic flag marks it honestly.
+        return {"epochs": epochs,
+                "best_holdout_ce": round(best, 4),
+                "holdout_role": "selection"}
 
     def _rope_logits_from_params(self, ps, ctx):
         """Functional logits over (emb, W1, b1, W2, b2) for JVP —
@@ -1063,19 +1075,28 @@ class RopeAttentionByteLM:
         # on holdout windows — every accepted step carries a PROVEN
         # CE drop bound, restoring the StepContract semantics the
         # pure-Adam path was missing (bound was honest None).
+        # WAVE 239 FIX (external review): certified-refine MUST draw
+        # minibatches from the TRAIN partition only. The old code fit
+        # refine on the same contiguous tail that eval_holdout_ce
+        # uses — validation leaked into gradients, and the post-refine
+        # comparison was self-referential. Refine positions come from
+        # data[:-holdout_tail]; the holdout stays a pure audit set.
         pre_refine_ce = self.eval_holdout_ce(data, holdout=holdout)
-        hold_bytes = max(4096, int(len(data) * holdout))
-        tail = data[-hold_bytes:]
         import numpy as _np
-        idx_np = _np.frombuffer(tail, dtype=_np.uint8)
+        full_np = _np.frombuffer(data, dtype=_np.uint8)
+        n_all = len(full_np) - 2
+        n_hold = max(16, int(n_all * holdout))
+        hold_start = max(n_all - n_hold, n_all - 2048)
+        train_zone_end = max(self.k + 1, hold_start - self.k)
+        train_np = full_np[:train_zone_end]
         rng = _np.random.default_rng(7 if holdout_seed is None
                                      else int(holdout_seed))
-        positions = rng.choice(len(idx_np) - self.k - 1,
-                               size=min(64, len(idx_np) - self.k - 1),
+        positions = rng.choice(len(train_np) - self.k - 1,
+                               size=min(64, len(train_np) - self.k - 1),
                                replace=False)
-        X = _np.stack([idx_np[p + self.k::-1][:self.k]
+        X = _np.stack([train_np[p + self.k::-1][:self.k]
                        for p in positions])
-        y = idx_np[positions + self.k]
+        y = train_np[positions + self.k]
         import torch as _th
         refine_X = _th.as_tensor(X.copy(), dtype=_th.long,
                                  device=self.device)
@@ -1091,7 +1112,12 @@ class RopeAttentionByteLM:
                 if d > 0:
                     commits += 1
                     total_drop += d
-        bound = total_drop if commits else None
+        # WAVE 239 (external review): per-batch certified bounds do
+        # NOT telescope into one objective's guarantee — each bound
+        # holds on its own minibatch CE. Report the ledger honestly.
+        bound = ({"total": total_drop, "commits": commits,
+                  "scope": "per-batch-sum, no telescoping guarantee"}
+                 if commits else None)
         # Wave235 gate: certified steps are per-batch proven, but the
         # deployment metric is the Adam-phase holdout. If refine made
         # the full holdout worse, roll back to the best_state snapshot
@@ -1108,6 +1134,7 @@ class RopeAttentionByteLM:
                         q.data.copy_(s)
             bound = None  # refined weights not deployed
         return {"best_holdout_ce": r["best_holdout_ce"],
+                "holdout_role": "selection",
                 "certified_descent_lower_bound": bound,
                 "certified_refine": {"steps": steps,
                                      "commits": commits,
