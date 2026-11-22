@@ -14,8 +14,7 @@
 ### Символьный синтез (стек модернизирован)
 | Модуль | Роль |
 |---|---|
-| `skill_engine.py` | Autonomous Temporal Skill Engine (пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay. Компилятор по умолчанию: adder 5g, mux 3g |
-| `env_table_compiler.py` | общий компилятор transition-table → netlist (Rule of Three) |
+| `skill_engine.py` | Autonomous Temporal Skill Engine (пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay, transition-table → netlist компилятор (adder 5g, mux 3g) |
 | `env_temporal.py` | среды 5-бит (temporal): active identification, перенос памяти, drift |
 | `env_lut.py` | среды 4-бит (LUT-грамматика + OOD): банк гипотез, OOD LUT3, PROVEN_EXACT аудит |
 
