@@ -418,7 +418,68 @@ class Unified:
         )
         return u
 
-    # ---- neuro -> symbolic ----
+    def predict_next_byte(self, context: bytes | str,
+                          prefer_domain: str | None = None,
+                          allow_neural: bool = False) -> dict:
+        """WAVE 236i (user directive — honest-by-default): predict
+        the NEXT BYTE of an unseen context.
+
+        Priority:
+          1. PROVEN laws (verify == PROVEN_EXACT) — certified answer.
+          2. HOLD laws (partial coverage / pending OOS) — the law's
+             prediction is returned but flagged `certified: False`,
+             status HOLD.
+          3. NO LAW matched -> status HOLD, byte=None (NO GUESS).
+
+        The neural model is NOT consulted by default: an un-certified
+        guess would masquerade as knowledge. Callers may request
+        `allow_neural=True` explicitly for an un-certified guess.
+        """
+        import torch as _t
+        if isinstance(context, str):
+            context = context.encode("utf-8")
+        registry = getattr(self, "law_registry", {}) or {}
+        domains = ([prefer_domain] if prefer_domain
+                   else list(registry.keys()))
+        ctx = (tuple(int(b) for b in context[-4:])
+               if len(context) >= 4
+               else tuple(int(b) for b in context))
+        proven, hold = [], []
+        for dom in domains:
+            for entry in registry.get(dom, []):
+                tgt = (proven if entry.get("verify") == "PROVEN_EXACT"
+                       else hold)
+                tgt.append((dom, entry))
+        # 1) proven laws first
+        for dom, entry in proven:
+            try:
+                b = int(entry["bp"].apply(ctx)) % 256
+                return {"byte": b, "status": "OK",
+                        "source": f"law:{dom}:{entry['feature']}",
+                        "certified": True}
+            except Exception:
+                continue
+        # 2) HOLD laws — the model's best structured guess
+        for dom, entry in hold:
+            try:
+                b = int(entry["bp"].apply(ctx)) % 256
+                return {"byte": b, "status": "HOLD",
+                        "source": f"law-candidate:{dom}:"
+                                  f"{entry['feature']}",
+                        "certified": False}
+            except Exception:
+                continue
+        # 3) default HOLD — no guess without a law
+        if not allow_neural:
+            return {"byte": None, "status": "HOLD",
+                    "source": "no-law", "certified": False}
+        dev = self.model.device
+        ctx_list = list(context)[-self.model.k:][::-1]
+        x = _t.as_tensor([ctx_list], dtype=_t.long, device=dev)
+        b = int(self.model.logits(x)[0].argmax())
+        return {"byte": b, "status": "NEURAL_GUESS",
+                "source": "neural", "certified": False}
+    # ---- neuro -> symbolic ----    # ---- neuro -> symbolic ----
 
     def to_symbolic(self) -> dict:
         """Ternary projection of the body's first layer to the fabric

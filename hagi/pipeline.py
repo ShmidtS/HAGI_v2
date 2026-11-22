@@ -128,9 +128,11 @@ def lm_residual_relation(u, source: str, data: bytes
     idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
     n = len(idx) - u.k
     if n <= 0:
-        return [], []
+        return [], [], [], []
     misses_x: list[int] = []
     misses_y: list[int] = []
+    multi_ctx: list[tuple[int, ...]] = []
+    multi_y: list[int] = []
     step = max(1, n // 512)          # sample, bounded work
     with _t.no_grad():
         for i in range(0, n, step):
@@ -143,21 +145,33 @@ def lm_residual_relation(u, source: str, data: bytes
             except Exception:
                 continue
             if pred != nxt:
-                # WAVE 235b (external audit P5 + user follow-up): the
-                # symbolic layer synthesizes arity-1 laws, so each
-                # miss is offered from TWO context positions: the last
-                # byte (ctx[-1]) and the previous byte (ctx[-2]).
-                # A PROVEN_EXACT verdict certifies the corresponding
-                # single-position law — NOT the full k-context law.
-                # Laws reachable only from earlier context positions
-                # remain an honest HOLD until the arity-k
-                # synthesizer lands.
                 misses_x.append(int(ctx[-1]))
                 misses_y.append(nxt)
                 if len(ctx) >= 2:
                     misses_x.append(int(ctx[-2]))
                     misses_y.append(nxt)
-    return misses_x, misses_y
+    # WAVE 236g: multi-byte channel needs the UNDERSAMPLED stream —
+    # the arithmetic step (n//512) destroys the record-alignment
+    # periodicity the shift-stratified verifier relies on. Second
+    # sequential pass, bounded at 2000 misses.
+    step2 = 1
+    count2 = 0
+    for i in range(0, n, step2):
+        if count2 >= 2000:
+            break
+        ctx = idx[i:i + u.k]
+        nxt = int(idx[i + u.k])
+        x = _t.as_tensor([ctx.tolist()], dtype=_t.long, device=dev)
+        try:
+            logits = model.logits(x)[0]
+            pred = int(logits.argmax())
+        except Exception:
+            continue
+        if pred != nxt:
+            multi_ctx.append(tuple(int(b) for b in ctx[-4:]))
+            multi_y.append(nxt)
+            count2 += 1
+    return misses_x, misses_y, multi_ctx, multi_y
 
 
 def ingest_symbolic(u, source: str, data: bytes,
@@ -167,7 +181,44 @@ def ingest_symbolic(u, source: str, data: bytes,
     holdout_ce = u.domains.get(source, {}).get("ce")
     res = PipelineResult(source=source,
                          holdout_ce=holdout_ce if holdout_ce is not None else -1.0)
-    xs, ys = lm_residual_relation(u, source, data)
+    xs, ys, multi_ctx, multi_y = lm_residual_relation(u, source, data)
+    # WAVE 236: multi-byte law channel first (richer laws); if it
+    # yields a verified law, REGISTER it for PREDICTION on unseen
+    # next bytes (user directive), then fall through to the classic
+    # arity-1 path.
+    if multi_ctx:
+        try:
+            from hagi.invention_multi import invent_multi
+            from hagi.invention import verify_blueprint
+            mr = invent_multi(list(zip(multi_ctx, multi_y)),
+                              random.Random(7), max_attempts=8000)
+            if mr and mr.get("status") != "INVENTED":
+                res.notes.append(f"multi-byte: {mr['status']} "
+                                 f"({mr.get('attempts')} feats)")
+            if mr and mr.get("status") == "INVENTED":
+                bp = mr["blueprints"][0]
+                feat_pairs = [(bp.q_fn(x), y)
+                              for x, y in zip(multi_ctx, multi_y)]
+                full_dom = sorted(set(c for c, _ in feat_pairs))
+                v = verify_blueprint(bp, feat_pairs,
+                                     full_domain=full_dom)
+                # WAVE 236b (user directive): register verified laws
+                # in the domain's prediction registry — they predict
+                # the NEXT BYTE for unseen contexts.
+                registry = getattr(u, "law_registry", None)
+                if registry is None:
+                    registry = u.law_registry = {}
+                registry.setdefault(source, []).append({
+                    "feature": mr.get("feature"),
+                    "bp": bp,
+                    "verify": v["status"],
+                    "coverage": len(feat_pairs),
+                })
+                res.notes.append(
+                    f"multi-byte law {mr.get('feature')} "
+                    f"-> {v['status']} (registered for prediction)")
+        except Exception as _e:
+            res.notes.append(f"multi-byte skipped: {_e!r}")
     if not xs:
         res.notes.append("no LM residuals sampled")
         return res
