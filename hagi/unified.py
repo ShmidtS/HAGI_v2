@@ -279,7 +279,7 @@ class Unified:
 
     # ---- inference ----
 
-    def ask(self, prompt: str, n: int = 60) -> str:
+    def ask(self, prompt: str, n: int = 400) -> str:
         r = self.model.generate(prompt, n_bytes=n)
         return r[len(prompt) :].strip() if r.startswith(prompt) else r
     # ---- WAVE 225: knowledge consolidation from external memory ----
@@ -296,7 +296,7 @@ class Unified:
         """Store a conversation/fact permanently (weights untouched)."""
         self.memory().add(text)
 
-    def consolidate(self, query: str, n_bytes: int = 200) -> str:
+    def consolidate(self, query: str, n_bytes: int = 600) -> str:
         """Retrieval-augmented ask: relevant memory pages -> prompt
         prefix -> grounded generation (labs agent pattern)."""
         hits = self.memory().query(query, top_k=3)

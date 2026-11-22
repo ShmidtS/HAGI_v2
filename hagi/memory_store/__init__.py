@@ -12,7 +12,7 @@ class SemanticMemory:
     """FTS5 archive + gemma-embedding cosine rerank (replaces the
     labs Word2Vec/LSH layer with a stronger teacher-encoded index)."""
 
-    def __init__(self, db_path: str, page_chars: int = 512):
+    def __init__(self, db_path: str, page_chars: int = 2048):
         self.store = DiskBackedContext(db_path, page_chars=page_chars)
         self._vectors = {}  # page_id -> np.ndarray (lazy gemma)
 
