@@ -160,6 +160,23 @@ class Unified:
                 bank = self.adapter_bank = AdapterBank(
                     d=self.model.hidden, r=2)
             ad = bank.get(source)
+            # WAVE 232 (C592 sufficient-transfer gate): warm-start a
+            # FRESH adapter (A,B both zero = exact identity) from the
+            # best trained domain IFF that domain certified a
+            # compressible fit (ce <= 0.5 — strong structure signal).
+            # C592: certified SUFFICIENT negative-transfer exists
+            # (start gap > n*nlBudget => warm worse); low source ce is
+            # the measured proxy for a small start gap. forgetA=0 copy
+            # semantics keep the source untouched (warm_transfer_sound).
+            if not ad.B.any():  # B=0 = fresh (exact identity; A is
+                # random by init, identity lives in B neutrality)
+                cands = [(s, e.get("ce")) for s, e in self.domains.items()
+                         if s != source and e.get("ce") is not None
+                         and e.get("ce") <= 0.5]
+                if cands:
+                    best_src = min(cands, key=lambda kv: kv[1])[0]
+                    from hagi.trunk_ops import adapter_warm_start
+                    adapter_warm_start(bank.get(best_src), ad)
             self.model.domain_adapter = ad
             try:
                 # WAVE 230: RopeAttentionByteLM.adapter_head_step —
