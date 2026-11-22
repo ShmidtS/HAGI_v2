@@ -38,6 +38,17 @@ class SemanticMemory:
             self._vectors[pid] = np.asarray(v)
         self._pages = texts
 
+    def search(self, q: str, limit: int = 4):
+        """memory_agent-compatible alias: hits with .text attr."""
+        res = self.query(q, top_k=limit)
+        from hagi.memory_store.streaming import MemoryHit
+
+        class _Hit:
+            def __init__(self, pid, text):
+                self.page_id = pid
+                self.text = text
+        return [_Hit(pid, text) for _cos, pid, text in res]
+
     def query(self, q: str, top_k: int = 4):
         """Hybrid: FTS5 lexical first, gemma-cosine rerank."""
         import numpy as np
