@@ -2577,3 +2577,4 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | paired regression gate (P0.3) | ИСПРАВЛЕН (wave204) |
 | RoPE true phase + key-axis softmax (P1.1) | ИСПРАВЛЕН (wave204) |
 | StepContract monoid | соответствует (CertStepGen) |
+| AdapterBank C567 (upstream формализовал НАШ wave210 код с source-anchors trunk_ops.py/unified.py/lm.py) | соответствие полное: isolation/warm_transfer_sound/train_isolation/composition — все 4 теоремы отражают нашу dict-семантику; honest pins приняты (transfer-качество = эмпирика, caller решает; ленивый слот = нейтральный дефолт B=0) |
