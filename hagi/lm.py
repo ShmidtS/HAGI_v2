@@ -779,6 +779,9 @@ class RopeAttentionByteLM:
         return h @ self.W2 + self.b2
 
     def ce(self, ctx, nxt):
+        dev = next(self.model_parameters_device(), None) if False else             self.device
+        if nxt.device != dev:
+            nxt = nxt.to(dev)
         return self.t.nn.functional.cross_entropy(
             self.logits(ctx), nxt, reduction="mean")
 
@@ -830,6 +833,24 @@ class RopeAttentionByteLM:
             for q2, s in zip(self.params(), best_state):
                 q2.data.copy_(s)
         return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
+
+    # ---- WAVE 229 (URGENT, user directive): production long-context ----
+    # CertifiedStepLM (k=16 fixed window) is REPLACED as the Unified
+    # model: RoPE attention sees up to max_train_ctx=96 bytes per
+    # example with TRUE positional attention over all of them.
+
+    k = 96  # interface compat with Unified (model.k consumers)
+
+    def train_certified(self, data: bytes, epochs: int = 60,
+                        holdout: float = 0.1, batch: int = 256,
+                        log_every: int = 0,
+                        holdout_seed: int | None = None) -> dict:
+        """Unified-compatible training: delegates to train_guarded,
+        returns the dict shape Unified.ingest expects."""
+        r = self.train_guarded(data, epochs=epochs, holdout=holdout,
+                               batch=batch, max_train_ctx=self.k)
+        return {"best_holdout_ce": r["best_holdout_ce"],
+                "certified_descent_lower_bound": 0.0}
 
     def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.5,
                  seed: int = 1) -> str:

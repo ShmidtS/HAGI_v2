@@ -47,7 +47,9 @@ class Unified:
 
         self.lm_mod = lm_mod
         self.k, self.dim, self.hidden = k, dim, hidden
-        self.model = lm_mod.CertifiedStepLM(k=k, dim=dim, hidden=hidden)
+        # WAVE 229 (URGENT): RopeAttentionByteLM — true attention,
+        # 96-byte context (vs k=16 fixed window of CertifiedStepLM).
+        self.model = lm_mod.RopeAttentionByteLM(dim=dim, hidden=hidden)
         self.domains: dict[str, dict[str, Any]] = {}
 
     # ---- ingest: ANY data ----
@@ -327,10 +329,10 @@ class Unified:
     def save(self) -> None:
         import torch as _t
 
-        st = {
-            n: getattr(self.model, n).detach().cpu()
-            for n in ("emb", "W1", "b1", "W2", "b2")
-        }
+        names = ["emb", "W1", "b1", "W2", "b2"]
+        if hasattr(self.model, "q"):
+            names.append("q")
+        st = {n: getattr(self.model, n).detach().cpu() for n in names}
         st.update(
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
         )
@@ -353,10 +355,11 @@ class Unified:
         u.lm_mod = lm_mod
         st = _t.load(UNET_CKPT, weights_only=False)
         u.k, u.dim, u.hidden = st["k"], st["dim"], st["hidden"]
-        u.model = lm_mod.CertifiedStepLM(k=u.k, dim=u.dim, hidden=u.hidden)
+        u.model = lm_mod.RopeAttentionByteLM(dim=u.dim, hidden=u.hidden)
         with _t.no_grad():
-            for n in ("emb", "W1", "b1", "W2", "b2"):
-                getattr(u.model, n).copy_(st[n])
+            for n in ("emb", "W1", "b1", "W2", "b2", "q"):
+                if hasattr(u.model, n) and n in st:
+                    getattr(u.model, n).copy_(st[n])
         u.domains = (
             json.loads(LEDGER.read_text(encoding="utf-8")) if LEDGER.exists() else {}
         )
