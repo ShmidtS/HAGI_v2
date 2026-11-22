@@ -305,3 +305,38 @@ def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict
         out["full_block"] = full_block_d * full_block_d
         out["ratio"] = out["adapter"] / out["full_block"]
     return out
+
+
+class AdapterBank:
+    """WAVE 210: per-domain independent adapters (user-directed,
+    upstream HAGI_v2_final measured: separate B/C adapters kept
+    source logits bit-exact, forgetA=0.0). ONE shared trunk/head +
+    isolated low-rank side-branches per domain. Cross-domain reuse
+    via adapter_warm_start (C560)."""
+
+    def __init__(self, d: int, r: int = 2):
+        self.d, self.r = d, r
+        self._adapters: dict[str, LowRankAdapter] = {}
+
+    def get(self, domain: str) -> LowRankAdapter:
+        if domain not in self._adapters:
+            self._adapters[domain] = LowRankAdapter(self.d, self.r,
+                                                    seed=len(self._adapters))
+        return self._adapters[domain]
+
+    def apply(self, domain: str, f):
+        """Residual through THIS domain's adapter only: f + B(A f).
+        Other domains' adapters are untouched — isolation by
+        construction (forgetA=0 bit-exact, upstream-measured)."""
+        return self.get(domain)(f)
+
+    def transfer(self, src: str, dst: str) -> bool:
+        """C560 warm-start: copy src adapter into dst (caller decides
+        closeness). Source adapter unchanged."""
+        if src not in self._adapters:
+            return False
+        return adapter_warm_start(self._adapters[src],
+                                  self.get(dst))
+
+    def n_params(self) -> int:
+        return sum(a.n_params for a in self._adapters.values())

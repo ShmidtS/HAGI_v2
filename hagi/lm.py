@@ -767,6 +767,14 @@ class CertifiedStepLM:
             ctx = ctx.to(self.device)   # WAVE 176: robust CPU input
         e = self.emb[ctx]
         h = t.relu(e.reshape(ctx.shape[0], -1) @ self.W1 + self.b1)
+        # WAVE 210: optional per-domain low-rank adapter on the hidden
+        # head (AdapterBank.get(domain)) — C532 form x + B(A x); with
+        # B=0 EXACT identity, so a fresh adapter never changes logits.
+        ad = getattr(self, "domain_adapter", None)
+        if ad is not None:
+            At = t.as_tensor(ad.A, device=h.device, dtype=h.dtype)
+            Bt = t.as_tensor(ad.B, device=h.device, dtype=h.dtype)
+            h = h + (h @ At.T) @ Bt.T
         return h @ self.W2 + self.b2
 
     def ternary_(self) -> dict[str, Any]:
