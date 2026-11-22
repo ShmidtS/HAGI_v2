@@ -18,6 +18,7 @@ handles structured; raw bytes always work).
 """
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import time
@@ -143,6 +144,26 @@ class Unified:
                 )
             )
         ce = min(r.get("best_holdout_ce", 99) for r in reps)
+        # WAVE 210: optional per-domain adapters (HAGI_DOMAIN_ADAPTERS=1).
+        # Fresh adapter = exact identity (B=0), so this never changes
+        # the incumbent path; the adapter head-trains on the fresh
+        # domain only. Restore runs WITHOUT the env — behavior
+        # identical to wave209.
+        if os.environ.get("HAGI_DOMAIN_ADAPTERS") == "1":
+            from hagi.trunk_ops import AdapterBank
+            bank = getattr(self, "adapter_bank", None)
+            if bank is None:
+                bank = self.adapter_bank = AdapterBank(
+                    d=self.model.hidden, r=2)
+            ad = bank.get(source)
+            self.model.domain_adapter = ad
+            try:
+                for _ in range(3):
+                    self.model._certified_step(
+                        *self._fresh_batch(source), lr_scale=0.5)
+            except Exception:
+                pass  # adapter training is best-effort, head stays safe
+            self.model.domain_adapter = None
         # WAVE 199 (candidate-vs-incumbent gate): measured CE on a
         # sample of OLD domains — accept only without impermissible
         # regression on them (fresh-domain improvement alone is not
@@ -190,6 +211,21 @@ class Unified:
         """Bytes for a domain — from disk cache (data kept per domain)."""
         p = CKPT_DIR / "domains" / f"{name}.bin"
         return p.read_bytes() if p.exists() else b""
+
+    def _fresh_batch(self, source: str):
+        """One training batch from the fresh domain bytes (adapter
+        head-training)."""
+        d = self._domain_bytes(source, self.domains[source])
+        idx = np.frombuffer(d, dtype=np.uint8).astype(np.int64)
+        k = self.model.k
+        n = len(idx) - k
+        sel = np.arange(0, max(1, n), max(1, n // 128))[:128]
+        X = np.stack([idx[i:i + k] for i in sel])
+        y = idx[sel + k]
+        t = self.model.t
+        dev = getattr(self.model, "device", "cpu")
+        return (t.as_tensor(X, dtype=t.long, device=dev),
+                t.as_tensor(y, dtype=t.long, device=dev))
 
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """WAVE 199: measured CE on a sample of OLD domains (the
