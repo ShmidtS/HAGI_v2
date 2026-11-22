@@ -48,6 +48,7 @@ def main() -> None:
     chunk, chunk_bytes = [], 0
     files_now = 0
     it = 0
+    (CKPT_DIR / 'inbox').mkdir(parents=True, exist_ok=True)
     print(f"neuro-symbolic cycle start: chunks={st['chunks']}", flush=True)
     while time.time() < deadline:
         # ---- 1. GROW: collect a chunk from C:/ (persistent cursor) ----
@@ -102,6 +103,44 @@ def main() -> None:
             r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
+        # WAVE 238 (user directive): LIVE CHAT during training.
+        # Drop a .chat file into checkpoints/inbox/ — the TRAINING
+        # PROCESS itself ingests it (single-owner weight writes,
+        # no checkpoint races); reply lands as .reply.
+        try:
+            inbox = CKPT_DIR / "inbox"
+            if inbox.exists():
+                for chat_file in sorted(inbox.glob("*.chat")):
+                    reply = []
+                    try:
+                        msg = chat_file.read_text(
+                            encoding="utf-8", errors="ignore")
+                        dom = "chat_" + chat_file.stem
+                        u.learn_from_dialog(msg, name=dom)
+                        dom_ce = u.domains.get(dom, {}).get("ce")
+                        reply.append("learned: domain " + dom
+                                     + " CE=" + str(dom_ce))
+                        ans = u.consolidate(msg[:400])
+                        reply.append("answer: " + ans[:600])
+                        print("    [chat] " + chat_file.stem
+                              + ": learned+replied", flush=True)
+                    except Exception as chat_err:
+                        reply.append("error: " + repr(chat_err))
+                        print("    [chat] " + chat_file.stem
+                              + " error: " + repr(chat_err),
+                              flush=True)
+                    reply_path = inbox / (chat_file.stem + ".reply")
+                    reply_path.write_text(chr(10).join(reply),
+                                          encoding="utf-8")
+                    chat_file.unlink()
+        except Exception:
+            pass  # inbox optional
+        # WAVE 236: law synthesizer verdict for this chunk.
+        sym = r.get("symbolic")
+        if sym:
+            for note in sym.get("notes", []):
+                if "multi-byte" in note or "law" in note.lower():
+                    print("    " + note, flush=True)
         # WAVE 234 (user directive): semantic distill ALWAYS ON in the
         # full-disk cycle — same protocol as restore_domains (gemma
         # teacher -> LM hidden cosine distill on chunk fragments).
