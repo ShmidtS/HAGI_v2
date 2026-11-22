@@ -33,6 +33,23 @@ def main() -> None:
             continue
         r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)
         ce = r.get("holdout_ce", -1)
+        # WAVE 205 (VRAM hygiene): the replay corpus grows with every
+        # domain (full-book replay) and allocator caching fragments
+        # VRAM over a long run — measured as chunk time 700s -> 980s
+        # and HIP launch failures after ~1h on the iGPU. Free the
+        # cached blocks and log VRAM so growth is visible.
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                mem = torch.cuda.memory_allocated() / 2**20
+                resv = torch.cuda.memory_reserved() / 2**20
+                print(f"    vram: alloc={mem:.0f}MB reserved={resv:.0f}MB",
+                      flush=True)
+        except Exception:
+            pass
+        import gc
+        gc.collect()
         print(f"[restore {i}/{len(chunks)}] {p.stem} -> CE {ce} "
               f"({r.get('seconds', '?')}s)", flush=True)
         if i % 8 == 0:

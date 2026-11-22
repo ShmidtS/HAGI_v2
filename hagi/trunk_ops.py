@@ -242,3 +242,52 @@ def snap_obj_bound(s_err: float, ds: float) -> float:
     features by ds: |(s+ds-y)^2 - (s-y)^2| <= (2|s-y| + |ds|)*|ds|
     (C521 snap_preserves_objective_bound, exact in Fraction)."""
     return (2 * abs(s_err) + abs(ds)) * abs(ds)
+
+
+# ==================================================================
+# ADAPTER GROWTH (C532): certified low-rank side-branch growth.
+# adapterVec A B x = x + B*(A*x) — 2*r*d parameters instead of d*d
+# for a full residual block (r << d). Neutrality certified with ONE
+# zero factor (B=0 => exact identity), unlike residualLeaf which
+# requires both zero.
+
+import numpy as _np
+
+
+class LowRankAdapter:
+    """LoRA-form growth adapter (C532 AdapterGrowth):
+    pred = w @ (f + B @ (A @ f)). Grows 2*r*d params, certified
+    identity at B = 0 (one-factor zero neutrality)."""
+
+    def __init__(self, d: int, r: int = 1, seed: int = 0):
+        rng = _np.random.default_rng(seed)
+        # Kaiming-style init for A; B = 0 => exact obj-invariant start
+        self.A = rng.standard_normal((r, d)) / _np.sqrt(d)
+        self.B = _np.zeros((d, r))
+        self.d, self.r = d, r
+
+    @property
+    def n_params(self) -> int:
+        return 2 * self.r * self.d
+
+    def __call__(self, f: _np.ndarray) -> _np.ndarray:
+        # x + B @ (A @ x); with B=0 this is EXACTLY x (C532 neutrality)
+        return f + self.B @ (self.A @ f)
+
+    def params(self) -> _np.ndarray:
+        return _np.concatenate([self.A.ravel(), self.B.ravel()])
+
+    def set_params(self, flat: _np.ndarray) -> None:
+        rA = self.r * self.d
+        self.A = flat[:rA].reshape(self.r, self.d)
+        self.B = flat[rA:].reshape(self.d, self.r)
+
+
+def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:
+    """C532 explicit parameter count: adapter 2*r*d vs full block d*d
+    (C532 adapter_param_le_full_block when r <= d/2)."""
+    out = {"adapter": 2 * r * d}
+    if full_block_d is not None:
+        out["full_block"] = full_block_d * full_block_d
+        out["ratio"] = out["adapter"] / out["full_block"]
+    return out
