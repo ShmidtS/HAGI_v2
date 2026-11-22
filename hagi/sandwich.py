@@ -95,3 +95,37 @@ def certified_argmax(z, nm: int = DEFAULT_NM, nm_max: int = EVAL_NM_MAX):
             return a, nm
         nm *= 2
     return None, None
+
+
+def band_drift_check(z, nm: int = DEFAULT_NM) -> dict:
+    """WAVE 213 (C568 band describes measurement): drift detector
+    between the certified rational band and the actual softmax.
+    bandDescribes holds for genuine certified bands — this measures
+    whether the band still DESCRIBES the measurement (if the true
+    softmax point escapes the [L_i, U_i] interval, the band is stale:
+    wrong logits domain or float precision drift)."""
+    from fractions import Fraction as F
+    import math
+    t = sandwich_terms(z, nm)
+    if t is None:
+        if nm * 2 <= EVAL_NM_MAX:
+            return band_drift_check(z, nm * 2)
+        return {"ok": False, "reason": "range guard failed at nm_max"}
+    lo, hi = t
+    n = len(z)
+    L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))
+         for i in range(n)]
+    U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))
+         for i in range(n)]
+    mx = max(z)
+    probs = [math.exp(float(v - mx)) for v in z]
+    s = sum(probs)
+    probs = [p / s for p in probs]
+    escapes = [i for i in range(n)
+               if not (float(L[i]) <= probs[i] <= float(U[i]))]
+    # WAVE 213b: range-guard / escapes at current nm — double like
+    # certified_argmax (BandTightening: larger nm tightens walls).
+    if escapes and nm * 2 <= EVAL_NM_MAX:
+        return band_drift_check(z, nm * 2)
+    return {"ok": not escapes, "escapes": escapes,
+            "nm": nm, "widths": [float(U[i] - L[i]) for i in range(n)]}
