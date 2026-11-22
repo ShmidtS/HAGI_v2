@@ -310,9 +310,10 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"
     class _W:  # view exposing .weight for the existing exporter
         def __init__(self, tensor, transpose):
             self.weight = tensor if not transpose else tensor.T.contiguous()
+    # WAVE 215e: embedding kept FP16 (labs QAT evidence: ternary emb
+    # is the dominant quality loss for un-QAT models); W1/W2 ternary.
     specs_tr = [("W1.weight", model.W1, True),
-                ("W2.weight", model.W2, True),
-                ("emb.weight", model.emb, False)]
+                ("W2.weight", model.W2, True)]
     class _Model:  # duck-typed for export_ternary_payload
         pass
     mm = _Model()
@@ -330,6 +331,72 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"
     payload, meta = export_ternary_payload(mm, scale_mode="mean_abs",
                                            scale_dtype=scale_dtype,
                                            bias_dtype=scale_dtype)
+    emb_fp16 = model.emb.detach().to(torch.float16).numpy().tobytes()
+    payload += emb_fp16
     meta["hagi_lm"] = {"k": model.k, "dim": model.dim,
-                       "hidden": model.hidden}
+                       "hidden": model.hidden,
+                       "emb_fp16_len": len(emb_fp16)}
     return payload, meta
+
+
+def instantiate_hagi_lm_payload(payload: bytes):
+    """WAVE 215 (final, header-driven): restore a HAGI_v2 byte-LM
+    from packed payload ONLY. Walks header["matrices"] exact
+    offsets (packed_offset/scale_offset are body-absolute)."""
+    import json as _json
+    import numpy as np
+    import struct as _struct
+    import torch
+    if not payload.startswith(MAGIC):
+        raise ValueError("invalid HAGI ternary payload magic")
+    header_len = _struct.unpack("<I", payload[len(MAGIC):len(MAGIC)+4])[0]
+    start = len(MAGIC) + 4
+    header = _json.loads(payload[start:start + header_len].decode("utf-8"))
+    body = payload[start + header_len:]
+    from hagi.lm import CertifiedStepLM
+    template = CertifiedStepLM(k=int(header["context"]),
+                               dim=int(header["dim"]),
+                               hidden=int(header["hidden"]), seed=0)
+    params = {"emb.weight": template.emb, "W1.weight": template.W1,
+              "W2.weight": template.W2}
+    for m in header["matrices"]:
+        tgt = params[m["name"]]
+        src_shape = tuple(m["source_shape"])
+        rows, cols = src_shape
+        scales = np.frombuffer(body[m["scale_offset"]:m["scale_offset"]
+                                    + m["scale_length"]],
+                               dtype="<f4" if m["scale_dtype"] == "f32"
+                               else "<f2").astype(np.float32)
+        packed = body[m["packed_offset"]:m["packed_offset"]
+                      + m["packed_length"]]
+        # packed was written CONTIGUOUS (levels.ravel()), not per-row
+        lv = unpack_trits5(packed, rows * cols)
+        mat = (lv.astype(np.float32).reshape(rows, cols) * scales[:, None])
+        t = torch.as_tensor(mat)
+        # WAVE 215d: our adapter stored W1.T.T = the RAW W1 — i.e.
+        # source_shape IS the parameter shape; no extra transpose.
+        if tuple(t.shape) != tuple(tgt.shape) and m.get("transposed"):
+            t = t.T.contiguous()  # genuine nn.Linear-style payload
+        if tuple(t.shape) != tuple(tgt.shape):
+            raise ValueError(
+                f"shape mismatch for {m['name']}: {tuple(t.shape)} vs {tuple(tgt.shape)}")
+        with torch.no_grad():
+            tgt.copy_(t.to(tgt.dtype))
+    bd = header.get("bias_dtype", "f32")
+    for bm in header["biases"]:
+        name, tgt = (("W1.bias", template.b1) if bm["name"] == "W1.bias"
+                     else ("W2.bias", template.b2))
+        arr = np.frombuffer(body[bm["offset"]:bm["offset"] + bm["length"]],
+                            dtype="<f2" if bd == "f16" else "<f4")
+        with torch.no_grad():
+            tgt.copy_(torch.as_tensor(arr.astype(np.float32),
+                                      dtype=tgt.dtype))
+    # WAVE 215e: FP16 embedding appended after biases
+    emb_len = (header.get("hagi_lm") or {}).get("emb_fp16_len", 0)
+    if emb_len:
+        tail = body[len(body) - emb_len:]
+        emb = np.frombuffer(tail, dtype="<f2").astype(np.float32)
+        with torch.no_grad():
+            template.emb.copy_(torch.as_tensor(
+                emb.reshape(template.emb.shape), dtype=template.emb.dtype))
+    return template
