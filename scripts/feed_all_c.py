@@ -52,19 +52,36 @@ _lock = None
 
 def iter_files(root: str = "C:/", start_after: str | None = None):
     """Walk EVERYTHING; skip only unavoidable OS locks. start_after:
-    full path of the last consumed FILE — resume lexically after it
-    (files visited in sorted order within sorted dirs)."""
+    full path of the last consumed FILE. WAVE 230 FIX: os.walk
+    yields a directory's files BEFORE descending, so the old
+    lexical comparison skipped files visited after the cursor in
+    walk order but lexicographically smaller. Resume now tracks
+    walk POSITION (dirpath, filename), not lexical order."""
     started = start_after is None
+    cursor_dir = None if started else os.path.normpath(
+        os.path.dirname(start_after))
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
         dirnames[:] = sorted([d for d in dirnames if d not in SKIP_DIRS])
-        for f in sorted(filenames):
-            path = os.path.join(dirpath, f)
-            if not started:
-                if path > start_after:
-                    started = True
-                    yield path
+        dnorm = os.path.normpath(dirpath)
+        if not started:
+            if dnorm == cursor_dir:
+                # resume INSIDE the cursor directory: yield only
+                # files after the cursor path in sorted order.
+                seen_cursor = False
+                for f in sorted(filenames):
+                    path = os.path.join(dirpath, f)
+                    if path == start_after:
+                        seen_cursor = True
+                    elif seen_cursor:
+                        yield path
+                started = True
                 continue
-            yield path
+            # walk visits ancestors/cursor_dir's tree in sorted
+            # order; skip directories strictly BEFORE cursor_dir.
+            if dnorm < cursor_dir:
+                continue
+        for f in sorted(filenames):
+            yield os.path.join(dirpath, f)
 
 
 def sample_bytes(p: str, size: int) -> bytes | None:

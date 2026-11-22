@@ -742,20 +742,10 @@ class RopeAttentionByteLM:
         return r
 
     def logits(self, ctx):
-        """ctx: (B, L) newest-first. Full attention over all positions."""
-        t = self.t
-        if ctx.device != self.device:
-            ctx = ctx.to(self.device)
-        B, L = ctx.shape
-        e = self.emb[ctx]                          # (B, L, dim)
-        e = self._rope(e, L, ctx.device)           # C308
-        # C307 branch: q-attention over positions
-        q = self.q                                  # (dim,)
-        scores = (e @ q) / (self.dim ** 0.5) - self.lam * t.arange(
-            L, device=ctx.device, dtype=t.float32)  # A8 heat-bath recency
-        p = t.softmax(scores, dim=-1)               # (B, L)
-        h = t.relu((p[..., None] * e).sum(dim=1) @ self.W1 + self.b1)
-        return h @ self.W2 + self.b2
+        """ctx: (B, L) newest-first. WAVE 229b: delegates to
+        full_logits last position — ONE attention path for train
+        and generate (was a divergent aggregate softmax here)."""
+        return self.full_logits(ctx)[:, -1, :]
 
     def full_logits(self, ctx):
         t = self.t
@@ -764,22 +754,34 @@ class RopeAttentionByteLM:
         B, L = ctx.shape
         e = self.emb[ctx]
         e = self._rope(e, L, ctx.device)
-        q = self.q
-        scores = (e @ q) / (self.dim ** 0.5) - self.lam * t.arange(
-            L, device=ctx.device, dtype=t.float32)
-        j_idx = t.arange(L, device=ctx.device)
-        mask = j_idx[None, :, None] >= j_idx[None, None, :]
-        sc = scores.unsqueeze(-1).masked_fill(~mask, float("-inf"))
+        # WAVE 229b FIX: true pairwise (query,key) scores. The old
+        # code unsqueezed a per-position scalar to (B,L,1) and
+        # broadcast it over the key axis -> uniform attention,
+        # q/lam ignored (train/generate distributions diverged).
+        pos = t.arange(L, device=ctx.device, dtype=t.float32)
+        dot = t.einsum("bid,bjd->bij", e, e) / (self.dim ** 0.5)
+        sc = dot - self.lam * (pos[None, :, None]
+                               - pos[None, None, :])
+        mask = pos[None, :, None] >= pos[None, None, :]
+        sc = sc.masked_fill(~mask, float("-inf"))
         # WAVE 204 FIX (P1.1.2, audit v2): softmax over the KEY axis
         # (dim=-1), not the query axis — dim=1 normalized across
         # queries, leaking future tokens into earlier positions'
         # denominators.
         pp = t.softmax(sc, dim=-1)
         h = t.relu(t.einsum("blj,bjd->bld", pp, e) @ self.W1 + self.b1)
+        # WAVE 230: per-domain low-rank adapter (AdapterBank, C532):
+        # h + B(A h); B=0 is EXACT identity (fresh adapter never
+        # changes logits) — same contract as CertifiedStepLM.
+        ad = getattr(self, "domain_adapter", None)
+        if ad is not None:
+            At = t.as_tensor(ad.A, device=h.device, dtype=h.dtype)
+            Bt = t.as_tensor(ad.B, device=h.device, dtype=h.dtype)
+            h = h + (h @ At.T) @ Bt.T
         return h @ self.W2 + self.b2
 
     def ce(self, ctx, nxt):
-        dev = next(self.model_parameters_device(), None) if False else             self.device
+        dev = self.device
         if nxt.device != dev:
             nxt = nxt.to(dev)
         return self.t.nn.functional.cross_entropy(
@@ -787,57 +789,111 @@ class RopeAttentionByteLM:
 
     def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 3e-3,
                       holdout: float = 0.1, batch: int = 256,
-                      max_train_ctx: int = 96, log_every: int = 0) -> dict:
+                      max_train_ctx: int = 96, log_every: int = 0,
+                      holdout_seed: int | None = None) -> dict:
+        """WAVE 231 (integrated from HAGI_v2_local_repro):
+        - GPU-resident uint8 byte buffer + tensor gather (no per-batch
+          host->device copies in the hot loop; measured 1.17-1.40x);
+        - mini-batched holdout eval (OOM fix, cap 2048 targets);
+        - contiguous tail holdout + embargo (wave229b semantics kept);
+        - Adam + rollback (certified-loop contract kept)."""
         import numpy as np
         t = self.t
-        idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
-        rng = np.random.default_rng(7)
-        n = len(idx) - 2
-        perm = rng.permutation(n)
+        idx_np = np.frombuffer(data, dtype=np.uint8)
+        n = len(idx_np) - 2
+        dev = self.device
+        # GPU-resident buffer: windows are gathered on-device.
+        raw = t.as_tensor(idx_np.copy(), dtype=t.long, device=dev)
+        offs = t.arange(max_train_ctx, dtype=t.long, device=dev)
+
+        rng = np.random.default_rng(7 if holdout_seed is None
+                                    else int(holdout_seed))
         n_hold = max(16, int(n * holdout))
-        hold, train = np.sort(perm[:n_hold]), perm[n_hold:]
+        hold = np.arange(max(hold_start := n - n_hold, n - 2048), n)
+        train = np.arange(0, max(16, int(hold[0]) - max_train_ctx))
 
-        def windows(positions, fixed_len=None):
-            xs, ys = [], []
-            for i in positions:
-                Lm = fixed_len or rng.integers(4, max_train_ctx + 1)
-                L = min(int(Lm), i)
-                xs.append(idx[i - L:i][::-1])
-                ys.append(idx[i])
-            pad = max(len(x) for x in xs)
-            X = np.zeros((len(xs), pad), dtype=np.int64)
-            for j, x in enumerate(xs):
-                X[j, :len(x)] = x
-            return (t.as_tensor(X, dtype=t.long),
-                    t.as_tensor(ys, dtype=t.long))
+        def batch_at(positions, fixed_len=None):
+            """Build (X newest-first variable-len, y) entirely on dev."""
+            pos_np = np.asarray(positions, dtype=np.int64)
+            lens = np.full(len(pos_np), fixed_len or max_train_ctx,
+                           dtype=np.int64)
+            lens = np.minimum(lens, pos_np)
+            pad = int(lens.max(initial=1))
+            pos = t.as_tensor(pos_np, dtype=t.long, device=dev)
+            lens_t = t.as_tensor(lens, dtype=t.long, device=dev)
+            # gather offsets [pos-1-(L-1-j)] for j in 0..pad-1, masked
+            j = t.arange(pad, dtype=t.long, device=dev)
+            # newest-first: index pos-1-(L-1-j) valid when j >= pad-L
+            base = pos[:, None] - 1 - (lens_t[:, None] - 1) + j[None, :]
+            mask = j[None, :] >= (pad - lens_t[:, None])
+            base = t.where(mask, base, t.zeros_like(base))
+            X = raw[base.clamp_(0, len(raw) - 1)]
+            X = t.where(mask, X, t.zeros_like(X))  # pad byte 0
+            y = raw[pos]
+            return X, y, lens
 
-        ctx_va, nxt_va = windows(hold, fixed_len=max_train_ctx)
+        def eval_ce(positions, eval_batch=512):
+            tot, cnt = 0.0, 0
+            with t.no_grad():
+                for s in range(0, len(positions), eval_batch):
+                    X, y, _ = batch_at(positions[s:s + eval_batch],
+                                       fixed_len=max_train_ctx)
+                    tot += float(self.ce(X, y)) * len(X)
+                    cnt += len(X)
+            return tot / max(cnt, 1)
+
         opt = t.optim.Adam(self.params(), lr=lr)
-        best = float(self.ce(ctx_va, nxt_va).detach())
-        best_state = [p.detach().clone() for p in self.params()]  # WAVE 196: initial IS best
+        best = eval_ce(hold)
+        best_state = [p.detach().clone() for p in self.params()]
         for ep in range(epochs):
             perm2 = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
-                ctx, nxt = windows(train[perm2[bs:bs + batch]])
+                X, y, _ = batch_at(train[perm2[bs:bs + batch]])
                 opt.zero_grad()
-                self.ce(ctx, nxt).backward()
+                self.ce(X, y).backward()
                 opt.step()
-            ce_va = float(self.ce(ctx_va, nxt_va).detach())
+            ce_va = eval_ce(hold)
             if ce_va <= best:
                 best = ce_va
                 best_state = [q2.detach().clone() for q2 in self.params()]
             if log_every and (ep + 1) % log_every == 0:
                 print(f"  ep {ep+1} ce {ce_va:.4f} (best {best:.4f})",
                       flush=True)
+            if best < 0.01:  # memorized; skip remaining epochs
+                break
         if best_state is not None:
             for q2, s in zip(self.params(), best_state):
                 q2.data.copy_(s)
         return {"epochs": epochs, "best_holdout_ce": round(best, 4)}
 
-    # ---- WAVE 229 (URGENT, user directive): production long-context ----
-    # CertifiedStepLM (k=16 fixed window) is REPLACED as the Unified
-    # model: RoPE attention sees up to max_train_ctx=96 bytes per
-    # example with TRUE positional attention over all of them.
+    def adapter_head_step(self, ctx, nxt, lr: float = 1e-2):
+        """WAVE 230: train ONLY the domain adapter (A/B) on this
+        batch — Adam on adapter factors, trunk/head frozen."""
+        ad = getattr(self, "domain_adapter", None)
+        if ad is None:
+            return
+        t = self.t
+        At = t.as_tensor(ad.A, device=self.device).requires_grad_(True)
+        Bt = t.as_tensor(ad.B, device=self.device).requires_grad_(True)
+        opt = t.optim.Adam([At, Bt], lr=lr)
+        e = self._rope(self.emb[ctx], ctx.shape[1], ctx.device)
+        pos = t.arange(ctx.shape[1], device=ctx.device, dtype=t.float32)
+        dot = t.einsum("bid,bjd->bij", e, e) / (self.dim ** 0.5)
+        sc = dot - self.lam * (pos[None, :, None] - pos[None, None, :])
+        mask = pos[None, :, None] >= pos[None, None, :]
+        sc = sc.masked_fill(~mask, float("-inf"))
+        pp = t.softmax(sc, dim=-1)
+        h0 = t.relu(t.einsum("blj,bjd->bld", pp, e) @ self.W1 + self.b1)
+        logits = (h0 + (h0 @ At.T) @ Bt.T) @ self.W2 + self.b2
+        loss = t.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            nxt.reshape(-1).to(self.device))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        with t.no_grad():
+            ad.A.copy_(At.detach().cpu())
+            ad.B.copy_(Bt.detach().cpu())
 
     k = 96  # interface compat with Unified (model.k consumers)
 
@@ -845,12 +901,84 @@ class RopeAttentionByteLM:
                         holdout: float = 0.1, batch: int = 256,
                         log_every: int = 0,
                         holdout_seed: int | None = None) -> dict:
-        """Unified-compatible training: delegates to train_guarded,
-        returns the dict shape Unified.ingest expects."""
+        """Unified-compatible training: delegates to train_guarded."""
         r = self.train_guarded(data, epochs=epochs, holdout=holdout,
-                               batch=batch, max_train_ctx=self.k)
+                               batch=batch, max_train_ctx=self.k,
+                               holdout_seed=holdout_seed)
         return {"best_holdout_ce": r["best_holdout_ce"],
-                "certified_descent_lower_bound": 0.0}
+                "certified_descent_lower_bound": None}
+
+    # ---- WAVE 230: self-terminating generation on the Rope model --
+
+    def _read_all_windows(self, prompt_bytes: bytes, max_span: int = 64):
+        """Coverage windows over EVERY prompt byte (newest-first,
+        variable tail length), matching train window semantics."""
+        ctx = list(prompt_bytes)
+        wins = []
+        i = len(ctx)
+        while i > 0:
+            j = max(0, i - max_span)
+            wins.append(ctx[j:i][::-1])
+            i = j
+        return wins or [[0]]
+
+    def generate_auto(self, prompt: str, max_bytes: int = 4096,
+                      temp: float = 0.5, seed: int = 1) -> str:
+        """Model decides HOW LONG to answer (wave226 semantics, ported
+        to Rope pairwise attention). Reads the WHOLE prompt via
+        coverage windows; logits averaged. WAVE 230 fix: the last
+        window is no longer double-counted (was `or True`), divisor
+        is the actual number of terms."""
+        t = self.t
+        pb = prompt.encode('utf-8')
+        windows = self._read_all_windows(pb, max_span=64)
+        with t.no_grad():
+            g = t.Generator(device=self.device).manual_seed(seed)
+            out = bytearray()
+            last_ctx = windows[-1]
+            rep_counter = 0
+            low_conf = 0
+            last_token = None
+            while len(out) < max_bytes:
+                cur = windows[:-1] + [last_ctx]
+                probs = None
+                for w in cur:
+                    x = t.as_tensor([w], dtype=t.long, device=self.device)
+                    pp = t.softmax(self.logits(x)[0] / max(temp, 1e-3),
+                                   dim=-1)
+                    probs = pp if probs is None else probs + pp
+                probs = probs / len(cur)
+                top_p = float(probs.max())
+                b = int(t.multinomial(probs, 1, generator=g))
+                out.append(b)
+                last_ctx = last_ctx[1:] + [b]
+                ch = bytes([b])
+                if top_p < (1.0 / 256) * 1.2:
+                    low_conf += 1
+                else:
+                    low_conf = 0
+                if b == last_token:
+                    rep_counter += 1
+                else:
+                    rep_counter = 0
+                last_token = b
+                if ch in b'.!?':
+                    nxt = int(t.multinomial(probs, 1, generator=g)) \
+                        if False else None
+                    if low_conf >= 2 or rep_counter >= 3:
+                        break
+                if rep_counter >= 8 or low_conf >= 8:
+                    break
+                if ch in b'\n' and low_conf >= 3:
+                    break
+        tail = bytes(out)
+        # trim to last sentence terminator if any
+        for term in (b'.', b'!', b'?'):
+            k = tail.rfind(term)
+            if k != -1:
+                tail = tail[:k + 1]
+                break
+        return (prompt + tail.decode('utf-8', errors='replace'))
 
     def generate(self, prompt: str, n_bytes: int = 120, temp: float = 0.5,
                  seed: int = 1) -> str:

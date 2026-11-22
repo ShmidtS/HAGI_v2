@@ -320,8 +320,13 @@ class AdapterBank:
 
     def get(self, domain: str) -> LowRankAdapter:
         if domain not in self._adapters:
+            # WAVE 230: deterministic seed from the domain NAME — the
+            # old len(self._adapters) made initialization depend on
+            # the ORDER domains were created in (reproducibility bug).
+            seed = int(__import__("hashlib").sha1(
+                domain.encode("utf-8")).hexdigest()[:8], 16)
             self._adapters[domain] = LowRankAdapter(self.d, self.r,
-                                                    seed=len(self._adapters))
+                                                    seed=seed)
         return self._adapters[domain]
 
     def apply(self, domain: str, f):

@@ -162,9 +162,11 @@ class Unified:
             ad = bank.get(source)
             self.model.domain_adapter = ad
             try:
+                # WAVE 230: RopeAttentionByteLM.adapter_head_step —
+                # Adam on A/B only, trunk frozen; 3 guarded steps.
                 for _ in range(3):
-                    self.model._certified_step(
-                        *self._fresh_batch(source), lr_scale=0.5)
+                    ctx, nxt = self._fresh_batch(source)
+                    self.model.adapter_head_step(ctx, nxt)
             except Exception:
                 pass  # adapter training is best-effort, head stays safe
             self.model.domain_adapter = None
@@ -336,11 +338,24 @@ class Unified:
         st.update(
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
         )
+        # WAVE 230: persist attention geometry (theta0/lam) — without
+        # them load() silently reverts to defaults and the trained
+        # recency profile changes after restart.
+        for g in ("theta0", "lam"):
+            if hasattr(self.model, g):
+                st[g] = float(getattr(self.model, g))
         UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
-        _t.save(st, UNET_CKPT)
-        LEDGER.write_text(
-            json.dumps(self.domains, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
+        # WAVE 230: atomic checkpoint write — a crash mid-save must
+        # not leave a truncated .pt / half-written ledger.
+        import os as _os
+        tmp = UNET_CKPT.with_suffix(".pt.tmp")
+        _t.save(st, tmp)
+        _os.replace(tmp, UNET_CKPT)
+        tmp_l = LEDGER.with_suffix(".json.tmp")
+        tmp_l.write_text(
+            json.dumps(self.domains, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        _os.replace(tmp_l, LEDGER)
 
     @staticmethod
     def exists() -> bool:
@@ -355,7 +370,9 @@ class Unified:
         u.lm_mod = lm_mod
         st = _t.load(UNET_CKPT, weights_only=False)
         u.k, u.dim, u.hidden = st["k"], st["dim"], st["hidden"]
-        u.model = lm_mod.RopeAttentionByteLM(dim=u.dim, hidden=u.hidden)
+        u.model = lm_mod.RopeAttentionByteLM(
+            dim=u.dim, hidden=u.hidden,
+            theta0=st.get("theta0", 1.0), lam=st.get("lam", 0.05))
         with _t.no_grad():
             for n in ("emb", "W1", "b1", "W2", "b2", "q"):
                 if hasattr(u.model, n) and n in st:

@@ -103,7 +103,7 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
     res.exact_points = len(full_domain)
 
     # adoption: reify the exact construct so later tasks reuse it
-    q_name = result.get("q_name") or bp.name
+    q_name = (result or {}).get("q_name") or bp.name
     fn = getattr(bp, "fn", None) or (lambda x: bp.apply(x))
     try:
         op = reify_construct(bp, f"{source}_{q_name}", fn,

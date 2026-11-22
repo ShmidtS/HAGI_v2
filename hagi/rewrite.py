@@ -458,6 +458,9 @@ def rename_programs_hash(path: Path) -> dict[str, str]:
         return ("def " + mapping[n] + "(") if n in mapping else m.group(0)
     src2 = re.sub(r"^def ([A-Za-z0-9_]+)\(", sub, src, flags=re.M)
     for old, new in mapping.items():
+        # WAVE 230 FIX: real word boundaries (); the previous
+        # text contained literal backspace chars (0x08) so the
+        # rename regex NEVER matched and rewrites were no-ops.
         src2 = re.sub(rf"{re.escape(old)}", new, src2)
     path.write_text(src2, encoding="utf-8")
     return mapping

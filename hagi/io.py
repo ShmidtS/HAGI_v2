@@ -153,8 +153,6 @@ def ingest_main() -> None:
             for r in f.get('results', []):
                 print(f"  {r['task']}: {r['action']} ({r['reason']})")
         print(f"total: {rep['committed']}/{rep['tasks']} committed")
-if __name__ == '__main__':
-    main()
 
 # ============================================================
 # EXECUTE: run written programs
@@ -219,4 +217,4 @@ def execute_main() -> None:
     else:
         print(execute(a.task, *a.values, programs=a.programs))
 if __name__ == '__main__':
-    main()
+    execute_main()

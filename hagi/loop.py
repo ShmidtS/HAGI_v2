@@ -75,9 +75,14 @@ class DecisionListSelfModel:
             k = tuple(t[f] for f in FULL_KEY)
             succ.setdefault(k, set()).add(t["success"])
             cost.setdefault(k, []).append(t["cost"])
-        self._succ = {k: v.pop() for k, v in succ.items() if len(v) == 1}
+        # WAVE 230 FIX: v.pop() emptied every consistent set, so
+        # len(succ[k]) == 1 was always False downstream and the cost
+        # model was dead. Record consistency BEFORE mutating.
+        consistent = {k for k, v in succ.items() if len(v) == 1}
+        self._succ = {k: next(iter(succ[k])) for k in consistent}
         self._ambig = sorted(k for k, v in succ.items() if len(v) > 1)
-        self._cost = {k: max(vs) for k, vs in cost.items() if len(succ[k]) == 1}
+        self._cost = {k: max(vs) for k, vs in cost.items()
+                      if k in consistent}
 
     def predict_success(self, feats: dict[str, Any]) -> Optional[int]:
         return self._succ.get(tuple(feats[f] for f in FULL_KEY))

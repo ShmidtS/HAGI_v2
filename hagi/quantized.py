@@ -341,8 +341,32 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"
     payload, meta = export_ternary_payload(mm, scale_mode="mean_abs",
                                            scale_dtype=scale_dtype,
                                            bias_dtype=scale_dtype)
+    # WAVE 230: record the REAL model class so instantiate builds a
+    # matching template (was hardcoded to CertifiedStepLM).
+    real_cls = type(model).__name__
+    hl = struct.unpack("<I", payload[len(MAGIC):
+                                     len(MAGIC) + 4])[0]
+    hd = json.loads(payload[len(MAGIC) + 4:
+                            len(MAGIC) + 4 + hl])
+    hd["hagi_model_class"] = real_cls
+    hd["context"] = int(getattr(model, "k", 16))
+    hb = json.dumps(hd, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")
+    payload = (MAGIC + struct.pack("<I", len(hb)) + hb
+               + payload[len(MAGIC) + 4 + hl:])
     emb_fp16 = model.emb.detach().to(torch.float16).numpy().tobytes()
-    payload += emb_fp16
+    # WAVE 230 FIX: emb_fp16_len must live IN THE PAYLOAD HEADER,
+    # not only in the out-of-band meta — a lost/None meta silently
+    # left the seed-0 template emb in place with no error.
+    header_len = struct.unpack("<I", payload[len(MAGIC):
+                                              len(MAGIC) + 4])[0]
+    header = json.loads(payload[len(MAGIC) + 4:
+                                 len(MAGIC) + 4 + header_len])
+    header["emb_fp16_len"] = len(emb_fp16)
+    hb = json.dumps(header, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    payload = (MAGIC + struct.pack("<I", len(hb)) + hb
+               + payload[len(MAGIC) + 4 + header_len:] + emb_fp16)
     meta["hagi_lm"] = {"k": model.k, "dim": model.dim,
                        "hidden": model.hidden,
                        "emb_fp16_len": len(emb_fp16)}
@@ -359,15 +383,21 @@ def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):
     import torch
     if not payload.startswith(MAGIC):
         raise ValueError("invalid HAGI ternary payload magic")
-    header_len = _struct.unpack("<I", payload[len(MAGIC):len(MAGIC)+4])[0]
+    header_len = struct.unpack("<I", payload[len(MAGIC):len(MAGIC)+4])[0]
     start = len(MAGIC) + 4
-    header = _json.loads(payload[start:start + header_len].decode("utf-8"))
+    header = json.loads(payload[start:start + header_len].decode("utf-8"))
     meta = meta or {}
     body = payload[start + header_len:]
-    from hagi.lm import CertifiedStepLM
-    template = CertifiedStepLM(k=int(header["context"]),
-                               dim=int(header["dim"]),
-                               hidden=int(header["hidden"]), seed=0)
+    import hagi.lm as _lm
+    cls_name = header.get("hagi_model_class", "CertifiedStepLM")
+    tpl_cls = getattr(_lm, cls_name, _lm.CertifiedStepLM)
+    if cls_name == "RopeAttentionByteLM":
+        template = tpl_cls(dim=int(header["dim"]),
+                           hidden=int(header["hidden"]), seed=0)
+    else:
+        template = tpl_cls(k=int(header["context"]),
+                           dim=int(header["dim"]),
+                           hidden=int(header["hidden"]), seed=0)
     params = {"emb.weight": None, "W1.weight": template.W1,
               "W2.weight": template.W2}  # emb travels as FP16 tail
     for m in header["matrices"]:
@@ -405,7 +435,10 @@ def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):
             tgt.copy_(torch.as_tensor(arr.astype(np.float32),
                                       dtype=tgt.dtype))
     # WAVE 215e: FP16 embedding appended after biases
-    emb_len = (meta.get("hagi_lm") or {}).get("emb_fp16_len", 0)
+    # WAVE 230: header is SSOT; meta kept as legacy fallback.
+    emb_len = int(header.get("emb_fp16_len",
+                             (meta or {}).get("hagi_lm", {})
+                             .get("emb_fp16_len", 0)))
     if emb_len:
         tail = body[len(body) - emb_len:]
         emb = np.frombuffer(tail, dtype="<f2").astype(np.float32)
