@@ -222,9 +222,15 @@ def ingest_symbolic(u, source: str, data: bytes,
     if not xs:
         res.notes.append("no LM residuals sampled")
         return res
-    return symbolic_phase(source, xs, ys,
-                          full_domain=sorted(set(xs)),
-                          gap_buffer=gap_buffer)
+    # WAVE 236: symbolic_phase returns a FRESH PipelineResult —
+    # carry the multi-byte channel's notes over so the log shows
+    # what the law synthesizer actually did.
+    sym_res = symbolic_phase(source, xs, ys,
+                             full_domain=sorted(set(xs)),
+                             gap_buffer=gap_buffer)
+    sym_res.notes = [n for n in res.notes
+                     if n.startswith("multi-byte")] + sym_res.notes
+    return sym_res
 
 
 def unified_ingest(u, source: str, data: bytes, epochs: int = 200,

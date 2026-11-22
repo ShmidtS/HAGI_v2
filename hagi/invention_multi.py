@@ -17,6 +17,7 @@ feature's domain. Coverage is reported, never implied.
 from __future__ import annotations
 
 import random
+from collections import Counter
 from typing import Callable
 
 from hagi.invention import (BASES, ConstructBlueprint,
@@ -107,20 +108,26 @@ def invent_multi(
     rng: random.Random | None = None,
     max_attempts: int = 8000,
     n_shifts: int = 6,
+    min_support: float = 0.30,
 ) -> dict | None:
-    """WAVE 236f: multi-byte law synthesis with SHIFT-STRATIFIED
-    verification.
+    """WAVE 236k: PARTIAL-LAW synthesis for byte streams.
 
-    A byte-stream law y = law(ctx[-k:]) holds only on positions
-    aligned with the data's repeating structure (e.g. records of
-    length 3). Unaligned positions are noise BY CONSTRUCTION, so a
-    single global consistency check is doomed. Strategy: for each
-    candidate feature, partition pairs by stream position mod
-    n_shifts, fit on ONE stratum and verify out-of-sample on the
-    OTHERS (rotating). A law is accepted only when some stratum
-    yields a generalizing basis (POLY_LIN / OUT_PERIOD) whose
-    predictions verify >=95% on the other strata of the SAME
-    feature. The stratum index is reported for honest provenance.
+    Real stream laws hold only on record-ALIGNED positions (e.g.
+    every 3rd byte); unaligned positions are noise by construction.
+    A single global consistency check therefore rejects true laws.
+    New semantics:
+
+    1. A candidate feature maps contexts to a feature value c.
+    2. For each position-stratum (pair index mod n_shifts) fit a
+       generalizing basis (POLY_LIN / OUT_PERIOD) on the MAJORITY
+       vote y per feature value (mode), then verify on the
+       held-out strata: prediction must match >=90% of majority
+       votes AND the majority coverage must be >= min_support.
+    3. Accepted laws are returned with status PARTIAL_LAW and a
+       `support` ratio — they predict with known reliability on
+       aligned positions, HOLD everywhere else. They are NEVER
+       PROVEN_EXACT (that status requires full deterministic
+       coverage, invention.py verify_blueprint keeps that bar).
     """
     rng = rng or random.Random(0)
     if not pairs:
@@ -139,23 +146,43 @@ def invent_multi(
         for shift in range(n_shifts):
             stratum = [(i, c, y) for i, (c, y) in enumerate(feats)
                        if i % n_shifts == shift]
-            if len(stratum) < 60:
+            if len(stratum) < 80:
                 continue
-            c2y: dict[int, set[int]] = {}
+            # majority vote per feature value in this stratum
+            c2y: dict[int, Counter] = {}
             for _, c, y in stratum:
-                c2y.setdefault(c, set()).add(y)
-            cons = sorted((c, next(iter(v)))
-                          for c, v in c2y.items() if len(v) == 1)
-            # WAVE 236h: aligned fraction of a true law's own
-            # stratum measured ~0.4 on real miss streams (the LM
-            # occasionally guesses right, punching holes); 0.35
-            # with an absolute floor is the honest cut.
-            if len(cons) < 24 or len(cons) < int(0.35 * len(c2y)):
+                c2y.setdefault(c, Counter())[y] += 1
+            fit_pairs = []
+            support_hits = 0
+            # keep one representative CONTEXT per feature value so
+            # bp.apply(context) runs on real tuples, not ints
+            c2ctx: dict[int, tuple] = {}
+            for _, c, y in stratum:
+                c2ctx.setdefault(c, None)
+            ctx_of: dict[int, tuple] = {}
+            for idx_pair, (x, y) in enumerate(pairs):
+                if idx_pair % n_shifts != shift:
+                    continue
+                c = ffn(x)
+                if c not in ctx_of:
+                    ctx_of[c] = x
+            feat_fit = []     # (c, y) для basis (инт-пары)
+            ctx_fit = []      # (ctx, y) для apply-верификации
+            support_hits = 0
+            for c, cnt in c2y.items():
+                top_y, top_n = cnt.most_common(1)[0]
+                if top_n >= 2 and top_n / sum(cnt.values()) >= 0.6:
+                    feat_fit.append((c, top_y))
+                    ctx_fit.append((ctx_of[c], top_y))
+                    support_hits += top_n
+            support = support_hits / max(len(stratum), 1)
+            if len(feat_fit) < 24 or support < min_support:
                 continue
             rng2 = random.Random(rng.randrange(1 << 30))
-            rng2.shuffle(cons)
-            fit_n = max(8, int(0.6 * len(cons)))
-            fit, oos = cons[:fit_n], cons[fit_n:]
+            rng2.shuffle(feat_fit)
+            fit_n = max(8, int(0.6 * len(feat_fit)))
+            fit, oos = feat_fit[:fit_n], feat_fit[fit_n:]
+            oos_ctx = [(ctx_of[c], y) for c, y in oos]
             best = None
             for b_name, b_fn in GEN_BASES:
                 payload = b_fn(fit)
@@ -165,35 +192,69 @@ def invent_multi(
                 bp = ConstructBlueprint(fname, fparam, ffn, b_name,
                                         payload, 9,
                                         total_bits=b_bits + 9)
-                # OOS within the same stratum
-                if not all(bp.apply(c) == y for c, y in oos):
+                # OOS: apply на контекстах (bp сам вычислит фичу)
+                hits = sum(1 for x, y in oos_ctx
+                           if bp.apply(x) == y)
+                if oos and hits / len(oos) < 0.9:
                     continue
-                # cross-stratum check on OTHER shifts' consistent
-                # groups: each OTHER stratum must agree on >=70%
-                # of its consistent groups
-                ok_all = True
+                # cross-stratum: majority votes of other strata
+                # WAVE 236k: cross-stratum only against STRUCTURAL
+                # strata (support >= min_support); noise phases carry
+                # no evidence and must not veto the law.
+                cross_ok = True
                 for other in range(n_shifts):
                     if other == shift:
                         continue
+                    if _stratum_support(feats, other,
+                                        n_shifts) < min_support:
+                        continue
                     o2 = [(i, c, y) for i, (c, y) in enumerate(feats)
                           if i % n_shifts == other]
-                    c2y2: dict[int, set[int]] = {}
+                    c2y2: dict[int, Counter] = {}
                     for _, c, y in o2:
-                        c2y2.setdefault(c, set()).add(y)
-                    cons2 = [(c, next(iter(v)))
-                             for c, v in c2y2.items() if len(v) == 1]
-                    if len(cons2) < 8:
+                        c2y2.setdefault(c, Counter())[y] += 1
+                    ctx2: dict[int, tuple] = {}
+                    for idx_pair, (x, y) in enumerate(pairs):
+                        if idx_pair % n_shifts != other:
+                            continue
+                        c2 = ffn(x)
+                        if c2 not in ctx2:
+                            ctx2[c2] = x
+                    maj = [(ctx2[c], cnt.most_common(1)[0][0])
+                           for c, cnt in c2y2.items()
+                           if cnt.most_common(1)[0][1]
+                           / sum(cnt.values()) >= 0.6
+                           and sum(cnt.values()) >= 3 and c in ctx2]
+                    if len(maj) < 8:
                         continue
-                    hit = sum(1 for c, y in cons2
-                              if bp.apply(c) == y)
-                    if hit / len(cons2) < 0.7:
-                        ok_all = False
+                    hit = sum(1 for x, y in maj if bp.apply(x) == y)
+                    if hit / len(maj) < 0.7:
+                        cross_ok = False
                         break
-                if ok_all and (best is None
-                               or bp.total_bits < best.total_bits):
+                if cross_ok and (best is None
+                                 or bp.total_bits < best.total_bits):
                     best = bp
             if best is not None:
-                return {"status": "INVENTED", "blueprints": [best],
+                return {"status": "PARTIAL_LAW",
+                        "blueprints": [best],
                         "feature": fname, "shift": shift,
+                        "support": round(support, 3),
                         "attempts": attempts}
     return {"status": "NO_LAW", "attempts": attempts}
+
+def _stratum_support(feats, shift, n_shifts) -> float:
+    """Majority-vote support of one stratum (share of its mass on
+    >=60%-dominant y values)."""
+    stratum = [(c, y) for i, (c, y) in enumerate(feats)
+               if i % n_shifts == shift]
+    if not stratum:
+        return 0.0
+    c2y: dict[int, Counter] = {}
+    for c, y in stratum:
+        c2y.setdefault(c, Counter())[y] += 1
+    hits = 0
+    for cnt in c2y.values():
+        top_y, top_n = cnt.most_common(1)[0]
+        if top_n >= 2 and top_n / sum(cnt.values()) >= 0.6:
+            hits += top_n
+    return hits / len(stratum)
