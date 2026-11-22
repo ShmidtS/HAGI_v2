@@ -278,3 +278,17 @@ def select_query_by_committee(candidates: Sequence[H], pool: Sequence[X], predic
         if best is None or entropy > best.information_gain_bits + 1e-12:
             best = QueryChoice(point=point, information_gain_bits=entropy, outcome_probabilities=tuple(sorted(outcome_mass.items(), key=lambda item: repr(item[0]))))
     return best
+
+def oe_first_representatives(programs, probes, evaluate):
+    """WAVE 211 (HAGI_v2_final theory_ports, C540 OE-дедуп):
+    keep the FIRST program per finite probe-observation vector —
+    observational equivalence pruning without global equivalence
+    (OEComplete.lean: дедуп не теряет решений)."""
+    seen = set()
+    out = []
+    for program in programs:
+        key = tuple(evaluate(program, x) for x in probes)
+        if key not in seen:
+            seen.add(key)
+            out.append(program)
+    return out

@@ -340,3 +340,31 @@ class AdapterBank:
 
     def n_params(self) -> int:
         return sum(a.n_params for a in self._adapters.values())
+
+
+# ==================================================================
+# WAVE 211 (HAGI_v2_final theory_ports C538-C541): projected weight
+# decay + exact coverage gate.
+
+def projected_weight_decay(W, P, c: float, complement_update=None):
+    """WeightDecayLeak: W' = W - dC - c(W - WP); assumes dC P = 0,
+    P^2 = P. Protected component W P is preserved EXACTLY (upstream
+    measured 5.68e-15 vs naive 1.945 leak)."""
+    W = np.asarray(W, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    d = (np.zeros_like(W) if complement_update is None
+         else np.asarray(complement_update, dtype=np.float64))
+    return W - d - c * (W - W @ P)
+
+
+def exact_ce_contribution(p_true: float) -> float:
+    """C541: exact-zero CE only at p == 1; reject p <= 0 instead of
+    computing -log(0)."""
+    import math
+    p = float(p_true)
+    if p == 1.0:
+        return 0.0
+    if p <= 0.0:
+        raise ValueError(
+            "invalid exact coverage: true-byte probability must be > 0")
+    return -math.log(p)
