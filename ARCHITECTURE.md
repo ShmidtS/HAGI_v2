@@ -15,18 +15,19 @@
 | Модуль | Роль |
 |---|---|
 | `skill_engine.py` | Autonomous Temporal Skill Engine (пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay. Компилятор по умолчанию: adder 5g, mux 3g |
-| `anf_frontend.py` | v2.1 ANF front-end (fallback синтезатор) |
 | `env_table_compiler.py` | общий компилятор transition-table → netlist (Rule of Three) |
-| `env_temporal.py` + `_bridge.py` | среды 5-бит (temporal): active identification, перенос памяти, drift |
-| `env_lut.py` + `_bridge.py` | среды 4-бит (LUT-грамматика + OOD): банк 1536 гипотез, OOD LUT3, PROVEN_EXACT аудит |
-| `rdl.py` | **Representation Discovery Loop**: изобретение конструкций (LFSR/cnt-mod/sat/Gray/shift2), FAIL→propose→sampled→adversarial sweep→certificate, измерение экономии (52% vs full-table) |
+| `env_temporal.py` | среды 5-бит (temporal): active identification, перенос памяти, drift |
+| `env_lut.py` | среды 4-бит (LUT-грамматика + OOD): банк гипотез, OOD LUT3, PROVEN_EXACT аудит |
 
 ### Цикл и контроль
 | Модуль | Роль |
 |---|---|
-| `loop.py`, `rewrite.py`, `selfedit.py`, `mdl.py` | certified self-development: GROW→DERIVE→OPTIMIZE→GATE, MDL prune, gated knobs |
-| `controller.py`, `selfmodel.py`, `experiment.py` | v10 controller, self-model, A/B эксперименты |
-| `curriculum.py`, `lessons.py`, `ingest.py`, `execute.py`, `mind.py` | учебный контур и интерфейс |
+| `loop.py`, `rewrite.py` | certified self-development: GROW→DERIVE→OPTIMIZE→GATE, self-rewrite |
+| `selfmodel.py` | self-model + MDL prune (слит mdl.py, wave200) + controller/experiment/selfedit |
+| `school.py` | curriculum + lessons + mind (учебный контур) |
+| `io.py` | ingest + execute (слиты, wave195) |
+| `genesis.py` | поиск конфигураций + ec_lib |
+| `cycle.py` | CLI-библиотека derive/weave/grow (C492/C504/C506) |
 
 ## ЕДИНЫЙ CLI (волна 190)
 
@@ -87,7 +88,7 @@ unified_ledger.json, processor_netlist.json, domains/*.bin}.
 
 ## Итог рефакторинга (волны 185–195)
 
-Пакет: **55 → 30 файлов** (-45%), объединение по смыслу:
+Пакет: **55 → 28 файлов** (-49%; wave200: logic.py удалён, mdl.py слит в selfmodel), объединение по смыслу:
 measurement(5→1), invention(+cegis/prior/while_loop/rdl),
 representations(+reifier), trunk_ops(full_pipeline+merge+hadamard+
 growth), school(lessons+curriculum+mind), env 7→2, selfmodel
