@@ -283,6 +283,20 @@ class LowRankAdapter:
         self.B = flat[rA:].reshape(self.d, self.r)
 
 
+def adapter_warm_start(src_adapter: "LowRankAdapter",
+                       dst: "LowRankAdapter") -> bool:
+    """C560 adapter-transfer: warm-start domain B's adapter with a
+    copy of domain A's (pre-registered pair closeness decides WHEN
+    to do this — the caller's job). Measured upstream: T1-positive
+    on close pairs (x387 drop speed), forgetA=0 (copy semantics —
+    source untouched by construction). Shapes must match."""
+    if (src_adapter.d, src_adapter.r) != (dst.d, dst.r):
+        return False
+    dst.A = src_adapter.A.copy()
+    dst.B = src_adapter.B.copy()
+    return True
+
+
 def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:
     """C532 explicit parameter count: adapter 2*r*d vs full block d*d
     (C532 adapter_param_le_full_block when r <= d/2)."""
