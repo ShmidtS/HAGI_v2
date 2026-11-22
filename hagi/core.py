@@ -451,6 +451,30 @@ class Expr:
                 + gamma_bits(idx + 1)
                 + sum(a.bits(expert_index) for a in self.args)
             )
+        # WAVE 221 (O4, research report): MDL parity with
+        # certificates._expr_bits delta coding for in_set/in_ranges —
+        # without this the memorization cost is miscounted.
+        if self.op == "in_set":
+            pts = [int(v) for v in (self.value or ())]
+            if not pts:
+                return TOKEN_BITS
+            pay = (gamma_bits(len(pts) + 1)
+                   + gamma_bits(zigzag(pts[0]) + 1))
+            pay += sum(gamma_bits(b - a) for a, b in zip(pts, pts[1:]))
+            return TOKEN_BITS + pay + sum(a.bits(expert_index)
+                                          for a in self.args)
+        if self.op == "in_ranges":
+            rs = [(int(lo), int(hi)) for lo, hi in (self.value or ())]
+            if not rs:
+                return TOKEN_BITS
+            pay = (gamma_bits(len(rs) + 1)
+                   + gamma_bits(zigzag(rs[0][0]) + 1)
+                   + gamma_bits(rs[0][1] - rs[0][0] + 1))
+            for pr, c in zip(rs, rs[1:]):
+                pay += (gamma_bits(c[0] - pr[1])
+                        + gamma_bits(c[1] - c[0] + 1))
+            return TOKEN_BITS + pay + sum(a.bits(expert_index)
+                                          for a in self.args)
         if self.op == "anf":
             n_vars, coeffs = self.value
             payload = gamma_bits(n_vars + 1) + gamma_bits(len(coeffs) + 1)
@@ -2985,6 +3009,72 @@ def exact_piecewise_poly_fit(
     return None
 
 
+# WAVE 221 (O1/O3): exact cheap templates (research report).
+_MODULI = (16, 26, 64, 128, 256, 10, 12, 60, 100, 7, 3, 5, 8, 9, 11,
+           13, 17, 19, 23, 32, 24, 36, 48, 251, 255, 257, 1000, 1024,
+           2, 4, 6, 14, 15, 18, 20, 21, 22, 25, 27, 28, 30, 31)
+_CURRENT_FAMILY = [""]
+_FULL_CAND = [None]
+
+
+def _mod_affine_expr(X, Y, arity: int):
+    """O1: exact y=(sum a_i x_i + b) mod m fit in O(N) per candidate —
+    covers Caesar/SHIFT/ATBASH without the ~20k-eval search."""
+    if len(Y) < 4:
+        return None
+    ymax = int(Y.max())
+    ms = sorted({ymax + d for d in (1, 2, 3)}
+                | {m for m in _MODULI if m > ymax})
+    X0 = X[0]
+    y0 = int(Y[0])
+    for m in ms:
+        if m > 4096:
+            continue
+        if arity == 1:
+            x = X[:, 0]
+            for a in range(m):
+                b = (y0 - a * int(X0[0])) % m
+                if np.array_equal((a * x + b) % m, Y):
+                    return Expr("mod", (
+                        Expr("add", (
+                            Expr("mul", (Expr.var(0), Expr.const(a))),
+                            Expr.const(b))),
+                        Expr.const(m)))
+        elif arity == 2:
+            x1, x2 = X[:, 0], X[:, 1]
+            for a1 in (-2, -1, 0, 1, 2):
+                for a2 in (-2, -1, 0, 1, 2):
+                    b = (y0 - a1 * int(X0[0]) - a2 * int(X0[1])) % m
+                    if np.array_equal((a1 * x1 + a2 * x2 + b) % m, Y):
+                        e = Expr("add", (
+                            Expr("mul", (Expr.var(0), Expr.const(a1))),
+                            Expr("mul", (Expr.var(1), Expr.const(a2)))))
+                        return Expr("mod", (
+                            Expr("add", (e, Expr.const(int(b)))),
+                            Expr.const(m)))
+    return None
+
+
+def _sparse_membership(X, Y):
+    """O3: language-gated sparse membership (in_set/in_ranges) —
+    admitted ONLY for language-family unary 0/1 specs (core guard),
+    certified on the full domain by the caller's gate."""
+    x = X[:, 0]
+    S = tuple(sorted(int(v) for v in x[Y == 1]))
+    if not S or len(S) == len(Y) or max(S) >= 4096 or min(S) < 0:
+        return None
+    cands = [Expr("in_set", (Expr.var(0),), S)]
+    runs = []
+    for v in S:
+        if runs and v == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], v)
+        else:
+            runs.append((v, v))
+    if len(runs) < len(S):
+        cands.append(Expr("in_ranges", (Expr.var(0),), tuple(runs)))
+    return min(cands, key=lambda e: e.bits())
+
+
 def synthesize_batched_mdl(
     arity: int,
     train_x: Sequence[tuple[int, ...]],
@@ -3003,6 +3093,43 @@ def synthesize_batched_mdl(
         # input magnitude cap: byte pool (0..255) and cyrillic codepoints
         # (0x400..) must pass; intermediate-value safety stays with MAG_CAP
         return None, 0
+
+    # ------------------------------------------------------------------
+    # WAVE 221 (O1+O3, research report): exact cheap templates BEFORE
+    # the expensive search. Certificates NOT weakened — every candidate
+    # still passes the caller's train+val+full-domain gate.
+    env = {nm: ex for _, nm, ex in library_experts}
+    # WAVE 221c: full-domain sparse candidate (learn-provided) has
+    # priority — certified by try_commit on the full domain anyway.
+    fc = _FULL_CAND[0]
+    if fc is not None and _CURRENT_FAMILY[0] == "language" and arity == 1:
+        try:
+            if all(fc.eval(r, env) == y for r, y in zip(val_x, val_y)):
+                return fc, 1
+        except Exception:
+            pass
+    if X.size and arity in (1, 2):
+        # O1: mod-affine y=(sum a_i x_i + b) mod m — O(N) per (a,b,m)
+        cand = _mod_affine_expr(X, Y, arity)
+        if cand is not None:
+            try:
+                if all(cand.eval(r, env) == y
+                       for r, y in zip(val_x, val_y)):
+                    return cand, 1
+            except Exception:
+                pass
+        # O3: language-gated sparse membership (guard: family is set
+        # by learn() into _current_family; unary 0/1 outputs only)
+        if arity == 1 and _CURRENT_FAMILY[0] == "language"                 and set(np.unique(Y)) <= {0, 1}:
+            cand = _sparse_membership(X, Y)
+            if cand is not None:
+                try:
+                    if all(cand.eval(r, env) == y
+                           for r, y in zip(val_x, val_y)):
+                        return cand, 1
+                except Exception:
+                    pass
+
     N = X.shape[0]
     leaf_exprs = [Expr.var(i) for i in range(arity)] + [
         Expr.const(c) for c in CONSTS
@@ -3731,6 +3858,21 @@ class GrowingHagiProcessor:
         domain = spec.inputs()
         if not domain:
             return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)
+        # WAVE 221: family wiring for the O3 language gate
+        _CURRENT_FAMILY[0] = getattr(spec, "family", "")
+        # O3 full-domain candidate: teacher oracle over the WHOLE
+        # declared domain (labs pattern — every candidate still passes
+        # try_commit train+val+full-domain verification).
+        _FULL_CAND[0] = None
+        if _CURRENT_FAMILY[0] == "language" and spec.arity == 1:
+            try:
+                yy = np.array([int(spec.teacher(*r)) for r in domain],
+                              dtype=np.int64)
+                if set(np.unique(yy)) <= {0, 1}:
+                    _FULL_CAND[0] = _sparse_membership(
+                        np.asarray(domain, dtype=np.int64), yy)
+            except Exception:
+                _FULL_CAND[0] = None
 
         opt_snap = self._snapshot_state_with_optimizer()
 
