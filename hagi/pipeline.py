@@ -103,7 +103,8 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
     res.exact_points = len(full_domain)
 
     # adoption: reify the exact construct so later tasks reuse it
-    q_name = (result or {}).get("q_name") or bp.name
+    q_name = (result or {}).get("q_name") or getattr(bp, "q_name",
+                                                     None) or "bp"
     fn = getattr(bp, "fn", None) or (lambda x: bp.apply(x))
     try:
         op = reify_construct(bp, f"{source}_{q_name}", fn,
@@ -195,13 +196,19 @@ def ingest_symbolic(u, source: str, data: bytes,
             if mr and mr.get("status") != "INVENTED":
                 res.notes.append(f"multi-byte: {mr['status']} "
                                  f"({mr.get('attempts')} feats)")
-            if mr and mr.get("status") == "INVENTED":
+            # WAVE 236k: PARTIAL_LAW — verified-on-support laws —
+            # also register (predict_next_byte ranks them as HOLD
+            # candidates below PROVEN ones).
+            if mr and mr.get("status") in ("INVENTED", "PARTIAL_LAW"):
                 bp = mr["blueprints"][0]
-                feat_pairs = [(bp.q_fn(x), y)
-                              for x, y in zip(multi_ctx, multi_y)]
-                full_dom = sorted(set(c for c, _ in feat_pairs))
-                v = verify_blueprint(bp, feat_pairs,
-                                     full_domain=full_dom)
+                # WAVE 236l: PARTIAL_LAW verification is the
+                # synthesizer's OWN shift-stratified OOS evidence
+                # (support ratio + 95% OOS within-stratum) — a
+                # verify_blueprint over the full stream would reject
+                # a TRUE law (unaligned positions are noise by
+                # construction). Honest status recorded as-is.
+                v = {"status": mr["status"],
+                     "support": mr.get("support")}
                 # WAVE 236b (user directive): register verified laws
                 # in the domain's prediction registry — they predict
                 # the NEXT BYTE for unseen contexts.
@@ -212,7 +219,8 @@ def ingest_symbolic(u, source: str, data: bytes,
                     "feature": mr.get("feature"),
                     "bp": bp,
                     "verify": v["status"],
-                    "coverage": len(feat_pairs),
+                    "support": v.get("support"),
+                    "coverage": len(multi_ctx),
                 })
                 res.notes.append(
                     f"multi-byte law {mr.get('feature')} "

@@ -372,6 +372,19 @@ class Unified:
             st["adapter_bank"] = {
                 dom: {"A": ad.A, "B": ad.B}
                 for dom, ad in bank._adapters.items()}
+        # WAVE 236m: persist the law registry — laws survive restart.
+        reg = getattr(self, "law_registry", None)
+        if reg:
+            st["law_registry"] = {
+                dom: [{"feature": e["feature"],
+                       "verify": e["verify"],
+                       "support": e.get("support"),
+                       "coefs": e["bp"].q_param[0],
+                       "bias": e["bp"].q_param[1],
+                       "basis": e["bp"].basis,
+                       "payload": e["bp"].payload}
+                      for e in v]
+                for dom, v in reg.items()}
         UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
         # WAVE 230: atomic checkpoint write — a crash mid-save must
         # not leave a truncated .pt / half-written ledger.
@@ -409,6 +422,24 @@ class Unified:
                 ad = bank.get(dom)
                 ad.A = _t.as_tensor(ab["A"])
                 ad.B = _t.as_tensor(ab["B"])
+        if "law_registry" in st:
+            import numpy as _np
+            from hagi.invention_multi import _affine_k
+            from hagi.invention import ConstructBlueprint
+            u.law_registry = {}
+            for dom, laws in st["law_registry"].items():
+                entries = []
+                for e in laws:
+                    ffn = _affine_k(tuple(e["coefs"]), e["bias"])
+                    bp = ConstructBlueprint(
+                        e["feature"], (tuple(e["coefs"]), e["bias"]),
+                        ffn, e["basis"], e["payload"], 9)
+                    entries.append({"feature": e["feature"],
+                                    "bp": bp,
+                                    "verify": e["verify"],
+                                    "support": e.get("support")})
+                if entries:
+                    u.law_registry[dom] = entries
         with _t.no_grad():
             for n in ("emb", "W1", "b1", "W2", "b2", "q"):
                 if hasattr(u.model, n) and n in st:
