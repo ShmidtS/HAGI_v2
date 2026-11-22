@@ -2486,3 +2486,94 @@ self-edit гейт работает (no-op фильтр активен), failure
 - mod-affine front-end прототип (62 задач: 59 COMMIT/1 REUSE/
   2 HOLD, 1.3s) — принят как направление специализированных
   поисков (грамматика); не в production до отдельного решения.
+
+
+---
+
+## 24. Полный ре-рид формализации (wave206, 2026-11-22)
+
+Полный обход всех 542 Lean-файлов C:\primes пятью параллельными
+обзорами. Итог сверки с кодом (22 модуля hagi/):
+
+### 24.1 Четыре столпа теории → наш код (все мосты живы)
+
+1. **Rational softmax sandwich** (Theory/Softmax, BandTightening,
+   CertSandwichBench, TrainerBenchmark) → `hagi/sandwich.py`
+   `certified_argmax` — волна 204 исправила границы на корректные
+   L_i/U_i (lo_i/Σlo не был валидной нижней границей; tie-кейсы
+   [3,3,0] ложно сертифицировались — исправлено, 300-seeded
+   panel 0 ложных).
+2. **CE safe-step контракт** (CEDescent, CEChain: η=4A/R²,
+   drop 2A²/R²; BatchCEDescent consolidated C523) →
+   `hagi/lm.py::_certified_step` — точный JVP полного directional
+   displacement, контракт соблюдён. `_adaptive_step` —
+   AdaptiveMajorizer (variance curvature C, η*=A/2C, cap η≤1).
+3. **GPM/snap/grow-адмиссия** (Continual, GrowSnap C521,
+   AdapterGrowth C532, GrowTrunkBlock) → `hagi/core.py::hybrid_select`
+   (fullGPM/agemFree/rankTrunc, wave201 добавил adaptive
+   conflict_threshold), `hagi/trunk_ops.py` (snap_rational q/2^k
+   banker's, snap_denominator_reset, snap_obj_bound; LowRankAdapter
+   B=0 one-factor neutrality, wave205).
+4. **Concentration-канон** (Hoeffding, Freedman, EmpiricalBernstein,
+   anytime_safe_threshold) → `hagi/core.py::AuditLedger` (α-spending,
+   streams disjoint, Hoeffding radius), loop-гейт δ-бюджет.
+
+### 24.2 Unified/Contracts/Step: наш сертификат соответствует канону
+
+`CertStepGen` (core.py) = Cert/StepGen.lean 1-в-1: drop/budget/
+risk/delta spends + floors_kept; телескоп по cert_log. Rollback
+инвариант (holdSafe) покрыт paired gate волны 204 (unified.py
+P0.3) и loop.py HOLD-веткой. GatePipeline false-commit ≤ δ —
+six_phase_cycle Σδ_i ≤ delta_total.
+
+### 24.3 Проверено и НЕ требует изменений
+
+- **EF21** (EF21Quantizer: ternary/TopK α=0, не contractive):
+  наш `_ef21_step` честен — commit только по измеренному
+  actual_drop с backtracking и полным откатом при reject
+  (weights AND residual unchanged). Не заявляет certified descent
+  от теоремы — соответствует upstream-оговорке.
+- **RoPE/causality** (LMCompose prefix_determined, RoPETransfer
+  isometry): исправлено в волне 204 (true RoPE phase, softmax по
+  key axis); E3-проверки: causal invariance 0.0, attention sums 1.
+- **SupervisorSafety** (no_restore_without_checkpoint): restore
+  работает только по sha-match ledger (checkpoint-derived).
+- **Checkpoints √n-оптимальны** (Checkpoint.lean ckpt_sqrt_opt):
+  наш save каждые 8 чанков — в разумном диапазоне √446≈21
+  (консервативнее оптимума — допустимо).
+- **Ternary quant** (Energy/STEStep, Ternary.lean trits_fit_byte):
+  `hagi/lm.py::ternary_quant` b1.58 per-row scale, scale-invariant —
+  соответствует; post-training, не в certified-пути.
+
+### 24.4 Задокументированные дистанции (не баги, честные границы)
+
+- **MDL/pruning**: прямого MDL-файла в upstream нет (ближайшие —
+  TernaryPert, Element LoRA rank, Select selection_hurts); наш
+  selfmodel-prune — инженерное расширение за пределами Lean.
+- **√-оптимум чекпоинтов** и **fixed-scale EF21 PIN** (заморожен
+  на шаге 1; при падении нормы градиента round(m/s)→нули —
+  upstream и аудит P1.2 оба требуют телеметрию zero-fraction —
+  кандидат на волну телеметрии).
+- **Model/Theory cost-семейства** (Attention GQA/MLA/MoD/Flash,
+  HNet, FastArch3, GDN/RAM) — не реализованы в Python
+  (единственный attention — RopeAttentionByteLM); это direction,
+  не долг: наша цель — универсальный процессор, не полный стек.
+- **Research/Legacy (39 файлов)** — карантин вне root-замыкания
+  (C239/C240 upstream): не портируется намеренно.
+
+### 24.5 Сводка статуса мостов (после wave204/205/206)
+
+| Мост | Статус |
+|---|---|
+| sandwich certified_argmax | ИСПРАВЛЕН+верифицирован (wave204) |
+| CE safe-step (_certified_step) | соответствует |
+| adaptive step (AdaptiveMajorizer) | соответствует |
+| EF21 honest-reject | соответствует |
+| hybrid GPM (C510) + adaptive threshold (C519) | соответствует |
+| GrowSnap q/2^k (C521) | перенесён (wave202) |
+| AdapterGrowth LoRA (C532) | перенесён (wave205) |
+| AuditLedger α-spending | соответствует |
+| verify_all suite coverage (P0.2) | ИСПРАВЛЕН (wave204) |
+| paired regression gate (P0.3) | ИСПРАВЛЕН (wave204) |
+| RoPE true phase + key-axis softmax (P1.1) | ИСПРАВЛЕН (wave204) |
+| StepContract monoid | соответствует (CertStepGen) |
