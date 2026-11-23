@@ -278,3 +278,27 @@ def test_invent_multi_without_positions_keeps_the_old_contract():
     pairs = _stream(4, lambda a, b, c: a + 2 * b - c + 7, n=6000)
     r = invent_multi([(tuple(x), y) for x, y in pairs], random.Random(0))
     assert r["status"] == "PARTIAL_LAW" and r["n_shifts"] == 4
+
+
+def test_pipeline_multibyte_channel_runs_end_to_end(tmp_path, monkeypatch):
+    # Regression (WAVE 250): the channel was silently disabled by a
+    # NameError inside its `except` — a chunk then reported NO
+    # 'multi-byte:' note at all instead of NO_LAW / PARTIAL_LAW.
+    import random
+    from hagi import unified as U
+    from hagi import pipeline as P
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    u = U.Unified()
+    u.domains["d"] = {}
+    r = random.Random(0)
+    data = bytearray(r.randbytes(9000 + K))
+    for i in range(K, len(data)):
+        if (i - K) % 3 == 0:
+            data[i] = (data[i - 3] + 2 * data[i - 2] - data[i + -1] + 7) & 255
+    data = bytes(data)
+    u.model.train_guarded(data, epochs=2)
+    res = P.ingest_symbolic(u, "d", data)
+    notes = " | ".join(res.notes)
+    assert "skipped" not in notes and "multi-byte:" in notes, notes
+    assert any(n.startswith("multi-byte: PARTIAL_LAW") for n in res.notes), notes
+    assert u.law_registry.get("d"), "law was not registered"

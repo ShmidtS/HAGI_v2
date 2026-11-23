@@ -181,7 +181,7 @@ def lm_residual_relation(u, source: str, data: bytes
             multi_y.append(nxt)
             multi_pos.append(i)            # WAVE 250: real stream position
             count2 += 1
-    return misses_x, misses_y, multi_ctx, multi_y, multi_full_ctx
+    return misses_x, misses_y, multi_ctx, multi_y, multi_full_ctx, multi_pos
 
 
 def ingest_symbolic(u, source: str, data: bytes,
@@ -191,7 +191,7 @@ def ingest_symbolic(u, source: str, data: bytes,
     holdout_ce = u.domains.get(source, {}).get("ce")
     res = PipelineResult(source=source,
                          holdout_ce=holdout_ce if holdout_ce is not None else -1.0)
-    xs, ys, multi_ctx, multi_y, multi_full_ctx =         lm_residual_relation(u, source, data)
+    xs, ys, multi_ctx, multi_y, multi_full_ctx, multi_pos = lm_residual_relation(u, source, data)
     # WAVE 236: multi-byte law channel first (richer laws); if it
     # yields a verified law, REGISTER it for PREDICTION on unseen
     # next bytes (user directive), then fall through to the classic
@@ -230,9 +230,11 @@ def ingest_symbolic(u, source: str, data: bytes,
                 n_shifts = int(mr.get("n_shifts", 6))
                 import numpy as _np_e
                 evidence = []
-                for i, (f_ctx, full_ctx, target) in enumerate(
-                        zip(multi_ctx, multi_full_ctx, multi_y)):
-                    if i % n_shifts != shift:
+                # WAVE 250: stratum membership by STREAM position (the
+                # list is the model's misses — its index is not aligned).
+                for f_ctx, full_ctx, target, p_i in zip(
+                        multi_ctx, multi_full_ctx, multi_y, multi_pos):
+                    if p_i % n_shifts != shift:
                         continue
                     try:
                         if int(bp.apply(f_ctx)) != int(target):
@@ -243,7 +245,7 @@ def ingest_symbolic(u, source: str, data: bytes,
                         "context": list(full_ctx),
                         "feature_context": list(f_ctx),
                         "target": int(target),
-                        "source_index": i,
+                        "source_index": p_i,      # stream position (WAVE 250)
                     })
                 if len(evidence) > 256:
                     take = _np_e.linspace(0, len(evidence) - 1, 256,
