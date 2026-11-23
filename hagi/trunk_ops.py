@@ -32,7 +32,11 @@ def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequen
     w2 = np.asarray(w2, dtype=float)
     mid = (w1 + w2) / 2.0
     L1, L2 = (float(L(w1)), float(L(w2)))
-    delta_mid = abs(float(L(mid)) - lin_at(g, w1, w2, 0.5))
+    # WAVE 247: lin_at returns the INCREMENT only; MergeQuant.lean
+    # linAt = L w1 + g.(w2-w1)t, so the base point belongs in the
+    # residual (delta_end already had it; delta_mid did not -> the
+    # bound was valid but needlessly loose: 25.0 vs 15.0 on a quad).
+    delta_mid = abs(float(L(mid)) - (L1 + lin_at(g, w1, w2, 0.5)))
     delta_end = abs(L2 - (L1 + lin_at(g, w1, w2, 1.0)))
     bound = (L1 + L2) / 2.0 + delta_mid + delta_end / 2.0
     return {'L_mid': float(L(mid)), 'bound': bound, 'delta_mid': delta_mid, 'delta_end': delta_end, 'certified': float(L(mid)) <= bound + 1e-12}

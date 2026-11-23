@@ -43,6 +43,18 @@ class ResidualProfile:
                                      # tables switch ~ (K-1)/K; laws
                                      # switch rarely)
     mn_classes: int | None = None  # Myhill-Nerode classes (sequential)
+    # WAVE 247: shift probe counts "equal OR +-1" (for counters), so
+    # on a narrow alphabet K it fires by chance ~3/K (3/8 = 0.375 >
+    # the fixed 0.3 gate: random bytes over 8 values were labeled
+    # REPRESENTATION_GAP). The chance level is carried explicitly.
+    shift_chance: float = 0.0
+    # WAVE 247: max over periods P in 2..64 of P(f(x) == f(x+P)).
+    # Real periodic laws hit 1.0 (fib mod 13: Pisano period 28) and
+    # were mislabeled RANDOM_INCOMPRESSIBLE by the switch-rate probe;
+    # random tables stay near 1/K.
+    period_hit: float = 0.0
+    period: int = 0
+    period_cover: float = 0.0   # share of pairs the period was scored on
 
     def signature(self) -> tuple:
         """Coarse signature for clustering."""
@@ -152,6 +164,26 @@ def build_residual_profile(
            for i, b in enumerate(pairs[:-1])
            if pairs[i + 1][0] == b[0] + 1]
     switch_rate = (sum(1 for a, b in adj if a != b) / len(adj)) if adj else 0.0
+    # WAVE 247: period probe on the dense integer grid (sparse tables
+    # have too few aligned pairs — hit stays 0, i.e. "unknown").
+    # A period is credited only on INFORMATIVE pairs: both ends equal
+    # the table's dominant value proves nothing (95% zeros matched at
+    # every P — measured 0.95 on a 2.6%-dense table; excluding "the
+    # zero value" instead broke binary alphabets, where 0 is a legal
+    # symbol). Dominant-value agreement is reported separately so the
+    # caller can see how much of the table the period actually covers.
+    period_hit, period, period_cover = 0.0, 0, 0.0
+    if len(pairs) >= 128 and all(b[0] == a[0] + 1 for a, b in zip(pairs, pairs[1:])):
+        ys = [y for _, y in pairs]
+        top = Counter(ys).most_common(1)[0][0]
+        for P in range(2, min(64, len(ys) // 2) + 1):
+            inf = [i for i in range(len(ys) - P) if not (ys[i] == top and ys[i + P] == top)]
+            if len(inf) < 32:                   # too little evidence
+                continue
+            hit = sum(1 for i in inf if ys[i] == ys[i + P]) / len(inf)
+            if hit > period_hit:
+                period_hit, period = hit, P
+                period_cover = len(inf) / (len(ys) - P)
     return ResidualProfile(
         n=n,
         k_density=len(active) / n if n else 0.0,
@@ -163,6 +195,10 @@ def build_residual_profile(
         autocorr_xor=xor_best,
         residual_frac_builtin=min(1.0, max(0.0, residual)),
         output_switch_rate=round(switch_rate, 4),
+        shift_chance=round(3.0 / max(1, uniq_out), 4),
+        period_hit=round(period_hit, 4),
+        period=period,
+        period_cover=round(period_cover, 4),
     )
 
 
@@ -188,20 +224,23 @@ def classify_hold(reason_str: str, profile: ResidualProfile) -> HoldReason:
     # (uniq/K ~ 1); a compact law spans a narrow slice of K.
     # Adjacent-switch is NOT a discriminator — small-period laws
     # switch naturally (x % 7 switches 6/7 of the time).
+    # WAVE 247: the shift gate is relative to the chance level of the
+    # probe (3/K on an alphabet of K outputs), fixed 0.3 as the floor
+    # for wide alphabets; a periodic table (fib!) is never noise.
+    shift_noise = max(0.3, 1.5 * profile.shift_chance)
+    no_structure = (profile.autocorr_shift < shift_noise
+                    and profile.autocorr_xor < 0.3
+                    and profile.autocorr_reflect < 0.3
+                    and profile.period_hit < 0.95)
     if (profile.residual_frac_builtin >= 0.9
-            and profile.autocorr_shift < 0.3
-            and profile.autocorr_xor < 0.3
-            and profile.autocorr_reflect < 0.3
+            and no_structure
             and profile.uniq_outputs > 2
             and profile.output_switch_rate >= 0.7):
         # switch-rate supports randomness; final check is alphabet
         # coverage done by the caller with max_y — here we use the
         # uniq_outputs vs n bound for the dense case only.
         return HoldReason.RANDOM_INCOMPRESSIBLE
-    if (profile.residual_frac_builtin >= 0.9
-            and profile.autocorr_shift < 0.3
-            and profile.autocorr_xor < 0.3
-            and profile.autocorr_reflect < 0.3):
+    if (profile.residual_frac_builtin >= 0.9 and no_structure):
         # no builtin explains it, no symmetry: representation gap or noise.
         # Dense random noise has uniq_outputs high AND runs ~ n/2;
         # structural gaps usually show SOME symmetry or sparsity.

@@ -142,14 +142,28 @@ def basis_out_period(core_pairs: list[tuple[int, int]]) -> dict | None:
     """y = (x + o) mod p — counter/ring structures (invented basis)."""
     if len(core_pairs) < 3:
         return None
+    # WAVE 247: (x+o) % p == y forces y < p, and with p > max(y) the
+    # offset is UNIQUE (o = (y0-x0) mod p); the pair then qualifies iff
+    # p | d_i for every i, d_i = (y_i-x_i) - (y_0-x_0). So the old
+    # exhaustive (p, o) scan (<= 32 896 pairs) reduces to: divisors of
+    # g = gcd(d_i) above max(y), ascending, one full verification.
+    # (A first version dropped the `p > max(y)` clause and returned
+    # p=2 on under-determined samples — caught by the 400-case
+    # differential check against the frozen original, now 0 mismatches.)
+    ys_max = max(y for _, y in core_pairs)
+    diffs = {(y - x) - (core_pairs[0][1] - core_pairs[0][0])
+             for x, y in core_pairs}
+    g = 0
+    for d in diffs:
+        g = math.gcd(g, abs(d))
     (x0, y0) = core_pairs[0]
-    # WAVE 203: modulus search bounded by the byte domain (256) so
-    # alphabets of any size (26-letter, bytes) are covered — was
-    # hardwired range(2, 17).
-    for p_ in range(2, 257):
-        for o in range(p_):
-            if all((x + o) % p_ == y for x, y in core_pairs):
-                return {"kind": "OUT_PERIOD", "p": p_, "o": o}
+    lo = max(2, ys_max + 1)
+    cands = range(lo, 257) if g == 0 else sorted(
+        d for d in range(2, 257) if d >= lo and g % d == 0)
+    for p_ in cands:
+        o = (y0 - x0) % p_
+        if all((x + o) % p_ == y for x, y in core_pairs):
+            return {"kind": "OUT_PERIOD", "p": p_, "o": o}
     return None
 
 
