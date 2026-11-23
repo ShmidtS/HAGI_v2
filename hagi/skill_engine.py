@@ -236,7 +236,19 @@ def verify_compaction_proof(raw_net: dict, opt_net: dict, proof: dict) -> tuple[
     return True, "verified"
 
 @functools.lru_cache(maxsize=512)
-def compile_factored_gf2(n: int, outputs: tuple[frozenset[int], ...]) -> dict:
+def compile_factored_gf2(n: int, outputs: tuple[frozenset[int], ...],
+                       xor_quad_resub: bool = False) -> dict:
+    """Multi-output Davio + Affine Divisor + 1-gate Functional Resubstitution over GF(2).
+
+    WAVE 247 `xor_quad_resub` (off by default): p = wire ^ (single
+    quadratic monomial not yet on a wire) is built as AND + XOR
+    before the affine divisor. It is exactly what the 2x2
+    multiplier needs (p2 = bd ^ (ad & bc): 9/4/124 -> 7/3/100) but as
+    a greedy first match it costs +0.8% gates / +1.0% bits over 20
+    random functions, so it is offered as a CANDIDATE for
+    ProofCarryingANFLearner.compile_optimal (verified min), not as a
+    replacement.
+    """
     """Multi-output Davio + Affine Divisor + 1-gate Functional Resubstitution over GF(2)."""
     gates: list[dict] = []
     poly_wire: dict[frozenset[int], int] = {frozenset({1 << i}): i for i in range(n)}
@@ -258,6 +270,13 @@ def compile_factored_gf2(n: int, outputs: tuple[frozenset[int], ...]) -> dict:
         for pa, wa in poly_wire.items():
             rem = xor(p, pa)
             if rem in poly_wire: return emit(wa, poly_wire[rem], 6, p)
+        if xor_quad_resub and len(wire_poly) <= 32:
+            for pa, wa in poly_wire.items():
+                rem = xor(p, pa)
+                if len(rem) == 1 and next(iter(rem)).bit_count() == 2:
+                    t = next(iter(rem)); b1 = t & -t; b2 = t ^ b1
+                    wq = emit(poly_wire[frozenset({b1})], poly_wire[frozenset({b2})], 8, rem)
+                    return emit(wa, wq, 6, p)
         if len(wire_poly) <= 32:
             items = [(pa, wa, deg(pa)) for pa, wa in poly_wire.items()]
             dp = deg(p)
@@ -458,9 +477,13 @@ class ProofCarryingANFLearner:
     def compile_optimal(n: int, outputs: tuple[frozenset[int], ...]) -> dict:
         sop = compact_netlist(ProofCarryingANFLearner.compile(n, outputs))
         if n <= 12:
-            fac = compile_factored_gf2(n, outputs)
-            if symbolic_verify_general(fac, outputs):
-                return min([sop, fac], key=lambda nt: (len(nt["gates"]), nt["metrics"]["depth"], nt["metrics"]["program_bits"]))
+            cands = [sop]
+            # WAVE 247: both factored variants are verified candidates;
+            # the min is taken over them, so the result can only improve.
+            for kwargs in ({}, {"xor_quad_resub": True}):
+                fac = compile_factored_gf2(n, outputs, **kwargs)
+                if symbolic_verify_general(fac, outputs): cands.append(fac)
+            return min(cands, key=lambda nt: (len(nt["gates"]), nt["metrics"]["depth"], nt["metrics"]["program_bits"]))
         return sop
 
     @staticmethod

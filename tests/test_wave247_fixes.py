@@ -164,3 +164,64 @@ def test_vectorised_features_are_bit_exact_with_the_callables():
             ref = np.fromiter((fn(tuple(int(v) for v in row)) for row in X),
                               dtype=np.int64, count=len(X))
             assert not (got != ref).any(), name
+
+
+# ---- 4. compile_factored_gf2 / compile_optimal (WAVE 247) ----
+def _anf(n, fn):
+    outs = []
+    for o in range(len(fn((0,) * n))):
+        T = set()
+        for s in range(1 << n):
+            c = 0
+            for t in range(1 << n):
+                if t & s == t:
+                    c ^= fn(tuple((t >> i) & 1 for i in range(n)))[o]
+            if c:
+                T.add(s)
+        outs.append(frozenset(T))
+    return tuple(outs)
+
+
+def _adder2(x):
+    s = x[0] + 2 * x[1] + x[2] + 2 * x[3]
+    return ((s >> 3) & 1, (s >> 2) & 1, (s >> 1) & 1)
+
+
+def _mul2(x):
+    p = (x[0] + 2 * x[1]) * (x[2] + 2 * x[3])
+    return ((p >> 3) & 1, (p >> 2) & 1, (p >> 1) & 1, p & 1)
+
+
+def _exact(net, n, fn):
+    import hagi.skill_engine as S
+    return S.symbolic_verify_general(net, _anf(n, fn)) and all(
+        S.eval_net(net, tuple((q >> i) & 1 for i in range(n)))
+        == fn(tuple((q >> i) & 1 for i in range(n))) for q in range(1 << n))
+
+
+def test_compile_optimal_shrinks_the_2x2_multiplier():
+    import hagi.skill_engine as S
+    net = S.ProofCarryingANFLearner.compile_optimal(4, _anf(4, _mul2))
+    m = net["metrics"]
+    assert len(net["gates"]) <= 7 and m["depth"] <= 3 and m["program_bits"] <= 100
+    assert _exact(net, 4, _mul2)
+
+
+def test_compile_optimal_keeps_the_adder_and_is_never_worse_than_before():
+    import hagi.skill_engine as S
+    net = S.ProofCarryingANFLearner.compile_optimal(4, _anf(4, _adder2))
+    assert len(net["gates"]) == 8 and _exact(net, 4, _adder2)
+    r = np.random.default_rng(0)
+    for n in (3, 4, 5):
+        for _ in range(8):                       # random functions
+            outs = []
+            for _ in range(int(r.integers(1, 4))):
+                tt = r.integers(0, 2, 1 << n)
+                outs.append(frozenset(s for s in range(1 << n)
+                                      if sum(tt[t] for t in range(1 << n) if t & s == t) % 2))
+            outs = tuple(outs)
+            opt = S.ProofCarryingANFLearner.compile_optimal(n, outs)
+            base = S.compile_factored_gf2(n, outs)          # flag off
+            assert S.symbolic_verify_general(opt, outs)
+            key = lambda nt: (len(nt["gates"]), nt["metrics"]["depth"], nt["metrics"]["program_bits"])
+            assert key(opt) <= min(key(base), key(S.compact_netlist(S.ProofCarryingANFLearner.compile(n, outs))))
