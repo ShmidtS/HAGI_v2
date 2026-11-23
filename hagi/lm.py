@@ -695,33 +695,41 @@ class RopeAttentionByteLM:
         hold = np.arange(max(hold_start := n - n_hold, n - 2048), n)
         train = np.arange(0, max(16, int(hold[0]) - max_train_ctx))
 
-        def batch_at(positions, fixed_len=None):
-            """Build (X newest-first variable-len, y) entirely on dev."""
-            pos_np = np.asarray(positions, dtype=np.int64)
-            lens = np.full(len(pos_np), fixed_len or max_train_ctx,
-                           dtype=np.int64)
-            lens = np.minimum(lens, pos_np)
-            pad = int(lens.max(initial=1))
-            pos = t.as_tensor(pos_np, dtype=t.long, device=dev)
-            lens_t = t.as_tensor(lens, dtype=t.long, device=dev)
-            # gather offsets [pos-1-(L-1-j)] for j in 0..pad-1, masked
+        # WAVE 253 (measured): batch_at cost 30 s of a 71 s chunk —
+        # 42%, twice the forward pass — because every call did 4
+        # synchronising host->device copies plus int(lens.max()) (a
+        # GPU->CPU sync); batch 256->64 (wave245) made it 4x more
+        # calls. Positions are known up front, so the windows are
+        # gathered ONCE on the device and batches are index slices.
+        # Same construction (newest-first, pad byte 0, y = raw[pos]).
+        def gather_all(pos_np, fixed_len=None):
+            pos_np = np.asarray(pos_np, dtype=np.int64)
+            n_ = len(pos_np)
+            if n_ == 0:
+                e = t.zeros((0, 1), dtype=t.long, device=dev)
+                return e, e[:, 0]
+            lens_np = np.minimum(np.full(n_, fixed_len or max_train_ctx, dtype=np.int64), pos_np)
+            pad = int(lens_np.max(initial=1))
+            pos_t = t.as_tensor(pos_np, dtype=t.long, device=dev)
+            lens_t = t.as_tensor(lens_np, dtype=t.long, device=dev)
             j = t.arange(pad, dtype=t.long, device=dev)
-            # newest-first: index pos-1-(L-1-j) valid when j >= pad-L
-            base = pos[:, None] - 1 - (lens_t[:, None] - 1) + j[None, :]
+            base = pos_t[:, None] - 1 - (lens_t[:, None] - 1) + j[None, :]
             mask = j[None, :] >= (pad - lens_t[:, None])
             base = t.where(mask, base, t.zeros_like(base))
             X = raw[base.clamp_(0, len(raw) - 1)]
             X = t.where(mask, X, t.zeros_like(X))  # pad byte 0
-            y = raw[pos]
-            return X, y, lens
+            return X.contiguous(), raw[pos_t]       # keep int64: a uint8
+            # index_select + .long() per batch measured 1731 us vs 5 us
 
-        def eval_ce(positions, eval_batch=512):
+        X_tr, y_tr = gather_all(train)
+        X_va, y_va = gather_all(hold, fixed_len=max_train_ctx)
+
+        def eval_ce(positions=None, eval_batch=512):
             tot, cnt = 0.0, 0
             with t.no_grad():
-                for s in range(0, len(positions), eval_batch):
-                    X, y, _ = batch_at(positions[s:s + eval_batch],
-                                       fixed_len=max_train_ctx)
-                    tot += float(self.ce(X, y)) * len(X)
+                for s in range(0, len(y_va), eval_batch):
+                    X = X_va[s:s + eval_batch]
+                    tot += float(self.ce(X, y_va[s:s + eval_batch])) * len(X)
                     cnt += len(X)
             return tot / max(cnt, 1)
 
@@ -737,7 +745,9 @@ class RopeAttentionByteLM:
         for ep in range(epochs):
             perm2 = rng.permutation(len(train))
             for bs in range(0, len(train), batch):
-                X, y, _ = batch_at(train[perm2[bs:bs + batch]])
+                sel = t.as_tensor(perm2[bs:bs + batch], dtype=t.long, device=dev)
+                X = X_tr.index_select(0, sel)
+                y = y_tr.index_select(0, sel)
                 opt.zero_grad()
                 self.ce(X, y).backward()
                 opt.step()
