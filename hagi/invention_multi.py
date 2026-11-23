@@ -151,10 +151,20 @@ def _majVotes(c: "np.ndarray", y: "np.ndarray", idx: "np.ndarray"):
     return rows, float(top_n[ok].sum() / max(len(idx), 1))
 
 
+def _mode_share(ys) -> float:
+    """Share of the most frequent target: what 'always predict the
+    mode' would score — the baseline any law has to beat (WAVE 251)."""
+    if not len(ys):
+        return 0.0
+    c = np.bincount(np.asarray(ys, dtype=np.int64) % 256, minlength=256)
+    return float(c.max() / len(ys))
+
+
 def invent_multi(pairs, rng: "random.Random | None" = None,
                  max_attempts: int = 8000, n_shifts: int = 8,
                  min_support: float = 0.30,
-                 max_period: int | None = None) -> dict | None:
+                 max_period: int | None = None,
+                 min_edge: float = 0.10) -> dict | None:
     """WAVE 236k: PARTIAL-LAW synthesis for byte streams.
 
     Real stream laws hold only on record-ALIGNED positions (e.g.
@@ -260,6 +270,16 @@ def invent_multi(pairs, rng: "random.Random | None" = None,
                     hits = sum(1 for x, yy in oos_ctx
                                if bp.apply(x) == yy)
                     if oos and hits / len(oos) < 0.9:
+                        continue
+                    # WAVE 251: a law must BEAT the mode of its own
+                    # held-out targets. Measured on a real chunk: a
+                    # "law" with OOS 0.90 on the fitted prefix scored
+                    # exactly the predict-the-mode baseline (0.233 =
+                    # 0.233) on the unseen half of the file — a fit to
+                    # the most frequent byte of a zero-rich stream.
+                    if oos and hits / len(oos) < (
+                            _mode_share([yy for _, yy in oos_ctx])
+                            + min_edge):
                         continue
                     # cross-stratum: majority votes of the OTHER
                     # phases of the same period; noise phases carry

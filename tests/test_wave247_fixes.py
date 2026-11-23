@@ -302,3 +302,24 @@ def test_pipeline_multibyte_channel_runs_end_to_end(tmp_path, monkeypatch):
     assert "skipped" not in notes and "multi-byte:" in notes, notes
     assert any(n.startswith("multi-byte: PARTIAL_LAW") for n in res.notes), notes
     assert u.law_registry.get("d"), "law was not registered"
+
+
+# ---- 7. WAVE 251: a law must beat the mode baseline ----
+def test_invent_multi_rejects_a_mode_fit():
+    # A zero-rich stream with NO law: a general affine feature can fit
+    # the most frequent byte. On a real chunk such a "law" scored
+    # exactly the predict-the-mode baseline on unseen data.
+    import random
+    from hagi.invention_multi import invent_multi
+    r = random.Random(3)
+    data = bytearray(r.randbytes(9000 + K))
+    for i in range(len(data)):                      # 55% zeros, rest sparse noise
+        if r.random() < 0.55:
+            data[i] = 0
+    # context = the 4 bytes BEFORE the target (a first version of
+    # this test leaked the target into its own context and the
+    # synthesizer correctly found "y = -x3" with support 1.0).
+    pairs = [((data[i], data[i + 1], data[i + 2], data[i + 3]), data[i + 4], i)
+             for i in range(0, 8000)]
+    res = invent_multi(pairs, random.Random(7))
+    assert res["status"] == "NO_LAW"
