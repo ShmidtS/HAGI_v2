@@ -658,7 +658,7 @@ class RopeAttentionByteLM:
             self.logits(ctx), nxt, reduction="mean")
 
     def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 3e-3,
-                      holdout: float = 0.1, batch: int = 32,
+                      holdout: float = 0.1, batch: int = 64,
                       max_train_ctx: int = 96, log_every: int = 0,
                       holdout_seed: int | None = None) -> dict:
         """WAVE 231 (integrated from HAGI_v2_local_repro):
@@ -680,6 +680,10 @@ class RopeAttentionByteLM:
         #  256    2.53     2.53      1.5
         # Smaller batch = more steps = more descent per byte read
         # (Step/BatchBudget: throughput optimum != quality optimum).
+        # WAVE 245b: on the real disk cycle batch 32 cost 52 s/chunk
+        # (was 18) with chunk CE ~2.3 inside the domain noise of the
+        # earlier 2.1-2.8 -> not worth 2.9x. Settled on 64 (CE 2.28,
+        # ~1.6x time): quality gain is certain in isolation, cheap.
         # GPU-resident buffer: windows are gathered on-device.
         raw = t.as_tensor(idx_np.copy(), dtype=t.long, device=dev)
         offs = t.arange(max_train_ctx, dtype=t.long, device=dev)
@@ -901,7 +905,7 @@ class RopeAttentionByteLM:
     k = 96  # interface compat with Unified (model.k consumers)
 
     def train_certified(self, data: bytes, epochs: int = 60,
-                        holdout: float = 0.1, batch: int = 32,
+                        holdout: float = 0.1, batch: int = 64,
                         log_every: int = 0,
                         holdout_seed: int | None = None) -> dict:
         """Unified-compatible training: delegates to train_guarded."""
