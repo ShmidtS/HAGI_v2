@@ -248,3 +248,33 @@ def test_polar_express_handles_wide_rank_deficient_and_zero():
     s = np.linalg.svd(out, compute_uv=False)
     assert out.shape == G.shape and s[0] <= 1049 / 1024 + 1e-9 and s[2:].max() < 1e-9
     assert np.array_equal(polar_express(np.zeros((3, 3))), np.zeros((3, 3)))
+
+
+# ---- 6. WAVE 250: strata by STREAM position, not list index ----
+def test_invent_multi_survives_a_sampled_miss_list():
+    # The pipeline hands invent_multi the model's misses. Dropping ONE
+    # position shifts the list numbering; the law must still be found
+    # when pairs carry their stream position.
+    import random
+    from hagi.invention_multi import invent_multi
+    r = random.Random(0)
+    raw = r.randbytes(9000 + K)
+    data = bytearray(raw)
+    for i in range(K, len(data)):
+        if (i - K) % 3 == 0:
+            data[i] = (data[i - 3] + 2 * data[i - 2] - data[i - 1] + 7) & 255
+    pairs = [((data[i], data[i + 1], data[i + 2]), data[i + 3], i)
+             for i in range(0, 6000) if i % 97 != 0]          # an irregular subsample
+    with_pos = invent_multi(pairs, random.Random(7))
+    assert with_pos["status"] == "PARTIAL_LAW" and with_pos["n_shifts"] == 3
+    # same pairs WITHOUT positions: numbering is off, the law is lost
+    # (this documents why the pipeline must pass them)
+    assert invent_multi([(c, y) for c, y, _ in pairs], random.Random(7))["status"] == "NO_LAW"
+
+
+def test_invent_multi_without_positions_keeps_the_old_contract():
+    import random
+    from hagi.invention_multi import invent_multi
+    pairs = _stream(4, lambda a, b, c: a + 2 * b - c + 7, n=6000)
+    r = invent_multi([(tuple(x), y) for x, y in pairs], random.Random(0))
+    assert r["status"] == "PARTIAL_LAW" and r["n_shifts"] == 4

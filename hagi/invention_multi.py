@@ -201,14 +201,22 @@ def invent_multi(pairs, rng: "random.Random | None" = None,
     if not pairs:
         return None
     k = len(pairs[0][0])
-    if any(len(x) != k for x, _ in pairs):
+    if any(len(x) != k for pr in pairs for x in (pr[0],)):
         return None
     if max_period is None:
         max_period = int(n_shifts)
     GEN_BASES = [(n, f) for n, f in BASES if n in ("POLY_LIN", "OUT_PERIOD")]
-    X = np.asarray([x for x, _ in pairs], dtype=np.int64)
-    y = np.asarray([yy for _, yy in pairs], dtype=np.int64)
+    X = np.asarray([pr[0] for pr in pairs], dtype=np.int64)
+    y = np.asarray([pr[1] for pr in pairs], dtype=np.int64)
     n = len(pairs)
+    # WAVE 250: strata are defined by the position IN THE STREAM. A pair
+    # may carry it as a third element (ctx, y, pos); otherwise the list
+    # index is used (only correct for a contiguous, unsampled stream).
+    # The pipeline hands invent_multi the model's MISSES: one skipped
+    # position shifts the numbering and the law is lost — measured, a
+    # period-3 law: NO_LAW on the miss list, PARTIAL_LAW on the stream.
+    pos = np.asarray([int(pr[2]) for pr in pairs if len(pr) > 2],
+                     dtype=np.int64) if all(len(pr) > 2 for pr in pairs) else np.arange(n)
     periods = [P for P in range(1, max(1, max_period) + 1)
                if n // P >= 80]
     attempts = 0
@@ -227,7 +235,7 @@ def invent_multi(pairs, rng: "random.Random | None" = None,
         rep[c[::-1]] = np.arange(n)[::-1]
         for P in periods:
             for shift in range(P):
-                idx = np.nonzero(np.arange(n) % P == shift)[0]
+                idx = np.nonzero(pos % P == shift)[0]
                 if len(idx) < 80:
                     continue
                 rows, support = _majVotes(c, y, idx)
@@ -260,7 +268,7 @@ def invent_multi(pairs, rng: "random.Random | None" = None,
                     for other in range(P):
                         if other == shift:
                             continue
-                        idx2 = np.nonzero(np.arange(n) % P == other)[0]
+                        idx2 = np.nonzero(pos % P == other)[0]
                         rows2, sup2 = _majVotes(c, y, idx2)
                         if sup2 < min_support:
                             continue

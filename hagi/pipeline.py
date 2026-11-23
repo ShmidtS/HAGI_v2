@@ -161,6 +161,7 @@ def lm_residual_relation(u, source: str, data: bytes
     # the arithmetic step (n//512) destroys the record-alignment
     # periodicity the shift-stratified verifier relies on. Second
     # sequential pass, bounded at 2000 misses.
+    multi_pos: list[int] = []
     step2 = 1
     count2 = 0
     for i in range(0, n, step2):
@@ -178,6 +179,7 @@ def lm_residual_relation(u, source: str, data: bytes
             multi_ctx.append(tuple(int(b) for b in ctx[-4:]))
             multi_full_ctx.append(tuple(int(b) for b in ctx))
             multi_y.append(nxt)
+            multi_pos.append(i)            # WAVE 250: real stream position
             count2 += 1
     return misses_x, misses_y, multi_ctx, multi_y, multi_full_ctx
 
@@ -198,7 +200,7 @@ def ingest_symbolic(u, source: str, data: bytes,
         try:
             from hagi.invention_multi import invent_multi
             from hagi.invention import verify_blueprint
-            mr = invent_multi(list(zip(multi_ctx, multi_y)),
+            mr = invent_multi(list(zip(multi_ctx, multi_y, multi_pos)),
                               random.Random(7), max_attempts=8000)
             if mr and mr.get("status") != "INVENTED":
                 res.notes.append(f"multi-byte: {mr['status']} "
