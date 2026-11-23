@@ -1171,7 +1171,10 @@ class RopeAttentionByteLM:
         is the actual number of terms."""
         t = self.t
         pb = prompt.encode('utf-8')
-        windows = self._read_all_windows(pb, max_span=64)
+        # WAVE 242 (CoverageReading C598): window width must MATCH
+        # train semantics (self.k=96) — was hardcoded 64 (the
+        # CertifiedStepLM value); no truncation of head windows.
+        windows = self._read_all_windows(pb, max_span=self.k)
         with t.no_grad():
             g = t.Generator(device=self.device).manual_seed(seed)
             out = bytearray()
