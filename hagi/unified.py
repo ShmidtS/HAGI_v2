@@ -396,7 +396,13 @@ class Unified:
                        "coefs": e["bp"].q_param[0],
                        "bias": e["bp"].q_param[1],
                        "basis": e["bp"].basis,
-                       "payload": e["bp"].payload}
+                       "payload": e["bp"].payload,
+                       "accepted_to_registry": e.get(
+                           "accepted_to_registry", True),
+                       "commit_id": e.get("commit_id"),
+                       "shift": e.get("shift"),
+                       "n_shifts": e.get("n_shifts"),
+                       "evidence": e.get("evidence", [])}
                       for e in v]
                 for dom, v in reg.items()}
         UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +457,13 @@ class Unified:
                     entries.append({"feature": e["feature"],
                                     "bp": bp,
                                     "verify": e["verify"],
-                                    "support": e.get("support")})
+                                    "support": e.get("support"),
+                                    "accepted_to_registry": e.get(
+                                        "accepted_to_registry", True),
+                                    "commit_id": e.get("commit_id"),
+                                    "shift": e.get("shift"),
+                                    "n_shifts": e.get("n_shifts"),
+                                    "evidence": e.get("evidence", [])})
                 if entries:
                     u.law_registry[dom] = entries
         with _t.no_grad():

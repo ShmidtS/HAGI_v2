@@ -101,6 +101,14 @@ def main() -> None:
                                replay_cap=None)
         else:
             r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)
+            # WAVE 241: re-check accepted laws even without symbolic
+            # invention on this chunk.
+            try:
+                from hagi.law_critique import run_law_self_critique
+                r["self_critique"] = run_law_self_critique(u)
+            except Exception as _ce:
+                print("    [self-critique] skipped: " + repr(_ce),
+                      flush=True)
         st["chunks"] += 1
         ce = r.get("holdout_ce", -1)
         # WAVE 238 (user directive): LIVE CHAT during training.

@@ -238,6 +238,7 @@ def invent_multi(
                 return {"status": "PARTIAL_LAW",
                         "blueprints": [best],
                         "feature": fname, "shift": shift,
+                        "n_shifts": n_shifts,
                         "support": round(support, 3),
                         "attempts": attempts}
     return {"status": "NO_LAW", "attempts": attempts}

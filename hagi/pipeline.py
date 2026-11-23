@@ -19,6 +19,7 @@ the LM holdout is already trivially good.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from dataclasses import dataclass, field
@@ -116,7 +117,9 @@ def symbolic_phase(source: str, xs: list[int], ys: list[int],
 
 
 def lm_residual_relation(u, source: str, data: bytes
-                         ) -> tuple[list[int], list[int]]:
+                         ) -> tuple[list[int], list[int],
+                                    list[tuple[int, ...]], list[int],
+                                    list[tuple[int, ...]]]:
     """WAVE 196 FIX (P1): the symbolic phase previously used ADJACENT
     byte pairs (x_i -> x_{i+1}) — a law of the data, NOT of the LM.
     Now: sample real LM errors — contexts where the model's argmax
@@ -134,6 +137,9 @@ def lm_residual_relation(u, source: str, data: bytes
     misses_y: list[int] = []
     multi_ctx: list[tuple[int, ...]] = []
     multi_y: list[int] = []
+    # WAVE 241: полный хронологический контекст отдельно от
+    # 4-байтовой фичи для evidence self-critique.
+    multi_full_ctx: list[tuple[int, ...]] = []
     step = max(1, n // 512)          # sample, bounded work
     with _t.no_grad():
         for i in range(0, n, step):
@@ -170,9 +176,10 @@ def lm_residual_relation(u, source: str, data: bytes
             continue
         if pred != nxt:
             multi_ctx.append(tuple(int(b) for b in ctx[-4:]))
+            multi_full_ctx.append(tuple(int(b) for b in ctx))
             multi_y.append(nxt)
             count2 += 1
-    return misses_x, misses_y, multi_ctx, multi_y
+    return misses_x, misses_y, multi_ctx, multi_y, multi_full_ctx
 
 
 def ingest_symbolic(u, source: str, data: bytes,
@@ -182,7 +189,7 @@ def ingest_symbolic(u, source: str, data: bytes,
     holdout_ce = u.domains.get(source, {}).get("ce")
     res = PipelineResult(source=source,
                          holdout_ce=holdout_ce if holdout_ce is not None else -1.0)
-    xs, ys, multi_ctx, multi_y = lm_residual_relation(u, source, data)
+    xs, ys, multi_ctx, multi_y, multi_full_ctx =         lm_residual_relation(u, source, data)
     # WAVE 236: multi-byte law channel first (richer laws); if it
     # yields a verified law, REGISTER it for PREDICTION on unseen
     # next bytes (user directive), then fall through to the classic
@@ -215,16 +222,56 @@ def ingest_symbolic(u, source: str, data: bytes,
                 registry = getattr(u, "law_registry", None)
                 if registry is None:
                     registry = u.law_registry = {}
-                registry.setdefault(source, []).append({
-                    "feature": mr.get("feature"),
-                    "bp": bp,
-                    "verify": v["status"],
-                    "support": v.get("support"),
-                    "coverage": len(multi_ctx),
-                })
+                # WAVE 241: полный контекст отдельно от фичи;
+                # evidence — только страта-подтверждённые примеры.
+                shift = int(mr.get("shift", 0))
+                n_shifts = int(mr.get("n_shifts", 6))
+                import numpy as _np_e
+                evidence = []
+                for i, (f_ctx, full_ctx, target) in enumerate(
+                        zip(multi_ctx, multi_full_ctx, multi_y)):
+                    if i % n_shifts != shift:
+                        continue
+                    try:
+                        if int(bp.apply(f_ctx)) != int(target):
+                            continue
+                    except Exception:
+                        continue
+                    evidence.append({
+                        "context": list(full_ctx),
+                        "feature_context": list(f_ctx),
+                        "target": int(target),
+                        "source_index": i,
+                    })
+                if len(evidence) > 256:
+                    take = _np_e.linspace(0, len(evidence) - 1, 256,
+                                          dtype=int)
+                    evidence = [evidence[int(i)] for i in take]
+                bp_meta = (bp.to_dict() if hasattr(bp, "to_dict")
+                           else repr(bp))
+                commit_material = repr((source, mr.get("feature"),
+                                        v["status"], bp_meta))
+                commit_id = hashlib.sha256(
+                    commit_material.encode("utf-8")).hexdigest()[:20]
+                entries = registry.setdefault(source, [])
+                if not any(e.get("commit_id") == commit_id
+                           for e in entries):
+                    entries.append({
+                        "feature": mr.get("feature"),
+                        "bp": bp,
+                        "verify": v["status"],
+                        "support": v.get("support"),
+                        "coverage": len(multi_ctx),
+                        "accepted_to_registry": True,
+                        "commit_id": commit_id,
+                        "shift": shift,
+                        "n_shifts": n_shifts,
+                        "evidence": evidence,
+                    })
                 res.notes.append(
                     f"multi-byte law {mr.get('feature')} "
-                    f"-> {v['status']} (registered for prediction)")
+                    f"-> {v['status']} (registry commit {commit_id}; "
+                    f"self-critique evidence={len(evidence)})")
         except Exception as _e:
             res.notes.append(f"multi-byte skipped: {_e!r}")
     if not xs:
@@ -251,10 +298,24 @@ def unified_ingest(u, source: str, data: bytes, epochs: int = 200,
     if os.environ.get("HAGI_SYMBOLIC", "0") != "1":
         r["symbolic"] = None
         return r
+    registry_before = sum(len(v) for v in
+                          (getattr(u, "law_registry", {}) or {}).values())
     sym = ingest_symbolic(u, source, data, gap_buffer=gap_buffer)
     r["symbolic"] = {"hold_reason": sym.hold_reason.name if sym.hold_reason else None,
                      "invented": sym.invented,
                      "exact_points": sym.exact_points,
                      "reified_op": sym.reified_op,
                      "notes": sym.notes}
+    # WAVE 241: persist only when a new law was appended; save the
+    # fresh registry so restarts keep it, then run auto-critique.
+    registry_after = sum(len(v) for v in
+                         (getattr(u, "law_registry", {}) or {}).values())
+    try:
+        if registry_after != registry_before:
+            u.save()
+        from hagi.law_critique import run_law_self_critique
+        r["self_critique"] = run_law_self_critique(u)
+    except Exception as _critique_error:
+        r["self_critique"] = {"status": "ERROR",
+                              "error": repr(_critique_error)}
     return r
