@@ -658,7 +658,7 @@ class RopeAttentionByteLM:
             self.logits(ctx), nxt, reduction="mean")
 
     def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 3e-3,
-                      holdout: float = 0.1, batch: int = 256,
+                      holdout: float = 0.1, batch: int = 32,
                       max_train_ctx: int = 96, log_every: int = 0,
                       holdout_seed: int | None = None) -> dict:
         """WAVE 231 (integrated from HAGI_v2_local_repro):
@@ -672,6 +672,14 @@ class RopeAttentionByteLM:
         idx_np = np.frombuffer(data, dtype=np.uint8)
         n = len(idx_np) - 2
         dev = self.device
+        # WAVE 245 (measured, CPU+GPU, 2 seeds): equal data, 2 epochs.
+        # batch  CE(CPU)  CE(GPU)   s(GPU)
+        #   16    1.99     1.99     10.6
+        #   32    2.11     2.11      5.0   <- Pareto: -0.42 CE vs 256
+        #   64    2.27     2.28      3.4      for +3.5 s/chunk
+        #  256    2.53     2.53      1.5
+        # Smaller batch = more steps = more descent per byte read
+        # (Step/BatchBudget: throughput optimum != quality optimum).
         # GPU-resident buffer: windows are gathered on-device.
         raw = t.as_tensor(idx_np.copy(), dtype=t.long, device=dev)
         offs = t.arange(max_train_ctx, dtype=t.long, device=dev)
@@ -893,7 +901,7 @@ class RopeAttentionByteLM:
     k = 96  # interface compat with Unified (model.k consumers)
 
     def train_certified(self, data: bytes, epochs: int = 60,
-                        holdout: float = 0.1, batch: int = 256,
+                        holdout: float = 0.1, batch: int = 32,
                         log_every: int = 0,
                         holdout_seed: int | None = None) -> dict:
         """Unified-compatible training: delegates to train_guarded."""
