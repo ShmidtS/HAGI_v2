@@ -1078,14 +1078,6 @@ class RopeAttentionByteLM:
             "utf-8", errors="replace")
 
 
-def save_rope(lm, path) -> None:
-    t = lm.t
-    t.save({n: getattr(lm, n).detach().cpu() for n in
-            ("emb", "q", "W1", "b1", "W2", "b2")} |
-           {"kind": "rope_attention", "dim": lm.dim, "hidden": lm.hidden,
-            "theta0": lm.theta0, "lam": lm.lam}, path)
-
-
 def load_rope(path):
     t, _ = _torch_and_device()
     st = t.load(path, weights_only=False)

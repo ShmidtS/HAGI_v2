@@ -40,12 +40,6 @@ ALL_MASKS = dict(MASKS)
 NAME_OF = {v: k for k, v in MASKS.items()}
 
 
-def eval_mask(mask: int, a: bool, b: bool) -> bool:
-    idx = 0 if (a and b) else (1 if (a and not b) else
-                               (2 if ((not a) and b) else 3))
-    return bool((mask >> (3 - idx)) & 1)
-
-
 
 
 

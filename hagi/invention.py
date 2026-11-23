@@ -183,8 +183,6 @@ def basis_poly_lin(core_pairs: list[tuple[int, int]]) -> dict | None:
     return None
 
 
-def _payload_bits_out_period(payload: dict, core_size: int) -> int:
-    return 4 + 4  # p, o nibbles
 
 
 BASES: list[tuple[str, Callable]] = [
@@ -258,8 +256,6 @@ def _cost_bits(n: int) -> int:
     return 2 * n.bit_length()
 
 
-def meta_cost(bp: ConstructBlueprint) -> int:
-    return bp.meta_bits
 
 
 def _payload_bits(basis_name: str, payload: dict, core_size: int) -> int:
@@ -777,44 +773,6 @@ def _digit_sum10(x: int) -> int:
         x //= 10
     return s
 STEP_PRIMITIVES: dict[str, tuple[Callable[[int], int], str, int]] = {'popcount': (lambda s: int(s).bit_count(), 'int(s).bit_count()', 8), 'digit_sum10': (_digit_sum10, 'sum(int(c) for c in str(abs(int(s))))', 12), 'halve': (lambda s: int(s) // 2, 's // 2', 8), 'drop_lsb': (lambda s: int(s) & int(s) - 1, 's & (s - 1)', 12), 'even_halve_odd_inc1': (lambda s: s // 2 if s % 2 == 0 else s + 1, '(s // 2) if (s & 1) == 0 else (s + 1)', 16), 'even_halve_odd_3x1': (lambda s: s // 2 if s % 2 == 0 else 3 * s + 1, '(s // 2) if (s & 1) == 0 else (3 * s + 1)', 20)}
-@dataclass(frozen=True)
-class WhileLoopBlueprint:
-    step_name: str
-    mode: str
-
-    @property
-    def meta_bits(self) -> int:
-        return 2 * 8 + STEP_PRIMITIVES[self.step_name][2]
-@dataclass
-class WhileLoopArtifact:
-    step_name: str
-    stop_le: int
-    mode: str
-    domain: frozenset
-    bits_val: int
-    max_iters: int = 256
-
-    def supports(self, x: int) -> bool:
-        return int(x) in self.domain
-
-    def eval(self, x: int) -> int:
-        x = int(x)
-        if x not in self.domain:
-            raise ValueError('outside certified domain')
-        s = x
-        fn = STEP_PRIMITIVES[self.step_name][0]
-        steps = 0
-        while s > self.stop_le:
-            s = fn(s)
-            steps += 1
-            if steps > self.max_iters:
-                raise ValueError('loop exceeded certified iteration cap')
-        return steps if self.mode == 'steps' else s
-
-    def emit_python(self, fn_name: str) -> str:
-        py = STEP_PRIMITIVES[self.step_name][1]
-        ret = 'steps' if self.mode == 'steps' else 's'
-        return '\n'.join([f'def {fn_name}(x0: int) -> int:', f'    _DOM = {sorted(self.domain)!r}', "    if int(x0) not in _DOM: raise ValueError('outside domain')", '    s = int(x0)', '    steps = 0', f'    while s > {self.stop_le}:', f'        s = {py}', '        steps += 1', f'    return {ret}'])
 
 # ============================================================
 # REPRESENTATION DISCOVERY LOOP (RDL: parametric families)

@@ -2434,12 +2434,6 @@ def stutter_norm(seq: Sequence[Any]) -> list[Any]:
     return out
 
 
-def adjacent_pairs(xs: Sequence[Any]) -> list[tuple[Any, Any]]:
-    if not xs:
-        return []
-    return [(xs[0], xs[0])] + list(zip(xs, xs[1:]))
-
-
 def boundary_chunks(
     boundary: Callable[[Any], bool], xs: Sequence[Any]
 ) -> list[list[Any]]:
@@ -2452,13 +2446,6 @@ def boundary_chunks(
         else:
             chunks[-1].append(tok)
     return chunks
-
-
-def capped_boundary_chunks(
-    capacity: int, boundary: Callable[[Any], bool], xs: Sequence[Any]
-) -> Optional[list[list[Any]]]:
-    ch = boundary_chunks(boundary, xs)
-    return ch if len(ch) <= capacity else None
 
 
 def boundary_heads(boundary: Callable[[Any], bool], xs: Sequence[Any]) -> list[Any]:
