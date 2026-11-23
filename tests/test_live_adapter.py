@@ -64,3 +64,34 @@ def test_scope_restores_state_on_exception(tmp_path, monkeypatch):
         with u._DomainScope(u, "d"):
             raise RuntimeError("boom")
     assert u.model.domain_adapter is None
+
+
+# ---- WAVE 255: function-preserving trunk growth -------------------------------
+def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatch):
+    import torch as t
+    from hagi import unified as U
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    u = U.Unified()
+    u.domains["d"] = {}
+    data = bytes(range(256)) * 30
+    u._domain_bytes = lambda s, e: data
+    u.model.train_guarded(data, epochs=2)
+    g = t.Generator().manual_seed(0)
+    X = t.randint(0, 256, (16, u.model.k), generator=g)
+    with t.no_grad():
+        l0 = u.model.logits(X).clone()
+    assert u.model.grow() == 1
+    with t.no_grad():
+        assert float((u.model.logits(X) - l0).abs().max()) == 0.0     # exact identity
+    r = u._maybe_grow("d", data)
+    assert r["status"] in ("GROW", "ROLLBACK", "HOLD")
+    if r["status"] == "GROW":
+        assert r["ce_after"] <= r["ce_before"] and len(u.model.blocks) == 2
+    if r["status"] == "ROLLBACK":
+        assert len(u.model.blocks) == 1                               # exact rollback
+    # persistence round-trip keeps the blocks
+    u.save(); v = U.Unified.load()
+    assert len(v.model.blocks) == len(u.model.blocks)
+    if u.model.blocks:
+        for a, b in zip(u.model.blocks, v.model.blocks):
+            assert float((a["Wo"] - b["Wo"]).abs().max()) < 1e-6

@@ -163,6 +163,9 @@ class Unified:
         # training (certified step path)
         t0 = time.perf_counter()
         import torch as _t
+        # WAVE 255: capacity growth BEFORE the incumbent snapshot, so the
+        # grown block is part of both sides of the paired gate.
+        growth = self._maybe_grow(source, data)
         incumbent_state = [q.detach().clone()
                            for q in self.model.params()]
         # WAVE 241 FIX (P0 anti-forgetting gate): incumbent CE must
@@ -261,6 +264,8 @@ class Unified:
         entry["old_ce"] = old_ce
         entry["regression"] = bool(regression)
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if growth.get("status") == "GROW":
+            entry["growth"] = growth
         self.save()
         return {
             "source": source,
@@ -270,6 +275,7 @@ class Unified:
             "replay_bytes": len(combined),
             "holdout_ce": ce,
             "old_ce": entry.get("old_ce"),
+            "growth": growth,
             "regression": entry.get("regression", False),
             "seconds": round(time.perf_counter() - t0, 1),
         }
@@ -359,6 +365,79 @@ class Unified:
         else:
             bank._adapters[source] = base
         return report
+
+    # WAVE 255 (FunctionPreservingGrowth.lean, GrowthGate): the trunk
+    # was capacity-limited — chunk CE crept 2.4 -> 4.9 over 500 chunks
+    # and CE on OLD domains 2.5 -> 4.8 while the GrowthGate signal
+    # n*G^2/(2L) was 427..1788 (huge gradient at a near-uniform CE).
+    # Measured A/B from the SAME checkpoint, 6 real chunks through
+    # ingest: 0 blocks forget +0.498, 1 block +0.123 (4x less) AND
+    # learns the new chunks better (-0.122 vs -0.054 CE).
+    # A fresh block is an exact identity (Wo = 0). It is warmed up
+    # with the trunk FROZEN on the fresh domain (so the rollback-by-
+    # selection of train_guarded cannot discard it: at epochs=2 that
+    # rollback silently zeroed the block — measured) and kept only if
+    # the holdout CE does not get worse.
+    MAX_BLOCKS = 2
+
+    def _maybe_grow(self, source: str, data: bytes) -> dict:
+        import torch as _t
+        import numpy as _np
+        m = self.model
+        if len(getattr(m, "blocks", [])) >= self.MAX_BLOCKS or len(data) < m.k + 4096:
+            return {"status": "SKIP"}
+        idx = _np.frombuffer(data, dtype=_np.uint8).astype(_np.int64)
+        n = len(idx) - m.k - 1
+        # GrowthGate signal on a probe batch of the fresh domain
+        pos = _np.random.default_rng(11).integers(m.k, n, 128)
+        X, y = self._windows(source, pos) if source in self.domains else (None, None)
+        if X is None:
+            raw = _t.as_tensor(idx, dtype=_t.long, device=m.device)
+            p = _t.as_tensor(pos, dtype=_t.long, device=m.device)
+            X = raw[p[:, None] + _t.arange(m.k, device=m.device)[None, :]]
+            y = raw[p + m.k]
+        params = [q for q in m.params() if q is not getattr(m, "q", None)]
+        loss = _t.nn.functional.cross_entropy(m.logits(X), y)
+        g = _t.autograd.grad(loss, params, allow_unused=True)
+        G2 = float(sum((gi ** 2).sum() for gi in g if gi is not None))
+        L = float(loss)
+        c_add = (m.dim * m.hidden + m.hidden * m.hidden) / max(1, sum(q.numel() for q in params)) * 10.0
+        signal = 128 * G2 / (2 * max(L, 1e-6))
+        if signal <= c_add:
+            return {"status": "HOLD", "signal": round(signal, 1), "c_add": round(c_add, 1)}
+        n_before = len(m.blocks)
+        m.grow(seed=n_before + 1)
+        blk = m.blocks[-1]
+        cut = int(n * 0.9)
+        raw = _t.as_tensor(idx, dtype=_t.long, device=m.device)
+        k = m.k
+        rng = _np.random.default_rng(7)
+        def batch(p):
+            pt = _t.as_tensor(p, dtype=_t.long, device=m.device)
+            return raw[pt[:, None] + _t.arange(k, device=m.device)[None, :]], raw[pt + k]
+        Xv, yv = batch(_np.arange(cut, n)[:512])
+        def hold_ce():
+            with _t.no_grad():
+                return float(_t.nn.functional.cross_entropy(m.logits(Xv), yv))
+        before = hold_ce()
+        opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=3e-3)   # trunk frozen
+        tr = _np.arange(m.k, cut)
+        for _ in range(2):
+            for s in range(0, len(tr), 64):
+                sel = rng.choice(tr, min(64, len(tr)), replace=False)
+                Xb, yb = batch(sel)
+                opt.zero_grad()
+                _t.nn.functional.cross_entropy(m.logits(Xb), yb).backward()
+                opt.step()
+                if s >= 64 * 300:
+                    break                      # bounded warm-up (~300 steps/epoch)
+        after = hold_ce()
+        if after > before:
+            m.blocks.pop()                    # not earned -> exact rollback
+            return {"status": "ROLLBACK", "ce_before": before, "ce_after": after}
+        return {"status": "GROW", "blocks": len(m.blocks), "signal": round(signal, 1),
+                "ce_before": round(before, 4), "ce_after": round(after, 4),
+                "params": sum(q.numel() for q in m.params())}
 
     def _live_adapter(self, domain: str | None):
         """WAVE 249: adapter of `domain` for inference, or None.
@@ -518,6 +597,10 @@ class Unified:
         if hasattr(self.model, "q"):
             names.append("q")
         st = {n: getattr(self.model, n).detach().cpu() for n in names}
+        # WAVE 255: function-preserving attention blocks
+        st["blocks"] = [
+            {k: v.detach().cpu() for k, v in blk.items()}
+            for blk in getattr(self.model, "blocks", [])]
         st.update(
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
         )
@@ -620,6 +703,13 @@ class Unified:
             for n in ("emb", "W1", "b1", "W2", "b2", "q"):
                 if hasattr(u.model, n) and n in st:
                     getattr(u.model, n).copy_(st[n])
+        # WAVE 255: restore grown blocks (Wo = 0 blocks are identity)
+        for blk in st.get("blocks", []):
+            u.model.grow()
+            live = u.model.blocks[-1]
+            with _t.no_grad():
+                for k in live:
+                    live[k].copy_(blk[k].to(live[k].device))
         u.domains = (
             json.loads(LEDGER.read_text(encoding="utf-8")) if LEDGER.exists() else {}
         )

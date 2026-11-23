@@ -562,13 +562,43 @@ class RopeAttentionByteLM:
         self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)
         self.b2 = t.nn.Parameter(t.zeros(256))
         self._ef21_s: float | None = None  # fixed-scale PIN (frozen on step 1)
+        # WAVE 255 (FunctionPreservingGrowth.lean): optional extra
+        # attention blocks. Block b adds Wo[b] * relu(a @ W1[b] + b1[b])
+        # to the hidden state, a = attention aggregate. A fresh block has
+        # Wo = 0 -> the function is preserved EXACTLY (lmLogits_grow_identity).
+        self.blocks: list[dict] = []
         self.device = _resolve_device(t, self.dim, self.hidden)
         if self.device == "cuda":
             for prm in self.params():
                 prm.data = prm.data.to(self.device)
 
     def params(self):
-        return [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
+        out = [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
+        for blk in getattr(self, "blocks", []):
+            out += [blk["W1"], blk["b1"], blk["Wo"]]
+        return out
+
+    def _block_add(self, a, h):
+        """Extra attention blocks: h += Wo * relu(a @ W1 + b1). Identity
+        while Wo == 0 (step 0 of FunctionPreservingGrowth)."""
+        t = self.t
+        for blk in getattr(self, "blocks", []):
+            h = h + t.relu(a @ blk["W1"] + blk["b1"]) @ blk["Wo"]
+        return h
+
+    def grow(self, seed: int = 0) -> int:
+        """Append ONE function-preserving attention block (Wo = 0).
+        Logits are unchanged exactly; capacity is learned afterwards."""
+        t = self.t
+        g = t.Generator().manual_seed(seed + 1000 * (len(self.blocks) + 1))
+        blk = {"W1": t.nn.Parameter(t.randn(self.dim, self.hidden, generator=g) * 0.08),
+               "b1": t.nn.Parameter(t.zeros(self.hidden)),
+               "Wo": t.nn.Parameter(t.zeros(self.hidden, self.hidden))}
+        self.blocks.append(blk)
+        if self.device == "cuda":
+            for prm in blk.values():
+                prm.data = prm.data.to(self.device)
+        return len(self.blocks)
 
     def _rope(self, e, L, device):
         """C308 isometry: rotate each positional slot by theta_i = i*theta0
@@ -610,7 +640,8 @@ class RopeAttentionByteLM:
         mask = t.arange(ctx.shape[1], device=ctx.device)[None, :]             <= ctx.shape[1] - 1  # all keys are causal past of query
         scores = scores.masked_fill(~mask, float("-inf"))
         pp = t.softmax(scores, dim=-1)
-        h = t.relu(t.einsum("bl,bld->bd", pp, e) @ self.W1 + self.b1)
+        a_agg = t.einsum("bl,bld->bd", pp, e)
+        h = self._block_add(a_agg, t.relu(a_agg @ self.W1 + self.b1))
         ad = getattr(self, "domain_adapter", None)
         if ad is not None:
             At = t.as_tensor(ad.A, device=h.device, dtype=h.dtype)
@@ -640,11 +671,10 @@ class RopeAttentionByteLM:
         # queries, leaking future tokens into earlier positions'
         # denominators.
         pp = t.softmax(sc, dim=-1)
-        h = t.relu(t.einsum("blj,bjd->bld", pp, e) @ self.W1 + self.b1)
-        # WAVE 230: per-domain low-rank adapter (AdapterBank, C532):
-        # h + B(A h); B=0 is EXACT identity (fresh adapter never
-        # changes logits) — same contract as CertifiedStepLM.
+        a_agg = t.einsum("blj,bjd->bld", pp, e)
+        h = self._block_add(a_agg, t.relu(a_agg @ self.W1 + self.b1))
         ad = getattr(self, "domain_adapter", None)
+
         if ad is not None:
             At = t.as_tensor(ad.A, device=h.device, dtype=h.dtype)
             Bt = t.as_tensor(ad.B, device=h.device, dtype=h.dtype)
@@ -738,6 +768,9 @@ class RopeAttentionByteLM:
         # checkpoints for backward compat only).
         live_params = [self.emb, self.W1, self.b1, self.W2,
                        self.b2]
+        # WAVE 255: extra blocks train with the trunk (q stays excluded)
+        for blk in getattr(self, "blocks", []):
+            live_params += [blk["W1"], blk["b1"], blk["Wo"]]
         opt = t.optim.Adam(live_params, lr=lr)
         best = eval_ce(hold)
         best_state = [p.detach().clone() for p in self.params()]

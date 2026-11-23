@@ -210,6 +210,10 @@ def main() -> None:
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "
               f"({files_now} files) → CE {ce} "
               f"({r.get('seconds', '?')}s)", flush=True)
+        gr = r.get("growth") or {}
+        if gr.get("status") in ("GROW", "ROLLBACK"):
+            print(f"    growth: {gr.get('status')} blocks={gr.get('blocks')} "
+                  f"signal={gr.get('signal')} CE {gr.get('ce_before')}->{gr.get('ce_after')}", flush=True)
         chunk, chunk_bytes, files_now = [], 0, 0
         # ---- 2+3. DERIVE + WEAVE: fabric self-assembly ----
         model = u.model
