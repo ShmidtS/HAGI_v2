@@ -29,6 +29,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import math
 import json
 from pathlib import Path
 from typing import Any
@@ -1272,9 +1273,27 @@ class CertifiedStepLM:
         soft = t.softmax(logits, dim=1)
         mean_disp = (soft * disp).sum(dim=1, keepdim=True)
         var_disp = (soft * (disp - mean_disp) ** 2).sum(dim=1)
-        C = float(var_disp.mean())
         per_sample_range = disp.max(dim=1).values - disp.min(dim=1).values
-        Rp_sq = float((per_sample_range ** 2).mean())
+        # WAVE 252 (Lean ceAdaptiveCurvTight): C = kappa(R) * Var with
+        # kappa(R) = (e^R - 1 - R)/R^2 >= 1/2 (kappa_ge_half), R = max
+        # per-sample logit range. The code used C = Var alone: too
+        # small, hence a too-small step and a drop claim 1.46-1.79x
+        # BELOW the realised one (180 steps, 0 violations) — valid but
+        # weaker than the theorem.
+        R = float(per_sample_range.max())
+        # kappa(R) -> 1/2 as R -> 0, but the expression loses all
+        # precision below R ~ 1e-6: measured kappa(1e-7) = 0.494,
+        # kappa(1e-8) = -0.608 (NEGATIVE curvature -> ascent step),
+        # kappa(1e-9) = 82.7. Below 1e-5 use the limit 1/2 (kappa_ge_half).
+        R_c = min(R, 50.0)
+        C = float(var_disp.mean()) * (
+            (math.exp(R_c) - 1.0 - R_c) / (R_c * R_c) if R > 1e-5 else 0.5)
+        # The range-bound certificate (Hoeffding, singleSampleStep) is
+        # stated with the MAXIMAL per-sample range R, not its mean
+        # square: with R'^2 = mean(range^2) the step 4A/R'^2 overshoots
+        # and the drop claim was violated by ~5e-4 on 7/12 steps
+        # (WAVE 252 measurement). Use R^2 = (max range)^2.
+        Rp_sq = R * R
         if C <= 0 or A <= 0 or Rp_sq <= 0:
             return 0.0
         # adaptive η* = A/(2C) (theorem) with the unit cap; when the cap
@@ -1284,13 +1303,35 @@ class CertifiedStepLM:
         use_adaptive = A / (2.0 * C) <= 1.0
         eta = (A / (2.0 * C)) if use_adaptive else (4.0 * A / Rp_sq)
         eta *= lr_scale
-        drop = (A * A / (4.0 * C)) if use_adaptive else (2.0 * A * A / Rp_sq)
+        # WAVE 252 (bug): the drop was claimed for the UNSCALED eta*
+        # while `eta` was multiplied by lr_scale. The majorizer is
+        # L(eta) <= L(0) - A*eta + C_curv*eta^2 with the curvature of the
+        # branch used, so the certified drop must be evaluated at the
+        # eta ACTUALLY taken: at lr_scale = 0.05 the old claim was
+        # ~10x the realised drop (40/40 steps violated it). At
+        # lr_scale = 1 both expressions reduce to the theorem's.
+        drop = (A * eta - C * eta * eta) if use_adaptive else (
+            A * eta - (Rp_sq / 8.0) * eta * eta)
+        snapshot = [q.detach().clone() for q in self.params()]
         with t.no_grad():
             off = 0
             for prm, gi in zip(self.params(), g):
                 sz = prm.numel()
                 prm.add_(eta * D[off:off + sz].reshape(prm.shape))
                 off += sz
+        # The majorizer is built on the JVP (tangent) displacement; the
+        # theorem is about the exact one. Measured: 6/40 steps still
+        # overclaimed by up to 1.9e-3. Same contract as the production
+        # Rope step (_certified_finite_step): verify the realised drop
+        # on the actual batch CE; below the claim -> roll back, HOLD.
+        with t.no_grad():
+            realised = float(loss.detach()) - float(
+                t.nn.functional.cross_entropy(self.logits(ctx), nxt))
+        if realised < drop:
+            with t.no_grad():
+                for q, old_q in zip(self.params(), snapshot):
+                    q.copy_(old_q)
+            return 0.0
         return drop
 
     # ---- C474: EF21 in-step quantized training -----------------------

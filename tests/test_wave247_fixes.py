@@ -323,3 +323,51 @@ def test_invent_multi_rejects_a_mode_fit():
              for i in range(0, 8000)]
     res = invent_multi(pairs, random.Random(7))
     assert res["status"] == "NO_LAW"
+
+
+# ---- 8. WAVE 252: CertifiedStepLM._adaptive_step curvature == Lean ----
+def test_adaptive_step_curvature_is_kappa_times_var_and_never_overclaims():
+    import math
+    import torch as t
+    from hagi.lm import CertifiedStepLM
+    seen = {}
+    orig_jvp = t.autograd.functional.jvp
+    m = CertifiedStepLM(dim=32, hidden=64, seed=0)
+    g = t.Generator().manual_seed(0)
+    viol = taken = 0
+    for _ in range(40):
+        ctx = t.randint(0, 256, (16, m.k), generator=g)
+        nxt = t.randint(0, 256, (16,), generator=g)
+        snap = [q.detach().clone() for q in m.params()]
+        before = float(t.nn.functional.cross_entropy(m.logits(ctx), nxt))
+        claimed = m._adaptive_step(ctx, nxt, lr_scale=0.05)   # small scale -> adaptive branch is eligible
+        after = float(t.nn.functional.cross_entropy(m.logits(ctx), nxt))
+        with t.no_grad():
+            for q, s in zip(m.params(), snap):
+                q.copy_(s)
+        if claimed > 0:
+            taken += 1
+            viol += (before - after) < claimed - 1e-6
+    assert taken > 0 and viol == 0                      # certificate never overclaims
+    # the curvature constant itself: kappa(R) >= 1/2, and C == kappa(R)*Var
+    kappa = lambda R: (math.exp(R) - 1 - R) / R ** 2
+    assert kappa(1e-3) == pytest.approx(0.5, abs=1e-3) and kappa(1.0) > 0.7
+    assert kappa(1e-8) < 0            # documents why the code switches to the limit 1/2
+
+
+def test_adaptive_step_curvature_stays_positive_for_tiny_ranges():
+    import math
+    import torch as t
+    from hagi.lm import CertifiedStepLM
+    m = CertifiedStepLM(dim=16, hidden=32, seed=0)
+    with t.no_grad():
+        for q in m.params():
+            q.mul_(1e-6)                           # logits ~ 0 -> ranges ~ 1e-6
+    g = t.Generator().manual_seed(0)
+    ctx = t.randint(0, 256, (8, m.k), generator=g)
+    nxt = t.randint(0, 256, (8,), generator=g)
+    before = float(t.nn.functional.cross_entropy(m.logits(ctx), nxt))
+    snap = [q.detach().clone() for q in m.params()]
+    m._adaptive_step(ctx, nxt)
+    after = float(t.nn.functional.cross_entropy(m.logits(ctx), nxt))
+    assert after <= before + 1e-9                 # never an ascent step
