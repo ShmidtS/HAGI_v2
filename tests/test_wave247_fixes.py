@@ -225,3 +225,26 @@ def test_compile_optimal_keeps_the_adder_and_is_never_worse_than_before():
             assert S.symbolic_verify_general(opt, outs)
             key = lambda nt: (len(nt["gates"]), nt["metrics"]["depth"], nt["metrics"]["program_bits"])
             assert key(opt) <= min(key(base), key(S.compact_netlist(S.ProofCarryingANFLearner.compile(n, outs))))
+
+
+# ---- 5. Polar-Express certificate (WAVE 248, PolarExpressCert.lean) ----
+def test_polar_express_singular_spectrum_lies_in_the_lean_box():
+    from hagi.trunk_ops import polar_express
+    # The function acts on singular values only; feed it as a small
+    # diagonal matrix (U = V = I, spectrum = diagonal) in batches.
+    # (A first version built one 20001x20001 diagonal — ~8e12 flops.)
+    for lo, box in ((0.1, (0.9075, 1.0212)), (1e-3, (9 / 512, 1049 / 1024))):
+        s = np.linspace(lo, 1.0, 20001)
+        for i in range(0, len(s), 64):
+            out = np.linalg.svd(polar_express(np.diag(s[i:i + 64])), compute_uv=False)
+            assert out.min() >= box[0] - 1e-9 and out.max() <= box[1] + 1e-9, (lo, out.min(), out.max())
+
+
+def test_polar_express_handles_wide_rank_deficient_and_zero():
+    from hagi.trunk_ops import polar_express
+    r = np.random.default_rng(0)
+    G = r.normal(size=(8, 2)) @ r.normal(size=(2, 64))          # wide, rank 2
+    out = polar_express(G)
+    s = np.linalg.svd(out, compute_uv=False)
+    assert out.shape == G.shape and s[0] <= 1049 / 1024 + 1e-9 and s[2:].max() < 1e-9
+    assert np.array_equal(polar_express(np.zeros((3, 3))), np.zeros((3, 3)))

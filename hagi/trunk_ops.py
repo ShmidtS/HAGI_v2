@@ -211,6 +211,38 @@ def paired_gain(before, after, z: float = 2.4):
     se = (d.std(ddof=1) / _np.sqrt(len(d))) if len(d) > 1 else 0.0
     return float(d.mean()), float(d.mean() - z * se)
 
+# ---- Polar-Express (primes Hagi/Optimization/PolarExpressCert.lean) -----
+# Three QUINTIC steps x <- a*x + b*x^3 + c*x^5 with rational
+# coefficients; polar_express_cycle_cert: spectrum [1/1000, 1] maps
+# into [9/512, 1049/1024]. The classic Newton-Schulz used by the GPM
+# (core.newton_schulz_orthogonalize) has no such box for small
+# singular values (4 steps: [0.47, 1.0] on [0.1, 1]; PE: [0.9075,
+# 1.0212]). Not wired into the GPM on purpose — measured (WAVE 248):
+# the GPM's backtracking line search rescales the step, so training
+# quality is unchanged (rel. operator error 0.010 vs 0.011), time per
+# call is on par (17.6 vs 23.0 us), and in the production config
+# (d_out = 1) orthogonalization degenerates to a vector norm.
+POLAR_EXPRESS = ((10151 / 2500, -17483 / 2500, 9623 / 2500),
+                 (5429 / 2000, -25159 / 10000, 1963 / 2500),
+                 (9473 / 5000, -1119 / 1000, 2201 / 10000))
+
+
+def polar_express(G) -> "np.ndarray":
+    """Polar factor approximation via 3 quintic steps (normalized
+    input; transposed to the wide form exactly like NS)."""
+    X = _np.asarray(G, dtype=_np.float64).copy()
+    nrm = float(_np.linalg.norm(X))
+    if nrm < 1e-12:
+        return X
+    X /= nrm
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    for a, b, c in POLAR_EXPRESS:
+        X2 = X @ X.T
+        X = a * X + b * (X2 @ X) + c * (X2 @ X2 @ X)
+    return X.T if transposed else X
+
 def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:
     """C532 explicit parameter count: adapter 2*r*d vs full block d*d
     (C532 adapter_param_le_full_block when r <= d/2)."""

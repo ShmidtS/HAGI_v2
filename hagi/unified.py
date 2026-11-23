@@ -360,6 +360,57 @@ class Unified:
             bank._adapters[source] = base
         return report
 
+    def _live_adapter(self, domain: str | None):
+        """WAVE 249: adapter of `domain` for inference, or None.
+
+        Trained adapters were never applied outside ingest (283 of
+        them sat unused in the checkpoint). Wiring them in blindly
+        would be WRONG: the acceptance gate (wave246) certified each
+        adapter against the trunk AS IT WAS at ingest, and the trunk
+        has moved since — measured on the current trunk, 1/3 of
+        trained adapters HURT their own domain (worst -0.103). So the
+        same paired gate is re-run live on the current trunk (4 ms,
+        256 probe windows): lower bound > ADAPTER_MIN_GAIN, else
+        identity. Measured: every kept adapter helps on an
+        independent holdout (3/3, +0.098..+0.255); the gate is
+        conservative and also drops some useful ones — the safe side.
+        No domain given -> no adapter (neutral path, unchanged)."""
+        if not domain:
+            return None
+        bank = getattr(self, "adapter_bank", None)
+        ad = bank._adapters.get(domain) if bank else None
+        if ad is None or not np.asarray(ad.B).any():
+            return None
+        data = self._domain_bytes(domain, self.domains.get(domain, {}))
+        k = self.model.k
+        if len(data) < k + 600:
+            return None
+        n = len(data) - k - 1
+        pos = np.random.default_rng(7).integers(0, int(n * 0.85), 256)
+        X, y = self._windows(domain, pos)
+        self.model.domain_adapter = None
+        _t = self.model.t
+        with _t.no_grad():
+            base = _t.nn.functional.cross_entropy(
+                self.model.logits(X), y, reduction="none").cpu().numpy()
+        after = self._adapter_val_ce(ad, X, y)
+        from hagi.trunk_ops import paired_gain
+        return ad if paired_gain(base, after)[1] > ADAPTER_MIN_GAIN else None
+
+    class _DomainScope:
+        """Applies the live-gated adapter of `domain` for the duration
+        of a neural call; always restores the previous state."""
+        def __init__(self, u, domain):
+            self.u, self.domain = u, domain
+        def __enter__(self):
+            self.ad = self.u._live_adapter(self.domain)
+            self.prev = getattr(self.u.model, "domain_adapter", None)
+            self.u.model.domain_adapter = self.ad        # None on gate failure = identity
+            return self.ad
+        def __exit__(self, *exc):
+            self.u.model.domain_adapter = self.prev
+            return False
+
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """WAVE 199: measured CE on a sample of OLD domains (the
         candidate-vs-incumbent gate-val). None when no old domains.
@@ -410,15 +461,20 @@ class Unified:
 
     # ---- inference ----
 
-    def ask(self, prompt: str, n: int = 400) -> str:
-        r = self.model.generate(prompt, n_bytes=n)
+    def ask(self, prompt: str, n: int = 400,
+            domain: str | None = None) -> str:
+        with self._DomainScope(self, domain):
+            r = self.model.generate(prompt, n_bytes=n)
         return r[len(prompt) :].strip() if r.startswith(prompt) else r
 
-    def ask_auto(self, prompt: str, max_bytes: int = 4096) -> str:
+    def ask_auto(self, prompt: str, max_bytes: int = 4096,
+                 domain: str | None = None) -> str:
         """WAVE 228: the model reads the WHOLE prompt (coverage
         windows) and decides ITSELF how long the answer is
-        (self-terminating generation)."""
-        r = self.model.generate_auto(prompt, max_bytes=max_bytes)
+        (self-terminating generation). `domain` (WAVE 249): apply that
+        domain's adapter iff it passes the live paired gate."""
+        with self._DomainScope(self, domain):
+            r = self.model.generate_auto(prompt, max_bytes=max_bytes)
         return r[len(prompt):].strip() if r.startswith(prompt) else r
     # ---- WAVE 225: knowledge consolidation from external memory ----
 
@@ -627,8 +683,10 @@ class Unified:
         dev = self.model.device
         ctx_list = list(context)[-self.model.k:][::-1]
         x = _t.as_tensor([ctx_list], dtype=_t.long, device=dev)
-        b = int(self.model.logits(x)[0].argmax())
-        return {"byte": b, "status": "NEURAL_GUESS",
+        with self._DomainScope(self, prefer_domain):
+            b = int(self.model.logits(x)[0].argmax())
+            used = self.model.domain_adapter is not None
+        return {"byte": b, "status": "NEURAL_GUESS", "adapter": used,
                 "source": "neural", "certified": False}
     # ---- neuro -> symbolic ----    # ---- neuro -> symbolic ----
 
