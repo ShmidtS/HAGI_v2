@@ -100,6 +100,24 @@ class Unified:
         # An integer cap remains available for quick tests only.
 
         parts = []
+        # WAVE 243 (user: replay ratio measured, not assumed): the
+        # full-book replay (wave168) grew quadratically — 94 domains
+        # = 19.7 MB per ingest, the cycle effectively stalled. Sweep
+        # on OUR Rope model, conflicting A->B domains, 5 seeds,
+        # balanced test CE:
+        #   0.20 2.056 | 0.25 1.990 | 0.30 1.986 | 1/e 2.039 |
+        #   0.42 2.100 | 0.50 2.213 | 0.75 2.729 | 0 6.682
+        # Dense sweep (7 seeds, ±SEM 0.06): 0.26..0.368 all within
+        # noise (2.016..2.066) — a PLATEAU 0.25-0.35, not a point
+        # optimum. 1/e and 1/pi are NOT distinguished from 0.30.
+        # Mid-plateau 0.30 chosen for distance from both edges
+        # (<0.2 forgets A, >0.4 starves B). Old domains get 30% of
+        # the fresh bytes, stratified over ALL past domains. An
+        # explicit replay_cap still overrides (tests / restore).
+        if replay_cap is None:
+            _fresh_len = len(self._domain_bytes(
+                source, self.domains[source]))
+            replay_cap = len(data) + int(_fresh_len * 0.30)
         total_cap = replay_cap  # TOTAL budget for all past domains
         # WAVE 133 FIX (Goodhart): old order put the FRESH domain last,
         # and the [:total_cap] truncation ate 97% of the tail — new data
@@ -110,7 +128,13 @@ class Unified:
         fresh_bytes = self._domain_bytes(fresh_name, self.domains[fresh_name])
         replay_budget = max(total_cap - len(fresh_bytes), 0) if total_cap else None
         n_past = max(1, len(self.domains) - 1)
-        per_domain = max(replay_budget // n_past, 8_000) if replay_budget else None
+        # WAVE 243 fix: the old 8KB floor summed to MORE than the
+        # whole budget once domains > budget/8KB, and the final
+        # [:total_cap] cut then kept only the FIRST domains —
+        # stratification silently collapsed to "replay domain #1".
+        # Share the budget evenly; the floor never exceeds it.
+        per_domain = (max(replay_budget // n_past, 0)
+                      if replay_budget else None)
         for name, e in self.domains.items():
             if name == fresh_name:
                 continue
