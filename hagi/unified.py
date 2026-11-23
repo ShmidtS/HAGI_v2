@@ -139,6 +139,11 @@ class Unified:
         import torch as _t
         incumbent_state = [q.detach().clone()
                            for q in self.model.params()]
+        # WAVE 241 FIX (P0 anti-forgetting gate): incumbent CE must
+        # be measured BEFORE any weight update. It was measured
+        # after training — both gate sides saw the same trained
+        # model, so forgetting was structurally undetectable.
+        old_ce_pre_early = self._old_domains_ce(exclude=source)
         reps = []
         for rep_i in range(max(1, repeat)):
             reps.append(
@@ -148,7 +153,13 @@ class Unified:
                     holdout_seed=7 + rep_i * 131 + len(self.domains) * 17,
                 )
             )
-        ce = min(r.get("best_holdout_ce", 99) for r in reps)
+        # WAVE 241 FIX (external review): the deployed weights are
+        # the LAST repeat's — log THAT repeat's CE, not the min over
+        # reps (the old min could belong to a different model than
+        # the one saved). selection_ce kept for reference.
+        ce = reps[-1].get("best_holdout_ce", 99)
+        selection_ce = min(r.get("best_holdout_ce", 99)
+                           for r in reps)
         # WAVE 210: optional per-domain adapters (HAGI_DOMAIN_ADAPTERS=1).
         # Fresh adapter = exact identity (B=0), so this never changes
         # the incumbent path; the adapter head-trains on the fresh
@@ -200,7 +211,10 @@ class Unified:
         # training, challenger CE on THE SAME windows after. The old
         # formula compared post-train old_ce against the mixed
         # new-domain CE — different quantities, wrong direction.
-        old_ce_pre = self._old_domains_ce(exclude=source)
+        # WAVE 241 FIX: use the TRUE pre-training incumbent CE
+        # (measured before train_certified above), not a post-hoc
+        # re-measurement on already-updated weights.
+        old_ce_pre = old_ce_pre_early
         old_ce = old_ce_pre
         # WAVE 233 (hagi_repro patch): measure post UNCONDITIONALLY —
         # the old `> 0` placeholder made the gate train-order only.

@@ -1014,7 +1014,12 @@ class RopeAttentionByteLM:
         with _th.no_grad():
             for s in range(0, len(hold), 512):
                 hp = hold[s:s + 512]
-                X = _np.stack([idx_np[p + self.k::-1][:self.k]
+                # WAVE 241 FIX (P0 target leak): old slice
+                # idx[p+k::-1][:k] STARTS at p+k = the target byte
+                # itself (it was X[0]!). Correct newest-first window:
+                # positions p+k-1 down to p.
+                X = _np.stack([idx_np[p + self.k - 1:
+                                      max(p - 1, -1):-1][:self.k]
                                for p in hp])
                 x = _th.as_tensor(X, dtype=_th.long, device=dev)
                 y = raw[_th.as_tensor(hp + self.k, dtype=_th.long,
@@ -1094,7 +1099,10 @@ class RopeAttentionByteLM:
         positions = rng.choice(len(train_np) - self.k - 1,
                                size=min(64, len(train_np) - self.k - 1),
                                replace=False)
-        X = _np.stack([train_np[p + self.k::-1][:self.k]
+        # WAVE 241 FIX (P0 target leak): same slice bug as
+        # eval_holdout_ce — old X[0] was the target byte itself.
+        X = _np.stack([train_np[p + self.k - 1:
+                                max(p - 1, -1):-1][:self.k]
                        for p in positions])
         y = train_np[positions + self.k]
         import torch as _th

@@ -523,17 +523,37 @@ from typing import Any, Optional
 import numpy as np
 FAMILY_IDS = {'BoolVenn': 0, 'unary': 1, 'integer-binary': 2, 'composed-ternary': 3, 'auto-composed': 4, 'auto-bool3': 5}
 FEATURE_KEYS = ('family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv')
-def _self_inverse_flag(spec) -> int:
-    """1 if the target is self-inverse (f∘f = id) on sampled unary inputs.
-    Separates tasks identical in range/unique stats (ATBASH vs CAESAR)."""
+def _self_inverse_flag(spec, seed: int = 13,
+                       train_fraction: float = 0.7) -> int:
+    """1 if the target is self-inverse (f∘f = id) on TRAIN-only
+    sampled unary inputs.
+
+    WAVE 241 FIX (external review): the old version sampled
+    dom[:64] — the head of the FULL domain, including points later
+    held out for validation. Teacher queries on validation points
+    leak label information into the feature the learner sees.
+    Restricted to the train partition (same split scheme as
+    _target_features)."""
     if spec.arity != 1:
         return 0
     dom = spec.inputs()
-    for x in dom[:64]:
+    if not dom:
+        return 0
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(dom))
+    n_train = max(1, min(len(dom) - 1,
+                         int(round(len(dom) * train_fraction))))
+    train_idx = perm[:n_train]
+    checked = 0
+    for i in train_idx:
+        if checked >= 64:
+            break
+        x = dom[int(i)]
         try:
             y = int(spec.teacher(*x))
             if not spec.valid((y,)) or int(spec.teacher(y)) != x[0]:
                 return 0
+            checked += 1
         except Exception:
             return 0
     return 1
@@ -562,7 +582,7 @@ class TracedProcessorV9(hagi.GrowingHagiProcessor):
 
     def learn(self, spec, seed=0, train_fraction=0.7, poison_one_label=False, train_neural=False, deadline=None):
         target_range, target_unique = _target_features(spec, seed, train_fraction)
-        feats = {'family': FAMILY_IDS.get(spec.family, 6), 'arity': spec.arity, 'domain': len(spec.inputs()), 'library': len(self.experts), 'self_inv': _self_inverse_flag(spec), 'target_range': target_range, 'target_unique': target_unique}
+        feats = {'family': FAMILY_IDS.get(spec.family, 6), 'arity': spec.arity, 'domain': len(spec.inputs()), 'library': len(self.experts), 'self_inv': _self_inverse_flag(spec, seed, train_fraction), 'target_range': target_range, 'target_unique': target_unique}
         c0 = self.candidates_generated
         t0 = time.perf_counter()
         ev = super().learn(spec, seed=seed, train_fraction=train_fraction, poison_one_label=poison_one_label, train_neural=train_neural, deadline=deadline)
@@ -570,7 +590,7 @@ class TracedProcessorV9(hagi.GrowingHagiProcessor):
         return ev
 def _features(spec, model, seed: int=0, train_fraction: float=0.7) -> tuple[int, ...]:
     target_range, target_unique = _target_features(spec, seed, train_fraction)
-    return (FAMILY_IDS.get(spec.family, 6), spec.arity, len(spec.inputs()), len(model.experts), target_range, target_unique, _self_inverse_flag(spec))
+    return (FAMILY_IDS.get(spec.family, 6), spec.arity, len(spec.inputs()), len(model.experts), target_range, target_unique, _self_inverse_flag(spec, seed, train_fraction))
 def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     """Induce self-model programs from the trace with HAGI's own machinery."""
     rows = [tuple((t[k] for k in FEATURE_KEYS)) for t in trace]
