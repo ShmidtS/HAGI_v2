@@ -295,14 +295,23 @@ class Unified:
         return p.read_bytes() if p.exists() else b""
 
     def _windows(self, source: str, pos):
-        """(X, y) newest-first windows — the SAME construction as
-        training (idx[p+k-1 .. p]); target = idx[p+k]. WAVE 246 fix:
-        the old _fresh_batch fed oldest-first windows, the reverse
-        of what the trunk was trained on."""
+        """(X, y) windows — the SAME construction as train_guarded's
+        gather_all (idx[p-k .. p-1], OLDEST-first, slot L-1 = newest
+        byte = query); target = idx[p]. WAVE 258 FIX: the window was
+        reversed (newest-first) by a wrong comment in lm.py ("Same
+        construction (newest-first)") — gather_all builds oldest-first.
+        Measured on the production trunk, 3 chunks: CE oldest-first
+        3.51/4.36/3.67 vs newest-first 6.03/6.41/6.09 nats. Every gate
+        built on _windows (adapter wave246/249, growth, repair) was
+        scoring the model on reversed input."""
         d = self._domain_bytes(source, self.domains[source])
         idx = np.frombuffer(d, dtype=np.uint8).astype(np.int64)
         k = self.model.k
-        X = np.stack([idx[p + k - 1: max(p - 1, -1): -1][:k] for p in pos])
+        pos = np.asarray(pos, dtype=np.int64)
+        lens = np.minimum(k, pos)                      # short tails: pad byte 0
+        X = np.zeros((len(pos), k), dtype=np.int64)
+        for i, (p, n_) in enumerate(zip(pos, lens)):
+            X[i, k - n_:] = idx[p - n_:p]
         y = idx[pos + k]
         t = self.model.t
         dev = getattr(self.model, "device", "cpu")
