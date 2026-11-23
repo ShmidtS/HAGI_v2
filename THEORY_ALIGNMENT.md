@@ -2569,7 +2569,7 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | CE safe-step (_certified_step) | соответствует |
 | adaptive step (AdaptiveMajorizer) | соответствует |
 | EF21 honest-reject | соответствует |
-| hybrid GPM (C510) + adaptive threshold (C519) | соответствует |
+| hybrid GPM (C510) + adaptive threshold (C519) | ЗЕРО вызовов в production — код удалён (wave242); теория остаётся pin-ом для будущего mechanism-selector |
 | GrowSnap q/2^k (C521) | перенесён (wave202) |
 | AdapterGrowth LoRA (C532) | перенесён (wave205) |
 | AuditLedger α-spending | соответствует |
@@ -2578,3 +2578,16 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | RoPE true phase + key-axis softmax (P1.1) | ИСПРАВЛЕН (wave204) |
 | StepContract monoid | соответствует (CertStepGen) |
 | AdapterBank C567 (upstream формализовал НАШ wave210 код с source-anchors trunk_ops.py/unified.py/lm.py) | соответствие полное: isolation/warm_transfer_sound/train_isolation/composition — все 4 теоремы отражают нашу dict-семантику; honest pins приняты (transfer-качество = эмпирика, caller решает; ленивый слот = нейтральный дефолт B=0) |
+
+### 24.6 Мосты волн 229–243 (post-audit)
+
+| Мост | Статус |
+|---|---|
+| CoverageReading C598 (_read_all_windows) | ИСПРАВЛЕН (wave242): ширина coverage-окна = train k=96 (была 64 от CertifiedStepLM); головные окна не усекаются (neg. теорема covStarts_trunc_uncovered_zero) |
+| WindowTradeoff C623 (режим a, fixed cost) | ПОДТВЕРЖДЁН ЗАМЕРОМ: per-read cost(w) плоский 3.5–5.5 мс на w∈[16,96], квадратичный член ≈0 → totalCost=c·⌈n/w⌉ монотонно убывает → максимальное w оптимально → наш k=96 согласован с теорией |
+| WindowTradeoff режим (c) w*=√(a/c) | неприменим (нет квадратичной цены чтения); применится при появлении retrieval-эксперта с растущей ценой окна |
+| GrowthGate C632 (n·G²/(2L) > c_add) | НЕ К ЧЕМУ: AdapterBank rank фиксирован, пути роста ёмкости нет — кандидат на волну rank-grow |
+| NegativeTransfer C592 (sufficient gate) | перенесён (wave232): warm-start fresh-адаптера iff источник ce≤0.5 |
+| FactLedger C579 / KnowledgeConsolidation C584 | соответствуют (memory_store, remember/consolidate); consolidation-файл upstream переименован — пин обновить при следующем sync |
+| Автосамокритика (wave241) | не имеет Lean-моста — инженерный контур; метрика teacher_forced_replay_accuracy честно не является OOD-доказательством |
+| Replay 30% stratified (wave243) | эмпирика (7 seed, плато 0.25–0.35); формального моста нет — HoldoutSplit/Continual не фиксируют долю replay |
