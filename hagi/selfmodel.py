@@ -75,7 +75,7 @@ def _restore_rng(snap: dict[str, Any]) -> None:
     random.setstate(snap['py'])
     _np.random.set_state(snap['np'])
     torch.set_rng_state(snap['torch'])
-def guarded_optimizer_step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, task_batches: Mapping[str, Any], loss_fn: Callable[[torch.nn.Module, Any], torch.Tensor], validation_fn: Callable[[torch.nn.Module], dict[str, float]], generalization_error_bound: float=0.0, quantization_error_bound: float=0.0, routing_error_bound: float=0.0, safety_margin: float=0.0, max_backtracks: int=8, conflict_tol: float=1e-08, task_weights: Optional[Mapping[str, float]]=None) -> StepResult:
+def guarded_optimizer_step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, task_batches: Mapping[str, Any], loss_fn: Callable[[torch.nn.Module, Any], torch.Tensor], validation_fn: Callable[[torch.nn.Module], dict[str, float]], generalization_error_bound: float=0.0, quantization_error_bound: float=0.0, routing_error_bound: float=0.0, safety_margin: float=0.0, max_backtracks: int=8, conflict_tol: float=1e-08, task_weights: Optional[Mapping[str, float]]=None, max_task_regression: float=0.0) -> StepResult:
     """One validation-gated multi-task optimizer step with exact rollback.
 
     validation_fn must return per-task held-out losses for the same keys as
@@ -111,7 +111,13 @@ def guarded_optimizer_step(model: torch.nn.Module, optimizer: torch.optim.Optimi
             return StepResult('HOLD', f"non-finite gradient on '{k}'")
         grads.append(g)
     alpha = mgda_weights(grads)
-    d = sum((float(alpha[i].item()) * grads[i] for i in range(len(grads))))
+    # WAVE 254 (bug): the weights are solved on NORMALIZED gradients
+    # (mgda_weights stacks g/||g||) but were applied to the RAW ones,
+    # so with different scales the mixture is dominated by the largest
+    # gradient (measured: alpha=[.5,.5], d=[500, 5e-4]) and is not the
+    # min-norm point that was computed. Mix the normalized gradients.
+    normed = [g / (g.norm() + 1e-12) for g in grads]
+    d = sum((float(alpha[i].item()) * normed[i] for i in range(len(grads))))
     dots = [float(grads[i].dot(d).item()) for i in range(len(grads))]
     min_dot = min(dots)
     _zero_grads(model)
@@ -130,21 +136,35 @@ def guarded_optimizer_step(model: torch.nn.Module, optimizer: torch.optim.Optimi
         optimizer.load_state_dict(optim_snap)
         _zero_grads(model)
         idx = 0
-        # WAVE 235b FIX (external audit P4): backtracking scaled the
-        # REPORTED step_scale only — optimizer.step() ran at full lr
-        # every retry, so all backtrack iterations were identical.
-        # Scale the GRADIENT instead: optimizer(lr) * scale*grad ==
-        # effective step of lr*scale for SGD/Adam direction.
+        # WAVE 235b scaled the gradient, claiming scale*grad == lr*scale
+        # for Adam. FALSE for Adam: m/sqrt(v) is scale-invariant, so
+        # every backtrack ran the identical full step (measured: grad
+        # scale 0.01 -> step ratio 1.000). WAVE 254: scale the LR of
+        # every param group for this trial and restore it afterwards.
         for p in model.parameters():
             n = p.numel()
-            p.grad = (scale * d[idx:idx + n]).view_as(p).clone()
+            p.grad = d[idx:idx + n].view_as(p).clone()
             idx += n
-        optimizer.step()
+        base_lrs = [g["lr"] for g in optimizer.param_groups]
+        for g in optimizer.param_groups:
+            g["lr"] = g["lr"] * scale
+        try:
+            optimizer.step()
+        finally:
+            for g, lr in zip(optimizer.param_groups, base_lrs):
+                g["lr"] = lr
         loss_after = validation_fn(model)
         if any((k not in loss_after for k in names)):
             break
         wa = sum((w[k] * float(loss_after[k]) for k in names)) / wsum
         gain = wb - wa
+        # WAVE 254: a weighted MEAN can improve while one task gets
+        # worse (forgetting hidden by the aggregate). An aggregate gain
+        # only commits if no single task regresses beyond
+        # max_task_regression.
+        worst = max(float(loss_after[k]) - float(loss_before[k]) for k in names)
+        if worst > max_task_regression:
+            break                      # no smaller step is tried: the direction itself is at fault
         res = StepResult('COMMIT', 'validation gain exceeds error bounds', step_scale=scale, certified_gain=gain, alphas={k: float(alpha[i]) for i, k in enumerate(names)}, grad_agreement_min=min_dot, backtracks=bt, loss_before=dict(loss_before), loss_after=dict(loss_after))
         if gain > total_bound:
             _zero_grads(model)
