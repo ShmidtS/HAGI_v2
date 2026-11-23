@@ -101,3 +101,66 @@ def test_basis_out_period_is_fast():
     t = time.perf_counter(); out = basis_out_period(pairs)
     assert out == {"kind": "OUT_PERIOD", "p": 13, "o": 5}
     assert time.perf_counter() - t < 0.01
+
+
+# ---- 3b. invent_multi: period search (WAVE 247) ----
+K = 3
+
+
+def _stream(period, fn, n=3000, seed=0):
+    import random
+    r = random.Random(seed)
+    data = bytearray(r.randbytes(n + K))
+    for i in range(K, len(data)):
+        if (i - K) % period == 0:
+            data[i] = fn(data[i - 3], data[i - 2], data[i - 1]) & 255
+    return [(tuple(data[i - K:i]), data[i]) for i in range(K, len(data))]
+
+
+@pytest.mark.parametrize("period", [3, 4, 5, 6, 7, 8])
+def test_invent_multi_finds_laws_on_every_period_up_to_8(period):
+    # 6000 bytes: every stratum then has >= 750 pairs. With 3000 the
+    # period-8 stratum (375 pairs) is too small for a near-injective
+    # law — it is still FOUND, with support 0.744 and raw accuracy
+    # 0.971 (the PARTIAL_LAW contract reports exactly that).
+    import random
+    from hagi.invention_multi import invent_multi
+    pairs = _stream(period, lambda a, b, c: a + 2 * b - c + 7, n=6000)
+    r = invent_multi(pairs, random.Random(0))
+    assert r["status"] == "PARTIAL_LAW"
+    bp, P, s = r["blueprints"][0], r["n_shifts"], r["shift"]
+    assert P == period
+    idx = [i for i in range(len(pairs)) if i % P == s]
+    assert sum(bp.apply(pairs[i][0]) == pairs[i][1] for i in idx) / len(idx) > 0.99
+
+
+def test_invent_multi_best_law_wins_over_the_first_that_passes():
+    # A weaker fit on a MULTIPLE of the period passes every gate at an
+    # earlier feature; the search must return the true period.
+    import random
+    from hagi.invention_multi import invent_multi
+    pairs = _stream(4, lambda a, b, c: a + 2 * b - c + 7)
+    r = invent_multi(pairs, random.Random(0))
+    assert r["n_shifts"] == 4 and r["feature"] == "aff(1, 2, -1)+0"
+
+
+def test_invent_multi_never_invents_a_law_for_noise():
+    import random
+    from hagi.invention_multi import invent_multi
+    for seed in range(8):
+        r0 = random.Random(100 + seed)
+        pairs = [(tuple(r0.randbytes(K)), r0.randbytes(1)[0])
+                 for _ in range(3000)]
+        assert invent_multi(pairs, random.Random(seed))["status"] == "NO_LAW"
+
+
+def test_vectorised_features_are_bit_exact_with_the_callables():
+    from hagi.invention_multi import _kind, _vfeat, enumerate_features
+    r = np.random.default_rng(0)
+    for k in (2, 3, 4):
+        X = r.integers(0, 256, (2000, k), dtype=np.uint8)
+        for name, param, fn in enumerate_features(k):
+            got = _vfeat(_kind(name), param, X)
+            ref = np.fromiter((fn(tuple(int(v) for v in row)) for row in X),
+                              dtype=np.int64, count=len(X))
+            assert not (got != ref).any(), name
