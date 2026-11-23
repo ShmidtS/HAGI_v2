@@ -196,6 +196,17 @@ def adapter_warm_start(src_adapter: "LowRankAdapter",
     return True
 
 
+def paired_gain(before, after, z: float = 2.4):
+    """WAVE 246 (local reproduction rank_controller, compact): paired
+    per-example loss gain (before - after; positive = better) with a
+    normal-approximation lower bound mean - z*SE. Empirical gate,
+    NOT a formal certificate."""
+    d = _np.asarray(before, dtype=float) - _np.asarray(after, dtype=float)
+    if len(d) == 0 or not _np.isfinite(d).all():
+        raise ValueError("paired losses must be finite and non-empty")
+    se = (d.std(ddof=1) / _np.sqrt(len(d))) if len(d) > 1 else 0.0
+    return float(d.mean()), float(d.mean() - z * se)
+
 def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:
     """C532 explicit parameter count: adapter 2*r*d vs full block d*d
     (C532 adapter_param_le_full_block when r <= d/2)."""

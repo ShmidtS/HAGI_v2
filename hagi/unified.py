@@ -39,6 +39,8 @@ def _sha(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 
+ADAPTER_MIN_GAIN = 0.005  # paired-validation gain an adapter must clear (WAVE 246)
+
 class Unified:
     """ONE evolving model."""
 
@@ -215,16 +217,17 @@ class Unified:
                     best_src = min(cands, key=lambda kv: kv[1])[0]
                     from hagi.trunk_ops import adapter_warm_start
                     adapter_warm_start(bank.get(best_src), ad)
-            self.model.domain_adapter = ad
-            try:
-                # WAVE 230: RopeAttentionByteLM.adapter_head_step —
-                # Adam on A/B only, trunk frozen; 3 guarded steps.
-                for _ in range(3):
-                    ctx, nxt = self._fresh_batch(source)
-                    self.model.adapter_head_step(ctx, nxt)
-            except Exception:
-                pass  # adapter training is best-effort, head stays safe
             self.model.domain_adapter = None
+            # WAVE 246 (HAGI_v2_local_reproduction §2/§7/§8): the
+            # adapter is CONDITIONAL, not automatic. Ranks 1/2/4 are
+            # trained from the identity (trunk frozen — old domains
+            # execute an unchanged path, regression 0 by construction)
+            # and accepted only on a PAIRED per-example validation CE
+            # gain over the rank-0 baseline (normal-approx lower
+            # bound > ADAPTER_MIN_GAIN). HOLD = the adapter stays at
+            # B = 0 (identity).
+            # Empirical gate, not a Lean certificate.
+            self._fit_domain_adapter(source)
         # WAVE 199 (candidate-vs-incumbent gate): measured CE on a
         # sample of OLD domains — accept only without impermissible
         # regression on them (fresh-domain improvement alone is not
@@ -276,20 +279,86 @@ class Unified:
         p = CKPT_DIR / "domains" / f"{name}.bin"
         return p.read_bytes() if p.exists() else b""
 
-    def _fresh_batch(self, source: str):
-        """One training batch from the fresh domain bytes (adapter
-        head-training)."""
+    def _windows(self, source: str, pos):
+        """(X, y) newest-first windows — the SAME construction as
+        training (idx[p+k-1 .. p]); target = idx[p+k]. WAVE 246 fix:
+        the old _fresh_batch fed oldest-first windows, the reverse
+        of what the trunk was trained on."""
         d = self._domain_bytes(source, self.domains[source])
         idx = np.frombuffer(d, dtype=np.uint8).astype(np.int64)
         k = self.model.k
-        n = len(idx) - k
-        sel = np.arange(0, max(1, n), max(1, n // 128))[:128]
-        X = np.stack([idx[i:i + k] for i in sel])
-        y = idx[sel + k]
+        X = np.stack([idx[p + k - 1: max(p - 1, -1): -1][:k] for p in pos])
+        y = idx[pos + k]
         t = self.model.t
         dev = getattr(self.model, "device", "cpu")
         return (t.as_tensor(X, dtype=t.long, device=dev),
                 t.as_tensor(y, dtype=t.long, device=dev))
+
+    def _adapter_val_ce(self, ad, X, y) -> "np.ndarray":
+        """Per-example CE of the frozen trunk + adapter `ad` (rank 0
+        = identity adapter gives the baseline)."""
+        t = self.model.t
+        self.model.domain_adapter = ad
+        out = []
+        with t.no_grad():
+            for i in range(0, len(X), 128):
+                lg = self.model.logits(X[i:i + 128])
+                out.append(t.nn.functional.cross_entropy(
+                    lg, y[i:i + 128].to(lg.device),
+                    reduction="none").cpu().numpy())
+        self.model.domain_adapter = None
+        return np.concatenate(out)
+
+    def _fit_domain_adapter(self, source: str) -> dict:
+        from hagi.trunk_ops import LowRankAdapter, paired_gain
+        bank = getattr(self, "adapter_bank", None)
+        if bank is None:
+            from hagi.trunk_ops import AdapterBank
+            bank = self.adapter_bank = AdapterBank(d=self.model.hidden, r=2)
+        d = self._domain_bytes(source, self.domains[source])
+        k = self.model.k
+        n = len(d) - k - 1
+        if n < 64:
+            return {"status": "HOLD", "reason": "too_short"}
+        cut = int(n * 0.85)                      # train | validation
+        rng = np.random.default_rng(7)
+        base = bank.get(source)
+        if np.asarray(base.B).any():             # re-ingest: continue
+            cands = [LowRankAdapter(bank.d, base.r, 0)]
+            cands[0].A, cands[0].B = np.array(base.A), np.array(base.B)
+        else:                                    # fresh: grow 1 -> 2 -> 4
+            cands = []
+            for r in (1, 2, 4):
+                c = LowRankAdapter(bank.d, r, seed=0)
+                if base.r == r:
+                    c.A, c.B = np.array(base.A), np.array(base.B)
+                cands.append(c)
+        val = self._windows(source, np.arange(cut, n))
+        before = self._adapter_val_ce(LowRankAdapter(bank.d, 1), *val)
+        best, report = None, {"status": "HOLD", "baseline_ce": float(before.mean()),
+                              "attempts": []}
+        for c in cands:
+            self.model.domain_adapter = c
+            for _ in range(3):
+                self.model.adapter_head_step(*self._windows(
+                    source, rng.integers(0, cut, 128)))
+            self.model.domain_adapter = None
+            after = self._adapter_val_ce(c, *val)
+            gain, lower = paired_gain(before, after)
+            report["attempts"].append({"rank": c.r, "ce": float(after.mean()),
+                                       "gain": gain, "lower_bound": lower})
+            # lower bound must clear MIN_GAIN (repro default 0.005):
+            # on a uniform trunk every paired diff is float noise ~1e-7
+            # and a bare "> 0" accepted a no-op (measured, seed 1).
+            if lower > ADAPTER_MIN_GAIN and (
+                    best is None or after.mean() < best[1]):
+                best = (c, float(after.mean()))
+        if best is not None:
+            bank._adapters[source] = best[0]
+            report.update(status="GROW", rank=best[0].r, ce=best[1])
+        else:
+            bank._adapters[source] = base
+        return report
 
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """WAVE 199: measured CE on a sample of OLD domains (the
@@ -464,6 +533,7 @@ class Unified:
                 d=u.model.hidden, r=2)
             for dom, ab in st["adapter_bank"].items():
                 ad = bank.get(dom)
+                ad.r = _t.as_tensor(ab["A"]).shape[0]  # WAVE 246: rank varies
                 ad.A = _t.as_tensor(ab["A"])
                 ad.B = _t.as_tensor(ab["B"])
         if "law_registry" in st:
