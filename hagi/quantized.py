@@ -275,9 +275,6 @@ def load_ternary_payload(model, payload: bytes):
     return model
 
 
-def decode_into_fresh(model, payload: bytes):
-    """Clone a model template, restore packed weights, and return it."""
-    return load_ternary_payload(copy.deepcopy(model), payload)
 
 
 def instantiate_ternary_payload(payload: bytes):

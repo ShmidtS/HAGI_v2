@@ -1364,24 +1364,6 @@ def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 4) -> np.ndarray:
     return X.T if transposed else X
 
 
-def hybrid_select(span_free: bool, g_dot_gold: float,
-                  conflict_threshold: float = 0.0) -> str:
-    """C510 hybridSelect: deterministic mechanism choice on two
-    MEASURED predicates — span fullness and conflict sign.
-    fullGPM | agemFree | rankTrunc (Hagi.Theory.Continual).
-
-    WAVE 201 (C519 roadmap 1a): conflict_threshold is a parameter —
-    the C510 degeneration (conflict-rate=0 -> always agemFree -> the
-    mechanism never engages) is broken by the caller adapting the
-    threshold mid-run; the default 0.0 keeps the exact C510
-    semantics."""
-    if span_free:
-        return "fullGPM"
-    if g_dot_gold >= conflict_threshold:
-        return "agemFree"
-    return "rankTrunc"
-
-
 class ContinualGPMMemory(GpuGpmMixin):
     """GPM + SpaceDecoupling (P_R = I - UU^T) + EF21Markov + Newton-Schulz Muon.
 

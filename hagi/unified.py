@@ -6,7 +6,7 @@ Self-evolution: ingest -> certified learn -> quantize to symbolic ->
 fabric weave -> the processor IS the model.
 
 Architecture (2026-11-17, user decision):
-  - ONE body (ByteLM k/dim/hidden) trained on everything seen;
+  - ONE body (RopeAttentionByteLM, context k=96) trained on all seen;
     no separate task checkpoints (nadya_school.pt etc. deleted).
   - Domains tracked by a domain ledger (name -> bytes seen, CE trace)
     so forgetting is measured per domain after each ingest.

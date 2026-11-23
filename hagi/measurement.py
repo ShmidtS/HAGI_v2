@@ -85,35 +85,6 @@ class CapabilitySnapshot:
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
-def total_mdl(library_meta_bits: int, expert_bits: list[int], unsolved: int, penalty_per_unsolved: int=64) -> int:
-    return int(library_meta_bits) + sum((int(b) for b in expert_bits)) + int(unsolved) * int(penalty_per_unsolved)
-def capability_delta(before: CapabilitySnapshot, after: CapabilitySnapshot) -> dict:
-    d_mdl = after.total_mdl_bits - before.total_mdl_bits
-    d_rate = after.heldout_solve_rate - before.heldout_solve_rate
-    d_samples = after.mean_samples_to_solve - before.mean_samples_to_solve
-    return {'delta_total_mdl': d_mdl, 'delta_heldout_solve_rate': d_rate, 'delta_mean_samples': d_samples, 'noise_false_accepts': after.noise_false_accepts, 'REAL_GAIN': d_mdl < 0 and d_rate > 0 and (after.noise_false_accepts == 0)}
-def heldout_suite(tasks: list[tuple[str, Callable, range, int]], solver: Callable[[str, range, int], tuple[int, int] | None]) -> tuple[int, float, float]:
-    """Run held-out transfer panel. solver(name, domain, target) returns
-    (bits_cost | None-if-HOLD, samples_used). Returns (solved, rate,
-    mean_samples_to_solve over solved only)."""
-    solved = 0
-    samples = []
-    for name, fn, dom, target in tasks:
-        res = solver(name, dom, target)
-        if res is not None and res[0] is not None:
-            solved += 1
-            samples.append(res[1])
-    rate = solved / max(1, len(tasks))
-    mean_s = sum(samples) / len(samples) if samples else 0.0
-    return (solved, rate, mean_s)
-def noise_panel(noise_tables: list[dict[int, int]], inventor: Callable[[dict[int, int]], object]) -> int:
-    """Feed randomized tables; count accepted STRUCTURAL constructs.
-    Honest system must return 0."""
-    accepts = 0
-    for tbl in noise_tables:
-        if inventor(tbl) is not None:
-            accepts += 1
-    return accepts
 
 # ============================================================
 # ANYTIME ALPHA BUDGET
@@ -242,42 +213,6 @@ class QueryChoice:
     point: object
     information_gain_bits: float
     outcome_probabilities: tuple[tuple[Hashable, float], ...]
-def select_query_by_committee(candidates: Sequence[H], pool: Sequence[X], predict: Callable[[H, X], Y], weights: Sequence[float] | None=None) -> QueryChoice | None:
-    """Choose the pool point with greatest predictive-label entropy.
-
-    ``weights`` are non-negative posterior/prior masses for candidates. The
-    function is deterministic: ties preserve the supplied pool order. It
-    returns ``None`` when fewer than two hypotheses remain or no pool point
-    separates them. A point is never queried here; this is pure selection.
-    """
-    if len(candidates) < 2 or not pool:
-        return None
-    if weights is None:
-        masses = [1.0] * len(candidates)
-    else:
-        if len(weights) != len(candidates):
-            raise ValueError('weights must match the candidate count')
-        masses = [float(value) for value in weights]
-        if any((not math.isfinite(value) or value < 0 for value in masses)):
-            raise ValueError('weights must be finite and non-negative')
-    total_mass = sum(masses)
-    if total_mass <= 0:
-        raise ValueError('at least one candidate weight must be positive')
-    masses = [value / total_mass for value in masses]
-    best: QueryChoice | None = None
-    for point in pool:
-        outcome_mass: dict[Hashable, float] = defaultdict(float)
-        for candidate, mass in zip(candidates, masses):
-            if mass <= 0:
-                continue
-            outcome = predict(candidate, point)
-            outcome_mass[outcome] += mass
-        if len(outcome_mass) < 2:
-            continue
-        entropy = -sum((prob * math.log2(prob) for prob in outcome_mass.values() if prob > 0))
-        if best is None or entropy > best.information_gain_bits + 1e-12:
-            best = QueryChoice(point=point, information_gain_bits=entropy, outcome_probabilities=tuple(sorted(outcome_mass.items(), key=lambda item: repr(item[0]))))
-    return best
 
 def oe_first_representatives(programs, probes, evaluate):
     """WAVE 211 (HAGI_v2_final theory_ports, C540 OE-дедуп):

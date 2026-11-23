@@ -801,63 +801,6 @@ class WhileLoopArtifact:
         py = STEP_PRIMITIVES[self.step_name][1]
         ret = 'steps' if self.mode == 'steps' else 's'
         return '\n'.join([f'def {fn_name}(x0: int) -> int:', f'    _DOM = {sorted(self.domain)!r}', "    if int(x0) not in _DOM: raise ValueError('outside domain')", '    s = int(x0)', '    steps = 0', f'    while s > {self.stop_le}:', f'        s = {py}', '        steps += 1', f'    return {ret}'])
-def discover_while_loop_candidates(xs: Sequence[int], ys: Sequence[int]) -> list[tuple[float, WhileLoopBlueprint]]:
-    """Bellman / orbit-invariance detector: walk ONE step from each
-    observed x; a family qualifies only if the relation holds for ALL
-    observed transition pairs (analytical, no threshold search)."""
-    obs = {int(x): int(y) for x, y in zip(xs, ys)}
-    if any((v < 0 for v in obs)):
-        return []
-    scored = []
-    for name, (sfn, _, _) in STEP_PRIMITIVES.items():
-        bell_ok = bell_tot = fp_ok = fp_tot = 0
-        for x, y in obs.items():
-            nxt = sfn(x)
-            if nxt == x or nxt not in obs:
-                continue
-            if y > 0:
-                bell_tot += 1
-                if y - obs[nxt] == 1:
-                    bell_ok += 1
-            if x != nxt:
-                fp_tot += 1
-                if y == obs[nxt]:
-                    fp_ok += 1
-        if bell_tot >= 4 and bell_ok == bell_tot and (len(set(ys)) >= 3):
-            scored.append((1.0 + 0.01 * bell_tot, WhileLoopBlueprint(name, 'steps')))
-        if fp_tot >= 4 and fp_ok == fp_tot and (len(set(ys)) >= 3):
-            if any((x == y for x, y in obs.items())):
-                scored.append((1.0 + 0.01 * fp_tot, WhileLoopBlueprint(name, 'final')))
-    scored.sort(key=lambda t: (-t[0], t[1].meta_bits))
-    return scored
-def synthesize_while_loop(bp: WhileLoopBlueprint, pairs: list[tuple[int, int]], domain: Sequence[int]) -> WhileLoopArtifact | None:
-    """Infer stop_le analytically from the boundary between zeros/fixed
-    points and the rest; then verify exactly on all pairs."""
-    obs = {int(x): int(y) for x, y in pairs}
-    if not obs or any((v < 0 for v in obs)):
-        return None
-    if bp.mode == 'steps':
-        anchors = [x for x, y in obs.items() if y == 0]
-        others = [x for x, y in obs.items() if y > 0]
-    else:
-        anchors = [x for x, y in obs.items() if x == y]
-        others = [x for x, y in obs.items() if x != y]
-    if not anchors or not others:
-        cands = [0, 1]
-    else:
-        lo, hi = (max(anchors), min(others) - 1)
-        if lo > hi:
-            return None
-        cands = list(range(lo, min(hi + 1, lo + 16)))
-    for stop_le in cands:
-        bits = bp.meta_bits + 2 * (max(1, stop_le + 1).bit_length() - 1) + 1
-        art = WhileLoopArtifact(bp.step_name, stop_le, bp.mode, frozenset((int(v) for v in domain)), bits)
-        try:
-            if all((art.eval(x) == y for x, y in pairs)):
-                return art
-        except (ValueError, RecursionError):
-            continue
-    return None
 
 # ============================================================
 # REPRESENTATION DISCOVERY LOOP (RDL: parametric families)
@@ -928,8 +871,6 @@ def generate_families() -> list[tuple[str, int, object]]:
     for m in range(1, 4):
         out.append(('shift2', m, mk_shift2(m)))
     return out
-def observe_world_step(world_step, s: int, a: int) -> int:
-    return world_step(s, a)
 def sample_agree(step_fn, samples: list[tuple[int, int, int]]) -> bool:
     return all((step_fn(s) == ns for s, _, ns in samples))
 def identify(world, samples: list[tuple[int, int, int]], families: list[tuple[str, int, object]]) -> dict:
@@ -978,11 +919,3 @@ def run_rdl(world, seed: int=0) -> dict:
         r['cost_full_table_baseline'] = 48
         r['savings_pct'] = round(100 * (1 - r['cost_class_knowledge'] / r['cost_full_table_baseline']), 1)
     return r
-def transfer_benefit(world_a, world_b, seed: int=0) -> dict:
-    """Step 6-7: discover class on world_a, then predict probe count on
-    world_b. Same class -> verification is 16 checks, not 48+."""
-    ra = run_rdl(world_a, seed)
-    if not ra.get('proven'):
-        return {'transferred': False, 'reason': 'class not discovered on A'}
-    rb = run_rdl(world_b, seed)
-    return {'transferred': rb.get('proven', False), 'class': ra['invented_class'], 'param_a': ra['param'], 'param_b': rb.get('param'), 'same_class': ra['invented_class'] == rb.get('invented_class'), 'cost_a': ra.get('cost_class_knowledge'), 'cost_b': rb.get('cost_class_knowledge')}

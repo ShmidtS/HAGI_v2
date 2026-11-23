@@ -445,22 +445,3 @@ if __name__ == "__main__":
     main()
 
 
-def rename_programs_hash(path: Path) -> dict[str, str]:
-    """Rewrite an existing generated_programs.py: every top-level
-    `def NAME(...)` and all its call sites get a short stable hash
-    name f<sha1:10>. Helper functions (_hagi_*) keep their names.
-    Returns the old->new mapping."""
-    src = path.read_text(encoding="utf-8")
-    defs = re.findall(r"^def ([A-Z][A-Za-z0-9_]*)\(", src, flags=re.M)
-    mapping = {old: _fn_hash(old) for old in defs}
-    def sub(m):
-        n = m.group(1)
-        return ("def " + mapping[n] + "(") if n in mapping else m.group(0)
-    src2 = re.sub(r"^def ([A-Za-z0-9_]+)\(", sub, src, flags=re.M)
-    for old, new in mapping.items():
-        # WAVE 230 FIX: real word boundaries (); the previous
-        # text contained literal backspace chars (0x08) so the
-        # rename regex NEVER matched and rewrites were no-ops.
-        src2 = re.sub(rf"{re.escape(old)}", new, src2)
-    path.write_text(src2, encoding="utf-8")
-    return mapping

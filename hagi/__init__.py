@@ -8,7 +8,7 @@ Layout (WAVE 195 refactor: 55 -> 32 files, merged by meaning):
   Kernel & body
     hagi.core       — canonical kernel (legacy body star-imported)
     hagi.legacy_kernel — frozen legacy body
-    hagi.lm         — byte-LM (CertifiedStepLM, RopeAttentionByteLM)
+    hagi.lm         — byte-LM (RopeAttentionByteLM = production)
     hagi.unified    — ONE model: ingest + ledger
     hagi.gpu        — CUDA/ROCm backend
   Construct discovery

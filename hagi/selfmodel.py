@@ -343,19 +343,6 @@ def run_experiment(seeds: int=5, policy_names: list[str] | None=None, seed_start
         report['gate'] = gate
         report['decision'] = {'action': 'HOLD', 'reason': 'no candidate policy preserved the baseline expert set on all seeds while reducing total candidate evaluations; baseline retained'}
     return report
-def main_experiment() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--seeds', type=int, default=5)
-    ap.add_argument('--seed-start', type=int, default=0)
-    ap.add_argument('--policies', nargs='+', choices=tuple(POLICIES))
-    a = ap.parse_args()
-    rep = run_experiment(seeds=a.seeds, policy_names=a.policies, seed_start=a.seed_start)
-    print(json.dumps({k: v for k, v in rep.items() if k != 'derived_algorithm'}, indent=2, ensure_ascii=False))
-    d = rep['decision']
-    if d['action'] == 'COMMIT':
-        print(f"ADOPTED: policy '{d['adopted_policy']}' (wasted {rep['gate']['baseline']['mean_wasted']} -> {rep['gate'][d['adopted_policy']]['mean_wasted']})")
-    else:
-        print('GATE HOLD: ' + d['reason'])
 
 # ============================================================
 # GATED SELF-EDIT LOG
@@ -457,11 +444,6 @@ def adopted_settings() -> dict[str, Any]:
     if 'proposals' in last:
         kwargs['proposals_per_round'] = last['proposals']
     return kwargs
-def apply_patch(patch: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
-    """Return a modified settings overlay (does NOT edit source code)."""
-    out = dict(target)
-    out[patch['knob']] = patch['value']
-    return out
 MAX_GATE_RUNS = 6
 def self_edit_cycle(seed: int=0, dry: bool=False) -> dict[str, Any]:
     """One propose->gate->adopt cycle. Honest record in EDIT_LOG."""
@@ -502,13 +484,6 @@ def self_edit_cycle(seed: int=0, dry: bool=False) -> dict[str, Any]:
     (log['adopted'] if no_regress else log['rejected']).append(proposal)
     EDIT_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding='utf-8')
     return proposal
-def main_selfedit() -> None:
-    import argparse
-    ap = argparse.ArgumentParser(description='Nadya self-edit gate')
-    ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--dry', action='store_true')
-    a = ap.parse_args()
-    print(json.dumps(self_edit_cycle(seed=a.seed, dry=a.dry), ensure_ascii=False, indent=1))
 
 # ============================================================
 # SELF-MODEL: TRACE->DERIVE->OPTIMIZE->GATE (anchor module)

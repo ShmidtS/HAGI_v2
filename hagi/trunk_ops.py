@@ -9,65 +9,6 @@ from __future__ import annotations
 
 from typing import Callable
 import numpy as np
-def six_phase_cycle(objective: Callable[[np.ndarray], float], grad: Callable[[np.ndarray], np.ndarray], w0: np.ndarray, steps_train: int=10, hadamard_len: int | None=None, merge_cand: np.ndarray | None=None, stop_patience: int=2, eta: float=0.1, delta_total: float=0.05) -> dict:
-    """Run the unified cycle; return the phase trace. A phase is a
-    COMMIT (with measured drop) or a HOLD (no-op) — never silent.
-    C479 contracts: Σδ_i ≤ delta_total across the 6 phases (false-commit
-    budget split by count), and the telescope invariant
-    objective(t6) ≤ objective(t0) is asserted on the trace."""
-    delta_per_phase = delta_total / 6.0
-    obj_start = float(objective(np.asarray(w0, dtype=float)))
-    trace: list[dict] = []
-    w = np.asarray(w0, dtype=float)
-    drops = []
-    for _ in range(steps_train):
-        obj = objective(w)
-        w = w - eta * grad(w)
-        drops.append(obj - objective(w))
-    trace.append({'phase': 'TRAIN', 'commit': sum((d > 0 for d in drops)) > 0, 'drop': float(sum(drops))})
-    g = grad(w)
-    s = max(float(np.abs(g).max()) * 0.2, 1e-12)
-    d = s * np.sign(np.round(g / s))
-    obj = objective(w)
-    w2 = w - eta * d
-    drop_ef = obj - objective(w2)
-    if drop_ef > 0:
-        w = w2
-    trace.append({'phase': 'EF21', 'commit': drop_ef > 0, 'drop': float(drop_ef)})
-    phase_h = {'phase': 'HADAMARD-TERN', 'commit': False, 'drop': 0.0}
-    if hadamard_len and w.size == hadamard_len:
-        g_gate = rotate_gate(w)
-        if g_gate['rotate']:
-            w_r = sylvester_mul(w, hadamard_len)
-            drop_h = objective(w) - objective(w_r)
-            if drop_h > 0:
-                w = w_r
-                phase_h['commit'] = True
-                phase_h['drop'] = float(drop_h)
-    trace.append(phase_h)
-    obj_before = objective(w)
-    grew = False
-    trace.append({'phase': 'GROW', 'commit': False, 'drop': 0.0})
-    obj_after = obj_before
-    phase_m = {'phase': 'MERGE', 'commit': False, 'drop': 0.0}
-    if merge_cand is not None:
-        g_w = grad(w)
-        b = merge_bound(lambda x: float(objective(x)), g_w, w, merge_cand)
-        if b['certified']:
-            cand_obj = float(objective(merge_cand))
-            obj_w = float(objective(w))
-            if (obj_w + cand_obj) / 2 + b['delta_mid'] + b['delta_end'] / 2 < obj_w:
-                w = (w + merge_cand) / 2.0
-                phase_m['commit'] = True
-                phase_m['drop'] = float(obj_w - objective(w))
-    trace.append(phase_m)
-    recent = [t for t in trace if t['phase'] in ('EF21', 'HADAMARD-TERN', 'MERGE')]
-    stalled = sum((1 for t in reversed(recent) if not t['commit']))
-    stop = stalled >= stop_patience
-    trace.append({'phase': 'STOP', 'commit': not stop, 'drop': 0.0, 'stalled': stalled})
-    obj_end = float(objective(w))
-    telescope_ok = obj_end <= obj_start + 1e-09
-    return {'trace': trace, 'w': w, 'obj': obj_end, 'obj_start': obj_start, 'telescope_ok': telescope_ok, 'delta_budget': {'per_phase': delta_per_phase, 'total': delta_total, 'phases_committed': len([t for t in trace if t['commit']])}, 'committed': [t['phase'] for t in trace if t['commit']]}
 def sylvester_mul(w: np.ndarray, n: int) -> np.ndarray:
     """Apply the integer Sylvester Hadamard of size n to w."""
     return sylvester(int(np.log2(n))).astype(float) @ w
@@ -95,21 +36,6 @@ def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequen
     delta_end = abs(L2 - (L1 + lin_at(g, w1, w2, 1.0)))
     bound = (L1 + L2) / 2.0 + delta_mid + delta_end / 2.0
     return {'L_mid': float(L(mid)), 'bound': bound, 'delta_mid': delta_mid, 'delta_end': delta_end, 'certified': float(L(mid)) <= bound + 1e-12}
-def diag_quadratic_merge(w1: Sequence[float], w2: Sequence[float], c: Sequence[float], a: Sequence[float]) -> dict:
-    """EXACT merge identity for the diagonal-quadratic loss
-    L(θ)=½Σ c_i (θ_i−a_i)²: residual (1/8)Σ c_i (w2−w1)_i², and the
-    merged loss computed exactly. Verifies the theorem's quadratic
-    bridge (C472 curvature)."""
-    w1 = np.asarray(w1, dtype=float)
-    w2 = np.asarray(w2, dtype=float)
-    c = np.asarray(c, dtype=float)
-    a = np.asarray(a, dtype=float)
-    L = lambda w: 0.5 * float(np.sum(c * (w - a) ** 2))
-    mid = (w1 + w2) / 2.0
-    g = c * (w1 - a)
-    delta_curv = float(np.sum(c * (w2 - w1) ** 2)) / 8.0
-    bound = (L(w1) + L(w2)) / 2.0 + delta_curv + delta_curv / 2.0
-    return {'L_mid': L(mid), 'bound': bound, 'delta_curv': delta_curv, 'exact': L(mid) <= bound + 1e-12}
 
 # ============================================================
 # HADAMARD INCOHERENCE GATE (C477)
@@ -142,32 +68,6 @@ def rotate_gate(w: np.ndarray) -> dict:
     hw = H @ w
     before, after = (coh_sq(w), coh_sq(hw))
     return {'cohSq_before': before, 'cohSq_after': after, 'rotate': after < before, 'energy_ratio': float((hw * hw).sum() / (w * w).sum()) if (w * w).sum() > 0 else 1.0}
-def quantize_rows_with_gate(W: np.ndarray) -> np.ndarray:
-    """Per-row: rotate-if-measured-better, then b1.58 ternary with the
-    row scale computed IN THE ROTATED BASIS (s = mean|v| of the rotated
-    row). Note: dequantization needs the row's rotation decision —
-    consumers should store the per-row gate flags.
-    """
-    W = np.asarray(W, dtype=float)
-    n = W.shape[1]
-    if n & n - 1:
-        raise ValueError('row length must be a power of two')
-    H = sylvester(int(np.log2(n))).astype(float)
-    out = np.empty_like(W)
-    flags: list[bool] = []
-    for i in range(W.shape[0]):
-        v = W[i]
-        g = rotate_gate(v)
-        if g['rotate']:
-            v, flag = (H @ v, True)
-        else:
-            flag = False
-        s = np.abs(v).mean()
-        s = s if s > 1e-12 else 1.0
-        q = np.round(v / s).clip(-1.0, 1.0) * s
-        out[i] = q
-        flags.append(flag)
-    return (out, flags)
 
 # ============================================================
 # RESIDUAL BLOCK GROWTH (C450/C504/C506)
@@ -197,12 +97,6 @@ def grow_trunk(trunk: Sequence[Callable], h: Callable) -> list[Callable]:
     set; the trainer must not touch them — only the fresh block
     enters the certified training loop)."""
     return list(trunk) + [ResidualBlock(h, gamma=0.0)]
-def trainable_blocks(trunk: Sequence['ResidualBlock'], grown_index: int | None=None):
-    """C506: only the LAST (fresh) block trains; the rest frozen.
-    Returns the block(s) allowed into the certified step."""
-    if grown_index is None:
-        grown_index = len(trunk) - 1
-    return [b for i, b in enumerate(trunk) if isinstance(b, ResidualBlock) and i == grown_index]
 def run_trunk(trunk: Sequence[Callable], x):
     """Compose blocks left-to-right (benchTrunk foldl form)."""
     for b in trunk:

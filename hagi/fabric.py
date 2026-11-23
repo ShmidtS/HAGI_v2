@@ -46,34 +46,8 @@ def eval_mask(mask: int, a: bool, b: bool) -> bool:
     return bool((mask >> (3 - idx)) & 1)
 
 
-def imply(mf: int, mg: int) -> bool:
-    """O(1) lattice implication: f⇒g ⟺ mf & ~mg == 0."""
-    return (mf & ~mg) == 0
 
 
-def npn_canonical(mask: int) -> int:
-    """Minimal mask over NPN group (swap A/B, input inversions,
-    output inversion)."""
-    best = mask
-    for swap in (False, True):
-        for ia in (False, True):
-            for ib in (False, True):
-                for inv in (False, True):
-                    m = mask ^ (0b1111 if inv else 0)
-                    new = 0
-                    for idx in range(4):
-                        a, b = [(True, True), (True, False),
-                                (False, True), (False, False)][idx]
-                        if ia:
-                            a = not a
-                        if ib:
-                            b = not b
-                        if swap:
-                            a, b = b, a
-                        if eval_mask(m, a, b):
-                            new |= 1 << (3 - idx)
-                    best = min(best, new)
-    return best
 
 
 # --- Fabric genome ---

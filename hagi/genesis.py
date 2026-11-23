@@ -187,16 +187,6 @@ def genesis_cycle(
     return entry
 
 
-def adopted_config() -> dict[str, Any]:
-    """Last adopted genesis config per knob (drives the production
-    loop — CertifiedLoop contract, same as self-edit)."""
-    log = _load_log()
-    last: dict[str, Any] = {}
-    for e in log.get("adopted", []):
-        m = e.get("mutation", {})
-        if m.get("knob") and "value" in m:
-            last[m["knob"]] = m["value"]
-    return last
 
 
 # ======================================================================
