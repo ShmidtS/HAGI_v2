@@ -263,7 +263,14 @@ def run_law_self_critique(
         return {"status": "SKIP", "reason": "no_model", "evaluated": 0,
                 "queued": 0}
     model_k = getattr(model, "k", None)
-    generation = max(0, len(getattr(u, "domains", {}) or {}))
+    # WAVE 242 fix: critique-generated chat domains must NOT count
+    # as "new training domains" — otherwise each corrective chat
+    # advances the re-evaluation clock and the loop self-accelerates
+    # (measured: generations 79->91 in one session, critique on
+    # nearly every chunk, starving real disk chunks).
+    _doms = getattr(u, "domains", {}) or {}
+    generation = max(0, sum(1 for d in _doms
+                            if not str(d).startswith("chat_")))
 
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))

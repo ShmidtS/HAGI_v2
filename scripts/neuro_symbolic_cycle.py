@@ -124,6 +124,36 @@ def main() -> None:
                         msg = chat_file.read_text(
                             encoding="utf-8", errors="ignore")
                         dom = "chat_" + chat_file.stem
+                        if "АВТОСАМОКРИТИКА" in msg:
+                            # WAVE 242: critique chats carry hex pairs
+                            # (context -> target). Teach the RAW byte
+                            # stream, not hex text — and skip the
+                            # gemma consolidate (minutes per chat,
+                            # no semantic value in hex dumps).
+                            import re as _re
+                            import binascii
+                            raw = bytearray()
+                            for m in _re.finditer(
+                                    r"^([0-9a-f]{8,})\s*->\s*"
+                                    r"([0-9a-f]{2})", msg, _re.M):
+                                raw += binascii.unhexlify(m.group(1))
+                                raw += bytes([int(m.group(2), 16)])
+                            if len(raw) >= 4096:
+                                u.ingest(dom, bytes(raw), epochs=1,
+                                         repeat=1)
+                            else:
+                                u.remember(msg)
+                            reply.append("learned: raw critique "
+                                         "stream " + str(len(raw))
+                                         + "B")
+                            print("    [chat] " + chat_file.stem
+                                  + ": critique stream "
+                                  + str(len(raw)) + "B", flush=True)
+                            (inbox / (chat_file.stem
+                                      + ".reply")).write_text(
+                                chr(10).join(reply), encoding="utf-8")
+                            chat_file.unlink()
+                            continue
                         u.learn_from_dialog(msg, name=dom)
                         dom_ce = u.domains.get(dom, {}).get("ce")
                         reply.append("learned: domain " + dom
