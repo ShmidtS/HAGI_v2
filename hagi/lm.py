@@ -567,6 +567,9 @@ class RopeAttentionByteLM:
         # to the hidden state, a = attention aggregate. A fresh block has
         # Wo = 0 -> the function is preserved EXACTLY (lmLogits_grow_identity).
         self.blocks: list[dict] = []
+        # WAVE 257: indices of FROZEN blocks (repair blocks = the old
+        # memory; the general train step must not overwrite them).
+        self.frozen_blocks: set = set()
         self.device = _resolve_device(t, self.dim, self.hidden)
         if self.device == "cuda":
             for prm in self.params():
@@ -688,7 +691,7 @@ class RopeAttentionByteLM:
         return self.t.nn.functional.cross_entropy(
             self.logits(ctx), nxt, reduction="mean")
 
-    def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 3e-3,
+    def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 1e-3,
                       holdout: float = 0.1, batch: int = 64,
                       max_train_ctx: int = 96, log_every: int = 0,
                       holdout_seed: int | None = None) -> dict:
@@ -769,7 +772,9 @@ class RopeAttentionByteLM:
         live_params = [self.emb, self.W1, self.b1, self.W2,
                        self.b2]
         # WAVE 255: extra blocks train with the trunk (q stays excluded)
-        for blk in getattr(self, "blocks", []):
+        for i, blk in enumerate(getattr(self, "blocks", [])):
+            if i in getattr(self, "frozen_blocks", ()):   # WAVE 257
+                continue
             live_params += [blk["W1"], blk["b1"], blk["Wo"]]
         opt = t.optim.Adam(live_params, lr=lr)
         best = eval_ce(hold)
@@ -951,11 +956,14 @@ class RopeAttentionByteLM:
     def train_certified(self, data: bytes, epochs: int = 60,
                         holdout: float = 0.1, batch: int = 64,
                         log_every: int = 0,
-                        holdout_seed: int | None = None) -> dict:
+                        holdout_seed: int | None = None,
+                        lr: float | None = None) -> dict:
         """Unified-compatible training: delegates to train_guarded."""
         r = self.train_guarded(data, epochs=epochs, holdout=holdout,
                                batch=batch, max_train_ctx=self.k,
-                               holdout_seed=holdout_seed)
+                               holdout_seed=holdout_seed,
+                               **({} if lr is None else {"lr": lr}))
+        # (lr default comes from train_guarded: 1e-3 since WAVE 256)
         # WAVE 235 HYBRID (user-approved): after the fast Adam phase,
         # a certified-refine phase runs §3.9 finite-displacement steps
         # on holdout windows — every accepted step carries a PROVEN

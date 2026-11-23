@@ -38,7 +38,10 @@ def test_adapter_rejects_noise_holds_identity(tmp_path, monkeypatch):
 
 def test_adapter_grows_on_structure(tmp_path, monkeypatch):
     u = _unified(tmp_path, monkeypatch)
-    u.model.train_guarded(bytes(range(256)) * 8, epochs=3)
+    # WAVE 256 (lr 3e-3 -> 1e-3): the same displacement budget as the
+    # old epochs=3 at 3e-3 (measured: at lr=1e-3 epochs=3 -> HOLD,
+    # epochs=6 -> GROW). The test is about structure, not epoch count.
+    u.model.train_guarded(bytes(range(256)) * 8, epochs=9)
     trunk = [q.detach().clone() for q in u.model.params()]
     r = u._fit_domain_adapter("d")
     assert r["status"] == "GROW" and r["rank"] in (1, 2, 4)

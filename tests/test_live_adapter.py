@@ -83,6 +83,7 @@ def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatc
     assert u.model.grow() == 1
     with t.no_grad():
         assert float((u.model.logits(X) - l0).abs().max()) == 0.0     # exact identity
+    u.GROW_BLOCKS = 2   # off by default (WAVE 257: hurts old domains)
     r = u._maybe_grow("d", data)
     assert r["status"] in ("GROW", "ROLLBACK", "HOLD")
     if r["status"] == "GROW":
@@ -95,3 +96,78 @@ def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatc
     if u.model.blocks:
         for a, b in zip(u.model.blocks, v.model.blocks):
             assert float((a["Wo"] - b["Wo"]).abs().max()) < 1e-6
+
+
+def test_grow_rolls_back_a_block_that_gains_nothing(tmp_path, monkeypatch):
+    """WAVE 257: on the production model a block with ce_before == ce_after
+    (3.4673 -> 3.4673) was accepted as GROW. Nothing earned -> rollback."""
+    import torch as t
+    from hagi import unified as U
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    u = U.Unified()
+    u.domains["d"] = {}
+    data = bytes(range(256)) * 30
+    u._domain_bytes = lambda s, e: data
+    u.model.train_guarded(data, epochs=2)
+    n0 = len(u.model.blocks)
+    calls = {"n": 0}
+    orig = t.nn.functional.cross_entropy
+    def frozen(*a, **k):            # every evaluation returns the same loss
+        calls["n"] += 1
+        return orig(*a, **k).mul(0).add(1.0)
+    u.GROW_BLOCKS = 2
+    monkeypatch.setattr(t.nn.functional, "cross_entropy", frozen)
+    r = u._maybe_grow("d", data)
+    monkeypatch.setattr(t.nn.functional, "cross_entropy", orig)
+    assert r["status"] in ("ROLLBACK", "HOLD")
+    assert len(u.model.blocks) == n0
+
+
+def test_repair_block_is_frozen_in_general_training_and_persisted(tmp_path, monkeypatch):
+    """WAVE 257: a repair block (the old memory) must not be moved by
+    train_certified — measured: movable repair blocks end at OLD +2.62
+    (worse than no blocks, +0.55)."""
+    import torch as t
+    from hagi import unified as U
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    u = U.Unified()
+    u.domains["d"] = {}
+    data = bytes(range(256)) * 30
+    u._domain_bytes = lambda s, e: data
+    u.model.train_guarded(data, epochs=1)
+    u.model.grow(seed=3)
+    u.model.frozen_blocks = {0}
+    w = [q.detach().clone() for q in u.model.blocks[0].values()]
+    u.model.train_guarded(data, epochs=1)
+    for q, w0 in zip(u.model.blocks[0].values(), w):
+        assert float((q - w0).abs().max()) == 0.0
+    u.save(); v = U.Unified.load()
+    assert v.model.frozen_blocks == {0} and len(v.model.blocks) == 1
+
+
+def test_repair_retrains_old_domains_until_forgetting_is_gone(tmp_path, monkeypatch):
+    """WAVE 257 (user: after growth, retrain the old domains until
+    forgetting reaches zero). Iterative: while the paired old-domain CE
+    is above its pre-training value, a retrain step on OLD bytes runs;
+    a step that does not improve is rolled back; the loop stops at the
+    tolerance or the round cap."""
+    import torch as t
+    from hagi import unified as U
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    u = U.Unified()
+    u.domains.update({"a": {}, "b": {}})
+    old = bytes(range(0, 128, 2)) * 200
+    u._domain_bytes = lambda s, e: old
+    u.model.train_guarded(old, epochs=2)
+    pre = u._old_domains_ce(exclude="c")
+    # forget on purpose: train hard on unrelated bytes
+    u.model.train_guarded(bytes(range(255, 0, -1)) * 200, epochs=4)
+    assert u._old_domains_ce(exclude="c") > pre
+    u._domain_bytes = lambda s, e: bytes(range(255, 0, -1)) * 200 if s == "c" else old
+    r = u._repair_forgetting("c", pre, [q.detach().clone() for q in u.model.params()])
+    assert r["mode"] == "replay" and r["rounds"]
+    assert all(x["status"] in ("RETRAIN", "ROLLBACK") for x in r["rounds"])
+    assert u._old_domains_ce(exclude="c") <= pre + u.FORGET_TOL or r["rounds"][-1]["status"] == "ROLLBACK"
+    # the loop is monotone in the gate value
+    ces = [x["ce"] for x in r["rounds"]]
+    assert ces == sorted(ces, reverse=True)

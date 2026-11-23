@@ -210,6 +210,10 @@ def main() -> None:
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "
               f"({files_now} files) → CE {ce} "
               f"({r.get('seconds', '?')}s)", flush=True)
+        rp = r.get("repair") or {}
+        if rp.get("rounds"):
+            print(f"    repair: forgot {rp.get('forgot')} blocks={len(u.model.blocks)} "
+                  f"rounds={[(x['status'], round(x['ce'], 3), round(x['after'], 3) if x['after'] else None) for x in rp['rounds']]}", flush=True)
         gr = r.get("growth") or {}
         if gr.get("status") in ("GROW", "ROLLBACK"):
             print(f"    growth: {gr.get('status')} blocks={gr.get('blocks')} "

@@ -253,6 +253,12 @@ class Unified:
             old_ce_pre is not None and old_ce_post is not None
             and old_ce_post > old_ce_pre * 1.25
         )
+        repair = self._repair_forgetting(source, old_ce_pre, incumbent_state)
+        if repair["rounds"]:
+            old_ce_post = self._old_domains_ce(exclude=source)
+            regression = bool(
+                old_ce_pre is not None and old_ce_post is not None
+                and old_ce_post > old_ce_pre * 1.25)
         old_ce = old_ce_post if old_ce_post is not None else old_ce_pre
         if regression:
             # in-place rollback: Unified.load() would recreate the
@@ -266,6 +272,8 @@ class Unified:
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if growth.get("status") == "GROW":
             entry["growth"] = growth
+        if repair["rounds"]:
+            entry["repair"] = repair
         self.save()
         return {
             "source": source,
@@ -276,6 +284,7 @@ class Unified:
             "holdout_ce": ce,
             "old_ce": entry.get("old_ce"),
             "growth": growth,
+            "repair": repair,
             "regression": entry.get("regression", False),
             "seconds": round(time.perf_counter() - t0, 1),
         }
@@ -378,13 +387,120 @@ class Unified:
     # selection of train_guarded cannot discard it: at epochs=2 that
     # rollback silently zeroed the block — measured) and kept only if
     # the holdout CE does not get worse.
-    MAX_BLOCKS = 2
+    # WAVE 257 (user: iterativnyj rost — posle rosta pereuchivat' starye
+    # domeny, poka zabyvanie ne upadet v nol'). Forgetting is measured on
+    # the gate's FIXED old-domain windows (_old_domains_ce, paired pre/post).
+    # While it is > FORGET_TOL and the block budget allows: grow one exact-
+    # identity block, train ONLY that block (trunk frozen -> the fresh chunk
+    # executes an unchanged path) on windows of the old domains, keep the
+    # best state seen, re-measure. No improvement -> pop (exact rollback)
+    # and stop; improvement but still > 0 -> another block.
+    MAX_BLOCKS = 4          # total blocks (repair reserve included)
+    GROW_BLOCKS = 0         # WAVE 257: OFF by default — measured (60 chunks,
+                            # OLD first-10 CE): blocks +2.07 vs no blocks +0.55
+    FORGET_TOL = 0.0
+    REPAIR_MODE = "replay"   # "replay" (retrain old bytes) | "block"
+    REPAIR_ROUNDS = 6       # measured: rounds=3/lr=1e-3 -> +0.343;
+                            # rounds=6/lr=3e-4 -> +0.036 (no repair: +0.553)
+    REPAIR_LR = 3e-4
+    REPAIR_BYTES = 400_000
+
+    def _repair_forgetting(self, exclude: str, pre, incumbent_state) -> dict:
+        import torch as _t
+        import numpy as _np
+        m = self.model
+        names = [n for n in self.domains if n != exclude]
+        if pre is None or not names:
+            return {"rounds": [], "why": "no_old"}
+        rng = _np.random.default_rng(23)
+        sample = list(rng.choice(names, min(8, len(names)), replace=False))
+        sets = []
+        for name in sample:
+            d = self._domain_bytes(name, self.domains[name])
+            if len(d) < m.k + 64:
+                continue
+            X, y = self._windows(name, rng.integers(0, len(d) - m.k - 1, 256))
+            sets.append((X, y))
+        if not sets:
+            return {"rounds": [], "why": "no_bytes"}
+        post = self._old_domains_ce(exclude)
+        rounds = []
+        if self.REPAIR_MODE == "replay":
+            # WAVE 257 (measured, fresh production-size model, 60 chunks,
+            # OLD first-10 CE after 60): no blocks +0.55, repair blocks
+            # +2.62, frozen repair blocks +3.48, growth blocks +2.07.
+            # Blocks overfit the 8 sampled domains and do not carry old
+            # memory. What the user asked for literally — RETRAIN the old
+            # domains — is a plain training step on old bytes, rolled back
+            # unless the paired gate improves. Bounded: REPAIR_ROUNDS.
+            for _ in range(self.REPAIR_ROUNDS):
+                if post <= pre + self.FORGET_TOL:
+                    break
+                snap = [q.detach().clone() for q in m.params()]
+                old_bytes = b"".join(self._domain_bytes(n, self.domains[n])
+                                     for n in sample if n in self.domains)[: self.REPAIR_BYTES]
+                if len(old_bytes) < m.k + 64:
+                    break
+                m.train_certified(old_bytes, epochs=2, holdout_seed=99,
+                                    lr=self.REPAIR_LR)
+                new = self._old_domains_ce(exclude)
+                if new is None or new >= post - 1e-4:
+                    with _t.no_grad():
+                        for q, s0 in zip(m.params(), snap):
+                            q.copy_(s0)
+                    rounds.append({"ce": post, "after": new, "status": "ROLLBACK"})
+                    break
+                rounds.append({"ce": post, "after": new, "status": "RETRAIN"})
+                post = new
+            return {"rounds": rounds, "mode": "replay",
+                    "forgot": None if post is None else round(post - pre, 4)}
+        why = ("no_post" if post is None else
+               "cap" if len(getattr(m, "blocks", [])) >= self.MAX_BLOCKS else
+               "none" if post <= pre + self.FORGET_TOL else "ran")
+        while post is not None and post > pre + self.FORGET_TOL \
+                and len(getattr(m, "blocks", [])) < self.MAX_BLOCKS:
+            m.grow(seed=len(m.blocks) + 1)
+            blk = m.blocks[-1]
+            opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=1e-3)
+            best_ce, best_blk = post, {k: v.detach().clone() for k, v in blk.items()}
+            for step in range(600):
+                X, y = sets[int(rng.integers(0, len(sets)))]
+                sel = _t.as_tensor(rng.integers(0, len(y), 64), device=y.device)
+                opt.zero_grad()
+                _t.nn.functional.cross_entropy(m.logits(X[sel]), y[sel]).backward()
+                opt.step()
+                if step % 50 == 49:
+                    c = self._old_domains_ce(exclude)
+                    if c is not None and c < best_ce:
+                        best_ce, best_blk = c, {k: v.detach().clone() for k, v in blk.items()}
+            with _t.no_grad():
+                for k_ in blk:
+                    blk[k_].copy_(best_blk[k_])
+            new = self._old_domains_ce(exclude)
+            if new is None or new >= post - 1e-4:
+                m.blocks.pop()                       # not earned
+                m.frozen_blocks.discard(len(m.blocks))
+                rounds.append({"ce": post, "after": new, "status": "ROLLBACK"})
+                break
+            incumbent_state.extend(q.detach().clone() for q in blk.values())
+            m.frozen_blocks.add(len(m.blocks) - 1)   # measured: if the general train_certified
+            # keeps moving a repair block, OLD ends at +2.62 (worse than
+            # no blocks at all, +0.55). The block is the old memory: freeze.
+            rounds.append({"ce": post, "after": new, "status": "GROW"})
+            post = new
+        return {"rounds": rounds, "why": why,
+                "forgot": None if post is None else round(post - pre, 4)}
+
 
     def _maybe_grow(self, source: str, data: bytes) -> dict:
         import torch as _t
         import numpy as _np
         m = self.model
-        if len(getattr(m, "blocks", [])) >= self.MAX_BLOCKS or len(data) < m.k + 4096:
+        # WAVE 257: slots are split — growth for the fresh domain may
+        # use GROW_BLOCKS; the rest is the reserve of _repair_forgetting
+        # (measured: with a shared budget _maybe_grow took all 4 slots in
+        # 4 chunks and the repair was capped for the next 55).
+        if len(getattr(m, "blocks", [])) >= self.GROW_BLOCKS or len(data) < m.k + 4096:
             return {"status": "SKIP"}
         idx = _np.frombuffer(data, dtype=_np.uint8).astype(_np.int64)
         n = len(idx) - m.k - 1
@@ -420,8 +536,15 @@ class Unified:
             with _t.no_grad():
                 return float(_t.nn.functional.cross_entropy(m.logits(Xv), yv))
         before = hold_ce()
-        opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=3e-3)   # trunk frozen
+        opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=1e-3)   # trunk frozen
         tr = _np.arange(m.k, cut)
+        # WAVE 255b: the block's holdout CE is NOT monotone in the warm-up
+        # (measured on the production model: 4.11 -> 6.56 at step 100 ->
+        # 2.45 at step 400 with lr=1e-3). Keep the BEST block state seen
+        # (best_state contract of train_guarded) instead of the last one —
+        # the first version returned the last state and rolled back a
+        # block that was already winning.
+        best_ce, best_blk = before, {k: v.detach().clone() for k, v in blk.items()}
         for _ in range(2):
             for s in range(0, len(tr), 64):
                 sel = rng.choice(tr, min(64, len(tr)), replace=False)
@@ -429,10 +552,20 @@ class Unified:
                 opt.zero_grad()
                 _t.nn.functional.cross_entropy(m.logits(Xb), yb).backward()
                 opt.step()
+                if s % (64 * 50) == 0:
+                    c = hold_ce()
+                    if c < best_ce:
+                        best_ce = c
+                        best_blk = {k: v.detach().clone() for k, v in blk.items()}
                 if s >= 64 * 300:
                     break                      # bounded warm-up (~300 steps/epoch)
+        with _t.no_grad():
+            for k_ in blk:
+                blk[k_].copy_(best_blk[k_])
         after = hold_ce()
-        if after > before:
+        # WAVE 257: strict — measured on the production model a block with
+        # ce_before == ce_after (3.4673 -> 3.4673) was accepted as GROW.
+        if after >= before - 1e-4:
             m.blocks.pop()                    # not earned -> exact rollback
             return {"status": "ROLLBACK", "ce_before": before, "ce_after": after}
         return {"status": "GROW", "blocks": len(m.blocks), "signal": round(signal, 1),
@@ -604,6 +737,7 @@ class Unified:
         st.update(
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
         )
+        st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))
         # WAVE 230: persist attention geometry (theta0/lam) — without
         # them load() silently reverts to defaults and the trained
         # recency profile changes after restart.
@@ -710,6 +844,7 @@ class Unified:
             with _t.no_grad():
                 for k in live:
                     live[k].copy_(blk[k].to(live[k].device))
+        u.model.frozen_blocks = set(st.get("frozen_blocks", []))
         u.domains = (
             json.loads(LEDGER.read_text(encoding="utf-8")) if LEDGER.exists() else {}
         )
