@@ -1,223 +1,258 @@
-"""Integrated retrieval-and-feedback loop for the local HAGI experiments.
+"""Цикл «поиск в памяти — ответ — проверенная обратная связь».
 
-The compact ternary ByteLM is used as an evidence reranker, not misrepresented
-as a general-purpose answer generator. Answers in this prototype are extracted
-from selected records; feedback must come from an external verifier.
+Ключевые идеи:
+  - Поиск гибридный: точный идентификатор из запроса (фиксирует сущность даже
+    при перефразировании), затем семантический индекс, затем полнотекстовый
+    поиск по всему запросу. Повторы удаляются по (page_id, char_start, char_end).
+  - Компактная троичная байтовая модель переупорядочивает доказательства: для
+    пары (запрос, доказательство) строится строка фиксированной длины context
+      "|IDM=|ST=|R=" + "Q=<слова запроса>|E=<слова доказательства>",
+    модель даёт logit следующего бита, оценка = logits['1'] − logits['0'].
+    Модель не порождает ответ: ответ извлекается из выбранной записи.
+  - Итоговый балл: combined = neural + utility_weight·utility + cache_bonus
+    (если страница в кэше). Маржа = балл первого − балл второго.
+  - Полезность страницы меняется только по внешней проверке: reward = +1 или −1.
+
+Экспортирует: RankedEvidence, MemoryAnswer, pair_prompt,
+pair_training_record, TernaryEvidenceReranker, MemoryAugmentedAgent.
 """
-from __future__ import annotations
+from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-from dataclasses import dataclass
-import re
-from typing import Iterable
+from dataclasses import dataclass  # классы-записи
+import re  # регулярные выражения
+from typing import Iterable  # тип «итерируемый»
 
-import torch
+import torch  # тензоры
 
-from .streaming import DiskBackedContext, MemoryHit
+from .streaming import DiskBackedContext, MemoryHit  # дисковый архив и попадание поиска
 
-_IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z_-]{1,}[0-9][A-Z0-9_-]*\b")
-_TOKEN_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
-_VALUE_RE = re.compile(r"\bvalue\s*[=:]\s*([A-Za-z0-9._/-]+)", flags=re.IGNORECASE)
-_FINAL_RE = re.compile(
-    r"\b(final\s+decision|approved|adopted|selected|confirmed|current|authoritative)\b",
-    flags=re.IGNORECASE,
+_IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z_-]{1,}[0-9][A-Z0-9_-]*\b")  # идентификатор: заглавная буква, затем ≥ 1 символ из [A-Z_-], цифра, хвост из [A-Z0-9_-]
+_TOKEN_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)  # слово: непрерывная цепочка букв/цифр (без подчёркивания)
+_VALUE_RE = re.compile(r"\bvalue\s*[=:]\s*([A-Za-z0-9._/-]+)", flags=re.IGNORECASE)  # «value = X» или «value: X»; группа 1 — значение X
+_FINAL_RE = re.compile(  # слова, помечающие запись как окончательную
+    r"\b(final\s+decision|approved|adopted|selected|confirmed|current|authoritative)\b",  # без учёта регистра
+    flags=re.IGNORECASE,  # флаг: регистр не различается
 )
-_OLD_RE = re.compile(
-    r"\b(earlier|preliminary|rejected|superseded|obsolete|draft|withdrawn|trial)\b",
-    flags=re.IGNORECASE,
+_OLD_RE = re.compile(  # слова, помечающие запись как устаревшую
+    r"\b(earlier|preliminary|rejected|superseded|obsolete|draft|withdrawn|trial)\b",  # без учёта регистра
+    flags=re.IGNORECASE,  # флаг: регистр не различается
 )
 
 
-@dataclass(frozen=True)
-class RankedEvidence:
-    hit: MemoryHit
-    neural_score: float
-    utility_score: float
-    cached: bool
-    combined_score: float
+@dataclass(frozen=True)  # неизменяемая класс-запись
+class RankedEvidence:  # доказательство с баллами
+    """Доказательство поиска с баллами: само попадание, балл нейросети, балл
+    полезности, признак страницы в кэше и итоговый балл."""
+    hit: MemoryHit  # попадание поиска (страница, границы, текст)
+    neural_score: float  # балл нейросети: logits['1'] − logits['0']
+    utility_score: float  # балл полезности от обучаемой оценки страницы
+    cached: bool  # находится ли страница в кэше рабочего набора
+    combined_score: float  # итог: neural + utility_weight·utility + cache_bonus·cached
+@dataclass(frozen=True)  # неизменяемая класс-запись
+class MemoryAnswer:  # ответ агента
+    """Ответ на запрос: status — 'unknown' (ничего не найдено),
+    'no_extractable_value' (в лучшей записи нет «value = X»), 'uncertain'
+    (маржа меньше min_score_margin) или 'answered'; answer — извлечённое
+    значение; evidence — выбранная запись; score и margin — её балл и маржа;
+    candidates — все доказательства-кандидаты."""
+    query: str  # текст запроса
+    status: str  # статус ответа
+    answer: str | None  # извлечённое значение или None
+    evidence: MemoryHit | None  # выбранная запись-доказательство
+    score: float | None  # итоговый балл выбранной записи
+    margin: float | None  # маржа над вторым кандидатом
+    candidates: tuple[RankedEvidence, ...]  # кортеж кандидатов после упорядочивания
 
 
-@dataclass(frozen=True)
-class MemoryAnswer:
-    query: str
-    status: str
-    answer: str | None
-    evidence: MemoryHit | None
-    score: float | None
-    margin: float | None
-    candidates: tuple[RankedEvidence, ...]
+def _first_identifier(text: str) -> str:  # первый идентификатор в тексте
+    match = _IDENTIFIER_RE.search(str(text))  # найти первый идентификатор
+    return match.group(0).casefold() if match else "none"  # идентификатор в нижнем регистре; если нет — "none"
 
 
-def _first_identifier(text: str) -> str:
-    match = _IDENTIFIER_RE.search(str(text))
-    return match.group(0).casefold() if match else "none"
+def _status_tag(text: str) -> str:  # грубый статус записи
+    final = bool(_FINAL_RE.search(text))  # есть ли слово окончательности
+    old = bool(_OLD_RE.search(text))  # есть ли слово устарелости
+    if old:  # слова устарелости важнее
+        return "old"  # устаревшая
+    if final:  # иначе есть слово окончательности
+        return "final"  # окончательная
+    return "neutral"  # иначе нейтральная
 
 
-def _status_tag(text: str) -> str:
-    final = bool(_FINAL_RE.search(text))
-    old = bool(_OLD_RE.search(text))
-    if old:
-        return "old"
-    if final:
-        return "final"
-    return "neutral"
+def _compact_words(text: str, max_chars: int = 45) -> str:  # сжатый текст
+    words = [w.casefold() for w in _TOKEN_RE.findall(str(text))]  # все слова текста в нижнем регистре
+    return " ".join(words)[:max_chars]  # слова через пробел, первые max_chars символов
 
 
-def _compact_words(text: str, max_chars: int = 45) -> str:
-    words = [w.casefold() for w in _TOKEN_RE.findall(str(text))]
-    return " ".join(words)[:max_chars]
+def pair_prompt(query: str, evidence: str, context: int = 160) -> bytes:  # запрос, доказательство, длина
+    """Строка фиксированной длины context байт — пара «запрос — доказательство»
+    для байтовой модели.
+
+        Явные признаки: IDM = 1, если первые идентификаторы запроса и
+        доказательства совпадают (и не равны "none"), иначе 0; ST — статус
+        доказательства. Хвост строки, на который модель предсказывает следующий
+        байт: "1" (релевантно) или "0" (нерелевантно).
+        Схема: fixed = "|IDM=<IDM>|ST=<ST>|R="; available = max(0, context −
+        |fixed| − |"Q=|E="|) в байтах; half = available // 2; слова запроса
+        обрезаются до half символов, слова доказательства — до available −
+        длина(слова запроса). Итог: "Q=<q>|E=<e>" + fixed; если длиннее context —
+        оставляется последние context байт; слева дополняется пробелами."""
+    if context < 32:  # контекст слишком мал для признаков и текста
+        raise ValueError("context must be >= 32")  # ошибка значения
+    query_id = _first_identifier(query)  # идентификатор запроса
+    evidence_id = _first_identifier(evidence)  # идентификатор доказательства
+    id_match = int(query_id != "none" and query_id == evidence_id)  # IDM = 1, если идентификаторы совпадают и не "none"
+    status = _status_tag(evidence)  # статус доказательства ST
+    fixed = f"|IDM={id_match}|ST={status}|R="  # неизменяемая часть строки с признаками
+    available = max(0, context - len(fixed.encode("utf-8")) - len("Q=|E="))  # место для слов: available = max(0, context − |fixed| − 6)
+    half = available // 2  # половина места
+    q_words = _compact_words(query, max_chars=half)  # слова запроса, до half символов
+    e_words = _compact_words(evidence, max_chars=available - len(q_words))  # слова доказательства, до available − длина(запроса)
+    body = f"Q={q_words}|E={e_words}{fixed}".encode("utf-8")  # тело: "Q=<q>|E=<e>" + fixed в байтах
+    if len(body) > context:  # тело длиннее контекста
+        body = body[-context:]  # оставить последние context байт
+    return b" " * (context - len(body)) + body  # дополнить пробелами слева до context байт
 
 
-def pair_prompt(query: str, evidence: str, context: int = 160) -> bytes:
-    """Create a fixed-size, inspectable pair representation for the ByteLM.
-
-    Explicit identifier equality and a coarse evidence-status tag are exposed
-    as features. The neural model learns how to combine these with query and
-    evidence words; this is not an opaque embedding or a truth detector.
-    """
-    if context < 32:
-        raise ValueError("context must be >= 32")
-    query_id = _first_identifier(query)
-    evidence_id = _first_identifier(evidence)
-    id_match = int(query_id != "none" and query_id == evidence_id)
-    status = _status_tag(evidence)
-    fixed = f"|IDM={id_match}|ST={status}|R="
-    available = max(0, context - len(fixed.encode("utf-8")) - len("Q=|E="))
-    half = available // 2
-    q_words = _compact_words(query, max_chars=half)
-    e_words = _compact_words(evidence, max_chars=available - len(q_words))
-    body = f"Q={q_words}|E={e_words}{fixed}".encode("utf-8")
-    if len(body) > context:
-        body = body[-context:]
-    return b" " * (context - len(body)) + body
+def pair_training_record(query: str, evidence: str, relevant: bool,  # запрос, доказательство, релевантность
+                         context: int = 160) -> bytes:  # длина контекста
+    """Один обучающий пример предсказания следующего байта: «1» — релевантно,
+    «0» — нерелевантно."""
+    return pair_prompt(query, evidence, context=context) + (b"1" if relevant else b"0")  # строка пары + байт метки
 
 
-def pair_training_record(query: str, evidence: str, relevant: bool,
-                         context: int = 160) -> bytes:
-    """One supervised next-byte example: 1 means relevant, 0 means not."""
-    return pair_prompt(query, evidence, context=context) + (b"1" if relevant else b"0")
+class TernaryEvidenceReranker:  # переупорядочиватель доказательств
+    """Оценивает найденные доказательства развернутой троичной байтовой моделью."""
+
+    def __init__(self, model, context: int | None = None):  # модель и длина контекста
+        self.model = model  # байтовая модель
+        self.context = int(context if context is not None else getattr(model, "context", 160))  # длина контекста: данная, иначе context модели, иначе 160
+        if int(getattr(model, "context", self.context)) != self.context:  # контекст модели задан и отличается
+            raise ValueError("reranker context does not match model architecture")  # ошибка: контекст не совпадает с устройством модели
+        self.model.eval()  # перевести модель в режим оценки
+
+    @torch.no_grad()  # без вычисления градиентов
+    def score(self, query: str, evidence: str) -> float:  # оценка пары
+        """Вернуть разность логитов logits['1'] − logits['0'] для следующего
+        байта строки пары."""
+        encoded = pair_prompt(query, evidence, context=self.context)  # строка пары длиной context
+        x = torch.tensor([list(encoded)], dtype=torch.long)  # тензор (1, context) кодов байтов
+        logits = self.model(x)[0]  # логиты следующего байта: убрана ось пакета
+        # Для упорядочивания разность логитов устойчивее, чем насыщающаяся вероятность.
+        return float((logits[ord("1")] - logits[ord("0")]).item())  # score = logits['1'] − logits['0']
 
 
-class TernaryEvidenceReranker:
-    """Scores retrieved evidence using a deployed TernaryAwareByteLM."""
+class MemoryAugmentedAgent:  # агент с памятью
+    """Гибридный поиск (полнотекстовый + семантический), троичное
+    переупорядочивание и проверенная обратная связь.
 
-    def __init__(self, model, context: int | None = None):
-        self.model = model
-        self.context = int(context if context is not None else getattr(model, "context", 160))
-        if int(getattr(model, "context", self.context)) != self.context:
-            raise ValueError("reranker context does not match model architecture")
-        self.model.eval()
+        Долговременный архив никогда не сокращается. Обратная связь меняет только
+        предпочтение внутри ограниченного рабочего набора; архив остаётся
+        источником, к которому всегда можно обратиться."""
 
-    @torch.no_grad()
-    def score(self, query: str, evidence: str) -> float:
-        encoded = pair_prompt(query, evidence, context=self.context)
-        x = torch.tensor([list(encoded)], dtype=torch.long)
-        logits = self.model(x)[0]
-        # Logit margin is more stable for ranking than a saturated probability.
-        return float((logits[ord("1")] - logits[ord("0")]).item())
-
-
-class MemoryAugmentedAgent:
-    """Hybrid FTS + semantic retrieval, ternary reranking and verified feedback.
-
-    The persistent archive is never pruned. Utility feedback only affects the
-    bounded working-set preference; the archive remains the fallback source.
-    """
-
+    # конструктор агента: архив, индексы, переупорядочиватель и параметры балла
     def __init__(
-        self,
-        memory: DiskBackedContext,
-        semantic_index,
-        reranker: TernaryEvidenceReranker,
-        utility_index=None,
-        utility_weight: float = 0.10,
-        cache_bonus: float = 0.0,
-        max_candidates: int = 24,
-        min_score_margin: float = 0.0,
+        self,  # создаваемый агент
+        memory: DiskBackedContext,  # дисковый архив с полнотекстовым поиском
+        semantic_index,  # семантический индекс с методом search(query, limit) или None
+        reranker: TernaryEvidenceReranker,  # переупорядочиватель доказательств
+        utility_index=None,  # индекс полезности страниц или None
+        utility_weight: float = 0.10,  # вес полезности в итоговом балле
+        cache_bonus: float = 0.0,  # прибавка за страницу в кэше
+        max_candidates: int = 24,  # максимум возвращаемых кандидатов
+        min_score_margin: float = 0.0,  # минимальная маржа для ответа
     ):
-        if max_candidates < 1 or utility_weight < 0 or cache_bonus < 0 or min_score_margin < 0:
-            raise ValueError("invalid agent configuration")
-        self.memory = memory
-        self.semantic_index = semantic_index
-        self.reranker = reranker
-        self.utility_index = utility_index
-        self.utility_weight = float(utility_weight)
-        self.cache_bonus = float(cache_bonus)
-        self.max_candidates = int(max_candidates)
-        self.min_score_margin = float(min_score_margin)
+        """Создать агент; вернуть кандидатов не более max_candidates."""
+        if max_candidates < 1 or utility_weight < 0 or cache_bonus < 0 or min_score_margin < 0:  # неверные параметры: кандидатов < 1 или отрицательный вес/прибавка/маржа
+            raise ValueError("invalid agent configuration")  # ошибка значения
+        self.memory = memory  # дисковый архив
+        self.semantic_index = semantic_index  # семантический индекс
+        self.reranker = reranker  # переупорядочиватель
+        self.utility_index = utility_index  # индекс полезности
+        self.utility_weight = float(utility_weight)  # вес полезности
+        self.cache_bonus = float(cache_bonus)  # прибавка за кэш
+        self.max_candidates = int(max_candidates)  # максимум кандидатов
+        self.min_score_margin = float(min_score_margin)  # минимальная маржа
 
-    def retrieve(self, query: str) -> tuple[RankedEvidence, ...]:
-        hits: list[MemoryHit] = []
-        seen: set[tuple[int, int, int]] = set()
+    def retrieve(self, query: str) -> tuple[RankedEvidence, ...]:  # найти и упорядочить доказательства
+        """Вернуть до max_candidates доказательств, упорядоченных по
+        combined = neural + utility_weight·utility + cache_bonus·cached
+        по убыванию; при равенстве — страница с меньшим page_id."""
+        hits: list[MemoryHit] = []  # накопленные попадания без повторов
+        seen: set[tuple[int, int, int]] = set()  # уже добавленные (page_id, char_start, char_end)
 
-        def add(found: Iterable[MemoryHit]) -> None:
-            for hit in found:
-                key = (hit.page_id, hit.char_start, hit.char_end)
-                if key not in seen:
-                    seen.add(key)
-                    hits.append(hit)
+        def add(found: Iterable[MemoryHit]) -> None:  # добавить находки без повторов
+            for hit in found:  # по каждой находке
+                key = (hit.page_id, hit.char_start, hit.char_end)  # ключ: (страница, начало, конец)
+                if key not in seen:  # такой записи ещё не было
+                    seen.add(key)  # запомнить ключ
+                    hits.append(hit)  # добавить находку
 
-        # Exact identifier lookup anchors entity identity even when the user's
-        # wording is a paraphrase; semantic/FTS retrieval adds related context.
-        identifier = _first_identifier(query)
-        if identifier != "none":
-            add(self.memory.search(identifier, limit=self.max_candidates))
-        if self.semantic_index is not None:
-            add(self.semantic_index.search(query, limit=self.max_candidates))
-        add(self.memory.search(query, limit=self.max_candidates))
+        # Точный поиск идентификатора фиксирует сущность, даже если пользователь
+        # выразился иначе; семантический и полнотекстовый поиск добавляют связный контекст.
+        identifier = _first_identifier(query)  # идентификатор запроса или "none"
+        if identifier != "none":  # в запросе есть идентификатор
+            add(self.memory.search(identifier, limit=self.max_candidates))  # добавить страницы с этим идентификатором
+        if self.semantic_index is not None:  # семантический индекс подключён
+            add(self.semantic_index.search(query, limit=self.max_candidates))  # добавить его находки по запросу
+        add(self.memory.search(query, limit=self.max_candidates))  # добавить полнотекстовые находки по запросу
 
-        if not hits:
-            return ()
+        if not hits:  # ничего не найдено
+            return ()  # пустой кортеж
 
-        cached_ids: set[int] = set()
-        learner = None
-        if self.utility_index is not None:
-            cached_ids = self.utility_index.working_set.cached_page_ids
-            learner = self.utility_index.working_set.learner
+        cached_ids: set[int] = set()  # номера страниц в кэше
+        learner = None  # оценка полезности страницы
+        if self.utility_index is not None:  # индекс полезности подключён
+            cached_ids = self.utility_index.working_set.cached_page_ids  # страницы рабочего набора в кэше
+            learner = self.utility_index.working_set.learner  # обучаемая оценка текста страницы
 
-        ranked: list[RankedEvidence] = []
-        for hit in hits[: self.max_candidates * 3]:
-            neural = self.reranker.score(query, hit.text)
-            utility = learner.score(hit.text) if learner is not None else 0.0
-            cached = hit.page_id in cached_ids
-            combined = neural + self.utility_weight * utility + (self.cache_bonus if cached else 0.0)
-            ranked.append(RankedEvidence(hit, neural, utility, cached, combined))
-        ranked.sort(key=lambda item: (item.combined_score, -item.hit.page_id), reverse=True)
-        return tuple(ranked[: self.max_candidates])
+        ranked: list[RankedEvidence] = []  # доказательства с баллами
+        for hit in hits[: self.max_candidates * 3]:  # оцениваются не более 3·max_candidates находок
+            neural = self.reranker.score(query, hit.text)  # балл нейросети: logits['1'] − logits['0']
+            utility = learner.score(hit.text) if learner is not None else 0.0  # полезность текста страницы или 0
+            cached = hit.page_id in cached_ids  # страница в кэше рабочего набора
+            combined = neural + self.utility_weight * utility + (self.cache_bonus if cached else 0.0)  # итог combined = neural + utility_weight·utility + cache_bonus·cached
+            ranked.append(RankedEvidence(hit, neural, utility, cached, combined))  # сохранить доказательство с баллами
+        ranked.sort(key=lambda item: (item.combined_score, -item.hit.page_id), reverse=True)  # по combined по убыванию; при равенстве — по −page_id по убыванию (меньший page_id первым)
+        return tuple(ranked[: self.max_candidates])  # первые max_candidates
 
-    def answer(self, query: str) -> MemoryAnswer:
-        candidates = self.retrieve(query)
-        if not candidates:
-            return MemoryAnswer(query, "unknown", None, None, None, None, ())
-        top = candidates[0]
-        second_score = candidates[1].combined_score if len(candidates) > 1 else None
-        margin = None if second_score is None else top.combined_score - second_score
-        value_match = _VALUE_RE.search(top.hit.text)
-        if value_match is None:
-            return MemoryAnswer(query, "no_extractable_value", None, top.hit, top.combined_score,
-                                margin, candidates)
-        if margin is not None and margin < self.min_score_margin:
-            return MemoryAnswer(query, "uncertain", None, top.hit, top.combined_score,
-                                margin, candidates)
-        return MemoryAnswer(query, "answered", value_match.group(1), top.hit,
-                            top.combined_score, margin, candidates)
+    def answer(self, query: str) -> MemoryAnswer:  # ответ на запрос
+        """Вернуть ответ: значение X из «value = X» лучшего кандидата, если он
+        есть и маржа не меньше min_score_margin; иначе статус объясняет отказ."""
+        candidates = self.retrieve(query)  # упорядоченные кандидаты
+        if not candidates:  # кандидатов нет
+            return MemoryAnswer(query, "unknown", None, None, None, None, ())  # статус "unknown", без ответа
+        top = candidates[0]  # лучший кандидат
+        second_score = candidates[1].combined_score if len(candidates) > 1 else None  # балл второго кандидата или None
+        margin = None if second_score is None else top.combined_score - second_score  # margin = балл первого − балл второго
+        value_match = _VALUE_RE.search(top.hit.text)  # найти «value = X» в тексте лучшего
+        if value_match is None:  # извлекаемого значения нет
+            return MemoryAnswer(query, "no_extractable_value", None, top.hit, top.combined_score,  # статус: нет извлекаемого значения
+                                margin, candidates)  # с доказательством, баллом, маржой и кандидатами
+        if margin is not None and margin < self.min_score_margin:  # есть второй кандидат и маржа меньше порога
+            return MemoryAnswer(query, "uncertain", None, top.hit, top.combined_score,  # статус: неуверенно
+                                margin, candidates)  # ответ не выдаётся
+        return MemoryAnswer(query, "answered", value_match.group(1), top.hit,  # статус: отвечено, answer = X
+                            top.combined_score, margin, candidates)  # с баллом, маржой и кандидатами
 
-    def record_verified_feedback(self, result: MemoryAnswer, verified_correct: bool,
-                                 verifier: str, refresh: bool = False):
-        """Update utility only after an external correctness judgement.
+    def record_verified_feedback(self, result: MemoryAnswer, verified_correct: bool,  # ответ, проверенная правильность
+                                 verifier: str, refresh: bool = False):  # имя проверяющего, пересчитать ли рабочее множество
+        """Обновить полезность страницы только после внешней проверки.
+        Возврат — результат записи обратной связи.
 
-        There is deliberately no self-reward or confidence-only update path.
-        """
-        if not isinstance(verified_correct, bool):
-            raise TypeError("verified_correct must be an explicit bool")
-        source = str(verifier).strip()
-        if not source:
-            raise ValueError("a verifier/source label is required")
-        if result.evidence is None:
-            raise ValueError("cannot provide page feedback without selected evidence")
-        if self.utility_index is None:
-            raise RuntimeError("no utility index is attached to this agent")
-        reward = 1.0 if verified_correct else -1.0
-        feedback = self.utility_index.record_page_feedback(result.evidence.page_id, reward=reward)
-        if refresh:
-            self.utility_index.refresh()
-        return feedback
+            Специального пути «самонаграды» или обновления по одной уверенности
+            нет. reward = +1, если verified_correct, иначе −1."""
+        if not isinstance(verified_correct, bool):  # правильность должна быть явным True/False
+            raise TypeError("verified_correct must be an explicit bool")  # ошибка типа
+        source = str(verifier).strip()  # имя проверяющего без крайних пробелов
+        if not source:  # имя пусто
+            raise ValueError("a verifier/source label is required")  # ошибка значения
+        if result.evidence is None:  # доказательство не выбрано
+            raise ValueError("cannot provide page feedback without selected evidence")  # ошибка: не к какой странице относить оценку
+        if self.utility_index is None:  # индекс полезности не подключён
+            raise RuntimeError("no utility index is attached to this agent")  # ошибка времени выполнения
+        reward = 1.0 if verified_correct else -1.0  # reward = +1 при правильном ответе, иначе −1
+        feedback = self.utility_index.record_page_feedback(result.evidence.page_id, reward=reward)  # записать оценку +reward странице доказательства
+        if refresh:  # требуется пересборка
+            self.utility_index.refresh()  # пересчитать рабочее множество
+        return feedback  # результат записи
