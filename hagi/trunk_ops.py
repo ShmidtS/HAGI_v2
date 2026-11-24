@@ -211,6 +211,29 @@ def paired_gain(before, after, z: float = 2.4):
     se = (d.std(ddof=1) / _np.sqrt(len(d))) if len(d) > 1 else 0.0
     return float(d.mean()), float(d.mean() - z * se)
 
+
+def paired_margin_eb(d, n_states: int = 1, delta: float = 0.05) -> float:
+    """WAVE 259 — the PROVEN one-sided margin for a paired gate, the
+    empirical-Bernstein mean bound of
+    Hagi/Probability/EmpiricalBernstein.lean
+    (`empirical_bernstein_mean_bound`):
+        eps = sqrt(2 * sig2 * L / n) + 2 * b * L / n,   L = ln(2 / alpha)
+    with a union bound over the `n_states` candidate states that were
+    scored on the same holdout (Hagi/Theory/HoldoutGateTwoWay.lean):
+    alpha = delta / n_states. `d` = per-window loss difference
+    (old - new; positive = candidate better); sig2 = sample variance,
+    b = max |d|. The gate may accept only if mean(d) > eps.
+    Unlike `paired_gain` (normal approximation, z*SE) this bound does
+    not assume a normal d and covers the best-of-K selection."""
+    d = _np.asarray(d, dtype=float)
+    n = len(d)
+    if n < 2 or not _np.isfinite(d).all():
+        return float("inf")
+    L = _np.log(2.0 * max(1, n_states) / delta)
+    sig2 = float(d.var(ddof=1))
+    b = float(_np.abs(d).max())
+    return float(_np.sqrt(2.0 * sig2 * L / n) + 2.0 * b * L / n)
+
 # ---- Polar-Express (primes Hagi/Optimization/PolarExpressCert.lean) -----
 # Three QUINTIC steps x <- a*x + b*x^3 + c*x^5 with rational
 # coefficients; polar_express_cycle_cert: spectrum [1/1000, 1] maps

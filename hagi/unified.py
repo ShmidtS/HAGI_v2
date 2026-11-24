@@ -430,6 +430,8 @@ class Unified:
     GROW_BLOCKS = 0         # WAVE 257: OFF by default — measured (60 chunks,
                             # OLD first-10 CE): blocks +2.07 vs no blocks +0.55
     FORGET_TOL = 0.0
+    # WAVE 259: round acceptance = paired gain > empirical-Bernstein margin
+    # (RepairForgetting.lean tol; HoldoutGateTwoWay.lean union bound).
     REPAIR_MODE = "replay"   # "replay" (retrain old bytes) | "block"
     REPAIR_ROUNDS = 6       # measured: rounds=3/lr=1e-3 -> +0.343;
                             # rounds=6/lr=3e-4 -> +0.036 (no repair: +0.553)
@@ -455,6 +457,7 @@ class Unified:
         if not sets:
             return {"rounds": [], "why": "no_bytes"}
         post = self._old_domains_ce(exclude)
+        post_vec = self._old_domains_ce_vec(exclude)[1]
         rounds = []
         if self.REPAIR_MODE == "replay":
             # WAVE 257 (measured, fresh production-size model, 60 chunks,
@@ -474,16 +477,28 @@ class Unified:
                     break
                 m.train_certified(old_bytes, epochs=2, holdout_seed=99,
                                     lr=self.REPAIR_LR)
-                new = self._old_domains_ce(exclude)
-                if new is None or new >= post - 1e-4:
+                new_vec = self._old_domains_ce_vec(exclude)[1]
+                new = None if new_vec is None else float(new_vec.mean())
+                # WAVE 259 (RepairForgetting.lean): a round is accepted
+                # only if the paired gain clears the empirical-Bernstein
+                # margin (the old 1e-4 tolerance made repair_drop_bound
+                # vacuous). n_states = rounds tried so far + this one.
+                from hagi.trunk_ops import paired_margin_eb
+                margin = (paired_margin_eb(post_vec - new_vec, n_states=len(rounds) + 1)
+                          if (new_vec is not None and post_vec is not None) else float("inf"))
+                gain = None if new is None else post - new
+                if gain is None or not (gain > margin):
                     with _t.no_grad():
                         for q, s0 in zip(m.params(), snap):
                             q.copy_(s0)
-                    rounds.append({"ce": post, "after": new, "status": "ROLLBACK"})
+                    rounds.append({"ce": post, "after": new, "gain": gain,
+                                   "margin": None if margin == float("inf") else round(margin, 4),
+                                   "status": "ROLLBACK"})
                     break
-                rounds.append({"ce": post, "after": new, "status": "RETRAIN"})
-                post = new
-            return {"rounds": rounds, "mode": "replay",
+                rounds.append({"ce": post, "after": new, "gain": round(gain, 4),
+                               "margin": round(margin, 4), "status": "RETRAIN"})
+                post, post_vec = new, new_vec
+            return {"rounds": rounds, "mode": "replay", "why": "ran" if rounds else "none",
                     "forgot": None if post is None else round(post - pre, 4)}
         why = ("no_post" if post is None else
                "cap" if len(getattr(m, "blocks", [])) >= self.MAX_BLOCKS else
@@ -562,11 +577,17 @@ class Unified:
         def batch(p):
             pt = _t.as_tensor(p, dtype=_t.long, device=m.device)
             return raw[pt[:, None] + _t.arange(k, device=m.device)[None, :]], raw[pt + k]
-        Xv, yv = batch(_np.arange(cut, n)[:512])
-        def hold_ce():
+        Xv, yv = batch(_np.arange(max(cut, n - 2048), n))
+        self.model.domain_adapter = None
+
+        def hold_vec():
             with _t.no_grad():
-                return float(_t.nn.functional.cross_entropy(m.logits(Xv), yv))
+                return _t.nn.functional.cross_entropy(m.logits(Xv), yv, reduction="none").double().cpu().numpy()
+
+        def hold_ce():
+            return float(hold_vec().mean())
         before = hold_ce()
+        base_before = hold_vec()            # block is an exact identity here
         opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=1e-3)   # trunk frozen
         tr = _np.arange(m.k, cut)
         # WAVE 255b: the block's holdout CE is NOT monotone in the warm-up
@@ -576,6 +597,7 @@ class Unified:
         # the first version returned the last state and rolled back a
         # block that was already winning.
         best_ce, best_blk = before, {k: v.detach().clone() for k, v in blk.items()}
+        n_eval = 1
         for _ in range(2):
             for s in range(0, len(tr), 64):
                 sel = rng.choice(tr, min(64, len(tr)), replace=False)
@@ -584,6 +606,7 @@ class Unified:
                 _t.nn.functional.cross_entropy(m.logits(Xb), yb).backward()
                 opt.step()
                 if s % (64 * 50) == 0:
+                    n_eval += 1
                     c = hold_ce()
                     if c < best_ce:
                         best_ce = c
@@ -596,11 +619,23 @@ class Unified:
         after = hold_ce()
         # WAVE 257: strict — measured on the production model a block with
         # ce_before == ce_after (3.4673 -> 3.4673) was accepted as GROW.
-        if after >= before - 1e-4:
+        # WAVE 259 (HoldoutGateTwoWay.lean): the gate may accept only if
+        # the paired gain clears the empirical-Bernstein margin over the
+        # `n_states` block states that were scored on this holdout
+        # (best-of-K selection = union bound). Measured on 6 fresh
+        # domains: gain 0.50..2.11 vs margin 0.29..0.62 (k=512),
+        # 0.12..0.26 (k=2048).
+        from hagi.trunk_ops import paired_margin_eb
+        diff = base_before - hold_vec()                # old - new, >0 = block helps
+        gain = float(diff.mean())
+        margin = paired_margin_eb(diff, n_states=n_eval)
+        if not (gain > margin):
             m.blocks.pop()                    # not earned -> exact rollback
-            return {"status": "ROLLBACK", "ce_before": before, "ce_after": after}
+            return {"status": "HOLD_UNCERTAIN", "ce_before": before, "ce_after": after,
+                    "gain": round(gain, 4), "margin": round(margin, 4)}
         return {"status": "GROW", "blocks": len(m.blocks), "signal": round(signal, 1),
                 "ce_before": round(before, 4), "ce_after": round(after, 4),
+                "gain": round(gain, 4), "margin": round(margin, 4),
                 "params": sum(q.numel() for q in m.params())}
 
     def _live_adapter(self, domain: str | None):
@@ -654,19 +689,21 @@ class Unified:
             self.u.model.domain_adapter = self.prev
             return False
 
-    def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
-        """WAVE 199: measured CE on a sample of OLD domains (the
-        candidate-vs-incumbent gate-val). None when no old domains.
-        Pure CE measurement — no training happens here."""
-        import numpy as np
+    def _old_domains_ce_vec(self, exclude: str, max_domains: int = 8):
+        """WAVE 259: per-window CE on FIXED old-domain windows (the
+        same sample/windows as the old scalar gate: rng(11) domains,
+        <=256 strided windows each). Returns (names, vector) or
+        (None, None). The vector is what a PAIRED gate needs: the
+        empirical-Bernstein margin of EmpiricalBernstein.lean applies
+        to per-window differences, not to a mean of means."""
         names = [n for n in self.domains if n != exclude]
         if not names:
-            return None
+            return None, None
         rng = np.random.default_rng(11)
         sample = list(rng.choice(names, min(max_domains, len(names)),
                                  replace=False))
         t = self.model.t
-        ces = []
+        vec = []
         with t.no_grad():
             for name in sample:
                 d = self._domain_bytes(name, self.domains[name])
@@ -680,11 +717,21 @@ class Unified:
                 X = np.stack([idx[i:i + k] for i in sel])
                 y = idx[sel + k]
                 dev = getattr(self.model, "device", "cpu")
-                ctx = t.as_tensor(X, dtype=t.long, device=dev)
-                nxt = t.as_tensor(y, dtype=t.long, device=dev)
-                ces.append(float(t.nn.functional.cross_entropy(
-                    self.model.logits(ctx), nxt)))
-        return sum(ces) / len(ces) if ces else None
+                ce = t.nn.functional.cross_entropy(
+                    self.model.logits(t.as_tensor(X, dtype=t.long, device=dev)),
+                    t.as_tensor(y, dtype=t.long, device=dev), reduction="none")
+                vec.append(ce.double().cpu().numpy())
+        if not vec:
+            return None, None
+        return sample, np.concatenate(vec)
+
+    def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
+        """WAVE 199: measured CE on a sample of OLD domains (the
+        candidate-vs-incumbent gate-val). None when no old domains.
+        Pure CE measurement — no training happens here. WAVE 259: the
+        mean of the per-window vector (same number as before)."""
+        _, v = self._old_domains_ce_vec(exclude, max_domains)
+        return None if v is None else float(v.mean())
 
     def ingest_file(self, path: Path, epochs: int = 200, repeat: int = 2) -> dict:
         data = path.read_bytes()
