@@ -1,24 +1,47 @@
-"""Shared tiny utilities (DRY: sha was duplicated in 6 modules)."""
+"""Общие мелкие утилиты проекта.
 
-from __future__ import annotations
+Содержит две вещи, нужные многим модулям:
 
-import hashlib
-import json
+- sha(obj) — устойчивый хеш-отпечаток содержимого объекта:
+  obj -> канонический JSON (ключи отсортированы, без лишних пробелов)
+  -> байты UTF-8 -> SHA-256 -> шестнадцатеричная строка.
+  Одинаковое содержимое даёт одинаковый хеш независимо от порядка
+  ключей при создании словаря.
+- CKPT_DIR — единый каталог для всех чекпойнтов модели: берётся из
+  переменной окружения HAGI_CKPT_DIR, а если она не задана — это
+  <корень проекта>/checkpoints, где корень — папка на уровень выше
+  папки с этим файлом.
+
+Экспортирует: sha, ROOT, CKPT_DIR.
+"""
+
+from __future__ import annotations  # имена типов в аннотациях можно не импортировать заранее
+
+import hashlib  # алгоритм SHA-256 для хеша
+import json  # превращение объекта в текст JSON
 
 
 def sha(obj) -> str:
-    """Canonical content hash: stable JSON dump, SHA-256 hex."""
-    return hashlib.sha256(
-        json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    """Хеш-отпечаток содержимого объекта: SHA-256 от его канонического JSON.
+
+    Аргумент obj — любой объект, который умеет сохранять json.dumps
+    (словарь, список, число, строка и т. п.).
+    Формула: s = json.dumps(obj) с сортировкой ключей и разделителями
+    "," и ":" без пробелов; h = hex(SHA256(UTF8(s))).
+    Возвращает строку из 64 шестнадцатеричных символов.
+    """
+    return hashlib.sha256(  # SHA-256 от байтов JSON и итог в виде hex-строки
+        json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()  # канонический JSON: ключи по алфавиту, разделители "," и ":" без пробелов, затем байты UTF-8
+    ).hexdigest()  # итог: hex-строка из 64 символов, h = hex(SHA256(b))
 
 
 
-import os as _os
-from pathlib import Path as _Path
+import os as _os  # доступ к переменным окружения (под коротким именем _os)
+from pathlib import Path as _Path  # работа с путями (под коротким именем _Path)
 
-# WAVE 185c: SSOT checkpoint root — every module MUST write
-# checkpoints through this (tests set HAGI_CKPT_DIR to a sandbox;
-# nothing may touch production paths directly).
-ROOT = _Path(__file__).resolve().parents[1]
-CKPT_DIR = _Path(_os.environ.get("HAGI_CKPT_DIR", str(ROOT / "checkpoints")))
+# Единый корень для чекпойнтов: каждый модуль обязан сохранять их только
+# через CKPT_DIR, чтобы весь проект лежал в одном месте.
+# Тесты задают переменную окружения HAGI_CKPT_DIR и указывают ей
+# временную папку, поэтому рабочие чекпойнты не затрагиваются.
+ROOT = _Path(__file__).resolve().parents[1]  # корень проекта: полный путь к этому файлу, подняться на один уровень выше папки hagi
+CKPT_DIR = _Path(_os.environ.get("HAGI_CKPT_DIR", str(ROOT / "checkpoints")))  # каталог чекпойнтов: путь из HAGI_CKPT_DIR, если задан, иначе ROOT/checkpoints
