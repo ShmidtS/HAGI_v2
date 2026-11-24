@@ -1,645 +1,694 @@
 #!/usr/bin/env python3
-"""HAGI self-development loop — iterated self-model derivation and adoption.
+"""Цикл саморазвития HAGI: многократный вывод модели самого себя и её принятие.
 
-Extends hagi.selfmodel (single-shot TRACE->DERIVE->OPTIMIZE->GATE) with:
+Надстройка над hagi.selfmodel (однократный цикл СЛЕД -> ВЫВОД -> ОПТИМИЗАЦИЯ -> ГЕЙТ):
 
-  1. An exact decision-list self-model (lookup keyed on full trace
-     features; unknown -> conservative default). Exact on the trace by
-     construction; holdout-validated (confidently-wrong HOLD predictions
-     block adoption).
-  2. Multi-round growth: each adopted round enlarges the task library
-     with fresh non-circular proposals, re-derives the self-model and
-     re-gates. Stops on the first HOLD gate or when the certified relief
-     margin (MIN_RELIEF) is not met — the certified-convergence stop
-     (theory R223: no certified-positive action = resource exhausted).
+  1. Точная модель самого себя в виде решающего списка: таблица с ключом из всех
+     признаков следа; неизвестный ключ -> осторожный базовый бюджет. На следе она
+     точна по построению; на отложенной части следа проверяется опасное направление
+     (уверенно неверное предсказание HOLD блокирует принятие).
+  2. Многораундовое движение: каждый принятый раунд дополняет библиотеку задач новыми
+     некруговыми предложениями, заново выводит модель самого себя и снова проходит
+     гейт. Остановка — на первом гейте HOLD или когда запас снижения стоимости
+     меньше нормы MIN_RELIEF: нет принятого действия с гарантированной пользой,
+     значит ресурс исчерпан.
 
-Performance (2026-11-15):
-  - Replay cache: prefix tasks whose assigned budget is unchanged reuse
-    the recorded outcome instead of re-learning -> the per-round full
-    replay becomes O(new tasks), the whole loop linear.
-  - Parallel batches: proposal tasks are learned in worker processes
-    (in-process, deterministic order; parallelism via BLAS/OMP) against
-    a snapshot of the library; results merge in stream order.
-    Batch semantics: tasks within one batch do not see each other's
-    commits. Both incumbent growth and optimized replay use the same
-    batching, so streams stay deterministic and comparable.
+Быстродействие:
+  - Кэш повторного прогона: задачи-префикса, чей назначенный бюджет не изменился,
+    используют записанный исход вместо повторного обучения. Полный повторный прогон
+    раунда стоит O(новых задач), весь цикл линеен.
+  - Пакеты заданий: задачи-предложения учатся на одном общем процессоре строго по
+    порядку (без подпроцессов), параллельность даёт только BLAS/OMP внутри numpy и
+    torch. Все слияния идут в порядке потока, поэтому оба прогона (рост и
+    оптимизированный повтор) детерминированы и сравнимы.
 
-CLI: python -m hagi.loop [--max-rounds N] [--workers N] [--json]
+Запуск: python -m hagi.loop [--max-rounds N] [--workers N] [--json]
 """
-from __future__ import annotations
+from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-import os
-# BLAS/OMP threads: with no spawn workers (2026-11-17), all machine
-# cores go to the numeric libraries. Only set if the user hasn't.
-for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_v, str(os.cpu_count() or 4))
+import os  # доступ к переменным окружения и числу процессоров
+# Число потоков BLAS/OMP: отдельных процессов-исполнителей нет, поэтому все ядра
+# машины отдаются численным библиотекам. Ставится только если пользователь не задал.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):  # по именам трёх переменных числа потоков
+    os.environ.setdefault(_v, str(os.cpu_count() or 4))  # задать переменную, если её ещё нет: число процессоров (при 0 — 4)
 
-import argparse
-import json
-import time
-from pathlib import Path
-from typing import Any, Optional
+import argparse  # разбор аргументов командной строки
+import json  # запись отчёта в JSON
+import time  # измерение времени
+from pathlib import Path  # путь к файлу отчёта
+from typing import Any, Optional  # типы для аннотаций
 
-import numpy as np
+import numpy as np  # численные массивы и генератор случайных чисел
 
-import hagi
-from hagi.selfmodel import (
-    FEATURE_KEYS,
-    SelfOptimizingProcessorV9,
-    TracedProcessorV9,
-    describe_pipeline,
-    impossibility_certificate,
+import hagi  # ядро системы: набор задач, предложения задач, процессоры
+from hagi.selfmodel import (  # из модуля модели самого себя:
+    FEATURE_KEYS,  # имена семи признаков задачи в следе
+    SelfOptimizingProcessorV9,  # процессор с бюджетом от модели самого себя
+    TracedProcessorV9,  # процессор, ведущий след своего обучения
+    describe_pipeline,  # описание конвейера по журналу роста
+    impossibility_certificate,  # свидетельство невозможности точного предсказателя успеха
 )
 
-FULL_KEY = FEATURE_KEYS + ("seed",)         # +seed: task-exact key (batch
-                                            # semantics make `library` constant
-                                            # within a batch — seed disambiguates)
-MIN_RELIEF = 0.02                            # certified relief margin per round
+FULL_KEY = FEATURE_KEYS + ("seed",)  # полный ключ задачи: семь признаков плюс зерно seed (внутри пакета библиотека неизменна, зерно различает задачи)
+MIN_RELIEF = 0.02  # минимальная доля снижения стоимости на раунд: новое ≤ старое·(1 − 0.02)
 
 
 # ------------------------------------------------------------------ model ----
 
 class DecisionListSelfModel:
-    """Exact-by-construction success/cost predictor over trace features.
+    """Точный по построению предсказатель успеха и стоимости по признакам следа.
 
-    Only exact full-key predictions floor a task: the replay stream is
-    deterministic, so keys re-occur verbatim. Anything less (coarse-key
-    generalization) once produced a confidently-wrong HOLD and lost an
-    expert (round-2 gate reject) — uncertified generalization stays out.
-    """
+    Решающий список: ключ — полный кортеж (семь признаков, зерно). Успех 1 или 0
+    берётся только для ключей, у которых в следе один и тот же исход во всех записях;
+    стоимость — максимум по ним. Ключи с разными исходами попадают в список
+    неоднозначных и предсказания не дают; обобщение по грубому ключу не используется:
+    однажды уверенно неверный HOLD стоил потерянного эксперта."""
 
-    def __init__(self, trace: list[dict[str, Any]]):
-        succ: dict[tuple, set[int]] = {}
-        cost: dict[tuple, list[int]] = {}
-        for t in trace:
-            k = tuple(t[f] for f in FULL_KEY)
-            succ.setdefault(k, set()).add(t["success"])
-            cost.setdefault(k, []).append(t["cost"])
-        # WAVE 230 FIX: v.pop() emptied every consistent set, so
-        # len(succ[k]) == 1 was always False downstream and the cost
-        # model was dead. Record consistency BEFORE mutating.
-        consistent = {k for k, v in succ.items() if len(v) == 1}
-        self._succ = {k: next(iter(succ[k])) for k in consistent}
-        self._ambig = sorted(k for k, v in succ.items() if len(v) > 1)
-        self._cost = {k: max(vs) for k, vs in cost.items()
-                      if k in consistent}
+    def __init__(self, trace: list[dict[str, Any]]):  # построить модель по следу trace
+        succ: dict[tuple, set[int]] = {}  # ключ -> множество значений успеха в следе
+        cost: dict[tuple, list[int]] = {}  # ключ -> список стоимостей в следе
+        for t in trace:  # по записям следа
+            k = tuple(t[f] for f in FULL_KEY)  # ключ k = (признаки задачи, зерно)
+            succ.setdefault(k, set()).add(t["success"])  # добавить исход успеха в множество ключа k
+            cost.setdefault(k, []).append(t["cost"])  # добавить стоимость в список ключа k
+        # Согласованность считается ДО каких-либо изменений множеств: раньше множество
+        # опустошалось обходом, проверка «ровно один исход» всегда была ложной, и
+        # модель стоимости не работала.
+        consistent = {k for k, v in succ.items() if len(v) == 1}  # согласованные ключи: |succ[k]| = 1 (исход всегда один)
+        self._succ = {k: next(iter(succ[k])) for k in consistent}  # предсказание успеха: единственный исход согласованного ключа
+        self._ambig = sorted(k for k, v in succ.items() if len(v) > 1)  # отсортированные неоднозначные ключи: |succ[k]| > 1
+        self._cost = {k: max(vs) for k, vs in cost.items()  # стоимость согласованного ключа = максимум по его записям
+                      if k in consistent}  # берутся только согласованные ключи
 
     def predict_success(self, feats: dict[str, Any]) -> Optional[int]:
-        return self._succ.get(tuple(feats[f] for f in FULL_KEY))
+        """Предсказать успех задачи по признакам feats: 0 или 1, либо None, если ключ неизвестен."""
+        return self._succ.get(tuple(feats[f] for f in FULL_KEY))  # lookup по полному ключу (признаки, зерно)
 
     def predict_cost(self, feats: dict[str, Any]) -> Optional[int]:
-        return self._cost.get(tuple(feats[f] for f in FULL_KEY))
+        """Предсказать стоимость задачи в кандидатах по признакам feats; None, если ключ неизвестен."""
+        return self._cost.get(tuple(feats[f] for f in FULL_KEY))  # lookup по полному ключу (признаки, зерно)
 
-    @property
-    def ambiguous_keys(self) -> list[tuple]:
-        return self._ambig
+    @property  # доступ как к атрибуту
+    def ambiguous_keys(self) -> list[tuple]:  # список ключей с противоречивыми исходами
+        """Ключи, у которых в следе были и успех, и неуспех."""
+        return self._ambig  # отсортированный список неоднозначных ключей
 
     def describe(self) -> dict[str, Any]:
-        return {
-            "kind": "exact-decision-list",
-            "full_key_rules": len(self._succ),
-            "ambiguous_keys": len(self._ambig),
-        }
+        """Краткое описание модели: вид, число правил и число неоднозначных ключей."""
+        return {  # словарь описания
+            "kind": "exact-decision-list",  # вид: точный решающий список
+            "full_key_rules": len(self._succ),  # число правил = числу согласованных ключей
+            "ambiguous_keys": len(self._ambig),  # число неоднозначных ключей
+        }  # конец словаря
 
 
 def holdout_validate(trace: list[dict[str, Any]],
-                     fraction: float = 0.30) -> dict[str, Any]:
-    """Derive on train split, check the dangerous direction on holdout:
-    a confident HOLD prediction for a task that would COMMIT blocks
-    adoption. Unknown predictions default to base budget (safe; any
-    regression they cause is caught by the non-regression gate)."""
-    rng = np.random.default_rng(7)
-    idx = rng.permutation(len(trace))
-    n_hold = max(1, int(len(trace) * fraction))
-    hold_idx = set(idx[:n_hold].tolist())
-    train = [t for i, t in enumerate(trace) if i not in hold_idx]
-    hold = [trace[i] for i in sorted(hold_idx)]
-    m = DecisionListSelfModel(train)
-    confident_wrong = 0
-    unknown_safe = 0
-    for t in hold:
-        pred = m.predict_success(t)
-        truth = t["success"]
-        if pred is None:
-            if truth == 0:
-                unknown_safe += 1
-        elif pred != truth:
-            confident_wrong += 1
-    # WAVE 196 FIX (P1): a model with ZERO coverage (predicts None
-    # for every holdout item) trivially has confident_wrong == 0 —
-    # it passed the gate while predicting nothing. Coverage is now
-    # required for the "exact" verdict.
-    covered = sum(1 for t in hold if m.predict_success(t) is not None)
-    coverage = covered / len(hold) if hold else 0.0
-    return {"holdout_size": len(hold), "confident_wrong": confident_wrong,
-            "unknown_safe": unknown_safe, "coverage": round(coverage, 4),
-            "exact": confident_wrong == 0 and coverage > 0.0}
+                     fraction: float = 0.30) -> dict[str, Any]:  # доля отложенной части следа; возвращает словарь проверки
+    """Проверка модели самого себя на отложенной части следа.
+
+    Случайная доля fraction записей откладывается; модель строится по остальным.
+    На отложенных записях ищется опасное направление: уверенное предсказание неуспеха
+    (уменьшенный бюджет) для задачи, которая на деле заканчивается COMMIT, — такое
+    предсказание блокирует принятие. Неизвестный ключ не считается ошибкой: он даёт
+    базовый бюджет, а любой регресс от этого ловит гейт безрегрессии.
+    Возвращает словарь: размер отложенной части, число уверенно неверных предсказаний,
+    число безопасных неизвестных, покрытие и признак exact (нет неверных и покрытие > 0)."""
+    rng = np.random.default_rng(7)  # генератор с фиксированным зерном 7 — разбиение воспроизводимо
+    idx = rng.permutation(len(trace))  # случайная перестановка номеров записей idx
+    n_hold = max(1, int(len(trace) * fraction))  # размер отложенной части n_hold = max(1, int(len·fraction))
+    hold_idx = set(idx[:n_hold].tolist())  # номера отложенных записей — первые n_hold элементов перестановки
+    train = [t for i, t in enumerate(trace) if i not in hold_idx]  # обучающая часть: записи вне hold_idx
+    hold = [trace[i] for i in sorted(hold_idx)]  # отложенная часть в порядке возрастания номеров
+    m = DecisionListSelfModel(train)  # модель, построенная только по обучающей части
+    confident_wrong = 0  # счётчик уверенно неверных предсказаний
+    unknown_safe = 0  # счётчик неизвестных ключей у неуспешных задач
+    for t in hold:  # по отложенным записям
+        pred = m.predict_success(t)  # предсказание успеха: 0, 1 или None
+        truth = t["success"]  # истинный исход записи: 1 или 0
+        if pred is None:  # ключ модели неизвестен
+            if truth == 0:  # задача в действительности не удалась
+                unknown_safe += 1  # неизвестный ключ при неуспехе: безопасно, счётчик + 1
+        elif pred != truth:  # предсказание есть и отлично от истины
+            confident_wrong += 1  # уверенно неверное предсказание: счётчик + 1
+    # Модель без покрытия (None для каждой отложенной записи) даёт 0 неверных
+    # предсказаний и формально проходит гейт, ничего не предсказывая. Для вердикта
+    # «точна» покрытие обязательно.
+    covered = sum(1 for t in hold if m.predict_success(t) is not None)  # число отложенных записей с известным ключом
+    coverage = covered / len(hold) if hold else 0.0  # покрытие = covered / |hold| (0 при пустой отложенной части)
+    return {"holdout_size": len(hold), "confident_wrong": confident_wrong,  # вернуть словарь: размер отложенной части и число уверенно неверных
+            "unknown_safe": unknown_safe, "coverage": round(coverage, 4),  # число безопасных неизвестных и покрытие с 4 знаками
+            "exact": confident_wrong == 0 and coverage > 0.0}  # exact = (неверных 0) и (покрытие > 0)
 
 
 # ---------------------------------------------------------- policy processor --
 
 class SelfModelPolicyProcessor(SelfOptimizingProcessorV9):
-    """Processor whose budget policy is a DecisionListSelfModel."""
+    """Процессор, чья политика бюджета — решающий список DecisionListSelfModel.
 
-    def __init__(self, dl: DecisionListSelfModel, base_budget: int,
-                 floor_budget: int, *a, **kw):
-        super().__init__({"_succ_expr": None}, base_budget, floor_budget, *a, **kw)
-        self.dl = dl
+    dl — модель; base_budget и floor_budget — верхний и нижний бюджет; *a, **kw —
+    прочие аргументы базового класса."""
+
+    def __init__(self, dl: DecisionListSelfModel, base_budget: int,  # решающий список, базовый бюджет
+                 floor_budget: int, *a, **kw):  # нижний бюджет и прочие аргументы базового класса; создать процессор с политикой dl
+        super().__init__({"_succ_expr": None}, base_budget, floor_budget, *a, **kw)  # конструктор базового класса с пустой моделью (её программа успеха не используется)
+        self.dl = dl  # сохранить решающий список
 
     def learn(self, spec, seed=0, **kw):
-        from hagi.selfmodel import _features
-        feats: dict[str, Any] = dict(zip(
-            FEATURE_KEYS,
-            _features(spec, self, seed,
-                      float(kw.get("train_fraction", 0.70)))))
-        feats["seed"] = int(seed)
-        pred = self.dl.predict_success(feats)
-        if pred is None:
-            pred = 1
-        self.node_budget = self.floor_budget if pred == 0 else self.base_budget
-        if pred == 0:
-            self.policy_overrides += 1
-        return super(SelfOptimizingProcessorV9, self).learn(spec, seed=seed, **kw)
+        """Выучить задачу spec с бюджетом от решающего списка.
+
+        Признаки задачи (семь, как в следе) вычисляются по текущему процессору и
+        вместе с зерном seed образуют ключ. Предсказание 0 -> floor_budget, иначе
+        (1 или неизвестный ключ) -> base_budget. Остальные аргументы kw передаются
+        в learn базового класса с пропуском политики по программе; возвращает
+        событие обучения."""
+        from hagi.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
+        feats: dict[str, Any] = dict(zip(  # словарь признаков: имя признака -> значение
+            FEATURE_KEYS,  # имена семи признаков
+            _features(spec, self, seed,  # вектор признаков задачи spec для этого процессора с зерном seed
+                      float(kw.get("train_fraction", 0.70)))))  # доля обучения из kw (по умолчанию 0.70)
+        feats["seed"] = int(seed)  # добавить в признаки зерно как целое
+        pred = self.dl.predict_success(feats)  # предсказание успеха: 0, 1 или None
+        if pred is None:  # ключ модели неизвестен
+            pred = 1  # считать успехом — оставить базовый бюджет
+        self.node_budget = self.floor_budget if pred == 0 else self.base_budget  # бюджет узлов = floor_budget при предсказанном неуспехе, иначе base_budget
+        if pred == 0:  # бюджет уменьшен политикой
+            self.policy_overrides += 1  # счётчик уменьшений: policy_overrides + 1
+        return super(SelfOptimizingProcessorV9, self).learn(spec, seed=seed, **kw)  # learn класса-прародителя (минуя политику по программе): обычное обучение с поставленным бюджетом
 
 
 # ------------------------------------------------------- parallel machinery ---
 
 def _state_probe(proc) -> dict[str, Any]:
-    return {
-        "cands": proc.candidates_generated, "evals": proc.evals,
-        "commits": proc.total_commits, "holds": proc.total_holds,
-        "version": proc.version,
-        "unsolved": proc.unsolved_objective,
-        "compute": proc.compute_budget, "risk": proc.risk_rem,
-        "n_experts": len(proc.experts), "n_log": len(proc.growth_log),
-        "n_cert": len(getattr(proc, "cert_log", [])), "n_trace": len(getattr(proc, "trace", [])),
-        "ram": proc.ram.snapshot(),
-    }
+    """Снимок счётчиков и состояния процессора proc до или после одного обучения."""
+    return {  # словарь снимка
+        "cands": proc.candidates_generated, "evals": proc.evals,  # всего сгенерировано кандидатов и сделано вычислений
+        "commits": proc.total_commits, "holds": proc.total_holds,  # всего принято задач и удержаний
+        "version": proc.version,  # версия библиотеки
+        "unsolved": proc.unsolved_objective,  # суммарная нерешённая цель
+        "compute": proc.compute_budget, "risk": proc.risk_rem,  # израсходованный бюджет вычислений и остаток риска
+        "n_experts": len(proc.experts), "n_log": len(proc.growth_log),  # число экспертов и длина журнала роста
+        "n_cert": len(getattr(proc, "cert_log", [])), "n_trace": len(getattr(proc, "trace", [])),  # длина журнала сертификатов и длина следа
+        "ram": proc.ram.snapshot(),  # снимок оперативной памяти (матрица ячейки -> вектор)
+    }  # конец словаря
 
 
 def _learn_worker_local(proc, spec, seed, budget, train_neural):
-    """In-process variant of _learn_worker (no pickling — for jobs too
-    large to serialize when memory is tight)."""
-    os.environ["HAGI_NEURAL_DEVICE"] = "cpu"
-    proc.node_budget = int(budget)
-    alpha = min(0.0005, proc.ledger.remaining() * 0.5)
-    pre = _state_probe(proc)
-    ev = proc.learn(spec, seed=int(seed), train_neural=train_neural)
-    post = _state_probe(proc)
-    names = list(proc.experts.keys())
-    new_names = names[pre["n_experts"]:]
-    diff = {
-        "ev": ev,
-        "trace_row": getattr(proc, "trace", [])[pre["n_trace"]:] or None,
-        "growth_log": proc.growth_log[pre["n_log"]:],
-        "certs": proc.cert_log[pre["n_cert"]:],
-        "new_experts": {n: proc.experts[n] for n in new_names},
-        "deltas": {k: post[k] - pre[k] for k in
-                   ("cands", "evals", "commits", "holds", "version",
-                    "unsolved", "compute", "risk")},
-        "ram_ops": _ram_diff(pre["ram"], post["ram"]),
-        "core": proc.core.snapshot(),
-        "router": proc.router.snapshot(),
-        "audit": {"task": spec.name, "alpha": alpha},
-    }
-    return diff
+    """Выучить одну задачу на самом процессоре proc и вернуть отличие «после минус до».
+
+    Без сериализации: та же логика, что у исполнителя в отдельном процессе, но
+    всё происходит внутри текущего процесса. Задаются нейронное устройство cpu и
+    бюджет узлов, снимаются два снимка состояния, вызывается proc.learn. Разница
+    содержит: событие обучения, новые записи следа, журнала роста и сертификатов,
+    новых экспертов, приросты счётчиков, изменённые ячейки памяти, снимки ядра
+    и маршрутизатора и запись аудита (имя задачи, alpha)."""
+    os.environ["HAGI_NEURAL_DEVICE"] = "cpu"  # нейронная часть выполняется на процессоре
+    proc.node_budget = int(budget)  # бюджет узлов на задачу = int(budget)
+    alpha = min(0.0005, proc.ledger.remaining() * 0.5)  # списываемая доля бюджета аудита alpha = min(0.0005, 0.5·остаток)
+    pre = _state_probe(proc)  # снимок состояния до обучения
+    ev = proc.learn(spec, seed=int(seed), train_neural=train_neural)  # выучить задачу с зерном seed; ev — событие обучения
+    post = _state_probe(proc)  # снимок состояния после обучения
+    names = list(proc.experts.keys())  # имена всех экспертов в порядке вставки
+    new_names = names[pre["n_experts"]:]  # имена экспертов, добавленных этим обучением (хвост списка)
+    diff = {  # словарь отличия
+        "ev": ev,  # событие обучения
+        "trace_row": getattr(proc, "trace", [])[pre["n_trace"]:] or None,  # новые записи следа; None, если их нет
+        "growth_log": proc.growth_log[pre["n_log"]:],  # новые записи журнала роста
+        "certs": proc.cert_log[pre["n_cert"]:],  # новые сертификаты
+        "new_experts": {n: proc.experts[n] for n in new_names},  # новые эксперты: имя -> объект
+        "deltas": {k: post[k] - pre[k] for k in  # приросты счётчиков: после − до
+                   ("cands", "evals", "commits", "holds", "version",  # по кандидатам, вычислениям, принятиям, удержаниям, версии
+                    "unsolved", "compute", "risk")},  # нерешённой цели, вычислениям, риску
+        "ram_ops": _ram_diff(pre["ram"], post["ram"]),  # изменившиеся ячейки памяти
+        "core": proc.core.snapshot(),  # снимок нейронного ядра
+        "router": proc.router.snapshot(),  # снимок маршрутизатора
+        "audit": {"task": spec.name, "alpha": alpha},  # запись аудита: имя задачи и списываемая доля
+    }  # конец словаря
+    return diff  # вернуть отличие
 
 
 
 
 def _ram_diff(pre: np.ndarray, post: np.ndarray) -> list[tuple[int, Any]]:
-    ops = []
-    for slot in range(post.shape[0]):
-        if not np.array_equal(pre[slot], post[slot]):
-            ops.append((slot, post[slot].copy()))
-    return ops
+    """Ячейки памяти, изменившиеся между снимками pre и post: список (номер ячейки, новый вектор)."""
+    ops = []  # пустой список операций
+    for slot in range(post.shape[0]):  # по номерам ячеек slot = 0..n−1
+        if not np.array_equal(pre[slot], post[slot]):  # если вектор ячейки изменился
+            ops.append((slot, post[slot].copy()))  # добавить (slot, копия нового вектора)
+    return ops  # вернуть список изменённых ячеек
 
 
 class ParallelLearner:
-    """Order-preserving batch learning in worker processes.
+    """Пакетное обучение с сохранением порядка потока на одном процессоре.
 
-    All tasks in a batch are learned against the same library snapshot;
-    their commits are merged into the parent in stream order (batch
-    semantics, identical for growth and replay -> deterministic).
-    With train_neural=True every learn also fits the neural core
-    (FactorizedSharedCore adapters); core/router states ride the diff
-    and are restored in stream order. Exact outcomes are unaffected
-    (commit gate uses exact programs only), so determinism holds."""
+    Все задачи пакета учатся на одном и том же процессоре по порядку; их отличия
+    применяются прямо при обучении. Слияние через _merge нужно только для отличий,
+    записанных кэшем на другом состоянии процессора; оно идёт в порядке потока.
+    При train_neural=True каждое обучение обучает и нейронное ядро (адаптеры
+    FactorizedSharedCore): состояния ядра и маршрутизатора входят в отличие и
+    восстанавливаются в порядке потока. Точные исходы это не меняет (гейт приёма
+    смотрит только точные программы), поэтому детерминизм сохраняется."""
 
     def __init__(self, proc, workers: int, train_neural: bool = False):
-        self.proc = proc
-        self.workers = max(1, workers)
-        self.train_neural = bool(train_neural)
+        """Создать обучатель для процессора proc; workers — заявленное число исполнителей,
+        train_neural — обучать ли нейронное ядро."""
+        self.proc = proc  # процессор, на котором идёт обучение
+        self.workers = max(1, workers)  # число исполнителей, не меньше 1
+        self.train_neural = bool(train_neural)  # признак обучения нейронного ядра как булево значение
 
     def batch(self, jobs: list[tuple[Any, int, int]]) -> list[dict[str, Any]]:
-        """jobs: [(spec, seed, budget)] -> merged diffs in order.
+        """Выучить пакет задач и вернуть их отличия в исходном порядке.
 
-        Threads, not processes (2026-11-17 user decision: no spawn
-        workers at all): shared memory, no payload pickling, no
-        BrokenProcessPool degradation path. numpy/torch release the
-        GIL in the hot paths, so threads parallelize the numeric work.
-        Determinism unchanged: jobs are independent, merged in order.
-        """
-        if not jobs:
-            return []
-        # NO worker processes/threads pool (user decision 2026-11-17):
-        # in-process sequential learning, one shared proc. Parallelism
-        # comes from BLAS/OMP (OPENBLAS_NUM_THREADS = all cores) inside
-        # numpy/torch ops. Deterministic order, zero race, zero spawn.
-        diffs = [_learn_worker_local(self.proc, spec, seed, budget,
-                                     self.train_neural)
-                 for spec, seed, budget in jobs]
-        # NOTE: caller merges diffs in stream order — merging here would
-        # double-apply counters/logs/trace (dict updates are idempotent,
-        # the rest is not).
-        return diffs
+        jobs — список (spec, seed, budget). Задачи выполняются последовательно на
+        общем процессоре в самом этом процессе: ни потоков, ни процессов-исполнителей,
+        ни сериализации данных. Параллельность возникает только внутри операций
+        numpy и torch (BLAS/OMP). Задачи независимы по построению, поэтому порядок
+        и результат детерминированы."""
+        if not jobs:  # пакет пуст
+            return []  # вернуть пустой список
+        # Обучения идут в этом процессе строго по порядку на одном процессоре.
+        # Отличия НЕ сливаются здесь: они уже применены общим процессором, вторичное
+        # слияние удвоило бы счётчики, журналы и след (обновление словарей можно
+        # повторить безвредно, остальное — нет).
+        diffs = [_learn_worker_local(self.proc, spec, seed, budget,  # список отличий: по одной задаче
+                                     self.train_neural)  # с общим признаком обучения нейронного ядра
+                 for spec, seed, budget in jobs]  # по тройкам (задача, зерно, бюджет)
+        # Слияние выполняет вызывающий код в порядке потока.
+        return diffs  # вернуть отличия в порядке задач
 
     def _merge(self, d: dict[str, Any]) -> None:
-        p = self.proc
-        # WAVE 169 (double-apply guard): in-process workers already
-        # applied the diff to the shared proc. A diff whose certs are
-        # already present in cert_log is a REPLAYED snapshot — merging
-        # it again doubled version/cert_log/objective (ADD: 1 commit
-        # became 2). Identity = first cert entry (task+round).
-        if d["certs"]:
-            first = d["certs"][0]
-            if any(c.version == first.version and c.task == first.task
-                   for c in p.cert_log):
-                return  # already applied
-        p.experts.update(d["new_experts"])
-        p.growth_log.extend(d["growth_log"])
-        p.cert_log.extend(d["certs"])
-        dl = d["deltas"]
-        p.candidates_generated += dl["cands"]
-        p.evals += dl["evals"]
-        p.total_commits += dl["commits"]
-        p.total_holds += dl["holds"]
-        p.version += dl["version"]
-        p.unsolved_objective += dl["unsolved"]
-        p.compute_budget += dl["compute"]
-        p.risk_rem += dl["risk"]
-        for slot, vec in d["ram_ops"]:
-            p.ram.store(slot, vec)  # gate_beta=1: exact overwrite
-        if d.get("core") is not None:
-            p.core.restore(d["core"])
-        if d.get("router") is not None:
-            p.router.restore(d["router"])
-        if d["trace_row"]:
-            for row in d["trace_row"]:
-                p.trace.append(row)
-        # audit ledger: replay the recorded spend/floor/reject for this task
-        ev = d["ev"]
-        task = ev["task"]
-        n_train = int(ev.get("train_examples", 1))
-        n_val = int(ev.get("validation_examples", 1))
-        p.ledger.allocate_stream(task, n_train + n_val)
-        if d["audit"].get("alpha") is not None:
-            p.ledger.spent[task] = (p.ledger.spent.get(task, 0.0)
-                                    + float(d["audit"]["alpha"]))
-            p.ledger.advance_stream(task, n_train + n_val)
+        """Применить отличие d к процессору self.proc (эксперты, журналы, счётчики, память, ядро, аудит).
+
+        Отличие, чей первый сертификат (задача и версия) уже есть в журнале
+        сертификатов, считается уже применённым и пропускается — иначе версия,
+        журнал сертификатов и нерешённая цель задваивались (одно принятие
+        превращалось в два)."""
+        p = self.proc  # процессор-приёмник
+        # Защита от двойного применения: отличия, полученные на самом процессоре,
+        # уже применены. Признак повтора — совпадение задачи и версии первого
+        # сертификата отличия с записью в журнале.
+        if d["certs"]:  # в отличии есть сертификаты
+            first = d["certs"][0]  # первый сертификат отличия
+            if any(c.version == first.version and c.task == first.task  # есть в журнале сертификат с той же версией и задачей
+                   for c in p.cert_log):  # по всем сертификатам c журнала
+                return  # уже применено — ничего не делать
+        p.experts.update(d["new_experts"])  # добавить новых экспертов в библиотеку
+        p.growth_log.extend(d["growth_log"])  # дописать журнал роста
+        p.cert_log.extend(d["certs"])  # дописать журнал сертификатов
+        dl = d["deltas"]  # приросты счётчиков
+        p.candidates_generated += dl["cands"]  # сгенерировано кандидатов: + Δcands
+        p.evals += dl["evals"]  # вычислений: + Δevals
+        p.total_commits += dl["commits"]  # принятых задач: + Δcommits
+        p.total_holds += dl["holds"]  # удержаний: + Δholds
+        p.version += dl["version"]  # версия библиотеки: + Δversion
+        p.unsolved_objective += dl["unsolved"]  # нерешённая цель: + Δunsolved
+        p.compute_budget += dl["compute"]  # израсходованные вычисления: + Δcompute
+        p.risk_rem += dl["risk"]  # остаток риска: + Δrisk
+        for slot, vec in d["ram_ops"]:  # по парам (ячейка, вектор) изменённой памяти
+            p.ram.store(slot, vec)  # записать вектор точно (gate_beta = 1: новая запись целиком заменяет старую)
+        if d.get("core") is not None:  # в отличии есть снимок ядра
+            p.core.restore(d["core"])  # восстановить нейронное ядро из снимка
+        if d.get("router") is not None:  # в отличии есть снимок маршрутизатора
+            p.router.restore(d["router"])  # восстановить маршрутизатор из снимка
+        if d["trace_row"]:  # в отличии есть новые записи следа
+            for row in d["trace_row"]:  # по записям row
+                p.trace.append(row)  # дописать запись в след
+        # Журнал аудита: повторить записанные списание, нижнюю границу и отказ по задаче
+        ev = d["ev"]  # событие обучения
+        task = ev["task"]  # имя задачи
+        n_train = int(ev.get("train_examples", 1))  # число обучающих примеров (по умолчанию 1)
+        n_val = int(ev.get("validation_examples", 1))  # число проверочных примеров (по умолчанию 1)
+        p.ledger.allocate_stream(task, n_train + n_val)  # выделить задаче поток аудита на n_train + n_val примеров (существующий поток возвращается как есть)
+        if d["audit"].get("alpha") is not None:  # в записи аудита есть доля списания
+            p.ledger.spent[task] = (p.ledger.spent.get(task, 0.0)  # списано по задаче: прежнее значение (0, если нет)
+                                    + float(d["audit"]["alpha"]))  # плюс alpha
+            p.ledger.advance_stream(task, n_train + n_val)  # сдвинуть курсор потока: cursor = min(hi, cursor + n_train + n_val)
+        # условие ниже: принято, ИЛИ принятие из-за проверенного покрытия эксперта, ИЛИ повторное использование
         if ev["action"] == "COMMIT" or ev.get("reason") == "verified-expert-coverage" \
-                or ev["action"] == "REUSE":
-            p.ledger.record_floor(task, 1.0)
-        elif ev["action"] == "HOLD":
-            p.ledger.record_reject(task)
+                or ev["action"] == "REUSE":  # (продолжение условия: действие — REUSE)
+            p.ledger.record_floor(task, 1.0)  # записать нижнюю границу качества 1.0 по задаче
+        elif ev["action"] == "HOLD":  # иначе, если задача удержана
+            p.ledger.record_reject(task)  # записать отказ по задаче
 
 
 # ------------------------------------------------------------------ streams --
 
 def _assign_budget(proc, spec, seed: int, train_fraction: float = 0.70) -> int:
-    """Budget the policy would assign (mirrors SelfModelPolicyProcessor)."""
-    if hasattr(proc, "dl"):
-        from hagi.selfmodel import _features
-        feats = dict(zip(FEATURE_KEYS, _features(spec, proc, seed, train_fraction)))
-        feats["seed"] = int(seed)
-        pred = proc.dl.predict_success(feats)
-        if pred == 0:
-            proc.policy_overrides += 1
-            return proc.floor_budget
-        return proc.base_budget
-    return proc.node_budget
+    """Бюджет узлов, который политика процессора proc назначила бы задаче spec с зерном seed.
+
+    Если у процессора есть решающий список dl — бюджет как в SelfModelPolicyProcessor
+    (предсказанный неуспех -> floor_budget, иначе base_budget; счётчик уменьшений
+    увеличивается). Иначе — текущий node_budget процессора."""
+    if hasattr(proc, "dl"):  # у процессора есть атрибут dl (решающий список)
+        from hagi.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
+        feats = dict(zip(FEATURE_KEYS, _features(spec, proc, seed, train_fraction)))  # словарь признаков: имя -> значение вектора признаков
+        feats["seed"] = int(seed)  # добавить зерно как целое
+        pred = proc.dl.predict_success(feats)  # предсказание успеха: 0, 1 или None
+        if pred == 0:  # предсказан неуспех
+            proc.policy_overrides += 1  # счётчик уменьшений: policy_overrides + 1
+            return proc.floor_budget  # вернуть нижний бюджет
+        return proc.base_budget  # иначе вернуть базовый бюджет
+    return proc.node_budget  # нет решающего списка — вернуть текущий бюджет узлов
 
 
 class ReplayCache:
-    """position -> outcome under a given budget; skips re-learning the
-    unchanged prefix of the replay stream each round."""
+    """Кэш повторного прогона: позиция потока и бюджет -> записанное отличие.
 
-    def __init__(self) -> None:
-        self.store: dict[tuple, dict[str, Any]] = {}
+    Позволяет не переучивать неизменившийся префикс повторного потока в каждом раунде."""
+
+    def __init__(self) -> None:  # создать пустой кэш
+        self.store: dict[tuple, dict[str, Any]] = {}  # хранилище: ключ (позиция, бюджет) -> отличие
 
     def key(self, pos: tuple, budget: int) -> Optional[dict[str, Any]]:
-        return self.store.get((pos, budget))
+        """Вернуть записанное отличие для позиции pos и бюджета budget либо None, если его нет."""
+        return self.store.get((pos, budget))  # lookup по ключу (pos, budget)
 
     def put(self, pos: tuple, budget: int, diff: dict[str, Any]) -> None:
-        self.store[(pos, budget)] = diff
+        """Записать отличие diff для позиции pos и бюджета budget."""
+        self.store[(pos, budget)] = diff  # сохранить по ключу (pos, budget)
 
-def run_stream(proc, segments: list[tuple[int, int]],
-               suite: list | None = None, cache: ReplayCache | None = None,
-               learner: ParallelLearner | None = None,
-               batch_size: int = 8, train_neural: bool = False) -> None:
-    """Deterministic stream: suite (sequential) + proposal segments
-    (parallel batches). `cache` short-circuits unchanged prefix tasks."""
-    names = getattr(proc, "stream_names", None)
-    actions = getattr(proc, "stream_actions", None)
-    for sp in (suite if suite is not None else hagi.make_task_suite()):
-        if names is not None:
-            names.append(("suite", sp.name))
-        ev = proc.learn(sp, seed=10_000, train_neural=train_neural)
-        if actions is not None:
-            actions.append(("suite", sp.name, ev["action"]))
-    for seg_idx, (n_prop, seed_base) in enumerate(segments):
-        rng = np.random.default_rng(seed_base)  # segment identity, not position
-        seen: set = set()
-        k = 0
-        while k < n_prop:
-            # generate one batch of proposals from the current snapshot
-            batch: list[tuple[Any, int]] = []
-            while k < n_prop and len(batch) < batch_size:
-                prop = hagi.propose_noncircular_task(proc.experts, rng, 0, seen)
-                if prop is None:
-                    k = n_prop
-                    break
-                sp, _ = prop
-                if sp.name in proc.experts:
-                    continue
-                batch.append((sp, seed_base + k))
-                if names is not None:
-                    names.append(("seg", sp.name))
-                k += 1
-            if not batch:
-                continue
-            # policy budgets for the batch
-            budgets = [_assign_budget(proc, sp, seed) for sp, seed in batch]
-            # replay cache: hits resolve instantly, fresh tasks run in the
-            # pool — but ALL merges happen strictly in batch position order,
-            # so the experts-dict insertion order (which proposal generation
-            # indexes via rng.choice) matches the incumbent stream exactly.
-            hits: list = []
-            jobs: list[tuple[Any, int, int]] = []
-            fresh_pos: list[tuple[tuple, int]] = []
-            for (sp, seed), budget in zip(batch, budgets):
-                pos = (seg_idx, seed)
-                hit = cache.key(pos, budget) if cache is not None else None
-                if hit is not None:
-                    hits.append(hit)
-                else:
-                    hits.append(None)
-                    jobs.append((sp, seed, budget))
-                    fresh_pos.append((pos, budget))
-            if jobs:
-                if learner is None:
-                    # no pool provided: honest in-process sequential path
-                    diffs = [_learn_worker_local(proc, sp, seed, budget,
-                                                 train_neural)
-                             for sp, seed, budget in jobs]
-                else:
-                    diffs = learner.batch(jobs)
-                for (pos, budget), d in zip(fresh_pos, diffs):
-                    if cache is not None:
-                        cache.put(pos, budget, d)
-            else:
-                diffs = []
-            # WAVE 169 fix (double-apply): fresh (slot None) diffs were
-            # applied IN-PROCESS by the worker on the shared proc —
-            # merging them again doubled version/cert_log/objective.
-            # Only CACHE-HIT diffs (learned on a different proc state)
-            # need merging. Merge in original batch order.
-            it = iter(diffs)
-            for slot in hits:
-                if slot is None:
-                    d = next(it)
-                    if actions is not None:
-                        actions.append(("seg", d["ev"]["task"],
-                                        d["ev"]["action"]))
-                    continue  # already applied by the worker
-                d = slot
-                learner._merge(d)
-                if actions is not None:
-                    actions.append(("seg", d["ev"]["task"], d["ev"]["action"]))
+def run_stream(proc, segments: list[tuple[int, int]],  # запустить детерминированный поток задач на процессоре proc
+               suite: list | None = None, cache: ReplayCache | None = None,  # базовый набор задач и кэш повторного прогона (могут быть None)
+               learner: ParallelLearner | None = None,  # обучатель пакетов (None — учить в этом процессе напрямую)
+               batch_size: int = 8, train_neural: bool = False) -> None:  # размер пакета и признак обучения нейронного ядра
+    """Детерминированный поток задач: базовый набор suite выполняется по одному, затем
+    сегменты предложений — пакетами.
+
+    segments — список (число предложений n_prop, базовое зерно seed_base). Кэш cache
+    замыкает задачи, чьи позиция и бюджет уже встречались. Если у процессора есть
+    списки stream_names и stream_actions, в них дописываются имена задач и действия
+    (suite, имя) и (seg, имя, действие) в порядке потока."""
+    names = getattr(proc, "stream_names", None)  # список имён задач потока, если процессор его ведёт
+    actions = getattr(proc, "stream_actions", None)  # список действий потока, если процессор его ведёт
+    for sp in (suite if suite is not None else hagi.make_task_suite()):  # по задачам базового набора (при None — полный учебный набор)
+        if names is not None:  # имена записываются
+            names.append(("suite", sp.name))  # дописать ("suite", имя задачи)
+        ev = proc.learn(sp, seed=10_000, train_neural=train_neural)  # выучить задачу с зерном 10000; ev — событие обучения
+        if actions is not None:  # действия записываются
+            actions.append(("suite", sp.name, ev["action"]))  # дописать ("suite", имя задачи, действие)
+    for seg_idx, (n_prop, seed_base) in enumerate(segments):  # по сегментам: номер seg_idx, число предложений, базовое зерно
+        rng = np.random.default_rng(seed_base)  # генератор предложений с зерном seed_base: зерно задаёт тождество сегмента, а не позицию
+        seen: set = set()  # множество уже предложенных подписей — от повторов
+        k = 0  # счётчик предложенных задач в сегменте
+        while k < n_prop:  # пока не набрано n_prop предложений
+            # собрать один пакет предложений по текущему снимку библиотеки
+            batch: list[tuple[Any, int]] = []  # пакет пар (задача, зерно)
+            while k < n_prop and len(batch) < batch_size:  # пока есть лимит и пакет не полон
+                prop = hagi.propose_noncircular_task(proc.experts, rng, 0, seen)  # предложить новую некруговую задачу по текущим экспертам; None — предложений нет
+                if prop is None:  # подходящей задачи не нашлось
+                    k = n_prop  # сегмент исчерпан: счётчик равен лимиту
+                    break  # прервать набор пакета
+                sp, _ = prop  # взять задачу (подпись не используется)
+                if sp.name in proc.experts:  # эксперт с таким именем уже есть
+                    continue  # пропустить — не учить заново
+                batch.append((sp, seed_base + k))  # добавить в пакет пару (задача, зерно = seed_base + k)
+                if names is not None:  # имена записываются
+                    names.append(("seg", sp.name))  # дописать ("seg", имя задачи)
+                k += 1  # предложенных: k + 1
+            if not batch:  # пакет пуст
+                continue  # перейти к следующему сегменту
+            # бюджеты политики для пакета
+            budgets = [_assign_budget(proc, sp, seed) for sp, seed in batch]  # бюджет каждой пары по политике процессора
+            # Кэш: попадание разрешается мгновенно, новые задачи учатся на процессоре.
+            # Все слияния идут строго в порядке позиций пакета, поэтому порядок
+            # вставки экспертов в словарь (от него зависит выбор в генераторе
+            # предложений) совпадает с исходным потоком.
+            hits: list = []  # для каждой позиции пакета — отличие из кэша или None
+            jobs: list[tuple[Any, int, int]] = []  # новые задачи к обучению: (задача, зерно, бюджет)
+            fresh_pos: list[tuple[tuple, int]] = []  # их позиции и бюджеты: ((seg_idx, зерно), бюджет)
+            for (sp, seed), budget in zip(batch, budgets):  # по парам (задача, зерно) и их бюджетам
+                pos = (seg_idx, seed)  # позиция в потоке: (номер сегмента, зерно)
+                hit = cache.key(pos, budget) if cache is not None else None  # отличие из кэша для (pos, budget), если кэш есть
+                if hit is not None:  # попадание в кэш
+                    hits.append(hit)  # записать отличие в позицию
+                else:  # промах
+                    hits.append(None)  # в позиции пока пусто
+                    jobs.append((sp, seed, budget))  # задача идёт на обучение
+                    fresh_pos.append((pos, budget))  # запомнить её позицию и бюджет
+            if jobs:  # есть новые задачи
+                if learner is None:  # обучатель не задан
+                    # без обучателя: последовательное обучение в этом процессе
+                    diffs = [_learn_worker_local(proc, sp, seed, budget,  # отличия по каждой новой задаче
+                                                 train_neural)  # с общим признаком обучения нейронного ядра
+                             for sp, seed, budget in jobs]  # по тройкам (задача, зерно, бюджет)
+                else:  # обучатель задан
+                    diffs = learner.batch(jobs)  # получить отличия пакета от обучателя
+                for (pos, budget), d in zip(fresh_pos, diffs):  # по позициям и полученным отличиям
+                    if cache is not None:  # кэш есть
+                        cache.put(pos, budget, d)  # записать отличие по ключу (pos, budget)
+            else:  # новых задач нет
+                diffs = []  # список отличий пуст
+            # Защита от двойного применения: отличия новых задач (слот None) уже
+            # применены общим процессором при обучении. Сливать нужно только отличия
+            # из кэша (полученные на другом состоянии процессора). Порядок слияния —
+            # исходный порядок пакета.
+            it = iter(diffs)  # итератор по отличиям новых задач
+            for slot in hits:  # по позициям пакета в порядке потока
+                if slot is None:  # новая задача — отличие уже применено
+                    d = next(it)  # взять её отличие
+                    if actions is not None:  # действия записываются
+                        actions.append(("seg", d["ev"]["task"],  # дописать ("seg", имя задачи из события,
+                                        d["ev"]["action"]))  # действие из события)
+                    continue  # слияние не нужно — к следующей позиции
+                d = slot  # отличие из кэша
+                learner._merge(d)  # слить его с процессором
+                if actions is not None:  # действия записываются
+                    actions.append(("seg", d["ev"]["task"], d["ev"]["action"]))  # дописать ("seg", имя задачи, действие)
 
 
 # ------------------------------------------------------------------- loop ----
 
 def _first_divergence(incumbent, opt) -> Optional[dict]:
-    """First stream position where the optimized replay saw a different
-    task or a different action than the incumbent (gate-reject diagnosis)."""
-    a = getattr(incumbent, "stream_actions", None) or []
-    b = getattr(opt, "stream_actions", None) or []
-    for i, (x, y) in enumerate(zip(a, b)):
-        if x != y:
-            return {"pos": i, "incumbent": x, "optimized": y}
-    if len(a) != len(b):
-        return {"pos": min(len(a), len(b)), "len_incumbent": len(a),
-                "len_optimized": len(b)}
-    return None
+    """Первая позиция, где оптимизированный повтор отличается от исходного потока
+    (диагностика отказа гейта): другая запись (имя задачи или действие) либо другая
+    длина потока. Возвращает словарь с позицией и обеими записями либо None, если
+    потоки совпадают."""
+    a = getattr(incumbent, "stream_actions", None) or []  # записи действий исходного потока (пустой список, если атрибута нет)
+    b = getattr(opt, "stream_actions", None) or []  # записи действий оптимизированного потока
+    for i, (x, y) in enumerate(zip(a, b)):  # по общим позициям i с записями x (исходный) и y (оптимизированный)
+        if x != y:  # записи различаются
+            return {"pos": i, "incumbent": x, "optimized": y}  # вернуть позицию и обе записи
+    if len(a) != len(b):  # длины потоков разные
+        return {"pos": min(len(a), len(b)), "len_incumbent": len(a),  # вернуть позицию = min(длины) и обе длины
+                "len_optimized": len(b)}  # длина оптимизированного потока
+    return None  # расхождений нет
 
 
-def run_self_development(max_rounds: int = 4,
-                         base_budget: int = 200000,  # 64-bit safe: evals are Python/numpy int64,
-                         # intermediate values guarded by MAG_CAP=2^28 in the vectorized evaluator
-                         floor_budget: int = 200,
-                         proposals_per_round: int = 10,
-                         workers: int = 0,
-                         batch_size: int = 8,
-                         floor_ladder: list[int] | None = None,
-                         initial_segments: list[tuple[int, int]] | None = None,
-                         train_neural: bool = True,
-                         ) -> dict[str, Any]:
-    """floor_ladder: certified lever-change schedule (R223: on exhaustion
-    of a lever, SWITCH the lever, don't repeat it). When relief drops below
-    MIN_RELIEF with floor F, retry with the next smaller floor — a task that
-    HOLDs at base budget cannot commit with less search, so a smaller floor
-    only makes the same HOLD cheaper. Loop ends when the ladder is spent.
+def run_self_development(max_rounds: int = 4,  # саморазвитие: не более max_rounds раундов
+                         base_budget: int = 200000,  # базовый бюджет узлов на задачу; укладывается в 64 бита (вычисления — Python/numpy int64),
+                         # промежуточные значения ограничены константой MAG_CAP = 2^28 в векторизованном вычислителе
+                         floor_budget: int = 200,  # нижний бюджет узлов для предсказанно неудачных задач
+                         proposals_per_round: int = 10,  # число новых предложений в раунде
+                         workers: int = 0,  # число исполнителей (0 — все процессоры, не больше 32)
+                         batch_size: int = 8,  # размер пакета задач
+                         floor_ladder: list[int] | None = None,  # расписание нижнего бюджета; None — [floor_budget]
+                         initial_segments: list[tuple[int, int]] | None = None,  # записанный ранее поток предложений для продолжения
+                         train_neural: bool = True,  # обучать ли нейронное ядро при каждом обучении
+                         ) -> dict[str, Any]:  # возвращает словарь-отчёт
+    """Цикл саморазвития: раунды РОСТ -> ВЫВОД модели -> ОПТИМИЗАЦИЯ -> ГЕЙТ, до отказа.
 
-    initial_segments: resume hook — a previously recorded proposal stream
-    (e.g. read back from the model's own self_state.json). Growth replays
-    it policy-free first, so the stream continues instead of restarting;
-    the self-model is re-derived from the rebuilt trace (cheap, exact)."""
-    workers = workers or min(32, (os.cpu_count() or 4))
-    ladder = list(floor_ladder) if floor_ladder else [floor_budget]
-    report: dict[str, Any] = {"rounds": [], "base_budget": base_budget,
-                              "floor_ladder": ladder, "workers": workers}
-    suite = hagi.make_task_suite()
-    segments: list[tuple[int, int]] = [tuple(s) for s in (initial_segments or [])]
-    round_offset = len(segments)
-    cache = ReplayCache()
+    Раунд 0 — исходный поток: базовый набор задач, затем (при заданном
+    initial_segments) повтор записанного потока предложений без политики. Каждый
+    раунд: (1) к потоку добавляется сегмент из proposals_per_round новых предложений;
+    (2) решающий список выводится по следу и проверяется на отложенной части —
+      неверные уверенные предсказания дают HOLD и остановку;
+    (3) тот же поток прогоняется процессором с бюджетом от модели (неизменившийся
+      префикс берётся из кэша); (4) гейт безрегрессии: эксперты исходного сохранены,
+      проверка набора точна и полна, стоимость принята ≤ стоимость исходного·(1 − MIN_RELIEF).
+    При COMMIT оптимизированный процессор становится исходным. При нехватке
+    снижения и незаконченном расписании floor_ladder меньший бюджет исчерпан —
+    берётся следующий: задача, удержанная на базовом бюджете, не станет принятой
+    при меньшем поиске, так что тот же HOLD лишь дешевеет. Цикл кончается, когда
+    расписание исчерпано, либо на HOLD. Возвращает словарь-отчёт с полями rounds
+    (по раунду), baseline, segments, final, converged и _final_incumbent (сам
+    итоговый процессор)."""
+    workers = workers or min(32, (os.cpu_count() or 4))  # исполнители: заданное число, иначе min(32, число процессоров или 4)
+    ladder = list(floor_ladder) if floor_ladder else [floor_budget]  # расписание нижнего бюджета: копия floor_ladder либо [floor_budget]
+    report: dict[str, Any] = {"rounds": [], "base_budget": base_budget,  # отчёт: пустой список раундов и базовый бюджет
+                              "floor_ladder": ladder, "workers": workers}  # расписание нижнего бюджета и число исполнителей
+    suite = hagi.make_task_suite()  # базовый учебный набор задач
+    segments: list[tuple[int, int]] = [tuple(s) for s in (initial_segments or [])]  # поток предложений: копия initial_segments (пустой список, если None)
+    round_offset = len(segments)  # смещение нумерации раундов = числу уже записанных сегментов
+    cache = ReplayCache()  # пустой кэш повторного прогона
 
-    # Round-0 baseline: suite only (sequential, golden-pinned semantics).
-    incumbent = TracedProcessorV9(node_budget=base_budget)
-    incumbent.stream_names = []
-    incumbent.stream_actions = []
-    for sp in suite:
-        incumbent.stream_names.append(("suite", sp.name))
-        incumbent.learn(sp, seed=10_000, train_neural=train_neural)
-    if segments:
-        # resume: replay the recorded stream policy-free (growth semantics)
-        run_stream(incumbent, segments, suite=[], cache=None,
-                   learner=ParallelLearner(incumbent, workers,
-                                           train_neural=train_neural),
-                   batch_size=batch_size, train_neural=train_neural)
-    prev_wasted = sum(t["cost"] for t in incumbent.trace if not t["success"])
-    report["baseline"] = {
-        "learn_calls": len(incumbent.trace),
-        "commits": sum(t["success"] for t in incumbent.trace),
-        "wasted_candidates_on_holds": prev_wasted,
-        "pipeline": describe_pipeline(incumbent),
-    }
+    # Раунд 0, исходная точка: только базовый набор, по одному.
+    incumbent = TracedProcessorV9(node_budget=base_budget)  # исходный процессор со следом и бюджетом base_budget
+    incumbent.stream_names = []  # список имён задач потока
+    incumbent.stream_actions = []  # список действий потока
+    for sp in suite:  # по задачам базового набора
+        incumbent.stream_names.append(("suite", sp.name))  # дописать ("suite", имя задачи)
+        incumbent.learn(sp, seed=10_000, train_neural=train_neural)  # выучить задачу с зерном 10000
+    if segments:  # есть записанный поток предложений — продолжение
+        # повторить записанный поток без политики (семантика роста)
+        run_stream(incumbent, segments, suite=[], cache=None,  # прогон сегментов на исходном процессоре: без базового набора и без кэша
+                   learner=ParallelLearner(incumbent, workers,  # обучатель на самом исходном процессоре
+                                           train_neural=train_neural),  # с тем же признаком обучения нейронного ядра
+                   batch_size=batch_size, train_neural=train_neural)  # размер пакета и признак обучения нейронного ядра
+    prev_wasted = sum(t["cost"] for t in incumbent.trace if not t["success"])  # стоимость всех неудачных задач следа W = Σ cost по записям с success = 0
+    report["baseline"] = {  # отчёт об исходной точке
+        "learn_calls": len(incumbent.trace),  # число вызовов обучения = длина следа
+        "commits": sum(t["success"] for t in incumbent.trace),  # число принятых задач = Σ success
+        "wasted_candidates_on_holds": prev_wasted,  # кандидатов, потраченных на неудачи
+        "pipeline": describe_pipeline(incumbent),  # описание конвейера исходного процессора
+    }  # конец словаря
 
-    adopted = True
-    round_idx = 0
-    t_start = time.perf_counter()
-    while adopted and round_idx < max_rounds:
-        round_idx += 1
-        t0 = time.perf_counter()
-        # 1. GROW: extend the incumbent with this round's fresh proposals.
-        segments.append((proposals_per_round,
-                         500_000 + 1000 * (round_idx + round_offset)))
-        grow_learner = ParallelLearner(incumbent, workers,
-                                       train_neural=train_neural)
-        run_stream(incumbent, [segments[-1]], suite=[], cache=None,
-                   learner=grow_learner, batch_size=batch_size,
-                   train_neural=train_neural)
-        incumbent_wasted = sum(t["cost"] for t in incumbent.trace
-                               if not t["success"])
+    adopted = True  # признак «предыдущий раунд принят» — цикл продолжается
+    round_idx = 0  # номер раунда
+    t_start = time.perf_counter()  # начало отсчёта общего времени
+    while adopted and round_idx < max_rounds:  # пока раунды принимаются и лимит не исчерпан
+        round_idx += 1  # номер раунда: round_idx + 1
+        t0 = time.perf_counter()  # начало отсчёта времени раунда
+        # 1. РОСТ: дополнить исходный поток новыми предложениями этого раунда.
+        segments.append((proposals_per_round,  # добавить сегмент: число предложений proposals_per_round
+                         500_000 + 1000 * (round_idx + round_offset)))  # базовое зерно = 500000 + 1000·(номер раунда + смещение)
+        grow_learner = ParallelLearner(incumbent, workers,  # обучатель роста на исходном процессоре
+                                       train_neural=train_neural)  # с признаком обучения нейронного ядра
+        run_stream(incumbent, [segments[-1]], suite=[], cache=None,  # прогон только нового сегмента: без базового набора и кэша
+                   learner=grow_learner, batch_size=batch_size,  # обучателем роста с заданным размером пакета
+                   train_neural=train_neural)  # и признаком обучения нейронного ядра
+        incumbent_wasted = sum(t["cost"] for t in incumbent.trace  # стоимость неудач исходного потока W_inc = Σ cost по записям
+                               if not t["success"])  # с success = 0
 
-        # 2. DERIVE + validate the self-model on the incumbent trace.
-        trace = incumbent.trace
-        dl = DecisionListSelfModel(trace)
-        val = holdout_validate(trace)
-        rnd_report: dict[str, Any] = {
-            "round": round_idx,
-            "learn_calls": len(trace),
-            "self_model": dl.describe(),
-            "holdout": val,
-            "impossibility_certificate": impossibility_certificate(trace),
-            "neural_adapters": sum(1 for ex in incumbent.experts.values()
-                                    if ex.adapter is not None),
-        }
-        if not val["exact"]:
-            rnd_report["gate"] = {"action": "HOLD",
-                                  "reason": "confidently-wrong HOLD predictions on holdout"}
-            report["rounds"].append(rnd_report)
-            adopted = False
-            break
+        # 2. ВЫВОД модели самого себя по следу и её проверка на отложенной части.
+        trace = incumbent.trace  # след исходного процессора
+        dl = DecisionListSelfModel(trace)  # решающий список по следу
+        val = holdout_validate(trace)  # проверка на отложенной части следа
+        rnd_report: dict[str, Any] = {  # отчёт раунда
+            "round": round_idx,  # номер раунда
+            "learn_calls": len(trace),  # число вызовов обучения = длина следа
+            "self_model": dl.describe(),  # описание модели самого себя
+            "holdout": val,  # результат проверки на отложенной части
+            "impossibility_certificate": impossibility_certificate(trace),  # свидетельство невозможности точного предсказателя (или None)
+            "neural_adapters": sum(1 for ex in incumbent.experts.values()  # число экспертов с нейронным адаптером
+                                    if ex.adapter is not None),  # = Σ 1 по экспертам, у которых adapter не None
+        }  # конец словаря
+        if not val["exact"]:  # модель не точна на отложенной части
+            rnd_report["gate"] = {"action": "HOLD",  # гейт: отказ (HOLD)
+                                  "reason": "confidently-wrong HOLD predictions on holdout"}  # причина: уверенно неверные предсказания неуспеха на отложенной части
+            report["rounds"].append(rnd_report)  # дописать отчёт раунда
+            adopted = False  # остановить цикл
+            break  # выйти из цикла раундов
 
-        # 3. OPTIMIZE: replay the SAME deterministic stream with
-        #    self-model-driven budgets (cached prefix -> only new tasks run).
-        floor_budget = ladder[0]
-        opt = SelfModelPolicyProcessor(dl, base_budget, floor_budget,
-                                       node_budget=base_budget)
-        opt.stream_names = []
-        opt.stream_actions = []
-        opt_learner = ParallelLearner(opt, workers, train_neural=train_neural)
-        run_stream(opt, segments, suite=suite, cache=cache,
-                   learner=opt_learner, batch_size=batch_size,
-                   train_neural=train_neural)
-        opt_wasted = sum(t["cost"] for t in opt.trace if not t["success"])
+        # 3. ОПТИМИЗАЦИЯ: тот же детерминированный поток с бюджетом от модели
+        #    самого себя (префикс из кэша — учатся только новые задачи).
+        floor_budget = ladder[0]  # текущий нижний бюджет — первый элемент расписания
+        opt = SelfModelPolicyProcessor(dl, base_budget, floor_budget,  # оптимизированный процессор с решающим списком dl и бюджетами base/floor
+                                       node_budget=base_budget)  # текущий бюджет узлов = базовый
+        opt.stream_names = []  # список имён задач потока
+        opt.stream_actions = []  # список действий потока
+        opt_learner = ParallelLearner(opt, workers, train_neural=train_neural)  # обучатель оптимизированного потока
+        run_stream(opt, segments, suite=suite, cache=cache,  # прогон всех сегментов с базовым набором и кэшем
+                   learner=opt_learner, batch_size=batch_size,  # обучателем и размером пакета
+                   train_neural=train_neural)  # с признаком обучения нейронного ядра
+        opt_wasted = sum(t["cost"] for t in opt.trace if not t["success"])  # стоимость неудач оптимизированного потока W_opt = Σ cost по записям с success = 0
 
-        # 4. Non-regression commit gate.
-        base_names = set(incumbent.experts.keys())
-        opt_names = set(opt.experts.keys())
-        experts_ok = opt_names >= base_names
-        check = opt.verify_all(suite)
-        # WAVE 204 (P0.2): gate on real suite coverage, not expert count.
-        floors_ok = (
-            check["accuracy"] == 1.0
-            and check.get("suite_complete", False)
-        )
-        improved = opt_wasted <= int(incumbent_wasted * (1.0 - MIN_RELIEF))
-        # certified-convergence margin: micro-improvements below MIN_RELIEF
-        # per round are not certified growth — stop instead of accumulating
-        # unbounded exploration debt.
-        if experts_ok and floors_ok and improved:
-            rnd_report["gate"] = {"action": "COMMIT",
-                                  "experts_incumbent": len(base_names),
-                                  "experts_optimized": len(opt_names),
-                                  "exact_accuracy": check["accuracy"],
-                                  "wasted_candidates":
-                                      f"{incumbent_wasted} -> {opt_wasted}",
-                                  "overrides": opt.policy_overrides,
-                                  "seconds": round(time.perf_counter() - t0, 2)}
-            prev_wasted = opt_wasted
-            incumbent = opt
-            report["rounds"].append(rnd_report)
-        else:
-            reason = ("lost experts" if not experts_ok else
-                      "quality floor violated" if not floors_ok else
-                      f"no certified improvement (relief below "
-                      f"{MIN_RELIEF:.0%} margin)")
-            if reason.startswith("no certified") and len(ladder) > 1:
-                # lever change, not a stop: same self-model, cheaper floor
-                used = ladder.pop(0)
-                rnd_report["gate"] = {
-                    "action": "LEVER_CHANGE",
-                    "reason": f"floor {used} exhausted -> floor {ladder[0]} "
-                              "(R223: switch the lever, don't repeat it)",
-                    "wasted_candidates": f"{incumbent_wasted} -> {opt_wasted}",
-                }
-                report["rounds"].append(rnd_report)
-                continue  # keep growing with the new lever
-            rnd_report["gate"] = {
-                "action": "HOLD",
-                "reason": ("lost experts" if not experts_ok else
-                           "quality floor violated" if not floors_ok else
-                           f"no certified improvement (relief below "
-                           f"{MIN_RELIEF:.0%} margin) — "
-                           "self-development converged"),
-                "experts_incumbent": len(base_names),
-                "experts_optimized": len(opt_names),
-                "accuracy": check["accuracy"],
-                "wasted_candidates": f"{incumbent_wasted} -> {opt_wasted}",
-                "lost": sorted(base_names - opt_names)[:3],
-                "first_divergence": _first_divergence(incumbent, opt),
-            }
-            report["rounds"].append(rnd_report)
-            adopted = False
+        # 4. Гейт приёма без регрессии.
+        base_names = set(incumbent.experts.keys())  # множество имён экспертов исходного потока E_inc
+        opt_names = set(opt.experts.keys())  # множество имён экспертов оптимизированного потока E_opt
+        experts_ok = opt_names >= base_names  # эксперты сохранены: E_inc ⊆ E_opt
+        check = opt.verify_all(suite)  # точная проверка оптимизированного процессора на базовом наборе
+        # Гейт смотрит на реальное покрытие базового набора, а не на число экспертов.
+        floors_ok = (  # порог качества выполнен, если одновременно:
+            check["accuracy"] == 1.0  # доля верных ответов равна 1
+            and check.get("suite_complete", False)  # и нет задач набора без эксперта (при отсутствии ключа — False)
+        )  # конец условия
+        improved = opt_wasted <= int(incumbent_wasted * (1.0 - MIN_RELIEF))  # снижение подтверждено: W_opt ≤ int(W_inc·(1 − 0.02))
+        # Запас снижения: улучшение раунда меньше MIN_RELIEF не является
+        # подтверждённым ростом — лучше остановиться, чем коплить долг исследования.
+        if experts_ok and floors_ok and improved:  # все три условия гейта выполнены
+            rnd_report["gate"] = {"action": "COMMIT",  # гейт: принять (COMMIT)
+                                  "experts_incumbent": len(base_names),  # число экспертов исходного
+                                  "experts_optimized": len(opt_names),  # число экспертов оптимизированного
+                                  "exact_accuracy": check["accuracy"],  # доля верных ответов проверки
+                                  "wasted_candidates":  # стоимость неудач в виде текста
+                                      f"{incumbent_wasted} -> {opt_wasted}",  # «исходная -> оптимизированная»
+                                  "overrides": opt.policy_overrides,  # число задач с уменьшенным бюджетом
+                                  "seconds": round(time.perf_counter() - t0, 2)}  # длительность раунда в секундах с 2 знаками
+            prev_wasted = opt_wasted  # стоимость неудач теперь = W_opt (переменная далее не используется)
+            incumbent = opt  # оптимизированный процессор становится исходным
+            report["rounds"].append(rnd_report)  # дописать отчёт раунда
+        else:  # хотя бы одно условие не выполнено
+            reason = ("lost experts" if not experts_ok else  # причина: потеряны эксперты
+                      "quality floor violated" if not floors_ok else  # иначе нарушен порог качества
+                      f"no certified improvement (relief below "  # иначе снижение меньше запаса
+                      f"{MIN_RELIEF:.0%} margin)")  # текст причины завершается: «ниже запаса 2%»
+            if reason.startswith("no certified") and len(ladder) > 1:  # снижение не подтверждено и в расписании есть меньший бюджет
+                # смена рычага, а не остановка: та же модель, меньший нижний бюджет
+                used = ladder.pop(0)  # убрать из расписания исчерпанный бюджет used
+                rnd_report["gate"] = {  # гейт: смена рычага
+                    "action": "LEVER_CHANGE",  # действие — смена рычага
+                    "reason": f"floor {used} exhausted -> floor {ladder[0]} "  # причина: бюджет used исчерпан, следующий — новый первый элемент расписания
+                              "(R223: switch the lever, don't repeat it)",  # пояснение к причине
+                    "wasted_candidates": f"{incumbent_wasted} -> {opt_wasted}",  # стоимость неудач «исходная -> оптимизированная»
+                }  # конец словаря
+                report["rounds"].append(rnd_report)  # дописать отчёт раунда
+                continue  # продолжать рост с новым рычагом
+            rnd_report["gate"] = {  # гейт: отказ
+                "action": "HOLD",  # действие — отказ
+                "reason": ("lost experts" if not experts_ok else  # причина: потеряны эксперты
+                           "quality floor violated" if not floors_ok else  # иначе нарушен порог качества
+                           f"no certified improvement (relief below "  # иначе снижение меньше запаса
+                           f"{MIN_RELIEF:.0%} margin) — "  # с пояснением в конце
+                           "self-development converged"),  # «саморазвитие сошлось»
+                "experts_incumbent": len(base_names),  # число экспертов исходного
+                "experts_optimized": len(opt_names),  # число экспертов оптимизированного
+                "accuracy": check["accuracy"],  # доля верных ответов проверки
+                "wasted_candidates": f"{incumbent_wasted} -> {opt_wasted}",  # стоимость неудач «исходная -> оптимизированная»
+                "lost": sorted(base_names - opt_names)[:3],  # до 3 имён потерянных экспертов в алфавитном порядке
+                "first_divergence": _first_divergence(incumbent, opt),  # первое расхождение потоков (диагностика)
+            }  # конец словаря
+            report["rounds"].append(rnd_report)  # дописать отчёт раунда
+            adopted = False  # остановить цикл
 
-    final = incumbent
-    report["segments"] = [[int(n), int(s)] for n, s in segments]
-    report["_final_incumbent"] = final
-    report["final"] = {
-        "adopted_rounds": sum(1 for r in report["rounds"]
-                              if r["gate"]["action"] == "COMMIT"),
-        "experts": len(final.experts),
-        "theorems": len(final.theorems),
-        "neural_adapters": sum(1 for ex in final.experts.values()
-                                if ex.adapter is not None),
-        "pipeline": describe_pipeline(final),
-        "wasted_candidates_on_holds": sum(t["cost"] for t in final.trace
-                                          if not t["success"]),
-        "seconds_total": round(time.perf_counter() - t_start, 2),
-        "workers": workers,
-    }
-    report["converged"] = not adopted
-    return report
+    final = incumbent  # итоговый процессор
+    report["segments"] = [[int(n), int(s)] for n, s in segments]  # поток предложений как списки [число предложений, зерно] — целые числа
+    report["_final_incumbent"] = final  # сам итоговый процессор (убирается перед записью в файл)
+    report["final"] = {  # итог цикла
+        "adopted_rounds": sum(1 for r in report["rounds"]  # число принятых раундов
+                              if r["gate"]["action"] == "COMMIT"),  # = Σ 1 по раундам с действием COMMIT
+        "experts": len(final.experts),  # число экспертов
+        "theorems": len(final.theorems),  # число теорем
+        "neural_adapters": sum(1 for ex in final.experts.values()  # число экспертов с нейронным адаптером
+                                if ex.adapter is not None),  # = Σ 1 по экспертам, у которых adapter не None
+        "pipeline": describe_pipeline(final),  # описание конвейера
+        "wasted_candidates_on_holds": sum(t["cost"] for t in final.trace  # стоимость всех неудач = Σ cost по записям следа
+                                          if not t["success"]),  # с success = 0
+        "seconds_total": round(time.perf_counter() - t_start, 2),  # общее время цикла в секундах с 2 знаками
+        "workers": workers,  # число исполнителей
+    }  # конец словаря
+    report["converged"] = not adopted  # цикл сошёлся, если остановился отказом гейта, а не исчерпанием лимита раундов
+    return report  # вернуть отчёт
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="HAGI self-development loop")
-    p.add_argument("--max-rounds", type=int, default=4)
-    p.add_argument("--workers", type=int, default=0,
-                   help="parallel workers (0 = all CPUs, capped at 32)")
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--floor-ladder", type=int, nargs="*", default=[2000, 200, 50, 20],
-                   help="certified lever-change schedule for the floor budget")
-    p.add_argument("--json", action="store_true")
-    a = p.parse_args()
-    rep = run_self_development(max_rounds=a.max_rounds, workers=a.workers,
-                               batch_size=a.batch_size,
-                               floor_ladder=a.floor_ladder)
-    rep.pop("_final_incumbent", None)
-    out = Path("experiments") / "selfloop_result.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")
-    if a.json:
-        print(json.dumps(rep, indent=2, ensure_ascii=False))
-    else:
-        print(f"rounds adopted: {rep['final']['adopted_rounds']}, "
-              f"converged: {rep['converged']}, experts: {rep['final']['experts']}, "
-              f"wasted: {rep['final']['wasted_candidates_on_holds']}, "
-              f"{rep['final']['seconds_total']}s on {rep['final']['workers']} workers")
-        print(f"report: {out}")
+    """Точка входа командной строки: запустить цикл саморазвития и записать отчёт.
+
+    Отчёт без процессора пишется в experiments/selfloop_result.json; по флагу --json
+    печатается целиком, иначе — одна итоговая строка и путь к файлу."""
+    p = argparse.ArgumentParser(description="HAGI self-development loop")  # разборщик аргументов командной строки
+    p.add_argument("--max-rounds", type=int, default=4)  # максимальное число раундов (по умолчанию 4)
+    p.add_argument("--workers", type=int, default=0,  # число исполнителей (по умолчанию 0)
+                   help="parallel workers (0 = all CPUs, capped at 32)")  # подсказка: 0 — все процессоры, не больше 32
+    p.add_argument("--batch-size", type=int, default=8)  # размер пакета задач (по умолчанию 8)
+    p.add_argument("--floor-ladder", type=int, nargs="*", default=[2000, 200, 50, 20],  # расписание нижнего бюджета: 2000, 200, 50, 20
+                   help="certified lever-change schedule for the floor budget")  # подсказка к расписанию
+    p.add_argument("--json", action="store_true")  # флаг печати отчёта в JSON
+    a = p.parse_args()  # разобрать аргументы командной строки
+    rep = run_self_development(max_rounds=a.max_rounds, workers=a.workers,  # запуск цикла с лимитом раундов и числом исполнителей
+                               batch_size=a.batch_size,  # размером пакета
+                               floor_ladder=a.floor_ladder)  # и расписанием нижнего бюджета
+    rep.pop("_final_incumbent", None)  # убрать процессор из отчёта (не сериализуется); отсутствие ключа не ошибка
+    out = Path("experiments") / "selfloop_result.json"  # путь файла отчёта experiments/selfloop_result.json
+    out.parent.mkdir(exist_ok=True)  # создать каталог experiments, если его нет
+    out.write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")  # записать отчёт с отступом 2, кириллица без экранирования
+    if a.json:  # запрошен полный отчёт
+        print(json.dumps(rep, indent=2, ensure_ascii=False))  # напечатать отчёт в JSON
+    else:  # иначе
+        print(f"rounds adopted: {rep['final']['adopted_rounds']}, "  # принято раундов
+              f"converged: {rep['converged']}, experts: {rep['final']['experts']}, "  # сходимость и число экспертов
+              f"wasted: {rep['final']['wasted_candidates_on_holds']}, "  # стоимость неудач
+              f"{rep['final']['seconds_total']}s on {rep['final']['workers']} workers")  # время и число исполнителей
+        print(f"report: {out}")  # путь к файлу отчёта
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # запуск файла как скрипта, а не импорт
+    main()  # точка входа командной строки
