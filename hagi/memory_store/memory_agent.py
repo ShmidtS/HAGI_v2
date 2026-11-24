@@ -139,7 +139,7 @@ class TernaryEvidenceReranker:  # переупорядочиватель док�
         x = torch.tensor([list(encoded)], dtype=torch.long)  # тензор (1, context) кодов байтов
         logits = self.model(x)[0]  # логиты следующего байта: убрана ось пакета
         # Для упорядочивания разность логитов устойчивее, чем насыщающаяся вероятность.
-        return float((logits[ord("1")] - logits[ord("0")]).item())  # score = logits['1'] − logits['0']
+        return float((logits[ord("1")] - logits[ord("0")]).item())  # оценка: разность логитов следующего байта: score = logits['1'] − logits['0'], чем она больше, тем сильнее доказательство
 
 
 class MemoryAugmentedAgent:  # агент с памятью
