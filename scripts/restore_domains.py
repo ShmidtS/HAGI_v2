@@ -41,7 +41,7 @@ def main() -> None:
         rec = u.domains.get(p.stem)  # запись книги доменов с именем файла без расширения
         if rec and rec.get("sha") == _sha(blob) and rec.get("ce") is not None:  # запись есть, хеш совпадает и CE обучена
             skipped += 1  # учесть пропуск
-            print(f"[restore {i}/{len(chunks)}] {p.stem} -> SKIP "
+            print(f"[restore {i}/{len(chunks)}] {p.stem} -> SKIP "  # начало печати: номер куска, имя файла и метка пропуска
                   "(already learned, sha match)", flush=True)  # печать пропуска
             continue  # к следующему куску
         r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)  # приём куска: 2 эпохи, 1 повтор, без предела повтора; r — словарь итога
@@ -89,11 +89,11 @@ def main() -> None:
             pass  # пропустить — память только для сведения
         import gc  # сборщик мусора
         gc.collect()  # полная сборка мусора
-        print(f"[restore {i}/{len(chunks)}] {p.stem} -> CE {ce} "
+        print(f"[restore {i}/{len(chunks)}] {p.stem} -> CE {ce} "  # начало печати: номер куска, имя файла и CE после приёма
               f"({r.get('seconds', '?')}s)", flush=True)  # печать номера, имени, CE и длительности приёма
         if i % 8 == 0:  # каждый 8-й кусок
             u.save()  # периодическое сохранение: граница возобновления сдвигается вперёд
-    print(f"restore done in {(time.perf_counter()-t0)/3600:.1f}h "
+    print(f"restore done in {(time.perf_counter()-t0)/3600:.1f}h "  # начало печати: длительность в часах = (t − t0)/3600
           f"(skipped {skipped})", flush=True)  # печать длительности в часах и числа пропусков
 
 
