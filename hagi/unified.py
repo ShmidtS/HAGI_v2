@@ -68,8 +68,8 @@ def _guard_prod_write():
     import os as _o  # доступ к переменным окружения
     if _o.environ.get("PYTEST_CURRENT_TEST") and CKPT_DIR == _PROD_CKPT:  # тест идёт И каталог не подменён
         raise RuntimeError(  # прервать запись
-            "refusing to save into the production checkpoint from a "
-            "test: set HAGI_CKPT_DIR / monkeypatch U.CKPT_DIR to a sandbox")
+            "refusing to save into the production checkpoint from a "  # продолжение текста ошибки
+            "test: set HAGI_CKPT_DIR / monkeypatch U.CKPT_DIR to a sandbox")  # конец текста ошибки: как подменить каталог
 
 
 def _sha(b: bytes) -> str:
@@ -651,7 +651,7 @@ class Unified:
 
         def hold_vec():  # CE отложенной выборки по окнам
             with _t.no_grad():  # без градиентов
-                return _t.nn.functional.cross_entropy(m.logits(Xv), yv, reduction="none").double().cpu().numpy()  # CE_i = −log softmax(logit(Xv_i))[yv_i], numpy float64
+                return _t.nn.functional.cross_entropy(m.logits(Xv), yv, reduction="none").double().cpu().numpy()  # перекрёстная энтропия по строкам: CE_i = −log softmax(logit(Xv_i))[yv_i], numpy float64
 
         def hold_ce():  # средняя CE отложенной выборки
             return float(hold_vec().mean())  # средняя: CE = mean_i CE_i
@@ -729,7 +729,7 @@ class Unified:
         _t = self.model.t  # torch: ссылка на библиотеку
         with _t.no_grad():  # без градиентов
             base = _t.nn.functional.cross_entropy(  # базовая CE по окнам ...
-                self.model.logits(X), y, reduction="none").cpu().numpy()  # ... CE_i = −log softmax(logit(X_i))[y_i]
+                self.model.logits(X), y, reduction="none").cpu().numpy()  # перекрёстная энтропия по строкам: ... CE_i = −log softmax(logit(X_i))[y_i]
         after = self._adapter_val_ce(ad, X, y)  # CE по окнам с адаптером
         from hagi.trunk_ops import paired_gain  # парный выигрыш и его нижняя граница
         return ad if paired_gain(base, after)[1] > ADAPTER_MIN_GAIN else None  # адаптер, если нижняя граница > 0.005, иначе None
@@ -991,14 +991,14 @@ class Unified:
                 for e in laws:  # по сохранённым записям
                     ffn = _affine_k(tuple(e["coefs"]), e["bias"])  # аффинная функция ffn(x) = Σ coef_i·x_i + bias
                     bp = ConstructBlueprint(  # чертёж: признак, параметры, функция, базис, нагрузка, 9
-                        e["feature"], (tuple(e["coefs"]), e["bias"]),
-                        ffn, e["basis"], e["payload"], 9)
+                        e["feature"], (tuple(e["coefs"]), e["bias"]),  # аргументы чертежа: признак, кортеж (коэффициенты, смещение)
+                        ffn, e["basis"], e["payload"], 9)  # продолжение: функция, базис, нагрузка, число 9
                     entries.append({"feature": e["feature"],  # запись: признак ...
                                     "bp": bp,  # ... чертёж ...
                                     "verify": e["verify"],  # ... статус проверки ...
                                     "support": e.get("support"),  # ... носитель ...
                                     "accepted_to_registry": e.get(  # ... принят ли в реестр (по умолчанию True) ...
-                                        "accepted_to_registry", True),
+                                        "accepted_to_registry", True),  # ключ «принят в реестр», значение по умолчанию True
                                     "commit_id": e.get("commit_id"),  # ... идентификатор фиксации ...
                                     "shift": e.get("shift"),  # ... сдвиг ...
                                     "n_shifts": e.get("n_shifts"),  # ... число сдвигов ...
@@ -1054,20 +1054,20 @@ class Unified:
         # 1) сначала доказанные законы
         for dom, entry in proven:  # по доказанным
             try:  # применение закона может завершиться ошибкой
-                b = int(entry["bp"].apply(ctx)) % 256  # b = apply(ctx) mod 256
+                b = int(entry["bp"].apply(ctx)) % 256  # предсказанный байт: b = apply(ctx) mod 256
                 return {"byte": b, "status": "OK",  # заверенный ответ: байт, статус OK ...
                         "source": f"law:{dom}:{entry['feature']}",  # ... источник — домен и признак закона ...
-                        "certified": True}  # ... certified = True
+                        "certified": True}  # ответ заверен: ... certified = True
             except Exception:  # закон неприменим
                 continue  # попробовать следующий
         # 2) законы HOLD — лучшая структурированная догадка
         for dom, entry in hold:  # по удерживаемым
             try:  # применение может завершиться ошибкой
-                b = int(entry["bp"].apply(ctx)) % 256  # b = apply(ctx) mod 256
+                b = int(entry["bp"].apply(ctx)) % 256  # предсказанный байт: b = apply(ctx) mod 256
                 return {"byte": b, "status": "HOLD",  # прогноз без заверения: статус HOLD ...
                         "source": f"law-candidate:{dom}:"  # ... источник "law-candidate:<домен>:<признак>" ...
-                                  f"{entry['feature']}",
-                        "certified": False}  # ... certified = False
+                                  f"{entry['feature']}",  # продолжение имени источника: признак закона
+                        "certified": False}  # ответ не заверен: ... certified = False
             except Exception:  # закон неприменим
                 continue  # попробовать следующий
         # 3) по умолчанию HOLD — без закона догадок нет
@@ -1100,10 +1100,10 @@ class Unified:
             "scale": scale.item(),  # масштаб как число
             "ternary_nonzeros": int((tern != 0).sum()),  # число ненулевых элементов маски
             "density": round(float((tern != 0).float().mean()), 4),  # плотность = доля ненулевых, 4 знака
-            "payload": {
+            "payload": {  # вложенный словарь нагрузки
                 "mask": tern.tolist(),          # элементы {−1,0,+1} по весам
                 "scale": scale.item(),  # масштаб (общий скаляр матрицы)
-                "schema": "W ~ mask * scale (per-matrix scalar scale)",
+                "schema": "W ~ mask * scale (per-matrix scalar scale)",  # строка-описание схемы квантования (текст не переводится)
             },
         }
 
