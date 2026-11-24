@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""Run the automatic critique over laws already accepted into law_registry.
+"""Автоматическая самокритика законов, уже принятых в реестр законов модели.
 
-This CLI intentionally contains no hand-written law definitions. The live
-training pipeline calls the same service after a new law is registered.
+Команда не содержит заранее написанных определений законов: единственный
+источник — реестр законов внутри модели Unified. Шаги:
+  1) загрузить сохранённую модель Unified, если файл состояния существует,
+     иначе создать новую пустую модель Unified();
+  2) run_law_self_critique(u) проверяет новые и периодически повторно
+     старые принятые законы на сохранённых примерах байт, где модель
+     предсказывает следующий байт по истинному контексту (контекст берётся истинный, а не сгенерированный);
+     при ошибках модели ставит в очередь файл диалога .chat;
+  3) результат — словарь с разбором — печатается как JSON (кириллица без
+     escape-кодов, отступ 2 пробела).
+Тот же сервис вызывает живой цикл обучения после регистрации нового закона.
+Выход: код возврата 0.
 """
-import json
-from hagi.unified import Unified
-from hagi.law_critique import run_law_self_critique
+import json  # вывод итога в формате JSON
+from hagi.unified import Unified  # единая обучающаяся модель (хранит реестр законов)
+from hagi.law_critique import run_law_self_critique  # служба самокритики законов
 
 
 def main() -> int:
-    u = Unified.load() if Unified.exists() else Unified()
-    report = run_law_self_critique(u)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
+    """Запуск самокритики: загрузить модель и проверить её законы.
+
+    Возвращает код возврата процесса: 0 — самокритика выполнена.
+    Побочный эффект: при ошибках модели в очередь обучения добавляется
+    файл диалога (это делает run_law_self_critique).
+    """
+    u = Unified.load() if Unified.exists() else Unified()  # u = загрузка модели из файла состояния, если файл существует, иначе новая модель по умолчанию
+    report = run_law_self_critique(u)  # проверка принятых законов на примерах; итог — словарь с разбором по каждому закону
+    print(json.dumps(report, ensure_ascii=False, indent=2))  # печать словаря как JSON: неэкранированная кириллица, отступ 2 пробела
+    return 0  # код возврата 0 — успех
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__":  # выполнять только при запуске файла как скрипта, не при импорте
+    raise SystemExit(main())  # завершить процесс с кодом возврата main()
