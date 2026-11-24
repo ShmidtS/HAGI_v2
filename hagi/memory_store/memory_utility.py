@@ -273,13 +273,16 @@ class SQLiteUtilityIndex:
         self.memory = memory  # архив с атрибутом db (соединение SQLite)
         self.working_set = working_set  # рабочий набор с учеником
         db = memory.db  # соединение SQLite
-        db.execute("""CREATE TABLE IF NOT EXISTS utility_page_stats (
+        db.execute("""\
+CREATE TABLE IF NOT EXISTS utility_page_stats (
             page_id INTEGER PRIMARY KEY, feature_count INTEGER NOT NULL)""")  # таблица числа признаков: page_id — номер страницы, feature_count — число её признаков
-        db.execute("""CREATE TABLE IF NOT EXISTS utility_page_features (
+        db.execute("""\
+CREATE TABLE IF NOT EXISTS utility_page_features (
             page_id INTEGER NOT NULL, feature_idx INTEGER NOT NULL,
             PRIMARY KEY(page_id, feature_idx)) WITHOUT ROWID""")  # таблица пар (номер страницы, ячейка признака); первичный ключ — пара; хранение без rowid
         db.execute("CREATE INDEX IF NOT EXISTS idx_utility_feature_page ON utility_page_features(feature_idx,page_id)")  # индекс (признак, страница) для поиска страниц по признаку
-        db.execute("""CREATE TEMP TABLE IF NOT EXISTS utility_active_weights (
+        db.execute("""\
+CREATE TEMP TABLE IF NOT EXISTS utility_active_weights (
             feature_idx INTEGER PRIMARY KEY, weight REAL NOT NULL) WITHOUT ROWID""")  # временная таблица активных весов: ячейка -> вес
         db.commit()  # зафиксировать создание таблиц и индекса
         self.indexed_page_id = int(db.execute(  # наибольший уже индексированный номер страницы
@@ -366,7 +369,8 @@ class SQLiteUtilityIndex:
             # число всех её признаков (соединение пар, активных весов и счётчиков по ячейке и странице,
             # группировка по странице)
             cur = db.execute(  # выполнить запрос и получить курсор
-                """SELECT f.page_id,SUM(w.weight),s.feature_count
+                """\
+SELECT f.page_id,SUM(w.weight),s.feature_count
                    FROM utility_page_features AS f
                    JOIN utility_active_weights AS w ON w.feature_idx=f.feature_idx
                    JOIN utility_page_stats AS s ON s.page_id=f.page_id
