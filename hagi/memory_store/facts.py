@@ -86,7 +86,8 @@ class ConflictAwareFactStore:
         """Создать таблицу журнала guarded_fact_history с индексом и таблицу текущих фактов guarded_fact_current."""
         # журнал: номер записи — ключ; ключ факта, версия, значение, источник, уверенность,
         # авторитет, статус, признак явной правки (по умолчанию 0), время создания
-        self.db.execute("""CREATE TABLE IF NOT EXISTS guarded_fact_history (
+        self.db.execute("""\
+CREATE TABLE IF NOT EXISTS guarded_fact_history (
             history_id INTEGER PRIMARY KEY,
             fact_key TEXT NOT NULL,
             revision INTEGER NOT NULL,
@@ -96,11 +97,13 @@ class ConflictAwareFactStore:
             authority REAL NOT NULL,
             status TEXT NOT NULL,
             explicit_correction INTEGER NOT NULL DEFAULT 0,
-            created_ns INTEGER NOT NULL)""")
+            created_ns INTEGER NOT NULL)"""  # created_ns — время создания; конец текста создания guarded_fact_history
+            )
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_guarded_history_key ON guarded_fact_history(fact_key, history_id)")  # индекс по (ключ факта, номер записи) для выборок истории одного ключа
         # текущие факты: по строке на ключ — версия, значение, источник, уверенность,
         # авторитет, номер записи журнала и время обновления
-        self.db.execute("""CREATE TABLE IF NOT EXISTS guarded_fact_current (
+        self.db.execute("""\
+CREATE TABLE IF NOT EXISTS guarded_fact_current (
             fact_key TEXT PRIMARY KEY,
             revision INTEGER NOT NULL,
             value TEXT NOT NULL,
@@ -108,7 +111,8 @@ class ConflictAwareFactStore:
             confidence REAL NOT NULL,
             authority REAL NOT NULL,
             history_id INTEGER NOT NULL,
-            updated_ns INTEGER NOT NULL)""")
+            updated_ns INTEGER NOT NULL)"""  # updated_ns — время обновления; конец текста создания guarded_fact_current
+            )
         self.db.commit()  # зафиксировать создание таблиц
 
     @staticmethod  # статический метод: не получает self
@@ -142,7 +146,8 @@ class ConflictAwareFactStore:
         """Вернуть действующую версию факта с ключом key либо None, если факта нет."""
         fact_key = self.normalize_key(key)  # нормализованный ключ факта
         row = self.db.execute(  # строка текущего факта (восемь столбцов снимка) по ключу
-            """SELECT fact_key,revision,value,source,confidence,authority,history_id,updated_ns
+            """\
+SELECT fact_key,revision,value,source,confidence,authority,history_id,updated_ns
                FROM guarded_fact_current WHERE fact_key=?""", (fact_key,)  # из таблицы текущих фактов по ключу
         ).fetchone()  # одна строка или None
         return None if row is None else self._snapshot(row)  # None, если строки нет, иначе снимок
@@ -201,7 +206,8 @@ class ConflictAwareFactStore:
             revision = current.revision + 1  # номер новой версии = текущий + 1
             status = "accepted" if accepted else "pending_conflict"  # статус: принято либо конфликт
         cur = self.db.execute(  # дописать предложение в журнал (в любом случае)
-            """INSERT INTO guarded_fact_history
+            """\
+INSERT INTO guarded_fact_history
                (fact_key,revision,value,source,confidence,authority,status,explicit_correction,created_ns)
                VALUES (?,?,?,?,?,?,?,?,?)""",  # девять параметров
             (fact_key, revision, proposed_value, src, conf, auth, status,  # ключ, версия, значение, источник, уверенность, авторитет, статус
@@ -210,7 +216,8 @@ class ConflictAwareFactStore:
         history_id = int(cur.lastrowid)  # номер записи = последний вставленный rowid
         if current is None:  # факта не было — вставить текущую версию
             self.db.execute(  # вставить текущую версию нового факта
-                """INSERT INTO guarded_fact_current
+                """\
+INSERT INTO guarded_fact_current
                    (fact_key,revision,value,source,confidence,authority,history_id,updated_ns)
                    VALUES (?,?,?,?,?,?,?,?)""",  # восемь параметров
                 (fact_key, 1, proposed_value, src, conf, auth, history_id, now),  # ключ, версия 1, значение, источник, уверенность, авторитет, номер записи, время
@@ -221,7 +228,8 @@ class ConflictAwareFactStore:
             new_auth = max(current.authority, auth)  # авторитет = max(текущий, новый)
             chosen_source = src if conf >= current.confidence else current.source  # источник нового, если его уверенность не ниже, иначе прежний
             self.db.execute(  # обновить свидетельства при подтверждении
-                """UPDATE guarded_fact_current SET confidence=?,authority=?,source=?,updated_ns=?
+                """\
+UPDATE guarded_fact_current SET confidence=?,authority=?,source=?,updated_ns=?
                    WHERE fact_key=?""",  # обновить уверенность, авторитет, источник и время по ключу
                 (new_conf, new_auth, chosen_source, now, fact_key),  # новые значения
             )
@@ -231,7 +239,8 @@ class ConflictAwareFactStore:
                 (current.history_id,),  # по её номеру
             )
             self.db.execute(  # заменить текущую версию принятой
-                """UPDATE guarded_fact_current SET revision=?,value=?,source=?,confidence=?,authority=?,
+                """\
+UPDATE guarded_fact_current SET revision=?,value=?,source=?,confidence=?,authority=?,
                    history_id=?,updated_ns=? WHERE fact_key=?""",  # заменить версию, значение, источник, уверенность, авторитет, номер записи и время
                 (revision, proposed_value, src, conf, auth, history_id, now, fact_key),  # новыми значениями по ключу
             )
@@ -252,12 +261,14 @@ class ConflictAwareFactStore:
         fact_key = self.normalize_key(key)  # нормализованный ключ факта
         # После решения проверяющим конкурирующие ожидающие предложения закрываются.
         self.db.execute(  # подтвердить совпадающие ожидающие предложения
-            """UPDATE guarded_fact_history SET status='reaffirmed'
+            """\
+UPDATE guarded_fact_history SET status='reaffirmed'
                WHERE fact_key=? AND status='pending_conflict' AND lower(trim(value))=lower(trim(?))""",  # совпадающие по значению (без регистра и крайних пробелов) ожидающие — подтверждены
             (fact_key, str(chosen_value).strip()),  # ключ и выбранное значение без крайних пробелов
         )
         self.db.execute(  # отклонить остальные ожидающие предложения
-            """UPDATE guarded_fact_history SET status='rejected'
+            """\
+UPDATE guarded_fact_history SET status='rejected'
                WHERE fact_key=? AND status='pending_conflict' AND lower(trim(value))<>lower(trim(?))""",  # не совпадающие ожидающие — отклонены
             (fact_key, str(chosen_value).strip()),  # ключ и выбранное значение
         )
@@ -270,7 +281,8 @@ class ConflictAwareFactStore:
         include_pending=False исключает записи со статусом pending_conflict."""
         fact_key = self.normalize_key(key)  # нормализованный ключ факта
         # запрос истории: номер записи, версия, значение, источник, уверенность, авторитет, статус, признак правки, время
-        sql = """SELECT history_id,revision,value,source,confidence,authority,status,
+        sql = """\
+SELECT history_id,revision,value,source,confidence,authority,status,
                         explicit_correction,created_ns
                  FROM guarded_fact_history WHERE fact_key=?"""  # по ключу факта
         params: list = [fact_key]  # параметры запроса
@@ -285,7 +297,8 @@ class ConflictAwareFactStore:
     def pending_conflicts(self, key: str | None = None) -> list[dict]:
         """Вернуть ожидающие конфликтные предложения (по ключу key или все) в порядке номеров записей — словари с восемью полями."""
         # запрос: номер записи, ключ, версия, значение, источник, уверенность, авторитет, время создания
-        sql = """SELECT history_id,fact_key,revision,value,source,confidence,authority,created_ns
+        sql = """\
+SELECT history_id,fact_key,revision,value,source,confidence,authority,created_ns
                  FROM guarded_fact_history WHERE status='pending_conflict'"""  # только ожидающие конфликты
         params: tuple = ()  # параметров пока нет
         if key is not None:  # задан конкретный ключ
