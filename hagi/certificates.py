@@ -97,16 +97,16 @@ _AST_SCHEMA_DESCRIPTOR = {  # описание схемы выражений (с
         "anf": {"arity": 0, "semantics": "xor coefficients whose subset mask is contained in input bitmask"},  # anf: 0 аргументов, искл. или коэффициентов, чьи маски подмножеств входят в маску входа
         "poly": {"arity": 1, "semantics": "integer polynomial evaluated by Horner's method; coefficients low-to-high"},  # poly: 1 аргумент, многочлен по схеме Горнера, коэффициенты от младших к старшим
         "poly_nd": {"arity": 0, "semantics": "sum of integer coefficient times each input raised to its nonnegative power"},  # poly_nd: 0 аргументов, сумма коэффициентов, умноженных на входы в неотрицательных степенях
-        "neg": {"arity": 1, "semantics": "-x"},  # neg: −x
+        "neg": {"arity": 1, "semantics": "-x"},  # отрицание: neg: −x
         "abs": {"arity": 1, "semantics": "absolute value"},  # abs: абсолютное значение
         "sign": {"arity": 1, "semantics": "-1, 0, or 1"},  # sign: −1, 0 или 1
-        "bit_not8": {"arity": 1, "semantics": "(~x) & 255"},  # bit_not8: (~x) & 255
-        "square": {"arity": 1, "semantics": "x*x"},  # square: x·x
-        "cube": {"arity": 1, "semantics": "x*x*x"},  # cube: x·x·x
-        "clamp3": {"arity": 1, "semantics": "min(max(x,-3),3)"},  # clamp3: min(max(x, −3), 3)
-        "add": {"arity": 2, "semantics": "a+b"},  # add: a + b
-        "sub": {"arity": 2, "semantics": "a-b"},  # sub: a − b
-        "mul": {"arity": 2, "semantics": "a*b"},  # mul: a·b
+        "bit_not8": {"arity": 1, "semantics": "(~x) & 255"},  # побитовое отрицание по модулю 256: bit_not8: (~x) & 255
+        "square": {"arity": 1, "semantics": "x*x"},  # квадрат: square: x·x
+        "cube": {"arity": 1, "semantics": "x*x*x"},  # куб: cube: x·x·x
+        "clamp3": {"arity": 1, "semantics": "min(max(x,-3),3)"},  # усечение в отрезок [−3, 3]: clamp3: min(max(x, −3), 3)
+        "add": {"arity": 2, "semantics": "a+b"},  # сложение: add: a + b
+        "sub": {"arity": 2, "semantics": "a-b"},  # вычитание: sub: a − b
+        "mul": {"arity": 2, "semantics": "a*b"},  # умножение: mul: a·b
         "floordiv": {"arity": 2, "semantics": "Python integer floor division"},  # floordiv: деление нацело по правилам Python
         "mod": {"arity": 2, "semantics": "Python integer modulo"},  # mod: остаток по правилам Python
         "gcd": {"arity": 2, "semantics": "nonnegative greatest common divisor"},  # gcd: неотрицательный наибольший общий делитель
@@ -122,15 +122,15 @@ _AST_SCHEMA_DESCRIPTOR = {  # описание схемы выражений (с
         "bit_and": {"arity": 2, "semantics": "integer bitwise and"},  # bit_and: побитовое и
         "bit_or": {"arity": 2, "semantics": "integer bitwise or"},  # bit_or: побитовое или
         "bit_xor": {"arity": 2, "semantics": "integer bitwise xor"},  # bit_xor: побитовое исключающее или
-        "bit_nand8": {"arity": 2, "semantics": "(~(a&b)) & 255"},  # bit_nand8: (~(a & b)) & 255
-        "bit_nor8": {"arity": 2, "semantics": "(~(a|b)) & 255"},  # bit_nor8: (~(a | b)) & 255
-        "bit_xnor8": {"arity": 2, "semantics": "(~(a^b)) & 255"},  # bit_xnor8: (~(a ^ b)) & 255
+        "bit_nand8": {"arity": 2, "semantics": "(~(a&b)) & 255"},  # побитовое «и-не»: bit_nand8: (~(a & b)) & 255
+        "bit_nor8": {"arity": 2, "semantics": "(~(a|b)) & 255"},  # побитовое «или-не»: bit_nor8: (~(a | b)) & 255
+        "bit_xnor8": {"arity": 2, "semantics": "(~(a^b)) & 255"},  # побитовое «исключающее или-не»: bit_xnor8: (~(a ^ b)) & 255
         "pow_int": {"arity": 2, "semantics": "a**b; exponent must be in [0,8]"},  # pow_int: a в степени b, показатель из отрезка [0, 8]
-        "absdiff": {"arity": 2, "semantics": "abs(a-b)"},  # absdiff: |a − b|
-        "fma": {"arity": 3, "semantics": "a*b+c"},  # fma: a·b + c
-        "clamp": {"arity": 3, "semantics": "min(max(a,b),c)"},  # clamp: min(max(a, b), c)
+        "absdiff": {"arity": 2, "semantics": "abs(a-b)"},  # модуль разности: absdiff: |a − b|
+        "fma": {"arity": 3, "semantics": "a*b+c"},  # умножение со сложением: fma: a·b + c
+        "clamp": {"arity": 3, "semantics": "min(max(a,b),c)"},  # усечение снизу и сверху: clamp: min(max(a, b), c)
         "median3": {"arity": 3, "semantics": "median of three integers"},  # median3: медиана трёх целых
-        "mul3": {"arity": 3, "semantics": "a*b*c"},  # mul3: a·b·c
+        "mul3": {"arity": 3, "semantics": "a*b*c"},  # тройное произведение: mul3: a·b·c
     },
 }
 AST_SCHEMA_SHA256 = _sha256(_AST_SCHEMA_DESCRIPTOR)  # хеш SHA-256 описания схемы, вшитый в проверяющего
@@ -386,48 +386,48 @@ def _eval_expr_inner(
         return total  # вернуть сумму термов
     if op in unary or op in binary:  # унарная или бинарная операция
 # вычислитель явный: без динамической диспетчеризации и без eval
-        if op == "neg": return -vals[0]  # neg: −a
-        if op == "abs": return abs(vals[0])  # abs: |a|
-        if op == "sign": return (vals[0] > 0) - (vals[0] < 0)  # sign: (a > 0) − (a < 0)
-        if op == "bit_not8": return (~vals[0]) & 0xFF  # bit_not8: (~a) & 255
-        if op == "square": return vals[0] * vals[0]  # square: a²
-        if op == "cube": return vals[0] * vals[0] * vals[0]  # cube: a³
-        if op == "clamp3": return min(max(vals[0], -3), 3)  # clamp3: min(max(a, −3), 3)
+        if op == "neg": return -vals[0]  # отрицание: neg: −a
+        if op == "abs": return abs(vals[0])  # модуль: abs: |a|
+        if op == "sign": return (vals[0] > 0) - (vals[0] < 0)  # знак числа: sign: (a > 0) − (a < 0)
+        if op == "bit_not8": return (~vals[0]) & 0xFF  # побитовое отрицание по модулю 256: bit_not8: (~a) & 255
+        if op == "square": return vals[0] * vals[0]  # квадрат: square: a²
+        if op == "cube": return vals[0] * vals[0] * vals[0]  # куб: cube: a³
+        if op == "clamp3": return min(max(vals[0], -3), 3)  # усечение в отрезок [−3, 3]: clamp3: min(max(a, −3), 3)
         a, b = vals  # распаковать два аргумента a, b
-        if op == "add": return a + b  # add: a + b
-        if op == "sub": return a - b  # sub: a − b
-        if op == "mul": return a * b  # mul: a·b
-        if op == "floordiv": return a // b  # floordiv: a // b
-        if op == "mod": return a % b  # mod: a mod b
+        if op == "add": return a + b  # сложение: add: a + b
+        if op == "sub": return a - b  # вычитание: sub: a − b
+        if op == "mul": return a * b  # умножение: mul: a·b
+        if op == "floordiv": return a // b  # деление нацело: floordiv: a // b
+        if op == "mod": return a % b  # остаток от деления: mod: a mod b
         if op == "gcd": return math.gcd(a, b)  # gcd: НОД(a, b)
         if op == "lcm": return math.lcm(a, b)  # lcm: НОК(a, b)
-        if op == "min": return min(a, b)  # min: min(a, b)
-        if op == "max": return max(a, b)  # max: max(a, b)
+        if op == "min": return min(a, b)  # минимум: min: min(a, b)
+        if op == "max": return max(a, b)  # максимум: max: max(a, b)
         if op == "eq": return int(a == b)  # eq: 1, если a = b, иначе 0
         if op == "ne": return int(a != b)  # ne: 1, если a ≠ b, иначе 0
         if op == "lt": return int(a < b)  # lt: 1, если a < b, иначе 0
         if op == "le": return int(a <= b)  # le: 1, если a ≤ b, иначе 0
         if op == "gt": return int(a > b)  # gt: 1, если a > b, иначе 0
         if op == "ge": return int(a >= b)  # ge: 1, если a ≥ b, иначе 0
-        if op == "bit_and": return a & b  # bit_and: a & b
-        if op == "bit_or": return a | b  # bit_or: a | b
-        if op == "bit_xor": return a ^ b  # bit_xor: a ^ b
-        if op == "bit_nand8": return (~(a & b)) & 0xFF  # bit_nand8: (~(a & b)) & 255
-        if op == "bit_nor8": return (~(a | b)) & 0xFF  # bit_nor8: (~(a | b)) & 255
-        if op == "bit_xnor8": return (~(a ^ b)) & 0xFF  # bit_xnor8: (~(a ^ b)) & 255
+        if op == "bit_and": return a & b  # побитовое «и»: bit_and: a & b
+        if op == "bit_or": return a | b  # побитовое «или»: bit_or: a | b
+        if op == "bit_xor": return a ^ b  # побитовое «исключающее или»: bit_xor: a ^ b
+        if op == "bit_nand8": return (~(a & b)) & 0xFF  # побитовое «и-не»: bit_nand8: (~(a & b)) & 255
+        if op == "bit_nor8": return (~(a | b)) & 0xFF  # побитовое «или-не»: bit_nor8: (~(a | b)) & 255
+        if op == "bit_xnor8": return (~(a ^ b)) & 0xFF  # побитовое «исключающее или-не»: bit_xnor8: (~(a ^ b)) & 255
         if op == "pow_int":  # pow_int: возведение в степень
             if b < 0 or b > 8:  # показатель из отрезка [0, 8]
                 raise ValueError("pow_int exponent outside [0,8]")  # ошибка: показатель вне [0, 8]
             return a ** b  # вернуть a^b
-        if op == "absdiff": return abs(a - b)  # absdiff: |a − b|
+        if op == "absdiff": return abs(a - b)  # модуль разности: absdiff: |a − b|
     if op in {"fma", "clamp", "median3", "mul3"}:  # тернарные операции
         if len(vals) != 3:  # ровно три аргумента
             raise ValueError(f"{op} expects three arguments")  # ошибка: нужно три аргумента
         a, b, c = vals  # распаковать a, b, c
-        if op == "fma": return a * b + c  # fma: a·b + c
-        if op == "clamp": return min(max(a, b), c)  # clamp: min(max(a, b), c)
+        if op == "fma": return a * b + c  # умножение со сложением: fma: a·b + c
+        if op == "clamp": return min(max(a, b), c)  # усечение снизу и сверху: clamp: min(max(a, b), c)
         if op == "median3": return sorted(vals)[1]  # медиана трёх: средний элемент отсортированного списка
-        if op == "mul3": return a * b * c  # mul3: a·b·c
+        if op == "mul3": return a * b * c  # тройное произведение: mul3: a·b·c
     raise ValueError(f"unsupported or malformed AST op: {op}")  # ошибка: неизвестная или неверная операция узла
 
 
@@ -902,9 +902,9 @@ def verify_portable_certificate(source: str | Path | Mapping[str, Any]) -> dict[
         artifact_format = artifact.get("format")  # формат артефакта
         if artifact_format == FORMAT_V1:  # формат версии 1
             expected_keys = {  # обязательные ключи V1
-                "format", "format_version", "hagi_version", "scope_notice",  # format, format_version, hagi_version, scope_notice
-                "model_version", "total_commits", "task_count", "expert_library",  # model_version, total_commits, task_count, expert_library
-                "tasks", "artifact_sha256",  # tasks, artifact_sha256
+                "format", "format_version", "hagi_version", "scope_notice",  # имена обязательных ключей: format, format_version, hagi_version, scope_notice
+                "model_version", "total_commits", "task_count", "expert_library",  # имена обязательных ключей: model_version, total_commits, task_count, expert_library
+                "tasks", "artifact_sha256",  # имена обязательных ключей: tasks, artifact_sha256
             }
             _require_keys(artifact, expected_keys, set(), "V1 artifact")  # ровно эти ключи
             version = _int(artifact["format_version"], "format_version")  # номер версии — целое
@@ -914,10 +914,10 @@ def verify_portable_certificate(source: str | Path | Mapping[str, Any]) -> dict[
             verifier_profile = "hagi.portable-verifier.v1-legacy"  # профиль проверяющего V1 — устаревший, задан здесь
         elif artifact_format == FORMAT:  # формат версии 2
             expected_keys = {  # обязательные ключи V2
-                "format", "format_version", "ast_schema", "ast_schema_sha256",  # format, format_version, ast_schema, ast_schema_sha256
-                "verifier_profile", "hagi_version", "scope_notice", "model_version",  # verifier_profile, hagi_version, scope_notice, model_version
-                "total_commits", "task_count", "expert_library", "tasks",  # total_commits, task_count, expert_library, tasks
-                "artifact_sha256",  # artifact_sha256
+                "format", "format_version", "ast_schema", "ast_schema_sha256",  # имена обязательных ключей: format, format_version, ast_schema, ast_schema_sha256
+                "verifier_profile", "hagi_version", "scope_notice", "model_version",  # имена обязательных ключей: verifier_profile, hagi_version, scope_notice, model_version
+                "total_commits", "task_count", "expert_library", "tasks",  # имена обязательных ключей: total_commits, task_count, expert_library, tasks
+                "artifact_sha256",  # имена обязательных ключей: artifact_sha256
             }
             _require_keys(artifact, expected_keys, set(), "V2 artifact")  # ровно эти ключи
             version = _int(artifact["format_version"], "format_version")  # номер версии — целое
@@ -966,9 +966,9 @@ def verify_portable_certificate(source: str | Path | Mapping[str, Any]) -> dict[
             _require_keys(  # проверить ключи задачи
                 task,  # проверяемая задача
                 {  # ровно тринадцать обязательных ключей
-                    "name", "family", "arity", "domains", "valid_rule",  # name, family, arity, domains, valid_rule
-                    "domain_size", "expected_outputs", "labels_sha256", "action",  # domain_size, expected_outputs, labels_sha256, action
-                    "program_source", "program_bits", "reported_code_length", "reason",  # program_source, program_bits, reported_code_length, reason
+                    "name", "family", "arity", "domains", "valid_rule",  # имена обязательных ключей задачи: name, family, arity, domains, valid_rule
+                    "domain_size", "expected_outputs", "labels_sha256", "action",  # имена обязательных ключей задачи: domain_size, expected_outputs, labels_sha256, action
+                    "program_source", "program_bits", "reported_code_length", "reason",  # имена обязательных ключей задачи: program_source, program_bits, reported_code_length, reason
                 },
                 set(), "task",  # имя места
             )
@@ -1098,8 +1098,8 @@ def upgrade_portable_certificate_v1_to_v2(
     elif artifact.get("format") == FORMAT_V1:  # исходный V1
         upgraded = dict(artifact)  # копия артефакта
         upgraded.pop("artifact_sha256", None)  # удалить старый хеш
-        upgraded["format"] = FORMAT  # format = FORMAT
-        upgraded["format_version"] = FORMAT_VERSION  # format_version = FORMAT_VERSION
+        upgraded["format"] = FORMAT  # записать формат: format = FORMAT
+        upgraded["format_version"] = FORMAT_VERSION  # записать номер версии формата: format_version = FORMAT_VERSION
         upgraded["ast_schema"] = AST_SCHEMA  # явная схема AST
         upgraded["ast_schema_sha256"] = AST_SCHEMA_SHA256  # хеш схемы AST
         upgraded["verifier_profile"] = VERIFIER_PROFILE  # явный профиль проверяющего
