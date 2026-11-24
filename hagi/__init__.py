@@ -1,40 +1,39 @@
-"""HAGI — self-developing neuro-symbolic processor.
+"""HAGI — публичный API пакета: точка входа `import hagi`.
 
-Layout (WAVE 195 refactor: 55 -> 32 files, merged by meaning):
-  Entry points
-    hagi.cli        — unified CLI: python -m hagi.cli <cmd>
-    hagi.pipeline   — THE pipeline: ingest -> LM -> diagnose ->
-                      invent -> gate -> reify (HAGI_SYMBOLIC=1)
-  Kernel & body
-    hagi.core       — canonical kernel (legacy body star-imported)
-    hagi.legacy_kernel — frozen legacy body
-    hagi.lm         — byte-LM (RopeAttentionByteLM = production)
-    hagi.unified    — ONE model: ingest + ledger
-    hagi.gpu        — CUDA/ROCm backend
-  Construct discovery
-    hagi.invention  — blueprints + CEGIS + prior + while-loops + RDL
-    hagi.representations — representation registry + reifier
-    hagi.fabric     — Venn-cloth genome evolution
-    hagi.skill_engine / anf_frontend — proof-carrying ANF synthesis
-  Measurement
-    hagi.measurement — transfer meter, capability, budget, oracle, QBC
-    hagi.diagnosis  — residual profiles, hold classification
-  Trunk ops
-    hagi.trunk_ops  — six-phase cycle, merge, Hadamard, growth
-  Theory bridges
-    hagi.sandwich   — certified softmax argmax (C489-C502)
-  Environments
-    hagi.env_lut / env_temporal — worlds + bridges + verifiers
-  Self development
-    hagi.selfmodel  — self-model + controller + experiment + selfedit
-    hagi.loop / rewrite — growth loops
-    hagi.genesis    — architecture genesis + EC library
-    hagi.school     — lessons, curriculum, mind
-  Misc
-    hagi.certificates — portable certificate suite
-    hagi.cli        — see Entry points
+Назначение файла: собрать в пространстве имён `hagi` всё, что
+считается внешним интерфейсом модели. Сам файл ничего не вычисляет.
 
-`from hagi import *` exposes the core namespace.
+HAGI — самообучающаяся модель, работающая с данными как с потоком
+байтов. Ядро модели — символьный процессор: программа представляется
+выражением (дерево операций над целыми числами по модулю степени
+двойки), а обучение — поиском такой программы, которая точно
+воспроизводит пары «вход → выход». Языковая модель по байтам
+оценивает распределение следующего байта p(b | контекст) и живёт в
+модуле `hagi.lm`; сюда она не попадает и импортируется явно.
+
+Что экспортирует пакет (две строки ниже):
+  1. `from .core import *` — всё публичное канонического ядра
+     `hagi.core`: классы процессоров (`GrowingHagiProcessor`,
+     `V5Processor`, `GrowingMathProcessor` и др.), безопасное
+     выражение DSL (`Expr`, `Program`), таблицы операций (`OPS`,
+     `BINARY_OPS`, `UNARY_OPS`, `CONSTS`, `COMMUTATIVE_OPS`),
+     процедуры роста и самопроверки (`grow_deep`, `grow_v8`,
+     `self_test_core`), майнеры теорем, версии (`V5_VERSION`,
+     `V7_VERSION`, `V8_VERSION`, `V9_VERSION`) и служебные имена,
+     которые `core` сам импортировал (`np`, `json`, `math`, `Path`).
+     Правило звезды без `__all__`: копируются ВСЕ имена модуля, не
+     начинающиеся с подчёркивания; `core` в свою очередь делает
+     звезду из `hagi.legacy_kernel`, так что замороженное тело V5–V8
+     тоже попадает сюда (при совпадении имён побеждает определение
+     из `core`).
+  2. `from . import genesis` — подпакет/модуль `hagi.genesis`
+     становится атрибутом `hagi.genesis` (генезис конфигураций
+     цикла обучения и геномов эллиптико-кривого процессора), чтобы
+     писать `hagi.genesis.evolve(...)` после `import hagi`.
+
+Прагмы `# noqa` отключают линтер для этих строк: F401 — «импорт не
+используется в самом файле» (он здесь именно для перепродажи имён),
+F403 — «звёздный импорт».
 """
-from .core import *  # noqa: F401,F403
-from . import genesis  # noqa: F401
+from .core import *  # noqa: F401,F403  — скопировать в hagi все публичные имена ядра (без подчёркивания): процессоры, Expr/Program, OPS, grow_*, self_test_*
+from . import genesis  # noqa: F401  — сделать модуль hagi.genesis атрибутом пакета: доступно как hagi.genesis
