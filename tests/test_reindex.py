@@ -18,7 +18,7 @@ def test_reindex_rebuilds_the_book_from_bytes(tmp_path, monkeypatch):
     (tmp_path / "domains" / "a.bin").write_bytes(a)  # записать a в файл a.bin
     (tmp_path / "domains" / "tiny.bin").write_bytes(b"xx")  # файл из 2 байтов — короче порога 4096
     u = U.Unified()  # новая единая модель
-    u.domains = {"a": {"sha": "old", "bytes": 1, "ce": 1.5},   # measured: kept
+    u.domains = {"a": {"sha": "old", "bytes": 1, "ce": 1.5},  # домен a: ce уже измерена (1.5) — запись сохраняется
                  "kept": {"sha": "k", "bytes": 9, "ce": 2.0}}  # книга: a с измеренной CE (сохраняется), kept — посторонняя запись
     assert u.reindex_domains() == 0  # у a CE уже измерена — пересборка ничего не добавляет
     u.domains["a"]["ce"] = None  # у a CE больше нет — запись устарела
