@@ -753,7 +753,7 @@ def main():
     summary = run_panel(args.seed, args.panel, args.out)  # прогнать панель
     summary['elapsed_seconds'] = round(time.time() - t0, 3)  # затраченное время в секундах
     print(json.dumps(summary, indent=2))  # напечатать сводку
-if __name__ == '__main__':
+if __name__ == '__main__':  # файл запущен напрямую — выполнить main()
     main()  # запуск основной функции
 
 # ============================================================
@@ -1046,5 +1046,5 @@ def main():
     r = verify_bundle(args.root)  # независимая проверка пакета результатов
     print(json.dumps(r['summary'], indent=2))  # напечатать сводку
     raise SystemExit(0 if r['summary']['all_pass'] else 1)  # код выхода 0, если всё пройдено, иначе 1
-if __name__ == '__main__':
+if __name__ == '__main__':  # файл запущен напрямую — выполнить main()
     main()  # запуск основной функции
