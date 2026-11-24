@@ -319,5 +319,5 @@ def main() -> None:
           f"ingested={st['bytes_ingested']/1e6:.0f}MB", flush=True)  # ...и принятых мегабайтов
 
 
-if __name__ == "__main__":
-    main()  # запустить цикл  # запустить цикл
+if __name__ == "__main__":  # запуск файла как скрипта
+    main()  # запустить цикл
