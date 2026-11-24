@@ -1,13 +1,25 @@
-"""WAVE 245: batch size vs time-to-quality on OUR Rope model, equal
-data (train_guarded, epochs=2), conflicting-free periodic+text mix."""
-import sys, os, time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("HAGI_DEVICE", "cpu")
-from hagi.lm import RopeAttentionByteLM
-data = (open('README.md', 'rb').read() * 3)[:400_000]
-print("batch   CE      s     CE/s-gain")
-for b in (8, 16, 24, 32, 48):
-    m = RopeAttentionByteLM(dim=64, hidden=128, seed=int(os.environ.get("SW_SEED","7")))
-    t = time.perf_counter(); r = m.train_guarded(data, epochs=2, batch=b)
-    s = time.perf_counter() - t
-    print(f"{b:5}  {r['best_holdout_ce']:6.3f}  {s:6.1f}")
+"""Перебор размера батча: зависимость времени обучения и качества модели от batch.
+
+Для каждого размера батча b создаётся заново модель RopeAttentionByteLM (внимание
+с поворотом позиций, предсказание следующего байта) с одинаковым зерном
+инициализации и обучается методом train_guarded на одних и тех же данных
+(2 эпохи). Для каждого b печатается строка: b, лучший CE на отложенной выборке,
+полное время обучения в секундах.
+
+train_guarded возвращает словарь с ключом "best_holdout_ce" — наименьшая
+cross-entropy на отложенной части данных по эпохам (округлена до 4 знаков);
+это оценка качества при выборе эпохи, поэтому оптимистична.
+Данные: байты файла-описания проекта (открывается в строке с `open`),
+повторённые трижды, срез первых 400 000 байт.
+"""
+import sys, os, time  # sys — путь импорта, os — файлы и окружение, time — замер времени
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # добавить корень проекта (каталог над scripts/) в начало пути импорта, чтобы был виден пакет hagi
+os.environ.setdefault("HAGI_DEVICE", "cpu")  # устройство по умолчанию cpu, если HAGI_DEVICE ещё не задано (установленное значение не меняется)
+from hagi.lm import RopeAttentionByteLM  # импорт класса байтовой языковой модели с Rope-вниманием
+data = (open('README.md', 'rb').read() * 3)[:400_000]  # данные: байты файла × 3 (повтор трижды), срез [0:400_000]
+print("batch   CE      s     CE/s-gain")  # заголовок таблицы: батч, CE, секунды, прирост CE за секунду
+for b in (8, 16, 24, 32, 48):  # перебор размера батча b по списку
+    m = RopeAttentionByteLM(dim=64, hidden=128, seed=int(os.environ.get("SW_SEED","7")))  # новая модель: размерность 64, скрытый слой 128, зерно = int(SW_SEED), по умолчанию 7
+    t = time.perf_counter(); r = m.train_guarded(data, epochs=2, batch=b)  # t — старт отсчёта; обучить 2 эпохи с батчем b, r — словарь итогов
+    s = time.perf_counter() - t  # время обучения в секундах: perf_counter после − до
+    print(f"{b:5}  {r['best_holdout_ce']:6.3f}  {s:6.1f}")  # строка: b в 5 позиций | лучший CE в 6 позиций, 3 знака | секунды в 6 позиций, 1 знак
