@@ -41,10 +41,10 @@ def role_fn(role: str, s: int, p: dict) -> int:
     if role == 'clock':  # роль clock:
         return clock_fn(s)  # вернуть clock_fn(s)
     if role == 'xor':  # роль xor:
-        return s ^ int(p['xor_mask'])  # s XOR xor_mask
+        return s ^ int(p['xor_mask'])  # побитовое исключающее или: s XOR xor_mask
     if role == 'guard':  # роль guard:
         if s & int(p['guard_mask']) == int(p['guard_value']):  # если s & guard_mask == guard_value:
-            return s ^ int(p['effect_mask'])  # s XOR effect_mask
+            return s ^ int(p['effect_mask'])  # побитовое исключающее или: s XOR effect_mask
         return s  # иначе s без изменений
     if role == 'delay':  # роль delay:
         pending = s >> 4 & 1  # ожидающий бит: бит 4 состояния
@@ -470,7 +470,7 @@ def bfs_plan(table: list[list[int]], start: int, goal: int) -> list[int] | None:
 class TemporalGrowthAgent:
     """Агент: отождествляет модель мира, планирует и исполняет план, ведёт память."""
 
-    def __init__(self, memory: AgentMemory | None=None, strategy: str='active'):
+    def __init__(self, memory: AgentMemory | None=None, strategy: str='active'):  # создать агента: память и стратегия
         self.memory = memory or AgentMemory()  # память агента (по умолчанию новая)
         self.strategy = strategy  # стратегия выбора запросов
 
@@ -748,7 +748,7 @@ def main():
         print(json.dumps(self_tests(), indent=2))  # напечатать проверки
         return  # выход
     print(json.dumps(run_panel(args.seed, args.panel, args.out), indent=2))  # напечатать сводку панели
-if __name__ == '__main__':
+if __name__ == '__main__':  # файл запущен напрямую — выполнить main()
     main()  # запуск основной функции
 
 # ============================================================
@@ -787,7 +787,7 @@ def next_state(role, s, p):
     if role == 'clock':  # роль clock:
         return (s + 1) % N  # часы: (s + 1) mod 32
     if role == 'xor':  # роль xor:
-        return s ^ int(p['xor_mask'])  # s XOR xor_mask
+        return s ^ int(p['xor_mask'])  # побитовое исключающее или: s XOR xor_mask
     if role == 'guard':  # роль guard:
         return s ^ int(p['effect_mask']) if s & int(p['guard_mask']) == int(p['guard_value']) else s  # s XOR effect_mask, если s & guard_mask == guard_value, иначе s
     if role == 'delay':  # роль delay:
@@ -919,7 +919,7 @@ def verify_checkpoint(cp, label):
 def main():
     """Точка входа командной строки верификатора."""
     ap = argparse.ArgumentParser()  # парсер аргументов верификатора
-    ap.add_argument('--panel', type=Path, default=Path('results/panel20/panel_runs.json'))
+    ap.add_argument('--panel', type=Path, default=Path('results/panel20/panel_runs.json'))  # аргумент --panel: файл запусков панели
     ap.add_argument('--summary', type=Path, default=Path('results/panel20/panel_summary.json'))  # файл сводки панели
     ap.add_argument('--out', type=Path, default=Path('results/independent_verification.json'))  # файл результата проверки
     ap.add_argument('--checkpoint-dir', type=Path, default=Path('results/panel20'))  # каталог контрольных точек
@@ -979,5 +979,5 @@ def main():
     a.out.parent.mkdir(parents=True, exist_ok=True)  # создать каталог результата
     a.out.write_text(json.dumps(result, indent=2, sort_keys=True))  # записать результат
     print(json.dumps({k: v for k, v in result.items() if k != 'records'}, indent=2))  # напечатать итог без списка записей
-if __name__ == '__main__':
+if __name__ == '__main__':  # файл запущен напрямую — выполнить main()
     main()  # запуск основной функции
