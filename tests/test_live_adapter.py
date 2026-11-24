@@ -1,173 +1,204 @@
-"""WAVE 249: inference applies a domain adapter only if it passes the live paired gate."""
-import numpy as np
-import pytest
+"""Тесты живого гейта доменного адаптера при выводе и роста тела модели.
 
-from hagi import unified as U
+    Живой гейт (_live_adapter): адаптер домена ставится на модель только если
+    он помогает СЕЙЧАСС. На 256 случайных окнах первых 85% байтов домена
+    считается парный выигрыш d_i = CE_без_i − CE_с_i; нижняя граница
+    mean(d) − 2,4·SE(d) должна превысить 0,005. Причина: адаптер принимался
+    против старого тела, а тело с тех пор обучалось; на текущем теле адаптер
+    может вредить. _DomainScope ставит адаптер на время блока и всегда
+    возвращает прежнее состояние модели.
+
+    Рост тела: grow() добавляет блок внимания с Wo = 0 — logits не меняются
+    совсем; _maybe_grow оставляет блок, только если выигрыш CE превышает
+    границу, иначе откатывает (ROLLBACK). Блок ремонта (старая память)
+    замораживается в общем обучении; после роста старые домена переучиваются,
+    пока забывание не исчезнет."""
+import numpy as np  # массивы байтов
+import pytest  # проверка исключений
+
+from hagi import unified as U  # единая модель
 
 
 def _unified(tmp_path, monkeypatch):
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
-    u = U.Unified()
-    u.domains["d"] = {}
-    u._domain_bytes = lambda s, e: bytes(range(256)) * 12      # p8 law
-    u.model.train_guarded(bytes(range(256)) * 12, epochs=3)
-    return u
+    """Единая модель во временном каталоге с доменом d; байты домена — 0..255 ×12; тело обучено 3 эпохи."""
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains["d"] = {}  # пустая запись домена d
+    u._domain_bytes = lambda s, e: bytes(range(256)) * 12  # байты домена: 0..255, повторённые 12 раз
+    u.model.train_guarded(bytes(range(256)) * 12, epochs=3)  # обучить тело на законе домена, 3 эпохи
+    return u  # вернуть модель
 
 
 def test_no_domain_keeps_the_neutral_path(tmp_path, monkeypatch):
-    u = _unified(tmp_path, monkeypatch)
-    seen = []
-    orig = u.model.logits
-    u.model.logits = lambda x: (seen.append(u.model.domain_adapter), orig(x))[1]
-    u.predict_next_byte(bytes(range(200, 216)), allow_neural=True)
-    assert seen == [None]                                   # no adapter without a domain
+    """Без домена адаптер не ставится: при predict_next_byte(allow_neural=True) модель видит
+    domain_adapter = None; исходный logits вызывается ровно один раз."""
+    u = _unified(tmp_path, monkeypatch)  # модель с доменом d
+    seen = []  # значения domain_adapter в момент вызова logits
+    orig = u.model.logits  # исходный метод logits
+    u.model.logits = lambda x: (seen.append(u.model.domain_adapter), orig(x))[1]  # подменить logits: записать адаптер в seen и вернуть orig(x)
+    u.predict_next_byte(bytes(range(200, 216)), allow_neural=True)  # предсказать байт с разрешённой нейронной догадкой
+    assert seen == [None]  # без домена модель ни разу не получила адаптер
 
 
 def test_trained_adapter_is_applied_only_when_it_still_helps(tmp_path, monkeypatch):
-    u = _unified(tmp_path, monkeypatch)
-    r = u._fit_domain_adapter("d")
-    assert r["status"] == "GROW"
-    ad = u.adapter_bank.get("d")
-    assert u._live_adapter("d") is ad                      # fresh = helps now
-    with u._DomainScope(u, "d"):
-        assert u.model.domain_adapter is ad
-    assert u.model.domain_adapter is None                   # restored
-    # A stale adapter = certified against an OLD trunk. Age the trunk the
-    # way the cycle does: keep training it on the same domain. The trunk
-    # then learns the law itself and the old adapter is no longer a clear
-    # win -> the gate must not apply it blindly. (Randomising the trunk
-    # instead is a WRONG test: a uniform trunk lets any adapter "help".)
-    u.model.train_guarded(bytes(range(256)) * 12, epochs=25)
-    verdict = u._live_adapter("d")
-    live = verdict is not None
-    # independent check of the gate's decision on fresh positions
-    data = bytes(range(256)) * 12
-    idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64); k = u.model.k
-    pos = np.arange(2300, 2900)
-    X, y = u._windows("d", pos)
-    import torch as t
-    u.model.domain_adapter = None
-    with t.no_grad():
-        base = float(t.nn.functional.cross_entropy(u.model.logits(X), y))
-    with_ad = float(u._adapter_val_ce(ad, X, y).mean()); u.model.domain_adapter = None
-    if live:
-        assert with_ad < base, "gate kept an adapter that hurts"
-    else:
-        assert with_ad >= base - 0.02, "gate dropped an adapter that clearly helps"
-    assert u._live_adapter("nope") is None and u._live_adapter(None) is None
+    """Свежий адаптер проходит живой гейт и ставится только внутри _DomainScope; после обучения тела без
+    адаптера решение гейта согласовано с независимой проверкой CE на новых позициях: адаптер
+    применяется только если он реально снижает CE; без домена или с неизвестным доменом — None."""
+    u = _unified(tmp_path, monkeypatch)  # модель с доменом d
+    r = u._fit_domain_adapter("d")  # подогнать адаптер домена d
+    assert r["status"] == "GROW"  # адаптер принят
+    ad = u.adapter_bank.get("d")  # адаптер домена d
+    assert u._live_adapter("d") is ad  # свежий адаптер помогает сейчас — живой гейт его возвращает
+    with u._DomainScope(u, "d"):  # область с живым гейтом домена d
+        assert u.model.domain_adapter is ad  # внутри области адаптер поставлен
+    assert u.model.domain_adapter is None  # прежнее состояние восстановлено: адаптера нет
+    # Устаревший адаптер = принятый против СТАРОГО тела. Старим тело так, как это
+    # делает цикл: продолжаем обучать его на том же домене. Тело выучивает закон
+    # само, и прежний адаптер перестаёт быть явным выигрышем — гейт не должен
+    # ставить его вслепую. (Случайно перезапутать тело — НЕВЕРНЫЙ тест:
+    # на равномерном теле «помогает» любой адаптер.)
+    u.model.train_guarded(bytes(range(256)) * 12, epochs=25)  # дообучить тело на законе домена, 25 эпох
+    verdict = u._live_adapter("d")  # решение живого гейта на новом теле
+    live = verdict is not None  # гейт оставил адаптер (True) либо снял (False)
+    # независимая проверка решения гейта на свежих позициях
+    data = bytes(range(256)) * 12  # байты домена
+    idx = np.frombuffer(data, dtype=np.uint8).astype(np.int64); k = u.model.k  # idx — байты как целые; k — длина контекста
+    pos = np.arange(2300, 2900)  # позиции 2300..2899 — дальше обучающей части
+    X, y = u._windows("d", pos)  # окна: X_i = idx[p−k .. p−1], цели y_i = idx[p + k]
+    import torch as t  # тензоры
+    u.model.domain_adapter = None  # база меряется без адаптера
+    with t.no_grad():  # без градиентов
+        base = float(t.nn.functional.cross_entropy(u.model.logits(X), y))  # базовая CE = среднее по окнам −log softmax(logits(X))[y]
+    with_ad = float(u._adapter_val_ce(ad, X, y).mean()); u.model.domain_adapter = None  # CE с адаптером (среднее по окнам); адаптер снят
+    if live:  # если гейт оставил адаптер
+        assert with_ad < base, "gate kept an adapter that hurts"  # тогда он обязан снижать CE
+    else:  # если гейт снял адаптер
+        assert with_ad >= base - 0.02, "gate dropped an adapter that clearly helps"  # тогда он не снижает CE заметно (допуск 0,02)
+    assert u._live_adapter("nope") is None and u._live_adapter(None) is None  # неизвестный домен и отсутствие домена — без адаптера
 
 
 def test_scope_restores_state_on_exception(tmp_path, monkeypatch):
-    u = _unified(tmp_path, monkeypatch)
-    u._fit_domain_adapter("d")
-    with pytest.raises(RuntimeError):
-        with u._DomainScope(u, "d"):
-            raise RuntimeError("boom")
-    assert u.model.domain_adapter is None
+    """_DomainScope восстанавливает domain_adapter даже при исключении внутри блока:
+    после RuntimeError модель снова без адаптера."""
+    u = _unified(tmp_path, monkeypatch)  # модель с доменом d
+    u._fit_domain_adapter("d")  # подогнать адаптер домена d
+    with pytest.raises(RuntimeError):  # ожидается RuntimeError
+        with u._DomainScope(u, "d"):  # область с адаптером домена d
+            raise RuntimeError("boom")  # исключение внутри области
+    assert u.model.domain_adapter is None  # адаптер снят даже при исключении
 
 
-# ---- WAVE 255: function-preserving trunk growth -------------------------------
+# ---- Рост тела с сохранением функции ------------------------------------------
 def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatch):
-    import torch as t
-    from hagi import unified as U
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
-    u = U.Unified()
-    u.domains["d"] = {}
-    data = bytes(range(256)) * 30
-    u._domain_bytes = lambda s, e: data
-    u.model.train_guarded(data, epochs=2)
-    g = t.Generator().manual_seed(0)
-    X = t.randint(0, 256, (16, u.model.k), generator=g)
-    with t.no_grad():
-        l0 = u.model.logits(X).clone()
-    assert u.model.grow() == 1
-    with t.no_grad():
-        assert float((u.model.logits(X) - l0).abs().max()) == 0.0     # exact identity
-    u.GROW_BLOCKS = 2   # off by default (WAVE 257: hurts old domains)
-    r = u._maybe_grow("d", data)
-    assert r["status"] in ("GROW", "ROLLBACK", "HOLD")
-    if r["status"] == "GROW":
-        assert r["ce_after"] <= r["ce_before"] and len(u.model.blocks) == 2
-    if r["status"] == "ROLLBACK":
-        assert len(u.model.blocks) == 1                               # exact rollback
-    # persistence round-trip keeps the blocks
-    u.save(); v = U.Unified.load()
-    assert len(v.model.blocks) == len(u.model.blocks)
-    if u.model.blocks:
-        for a, b in zip(u.model.blocks, v.model.blocks):
-            assert float((a["Wo"] - b["Wo"]).abs().max()) < 1e-6
+    """grow() добавляет блок с Wo = 0: logits не меняются точно (max |Δ| = 0). _maybe_grow при лимите
+    2 блока даёт GROW / ROLLBACK / HOLD; при GROW CE не выросло и блоков 2, при ROLLBACK блок 1;
+    после save/load число блоков и веса Wo сохраняются (расхождение < 1e-6)."""
+    import torch as t  # тензоры
+    from hagi import unified as U  # единая модель
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains["d"] = {}  # пустая запись домена d
+    data = bytes(range(256)) * 30  # байты домена: 0..255 ×30
+    u._domain_bytes = lambda s, e: data  # байты домена := data
+    u.model.train_guarded(data, epochs=2)  # обучить тело, 2 эпохи
+    g = t.Generator().manual_seed(0)  # генератор с зерном 0
+    X = t.randint(0, 256, (16, u.model.k), generator=g)  # 16 случайных контекстов длины k
+    with t.no_grad():  # без градиентов
+        l0 = u.model.logits(X).clone()  # logits до роста
+    assert u.model.grow() == 1  # рост добавил ровно один блок
+    with t.no_grad():  # без градиентов
+        assert float((u.model.logits(X) - l0).abs().max()) == 0.0  # точное тождество: логиты не изменились
+    u.GROW_BLOCKS = 2  # лимит блоков := 2 (по умолчанию рост выключен: блоки вредят старым доменам)
+    r = u._maybe_grow("d", data)  # попытка добавить блок роста на домене d
+    assert r["status"] in ("GROW", "ROLLBACK", "HOLD")  # статус — один из трёх
+    if r["status"] == "GROW":  # если блок принят
+        assert r["ce_after"] <= r["ce_before"] and len(u.model.blocks) == 2  # CE не выросло и блоков 2
+    if r["status"] == "ROLLBACK":  # если блок откатан
+        assert len(u.model.blocks) == 1  # точный откат: добавленный блок снят
+    # круглый ход сохранения оставляет блоки на месте
+    u.save(); v = U.Unified.load()  # сохранить и загрузить
+    assert len(v.model.blocks) == len(u.model.blocks)  # число блоков совпадает
+    if u.model.blocks:  # если блоки есть
+        for a, b in zip(u.model.blocks, v.model.blocks):  # по парам одинаковых блоков
+            assert float((a["Wo"] - b["Wo"]).abs().max()) < 1e-6  # веса Wo совпадают: max |Δ| < 1e-6
 
 
 def test_grow_rolls_back_a_block_that_gains_nothing(tmp_path, monkeypatch):
-    """WAVE 257: on the production model a block with ce_before == ce_after
-    (3.4673 -> 3.4673) was accepted as GROW. Nothing earned -> rollback."""
-    import torch as t
-    from hagi import unified as U
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
-    u = U.Unified()
-    u.domains["d"] = {}
-    data = bytes(range(256)) * 30
-    u._domain_bytes = lambda s, e: data
-    u.model.train_guarded(data, epochs=2)
-    n0 = len(u.model.blocks)
-    calls = {"n": 0}
-    orig = t.nn.functional.cross_entropy
-    def frozen(*a, **k):            # every evaluation returns the same loss
-        calls["n"] += 1
-        return orig(*a, **k).mul(0).add(1.0)
-    u.GROW_BLOCKS = 2
-    monkeypatch.setattr(t.nn.functional, "cross_entropy", frozen)
-    r = u._maybe_grow("d", data)
-    monkeypatch.setattr(t.nn.functional, "cross_entropy", orig)
-    assert r["status"] in ("ROLLBACK", "HOLD")
-    assert len(u.model.blocks) == n0
+    """Блок, не дающий выигрыша CE (ce_before = ce_after), откатывается: при подмене cross_entropy
+    константой 1,0 статус ROLLBACK либо HOLD и число блоков не меняется.
+
+        Причина: блок с ce_before = ce_after (3,4673 → 3,4673) был принят как GROW;
+        ничего не заработано — значит откат."""
+    import torch as t  # тензоры
+    from hagi import unified as U  # единая модель
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains["d"] = {}  # пустая запись домена d
+    data = bytes(range(256)) * 30  # байты домена
+    u._domain_bytes = lambda s, e: data  # байты домена := data
+    u.model.train_guarded(data, epochs=2)  # обучить тело, 2 эпохи
+    n0 = len(u.model.blocks)  # число блоков до попытки роста
+    calls = {"n": 0}  # счётчик вызовов (в проверках не используется)
+    orig = t.nn.functional.cross_entropy  # исходная cross_entropy
+    def frozen(*a, **k):  # любая оценка потери возвращает одно и то же значение
+        calls["n"] += 1  # счётчик вызовов +1
+        return orig(*a, **k).mul(0).add(1.0)  # 0·CE + 1 = 1,0 при любых аргументах
+    u.GROW_BLOCKS = 2  # лимит блоков := 2
+    monkeypatch.setattr(t.nn.functional, "cross_entropy", frozen)  # подменить cross_entropy константой
+    r = u._maybe_grow("d", data)  # попытка роста: до и после CE одинакова
+    monkeypatch.setattr(t.nn.functional, "cross_entropy", orig)  # вернуть исходную cross_entropy
+    assert r["status"] in ("ROLLBACK", "HOLD")  # блок не принят
+    assert len(u.model.blocks) == n0  # число блоков не изменилось
 
 
 def test_repair_block_is_frozen_in_general_training_and_persisted(tmp_path, monkeypatch):
-    """WAVE 257: a repair block (the old memory) must not be moved by
-    train_certified — measured: movable repair blocks end at OLD +2.62
-    (worse than no blocks, +0.55)."""
-    import torch as t
-    from hagi import unified as U
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
-    u = U.Unified()
-    u.domains["d"] = {}
-    data = bytes(range(256)) * 30
-    u._domain_bytes = lambda s, e: data
-    u.model.train_guarded(data, epochs=1)
-    u.model.grow(seed=3)
-    u.model.frozen_blocks = {0}
-    w = [q.detach().clone() for q in u.model.blocks[0].values()]
-    u.model.train_guarded(data, epochs=1)
-    for q, w0 in zip(u.model.blocks[0].values(), w):
-        assert float((q - w0).abs().max()) == 0.0
-    u.save(); v = U.Unified.load()
-    assert v.model.frozen_blocks == {0} and len(v.model.blocks) == 1
+    """Блок ремонта (блок 0 в frozen_blocks) не меняется общим обучением (max |Δ| = 0) и сохраняется
+    в файле вместе с набором замороженных блоков.
+
+        Причина: подвижный блок ремонта на реальной модели дал +2,62 к CE старых доменов против
+        +0,55 без блоков — блок ремонта обязан быть заморожен."""
+    import torch as t  # тензоры
+    from hagi import unified as U  # единая модель
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains["d"] = {}  # пустая запись домена d
+    data = bytes(range(256)) * 30  # байты домена
+    u._domain_bytes = lambda s, e: data  # байты домена := data
+    u.model.train_guarded(data, epochs=1)  # обучить тело, 1 эпоха
+    u.model.grow(seed=3)  # добавить блок (будущий блок ремонта)
+    u.model.frozen_blocks = {0}  # заморозить блок 0
+    w = [q.detach().clone() for q in u.model.blocks[0].values()]  # снимок весов блока 0
+    u.model.train_guarded(data, epochs=1)  # ещё одна эпоха общего обучения
+    for q, w0 in zip(u.model.blocks[0].values(), w):  # по весам блока 0 и снимку
+        assert float((q - w0).abs().max()) == 0.0  # вес не изменился: max |Δ| = 0
+    u.save(); v = U.Unified.load()  # сохранить и загрузить
+    assert v.model.frozen_blocks == {0} and len(v.model.blocks) == 1  # заморожен блок 0, блоков 1
 
 
 def test_repair_retrains_old_domains_until_forgetting_is_gone(tmp_path, monkeypatch):
-    """WAVE 257 (user: after growth, retrain the old domains until
-    forgetting reaches zero). Iterative: while the paired old-domain CE
-    is above its pre-training value, a retrain step on OLD bytes runs;
-    a step that does not improve is rolled back; the loop stops at the
-    tolerance or the round cap."""
-    import torch as t
-    from hagi import unified as U
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
-    u = U.Unified()
-    u.domains.update({"a": {}, "b": {}})
-    old = bytes(range(0, 128, 2)) * 200
-    u._domain_bytes = lambda s, e: old
-    u.model.train_guarded(old, epochs=2)
-    pre = u._old_domains_ce(exclude="c")
-    # forget on purpose: train hard on unrelated bytes
-    u.model.train_guarded(bytes(range(255, 0, -1)) * 200, epochs=4)
-    assert u._old_domains_ce(exclude="c") > pre
-    u._domain_bytes = lambda s, e: bytes(range(255, 0, -1)) * 200 if s == "c" else old
-    r = u._repair_forgetting("c", pre, [q.detach().clone() for q in u.model.params()])
-    assert r["mode"] == "replay" and r["rounds"]
-    assert all(x["status"] in ("RETRAIN", "ROLLBACK") for x in r["rounds"])
-    assert u._old_domains_ce(exclude="c") <= pre + u.FORGET_TOL or r["rounds"][-1]["status"] == "ROLLBACK"
-    # the loop is monotone in the gate value
-    ces = [x["ce"] for x in r["rounds"]]
-    assert ces == sorted(ces, reverse=True)
+    """После обучения на новом домене CE старых доменов растёт (забывание), а _repair_forgetting
+    возвращает её к pre + FORGET_TOL итеративными раундами: раунд принят (RETRAIN) только если CE
+    снизилась, иначе откат (ROLLBACK); CE по раундам не возрастает.
+
+        Цикл: пока CE старых доменов выше значения до обучения — шаг переобучения на старых байтах;
+        шаг без улучшения откатывается; стоп по достижении допуска либо по лимиту раундов."""
+    import torch as t  # тензоры
+    from hagi import unified as U  # единая модель
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains.update({"a": {}, "b": {}})  # два старых домена a и b
+    old = bytes(range(0, 128, 2)) * 200  # старые байты: 0,2,4,…,126 ×200
+    u._domain_bytes = lambda s, e: old  # байты всех доменов := old
+    u.model.train_guarded(old, epochs=2)  # обучить на старых байтах, 2 эпохи
+    pre = u._old_domains_ce(exclude="c")  # CE старых доменов до забывания
+    # забываем нарочно: жёстко обучаем на посторонних байтах
+    u.model.train_guarded(bytes(range(255, 0, -1)) * 200, epochs=4)  # обучить на обратном законе 255..1, 4 эпохи
+    assert u._old_domains_ce(exclude="c") > pre  # забывание: CE старых доменов выросла
+    u._domain_bytes = lambda s, e: bytes(range(255, 0, -1)) * 200 if s == "c" else old  # домен c — новый закон, остальные — старые байты
+    r = u._repair_forgetting("c", pre, [q.detach().clone() for q in u.model.params()])  # переобучить старые домена, исключая c
+    assert r["mode"] == "replay" and r["rounds"]  # режим replay и есть раунды
+    assert all(x["status"] in ("RETRAIN", "ROLLBACK") for x in r["rounds"])  # каждый раунд — RETRAIN либо ROLLBACK
+    assert u._old_domains_ce(exclude="c") <= pre + u.FORGET_TOL or r["rounds"][-1]["status"] == "ROLLBACK"  # забывание устранено либо последний раунд откатан
+    # цикл монотонен по значению гейта
+    ces = [x["ce"] for x in r["rounds"]]  # CE по раундам
+    assert ces == sorted(ces, reverse=True)  # CE не возрастает от раунда к раунду
