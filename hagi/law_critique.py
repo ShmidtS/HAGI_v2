@@ -199,7 +199,7 @@ def _render_critique(domain: str, entry: dict[str, Any], law_id: str,  # domain,
     for i in errors[:_DEFAULT_MAX_ERROR_EXAMPLES]:  # по первым _DEFAULT_MAX_ERROR_EXAMPLES ошибкам
         row = rows[i]  # строка примера
         lines.append(  # добавить строку
-            f"{_hex(row['context'])} -> {row['target']:02x} ; "  # context_hex -> target_hex ;
+            f"{_hex(row['context'])} -> {row['target']:02x} ; "  # строка «контекст → цель»: context_hex -> target_hex ;
             f"predicted={predictions[i]:02x}"  # predicted=предсказание в hex
         )  # закрытие вызова
     error_set = set(errors)  # множество номеров ошибок
@@ -208,7 +208,7 @@ def _render_critique(domain: str, entry: dict[str, Any], law_id: str,  # domain,
         lines.extend(["", "КОНТРОЛЬНЫЕ ВЕРНЫЕ ПАРЫ:"])  # добавить пустую строку и заголовок верных пар
         for i in good[:_DEFAULT_MAX_GOOD_EXAMPLES]:  # по первым _DEFAULT_MAX_GOOD_EXAMPLES верным
             row = rows[i]  # строка примера
-            lines.append(f"{_hex(row['context'])} -> {row['target']:02x}")  # context_hex -> target_hex
+            lines.append(f"{_hex(row['context'])} -> {row['target']:02x}")  # строка «контекст → цель»: context_hex -> target_hex
     lines.extend([  # добавить заключительные строки
         "",  # пустая строка
         "Метрика выше — teacher-forced replay accuracy: каждый контекст подан",  # строка пояснения метрики 1
