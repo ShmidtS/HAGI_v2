@@ -1,381 +1,408 @@
-"""Trunk operations (WAVE 195): six-phase cycle, certified merge,
-Hadamard gate, residual-block growth — one file instead of 4."""
-from __future__ import annotations
+"""Операции над «стволом» модели: преобразование Адамара, сертифицированное
+слияние, рост остаточными блоками и адаптерами низкого ранга.
+
+Ключевые идеи и формулы:
+  - sylvester_mul / sylvester: матрица Адамара Сильвестра, H_0 = [1],
+    H_{k+1} = [[H_k, H_k], [H_k, −H_k]], размер 2^k; H @ w — умножение
+    без таблицы умножения (только сложения и вычитания).
+  - lin_at: приращение первого порядка функции L в точке w1 вдоль (w2 − w1):
+    g·(w2 − w1)·t.
+  - merge_bound: сертифицированная граница потери в середине отрезка
+    L(mid) <= (L1 + L2)/2 + δ + δ₂/2, где mid = (w1 + w2)/2,
+    δ = |L(mid) − (L1 + lin_at(0.5))|, δ₂ = |L2 − (L1 + lin_at(1.0))|.
+  - coh_sq = ‖w‖∞² / ‖w‖₂² — когерентность вектора; rotate_gate решает,
+    уменьшает ли умножение на H когерентность.
+  - ResidualBlock: y = x + γ·h(x); при γ = 0 — точное тождество.
+  - snap_rational: округление к сетке q/2^k; snap_obj_bound:
+    |(s+ds−y)² − (s−y)²| <= (2|s−y| + |ds|)·|ds|.
+  - LowRankAdapter: f + B(A f), A (r, d), B (d, r), B = 0 — тождество;
+    AdapterBank — по одному адаптеру на домен.
+  - paired_gain: d = before − after, нижняя граница mean(d) − z·SE.
+  - paired_margin_eb: эмпирическая граница Бернстайна
+    eps = √(2·sig2·L/n) + 2·b·L/n, L = ln(2·n_states/delta), b = max|d|.
+  - POLAR_EXPRESS: три шага X <- a·X + b·(X Xᵀ)X + c·(X Xᵀ)²X.
+  - projected_weight_decay: W' = W − dC − c(W − W P).
+  - pack_trits5 / unpack_trits5: пять троичных уровней в байте,
+    code = Σ_i (v_i + 1)·3^i.
+
+Экспортирует все перечисленные функции, классы и константы.
+"""
+from __future__ import annotations  # отложенное вычисление аннотаций типов
 
 
-# ============================================================
-# SIX-PHASE CANONICAL CYCLE (C479)
-# ============================================================
+# # ============================================================
+# # ПРЕОБРАЗОВАНИЕ АДАМАРА СИЛЬВЕСТЕРА
+# # ============================================================
 
-from typing import Callable
-import numpy as np
-def sylvester_mul(w: np.ndarray, n: int) -> np.ndarray:
-    """Apply the integer Sylvester Hadamard of size n to w."""
-    return sylvester(int(np.log2(n))).astype(float) @ w
+from typing import Callable  # тип «вызываемый объект»
+import numpy as np  # численные массивы
+def sylvester_mul(w: np.ndarray, n: int) -> np.ndarray:  # w — вектор, n — его длина (степень двойки)
+    """Умножить вектор w на целочисленную матрицу Адамара Сильвестра размера n: H @ w."""
+    return sylvester(int(np.log2(n))).astype(float) @ w  # H = матрица размера 2^k при k = log2(n); итог: H @ w в float
 
-# ============================================================
-# CERTIFIED CHECKPOINT MERGE (C479v2)
-# ============================================================
+# # ============================================================
+# # СЕРТИФИЦИРОВАННОЕ СЛИЯНИЕ ДВУХ СОСТОЯНИЙ
+# # ============================================================
 
-from typing import Callable, Sequence
-import numpy as np
-def lin_at(g: Sequence[float], w1: Sequence[float], w2: Sequence[float], t: float) -> float:
-    """First-order linearization of L at w1 along (w2 − w1)."""
-    g = np.asarray(g)
-    w1 = np.asarray(w1)
-    w2 = np.asarray(w2)
-    return float(g @ (w2 - w1)) * t
-def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequence[float], w2: Sequence[float]) -> dict:
-    """Measure δ (mid residual), δ₂ (end residual) and return the
-    certified bound L(mid) ≤ (L1+L2)/2 + δ + δ₂/2 (theorem)."""
-    w1 = np.asarray(w1, dtype=float)
-    w2 = np.asarray(w2, dtype=float)
-    mid = (w1 + w2) / 2.0
-    L1, L2 = (float(L(w1)), float(L(w2)))
-    # WAVE 247: lin_at returns the INCREMENT only; MergeQuant.lean
-    # linAt = L w1 + g.(w2-w1)t, so the base point belongs in the
-    # residual (delta_end already had it; delta_mid did not -> the
-    # bound was valid but needlessly loose: 25.0 vs 15.0 on a quad).
-    delta_mid = abs(float(L(mid)) - (L1 + lin_at(g, w1, w2, 0.5)))
-    delta_end = abs(L2 - (L1 + lin_at(g, w1, w2, 1.0)))
-    bound = (L1 + L2) / 2.0 + delta_mid + delta_end / 2.0
-    return {'L_mid': float(L(mid)), 'bound': bound, 'delta_mid': delta_mid, 'delta_end': delta_end, 'certified': float(L(mid)) <= bound + 1e-12}
+from typing import Callable, Sequence  # типы «вызываемый объект» и «последовательность» (повторный импорт безвреден)
+import numpy as np  # численные массивы (повторный импорт безвреден)
+def lin_at(g: Sequence[float], w1: Sequence[float], w2: Sequence[float], t: float) -> float:  # градиент g, точки w1 и w2, параметр t вдоль отрезка
+    """Приращение первого порядка функции L в точке w1 вдоль (w2 − w1): g·(w2 − w1)·t."""
+    g = np.asarray(g)  # g в массив
+    w1 = np.asarray(w1)  # w1 в массив
+    w2 = np.asarray(w2)  # w2 в массив
+    return float(g @ (w2 - w1)) * t  # приращение: (g · (w2 − w1))·t
+def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequence[float], w2: Sequence[float]) -> dict:  # L — функция потери, g — градиент в w1, w1 и w2 — сливаемые точки
+    """Измерить невязки δ (в середине) и δ₂ (в конце) и вернуть сертифицированную
+    границу L(mid) <= (L1 + L2)/2 + δ + δ₂/2.
 
-# ============================================================
-# HADAMARD INCOHERENCE GATE (C477)
-# ============================================================
+        mid = (w1 + w2)/2; L1 = L(w1); L2 = L(w2);
+        δ = |L(mid) − (L1 + lin_at(0.5))|; δ₂ = |L2 − (L1 + lin_at(1.0))|.
+        lin_at возвращает только приращение, поэтому база L1 входит в невязку
+        обеих точек; без этого граница остаётся верной, но излишне слабой.
+        Возврат: словарь L_mid, bound, delta_mid, delta_end, certified."""
+    w1 = np.asarray(w1, dtype=float)  # w1 в вещественный массив
+    w2 = np.asarray(w2, dtype=float)  # w2 в вещественный массив
+    mid = (w1 + w2) / 2.0  # середина отрезка: mid = (w1 + w2)/2
+    L1, L2 = (float(L(w1)), float(L(w2)))  # значения потери на концах: L1 = L(w1), L2 = L(w2)
+    # # lin_at возвращает ТОЛЬКО приращение; линейное приближение в точке t равно
+    # # L1 + g·(w2 − w1)·t, поэтому базовая точка входит в невязку
+    # # (в delta_end она уже была, в delta_mid — нет; без этого граница верна,
+    # # но излишне слаба: 25.0 вместо 15.0 на квадратичной функции).
+    delta_mid = abs(float(L(mid)) - (L1 + lin_at(g, w1, w2, 0.5)))  # невязка в середине: δ = |L(mid) − (L1 + lin_at(0.5))|
+    delta_end = abs(L2 - (L1 + lin_at(g, w1, w2, 1.0)))  # невязка в конце: δ₂ = |L2 − (L1 + lin_at(1.0))|
+    bound = (L1 + L2) / 2.0 + delta_mid + delta_end / 2.0  # граница: bound = (L1 + L2)/2 + δ + δ₂/2
+    return {'L_mid': float(L(mid)), 'bound': bound, 'delta_mid': delta_mid, 'delta_end': delta_end, 'certified': float(L(mid)) <= bound + 1e-12}  # словарь: L_mid, граница, обе невязки, флаг certified = L_mid <= bound + 1e-12
 
-import numpy as np
-def sylvester(k: int) -> np.ndarray:
-    """Integer ±1 Sylvester Hadamard of size 2^k (recursive Kronecker)."""
-    if k < 0:
-        raise ValueError('k must be >= 0')
-    H = np.ones((1, 1), dtype=np.int64)
-    for _ in range(k):
-        H = np.block([[H, H], [H, -H]])
-    return H
-def coh_sq(w: np.ndarray) -> float:
-    """cohSq = ‖w‖∞² / ‖w‖₂² (0 if w is all-zero: nothing to measure)."""
-    w = np.asarray(w, dtype=float).ravel()
-    l2 = float((w * w).sum())
-    if l2 <= 0:
-        return 0.0
-    return float(w.max() ** 2 if w.max() >= 0 else (-w).max() ** 2) / l2 if False else float(np.abs(w).max()) ** 2 / l2
-def rotate_gate(w: np.ndarray) -> dict:
-    """Measure cohSq(w) vs cohSq(H w); return the decision. H and w
-    must be length 2^k."""
-    w = np.asarray(w, dtype=float).ravel()
-    n = w.size
-    if n & n - 1:
-        raise ValueError('w length must be a power of two')
-    H = sylvester(int(np.log2(n))).astype(float)
-    hw = H @ w
-    before, after = (coh_sq(w), coh_sq(hw))
-    return {'cohSq_before': before, 'cohSq_after': after, 'rotate': after < before, 'energy_ratio': float((hw * hw).sum() / (w * w).sum()) if (w * w).sum() > 0 else 1.0}
+# # ============================================================
+# # ФИЛЬТР КОГЕРЕНТНОСТИ АДАМАРА
+# # ============================================================
 
-# ============================================================
-# RESIDUAL BLOCK GROWTH (C450/C504/C506)
-# ============================================================
+import numpy as np  # численные массивы (повторный импорт безвреден)
+def sylvester(k: int) -> np.ndarray:  # k — показатель степени; размер матрицы 2^k
+    """Целочисленная ±1 матрица Адамара Сильвестра размера 2^k (рекурсивное кронекерово произведение)."""
+    if k < 0:  # k отрицательно
+        raise ValueError('k must be >= 0')  # ошибка: k должен быть >= 0
+    H = np.ones((1, 1), dtype=np.int64)  # начало: H_0 = [1]
+    for _ in range(k):  # k раз
+        H = np.block([[H, H], [H, -H]])  # рекурсия: H_{j+1} = [[H_j, H_j], [H_j, −H_j]]
+    return H  # матрица размера 2^k
+def coh_sq(w: np.ndarray) -> float:  # w — вектор
+    """Когерентность: cohSq = ‖w‖∞² / ‖w‖₂² (0 для нулевого вектора — измерять нечего)."""
+    w = np.asarray(w, dtype=float).ravel()  # w в плоский вещественный вектор
+    l2 = float((w * w).sum())  # квадрат нормы: ‖w‖₂² = Σ_i w_i²
+    if l2 <= 0:  # нулевая энергия
+        return 0.0  # нет данных — 0
+    return float(w.max() ** 2 if w.max() >= 0 else (-w).max() ** 2) / l2 if False else float(np.abs(w).max()) ** 2 / l2  # итог: ‖w‖∞² / ‖w‖₂², где ‖w‖∞ = max_i |w_i| (левая ветка «if False» не вычисляется)
+def rotate_gate(w: np.ndarray) -> dict:  # w — вектор длины 2^k
+    """Сравнить cohSq(w) и cohSq(H w) и принять решение. Длина w должна быть
+    степенью двойки.
 
-from typing import Callable, Sequence
-class ResidualBlock:
-    """y = x + gamma * h(x); gamma=0 -> exact identity."""
+        Возврат: cohSq_before, cohSq_after, rotate = (after < before),
+        energy_ratio = ‖H w‖₂² / ‖w‖₂² (1 для нулевого вектора)."""
+    w = np.asarray(w, dtype=float).ravel()  # w в плоский вещественный вектор
+    n = w.size  # длина n
+    if n & n - 1:  # n не степень двойки: n & (n − 1) != 0
+        raise ValueError('w length must be a power of two')  # ошибка: длина w должна быть степенью двойки
+    H = sylvester(int(np.log2(n))).astype(float)  # H — матрица Адамара размера n = 2^(log2 n), вещественная
+    hw = H @ w  # произведение: hw = H @ w
+    before, after = (coh_sq(w), coh_sq(hw))  # когерентности до и после: (cohSq(w), cohSq(H w))
+    return {'cohSq_before': before, 'cohSq_after': after, 'rotate': after < before, 'energy_ratio': float((hw * hw).sum() / (w * w).sum()) if (w * w).sum() > 0 else 1.0}  # словарь: обе когерентности, решение rotate = after < before и отношение энергий ‖H w‖²/‖w‖² (1 при нулевой энергии)
 
-    def __init__(self, h: Callable, gamma: float=0.0):
-        self.h = h
-        self.gamma = float(gamma)
+# # ============================================================
+# # РОСТ СТВОЛА ОСТАТОЧНЫМИ БЛОКАМИ
+# # ============================================================
 
-    def __call__(self, x):
-        if self.gamma == 0.0:
-            return x
-        return x + self.gamma * self.h(x)
+from typing import Callable, Sequence  # типы (повторный импорт безвреден)
+class ResidualBlock:  # остаточный блок: y = x + γ·h(x)
+    """Остаточный блок: y = x + γ·h(x); при γ = 0 — точное тождество."""
 
-    def set_gamma(self, gamma: float) -> None:
-        self.gamma = float(gamma)
-def grow_trunk(trunk: Sequence[Callable], h: Callable) -> list[Callable]:
-    """Append a residual-zero block: trunk function preserved EXACTLY
-    (grow_block_bench_sound). Returns the new trunk. WAVE 186
-    (C506 grow_blocks_repeat_sound): repeated appends compose —
-    each new block is the only one with gamma != 0 potential; all
-    previous blocks are FROZEN by contract (their gamma stays as
-    set; the trainer must not touch them — only the fresh block
-    enters the certified training loop)."""
-    return list(trunk) + [ResidualBlock(h, gamma=0.0)]
-def run_trunk(trunk: Sequence[Callable], x):
-    """Compose blocks left-to-right (benchTrunk foldl form)."""
-    for b in trunk:
-        x = b(x)
-    return x
-def obj_invariant_check(trunk_old: Sequence[Callable], trunk_new: Sequence[Callable], xs, obj: Callable) -> bool:
-    """grow_block_obj_invariant check: any objective over trunk
-    output is unchanged by the append (exact float equality here —
-    the Fraction-exact form lives in the bench)."""
-    return all((obj(run_trunk(trunk_old, x)) == obj(run_trunk(trunk_new, x)) for x in xs))
+    def __init__(self, h: Callable, gamma: float=0.0):  # h — функция ветви, gamma — её вес
+        self.h = h  # запомнить функцию h
+        self.gamma = float(gamma)  # вес: γ как float
 
-# ==================================================================
-# GROW SNAP (C521): certified snap to q/2^k grid at grow boundaries.
+    def __call__(self, x):  # x — вход
+        if self.gamma == 0.0:  # γ = 0 — блок тождественен
+            return x  # вернуть x без изменений
+        return x + self.gamma * self.h(x)  # иначе: y = x + γ·h(x)
 
-from fractions import Fraction as _Fr
+    def set_gamma(self, gamma: float) -> None:  # новое значение веса
+        self.gamma = float(gamma)  # установить γ
+def grow_trunk(trunk: Sequence[Callable], h: Callable) -> list[Callable]:  # ствол и новая ветвь h
+    """Дописать блок с нулевым γ: функция ствола сохраняется ТОЧНО. Возвращает
+    новый ствол. При повторных дописываниях блоки компонуются: только
+    свежий блок может получить γ != 0, все прежние блоки по договорённости
+    заморожены (их γ не меняется; обучается только новый блок)."""
+    return list(trunk) + [ResidualBlock(h, gamma=0.0)]  # новый ствол: прежние блоки + ResidualBlock(h, γ = 0)
+def run_trunk(trunk: Sequence[Callable], x):  # ствол и вход x
+    """Применить блоки слева направо: x <- b(x) для каждого b. Возврат — итог."""
+    for b in trunk:  # по блокам
+        x = b(x)  # применить блок: x = b(x)
+    return x  # итог
+def obj_invariant_check(trunk_old: Sequence[Callable], trunk_new: Sequence[Callable], xs, obj: Callable) -> bool:  # старый и новый ствол, точки xs, целевая функция obj
+    """Проверка инварианта: значение obj на выходе ствола не изменилось после
+    дописывания блока — для всех точек xs (точное равенство float)."""
+    return all((obj(run_trunk(trunk_old, x)) == obj(run_trunk(trunk_new, x)) for x in xs))  # True, если для всех x: obj(старый(x)) == obj(новый(x))
 
+# # ==================================================================
+# # ОКРУГЛЕНИЕ ПРИ РОСТЕ: привязка к сетке q/2^k на границах роста.
 
-def snap_rational(value, k: int) -> _Fr:
-    """Snap a rational/float to the q/2^k grid (banker's rounding).
-    Per-value error <= 2^-(k+1) (half-cell)."""
-    f = _Fr(value)
-    scaled = f * (1 << k)
-    q = (scaled.numerator * 2 + scaled.denominator) // (2 * scaled.denominator)
-    return _Fr(q, 1 << k)
+from fractions import Fraction as _Fr  # дробь Fraction под именем _Fr
 
 
-def snap_denominator_reset(x, k: int):
-    """Snap values (scalar or sequence) so every denominator <= 2^k
-    (C521 snap_denominator_reset)."""
-    if isinstance(x, (list, tuple)):
-        return type(x)(snap_rational(v, k) for v in x)
-    return snap_rational(x, k)
+def snap_rational(value, k: int) -> _Fr:  # значение, точность k
+    """Округлить число к сетке q/2^k (банковское округление).
+    Погрешность одного значения <= 2^(−k−1) (половина ячейки)."""
+    f = _Fr(value)  # дробь: f = Fraction(value)
+    scaled = f * (1 << k)  # масштаб: scaled = f·2^k
+    q = (scaled.numerator * 2 + scaled.denominator) // (2 * scaled.denominator)  # q = floor((2·num + den)/(2·den)) — округление к ближайшему чётному
+    return _Fr(q, 1 << k)  # результат: Fraction(q, 2^k)
 
 
-def snap_obj_bound(s_err: float, ds: float) -> float:
-    """Certified per-point objective degradation bound for snapping
-    features by ds: |(s+ds-y)^2 - (s-y)^2| <= (2|s-y| + |ds|)*|ds|
-    (C521 snap_preserves_objective_bound, exact in Fraction)."""
-    return (2 * abs(s_err) + abs(ds)) * abs(ds)
+def snap_denominator_reset(x, k: int):  # x — число или последовательность, k — точность
+    """Округлить значения (скаляр или последовательность) так, чтобы каждый
+    знаменатель был <= 2^k."""
+    if isinstance(x, (list, tuple)):  # x — список или кортеж
+        return type(x)(snap_rational(v, k) for v in x)  # тот же тип из округлённых элементов
+    return snap_rational(x, k)  # скаляр — округлить одно значение
 
 
-# ==================================================================
-# ADAPTER GROWTH (C532): certified low-rank side-branch growth.
-# adapterVec A B x = x + B*(A*x) — 2*r*d parameters instead of d*d
-# for a full residual block (r << d). Neutrality certified with ONE
-# zero factor (B=0 => exact identity), unlike residualLeaf which
-# requires both zero.
-
-import numpy as _np
+def snap_obj_bound(s_err: float, ds: float) -> float:  # ошибка s_err = s − y, сдвиг признака ds
+    """Сертифицированная граница ухудшения функции потерь на одной точке при
+    сдвиге признака на ds:
+    |(s + ds − y)² − (s − y)²| <= (2|s − y| + |ds|)·|ds|."""
+    return (2 * abs(s_err) + abs(ds)) * abs(ds)  # граница: (2|s_err| + |ds|)·|ds|
 
 
-class LowRankAdapter:
-    """LoRA-form growth adapter (C532 AdapterGrowth):
-    pred = w @ (f + B @ (A @ f)). Grows 2*r*d params, certified
-    identity at B = 0 (one-factor zero neutrality)."""
+# # ==================================================================
+# # РОСТ АДАПТЕРАМИ: сертифицированный рост боковой ветви низкого ранга.
+# # adapterVec A B x = x + B·(A·x): 2·r·d параметров вместо d·d
+# # для полного остаточного блока (r << d). Нейтральность доказывается
+# # ОДНИМ нулевым множителем (B = 0 — точное тождество), в отличие от
+# # остаточного листа, где нужны оба нулевых.
 
-    def __init__(self, d: int, r: int = 1, seed: int = 0):
-        rng = _np.random.default_rng(seed)
-        # Kaiming-style init for A; B = 0 => exact obj-invariant start
-        self.A = rng.standard_normal((r, d)) / _np.sqrt(d)
-        self.B = _np.zeros((d, r))
-        self.d, self.r = d, r
-
-    @property
-    def n_params(self) -> int:
-        return 2 * self.r * self.d
-
-    def __call__(self, f: _np.ndarray) -> _np.ndarray:
-        # x + B @ (A @ x); with B=0 this is EXACTLY x (C532 neutrality)
-        return f + self.B @ (self.A @ f)
-
-    def params(self) -> _np.ndarray:
-        return _np.concatenate([self.A.ravel(), self.B.ravel()])
-
-    def set_params(self, flat: _np.ndarray) -> None:
-        rA = self.r * self.d
-        self.A = flat[:rA].reshape(self.r, self.d)
-        self.B = flat[rA:].reshape(self.d, self.r)
+import numpy as _np  # численные массивы под именем _np
 
 
-def adapter_warm_start(src_adapter: "LowRankAdapter",
-                       dst: "LowRankAdapter") -> bool:
-    """C560 adapter-transfer: warm-start domain B's adapter with a
-    copy of domain A's (pre-registered pair closeness decides WHEN
-    to do this — the caller's job). Measured upstream: T1-positive
-    on close pairs (x387 drop speed), forgetA=0 (copy semantics —
-    source untouched by construction). Shapes must match."""
-    if (src_adapter.d, src_adapter.r) != (dst.d, dst.r):
-        return False
-    # WAVE 236 fix: adapters restored from a checkpoint hold torch
-    # Tensors (Unified.save persists them as-is), fresh ones hold
-    # numpy arrays — normalize to numpy on handoff so copy() works
-    # for both.
-    import numpy as _np
-    dst.A = _np.asarray(src_adapter.A).copy()
-    dst.B = _np.asarray(src_adapter.B).copy()
-    return True
+class LowRankAdapter:  # адаптер низкого ранга
+    """Адаптер роста вида LoRA: pred = w @ (f + B @ (A @ f)). Добавляет 2·r·d
+    параметров; при B = 0 — точное тождество (нейтральность одним нулевым
+    множителем)."""
+
+    def __init__(self, d: int, r: int = 1, seed: int = 0):  # d — размерность, r — ранг, seed — зерно генератора
+        rng = _np.random.default_rng(seed)  # генератор нормальных чисел с зерном seed
+        # # инициализация A в стиле Кайминга; B = 0 => точное стартовое тождество
+        self.A = rng.standard_normal((r, d)) / _np.sqrt(d)  # A = N(0, 1)/√d, размер (r, d)
+        self.B = _np.zeros((d, r))  # B = нули (d, r)
+        self.d, self.r = d, r  # запомнить размерности
+
+    @property  # свойство только для чтения
+    def n_params(self) -> int:  # число параметров
+        return 2 * self.r * self.d  # число параметров: n_params = 2·r·d
+
+    def __call__(self, f: _np.ndarray) -> _np.ndarray:  # f — входной вектор
+        # # f + B @ (A @ f); при B = 0 это РОВНО f (нейтральность)
+        return f + self.B @ (self.A @ f)  # итог: f + B·(A·f)
+
+    def params(self) -> _np.ndarray:  # собрать все параметры
+        return _np.concatenate([self.A.ravel(), self.B.ravel()])  # A и B, развёрнутые в один вектор: сначала A, затем B
+
+    def set_params(self, flat: _np.ndarray) -> None:  # flat — развёрнутые параметры
+        rA = self.r * self.d  # rA = r·d — число элементов A
+        self.A = flat[:rA].reshape(self.r, self.d)  # A = flat[:rA] формы (r, d)
+        self.B = flat[rA:].reshape(self.d, self.r)  # B = flat[rA:] формы (d, r)
 
 
-def paired_gain(before, after, z: float = 2.4):
-    """WAVE 246 (local reproduction rank_controller, compact): paired
-    per-example loss gain (before - after; positive = better) with a
-    normal-approximation lower bound mean - z*SE. Empirical gate,
-    NOT a formal certificate."""
-    d = _np.asarray(before, dtype=float) - _np.asarray(after, dtype=float)
-    if len(d) == 0 or not _np.isfinite(d).all():
-        raise ValueError("paired losses must be finite and non-empty")
-    se = (d.std(ddof=1) / _np.sqrt(len(d))) if len(d) > 1 else 0.0
-    return float(d.mean()), float(d.mean() - z * se)
+def adapter_warm_start(src_adapter: "LowRankAdapter",  # перенос адаптера: src_adapter — источник
+                       dst: "LowRankAdapter") -> bool:  # dst — адаптер-приёмник; возвращает признак успеха
+    """Перенос адаптера: скопировать адаптер домена-источника в адаптер
+    домена-приёмника (когда домены достаточно близки — решает вызывающий
+    код). Это копия: источник не меняется. Формы должны совпадать,
+    иначе False."""
+    if (src_adapter.d, src_adapter.r) != (dst.d, dst.r):  # размерности не совпадают
+        return False  # отказ
+    # # адаптеры, восстановленные из сохранения, могут держать тензоры torch,
+    # # свежие — массивы numpy; приводим к numpy при передаче, чтобы copy()
+    # # работало в обоих случаях.
+    # # (сохранение записывает адаптеры как есть).
+    import numpy as _np  # numpy под именем _np (локальный импорт)
+    dst.A = _np.asarray(src_adapter.A).copy()  # dst.A = копия A источника
+    dst.B = _np.asarray(src_adapter.B).copy()  # dst.B = копия B источника
+    return True  # успех
 
 
-def paired_margin_eb(d, n_states: int = 1, delta: float = 0.05) -> float:
-    """WAVE 259 — the PROVEN one-sided margin for a paired gate, the
-    empirical-Bernstein mean bound of
-    Hagi/Probability/EmpiricalBernstein.lean
-    (`empirical_bernstein_mean_bound`):
-        eps = sqrt(2 * sig2 * L / n) + 2 * b * L / n,   L = ln(2 / alpha)
-    with a union bound over the `n_states` candidate states that were
-    scored on the same holdout (Hagi/Theory/HoldoutGateTwoWay.lean):
-    alpha = delta / n_states. `d` = per-window loss difference
-    (old - new; positive = candidate better); sig2 = sample variance,
-    b = max |d|. The gate may accept only if mean(d) > eps.
-    Unlike `paired_gain` (normal approximation, z*SE) this bound does
-    not assume a normal d and covers the best-of-K selection."""
-    d = _np.asarray(d, dtype=float)
-    n = len(d)
-    if n < 2 or not _np.isfinite(d).all():
-        return float("inf")
-    L = _np.log(2.0 * max(1, n_states) / delta)
-    sig2 = float(d.var(ddof=1))
-    b = float(_np.abs(d).max())
-    return float(_np.sqrt(2.0 * sig2 * L / n) + 2.0 * b * L / n)
-
-# ---- Polar-Express (primes Hagi/Optimization/PolarExpressCert.lean) -----
-# Three QUINTIC steps x <- a*x + b*x^3 + c*x^5 with rational
-# coefficients; polar_express_cycle_cert: spectrum [1/1000, 1] maps
-# into [9/512, 1049/1024]. The classic Newton-Schulz used by the GPM
-# (core.newton_schulz_orthogonalize) has no such box for small
-# singular values (4 steps: [0.47, 1.0] on [0.1, 1]; PE: [0.9075,
-# 1.0212]). Not wired into the GPM on purpose — measured (WAVE 248):
-# the GPM's backtracking line search rescales the step, so training
-# quality is unchanged (rel. operator error 0.010 vs 0.011), time per
-# call is on par (17.6 vs 23.0 us), and in the production config
-# (d_out = 1) orthogonalization degenerates to a vector norm.
-POLAR_EXPRESS = ((10151 / 2500, -17483 / 2500, 9623 / 2500),
-                 (5429 / 2000, -25159 / 10000, 1963 / 2500),
-                 (9473 / 5000, -1119 / 1000, 2201 / 10000))
+def paired_gain(before, after, z: float = 2.4):  # потери до и после, z — число стандартных отклонений
+    """Парный выигрыш по примерам: d = before − after (положительное — лучше)
+    с нижней границей нормального приближения mean(d) − z·SE. Эмпирический
+    фильтр, не формальный сертификат."""
+    d = _np.asarray(before, dtype=float) - _np.asarray(after, dtype=float)  # разности: d = before − after
+    if len(d) == 0 or not _np.isfinite(d).all():  # пусто или есть нечисловое значение
+        raise ValueError("paired losses must be finite and non-empty")  # ошибка: парные потери должны быть конечными и непустыми
+    se = (d.std(ddof=1) / _np.sqrt(len(d))) if len(d) > 1 else 0.0  # SE = std(d, ddof=1)/√n при n > 1, иначе 0
+    return float(d.mean()), float(d.mean() - z * se)  # возврат (mean(d), mean(d) − z·SE)
 
 
-def polar_express(G) -> "np.ndarray":
-    """Polar factor approximation via 3 quintic steps (normalized
-    input; transposed to the wide form exactly like NS)."""
-    X = _np.asarray(G, dtype=_np.float64).copy()
-    nrm = float(_np.linalg.norm(X))
-    if nrm < 1e-12:
-        return X
-    X /= nrm
-    transposed = X.shape[0] > X.shape[1]
-    if transposed:
-        X = X.T
-    for a, b, c in POLAR_EXPRESS:
-        X2 = X @ X.T
-        X = a * X + b * (X2 @ X) + c * (X2 @ X2 @ X)
-    return X.T if transposed else X
+def paired_margin_eb(d, n_states: int = 1, delta: float = 0.05) -> float:  # d — разности потерь по окнам, n_states — число кандидатов, delta — уровень доверия
+    """Доказуемая односторонняя граница для парного фильтра — граница среднего по
+    эмпирическому Бернстайну:
+        eps = √(2·sig2·L/n) + 2·b·L/n,   L = ln(2/alpha),
+    с объединённой оценкой по n_states кандидатам, оценённым на одной
+    отложенной выборке: alpha = delta / n_states.
+        d — разность потерь по окнам (старая − новая; положительная —
+    кандидат лучше); sig2 — выборочная дисперсия; b = max|d|.
+    Фильтр может принять, только если mean(d) > eps.
+    В отличие от paired_gain (нормальное приближение z·SE) граница не
+    предполагает нормальность d и учитывает выбор лучшего из K."""
+    d = _np.asarray(d, dtype=float)  # d в вещественный массив
+    n = len(d)  # n — число разностей
+    if n < 2 or not _np.isfinite(d).all():  # меньше двух значений или есть нечисловое
+        return float("inf")  # бесконечная граница: принять нельзя
+    L = _np.log(2.0 * max(1, n_states) / delta)  # логарифм: L = ln(2·max(1, n_states)/delta)
+    sig2 = float(d.var(ddof=1))  # sig2 = выборочная дисперсия d
+    b = float(_np.abs(d).max())  # максимум модуля: b = max|d|
+    return float(_np.sqrt(2.0 * sig2 * L / n) + 2.0 * b * L / n)  # граница: eps = √(2·sig2·L/n) + 2·b·L/n
 
-def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:
-    """C532 explicit parameter count: adapter 2*r*d vs full block d*d
-    (C532 adapter_param_le_full_block when r <= d/2)."""
-    out = {"adapter": 2 * r * d}
-    if full_block_d is not None:
-        out["full_block"] = full_block_d * full_block_d
-        out["ratio"] = out["adapter"] / out["full_block"]
-    return out
-
-
-class AdapterBank:
-    """WAVE 210: per-domain independent adapters (user-directed,
-    upstream HAGI_v2_final measured: separate B/C adapters kept
-    source logits bit-exact, forgetA=0.0). ONE shared trunk/head +
-    isolated low-rank side-branches per domain. Cross-domain reuse
-    via adapter_warm_start (C560)."""
-
-    def __init__(self, d: int, r: int = 2):
-        self.d, self.r = d, r
-        self._adapters: dict[str, LowRankAdapter] = {}
-
-    def get(self, domain: str) -> LowRankAdapter:
-        if domain not in self._adapters:
-            # WAVE 230: deterministic seed from the domain NAME — the
-            # old len(self._adapters) made initialization depend on
-            # the ORDER domains were created in (reproducibility bug).
-            seed = int(__import__("hashlib").sha1(
-                domain.encode("utf-8")).hexdigest()[:8], 16)
-            self._adapters[domain] = LowRankAdapter(self.d, self.r,
-                                                    seed=seed)
-        return self._adapters[domain]
-
-    def apply(self, domain: str, f):
-        """Residual through THIS domain's adapter only: f + B(A f).
-        Other domains' adapters are untouched — isolation by
-        construction (forgetA=0 bit-exact, upstream-measured)."""
-        return self.get(domain)(f)
-
-    def transfer(self, src: str, dst: str) -> bool:
-        """C560 warm-start: copy src adapter into dst (caller decides
-        closeness). Source adapter unchanged."""
-        if src not in self._adapters:
-            return False
-        return adapter_warm_start(self._adapters[src],
-                                  self.get(dst))
-
-    def n_params(self) -> int:
-        return sum(a.n_params for a in self._adapters.values())
+# # ---- Polar-Express: три квинтических шага с рациональными коэффициентами.
+# # Сингулярные числа из [1/1000, 1] переходят в [9/512, 1049/1024].
+# # Классический Ньютон–Шульц (core.newton_schulz_orthogonalize) такого
+# # окна для малых сингулярных чисел не даёт (4 шага: [0.47, 1.0] на [0.1, 1];
+# # здесь: [0.9075, 1.0212]). В основной цикл не подключён намеренно:
+# # обратный поиск шага там перемасштабирует шаг, качество обучения то же
+# # (относительная ошибка оператора 0.010 против 0.011), время на вызов
+# # сопоставимо (17.6 против 23.0 мкс), а при d_out = 1 ортогонализация
+# # вырождается в норму вектора.
+# #
+# # Три шага: X <- a·X + b·X³ + c·X⁵ с рациональными коэффициентами (a, b, c).
+POLAR_EXPRESS = ((10151 / 2500, -17483 / 2500, 9623 / 2500),  # коэффициенты первого шага (a, b, c)
+                 (5429 / 2000, -25159 / 10000, 1963 / 2500),  # коэффициенты второго шага
+                 (9473 / 5000, -1119 / 1000, 2201 / 10000))  # коэффициенты третьего шага
 
 
-# ==================================================================
-# WAVE 211 (HAGI_v2_final theory_ports C538-C541): projected weight
-# decay + exact coverage gate.
+def polar_express(G) -> "np.ndarray":  # G — матрица
+    """Приближение полярного множителя тремя квинтическими шагами (вход
+    нормируется; «высокая» матрица транспонируется в «широкую»)."""
+    X = _np.asarray(G, dtype=_np.float64).copy()  # X = копия G в float64
+    nrm = float(_np.linalg.norm(X))  # норма Фробениуса ‖X‖
+    if nrm < 1e-12:  # норма практически нулевая
+        return X  # вернуть X без изменений
+    X /= nrm  # нормировка: X = X/‖X‖
+    transposed = X.shape[0] > X.shape[1]  # матрица «высокая»: строк больше, чем столбцов
+    if transposed:  # нужно транспонировать
+        X = X.T  # транспонирование: X = Xᵀ
+    for a, b, c in POLAR_EXPRESS:  # по тройкам коэффициентов (a, b, c)
+        X2 = X @ X.T  # произведение: X2 = X @ Xᵀ
+        X = a * X + b * (X2 @ X) + c * (X2 @ X2 @ X)  # шаг: X = a·X + b·(X2 @ X) + c·(X2 @ X2 @ X)
+    return X.T if transposed else X  # вернуть X, при транспонировании — обратно Xᵀ
 
-def projected_weight_decay(W, P, c: float, complement_update=None):
-    """WeightDecayLeak: W' = W - dC - c(W - WP); assumes dC P = 0,
-    P^2 = P. Protected component W P is preserved EXACTLY (upstream
-    measured 5.68e-15 vs naive 1.945 leak)."""
-    W = np.asarray(W, dtype=np.float64)
-    P = np.asarray(P, dtype=np.float64)
-    d = (np.zeros_like(W) if complement_update is None
-         else np.asarray(complement_update, dtype=np.float64))
-    return W - d - c * (W - W @ P)
-
-
-def exact_ce_contribution(p_true: float) -> float:
-    """C541: exact-zero CE only at p == 1; reject p <= 0 instead of
-    computing -log(0)."""
-    import math
-    p = float(p_true)
-    if p == 1.0:
-        return 0.0
-    if p <= 0.0:
-        raise ValueError(
-            "invalid exact coverage: true-byte probability must be > 0")
-    return -math.log(p)
+def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:  # d и r — размерности адаптера, full_block_d — размер полного блока
+    """Подсчёт параметров: адаптер 2·r·d против полного блока d·d
+    (адаптер не больше полного блока при r <= d/2)."""
+    out = {"adapter": 2 * r * d}  # словарь: число параметров адаптера 2·r·d
+    if full_block_d is not None:  # задан размер полного блока
+        out["full_block"] = full_block_d * full_block_d  # full_block = full_block_d²
+        out["ratio"] = out["adapter"] / out["full_block"]  # ratio = adapter/full_block
+    return out  # итог
 
 
-# WAVE 214 (hagi_lab): packed 5-trit/byte codec (Ternary.lean: 3^5=243<=2^8).
+class AdapterBank:  # банк адаптеров по доменам
+    """Независимые адаптеры по доменам: один общий ствол и голова плюс
+    изолированные боковые ветви низкого ранга на каждый домен. Перенос между
+    доменами — через adapter_warm_start."""
 
-def pack_trits5(levels: Sequence[int]) -> tuple[bytes, int]:
-    """Pack {-1,0,+1} symbols in base-3 groups of five, one byte/group.
+    def __init__(self, d: int, r: int = 2):  # d — размерность, r — ранг (по умолчанию 2)
+        self.d, self.r = d, r  # запомнить размерности
+        self._adapters: dict[str, LowRankAdapter] = {}  # словарь «домен -> адаптер» (пока пуст)
 
-    Mapping: -1 -> 0, 0 -> 1, +1 -> 2. Since 3**5=243 <= 256,
-    every five-trit code fits injectively in one byte.
-    """
-    vals = [int(x) for x in levels]
-    if any(x not in (-1, 0, 1) for x in vals):
-        raise ValueError("levels must be in {-1,0,+1}")
-    out = bytearray()
-    for start in range(0, len(vals), 5):
-        digits = [v+1 for v in vals[start:start+5]]
-        digits += [1] * (5-len(digits))
-        code = sum(d * (3**i) for i, d in enumerate(digits))
-        if code >= 243:
-            raise AssertionError("base-three code overflow")
-        out.append(code)
-    return bytes(out), len(vals)
+    def get(self, domain: str) -> LowRankAdapter:  # domain — имя домена
+        if domain not in self._adapters:  # домена ещё нет
+            # # зерно детерминированно выводится из ИМЕНИ домена: прежнее
+            # # len(self._adapters) делало инициализацию зависящей от ПОРЯДКА
+            # # создания доменов (ошибка воспроизводимости).
+            seed = int(__import__("hashlib").sha1(  # seed = int(первые 8 цифр sha1(имя домена в utf-8), основание 16)
+                domain.encode("utf-8")).hexdigest()[:8], 16)  # продолжение sha1
+            self._adapters[domain] = LowRankAdapter(self.d, self.r,  # создать адаптер (d, r) с этим зерном
+                                                    seed=seed)  # продолжение: seed=seed
+        return self._adapters[domain]  # вернуть адаптер домена
+
+    def apply(self, domain: str, f):  # domain — имя домена, f — вход
+        """Остаток через адаптер ТОЛЬКО этого домена: f + B(A f). Адаптеры
+        других доменов не затрагиваются — изоляция по построению."""
+        return self.get(domain)(f)  # применить адаптер домена к f
+
+    def transfer(self, src: str, dst: str) -> bool:  # src — домен-источник, dst — домен-приёмник
+        """Тёплый старт: скопировать адаптер src в dst (о близости решает
+        вызывающий код). Адаптер-источник не меняется."""
+        if src not in self._adapters:  # источника нет
+            return False  # отказ
+        return adapter_warm_start(self._adapters[src],  # перенос: adapter_warm_start(src, get(dst))
+                                  self.get(dst))  # продолжение вызова
+
+    def n_params(self) -> int:  # число параметров банка
+        return sum(a.n_params for a in self._adapters.values())  # сумма n_params по всем адаптерам
 
 
-def unpack_trits5(payload: bytes, length: int) -> np.ndarray:
-    if length < 0 or len(payload) != (length+4)//5:
-        raise ValueError("payload length does not match trit count")
-    out = []
-    for code in payload:
-        if code >= 243:
-            raise ValueError("invalid packed trit byte (must be <243)")
-        n = int(code)
-        for _ in range(5):
-            out.append((n % 3)-1)
-            n //= 3
-    return np.asarray(out[:length], dtype=np.int8)
+# # ==================================================================
+# # Проекционный весовой спад и точный вклад покрытия.
+# # ==================================================================
+
+def projected_weight_decay(W, P, c: float, complement_update=None):  # W — веса, P — проектор, c — скорость спада, complement_update — обновление в дополнении
+    """Спад весов с защитой: W' = W − dC − c·(W − W P); предполагается
+    dC·P = 0 и P² = P. Защищённая компонента W P сохраняется ТОЧНО
+    (утечка 5.68e-15 против 1.945 у наивного спада)."""
+    W = np.asarray(W, dtype=np.float64)  # W в float64
+    P = np.asarray(P, dtype=np.float64)  # P в float64
+    d = (np.zeros_like(W) if complement_update is None  # dC = нули, если обновление не задано,
+         else np.asarray(complement_update, dtype=np.float64))  # иначе complement_update в float64
+    return W - d - c * (W - W @ P)  # итог: W' = W − dC − c·(W − W @ P)
+
+
+def exact_ce_contribution(p_true: float) -> float:  # p_true — вероятность истинного байта
+    """Точный вклад кросс-энтропии: ноль только при p == 1; p <= 0 отвергается
+    вместо вычисления −log(0)."""
+    import math  # математические функции
+    p = float(p_true)  # p как float
+    if p == 1.0:  # p = 1 — вклад нулевой
+        return 0.0  # вернуть 0.0
+    if p <= 0.0:  # p <= 0 — логарифм не определён
+        raise ValueError(  # ошибка значения
+            "invalid exact coverage: true-byte probability must be > 0")  # текст ошибки
+    return -math.log(p)  # вклад: −ln(p)
+
+
+# # Кодек: пять троичных уровней в одном байте (3^5 = 243 <= 2^8).
+
+def pack_trits5(levels: Sequence[int]) -> tuple[bytes, int]:  # levels — последовательность уровней из {−1, 0, +1}
+    """Упаковать символы {−1, 0, +1} в группы по пять в троичной системе —
+    один байт на группу.
+
+        Соответствие: −1 -> 0, 0 -> 1, +1 -> 2. Так как 3^5 = 243 <= 256,
+        каждый код из пяти трит укладывается в один байт взаимно однозначно.
+        code = Σ_{i=0..4} (v_i + 1)·3^i; неполная группа дополняется нулями
+        (цифрой 1). Возврат (байты, число исходных уровней)."""
+    vals = [int(x) for x in levels]  # vals — целые уровни
+    if any(x not in (-1, 0, 1) for x in vals):  # есть уровень вне {−1, 0, 1}
+        raise ValueError("levels must be in {-1,0,+1}")  # ошибка: уровни должны быть из {−1, 0, +1}
+    out = bytearray()  # накопитель байтов
+    for start in range(0, len(vals), 5):  # по группам по 5
+        digits = [v+1 for v in vals[start:start+5]]  # цифры: v + 1
+        digits += [1] * (5-len(digits))  # дополнить цифрой 1 (уровень 0) до 5
+        code = sum(d * (3**i) for i, d in enumerate(digits))  # код: code = Σ_i d_i·3^i
+        if code >= 243:  # код вне допустимого диапазона
+            raise AssertionError("base-three code overflow")  # ошибка: переполнение троичного кода
+        out.append(code)  # добавить байт
+    return bytes(out), len(vals)  # возврат (байты, число уровней)
+
+
+def unpack_trits5(payload: bytes, length: int) -> np.ndarray:  # payload — байты, length — число уровней
+    if length < 0 or len(payload) != (length+4)//5:  # отрицательная длина или размер не равен (length + 4)//5
+        raise ValueError("payload length does not match trit count")  # ошибка: длина payload не соответствует числу трит
+    out = []  # накопитель уровней
+    for code in payload:  # по байтам
+        if code >= 243:  # байт вне допустимого диапазона
+            raise ValueError("invalid packed trit byte (must be <243)")  # ошибка: недопустимый упакованный байт (должен быть < 243)
+        n = int(code)  # n — значение байта
+        for _ in range(5):  # пять раз
+            out.append((n % 3)-1)  # очередной уровень: (n mod 3) − 1
+            n //= 3  # переход к следующей цифре: n = n div 3
+    return np.asarray(out[:length], dtype=np.int8)  # первые length уровней в int8
 
