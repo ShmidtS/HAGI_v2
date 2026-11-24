@@ -39,7 +39,7 @@ def _two_task_setup(scale_ratio=1000.0):
         return ((m(x_) - y_) ** 2).sum()  # сумма квадратов ошибок Σ (m(x) − y)²
     task_batches = {"big": (x, t.tensor([[scale_ratio]])), "small": (x2, t.tensor([[1.0]]))}  # пакеты задач: цели scale_ratio и 1
     validation = lambda m: {"big": float(((m(x) - task_batches["big"][1]) ** 2).sum()),  # потери до/после: big = Σ (m(x) − scale_ratio)²
-                            "small": float(((m(x2) - task_batches["small"][1]) ** 2).sum())}  # small = Σ (m(x2) − 1)²
+                            "small": float(((m(x2) - task_batches["small"][1]) ** 2).sum())}  # small = Σ (m(x2) − 1)² — квадрат ошибки на маленькой задаче
     return model, task_batches, loss_fn, validation  # вернуть набор для шага
 
 
@@ -86,7 +86,7 @@ def test_aggregate_gain_cannot_hide_a_single_task_regression():
     def loss_fn(m, b):  # потеря пакета
         return (m(b[0]) - b[1]).sum() ** 2  # квадрат суммы ошибок (Σ (m(x) − y))²
     def validation(m):  # потери задач (заменяется ниже)
-        return {"a": 1.0, "b": 0.0}  # a = 1, b = 0
+        return {"a": 1.0, "b": 0.0}  # потери задач: a = 1, b = 0
     tb = {"a": (t.ones(1, 1), t.zeros(1, 1)), "b": (t.ones(1, 1), t.zeros(1, 1))}  # обе задачи: вход 1, цель 0
     # 'b' ухудшается после любого шага: потери зависят от параметра
     def validation2(m):  # потери как функции веса w
