@@ -162,7 +162,7 @@ def propose_mutation(rng, cur: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def genesis_cycle(
-    seed: int = 0, profile: str = "throughput", dry: bool = False
+    seed: int = 0, profile: str = "throughput", dry: bool = False  # аргументы: зерно, профиль, пробный запуск без записи
 ) -> dict[str, Any]:  # аннотация типа возврата: словарь с произвольными значениями
     """Один цикл «спроектировать → измерить → решить» зарождения настроек.
 
@@ -557,7 +557,7 @@ def tournament(
 def evolve(
     pop_size: int = 12,  # размер населения, по умолчанию 12
     generations: int = 8,  # число поколений, по умолчанию 8
-    profile: str = "throughput",
+    profile: str = "throughput",  # аргумент profile — профиль настройки
     seed: int = 7,  # зерно генератора, по умолчанию 7
     log: bool = True,  # вести журнал, по умолчанию да
 ) -> dict[str, Any]:  # аннотация типа возврата: словарь с произвольными значениями
