@@ -339,7 +339,7 @@ def clear_reified() -> None:
 def _state_sig_path(state_dir):
     """Путь к файлу контрольной метки сохранённых операторов: invented_reprs.sig внутри state_dir."""
     from pathlib import Path  # работа с путями (локальный импорт)
-    return Path(state_dir) / 'invented_reprs.sig'  # state_dir/invented_reprs.sig
+    return Path(state_dir) / 'invented_reprs.sig'  # путь к файлу подписи: state_dir/invented_reprs.sig
 def _state_hmac(payload_bytes: bytes, state_dir) -> str:
     """Контрольная метка целостности, привязанная к машине: hex(SHA-256(ключ + байты)).
 
