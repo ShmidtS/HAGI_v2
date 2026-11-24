@@ -115,10 +115,10 @@ def compose_adder2() -> dict:  # собрать двухразрядный су�
     from hagi import fabric  # эмуляция и проверка схем (повторный импорт безвреден)
     def adder_cell(srcA, srcB, srcC, base):  # входы A, B, перенос C; base — номер первого свободного провода
         g = [  # вентили ячейки; выход вентиля с индексом i имеет номер base + i
-            {"a": srcA, "b": srcB, "mask": fabric.MASKS["XOR"]},  # base+0: t = A ⊕ B
+            {"a": srcA, "b": srcB, "mask": fabric.MASKS["XOR"]},  # вентиль: base+0: t = A ⊕ B
             {"a": base+0, "b": srcC, "mask": fabric.MASKS["XOR"]},  # base+1: сумма s = t ⊕ C
-            {"a": base+0, "b": srcC, "mask": fabric.MASKS["AND"]},  # base+2: u = t ∧ C
-            {"a": srcA, "b": srcB, "mask": fabric.MASKS["AND"]},  # base+3: v = A ∧ B
+            {"a": base+0, "b": srcC, "mask": fabric.MASKS["AND"]},  # вентиль: base+2: u = t ∧ C
+            {"a": srcA, "b": srcB, "mask": fabric.MASKS["AND"]},  # вентиль: base+3: v = A ∧ B
             {"a": base+3, "b": base+2, "mask": fabric.MASKS["OR"]},  # base+4: перенос = v ∨ u
         ]
         return g, base+1, base+4  # вентили, номер провода суммы, номер провода переноса
