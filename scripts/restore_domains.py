@@ -1,96 +1,101 @@
-"""Restore unified model by replaying ALL saved domain chunks
-(412 ns_*.bin) through ingest — same path as the original cycle.
-Run with 1-thread OpenBLAS env (see watchdog pattern)."""
-import sys, time, os
-import torch
-from pathlib import Path
+"""Восстановление объединённой модели повторным приёмом всех сохранённых кусков доменов через ingest — тот же путь, что и в рабочем цикле.
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+Для каждого файла ns_*.bin из каталога доменов: если его хеш уже записан в книге
+доменов с обученной CE — кусок пропускается (повторный запуск идемпотентен);
+иначе u.ingest(2 эпохи, 1 повтор, без предела повтора), затем семантическая
+дистилляция (loss = 1 − среднее косинусных сходств pred и векторов учителя),
+освобождение кэша видеопамяти и сборка мусора. Каждые 8 кусков модель
+сохраняется. Включён режим квантования при обучении: прямой проход видит
+трёхзначные веса {-s, 0, +s}.
+"""
+import sys, time, os  # путь импорта, замер времени, окружение
+import torch  # тензоры и управление видеопамятью
+from pathlib import Path  # пути
 
-from hagi.unified import Unified
+ROOT = Path(__file__).resolve().parent.parent  # корень проекта
+sys.path.insert(0, str(ROOT))  # добавить корень проекта в путь импорта
+
+from hagi.unified import Unified  # объединённая модель
 
 
 def main() -> None:
-    dom_dir = ROOT / "checkpoints" / "domains"
-    chunks = sorted(dom_dir.glob("ns_*.bin"))
-    print(f"restore: {len(chunks)} domain chunks", flush=True)
-    u = Unified.load() if Unified.exists() else Unified()
-    # WAVE 216 (user: учи сразу тернарную): QAT on — forward sees
-    # {-s,0,+s} throughout training; payload export round-trips
-    # without post-training surprise.
-    u.model._qat = True
-    print("QAT: on (ternary straight-through)", flush=True)
-    t0 = time.perf_counter()
-    # WAVE 178: resume — a chunk whose sha is already in the ledger
-    # with a trained CE is already learned; skip it (idempotent
-    # restart: the model in memory is the accumulator, not the log).
-    from hagi.unified import _sha
-    skipped = 0
-    for i, p in enumerate(chunks, 1):
-        blob = p.read_bytes()
-        if len(blob) < 16:
-            continue
-        rec = u.domains.get(p.stem)
-        if rec and rec.get("sha") == _sha(blob) and rec.get("ce") is not None:
-            skipped += 1
+    """Прогнать все сохранённые куски через ingest, доучивая загруженную или новую модель."""
+    dom_dir = ROOT / "checkpoints" / "domains"  # каталог сохранённых кусков доменов
+    chunks = sorted(dom_dir.glob("ns_*.bin"))  # отсортированный список файлов ns_*.bin
+    print(f"restore: {len(chunks)} domain chunks", flush=True)  # печать числа кусков
+    u = Unified.load() if Unified.exists() else Unified()  # загрузить модель с диска, если файл есть, иначе создать новую
+    # квантование при обучении включено (решено учить сразу трёхзначные веса):
+    # прямой проход на всём обучении видит {-s, 0, +s}; экспорт payload
+    # проходит туда-обратно без сюрприза после обучения.
+    u.model._qat = True  # включить квантование при обучении
+    print("QAT: on (ternary straight-through)", flush=True)  # печать режима
+    t0 = time.perf_counter()  # начало отсчёта времени
+    # возобновление: кусок, чей хеш уже есть в книге доменов с обученной CE,
+    # считается выученным и пропускается (модель в памяти — накопитель, а не журнал).
+    from hagi.unified import _sha  # функция хеша байтов
+    skipped = 0  # число пропущенных кусков
+    for i, p in enumerate(chunks, 1):  # по кускам, i — номер с 1
+        blob = p.read_bytes()  # байты куска
+        if len(blob) < 16:  # кусок короче 16 байтов
+            continue  # пропустить
+        rec = u.domains.get(p.stem)  # запись книги доменов с именем файла без расширения
+        if rec and rec.get("sha") == _sha(blob) and rec.get("ce") is not None:  # запись есть, хеш совпадает и CE обучена
+            skipped += 1  # учесть пропуск
             print(f"[restore {i}/{len(chunks)}] {p.stem} -> SKIP "
-                  "(already learned, sha match)", flush=True)
-            continue
-        r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)
-        # WAVE 218 (user: модель наследует семантику embeddinggemma):
-        # после ingest — semantic distill на фрагментах домена.
-        # WAVE 220: semantic distill ALWAYS ON (gemma -> LM).
-        if True:
-            try:
-                from hagi.lm import SemanticDistillHead
-                bank = getattr(u, "sem_head", None)
-                if bank is None:
-                    bank = u.sem_head = SemanticDistillHead(dim=0)
-                import random as _rd
-                blob_u = blob.decode("utf-8", errors="ignore")
-                frags = [blob_u[i:i+200] for i in
-                         range(0, min(len(blob_u), 2000), 200)][:8]
-                if frags:
-                    dev = getattr(u.model, "device", "cpu")
-                    idx = torch.tensor(
-                        [[(ord(c) % 256) for c in f[:u.model.k]]
-                         for f in frags], dtype=torch.long,
-                        device=dev)
-                    if idx.shape[1] < u.model.k:
-                        pad = torch.full(
-                            (idx.shape[0], u.model.k - idx.shape[1]), 32,
-                            dtype=torch.long)
-                        idx = torch.cat([pad, idx], dim=1)
-                    u.model.domain_adapter = None
-                    l = bank.align_step(u.model, idx, frags)
-                    print(f"    semantic loss {l:.3f}", flush=True)
-            except Exception as _e:
-                print(f"    semantic skipped: {_e!r}", flush=True)
-        ce = r.get("holdout_ce", -1)
-        # WAVE 205 (VRAM hygiene): the replay corpus grows with every
-        # domain (full-book replay) and allocator caching fragments
-        # VRAM over a long run — measured as chunk time 700s -> 980s
-        # and HIP launch failures after ~1h on the iGPU. Free the
-        # cached blocks and log VRAM so growth is visible.
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                mem = torch.cuda.memory_allocated() / 2**20
-                resv = torch.cuda.memory_reserved() / 2**20
-                print(f"    vram: alloc={mem:.0f}MB reserved={resv:.0f}MB",
-                      flush=True)
-        except Exception:
-            pass
-        import gc
-        gc.collect()
+                  "(already learned, sha match)", flush=True)  # печать пропуска
+            continue  # к следующему куску
+        r = u.ingest(p.stem, blob, epochs=2, repeat=1, replay_cap=None)  # приём куска: 2 эпохи, 1 повтор, без предела повтора; r — словарь итога
+        # после приёма — семантическая дистилляция на фрагментах домена
+        # (всегда включена: учитель -> языковая модель).
+        if True:  # блок выполняется всегда
+            try:  # сбой дистилляции не должен останавливать восстановление
+                from hagi.lm import SemanticDistillHead  # голова семантического выравнивания
+                bank = getattr(u, "sem_head", None)  # существующая голова или None
+                if bank is None:  # головы ещё нет
+                    bank = u.sem_head = SemanticDistillHead(dim=0)  # создать голову и сохранить её в модели
+                import random as _rd  # модуль случайных чисел (далее не используется)
+                blob_u = blob.decode("utf-8", errors="ignore")  # текст куска: недопустимые байты отбрасываются
+                frags = [blob_u[i:i+200] for i in  # фрагменты text[i .. i+199] для i = 0, 200, 400, ...
+                         range(0, min(len(blob_u), 2000), 200)][:8]  # ...пока i < min(длина, 2000); берутся первые 8
+                if frags:  # есть хотя бы один фрагмент
+                    dev = getattr(u.model, "device", "cpu")  # устройство модели, по умолчанию "cpu"
+                    idx = torch.tensor(  # тензор контекстов
+                        [[(ord(c) % 256) for c in f[:u.model.k]]  # для каждого фрагмента f: коды ord(c) mod 256 первых k символов
+                         for f in frags], dtype=torch.long,  # по всем фрагментам; тип long
+                        device=dev)  # на устройстве модели
+                    if idx.shape[1] < u.model.k:  # фрагменты короче контекста
+                        pad = torch.full(  # прокладка из кода 32 (пробел)
+                            (idx.shape[0], u.model.k - idx.shape[1]), 32,  # форма (число фрагментов, k − длина); значение 32
+                            dtype=torch.long)  # тип long
+                        idx = torch.cat([pad, idx], dim=1)  # приклеить прокладку слева по оси 1: длина строки станет k
+                    u.model.domain_adapter = None  # отключить адаптер домена
+                    l = bank.align_step(u.model, idx, frags)  # один шаг выравнивания; l — потеря
+                    print(f"    semantic loss {l:.3f}", flush=True)  # печать потери с 3 знаками
+            except Exception as _e:  # любая ошибка дистилляции
+                print(f"    semantic skipped: {_e!r}", flush=True)  # печать причины пропуска
+        ce = r.get("holdout_ce", -1)  # CE на отложенных данных, −1, если ключа нет
+        # гигиена видеопамяти: корпус повтора растёт с каждым доменом, кэш
+        # аллокатора фрагментирует память при долгом запуске (время куска
+        # росло с 700 с до 980 с, на встроенном графическом процессоре около
+        # часа спустя срывались запуски). Освободить кэш и напечатать память.
+        try:  # печать памяти не должна прерывать цикл
+            if torch.cuda.is_available():  # графический процессор доступен
+                torch.cuda.empty_cache()  # вернуть закэшированные блоки видеопамяти
+                mem = torch.cuda.memory_allocated() / 2**20  # занято моделей, МБ = байты / 2^20
+                resv = torch.cuda.memory_reserved() / 2**20  # зарезервировано, МБ = байты / 2^20
+                print(f"    vram: alloc={mem:.0f}MB reserved={resv:.0f}MB",  # печать занятой и зарезервированной памяти в целых МБ
+                      flush=True)  # сразу сбросить вывод
+        except Exception:  # ошибка запроса памяти
+            pass  # пропустить — память только для сведения
+        import gc  # сборщик мусора
+        gc.collect()  # полная сборка мусора
         print(f"[restore {i}/{len(chunks)}] {p.stem} -> CE {ce} "
-              f"({r.get('seconds', '?')}s)", flush=True)
-        if i % 8 == 0:
-            u.save()  # periodic checkpoint: resume boundary advances
+              f"({r.get('seconds', '?')}s)", flush=True)  # печать номера, имени, CE и длительности приёма
+        if i % 8 == 0:  # каждый 8-й кусок
+            u.save()  # периодическое сохранение: граница возобновления сдвигается вперёд
     print(f"restore done in {(time.perf_counter()-t0)/3600:.1f}h "
-          f"(skipped {skipped})", flush=True)
+          f"(skipped {skipped})", flush=True)  # печать длительности в часах и числа пропусков
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # запуск только как сценарий
+    main()  # восстановить модель по сохранённым кускам
