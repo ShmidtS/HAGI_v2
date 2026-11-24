@@ -902,11 +902,10 @@ class RopeAttentionByteLM:
                 hp = hold[s:s + 512]
                 # WAVE 241 FIX (P0 target leak): old slice
                 # idx[p+k::-1][:k] STARTS at p+k = the target byte
-                # itself (it was X[0]!). Correct newest-first window:
-                # positions p+k-1 down to p.
-                X = _np.stack([idx_np[p + self.k - 1:
-                                      max(p - 1, -1):-1][:self.k]
-                               for p in hp])
+                # itself (it was X[0]!). WAVE 258 FIX: the window is
+                # OLDEST-first, like gather_all above (it was reversed:
+                # +1.0..2.5 nats of pure order error in the holdout CE).
+                X = _np.stack([idx_np[p:p + self.k] for p in hp])
                 x = _th.as_tensor(X, dtype=_th.long, device=dev)
                 y = raw[_th.as_tensor(hp + self.k, dtype=_th.long,
                                       device=dev)]
@@ -1040,14 +1039,18 @@ class RopeAttentionByteLM:
     # ---- WAVE 230: self-terminating generation on the Rope model --
 
     def _read_all_windows(self, prompt_bytes: bytes, max_span: int = 64):
-        """Coverage windows over EVERY prompt byte (newest-first,
-        variable tail length), matching train window semantics."""
+        """Coverage windows over EVERY prompt byte, OLDEST-first (slot
+        L-1 = the newest byte = the query), matching train_guarded's
+        gather_all. WAVE 258 FIX: windows were reversed (ctx[::-1]) —
+        the trunk is trained on oldest-first, measured CE 3.5..4.4 vs
+        6.0..6.4 nats on the reversed order."""
         ctx = list(prompt_bytes)
         wins = []
         i = len(ctx)
         while i > 0:
             j = max(0, i - max_span)
-            wins.append(ctx[j:i][::-1])
+            w = ctx[j:i]
+            wins.append([32] * (max_span - len(w)) + w)   # left pad: uniform width
             i = j
         return wins or [[0]]
 
