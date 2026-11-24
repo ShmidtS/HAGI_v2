@@ -93,7 +93,9 @@ def comment_map(src: str) -> dict[int, str]:
 
 def docstring_strings(tree: ast.AST) -> list[tuple[int, str]]:
     """(номер строки, текст) всех строковых литералов-документов модуля,
-    классов и функций, а также всех многострочных строковых литералов."""
+    классов и функций, а также строк-описаний — строковых литералов отдельным
+    оператором-выражением. Строковые литералы-код (в присваиваниях, вызовах)
+    документацией не считаются."""
     out: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -101,8 +103,8 @@ def docstring_strings(tree: ast.AST) -> list[tuple[int, str]]:
             if ds is not None:
                 first = node.body[0]
                 out.append((first.lineno, ds))
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and "\n" in node.value:
-            out.append((node.lineno, node.value))
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):  # строка-описание отдельным оператором (не первый в теле) — тоже документация
+            out.append((node.lineno, node.value.value))  # запомнить её текст
     return out
 
 
