@@ -86,27 +86,35 @@ class DiskBackedContext:
         self.db.execute("PRAGMA journal_mode=WAL")  # журнал упреждающей записи: чтение не блокируется записью
         self.db.execute("PRAGMA synchronous=NORMAL")  # обычная синхронизация с диском (в режиме WAL надёжна и быстрее полной)
         # полнотекстовая таблица страниц: один столбец content, токенизатор unicode61
-        self.db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS pages
-                          USING fts5(content, tokenize='unicode61')""")
+        self.db.execute("""\
+CREATE VIRTUAL TABLE IF NOT EXISTS pages
+                          USING fts5(content, tokenize='unicode61')"""  # полнотекстовая таблица pages (столбец content, токенизатор unicode61), если её нет
+                          )
         # таблица положения страниц: номер — ключ, начало и конец в потоке, длина
-        self.db.execute("""CREATE TABLE IF NOT EXISTS page_meta (
+        self.db.execute("""\
+CREATE TABLE IF NOT EXISTS page_meta (
                           page_id INTEGER PRIMARY KEY,
                           char_start INTEGER NOT NULL,
                           char_end INTEGER NOT NULL,
-                          char_count INTEGER NOT NULL)""")
+                          char_count INTEGER NOT NULL)"""  # char_count — длина страницы в символах; конец текста создания page_meta
+                          )
         # история фактов: ключ, номер версии, значение, источник; ключ пары (ключ, версия)
-        self.db.execute("""CREATE TABLE IF NOT EXISTS fact_history (
+        self.db.execute("""\
+CREATE TABLE IF NOT EXISTS fact_history (
                           fact_key TEXT NOT NULL,
                           revision INTEGER NOT NULL,
                           value TEXT NOT NULL,
                           source TEXT NOT NULL,
-                          PRIMARY KEY(fact_key, revision))""")
+                          PRIMARY KEY(fact_key, revision))"""  # первичный ключ — пара (fact_key, revision); конец текста создания fact_history
+                          )
         # текущие факты: по одной строке на ключ — номер последней версии, значение, источник
-        self.db.execute("""CREATE TABLE IF NOT EXISTS fact_current (
+        self.db.execute("""\
+CREATE TABLE IF NOT EXISTS fact_current (
                           fact_key TEXT PRIMARY KEY,
                           revision INTEGER NOT NULL,
                           value TEXT NOT NULL,
-                          source TEXT NOT NULL)""")
+                          source TEXT NOT NULL)"""  # source — источник факта; конец текста создания fact_current
+                          )
         self.db.commit()  # зафиксировать создание таблиц
         self._pending = ""  # буфер символов, ещё не ставших страницей
         self._indexed_chars = int(self.db.execute(  # проиндексировано символов = наибольший char_end в базе
@@ -223,10 +231,12 @@ class DiskBackedContext:
             # страницы соединяются со своим положением по номеру; условие — совпадение с
             # выражением поиска, порядок по bm25, не более k строк
             rows = self.db.execute(  # строки результата
-                """SELECT p.rowid, m.char_start, m.char_end, bm25(pages), p.content,
+                """\
+SELECT p.rowid, m.char_start, m.char_end, bm25(pages), p.content,
                           snippet(pages, 0, '[match]', '[/match]', ' … ', 40)
                    FROM pages AS p JOIN page_meta AS m ON m.page_id=p.rowid
-                   WHERE pages MATCH ? ORDER BY bm25(pages) LIMIT ?""",
+                   WHERE pages MATCH ? ORDER BY bm25(pages) LIMIT ?"""  # условие совпадения с запросом, порядок по bm25, не более k строк; конец текста запроса
+                   ,
                 (fts, k),  # параметры: выражение поиска и предел
             ).fetchall()  # выбрать все строки
         else:  # искать только на заданных страницах
@@ -239,11 +249,13 @@ class DiskBackedContext:
                                 ((pid,) for pid in allowed))  # по одному параметру-кортежу на номер
             # тот же запрос, что и выше, плюс соединение с фильтром: остаются только страницы из него
             rows = self.db.execute(  # строки результата
-                """SELECT p.rowid, m.char_start, m.char_end, bm25(pages), p.content,
+                """\
+SELECT p.rowid, m.char_start, m.char_end, bm25(pages), p.content,
                           snippet(pages, 0, '[match]', '[/match]', ' … ', 40)
                    FROM pages AS p JOIN page_meta AS m ON m.page_id=p.rowid
                    JOIN active_page_filter AS f ON f.page_id=p.rowid
-                   WHERE pages MATCH ? ORDER BY bm25(pages) LIMIT ?""",
+                   WHERE pages MATCH ? ORDER BY bm25(pages) LIMIT ?"""  # условие совпадения с запросом, порядок по bm25, не более k строк; конец текста запроса
+                   ,
                 (fts, k),  # параметры: выражение поиска и предел
             ).fetchall()  # выбрать все строки
         return [MemoryHit(int(r[0]), int(r[1]), int(r[2]), float(r[3]), str(r[4]), str(r[5]))  # каждая строка -> MemoryHit: номер, начало, конец, оценка, текст, фрагмент
@@ -283,9 +295,11 @@ class DiskBackedContext:
         # вставить строку текущего факта; если ключ уже есть — заменить её номер версии,
         # значение и источник новыми (excluded — строка, которую пытались вставить)
         self.db.execute(  # вставить или обновить строку текущего факта
-            """INSERT INTO fact_current(fact_key,revision,value,source) VALUES (?,?,?,?)
+            """\
+INSERT INTO fact_current(fact_key,revision,value,source) VALUES (?,?,?,?)
                ON CONFLICT(fact_key) DO UPDATE SET
-               revision=excluded.revision, value=excluded.value, source=excluded.source""",
+               revision=excluded.revision, value=excluded.value, source=excluded.source"""  # при конфликте по ключу заменить версию, значение и источник; конец текста запроса
+               ,
             (fact_key, revision, value, source),  # ключ, номер версии, значение, источник
         )
         self.db.commit()  # зафиксировать изменения
