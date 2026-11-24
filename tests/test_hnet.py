@@ -10,7 +10,11 @@ def test_hnet_factory_shapes_and_params():
     assert m.ARCH == "hnet" and m.k == 64
     out = m.logits(m.t.as_tensor([[0] * 64], dtype=m.t.long))
     assert tuple(out.shape) == (1, 256)
-    assert sum(p.numel() for p in m.params()) == 28048
+    # WAVE 262 measured default d=64 h=128 (105 088 params); the d=24
+    # variant of the report has 28 048
+    assert (m.dim, m.hidden, sum(p.numel() for p in m.params())) == (64, 128, 105088)
+    small = make_lm("hnet", dim=24, hidden=48, seed=1)
+    assert sum(p.numel() for p in small.params()) == 28048
     assert make_lm("rope", seed=1).ARCH == "rope"
 
 
