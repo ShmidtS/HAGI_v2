@@ -104,38 +104,10 @@ class SemanticDistillHead:
         from hagi.embeddings import GemmaEmbedder
         gemma = GemmaEmbedder.get()
         tv = gemma.embed(texts).to(model.device)
-        # forward to hidden: replicate logits' trunk up to h
-        with torch.no_grad():
-            pass
-        e_w = (model._ste_ternary(model.emb, t)
-               if getattr(model, "_qat", False) else model.emb)
-        e = e_w[ctx]
-        if hasattr(model, "_rope") and hasattr(model, "full_logits"):
-            # WAVE 234: RopeAttentionByteLM — mean-pooled per-position
-            # hidden (B, L, H) -> (B, H); CertifiedStepLM flatten path
-            # is wrong for the pairwise-attention trunk.
-            from hagi.trunk_ops import AdapterBank  # noqa: F401 (ad via logits path only)
-            pos = t.arange(ctx.shape[1], device=ctx.device,
-                           dtype=t.float32)
-            dot = t.einsum("bid,bjd->bij", e, e) / (model.dim ** 0.5)
-            sc = dot - model.lam * (pos[None, :, None]
-                                    - pos[None, None, :])
-            mask = pos[None, :, None] >= pos[None, None, :]
-            sc = sc.masked_fill(~mask, float("-inf"))
-            pp = t.softmax(sc, dim=-1)
-            h_all = t.relu(t.einsum("blj,bjd->bld", pp, e) @ model.W1
-                           + model.b1)
-            ad = getattr(model, "domain_adapter", None)
-            if ad is not None:
-                At = t.as_tensor(ad.A, device=h_all.device,
-                                 dtype=h_all.dtype)
-                Bt = t.as_tensor(ad.B, device=h_all.device,
-                                 dtype=h_all.dtype)
-                h_all = h_all + (h_all @ At.T) @ Bt.T
-            h = (h_all @ model.W2 + model.b2).mean(dim=1)
-        else:
-            h = t.relu(e.reshape(ctx.shape[0], -1) @ model.W1
-                       + model.b1)
+        # WAVE 262: the model exposes its own hidden features (Rope:
+        # per-position hidden pooled as before; HNet: the residual
+        # stream h2). No hand-copied forward here — it broke on HNet.
+        h = model.features(ctx)
         self._ensure_proj(h.shape[1], h.device, h.dtype)
         pred = h @ self.proj
         pred = torch.nn.functional.normalize(pred, dim=-1)
@@ -660,6 +632,14 @@ class RopeAttentionByteLM:
             Bt = t.as_tensor(ad.B, device=h.device, dtype=h.dtype)
             h = h + (h @ At.T) @ Bt.T
         return h @ self.W2 + self.b2
+
+    def features(self, ctx):
+        """Features for the semantic-distill head: per-position hidden
+        (B, L, hidden) -> mean over positions -> (B, 256) logit space,
+        i.e. exactly the quantity align_step used to compute by hand."""
+        t = self.t
+        with t.no_grad():
+            return self.full_logits(ctx).mean(dim=1)
 
     def full_logits(self, ctx):
         t = self.t

@@ -142,11 +142,21 @@ class HNetByteLM:
             At = t.as_tensor(ad.A, device=h2.device, dtype=h2.dtype)
             Bt = t.as_tensor(ad.B, device=h2.device, dtype=h2.dtype)
             h2 = h2 + (h2 @ At.T) @ Bt.T
+        self._last_h2 = h2
         lg = h2 @ self.W_out + self.b2
         if self._extra:
             idx = (ctx[:, -2].long() * 131 + ctx[:, -1].long()) % self.bi_buckets
             lg = lg + self.bi_emb[idx] @ self.W_bi
         return lg
+
+    def features(self, ctx):
+        """Residual stream h2 (B, dim) of the last forward — the features
+        the output head reads (semantic-distill head regresses them)."""
+        if ctx.device != self.device:
+            ctx = ctx.to(self.device)
+        with self.t.no_grad():
+            self.logits(ctx)
+        return self._last_h2
 
     def full_logits(self, ctx):
         """Last-position logits for every prefix (B, L) — via L forward
