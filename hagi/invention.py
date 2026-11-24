@@ -316,8 +316,8 @@ def _ranked_quotients(hints: dict | None = None):
     if not hints:  # если подсказок нет — исходный порядок
         return list(QUOTIENTS)  # вернуть копию меню
     order = {"mod": hints.get("period_candidates"),  # соответствие семейство -> сигнал подсказки: 'mod' <- period_candidates
-             "xor": hints.get("xor_mask"),  # xor <- xor_mask
-             "reflect": hints.get("reflect_axis")}  # reflect <- reflect_axis
+             "xor": hints.get("xor_mask"),  # поле: xor <- xor_mask
+             "reflect": hints.get("reflect_axis")}  # поле: reflect <- reflect_axis
     def key(q):  # ключ сортировки: (0, семейство) для подсказанного семейства, иначе (1, имя)
         name = q[0]  # имя фактора
         for fam, sig in order.items():  # по парам (семейство, сигнал)
