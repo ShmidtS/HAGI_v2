@@ -14,7 +14,7 @@ construction.
 Container:
   MAGIC | u32 total_len | u8 mode
   mode 0 (stored): raw bytes — the model did not beat raw
-  mode 1: u8 L | u16 G | phases: u16 nb | u32 bit_len | bitstream ... | tail
+  mode 1: u8 L | groups: u16 nb | u32 bit_len | bitstream ... | tail
 
 Only the SAME model decodes an archive: the payload is tied to the
 checkpoint (weights, k, dim, hidden, theta0/lam, blocks).
@@ -150,28 +150,29 @@ def _groups(n_blk: int, group: int):
         s += group
 
 
-def _phases(n_blk: int, G: int):
-    """Stream-preserving schedule. Phase p codes the blocks
-    p, p+G, p+2G, ... column by column; every byte such a context
-    needs is either in an EARLIER phase (already decoded) or in the
-    same block at a column < col (decoded in this phase). So the
-    decoder stays causal while every column enjoys its full k-byte
-    STREAM context — the distribution train_guarded trains on."""
-    for p in range(min(G, n_blk)):
-        yield np.arange(p, n_blk, G, dtype=np.int64)
+def _ctx_from(buf: np.ndarray, starts: np.ndarray, k: int) -> np.ndarray:
+    """Oldest-first contexts: buf holds k zeros followed by a stream,
+    so the context of stream position p is buf[p : p+k] (the k bytes
+    BEFORE it, zero-padded — the construction of train_guarded)."""
+    return np.stack([buf[p:p + k] for p in starts])
 
 
-def _ctx_from(out: np.ndarray, k: int, positions: np.ndarray) -> np.ndarray:
-    """Oldest-first contexts of stream positions `positions`: the k
-    bytes before each (zero-padded before the stream start)."""
-    pad = np.zeros(k, dtype=np.int64)
-    buf = np.concatenate([pad, out])
-    return np.stack([buf[p:p + k] for p in positions])
+def _groups(blocks: np.ndarray, group: int):
+    for s in range(0, len(blocks), group):
+        yield blocks[s:s + group]
 
 
-def compress(model, data: bytes, L: int | None = None, G: int = 256) -> bytes:
-    """Lossless archive of `data` under `model` (phased column-batched
-    arithmetic coding, see _phases)."""
+def compress(model, data: bytes, L: int | None = None, group: int = 256) -> bytes:
+    """Lossless archive of `data` under `model`. Blocks of L bytes are
+    INDEPENDENT (the context starts from a zero pad at the block
+    start), which is what makes the column-batched decoder causal:
+    column col of every block in a group is coded and decoded from one
+    forward pass over the same, already known bytes. Measured price of
+    the block-start pad vs a full stream context (2 epochs on a real
+    file): +0.04 nats (Rope), +0.13 nats (HNet). A stream context of
+    k = L bytes cannot be column-batched: block j needs block j-1 in
+    full, so the blocks are a chain (WAVE 261 tried three phase
+    schedules; every one broke losslessness on files > G*L bytes)."""
     head = MAGIC + struct.pack(">I", len(data))
     stored = head + ZERO + data
     L = L or model.k
@@ -180,14 +181,17 @@ def compress(model, data: bytes, L: int | None = None, G: int = 256) -> bytes:
     if len(data) < 64 or n_blk == 0:
         return stored
     k = model.k
-    out = bytearray(head) + struct.pack(">BBH", 1, L, min(G, n_blk))
-    for blk_ids in _phases(n_blk, G):
+    blocks = arr[:n_blk * L].reshape(n_blk, L)
+    out = bytearray(head) + struct.pack(">BB", 1, L)
+    for grp in _groups(blocks, group):
+        nb = len(grp)
+        pad = np.zeros((nb, k), dtype=np.int64)
+        buf = np.concatenate([pad, grp], axis=1)           # (nb, k+L)
         enc = ArithEncoder()
         for col in range(L):
-            pos = blk_ids * L + col
-            enc.encode_step(arr[pos], _probs(model, _ctx_from(arr, k, pos)))
+            enc.encode_step(grp[:, col], _probs(model, buf[:, col:col + k]))
         bs = enc.finish()
-        out += struct.pack(">HI", len(blk_ids), len(bs)) + bs
+        out += struct.pack(">HI", nb, len(bs)) + bs
     out += arr[n_blk * L:].astype(np.uint8).tobytes()
     return bytes(out) if len(out) < len(stored) else stored
 
@@ -205,24 +209,25 @@ def decompress(model, payload: bytes) -> bytes:
         return bytes(raw)
     if mode != 1:
         raise ValueError("unsupported archive mode")
-    L, G = struct.unpack(">BH", payload[10:13])
+    L = payload[10]
     k = model.k
     n_blk = total // L
     tail_len = total - n_blk * L
-    pos, done = 13, 0
-    out = np.zeros(n_blk * L, dtype=np.int64)
-    while done < min(G, n_blk):
+    pos, done = 11, 0
+    parts = []
+    while done < n_blk:
         nb, bl = struct.unpack(">HI", payload[pos:pos + 6]); pos += 6
         dec = ArithDecoder(payload[pos:pos + bl]); pos += bl
-        blk_ids = np.arange(done, n_blk, G, dtype=np.int64)
+        buf = np.zeros((nb, k + L), dtype=np.int64)       # k-byte pad, then the block
+        blk = buf[:, k:]                                  # a VIEW: writes are seen by the context
         for col in range(L):
-            p = blk_ids * L + col
-            out[p] = dec.decode_step(_probs(model, _ctx_from(out, k, p)))
-        done += 1
+            blk[:, col] = dec.decode_step(_probs(model, buf[:, col:col + k]))
+        parts.append(blk.astype(np.uint8).tobytes())
+        done += nb
     tail = payload[pos:pos + tail_len]
     if len(tail) != tail_len:
         raise ValueError("corrupt archive")
-    return out.astype(np.uint8).tobytes() + tail
+    return b"".join(parts) + tail
 
 
 # ---- Unified facade -------------------------------------------------------

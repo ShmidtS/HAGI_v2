@@ -83,3 +83,18 @@ def test_corrupt_archive_is_rejected():
         A.decompress(m, bytes(c))
     with pytest.raises(ValueError):
         A.decompress(m, A.MAGIC + (5).to_bytes(4, "big") + b"\x00" + b"abc")
+
+
+def test_archiver_is_lossless_on_a_long_real_file_for_both_archs():
+    """WAVE 261: files longer than G*L bytes (three phase schedules
+    broke here) and both model classes, trained and dense."""
+    import glob
+    import os
+    from hagi.lm import make_lm
+    files = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "checkpoints", "domains", "ns_04*.bin")))
+    data = open(files[0], "rb").read()[:20000] if files else bytes(range(64)) * 300
+    for arch in ("rope", "hnet"):
+        m = make_lm(arch, seed=1)
+        m.train_guarded(data[:8000], epochs=1)
+        c = _roundtrip(m, data)
+        assert c[9] == 1 and len(c) * 8 / len(data) < 8.0

@@ -65,6 +65,10 @@ ADAPTER_MIN_GAIN = 0.005  # paired-validation gain an adapter must clear (WAVE 2
 
 class Unified:
     """ONE evolving model."""
+    # WAVE 261: HAGI_ARCH=hnet -> HNetByteLM (measured: whole-file CE
+    # 1.54 vs Rope 1.81 on 4 real files, 4.7x fewer params). Default
+    # stays rope until the cycle has run on hnet end-to-end.
+    ARCH = os.environ.get("HAGI_ARCH", "rope")
 
     def __init__(self, k: int = 16, dim: int = 128, hidden: int = 256):
         from hagi import lm as lm_mod
@@ -73,7 +77,7 @@ class Unified:
         self.k, self.dim, self.hidden = k, dim, hidden
         # WAVE 229 (URGENT): RopeAttentionByteLM — true attention,
         # 96-byte context (vs k=16 fixed window of CertifiedStepLM).
-        self.model = lm_mod.RopeAttentionByteLM(dim=dim, hidden=hidden)
+        self.model = lm_mod.make_lm(self.ARCH, dim, hidden)
         self.domains: dict[str, dict[str, Any]] = {}
 
     # ---- ingest: ANY data ----
@@ -223,7 +227,7 @@ class Unified:
             bank = getattr(self, "adapter_bank", None)
             if bank is None:
                 bank = self.adapter_bank = AdapterBank(
-                    d=self.model.hidden, r=2)
+                    d=getattr(self.model, "adapter_dim", self.model.hidden), r=2)
             ad = bank.get(source)
             # WAVE 232 (C592 sufficient-transfer gate): warm-start a
             # FRESH adapter (A,B both zero = exact identity) from the
@@ -826,17 +830,18 @@ class Unified:
     def save(self) -> None:
         import torch as _t
 
-        names = ["emb", "W1", "b1", "W2", "b2"]
-        if hasattr(self.model, "q"):
-            names.append("q")
-        st = {n: getattr(self.model, n).detach().cpu() for n in names}
+        # WAVE 261: named by the model itself (Rope keeps its legacy names:
+        # emb,q,W1,b1,W2,b2 + blk{i}.* ; HNet has its own set)
+        st = {n: p_.detach().cpu() for n, p_ in zip(self.model.param_names(), self.model.params())}
         # WAVE 255: function-preserving attention blocks
-        st["blocks"] = [
-            {k: v.detach().cpu() for k, v in blk.items()}
-            for blk in getattr(self.model, "blocks", [])]
+        if getattr(self.model, "ARCH", "rope") == "rope":
+            st["blocks"] = [
+                {k: v.detach().cpu() for k, v in blk.items()}
+                for blk in getattr(self.model, "blocks", [])]
         st.update(
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}
         )
+        st["arch"] = getattr(self.model, "ARCH", "rope")
         st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))
         # WAVE 230: persist attention geometry (theta0/lam) — without
         # them load() silently reverts to defaults and the trained
@@ -898,13 +903,12 @@ class Unified:
         u.lm_mod = lm_mod
         st = _t.load(_unified_pt(), weights_only=False)
         u.k, u.dim, u.hidden = st["k"], st["dim"], st["hidden"]
-        u.model = lm_mod.RopeAttentionByteLM(
-            dim=u.dim, hidden=u.hidden,
-            theta0=st.get("theta0", 1.0), lam=st.get("lam", 0.05))
+        u.model = lm_mod.make_lm(st.get("arch", "rope"), u.dim, u.hidden,
+                                 theta0=st.get("theta0", 1.0), lam=st.get("lam", 0.05))
         if "adapter_bank" in st:
             from hagi.trunk_ops import AdapterBank
             bank = u.adapter_bank = AdapterBank(
-                d=u.model.hidden, r=2)
+                d=getattr(u.model, "adapter_dim", u.model.hidden), r=2)
             for dom, ab in st["adapter_bank"].items():
                 ad = bank.get(dom)
                 ad.r = _t.as_tensor(ab["A"]).shape[0]  # WAVE 246: rank varies
@@ -935,11 +939,11 @@ class Unified:
                 if entries:
                     u.law_registry[dom] = entries
         with _t.no_grad():
-            for n in ("emb", "W1", "b1", "W2", "b2", "q"):
-                if hasattr(u.model, n) and n in st:
-                    getattr(u.model, n).copy_(st[n])
-        # WAVE 255: restore grown blocks (Wo = 0 blocks are identity)
-        for blk in st.get("blocks", []):
+            for n, p_ in zip(u.model.param_names(), u.model.params()):
+                if n in st:
+                    p_.copy_(st[n].to(p_.device))
+        # legacy Rope checkpoints store grown blocks separately
+        for blk in st.get("blocks", []) or []:
             u.model.grow()
             live = u.model.blocks[-1]
             with _t.no_grad():

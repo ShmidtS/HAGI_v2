@@ -531,6 +531,8 @@ if __name__ == "__main__":
 
 
 class RopeAttentionByteLM:
+    ARCH = "rope"
+    adapter_dim = 256   # overwritten in __init__ = hidden
     """Theory-aligned unbounded-context LM (primes C307/C308/A8):
 
     - C308 RoPE isometry: positions are ROTATIONS theta_i = i*theta0,
@@ -554,6 +556,7 @@ class RopeAttentionByteLM:
         self.t = t
         self.dim, self.hidden = dim, hidden
         self.theta0, self.lam = theta0, lam
+        self.adapter_dim = hidden
         g = t.Generator().manual_seed(seed)
         self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)
         self.q = t.nn.Parameter(t.randn(dim, generator=g) * 0.08)
@@ -574,6 +577,12 @@ class RopeAttentionByteLM:
         if self.device == "cuda":
             for prm in self.params():
                 prm.data = prm.data.to(self.device)
+
+    _BASE_NAMES = ("emb", "q", "W1", "b1", "W2", "b2")
+
+    def param_names(self):
+        # grown blocks are persisted separately (st["blocks"], load grows them)
+        return list(self._BASE_NAMES)
 
     def params(self):
         out = [self.emb, self.q, self.W1, self.b1, self.W2, self.b2]
@@ -694,7 +703,8 @@ class RopeAttentionByteLM:
     def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 1e-3,
                       holdout: float = 0.1, batch: int = 64,
                       max_train_ctx: int = 96, log_every: int = 0,
-                      holdout_seed: int | None = None) -> dict:
+                      holdout_seed: int | None = None,
+                      holdout_mode: str = "stratified") -> dict:
         """WAVE 231 (integrated from HAGI_v2_local_repro):
         - GPU-resident uint8 byte buffer + tensor gather (no per-batch
           host->device copies in the hot loop; measured 1.17-1.40x);
@@ -703,6 +713,7 @@ class RopeAttentionByteLM:
         - Adam + rollback (certified-loop contract kept)."""
         import numpy as np
         t = self.t
+        max_train_ctx = min(max_train_ctx, self.k)   # WAVE 261: HNet k=64
         idx_np = np.frombuffer(data, dtype=np.uint8)
         n = len(idx_np) - 2
         dev = self.device
@@ -725,8 +736,30 @@ class RopeAttentionByteLM:
         rng = np.random.default_rng(7 if holdout_seed is None
                                     else int(holdout_seed))
         n_hold = max(16, int(n * holdout))
-        hold = np.arange(max(hold_start := n - n_hold, n - 2048), n)
-        train = np.arange(0, max(16, int(hold[0]) - max_train_ctx))
+        if holdout_mode == "tail":
+            hold = np.arange(max(n - n_hold, n - 2048), n)
+            train = np.arange(0, max(16, int(hold[0]) - max_train_ctx))
+        else:
+            # WAVE 260 (measured, real disk files): a CONTIGUOUS tail
+            # holdout is not an iid sample of the domain. Disk chunks
+            # are heterogeneous; the tail gets memorised while the
+            # body becomes confidently wrong, and rollback-by-selection
+            # REWARDS that (same file: tail holdout 1.9..2.6 nats,
+            # CE over the body 7.3..10.0 — worse than the unigram
+            # table 3.9; plain Adam without selection reaches 3.59).
+            # HoldoutGateTwoWay.lean assumes iid windows: draw the
+            # holdout stratified over the WHOLE domain and embargo
+            # every training window that overlaps a holdout window.
+            hold = np.sort(rng.choice(np.arange(max_train_ctx, n),
+                                      size=min(n_hold, n - max_train_ctx),
+                                      replace=False))
+            blocked = np.zeros(n + 1, dtype=bool)
+            for h in hold:
+                blocked[max(0, h - 2 * max_train_ctx):h + 1] = True
+            train = np.flatnonzero(~blocked[:n])
+            train = train[train >= max_train_ctx]
+            if len(train) < 64:
+                train = np.arange(0, max(16, n - 2 * max_train_ctx))
 
         # WAVE 253 (measured): batch_at cost 30 s of a 71 s chunk —
         # 42%, twice the forward pass — because every call did 4
@@ -769,8 +802,14 @@ class RopeAttentionByteLM:
         # WAVE 239: exclude dead q from the optimizer (gradient
         # is always None since pairwise attention; q stays in
         # checkpoints for backward compat only).
-        live_params = [self.emb, self.W1, self.b1, self.W2,
-                       self.b2]
+        # WAVE 261: generic — every parameter except the dead q (HNetByteLM
+        # shares this loop and has no W1/W2)
+        base = [self.emb, self.W1, self.b1, self.W2, self.b2] if hasattr(self, "W1") else self.params()
+        live_params = list(base)
+        for i, blk in enumerate(getattr(self, "blocks", [])):
+            if i in getattr(self, "frozen_blocks", ()):   # WAVE 257/261
+                continue
+            live_params += [blk["W1"], blk["b1"], blk["Wo"]]
         # WAVE 255: extra blocks train with the trunk (q stays excluded)
         for i, blk in enumerate(getattr(self, "blocks", [])):
             if i in getattr(self, "frozen_blocks", ()):   # WAVE 257
@@ -1668,3 +1707,13 @@ class CertifiedStepLM:
             "utf-8", errors="replace")
 
 
+
+
+# WAVE 261: model factory (HAGI_ARCH). RopeAttentionByteLM is the
+# default; "hnet" -> hagi.hnet_lm.HNetByteLM (torch port of the
+# "HAGI v2 Optimal" byte LM, see its module docstring for the A/B).
+def make_lm(arch: str, dim: int | None = None, hidden: int | None = None, **kw):
+    if arch == "hnet":
+        from hagi.hnet_lm import HNetByteLM
+        return HNetByteLM(dim=dim or 24, hidden=hidden or 48, **kw)
+    return RopeAttentionByteLM(dim=dim or 128, hidden=hidden or 256, **kw)
