@@ -1,166 +1,170 @@
-"""WAVE 240: MEGA law seeding — ONE .chat file, every example
-exactly once (dedup by content hash).
+"""Большой учебный пакет законов: ОДИН файл .chat, каждый пример встречается ровно один раз.
 
-Sections:
-  A. Alphabets (latin/cyrillic/greek/digits/hex/base64/ascii85)
-  B. Encodings (UTF-8 byte anatomy, UTF-16 BOM, base64, hex,
-     ROT13, Caesar shifts, URL-escape)
-  C. Bit hacks (graphics.stanford.edu/~seander/bithacks.html):
-     swap-xor, popcount, round-up-pow2, abs, min/max, bit-reversal,
-     power-of-2 check, mask tricks, gray code, parity
-Each example appears ONCE globally.
+Дедупликация — по хешу sha1 текста строки: строка добавляется, только если её хеш ещё
+не встречался. Разделы:
+  A. Алфавиты (латиница, кириллица, греческий, цифры, hex, base64, ascii85)
+  B. Кодировки (строение UTF-8 по байтам, BOM UTF-16, base64, hex, ROT13, сдвиги Цезаря, URL-escape)
+  C. Битовые приёмы: обмен через XOR, число единичных битов, округление вверх до степени 2,
+     модуль и минимум/максимум без ветвления, обращение порядка битов, проверка степени 2,
+     маски, код Грея, чётность
+Формулы: Цезарь enc(c) = chr((ord(c) − 97 + shift) mod 26 + 97); код Грея g = v XOR (v >> 1);
+обмен полубайтовами sw = ((v AND 0x0F) << 4) OR ((v >> 4) AND 0x0F).
 """
-import sys, os, hashlib
-sys.path.insert(0, os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
+import sys, os, hashlib  # доступ к интерпретатору, пути, хеш sha1
+sys.path.insert(0, os.path.dirname(os.path.dirname(  # добавить корень проекта в путь импорта
+    os.path.abspath(__file__))))  # продолжение пути: каталог файла -> каталог выше -> каталог выше
 
-INBOX = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "checkpoints", "inbox")
+INBOX = os.path.join(os.path.dirname(os.path.dirname(  # каталог ящика: <корень проекта>/checkpoints/inbox
+    os.path.abspath(__file__))), "checkpoints", "inbox")  # продолжение пути
 
-_seen = set()
+_seen = set()  # множество хешей уже добавленных строк
 
 
 def add(lines: list[str], s: str) -> None:
-    """Append line if its content hash was not seen."""
-    h = hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-    if h in _seen:
-        return
-    _seen.add(h)
-    lines.append(s)
+    """Добавить строку s в lines, если хеш её содержания ещё не встречался: h = sha1(s), первые не используются."""
+    h = hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()  # h = шестнадцатеричный текст sha1 от байтов s
+    if h in _seen:  # такая строка уже была
+        return  # не добавлять повтор
+    _seen.add(h)  # запомнить хеш
+    lines.append(s)  # дописать строку в список
 
 
 def section_alphabets(lines):
-    add(lines, "## АЛФАВИТЫ: следующая буква = предыдущая + 1")
-    # latin lower
-    add(lines, "abcdefghijklmnopqrstuvwxyz -> each next = prev+1")
-    # latin upper
-    add(lines, "ABCDEFGHIJKLMNOPQRSTUVWXYZ -> each next = prev+1")
-    # cyrillic
-    add(lines, "абвгдежзийклмнопрстуфхцчшщъыьэюя -> each next = prev+1")
-    # greek
-    add(lines, "αβγδεζηθικλμνξοπρστυφχψω -> each next = prev+1")
-    # digits
-    add(lines, "0123456789 -> each next = prev+1")
-    # hex digits
-    add(lines, "0123456789abcdef -> hex alphabet order")
-    # base64 alphabet
-    add(lines, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-               "0123456789+/ -> base64 alphabet order")
-    # reversed alphabets
-    add(lines, "zyxwvutsrqponmlkjihgfedcba -> each next = prev-1")
-    add(lines, "9876543210 -> each next = prev-1")
+    """Раздел А: строки-алфавиты, где следующая буква = предыдущая + 1 (или −1 для обратных)."""
+    add(lines, "## АЛФАВИТЫ: следующая буква = предыдущая + 1")  # заголовок раздела
+    # латиница строчная
+    add(lines, "abcdefghijklmnopqrstuvwxyz -> each next = prev+1")  # пример: строчные латинские буквы по порядку
+    # латиница прописная
+    add(lines, "ABCDEFGHIJKLMNOPQRSTUVWXYZ -> each next = prev+1")  # пример: прописные латинские буквы по порядку
+    # кириллица
+    add(lines, "абвгдежзийклмнопрстуфхцчшщъыьэюя -> each next = prev+1")  # пример: русские буквы по порядку
+    # греческий алфавит
+    add(lines, "αβγδεζηθικλμνξοπρστυφχψω -> each next = prev+1")  # пример: греческие буквы по порядку
+    # цифры
+    add(lines, "0123456789 -> each next = prev+1")  # пример: десятичные цифры по порядку
+    # hex-цифры
+    add(lines, "0123456789abcdef -> hex alphabet order")  # пример: алфавит шестнадцатеричных цифр
+    # алфавит base64
+    add(lines, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # пример: алфавит base64, часть 1
+               "0123456789+/ -> base64 alphabet order")  # часть 2: цифры, «+», «/» и пояснение
+    # обратные алфавиты
+    add(lines, "zyxwvutsrqponmlkjihgfedcba -> each next = prev-1")  # пример: латиница в обратном порядке
+    add(lines, "9876543210 -> each next = prev-1")  # пример: цифры в обратном порядке
 
 
 def section_encodings(lines):
-    add(lines, "## КОДИРОВКИ: байтовая анатомия UTF-8")
-    # UTF-8 anatomy of ASCII (1 byte)
+    """Раздел Б: кодировки — строение UTF-8, ROT13, сдвиги Цезаря, base64, hex, URL-escape."""
+    add(lines, "## КОДИРОВКИ: байтовая анатомия UTF-8")  # заголовок раздела
+    # строение UTF-8 для ASCII (1 байт)
     add(lines, "UTF-8: ASCII 'A'=0x41 (1 байт), 'Кирилл 'а'=0xD0B0 "
-               "(2 байта), '€'=0xE282AC (3 байта)")
-    # byte-length pattern
-    for ch, enc in (("A", "41"), ("а", "D0B0"), ("Я", "D0AF"),
-                    ("€", "E282AC"), ("中", "E4B8AD")):
-        add(lines, f"UTF-8 байты '{ch}' = {enc}")
-    # ROT13 on alphabet
+               "(2 байта), '€'=0xE282AC (3 байта)")  # пример: длины кодов UTF-8 у символов ASCII, кириллицы и евро
+    # схема длины в байтах
+    for ch, enc in (("A", "41"), ("а", "D0B0"), ("Я", "D0AF"),  # по парам (символ, hex-код UTF-8)
+                    ("€", "E282AC"), ("中", "E4B8AD")):  # оставшиеся пары
+        add(lines, f"UTF-8 байты '{ch}' = {enc}")  # строка: символ и его байты в hex
+    # ROT13 по алфавиту
     add(lines, "ROT13: abcdefghijklmnopqrstuvwxyz -> "
-               "nopqrstuvwxyzabcdefghijklm (сдвиг 13)")
-    # Caesar shifts on a sample word
-    for shift in (1, 3, 5):
-        w = "hello"
-        enc = "".join(chr((ord(c) - 97 + shift) % 26 + 97) for c in w)
+               "nopqrstuvwxyzabcdefghijklm (сдвиг 13)")  # пример: сдвиг латиницы на 13
+    # сдвиги Цезаря на слове-образце
+    for shift in (1, 3, 5):  # сдвиги 1, 3, 5
+        w = "hello"  # слово-образец
+        enc = "".join(chr((ord(c) - 97 + shift) % 26 + 97) for c in w)  # enc = по буквам chr((ord(c) − 97 + shift) mod 26 + 97)
         add(lines, f"Цезарь +{shift}: hello -> {enc} (каждая буква "
-                   f"сдвигается на {shift})")
-    # base64 of known strings (each unique)
-    import base64
-    for s in (b"Man", b"Hello", b"a", b"ab", b"abc", b"test"):
+                   f"сдвигается на {shift})")  # строка: слово, результат и величина сдвига
+    # base64 известных строк (каждая уникальна)
+    import base64  # кодирование base64
+    for s in (b"Man", b"Hello", b"a", b"ab", b"abc", b"test"):  # по шести байтовым строкам
         add(lines, f"base64({s.decode()}) = "
-                   f"{base64.b64encode(s).decode()}")
-    # hex encoding
-    for s in (b"abc", b"test", b"ABC"):
-        add(lines, f"hex({s.decode()}) = {s.hex()}")
-    # URL escape
-    for s in ("a b", "a&b", "a=b"):
-        esc = (s.replace(" ", "%20").replace("&", "%26")
-               .replace("=", "%3D"))
-        add(lines, f"URL-escape '{s}' -> {esc}")
+                   f"{base64.b64encode(s).decode()}")  # строка: строка и её base64
+    # hex-кодирование
+    for s in (b"abc", b"test", b"ABC"):  # по трём байтовым строкам
+        add(lines, f"hex({s.decode()}) = {s.hex()}")  # строка: строка и её hex-вид
+    # экранирование адреса URL
+    for s in ("a b", "a&b", "a=b"):  # по трём строкам с пробелом, «&» и «=»
+        esc = (s.replace(" ", "%20").replace("&", "%26")  # заменить пробел на %20 и «&» на %26
+               .replace("=", "%3D"))  # затем «=» на %3D
+        add(lines, f"URL-escape '{s}' -> {esc}")  # строка: исходная и экранированная
 
 
 def section_bithacks(lines):
+    """Раздел В: битовые приёмы — примеры с вычисленными значениями."""
     add(lines, "## БИТОВЫЕ ТРЮКИ (graphics.stanford.edu/~seander/"
-               "bithacks.html)")
-    # XOR swap
+               "bithacks.html)")  # заголовок раздела
+    # обмен через XOR
     add(lines, "XOR-swap: a^=b; b^=a; a^=b — обмен без временной "
-               "переменной. Пример: a=5,b=9 -> a=9,b=5")
-    # popcount (Brian Kernighan)
-    for v in (0b1011, 0b1111, 0b100000, 0b11111111, 7, 255, 128):
-        add(lines, f"popcount({v}) = {bin(v).count('1')} "
-                   f"(число единичных бит в {bin(v)})")
-    # round up to power of 2
-    for v in (5, 17, 100, 255, 256, 1000):
-        r = 1
-        while r < v:
-            r <<= 1
+               "переменной. Пример: a=5,b=9 -> a=9,b=5")  # пример обмена значениями
+    # число единичных битов (способ Кернигана)
+    for v in (0b1011, 0b1111, 0b100000, 0b11111111, 7, 255, 128):  # по семи числам
+        add(lines, f"popcount({v}) = {bin(v).count('1')} "  # строка: число и количество единиц в его двоичной записи
+                   f"(число единичных бит в {bin(v)})")  # пояснение с двоичной записью
+    # округление вверх до степени 2
+    for v in (5, 17, 100, 255, 256, 1000):  # по шести числам
+        r = 1  # начальное значение r = 1
+        while r < v:  # пока r < v
+            r <<= 1  # удвоить: r = 2r
         add(lines, f"round_up_pow2({v}) = {r} (ближайшая степень "
-                   f"двойки сверху)")
-    # power of 2 check
-    for v, is_p in ((1, True), (2, True), (3, False), (64, True),
-                    (100, False), (128, True)):
-        add(lines, f"is_power_of_2({v}) = {is_p and v != 0} "
-                   f"(v & (v-1)) == 0 и v > 0")
-    # abs without branch
-    for v in (-5, 7, -128, 42):
+                   f"двойки сверху)")  # строка: число и наименьшая степень двойки, которая не меньше его
+    # проверка степени 2
+    for v, is_p in ((1, True), (2, True), (3, False), (64, True),  # по парам (число, признак «степень двойки»)
+                    (100, False), (128, True)):  # оставшиеся пары
+        add(lines, f"is_power_of_2({v}) = {is_p and v != 0} "  # строка: число и is_p AND (v ≠ 0)
+                   f"(v & (v-1)) == 0 и v > 0")  # формула проверки
+    # модуль без ветвления
+    for v in (-5, 7, -128, 42):  # по четырём числам
         add(lines, f"abs({v}) = {abs(v)} (маска m = x>>31; "
-                   f"(x+m)^m)")
-    # min/max without branch
+                   f"(x+m)^m)")  # строка: число и его модуль, формула маской
+    # минимум и максимум без ветвления
     add(lines, "min(x,y) = y ^ ((x ^ y) & -(x < y)); "
-               "max(x,y) = x ^ ((x ^ y) & -(x < y))")
-    add(lines, "пример: min(3,7)=3, max(3,7)=7")
-    # bit reversal (8-bit)
-    for v in (0b1, 0b110, 0b1010, 0b11110000):
-        rev = int(format(v, '08b')[::-1], 2)
+               "max(x,y) = x ^ ((x ^ y) & -(x < y))")  # формулы минимума и максимума
+    add(lines, "пример: min(3,7)=3, max(3,7)=7")  # числовой пример
+    # обращение порядка битов (8 бит)
+    for v in (0b1, 0b110, 0b1010, 0b11110000):  # по четырём числам
+        rev = int(format(v, '08b')[::-1], 2)  # rev = число из 8-битной записи v, прочитанной справа налево
         add(lines, f"bit_reverse_8({v:3}) = {rev:3} "
-                   f"({format(v, '08b')} -> {format(rev, '08b')})")
-    # parity
-    for v in (0b1011, 0b1111, 0b1100, 7):
-        p = bin(v).count('1') % 2
+                   f"({format(v, '08b')} -> {format(rev, '08b')})")  # строка: число, результат и двоичные записи
+    # чётность
+    for v in (0b1011, 0b1111, 0b1100, 7):  # по четырём числам
+        p = bin(v).count('1') % 2  # p = (число единичных битов) mod 2
         add(lines, f"parity({bin(v)}) = {p} (XOR всех бит: "
-                   f"{bin(v).count('1')} единиц -> {'нечёт' if p else 'чёт'})")
-    # gray code
-    for v in (0, 1, 2, 3, 4, 5, 7, 10):
-        g = v ^ (v >> 1)
-        add(lines, f"gray_code({v}) = {g} (v ^ (v>>1))")
-    # masks
+                   f"{bin(v).count('1')} единиц -> {'нечёт' if p else 'чёт'})")  # строка: чётность, число единиц и вердикт
+    # код Грея
+    for v in (0, 1, 2, 3, 4, 5, 7, 10):  # по восьми числам
+        g = v ^ (v >> 1)  # код Грея g = v XOR (v >> 1)
+        add(lines, f"gray_code({v}) = {g} (v ^ (v>>1))")  # строка: число и его код Грея
+    # маски
     add(lines, "младший бит: x & 1; сброс младшего единичного: "
-               "x & (x-1); изоляция младшего единичного: x & -x")
-    add(lines, "пример: x=0b1010 -> x&(x-1)=0b1000, x&-x=0b0010")
-    # swap nibbles
-    for v in (0xAB, 0x12, 0xF0):
-        sw = ((v & 0x0F) << 4) | ((v >> 4) & 0x0F)
-        add(lines, f"swap_nibbles({v:#04x}) = {sw:#04x}")
-    # sign extension tricks
+               "x & (x-1); изоляция младшего единичного: x & -x")  # три формулы масок
+    add(lines, "пример: x=0b1010 -> x&(x-1)=0b1000, x&-x=0b0010")  # числовой пример масок
+    # обмен полубайтов
+    for v in (0xAB, 0x12, 0xF0):  # по трём байтам
+        sw = ((v & 0x0F) << 4) | ((v >> 4) & 0x0F)  # обмен полубайтов: sw = ((v AND 0x0F) << 4) OR ((v >> 4) AND 0x0F)
+        add(lines, f"swap_nibbles({v:#04x}) = {sw:#04x}")  # строка: байт и байт с обменёнными полубайтами
+    # приёмы распространения знака
     add(lines, "знак числа: x >> 31 даёт -1 для отрицательных, "
-               "0 для неотрицательных (32-бит int)")
-    # conditional set without branch
+               "0 для неотрицательных (32-бит int)")  # пример распространения знака
+    # условная установка без ветвления
     add(lines, "условная установка без ветвления: r = y ^ ((x ^ y) "
-               "& -(cond)) — выбирает x если cond, иначе y")
+               "& -(cond)) — выбирает x если cond, иначе y")  # формула выбора по условию
 
 
 def main() -> None:
-    os.makedirs(INBOX, exist_ok=True)
-    lines: list[str] = []
-    section_alphabets(lines)
-    section_encodings(lines)
-    section_bithacks(lines)
+    """Собрать все три раздела в один файл mega_laws.chat в каталоге ящика и напечатать итог."""
+    os.makedirs(INBOX, exist_ok=True)  # создать каталог ящика, если его нет
+    lines: list[str] = []  # список строк пакета
+    section_alphabets(lines)  # добавить раздел А
+    section_encodings(lines)  # добавить раздел Б
+    section_bithacks(lines)  # добавить раздел В
     # заголовок
-    header = ("УЧЕБНЫЙ ПАКЕТ ЗАКОНОВ (wave240): каждый пример ниже "
-              "встречается ровно один раз. Выучи все закономерности.\n\n")
-    content = header + "\n".join(lines)
-    path = os.path.join(INBOX, "mega_laws.chat")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    print(f"queued: {path}")
-    print(f"строк: {len(lines)} | всего символов: {len(content)} | "
-          f"уникальных (по хэшу): {len(_seen)}")
+    header = ("УЧЕБНЫЙ ПАКЕТ ЗАКОНОВ (wave240): каждый пример ниже "  # заголовок пакета, часть 1
+              "встречается ровно один раз. Выучи все закономерности.\n\n")  # часть 2: конец предложения и две пустые строки
+    content = header + "\n".join(lines)  # содержимое: заголовок + строки пакета через перевод строки
+    path = os.path.join(INBOX, "mega_laws.chat")  # путь файла пакета в ящике
+    with open(path, "w", encoding="utf-8") as fh:  # открыть файл для записи в UTF-8
+        fh.write(content)  # записать содержимое
+    print(f"queued: {path}")  # печать пути файла
+    print(f"строк: {len(lines)} | всего символов: {len(content)} | "  # печать числа строк и длины содержимого
+          f"уникальных (по хэшу): {len(_seen)}")  # печать числа уникальных строк = размер множества хешей
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # запуск только как сценарий
+    main()  # собрать и записать пакет
