@@ -1,84 +1,87 @@
-"""WAVE 238: seed well-known laws VIA THE CHAT INBOX — write .chat
-files into checkpoints/inbox/, the live training process ingests
-them between chunks (single-owner weight writes, no races).
+"""Загрузка известных законов в модель через ящик входящих сообщений: файлы .chat в каталоге checkpoints/inbox.
 
-Each .chat contains: human-readable law description + a demo byte
-stream (hex) instantiating the law. The training process stores
-the description in semantic memory and learns the stream as a
-domain; the symbolic synthesizer can then register laws in
-law_registry.
+Работающий процесс обучения читает эти файлы между кусками — веса пишет только он, без гонок.
+Каждый .chat содержит описание закона словами и демонстрационный поток байтов (hex),
+в котором закон выполняется. Процесс сохраняет описание в памяти и учит поток как домен.
+Шесть законов: y = x + 3, y = 2x, y = x XOR 0xFF (mod 256), c = a + b (mod 256),
+алфавит, y = x XOR 1.
 """
-import os
-import sys
+import os  # пути и каталоги
+import sys  # доступ к интерпретатору
 
-INBOX = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "checkpoints", "inbox")
+INBOX = os.path.join(os.path.dirname(os.path.dirname(  # каталог ящика: <корень проекта>/checkpoints/inbox
+    os.path.abspath(__file__))), "checkpoints", "inbox")  # продолжение пути
 
 
 def laws() -> list[tuple[str, str, bytes]]:
-    out = []
-    # 1. y = x + 3 (mod 256)
-    s = bytearray(); x = 10
-    for _ in range(1200):
-        s.append(x); s.append((x + 3) % 256); x = (x + 7) % 256
-    out.append(("law_plus3",
-                "Закон: следующий байт = предыдущий + 3 (mod 256).",
-                bytes(s)))
-    # 2. y = 2x (mod 256)
-    s = bytearray(); x = 5
-    for _ in range(1200):
-        s.append(x); s.append((2 * x) % 256); x = (x + 11) % 256
-    out.append(("law_double",
-                "Закон: следующий байт = 2 * предыдущий (mod 256).",
-                bytes(s)))
-    # 3. y = x XOR 0xFF
-    s = bytearray(); x = 0
-    for _ in range(1200):
-        s.append(x); s.append(x ^ 0xFF); x = (x + 13) % 256
-    out.append(("law_xor_ff",
+    """Собрать демонстрационные потоки законов; возвращает список (имя, описание, байты).
+
+        Каждый поток — 1200 или 600 повторов тройки (x, f(x), x_след)."""
+    out = []  # накопитель результатов
+    # 1. закон y = x + 3 (mod 256)
+    s = bytearray(); x = 10  # пустой поток; первый аргумент x = 10
+    for _ in range(1200):  # 1200 пар байтов
+        s.append(x); s.append((x + 3) % 256); x = (x + 7) % 256  # добавить x и y = (x + 3) mod 256; следующий x = (x + 7) mod 256
+    out.append(("law_plus3",  # имя закона
+                "Закон: следующий байт = предыдущий + 3 (mod 256).",  # описание
+                bytes(s)))  # поток байтов
+    # 2. закон y = 2x (mod 256)
+    s = bytearray(); x = 5  # пустой поток; первый аргумент x = 5
+    for _ in range(1200):  # 1200 пар байтов
+        s.append(x); s.append((2 * x) % 256); x = (x + 11) % 256  # добавить x и y = 2x mod 256; следующий x = (x + 11) mod 256
+    out.append(("law_double",  # имя закона
+                "Закон: следующий байт = 2 * предыдущий (mod 256).",  # описание
+                bytes(s)))  # поток байтов
+    # 3. закон y = x XOR 0xFF
+    s = bytearray(); x = 0  # пустой поток; первый аргумент x = 0
+    for _ in range(1200):  # 1200 пар байтов
+        s.append(x); s.append(x ^ 0xFF); x = (x + 13) % 256  # добавить x и y = x XOR 0xFF (побитовая инверсия); следующий x = (x + 13) mod 256
+    out.append(("law_xor_ff",  # имя закона
                 "Закон: следующий байт = инверсия предыдущего "
-                "(XOR 0xFF).",
-                bytes(s)))
-    # 4. y = x1 + x2 (mod 256), Фибоначчи
-    s = bytearray(); a, b = 3, 7
-    for _ in range(1200):
-        c = (a + b) % 256
-        s += bytes([a, b, c]); a, b = b, c
-    out.append(("law_fib_sum",
+                "(XOR 0xFF).",  # описание
+                bytes(s)))  # поток байтов
+    # 4. закон y = x1 + x2 (mod 256), Фибоначчи
+    s = bytearray(); a, b = 3, 7  # пустой поток; начальная пара a = 3, b = 7
+    for _ in range(1200):  # 1200 троек байтов
+        c = (a + b) % 256  # сумма c = (a + b) mod 256
+        s += bytes([a, b, c]); a, b = b, c  # добавить (a, b, c); сдвиг: a' = b, b' = c
+    out.append(("law_fib_sum",  # имя закона
                 "Закон: третий байт = сумма двух предыдущих "
-                "(mod 256), рекуррентность Фибоначчи.",
-                bytes(s)))
-    # 5. алфавит: b -> следующий по алфавиту
-    s = bytearray()
-    for _ in range(600):
-        s += b"abcdefghijklmnopqrstuvwxyz. "
-    out.append(("law_alphabet",
+                "(mod 256), рекуррентность Фибоначчи.",  # описание
+                bytes(s)))  # поток байтов
+    # 5. закон алфавита: b -> следующий по алфавиту
+    s = bytearray()  # пустой поток
+    for _ in range(600):  # 600 повторов алфавита
+        s += b"abcdefghijklmnopqrstuvwxyz. "  # дописать 26 букв латиницы, точку и пробел
+    out.append(("law_alphabet",  # имя закона
                 "Закон текста: после буквы алфавита идёт следующая "
-                "буква; после 'z' — '. ' и цикл повторяется.",
-                bytes(s)))
-    # 6. чётность: y = x XOR 1
-    s = bytearray(); x = 100
-    for _ in range(1200):
-        s.append(x); s.append(x ^ 1); x = (x + 5) % 256
-    out.append(("law_parity",
+                "буква; после 'z' — '. ' и цикл повторяется.",  # описание
+                bytes(s)))  # поток байтов
+    # 6. закон чётности: y = x XOR 1
+    s = bytearray(); x = 100  # пустой поток; первый аргумент x = 100
+    for _ in range(1200):  # 1200 пар байтов
+        s.append(x); s.append(x ^ 1); x = (x + 5) % 256  # добавить x и y = x XOR 1; следующий x = (x + 5) mod 256
+    out.append(("law_parity",  # имя закона
                 "Закон: следующий байт отличается младшим битом "
-                "(XOR 1) — переключение чётности.",
-                bytes(s)))
-    return out
+                "(XOR 1) — переключение чётности.",  # описание
+                bytes(s)))  # поток байтов
+    return out  # список (имя, описание, поток) всех законов
 
 
 def main() -> None:
-    os.makedirs(INBOX, exist_ok=True)
-    for name, desc, stream in laws():
-        hexs = stream.hex()
-        # bounded message: описание + первые ~2000 байт потока hex
+    """Записать по одному файлу <имя>.chat в ящик для каждого закона."""
+    os.makedirs(INBOX, exist_ok=True)  # создать каталог ящика, если его нет
+    for name, desc, stream in laws():  # по всем законам
+        hexs = stream.hex()  # шестнадцатеричный текст потока (2 символа на байт)
+        # сообщение ограничено: описание + первые ~2000 байт потока в hex
+        # сообщение = описание + пустая строка + заголовок + первые 4000 hex-символов (= 2000 байтов) потока
         msg = desc + "\n\n[demo stream hex, first 2000 bytes]\n" \
-            + hexs[:4000]
-        path = os.path.join(INBOX, name + ".chat")
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(msg)
-        print("queued:", path, flush=True)
+            + hexs[:4000]  # к сообщению добавляются первые 4000 hex-символов = 2000 байтов
+        path = os.path.join(INBOX, name + ".chat")  # путь файла сообщения
+        with open(path, "w", encoding="utf-8") as fh:  # открыть файл для записи в UTF-8
+            fh.write(msg)  # записать сообщение
+        print("queued:", path, flush=True)  # напечатать путь и сразу сбросить вывод
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # запуск только как сценарий
+    main()  # разложить законы по файлам ящика
