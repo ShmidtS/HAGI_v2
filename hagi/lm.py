@@ -1123,7 +1123,9 @@ class RopeAttentionByteLM:
             ctx = list(prompt.encode("utf-8"))
             out = bytearray()
             for _ in range(n_bytes):
-                x = t.as_tensor([ctx[::-1]], dtype=t.long,
+                # WAVE 258c: oldest-first like training (was ctx[::-1]:
+                # the query slot then held the OLDEST byte of the prompt)
+                x = t.as_tensor([ctx[-self.k:]], dtype=t.long,
                                 device=self.device)
                 probs = t.softmax(self.full_logits(x)[0, -1] /
                                   max(temp, 1e-3), dim=-1)

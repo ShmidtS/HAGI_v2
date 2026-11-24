@@ -31,8 +31,30 @@ ROOT = Path(__file__).resolve().parent.parent
 # WAVE 178/185c: CKPT_DIR lives in hagi.util (SSOT) — every module
 # routes checkpoint writes through it; HAGI_CKPT_DIR redirects all.
 from hagi.util import CKPT_DIR
-UNET_CKPT = CKPT_DIR / "unified.pt"
-LEDGER = CKPT_DIR / "unified_ledger.json"
+# WAVE 259 (DATA-LOSS FIX): these were module constants computed at
+# import time. Tests monkeypatch CKPT_DIR (and experiments override
+# it) — but save()/load()/exists() kept writing to the PRODUCTION
+# files. That erased the production checkpoint (770 domains, 283
+# adapters) on 2026-11-24 via test_live_adapter's u.save(). Now every
+# path is derived from the CURRENT CKPT_DIR, and save() refuses to
+# touch the real checkpoint from under pytest.
+_PROD_CKPT = CKPT_DIR
+
+
+def _unified_pt():
+    return CKPT_DIR / "unified.pt"
+
+
+def _ledger_js():
+    return CKPT_DIR / "unified_ledger.json"
+
+
+def _guard_prod_write():
+    import os as _o
+    if _o.environ.get("PYTEST_CURRENT_TEST") and CKPT_DIR == _PROD_CKPT:
+        raise RuntimeError(
+            "refusing to save into the production checkpoint from a "
+            "test: set HAGI_CKPT_DIR / monkeypatch U.CKPT_DIR to a sandbox")
 
 
 def _sha(b: bytes) -> str:
@@ -670,6 +692,28 @@ class Unified:
         (CKPT_DIR / "domains" / f"{path.stem}.bin").write_bytes(data)
         return self.ingest(path.stem, data, epochs=epochs, repeat=repeat)
 
+    # ---- book recovery ----
+
+    def reindex_domains(self) -> int:
+        """Rebuild the domain book from CKPT_DIR/domains/*.bin (WAVE
+        259: the ledger was erased together with the checkpoint).
+        sha/bytes are recomputed from the bytes; entries that already
+        carry a measured `ce` for the CURRENT model are kept, every
+        other one gets ce=None (not measured — never a guessed number).
+        Returns the number of added domains."""
+        ddir = CKPT_DIR / "domains"
+        added = 0
+        for pth in sorted(ddir.glob("*.bin")):
+            name = pth.stem
+            if name in self.domains and self.domains[name].get("ce") is not None:
+                continue
+            b = pth.read_bytes()
+            if len(b) < 4096:
+                continue
+            self.domains[name] = {"sha": _sha(b), "bytes": len(b), "ce": None}
+            added += 1
+        return added
+
     # ---- text (lessons) ----
 
     def learn_text(
@@ -780,22 +824,23 @@ class Unified:
                        "evidence": e.get("evidence", [])}
                       for e in v]
                 for dom, v in reg.items()}
-        UNET_CKPT.parent.mkdir(parents=True, exist_ok=True)
+        _guard_prod_write()
+        _unified_pt().parent.mkdir(parents=True, exist_ok=True)
         # WAVE 230: atomic checkpoint write — a crash mid-save must
         # not leave a truncated .pt / half-written ledger.
         import os as _os
-        tmp = UNET_CKPT.with_suffix(".pt.tmp")
+        tmp = _unified_pt().with_suffix(".pt.tmp")
         _t.save(st, tmp)
-        _os.replace(tmp, UNET_CKPT)
-        tmp_l = LEDGER.with_suffix(".json.tmp")
+        _os.replace(tmp, _unified_pt())
+        tmp_l = _ledger_js().with_suffix(".json.tmp")
         tmp_l.write_text(
             json.dumps(self.domains, ensure_ascii=False, indent=1),
             encoding="utf-8")
-        _os.replace(tmp_l, LEDGER)
+        _os.replace(tmp_l, _ledger_js())
 
     @staticmethod
     def exists() -> bool:
-        return UNET_CKPT.exists()
+        return _unified_pt().exists()
 
     @classmethod
     def load(cls) -> "Unified":
@@ -804,7 +849,7 @@ class Unified:
 
         u = cls.__new__(cls)
         u.lm_mod = lm_mod
-        st = _t.load(UNET_CKPT, weights_only=False)
+        st = _t.load(_unified_pt(), weights_only=False)
         u.k, u.dim, u.hidden = st["k"], st["dim"], st["hidden"]
         u.model = lm_mod.RopeAttentionByteLM(
             dim=u.dim, hidden=u.hidden,
@@ -855,7 +900,7 @@ class Unified:
                     live[k].copy_(blk[k].to(live[k].device))
         u.model.frozen_blocks = set(st.get("frozen_blocks", []))
         u.domains = (
-            json.loads(LEDGER.read_text(encoding="utf-8")) if LEDGER.exists() else {}
+            json.loads(_ledger_js().read_text(encoding="utf-8")) if _ledger_js().exists() else {}
         )
         return u
 
