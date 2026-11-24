@@ -299,8 +299,8 @@ def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict
     (адаптер не больше полного блока при r <= d/2)."""
     out = {"adapter": 2 * r * d}  # словарь: число параметров адаптера 2·r·d
     if full_block_d is not None:  # задан размер полного блока
-        out["full_block"] = full_block_d * full_block_d  # full_block = full_block_d²
-        out["ratio"] = out["adapter"] / out["full_block"]  # ratio = adapter/full_block
+        out["full_block"] = full_block_d * full_block_d  # число параметров: full_block = full_block_d²
+        out["ratio"] = out["adapter"] / out["full_block"]  # доля параметров: ratio = adapter/full_block
     return out  # итог
 
 
