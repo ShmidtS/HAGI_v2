@@ -1,2020 +1,2278 @@
-"""HAGI legacy kernel V5-V8 (extracted from core.py 2026-11-19, Phase 0).
+"""Замороженное наследие ядра вычислителя выражений (слои V5, V7, V8 и V9).
 
-Verbatim body of the old PART I-III. Imported by hagi.core via star
-import; shared names are re-defined in core.py V9 section (later wins),
-preserving the historical override semantics. Do not edit — frozen.
-"""
+    Код перенесён сюда без изменений из старого монолитного ядра и больше не редактируется. Модуль импортируется звёздочкой в hagi.core; совпадающие имена там определяются заново позже, и победает позднейшее определение — так сохраняется исторический порядок переопределений.
 
-from __future__ import annotations
-import argparse, ast, copy, heapq, itertools, json, math, os, random
-import statistics, sys, time
-from collections import Counter
-from dataclasses import dataclass, field
-from fractions import Fraction
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Sequence
-import numpy as np
+    Ключевые идеи:
+        * выражение — дерево операций над целыми входами; стоимость = 1 + сумма стоимостей аргументов;
+        * поиск программы для задачи — перебор кандидатов от коротких описаний к длинным (принцип минимальной длины описания: число бит = Σ gamma_bits(n) по узлам);
+        * эксперт — программа, найденная для задачи и допускающая подстановку в другие программы.
 
-VERSION = "5.0.0"
-V5_VERSION = VERSION
+    Содержание по порядку:
+        * безопасный язык выражений: таблица операций OPS, класс Expr, класс Program, описания задач TaskSpec;
+        * перечисление кандидатов, нейронный слой NeuralFiber, хранилище экспертов, класс SafeExpression и растущий процессор V5;
+        * векторный предварительный фильтр (numpy и torch), синтез кандидатов по длине описания, процессор V7;
+        * ограниченный оптимизатор слоя, решение задачи раскраски, точная подгонка многочленов и добыча теорем;
+        * регулятор ресурсов и бесконечный цикл саморазвития, эксперимент и точка входа V7;
+        * выражения V8, коды длин, векторный фильтр и синтезатор V8, процессор V8 и его проверка;
+        * заново определённые базовые операции, наборы операций и констант, функции кодирования длин.
 
-# ----------------------------- Safe expression DSL -----------------------------
+    Экспортирует все определённые здесь имена, включая Processors разных версий, Expr, Program, Expert, TaskSpec, OPS, gamma_bits и zigzag."""
 
+from __future__ import annotations  # отложенное вычисление аннотаций типов (модуль __future__)
+import argparse, ast, copy, heapq, itertools, json, math, os, random  # импорт стандартных библиотек: разбор аргументов, синтаксические деревья, копирование, куча, декартово произведение, JSON, математика, окружение, случайность
+import statistics, sys, time  # статистика, системный модуль, время
+from collections import Counter  # Counter — счётчик числа появлений элементов
+from dataclasses import dataclass, field  # dataclass и field — классы данных
+from fractions import Fraction  # Fraction — точные рациональные дроби
+from functools import lru_cache  # lru_cache — запоминание результатов вызовов функций
+from pathlib import Path  # Path — путь к файлу
+from typing import Any, Callable, Iterable, Optional, Sequence  # типы для аннотаций
+import numpy as np  # numpy — численные массивы
+
+VERSION = "5.0.0"  # VERSION — версия базового слоя
+V5_VERSION = VERSION  # V5_VERSION — то же значение версии слоя V5
+
+
+# ------------------- Безопасный язык выражений -------------------
 
 def _truth(v: Any) -> bool:
-    return bool(int(v))
+    """Истинность значения v как логическое значение.
+
+        »    v: число или значение, приводимое к целому. Возврат: bool(int(v)) — истина, если int(v) ≠ 0."""
+    return bool(int(v))  # истина, когда int(v) ≠ 0
 
 
 def _bit_not8(x: int) -> int:
-    return (~int(x)) & 0xFF
+    """Побитовое «не» в одном байте.
+
+        »    x: целое. Возврат: (~x) & 0xFF — инверсия младших 8 бит, старшие обнулены."""
+    return (~int(x)) & 0xFF  # не(x) по модулю 256: инверсия младших 8 бит
 
 
 def _bit_nand8(x: int, y: int) -> int:
-    return (~(int(x) & int(y))) & 0xFF
+    """Побитовый «не-и» в одном байте.
+
+        »    x, y: целые. Возврат: ~(x & y) & 0xFF — инверсия побитового «и», старшие 8 бит обнулены."""
+    return (~(int(x) & int(y))) & 0xFF  # не-и по модулю 256: (~(x & y)) & 0xFF
 
 
 def _bit_nor8(x: int, y: int) -> int:
-    return (~(int(x) | int(y))) & 0xFF
+    """Побитовый «не-или» в одном байте.
+
+        »    x, y: целые. Возврат: ~(x | y) & 0xFF."""
+    return (~(int(x) | int(y))) & 0xFF  # не-или по модулю 256: (~(x | y)) & 0xFF
 
 
 def _bit_xnor8(x: int, y: int) -> int:
-    return (~(int(x) ^ int(y))) & 0xFF
+    """Побитовая эквивалентность (не-исключающее или) в одном байте.
+
+        »    x, y: целые. Возврат: ~(x ^ y) & 0xFF."""
+    return (~(int(x) ^ int(y))) & 0xFF  # исключающее-или с инверсией: (~(x ^ y)) & 0xFF
 
 
 def _sign(x: int) -> int:
-    return (int(x) > 0) - (int(x) < 0)
+    """Знак числа.
+
+        »    x: целое. Возврат: −1, 0 или +1; формула: (x > 0) − (x < 0)."""
+    return (int(x) > 0) - (int(x) < 0)  # знак: (x > 0) − (x < 0), то есть −1, 0 или 1
 
 
 def _pow_int(x: int, y: int) -> int:
-    y = int(y)
-    if y < 0 or y > 8:
-        raise ValueError("exponent outside certified range")
-    return int(x) ** y
+    """Целая степень с проверенным диапазоном показателя.
+
+                x: основание, y: показатель. Показатель обязан лежать в 0..8, иначе ValueError.
+        »    Возврат: x ** y."""
+    y = int(y)  # показатель y приводится к целому
+    if y < 0 or y > 8:  # истина, если y < 0 или y > 8
+        raise ValueError("exponent outside certified range")  # ошибка: показатель вне проверенного диапазона
+    return int(x) ** y  # степень: x ** y
 
 
-OPS: dict[str, Callable[..., Any]] = {
-    "add": lambda x, y: int(x) + int(y),
-    "sub": lambda x, y: int(x) - int(y),
-    "mul": lambda x, y: int(x) * int(y),
-    "floordiv": lambda x, y: int(x) // int(y),
-    "mod": lambda x, y: int(x) % int(y),
-    "gcd": lambda x, y: math.gcd(int(x), int(y)),
-    "lcm": lambda x, y: math.lcm(int(x), int(y)),
-    "min": lambda x, y: min(int(x), int(y)),
-    "max": lambda x, y: max(int(x), int(y)),
-    "eq": lambda x, y: int(x == y),
-    "ne": lambda x, y: int(x != y),
-    "lt": lambda x, y: int(x < y),
-    "le": lambda x, y: int(x <= y),
-    "gt": lambda x, y: int(x > y),
-    "ge": lambda x, y: int(x >= y),
-    "bit_and": lambda x, y: int(x) & int(y),
-    "bit_or": lambda x, y: int(x) | int(y),
-    "bit_xor": lambda x, y: int(x) ^ int(y),
-    "bit_nand8": _bit_nand8,
-    "bit_nor8": _bit_nor8,
-    "bit_xnor8": _bit_xnor8,
-    "pow_int": _pow_int,
-    "neg": lambda x: -int(x),
-    "abs": lambda x: abs(int(x)),
-    "sign": _sign,
-    "bit_not8": _bit_not8,
-    "square": lambda x: int(x) * int(x),
-    "cube": lambda x: int(x) * int(x) * int(x),
+OPS: dict[str, Callable[..., Any]] = {  # таблица операций по имени: имя -> функция от целых аргументов; значения dict-литерала идут ниже
+    "add": lambda x, y: int(x) + int(y),  # add: x + y
+    "sub": lambda x, y: int(x) - int(y),  # sub: x − y
+    "mul": lambda x, y: int(x) * int(y),  # mul: x·y
+    "floordiv": lambda x, y: int(x) // int(y),  # floordiv: x // y (деление с округлением вниз)
+    "mod": lambda x, y: int(x) % int(y),  # mod: x mod y (остаток)
+    "gcd": lambda x, y: math.gcd(int(x), int(y)),  # gcd: наибольший общий делитель
+    "lcm": lambda x, y: math.lcm(int(x), int(y)),  # lcm: наименьшее общее кратное
+    "min": lambda x, y: min(int(x), int(y)),  # min: меньшее из x, y
+    "max": lambda x, y: max(int(x), int(y)),  # max: большее из x, y
+    "eq": lambda x, y: int(x == y),  # eq: 1, если x = y, иначе 0
+    "ne": lambda x, y: int(x != y),  # ne: 1, если x ≠ y, иначе 0
+    "lt": lambda x, y: int(x < y),  # lt: 1, если x < y, иначе 0
+    "le": lambda x, y: int(x <= y),  # le: 1, если x ≤ y, иначе 0
+    "gt": lambda x, y: int(x > y),  # gt: 1, если x > y, иначе 0
+    "ge": lambda x, y: int(x >= y),  # ge: 1, если x ≥ y, иначе 0
+    "bit_and": lambda x, y: int(x) & int(y),  # bit_and: x & y
+    "bit_or": lambda x, y: int(x) | int(y),  # bit_or: x | y
+    "bit_xor": lambda x, y: int(x) ^ int(y),  # bit_xor: x ^ y
+    "bit_nand8": _bit_nand8,  # bit_nand8: ~(x & y) & 0xFF
+    "bit_nor8": _bit_nor8,  # bit_nor8: ~(x | y) & 0xFF
+    "bit_xnor8": _bit_xnor8,  # bit_xnor8: ~(x ^ y) & 0xFF
+    "pow_int": _pow_int,  # pow_int: x ** y, показатель 0..8
+    "neg": lambda x: -int(x),  # neg: −x
+    "abs": lambda x: abs(int(x)),  # abs: |x|
+    "sign": _sign,  # sign: (x > 0) − (x < 0)
+    "bit_not8": _bit_not8,  # bit_not8: ~x & 0xFF
+    "square": lambda x: int(x) * int(x),  # square: x²
+    "cube": lambda x: int(x) * int(x) * int(x),  # cube: x³
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)  # неизменяемый класс данных: после создания поля менять нельзя
 class Expr:
-    op: str
-    args: tuple["Expr", ...] = ()
-    value: Optional[Any] = None
+    """Дерево выражения: операция op над кортежем аргументов args со вспомогательным значением value.
 
-    @staticmethod
+                op: имя операции ("var", "const", "poly", "poly_nd" или имя из OPS);
+                args: подвыражения-аргументы; value: индекс переменной, константа либо коэффициенты многочлена.
+        »    eval(xs) вычисляет значение на входах xs; cost — число узлов; pretty — текстовый вид; to_dict/from_dict — сохранение и восстановление."""
+    op: str  # имя операции-узла
+    args: tuple["Expr", ...] = ()  # аргументы-подвыражения, по умолчанию пусто
+    value: Optional[Any] = None  # вспомогательное значение узла, по умолчанию нет
+
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def var(i: int) -> "Expr":
-        return Expr("var", (), int(i))
+        """Выражение-переменная: обращение к входу с индексом i.
 
-    @staticmethod
+            »    i: индекс входа (0 — первый аргумент). Возврат: Expr("var", value = int(i))."""
+        return Expr("var", (), int(i))  # узел var с индексом int(i)
+
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def const(v: int) -> "Expr":
-        return Expr("const", (), int(v))
+        """Выражение-константа.
+
+            »    v: значение. Возврат: Expr("const", value = int(v))."""
+        return Expr("const", (), int(v))  # узел const со значением int(v)
 
     def eval(self, xs: Sequence[int]) -> int:
-        if self.op == "var":
-            assert self.value is not None
-            return int(xs[self.value])
-        if self.op == "const":
-            assert self.value is not None
-            return int(self.value)
-        vals = [a.eval(xs) for a in self.args]
-        if self.op == "poly":
-            coeffs = self.value or ()
-            acc = 0
-            for ci in reversed(list(coeffs)):
-                acc = acc * vals[0] + int(ci)
-            return int(acc)
-        if self.op == "poly_nd":
-            total = 0
-            for coefficient, powers in self.value or ():
-                term = int(coefficient)
-                for x, exponent in zip(xs, powers):
-                    term *= int(x) ** int(exponent)
-                total += term
-            return int(total)
-        if self.op == "absdiff":
-            return abs(vals[0] - vals[1])
-        if self.op == "fma":
-            return vals[0] * vals[1] + vals[2]
-        if self.op == "clamp":
-            return min(max(vals[0], vals[1]), vals[2])
-        if self.op == "median3":
-            return sorted(vals)[1]
-        if self.op == "clamp3":
-            return min(max(vals[0], -3), 3)
-        if self.op == "mul3":
-            return vals[0] * vals[1] * vals[2]
-        fn = OPS.get(self.op)
-        if fn is None:
-            raise ValueError(f"unsupported expression opcode: {self.op}")
-        return int(fn(*vals))
+        """Вычислить выражение на входах xs.
 
-    @property
+                    xs: последовательность целых входов. Возврат: целое значение.
+                    var: xs[value]; const: value; узлы poly, poly_nd, absdiff, fma, clamp, median3,
+            »    clamp3, mul3 вычисляются напрямую; остальные — функция OPS[op], применённая к значениям аргументов."""
+        if self.op == "var":  # ветка узла-переменной
+            assert self.value is not None  # гарантия: индекс переменной задан
+            return int(xs[self.value])  # значение входа xs[value]
+        if self.op == "const":  # ветка узла-константы
+            assert self.value is not None  # гарантия: константа задана
+            return int(self.value)  # значение константы
+        vals = [a.eval(xs) for a in self.args]  # значения аргументов vals = [a.eval(xs) для каждого аргумента a]
+        if self.op == "poly":  # ветка многочлена одной переменной
+            coeffs = self.value or ()  # коэффициенты от младшего к старшему; () если нет
+            acc = 0  # накопитель схемы Горнера acc = 0
+            for ci in reversed(list(coeffs)):  # обход коэффициентов от старшего к младшему
+                acc = acc * vals[0] + int(ci)  # шаг Горнера: acc = acc·x + c_i, где x = vals[0]
+            return int(acc)  # значение многочлена Σ c_i·x^i
+        if self.op == "poly_nd":  # ветка многочлена многих переменных
+            total = 0  # сумма членов total = 0
+            for coefficient, powers in self.value or ():  # по парам (коэффициент, показатели степеней)
+                term = int(coefficient)  # член term = коэффициент
+                for x, exponent in zip(xs, powers):  # по парам (вход x, показатель степени)
+                    term *= int(x) ** int(exponent)  # член умножается на x^exponent
+                total += term  # сумма увеличивается на term
+            return int(total)  # сумма членов Σ c_j · Π x_i^{e_ji}
+        if self.op == "absdiff":  # ветка модуля разности
+            return abs(vals[0] - vals[1])  # модуль разности: |vals[0] − vals[1]|
+        if self.op == "fma":  # ветка умножения-сложения
+            return vals[0] * vals[1] + vals[2]  # умножение-сложение: vals[0]·vals[1] + vals[2]
+        if self.op == "clamp":  # ветка ограничения диапазоном
+            return min(max(vals[0], vals[1]), vals[2])  # min(max(v0, v1), v2): не ниже v1 и не выше v2
+        if self.op == "median3":  # ветка медианы трёх
+            return sorted(vals)[1]  # средний по величине из трёх значений
+        if self.op == "clamp3":  # ветка ограничения отрезком [−3, 3]
+            return min(max(vals[0], -3), 3)  # ограничение отрезком: min(max(vals[0], −3), 3)
+        if self.op == "mul3":  # ветка произведения трёх
+            return vals[0] * vals[1] * vals[2]  # произведение трёх: vals[0]·vals[1]·vals[2]
+        fn = OPS.get(self.op)  # функция операции из таблицы OPS
+        if fn is None:  # истина, если операции нет в таблице
+            raise ValueError(f"unsupported expression opcode: {self.op}")  # ошибка: неподдерживаемая операция
+        return int(fn(*vals))  # результат операции над значениями аргументов
+
+    @property  # свойство: вычисляется при обращении как атрибут
     def cost(self) -> int:
-        c = self.__dict__.get("_cost_memo")
-        if c is None:
-            if self.op in ("var", "const"):
-                c = 1
-            else:
-                c = 1 + sum(a.cost for a in self.args)
-            object.__setattr__(self, "_cost_memo", c)
-        return c
+        """Стоимость выражения: число узлов дерева.
+
+            »    cost = 1 для var и const, иначе 1 + Σ cost(аргумента). Результат запоминается в поле _cost_memo."""
+        c = self.__dict__.get("_cost_memo")  # взять запомненное значение, если уже считалось
+        if c is None:  # истина, если ещё не считалось
+            if self.op in ("var", "const"):  # лист — переменная или константа
+                c = 1  # стоимость листа 1
+            else:  # иначе — внутренний узел
+                c = 1 + sum(a.cost for a in self.args)  # стоимость 1 + сумма стоимостей аргументов
+            object.__setattr__(self, "_cost_memo", c)  # запомнить стоимость (обход запрета замороженного класса)
+        return c  # вернуть стоимость
 
     def pretty(self) -> str:
-        if self.op == "var":
-            return ("x", "y", "z")[self.value or 0]
-        if self.op == "const":
-            return str(self.value)
-        if self.op == "poly":
-            coeffs = tuple(self.value or ())
-            terms = []
-            for i in range(len(coeffs) - 1, -1, -1):
-                c = int(coeffs[i])
-                if c == 0:
-                    continue
-                mag = abs(c)
-                if i == 0:
-                    term = str(mag)
-                else:
-                    body = "x" if i == 1 else f"x**{i}"
-                    term = body if mag == 1 else f"{mag}*{body}"
-                if not terms:
-                    terms.append(("-" if c < 0 else "") + term)
-                else:
-                    terms.append((" - " if c < 0 else " + ") + term)
-            return "poly(" + ("".join(terms) if terms else "0") + ")"
-        if self.op == "poly_nd":
-            symbols = ("x", "y", "z", "u", "v", "w")
-            terms = []
-            for coefficient, powers in sorted(
-                (self.value or ()),
-                key=lambda item: (sum(item[1]), item[1]),
-                reverse=True,
-            ):
-                c = int(coefficient)
-                if c == 0:
-                    continue
-                factors = []
-                for index, exponent in enumerate(powers):
-                    exponent = int(exponent)
-                    if exponent == 0:
-                        continue
-                    name = symbols[index] if index < len(symbols) else f"x{index}"
-                    factors.append(name if exponent == 1 else f"{name}**{exponent}")
-                body = "*".join(factors) if factors else str(abs(c))
-                if factors and abs(c) != 1:
-                    body = f"{abs(c)}*{body}"
-                if not terms:
-                    terms.append(("-" if c < 0 else "") + body)
-                else:
-                    terms.append((" - " if c < 0 else " + ") + body)
-            return "poly_nd(" + ("".join(terms) if terms else "0") + ")"
-        if self.op == "clamp3":
-            return f"min(max({self.args[0].pretty()}, -3), 3)"
-        if self.op == "absdiff":
-            return f"abs({self.args[0].pretty()} - {self.args[1].pretty()})"
-        if self.op == "fma":
-            return f"({self.args[0].pretty()} * {self.args[1].pretty()} + {self.args[2].pretty()})"
-        if self.op == "clamp":
-            return f"min(max({self.args[0].pretty()}, {self.args[1].pretty()}), {self.args[2].pretty()})"
-        if self.op == "median3":
-            return f"median({', '.join(a.pretty() for a in self.args)})"
-        if self.op == "mul3":
-            return " * ".join(a.pretty() for a in self.args)
-        if len(self.args) == 1:
-            return f"{self.op}({self.args[0].pretty()})"
-        if len(self.args) == 2:
-            return f"({self.args[0].pretty()} {self.op} {self.args[1].pretty()})"
-        return f"{self.op}({', '.join(a.pretty() for a in self.args)})"
+        """Читаемая запись выражения в текстовом виде.
+
+                    Возврат: строка, например "x**2 + 3" или "poly_nd(x*y - 2*z)".
+            »    Многочлены печатаются от старшей степени к младшей с опусканием нулевых коэффициентов."""
+        if self.op == "var":  # ветка переменной
+            return ("x", "y", "z")[self.value or 0]  # имя по индексу: x, y или z
+        if self.op == "const":  # ветка константы
+            return str(self.value)  # запись числа
+        if self.op == "poly":  # ветка многочлена одной переменной
+            coeffs = tuple(self.value or ())  # кортеж коэффициентов c_0..c_n
+            terms = []  # список кусков текста
+            for i in range(len(coeffs) - 1, -1, -1):  # степень i от n down to 0
+                c = int(coeffs[i])  # коэффициент c_i
+                if c == 0:  # нулевой коэффициент пропускается
+                    continue  # переход к следующему i
+                mag = abs(c)  # модуль коэффициента
+                if i == 0:  # свободный член (i = 0)
+                    term = str(mag)  # текст свободного члена
+                else:  # иначе — степень i ≥ 1
+                    body = "x" if i == 1 else f"x**{i}"  # "x" при i = 1, иначе "x**i"
+                    term = body if mag == 1 else f"{mag}*{body}"  # "x**i", а при |c| ≠ 1 — "|c|*x**i"
+                if not terms:  # первый член
+                    terms.append(("-" if c < 0 else "") + term)  # минус перед первым отрицательным членом
+                else:  # последующие члены
+                    terms.append((" - " if c < 0 else " + ") + term)  # " + " либо " − " перед членом
+            return "poly(" + ("".join(terms) if terms else "0") + ")"  # "poly(" + члены + ")", "0" если членов нет
+        if self.op == "poly_nd":  # ветка многочлена многих переменных
+            symbols = ("x", "y", "z", "u", "v", "w")  # имена переменных по индексу
+            terms = []  # список кусков текста
+            for coefficient, powers in sorted(  # члены от большей суммарной степени к меньшей
+                (self.value or ()),  # сами пары (коэффициент, показатели)
+                key=lambda item: (sum(item[1]), item[1]),  # ключ сортировки: (сумма показателей, кортеж показателей)
+                reverse=True,  # по убыванию ключа
+            ):  # конец сортировки
+                c = int(coefficient)  # коэффициент члена
+                if c == 0:  # нулевой коэффициент пропускается
+                    continue  # переход к следующему члену
+                factors = []  # множители члена
+                for index, exponent in enumerate(powers):  # по парам (индекс переменной, показатель)
+                    exponent = int(exponent)  # показатель степени как целое
+                    if exponent == 0:  # показатель 0 — переменная не входит
+                        continue  # пропустить её
+                    name = symbols[index] if index < len(symbols) else f"x{index}"  # имя переменной; для индексов свыше списка — "x{индекс}"
+                    factors.append(name if exponent == 1 else f"{name}**{exponent}")  # "имя", если степень 1, иначе "имя**степень"
+                body = "*".join(factors) if factors else str(abs(c))  # тело члена: произведение множителей; без множителей — |c|
+                if factors and abs(c) != 1:  # истина, если есть множители и |c| ≠ 1
+                    body = f"{abs(c)}*{body}"  # тело = "|c|*" + тело
+                if not terms:  # первый член
+                    terms.append(("-" if c < 0 else "") + body)  # минус перед первым отрицательным членом
+                else:  # последующие члены
+                    terms.append((" - " if c < 0 else " + ") + body)  # " + " либо " − " перед членом
+            return "poly_nd(" + ("".join(terms) if terms else "0") + ")"  # "poly_nd(" + члены + ")", "0" если членов нет
+        if self.op == "clamp3":  # ветка ограничения отрезком [−3, 3]
+            return f"min(max({self.args[0].pretty()}, -3), 3)"  # текст "min(max(аргумент, -3), 3)"
+        if self.op == "absdiff":  # ветка модуля разности
+            return f"abs({self.args[0].pretty()} - {self.args[1].pretty()})"  # текст "abs(арг0 − арг1)"
+        if self.op == "fma":  # ветка умножения-сложения
+            return f"({self.args[0].pretty()} * {self.args[1].pretty()} + {self.args[2].pretty()})"  # текст "(арг0 * арг1 + арг2)"
+        if self.op == "clamp":  # ветка ограничения диапазоном
+            return f"min(max({self.args[0].pretty()}, {self.args[1].pretty()}), {self.args[2].pretty()})"  # текст "min(max(арг0, арг1), арг2)"
+        if self.op == "median3":  # ветка медианы трёх
+            return f"median({', '.join(a.pretty() for a in self.args)})"  # текст "median(арг0, арг1, арг2)"
+        if self.op == "mul3":  # ветка произведения трёх
+            return " * ".join(a.pretty() for a in self.args)  # аргументы, соединённые " * "
+        if len(self.args) == 1:  # один аргумент
+            return f"{self.op}({self.args[0].pretty()})"  # текст "операция(аргумент)"
+        if len(self.args) == 2:  # два аргумента
+            return f"({self.args[0].pretty()} {self.op} {self.args[1].pretty()})"  # текст "(арг0 операция арг1)"
+        return f"{self.op}({', '.join(a.pretty() for a in self.args)})"  # прочее: "операция(арг0, арг1, ...)"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "op": self.op,
-            "value": self.value,
-            "args": [a.to_dict() for a in self.args],
+        """Сохранить выражение в словарь для записи в JSON.
+
+            »    Возврат: {"op": имя, "value": значение, "args": [словари аргументов]}."""
+        return {  # начало словаря
+            "op": self.op,  # имя операции
+            "value": self.value,  # вспомогательное значение
+            "args": [a.to_dict() for a in self.args],  # аргументы, сохранённые тем же способом
         }
 
-    @staticmethod
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def from_dict(d: dict[str, Any]) -> "Expr":
-        op = str(d["op"])
-        value = d.get("value")
-        # JSON turns immutable tuples into lists. Restore the canonical value
-        # shape so expressions stay hashable and equality-stable after reload.
-        if op == "poly" and value is not None:
-            value = tuple(int(v) for v in value)
-        elif op == "poly_nd" and value is not None:
-            value = tuple(
-                (int(term[0]), tuple(int(v) for v in term[1])) for term in value
-            )
-        return Expr(op, tuple(Expr.from_dict(a) for a in d.get("args", [])), value)
+        """Восстановить выражение из словаря.
+
+                    d: словарь вида to_dict(). После записи в JSON кортежи превращаются в списки;
+                    для poly и poly_nd они приводятся обратно к кортежам, чтобы выражение оставалось хешируемым и равенство не менялось.
+            »    Возврат: Expr."""
+        op = str(d["op"])  # имя операции
+        value = d.get("value")  # вспомогательное значение или None
+        if op == "poly" and value is not None:  # многочлен одной переменной
+            value = tuple(int(v) for v in value)  # value = кортеж целых коэффициентов
+        # JSON превращает неизменяемые кортежи в списки. Восстанавливаем исходную форму значения,
+        # чтобы после перечитывания выражение оставалось хешируемым и равенство не менялось.
+        elif op == "poly_nd" and value is not None:  # многочлен многих переменных
+            value = tuple(  # value = кортеж пар (коэффициент, кортеж показателей)
+                (int(term[0]), tuple(int(v) for v in term[1])) for term in value  # пара: (int(коэффициент), кортеж int показателей)
+            )  # конец генератора
+        return Expr(op, tuple(Expr.from_dict(a) for a in d.get("args", [])), value)  # собрать узел: аргументы восстановлены рекурсивно
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)  # неизменяемый класс данных
 class Program:
-    arity: int
-    expr: Optional[Expr] = None
-    venn_mask: Optional[int] = None
+    """Программа-эксперт: выражение либо булева таблица истинности.
 
-    @property
+                arity: число входов; expr: выражение Expr; venn_mask: 4-битная маска таблицы истинности двух булевых входов.
+        »    Если venn_mask задана, значение = бит маски с номером (x << 1) | y; иначе значение выражения expr."""
+    arity: int  # число входов
+    expr: Optional[Expr] = None  # выражение программы, по умолчанию нет
+    venn_mask: Optional[int] = None  # 4-битная маска таблицы истинности, по умолчанию нет
+
+    @property  # свойство: вычисляется при обращении как атрибут
     def cost(self) -> int:
-        return (
-            4
-            if self.venn_mask is not None
-            else (self.expr.cost if self.expr else 10**9)
+        """Стоимость программы в узлах.
+
+            »    4 для булевой маски; иначе стоимость выражения; 10^9, если выражения нет."""
+        return (  # начало условного выражения
+            4  # стоимость булевой маски — 4
+            if self.venn_mask is not None  # если маска задана
+            else (self.expr.cost if self.expr else 10**9)  # иначе cost(expr), а без выражения 10^9
         )
 
     def eval(self, xs: Sequence[int]) -> int:
-        if len(xs) != self.arity:
-            raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")
-        if self.venn_mask is not None:
-            if self.arity != 2 or int(xs[0]) not in (0, 1) or int(xs[1]) not in (0, 1):
-                raise ValueError("BoolVenn expert accepts two Boolean inputs")
-            idx = (int(xs[0]) << 1) | int(xs[1])
-            return (int(self.venn_mask) >> idx) & 1
-        if self.expr is None:
-            raise RuntimeError("program has no expression")
-        return self.expr.eval(xs)
+        """Вычислить программу на входах xs.
+
+                    xs: последовательность целых длины arity. Число входов обязано совпадать с arity.
+                    Булева маска требует ровно двух входов из {0, 1}: значение = бит маски с номером 2·x + y.
+            »    Иначе значение = expr.eval(xs); если выражения нет — RuntimeError."""
+        if len(xs) != self.arity:  # проверка числа входов: len(xs) = arity
+            raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")  # ошибка: число входов не совпадает
+        if self.venn_mask is not None:  # ветка булевой маски
+            if self.arity != 2 or int(xs[0]) not in (0, 1) or int(xs[1]) not in (0, 1):  # маска требует ровно двух входов, каждый 0 или 1
+                raise ValueError("BoolVenn expert accepts two Boolean inputs")  # ошибка: булев эксперт принимает два булевых входа
+            idx = (int(xs[0]) << 1) | int(xs[1])  # номер бита idx = 2·x + y
+            return (int(self.venn_mask) >> idx) & 1  # значение = (маска >> idx) & 1
+        if self.expr is None:  # ветка отсутствия выражения
+            raise RuntimeError("program has no expression")  # ошибка: у программы нет выражения
+        return self.expr.eval(xs)  # значение выражения
 
     def pretty(self) -> str:
-        if self.venn_mask is not None:
-            return f"BoolVenn(mask={self.venn_mask:04b})"
-        assert self.expr is not None
-        return self.expr.pretty()
+        """Читаемая запись программы.
+
+            »    Возврат: "BoolVenn(mask=....)" — 4 бита маски, либо текст выражения."""
+        if self.venn_mask is not None:  # ветка булевой маски
+            return f"BoolVenn(mask={self.venn_mask:04b})"  # текст с маской в 4-битной двоичной записи
+        assert self.expr is not None  # гарантия: выражение задано
+        return self.expr.pretty()  # текст выражения
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "arity": self.arity,
-            "venn_mask": self.venn_mask,
-            "expr": self.expr.to_dict() if self.expr else None,
+        """Сохранить программу в словарь для записи в JSON.
+
+            »    Возврат: {"arity": ..., "venn_mask": ..., "expr": словарь выражения или None}."""
+        return {  # начало словаря
+            "arity": self.arity,  # число входов
+            "venn_mask": self.venn_mask,  # маска таблицы истинности
+            "expr": self.expr.to_dict() if self.expr else None,  # словарь выражения, если оно есть
         }
 
-    @staticmethod
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def from_dict(d: dict[str, Any]) -> "Program":
-        return Program(
-            int(d["arity"]),
-            Expr.from_dict(d["expr"]) if d.get("expr") else None,
-            d.get("venn_mask"),
+        """Восстановить программу из словаря.
+
+            »    d: словарь вида to_dict(). Возврат: Program."""
+        return Program(  # собрать программу
+            int(d["arity"]),  # число входов
+            Expr.from_dict(d["expr"]) if d.get("expr") else None,  # выражение, если в словаре оно есть
+            d.get("venn_mask"),  # маска таблицы истинности
         )
 
 
-# ------------------------------- Task definitions ------------------------------
 
+# ------------------------------- Описания задач ------------------------------
 
-@dataclass
+@dataclass  # изменяемый класс данных
 class TaskSpec:
-    name: str
-    arity: int
-    domains: tuple[tuple[int, ...], ...]
-    teacher: Callable[..., int]
-    valid_rule: str = "all"
-    family: str = "integer"
+    """Описание задачи: имя, входы, обучающая функция и правило отсева входов.
+
+                name: имя задачи; arity: число входов; domains: кортеж допустимых значений каждого входа;
+                teacher: функция-учитель, дающая правильный ответ; valid_rule: "all" — все входы допустимы,
+                "nonzero_y" — второй вход не равен 0, "ordered_yz" — второй вход не больше третьего;
+        »    family: семейство задач. inputs() даёт все допустимые входы, valid(xs) проверяет один вход."""
+    name: str  # имя задачи
+    arity: int  # число входов
+    domains: tuple[tuple[int, ...], ...]  # допустимые значения каждого входа
+    teacher: Callable[..., int]  # функция-учитель: правильный ответ
+    valid_rule: str = "all"  # правило отсева входов, по умолчанию все допустимы
+    family: str = "integer"  # семейство задач
 
     def inputs(self) -> list[tuple[int, ...]]:
-        rows = itertools.product(*self.domains)
-        out = []
-        for row in rows:
-            if self.valid_rule == "nonzero_y" and row[1] == 0:
-                continue
-            if self.valid_rule == "ordered_yz" and row[1] > row[2]:
-                continue
-            out.append(tuple(int(x) for x in row))
-        return out
+        """Все допустимые входы задачи.
+
+            »    Возврат: список кортежей — декартово произведение областей без строк, отброшенных правилом valid_rule."""
+        rows = itertools.product(*self.domains)  # декартово произведение областей
+        out = []  # накопитель результата
+        for row in rows:  # по строкам произведения
+            if self.valid_rule == "nonzero_y" and row[1] == 0:  # правило nonzero_y и второй вход равен 0
+                continue  # строка отброшена
+            if self.valid_rule == "ordered_yz" and row[1] > row[2]:  # правило ordered_yz и второй вход больше третьего
+                continue  # строка отброшена
+            out.append(tuple(int(x) for x in row))  # добавить строку целых значений
+        return out  # вернуть список входов
 
     def valid(self, xs: Sequence[int]) -> bool:
-        if len(xs) != self.arity:
-            return False
-        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):
-            return False
-        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:
-            return False
-        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):
-            return False
-        return True
+        """Проверить, допустим ли вход xs для задачи.
+
+            »    xs: последовательность целых. Возврат: истина, если длина равна arity, каждое значение лежит в своей области и выполнено правило valid_rule."""
+        if len(xs) != self.arity:  # длина обязана совпадать с arity
+            return False  # ложь при несовпадении длины
+        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):  # истина, если хотя бы одно значение вне своей области
+            return False  # ложь, если есть значение вне области
+        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило nonzero_y и xs[1] = 0
+            return False  # ложь
+        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило ordered_yz и xs[1] > xs[2]
+            return False  # ложь
+        return True  # иначе вход допустим
 
 
-BOOL_NAMES = {
-    0: "BOOL_FALSE",
-    1: "BOOL_NOR",
-    2: "BOOL_NOT_X_AND_Y",
-    3: "BOOL_NOT_X",
-    4: "BOOL_X_AND_NOT_Y",
-    5: "BOOL_NOT_Y",
-    6: "BOOL_XOR",
-    7: "BOOL_NAND",
-    8: "BOOL_AND",
-    9: "BOOL_XNOR",
-    10: "BOOL_Y",
-    11: "BOOL_X_IMPLIES_Y",
-    12: "BOOL_X",
-    13: "BOOL_Y_IMPLIES_X",
-    14: "BOOL_OR",
-    15: "BOOL_TRUE",
+BOOL_NAMES = {  # таблица истинности 16 булевых функций двух переменных: маска -> имя; в маске бит 2·x + y равен значению функции
+    0: "BOOL_FALSE",  # маска 0: всегда 0
+    1: "BOOL_NOR",  # маска 1: nor — не(x или y)
+    2: "BOOL_NOT_X_AND_Y",  # маска 2: не x и y
+    3: "BOOL_NOT_X",  # маска 3: не x
+    4: "BOOL_X_AND_NOT_Y",  # маска 4: x и не y
+    5: "BOOL_NOT_Y",  # маска 5: не y
+    6: "BOOL_XOR",  # маска 6: xor — исключающее или
+    7: "BOOL_NAND",  # маска 7: nand — не(x и y)
+    8: "BOOL_AND",  # маска 8: and — x и y
+    9: "BOOL_XNOR",  # маска 9: xnor — эквивалентность
+    10: "BOOL_Y",  # маска 10: y
+    11: "BOOL_X_IMPLIES_Y",  # маска 11: x влечёт y
+    12: "BOOL_X",  # маска 12: x
+    13: "BOOL_Y_IMPLIES_X",  # маска 13: y влечёт x
+    14: "BOOL_OR",  # маска 14: or — x или y
+    15: "BOOL_TRUE",  # маска 15: всегда 1
 }
 
 
 def make_task_suite() -> list[TaskSpec]:
-    suite: list[TaskSpec] = []
-    bool_domain = ((0, 1), (0, 1))
-    for mask, name in BOOL_NAMES.items():
-        suite.append(
-            TaskSpec(
-                name,
-                2,
-                bool_domain,
-                lambda x, y, m=mask: (m >> ((int(x) << 1) | int(y))) & 1,
-                family="BoolVenn",
+    """Построить полный набор задач.
+
+        »    Возврат: список TaskSpec — 16 булевых, 7 унарных, 22 бинарные, степень, fma, clamp и далее составные задачи."""
+    suite: list[TaskSpec] = []  # накопитель задач
+    bool_domain = ((0, 1), (0, 1))  # область двух булевых входов {0, 1}
+    for mask, name in BOOL_NAMES.items():  # по маскам и именам булевых функций
+        suite.append(  # добавить задачу
+            TaskSpec(  # начало описания задачи
+                name,  # имя функции
+                2,  # два входа
+                bool_domain,  # области {0, 1} × {0, 1}
+                lambda x, y, m=mask: (m >> ((int(x) << 1) | int(y))) & 1,  # ответ = бит маски с номером 2·x + y; m фиксирован для данной итерации
+                family="BoolVenn",  # семейство BoolVenn
             )
         )
 
-    U = tuple(range(-8, 9))
-    unary = [
-        ("NEG", lambda x: -x),
-        ("ABS", abs),
-        ("SIGN", _sign),
-        ("SQUARE", lambda x: x * x),
-        ("CUBE", lambda x: x * x * x),
-        ("BIT_NOT8", _bit_not8),
-        ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),
-    ]
-    for name, fn in unary:
-        suite.append(TaskSpec(name, 1, (U,), fn, family="unary"))
+    U = tuple(range(-8, 9))  # U — область унарных и бинарных задач: целые от −8 до 8
+    unary = [  # унарные функции: имя и функция
+        ("NEG", lambda x: -x),  # NEG: −x
+        ("ABS", abs),  # ABS: |x|
+        ("SIGN", _sign),  # SIGN: знак
+        ("SQUARE", lambda x: x * x),  # SQUARE: x²
+        ("CUBE", lambda x: x * x * x),  # CUBE: x³
+        ("BIT_NOT8", _bit_not8),  # BIT_NOT8: ~x & 0xFF
+        ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),  # CLAMP_TO_3: min(max(x, −3), 3)
+    ]  # конец списка унарных функций
+    for name, fn in unary:  # по унарным парам (имя, функция)
+        suite.append(TaskSpec(name, 1, (U,), fn, family="unary"))  # задача с одним входом из U
 
-    binary = [
-        ("ADD", lambda x, y: x + y, "all"),
-        ("SUB", lambda x, y: x - y, "all"),
-        ("MUL", lambda x, y: x * y, "all"),
-        ("FLOORDIV", lambda x, y: x // y, "nonzero_y"),
-        ("MOD", lambda x, y: x % y, "nonzero_y"),
-        ("GCD", math.gcd, "all"),
-        ("LCM", math.lcm, "all"),
-        ("MIN", min, "all"),
-        ("MAX", max, "all"),
-        ("ABSDIFF", lambda x, y: abs(x - y), "all"),
-        ("EQ", lambda x, y: int(x == y), "all"),
-        ("NE", lambda x, y: int(x != y), "all"),
-        ("LT", lambda x, y: int(x < y), "all"),
-        ("LE", lambda x, y: int(x <= y), "all"),
-        ("GT", lambda x, y: int(x > y), "all"),
-        ("GE", lambda x, y: int(x >= y), "all"),
-        ("BIT_AND", lambda x, y: x & y, "all"),
-        ("BIT_OR", lambda x, y: x | y, "all"),
-        ("BIT_XOR", lambda x, y: x ^ y, "all"),
-        ("BIT_NAND8", _bit_nand8, "all"),
-        ("BIT_NOR8", _bit_nor8, "all"),
-        ("BIT_XNOR8", _bit_xnor8, "all"),
-    ]
-    for name, fn, valid in binary:
-        suite.append(
-            TaskSpec(name, 2, (U, U), fn, valid_rule=valid, family="integer-binary")
+    binary = [  # бинарные функции: имя, функция, правило отсева
+        ("ADD", lambda x, y: x + y, "all"),  # ADD: x + y
+        ("SUB", lambda x, y: x - y, "all"),  # SUB: x − y
+        ("MUL", lambda x, y: x * y, "all"),  # MUL: x·y
+        ("FLOORDIV", lambda x, y: x // y, "nonzero_y"),  # FLOORDIV: x // y, y ≠ 0
+        ("MOD", lambda x, y: x % y, "nonzero_y"),  # MOD: x mod y, y ≠ 0
+        ("GCD", math.gcd, "all"),  # GCD: наибольший общий делитель
+        ("LCM", math.lcm, "all"),  # LCM: наименьшее общее кратное
+        ("MIN", min, "all"),  # MIN: меньшее
+        ("MAX", max, "all"),  # MAX: большее из x, y
+        ("ABSDIFF", lambda x, y: abs(x - y), "all"),  # ABSDIFF: |x − y|
+        ("EQ", lambda x, y: int(x == y), "all"),  # EQ: 1, если x = y
+        ("NE", lambda x, y: int(x != y), "all"),  # NE: 1, если x ≠ y
+        ("LT", lambda x, y: int(x < y), "all"),  # LT: 1, if x < y
+        ("LE", lambda x, y: int(x <= y), "all"),  # LE: 1, если x ≤ y
+        ("GT", lambda x, y: int(x > y), "all"),  # GT: 1, если x > y
+        ("GE", lambda x, y: int(x >= y), "all"),  # GE: 1, если x ≥ y
+        ("BIT_AND", lambda x, y: x & y, "all"),  # BIT_AND: x & y
+        ("BIT_OR", lambda x, y: x | y, "all"),  # BIT_OR: x | y
+        ("BIT_XOR", lambda x, y: x ^ y, "all"),  # BIT_XOR: x ^ y
+        ("BIT_NAND8", _bit_nand8, "all"),  # BIT_NAND8: ~(x & y) & 0xFF
+        ("BIT_NOR8", _bit_nor8, "all"),  # BIT_NOR8: ~(x | y) & 0xFF
+        ("BIT_XNOR8", _bit_xnor8, "all"),  # BIT_XNOR8: ~(x ^ y) & 0xFF
+    ]  # конец списка бинарных функций
+    for name, fn, valid in binary:  # по тройкам (имя, функция, правило)
+        suite.append(  # добавить задачу
+            TaskSpec(name, 2, (U, U), fn, valid_rule=valid, family="integer-binary")  # два входа из U, правило отсева и семейство integer-binary
         )
-    P = tuple(range(-3, 4))
-    E = tuple(range(0, 5))
-    suite.append(TaskSpec("POW_INT", 2, (P, E), _pow_int, family="integer-binary"))
+    P = tuple(range(-3, 4))  # P — область основания степени: целые от −3 до 3
+    E = tuple(range(0, 5))  # E — область показателя степени: целые от 0 до 4
+    suite.append(TaskSpec("POW_INT", 2, (P, E), _pow_int, family="integer-binary"))  # задача POW_INT с областями P и E
 
-    Z = tuple(range(-8, 9))
-    F = tuple(range(-4, 5))
-    suite.extend(
-        [
-            TaskSpec(
-                "FMA",
-                3,
-                (Z, Z, Z),
-                lambda x, y, z: x * y + z,
-                family="composed-ternary",
+    Z = tuple(range(-8, 9))  # Z — область: целые от −8 до 8
+    F = tuple(range(-4, 5))  # F — область границ clamp: целые от −4 до 4
+    suite.extend(  # добавить список составных задач
+        [  # начало списка
+            TaskSpec(  # задача
+                "FMA",  # имя FMA
+                3,  # три входа
+                (Z, Z, Z),  # три области Z
+                lambda x, y, z: x * y + z,  # ответ x·y + z
+                family="composed-ternary",  # семейство составных тернарных задач
             ),
-            TaskSpec(
-                "CLAMP",
-                3,
-                (Z, F, F),
-                lambda x, lo, hi: min(max(x, lo), hi),
-                valid_rule="ordered_yz",
-                family="composed-ternary",
+            TaskSpec(  # начало описания задачи
+                "CLAMP",  # имя CLAMP
+                3,  # три входа
+                (Z, F, F),  # x из Z, границы lo и hi из F
+                lambda x, lo, hi: min(max(x, lo), hi),  # ответ min(max(x, lo), hi)
+                valid_rule="ordered_yz",  # правило: lo ≤ hi
+                family="composed-ternary",  # семейство составных тернарных задач
             ),
-            TaskSpec(
-                "MEDIAN3",
-                3,
-                (F, F, F),
-                lambda x, y, z: sorted((x, y, z))[1],
-                family="composed-ternary",
+            TaskSpec(  # начало описания задачи
+                "MEDIAN3",  # имя MEDIAN3
+                3,  # три входа
+                (F, F, F),  # три области F
+                lambda x, y, z: sorted((x, y, z))[1],  # ответ — среднее по величине из x, y, z: отсортировать и взять элемент с индексом 1
+                family="composed-ternary",  # семейство составных тернарных задач
             ),
-        ]
+        ]  # конец списка
     )
-    return suite
+    return suite  # вернуть набор задач
 
 
-# ------------------------- Candidate program enumeration ------------------------
 
+# ------------------------- Перечисление программ-кандидатов ------------------------
 
 def _dedupe_candidates(candidates: Iterable[Expr]) -> list[Expr]:
-    by_text: dict[str, Expr] = {}
-    for e in candidates:
-        by_text.setdefault(e.pretty(), e)
-    return sorted(by_text.values(), key=lambda e: (e.cost, e.pretty()))
+    """Убрать повторяющиеся выражения и отсортировать по стоимости.
+
+                candidates: перебор выражений. Два выражения считаются одинаковыми, если совпадает их текстовый вид pretty().
+        »    Возврат: список уникальных выражений, отсортированный по (cost, pretty())."""
+    by_text: dict[str, Expr] = {}  # словарь «текст выражения -> выражение»
+    for e in candidates:  # по всем выражениям-кандидатам
+        by_text.setdefault(e.pretty(), e)  # записать выражение, если такой текст ещё не встречался
+    return sorted(by_text.values(), key=lambda e: (e.cost, e.pretty()))  # уникальные значения, отсортированные по (стоимость, текст)
 
 
 def candidate_programs(arity: int) -> list[Program]:
-    v = [Expr.var(i) for i in range(arity)]
-    cands: list[Expr] = []
-    if arity == 1:
-        x = v[0]
-        cands += [
-            Expr("neg", (x,)),
-            Expr("abs", (x,)),
-            Expr("sign", (x,)),
-            Expr("bit_not8", (x,)),
-            Expr("mul", (x, x)),
-            Expr("mul", (Expr("mul", (x, x)), x)),
-            Expr("clamp3", (x,)),
-        ]
-        return [Program(arity, e) for e in _dedupe_candidates(cands)]
-    if arity == 2:
-        x, y = v
-        for op in (
-            "add",
-            "sub",
-            "mul",
-            "floordiv",
-            "mod",
-            "gcd",
-            "lcm",
-            "min",
-            "max",
-            "eq",
-            "ne",
-            "lt",
-            "le",
-            "gt",
-            "ge",
-            "bit_and",
-            "bit_or",
-            "bit_xor",
-            "bit_nand8",
-            "bit_nor8",
-            "bit_xnor8",
-            "pow_int",
-        ):
-            cands.append(Expr(op, (x, y)))
-        cands.append(Expr("sub", (y, x)))
-        cands.append(Expr("absdiff", (x, y)))
-        cands.append(Expr("abs", (Expr("sub", (x, y)),)))
-        cands.append(Expr("abs", (Expr("sub", (y, x)),)))
-        # Small compositional grammar: two-layer expressions from arithmetic atoms.
-        atoms = [
-            Expr("add", (x, y)),
-            Expr("sub", (x, y)),
-            Expr("sub", (y, x)),
-            Expr("mul", (x, y)),
-            Expr("abs", (x,)),
-            Expr("abs", (y,)),
-        ]
-        for a in atoms:
-            cands.append(Expr("abs", (a,)))
-        return [Program(arity, e) for e in _dedupe_candidates(cands)]
-    if arity == 3:
-        x, y, z = v
-        cands += [
-            Expr("fma", (x, y, z)),
-            Expr("clamp", (x, y, z)),
-            Expr("median3", (x, y, z)),
-            Expr("mul3", (x, y, z)),
-            Expr("add", (Expr("mul", (x, y)), z)),
-            Expr("max", (Expr("min", (x, y)), Expr("min", (Expr("max", (x, y)), z)))),
-        ]
-        return [Program(arity, e) for e in _dedupe_candidates(cands)]
-    return []
+    """Построить программы-кандидаты для заданного числа входов.
+
+                arity: число входов. Для 1, 2 и 3 входов перечисляются выражения из фиксированных списков
+                (унарные операции, бинарные операции над (x, y), тернарные примитивы), дубликаты убираются.
+        »    Возврат: список Program; для прочих arity — пустой список."""
+    v = [Expr.var(i) for i in range(arity)]  # переменные-листы: x_i = Expr.var(i), i = 0..arity−1
+    cands: list[Expr] = []  # накопитель выражений-кандидатов
+    if arity == 1:  # ветка одного входа
+        x = v[0]  # x — единственный вход
+        cands += [  # начать список унарных кандидатов
+            Expr("neg", (x,)),  # −x
+            Expr("abs", (x,)),  # |x|
+            Expr("sign", (x,)),  # знак x
+            Expr("bit_not8", (x,)),  # побитовое «не» в байте
+            Expr("mul", (x, x)),  # x²
+            Expr("mul", (Expr("mul", (x, x)), x)),  # x³
+            Expr("clamp3", (x,)),  # ограничение отрезком [−3, 3]
+        ]  # конец списка
+        return [Program(arity, e) for e in _dedupe_candidates(cands)]  # программы из уникальных кандидатов
+    if arity == 2:  # ветка двух входов
+        x, y = v  # x, y — входы
+        for op in (  # по именам бинарных операций
+            "add",  # сложение
+            "sub",  # вычитание
+            "mul",  # умножение
+            "floordiv",  # деление с округлением вниз
+            "mod",  # остаток
+            "gcd",  # наибольший общий делитель
+            "lcm",  # наименьшее общее кратное
+            "min",  # минимум
+            "max",  # максимум
+            "eq",  # равно
+            "ne",  # не равно
+            "lt",  # меньше
+            "le",  # меньше или равно
+            "gt",  # больше
+            "ge",  # больше или равно
+            "bit_and",  # побитовое «и»
+            "bit_or",  # побитовое «или»
+            "bit_xor",  # исключающее «или»
+            "bit_nand8",  # не-и в байте
+            "bit_nor8",  # не-или в байте
+            "bit_xnor8",  # эквивалентность в байте
+            "pow_int",  # целая степень
+        ):  # конец кортежа операций
+            cands.append(Expr(op, (x, y)))  # кандидат op(x, y)
+        cands.append(Expr("sub", (y, x)))  # кандидат y − x (порядок аргументов изменён)
+        cands.append(Expr("absdiff", (x, y)))  # кандидат |x − y|
+        cands.append(Expr("abs", (Expr("sub", (x, y)),)))  # кандидат |x − y| через abs(sub)
+        cands.append(Expr("abs", (Expr("sub", (y, x)),)))  # кандидат |y − x| через abs(sub)
+        atoms = [  # атомы — базовые выражения двух входов
+        # Небольшая составная грамматика: двухслойные выражения из арифметических атомов.
+            Expr("add", (x, y)),  # x + y
+            Expr("sub", (x, y)),  # x − y
+            Expr("sub", (y, x)),  # y − x
+            Expr("mul", (x, y)),  # x·y
+            Expr("abs", (x,)),  # |x|
+            Expr("abs", (y,)),  # |y|
+        ]  # конец списка атомов
+        for a in atoms:  # по атомам
+            cands.append(Expr("abs", (a,)))  # кандидат |атом|
+        return [Program(arity, e) for e in _dedupe_candidates(cands)]  # программы из уникальных кандидатов
+    if arity == 3:  # ветка трёх входов
+        x, y, z = v  # x, y, z — входы
+        cands += [  # начать список тернарных кандидатов
+            Expr("fma", (x, y, z)),  # x·y + z
+            Expr("clamp", (x, y, z)),  # min(max(x, y), z)
+            Expr("median3", (x, y, z)),  # медиана трёх
+            Expr("mul3", (x, y, z)),  # x·y·z
+            Expr("add", (Expr("mul", (x, y)), z)),  # (x·y) + z
+            Expr("max", (Expr("min", (x, y)), Expr("min", (Expr("max", (x, y)), z)))),  # max(min(x, y), min(max(x, y), z))
+        ]  # конец списка
+        return [Program(arity, e) for e in _dedupe_candidates(cands)]  # программы из уникальных кандидатов
+    return []  # прочее число входов — кандидатов нет
 
 
-# ------------------------------- Neural fiber ----------------------------------
 
+# ------------------------------- Нейронный слой ----------------------------------
 
-@dataclass
+@dataclass  # изменяемый класс данных
 class NeuralFiber:
-    arity: int
-    input_scale: float
-    target_scale: float
-    w1: np.ndarray
-    b1: np.ndarray
-    w2: np.ndarray
-    b2: np.ndarray
-    train_loss: float = float("nan")
-    validation_loss: float = float("nan")
-    validation_exact_accuracy: float = float("nan")
+    """Нейронная сеть из одного скрытого слоя, приближающая целочисленную функцию.
 
-    @staticmethod
+                Схема: h = tanh(x·w1 + b1); pred = h·w2 + b2. Число входов arity, скрытый слой hidden.
+                input_scale и target_scale — нормирующие множители: обучение идёт на x/sx и y/sy.
+        »    train_loss, validation_loss — средний квадрат ошибки; validation_exact_accuracy — доля точных попаданий после округления."""
+    arity: int  # число входов
+    input_scale: float  # множитель нормировки входов sx
+    target_scale: float  # множитель нормировки ответов sy
+    w1: np.ndarray  # веса первого слоя w1
+    b1: np.ndarray  # смещения первого слоя b1
+    w2: np.ndarray  # веса второго слоя w2
+    b2: np.ndarray  # смещение второго слоя b2
+    train_loss: float = float("nan")  # ошибка на обучающих примерах, по умолчанию не число
+    validation_loss: float = float("nan")  # ошибка на проверочных примерах, по умолчанию не число
+    validation_exact_accuracy: float = float("nan")  # доля точных попаданий на проверке, по умолчанию не число
+
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def fit(
-        inputs: Sequence[Sequence[int]],
-        targets: Sequence[int],
-        val_inputs: Sequence[Sequence[int]],
-        val_targets: Sequence[int],
-        seed: int,
-        hidden: int = 24,
-        epochs: int = 140,
-        lr: float = 0.025,
+        inputs: Sequence[Sequence[int]],  # inputs — обучающие входы
+        targets: Sequence[int],  # targets — обучающие ответы
+        val_inputs: Sequence[Sequence[int]],  # val_inputs — проверочные входы
+        val_targets: Sequence[int],  # val_targets — проверочные ответы
+        seed: int,  # зерно случайности
+        hidden: int = 24,  # ширина скрытого слоя, по умолчанию 24
+        epochs: int = 140,  # число эпох, по умолчанию 140
+        lr: float = 0.025,  # скорость обучения, по умолчанию 0.025
     ) -> "NeuralFiber":
-        x = np.asarray(inputs, dtype=np.float64).reshape(-1, len(inputs[0]))
-        y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
-        xv = np.asarray(val_inputs, dtype=np.float64).reshape(-1, x.shape[1])
-        yv = np.asarray(val_targets, dtype=np.float64).reshape(-1, 1)
-        sx = max(1.0, float(np.max(np.abs(x))))
-        sy = max(1.0, float(np.max(np.abs(y))))
-        x, y, xv, yv = x / sx, y / sy, xv / sx, yv / sy
-        rng = np.random.default_rng(seed)
-        w1 = rng.normal(0.0, 0.32, (x.shape[1], hidden))
-        b1 = np.zeros((1, hidden), dtype=np.float64)
-        w2 = rng.normal(0.0, 0.12, (hidden, 1))
-        b2 = np.zeros((1, 1), dtype=np.float64)
-        params = [w1, b1, w2, b2]
-        m = [np.zeros_like(p) for p in params]
-        v = [np.zeros_like(p) for p in params]
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-        best = [p.copy() for p in params]
-        best_val = float("inf")
-        step = 0
-        for _ in range(epochs):
-            h = np.tanh(x @ w1 + b1)
-            pred = h @ w2 + b2
-            err = pred - y
-            loss = float(np.mean(err * err))
-            dp = (2.0 / len(x)) * err
-            dw2 = h.T @ dp
-            db2 = np.sum(dp, axis=0, keepdims=True)
-            dh = (dp @ w2.T) * (1.0 - h * h)
-            dw1 = x.T @ dh
-            db1 = np.sum(dh, axis=0, keepdims=True)
-            grads = [dw1, db1, dw2, db2]
-            step += 1
-            for i, (p, g) in enumerate(zip(params, grads)):
-                m[i] = beta1 * m[i] + (1 - beta1) * g
-                v[i] = beta2 * v[i] + (1 - beta2) * (g * g)
-                mh = m[i] / (1 - beta1**step)
-                vh = v[i] / (1 - beta2**step)
-                p -= lr * mh / (np.sqrt(vh) + eps)
-            hv = np.tanh(xv @ w1 + b1)
-            pv = hv @ w2 + b2
-            vl = float(np.mean((pv - yv) ** 2))
-            if np.isfinite(vl) and vl < best_val:
-                best_val = vl
-                best = [p.copy() for p in params]
-        w1, b1, w2, b2 = best
-        h = np.tanh(x @ w1 + b1)
-        tr_loss = float(np.mean((h @ w2 + b2 - y) ** 2)) * sy * sy
-        hv = np.tanh(xv @ w1 + b1)
-        predv = (hv @ w2 + b2).reshape(-1) * sy
-        val_loss = float(np.mean((predv - np.asarray(val_targets, dtype=float)) ** 2))
-        exact = float(
-            np.mean(
-                np.rint(predv).astype(np.int64)
-                == np.asarray(val_targets, dtype=np.int64)
+        """Обучить нейронный слой методом Адамса и вернуть его.
+
+                    inputs, targets: обучающие примеры и ответы; val_inputs, val_targets: проверочные.
+                    seed: зерно генератора; hidden: ширина скрытого слоя; epochs: число проходов; lr: скорость обучения.
+                    Входы нормируются: x/sx, y/sy, где sx = max(1, max|x|), sy = max(1, max|y|).
+                    Прямой ход: h = tanh(x·w1 + b1), pred = h·w2 + b2; ошибка err = pred − y; средний квадрат loss = mean(err²).
+                    Обратный ход: dp = (2/N)·err; dw2 = hᵀ·dp; dh = (dp·w2ᵀ)·(1 − h²); dw1 = xᵀ·dh.
+                    Обновление Адамса: m = β1·m + (1−β1)·g; v = β2·v + (1−β2)·g²; p −= lr·(m/(1−β1^t))/(√(v/(1−β2^t)) + eps).
+            »    Сохраняются веса с наименьшей проверочной ошибкой. Возврат: NeuralFiber."""
+        x = np.asarray(inputs, dtype=np.float64).reshape(-1, len(inputs[0]))  # x — матрица входов (N, число входов) в float64
+        y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)  # y — столбец ответов (N, 1)
+        xv = np.asarray(val_inputs, dtype=np.float64).reshape(-1, x.shape[1])  # xv — проверочные входы той же ширины
+        yv = np.asarray(val_targets, dtype=np.float64).reshape(-1, 1)  # yv — проверочные ответы, столбец
+        sx = max(1.0, float(np.max(np.abs(x))))  # масштаб входов sx = max(1, наибольший |x|)
+        sy = max(1.0, float(np.max(np.abs(y))))  # масштаб ответов sy = max(1, наибольший |y|)
+        x, y, xv, yv = x / sx, y / sy, xv / sx, yv / sy  # нормировка: x/sx, y/sy, xv/sx, yv/sy
+        rng = np.random.default_rng(seed)  # генератор случайных чисел с зерном seed
+        w1 = rng.normal(0.0, 0.32, (x.shape[1], hidden))  # w1 — нормальные веса (число входов, hidden) с дисперсией 0.32
+        b1 = np.zeros((1, hidden), dtype=np.float64)  # b1 — нулевые смещения (1, hidden)
+        w2 = rng.normal(0.0, 0.12, (hidden, 1))  # w2 — нормальные веса (hidden, 1) с дисперсией 0.12
+        b2 = np.zeros((1, 1), dtype=np.float64)  # b2 — нулевое смещение (1, 1)
+        params = [w1, b1, w2, b2]  # список параметров [w1, b1, w2, b2]
+        m = [np.zeros_like(p) for p in params]  # m — первые моменты Адамса, нули
+        v = [np.zeros_like(p) for p in params]  # v — вторые моменты Адамса, нули
+        beta1, beta2, eps = 0.9, 0.999, 1e-8  # коэффициенты β1 = 0.9, β2 = 0.999, eps = 10⁻⁸
+        best = [p.copy() for p in params]  # лучшие веса — копии исходных
+        best_val = float("inf")  # лучшая проверочная ошибка — бесконечность
+        step = 0  # номер шага t = 0
+        for _ in range(epochs):  # по эпохам
+            h = np.tanh(x @ w1 + b1)  # скрытый слой h = tanh(x·w1 + b1)
+            pred = h @ w2 + b2  # прогноз pred = h·w2 + b2
+            err = pred - y  # ошибка err = pred − y
+            loss = float(np.mean(err * err))  # средний квадрат ошибки loss = mean(err²)
+            dp = (2.0 / len(x)) * err  # градиент по pred: dp = (2/N)·err
+            dw2 = h.T @ dp  # градиент dw2 = hᵀ·dp
+            db2 = np.sum(dp, axis=0, keepdims=True)  # градиент db2 = сумма dp по строкам
+            dh = (dp @ w2.T) * (1.0 - h * h)  # градиент по h: dh = (dp·w2ᵀ)·(1 − h²) (производная tanh)
+            dw1 = x.T @ dh  # градиент dw1 = xᵀ·dh
+            db1 = np.sum(dh, axis=0, keepdims=True)  # градиент db1 = сумма dh по строкам
+            grads = [dw1, db1, dw2, db2]  # список градиентов в порядке параметров
+            step += 1  # шаг t = t + 1
+            for i, (p, g) in enumerate(zip(params, grads)):  # по парам (параметр, градиент)
+                m[i] = beta1 * m[i] + (1 - beta1) * g  # первый момент m = β1·m + (1−β1)·g
+                v[i] = beta2 * v[i] + (1 - beta2) * (g * g)  # второй момент v = β2·v + (1−β2)·g²
+                mh = m[i] / (1 - beta1**step)  # исправленный первый момент mh = m/(1 − β1^t)
+                vh = v[i] / (1 - beta2**step)  # исправленный второй момент vh = v/(1 − β2^t)
+                p -= lr * mh / (np.sqrt(vh) + eps)  # шаг параметра: p −= lr·mh/(√vh + eps)
+            hv = np.tanh(xv @ w1 + b1)  # скрытый слой проверочных входов hv = tanh(xv·w1 + b1)
+            pv = hv @ w2 + b2  # проверочный прогноз pv = hv·w2 + b2
+            vl = float(np.mean((pv - yv) ** 2))  # проверочная ошибка vl = mean((pv − yv)²)
+            if np.isfinite(vl) and vl < best_val:  # ошибка конечна и меньше рекордной
+                best_val = vl  # новый рекорд
+                best = [p.copy() for p in params]  # запомнить лучшие веса
+        w1, b1, w2, b2 = best  # взять лучшие веса
+        h = np.tanh(x @ w1 + b1)  # скрытый слой обучающих входов
+        tr_loss = float(np.mean((h @ w2 + b2 - y) ** 2)) * sy * sy  # ошибка обучения в исходном масштабе: mean((h·w2 + b2 − y)²)·sy²
+        hv = np.tanh(xv @ w1 + b1)  # скрытый слой проверочных входов
+        predv = (hv @ w2 + b2).reshape(-1) * sy  # проверочный прогноз в исходном масштабе: predv·sy
+        val_loss = float(np.mean((predv - np.asarray(val_targets, dtype=float)) ** 2))  # проверочная ошибка val_loss = mean((predv − val_targets)²)
+        exact = float(  # доля точных попаданий (начало выражения)
+            np.mean(  # начало mean
+                np.rint(predv).astype(np.int64)  # округлённый прогноз как целое
+                == np.asarray(val_targets, dtype=np.int64)  # сравнение с целым ответом; доля совпадений
             )
-        )
-        return NeuralFiber(
-            len(inputs[0]), sx, sy, w1, b1, w2, b2, tr_loss, val_loss, exact
+        )  # конец mean
+        return NeuralFiber(  # создать слой с найденными параметрами
+            len(inputs[0]), sx, sy, w1, b1, w2, b2, tr_loss, val_loss, exact  # arity, sx, sy, w1, b1, w2, b2, ошибка обучения, ошибка проверки, точность
         )
 
     def predict(self, xs: Sequence[int]) -> float:
-        if len(xs) != self.arity:
-            raise ValueError("wrong neural fiber arity")
-        x = np.asarray(xs, dtype=np.float64).reshape(1, -1) / self.input_scale
-        return float(
-            (np.tanh(x @ self.w1 + self.b1) @ self.w2 + self.b2)[0, 0]
-            * self.target_scale
+        """Прогноз слоя для одного входа.
+
+            »    xs: вход длины arity. Возврат: (tanh((x/sx)·w1 + b1)·w2 + b2)·sy — число в исходном масштабе."""
+        if len(xs) != self.arity:  # проверка числа входов
+            raise ValueError("wrong neural fiber arity")  # ошибка: неверное число входов
+        x = np.asarray(xs, dtype=np.float64).reshape(1, -1) / self.input_scale  # x — строка (1, arity) из xs, делённая на input_scale
+        return float(  # возврат числа (начало выражения)
+            (np.tanh(x @ self.w1 + self.b1) @ self.w2 + self.b2)[0, 0]  # прогноз сети tanh(x·w1 + b1)·w2 + b2
+            * self.target_scale  # умножение на target_scale
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "arity": self.arity,
-            "input_scale": self.input_scale,
-            "target_scale": self.target_scale,
-            "w1": self.w1.tolist(),
-            "b1": self.b1.tolist(),
-            "w2": self.w2.tolist(),
-            "b2": self.b2.tolist(),
-            "train_loss": self.train_loss,
-            "validation_loss": self.validation_loss,
-            "validation_exact_accuracy": self.validation_exact_accuracy,
+        """Сохранить слой в словарь для записи в JSON.
+
+            »    Возврат: словарь с arity, масштабами, весами (как вложенные списки) и метриками качества."""
+        return {  # начало словаря
+            "arity": self.arity,  # число входов
+            "input_scale": self.input_scale,  # множитель входов
+            "target_scale": self.target_scale,  # множитель ответов
+            "w1": self.w1.tolist(),  # w1 как список
+            "b1": self.b1.tolist(),  # b1 как список
+            "w2": self.w2.tolist(),  # w2 как список
+            "b2": self.b2.tolist(),  # b2 как список
+            "train_loss": self.train_loss,  # ошибка обучения
+            "validation_loss": self.validation_loss,  # ошибка проверки
+            "validation_exact_accuracy": self.validation_exact_accuracy,  # доля точных попаданий
         }
 
-    @staticmethod
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def from_dict(d: dict[str, Any]) -> "NeuralFiber":
-        return NeuralFiber(
-            int(d["arity"]),
-            float(d["input_scale"]),
-            float(d["target_scale"]),
-            np.asarray(d["w1"], dtype=np.float64),
-            np.asarray(d["b1"], dtype=np.float64),
-            np.asarray(d["w2"], dtype=np.float64),
-            np.asarray(d["b2"], dtype=np.float64),
-            float(d.get("train_loss", float("nan"))),
-            float(d.get("validation_loss", float("nan"))),
-            float(d.get("validation_exact_accuracy", float("nan"))),
+        """Восстановить слой из словаря.
+
+            »    d: словарь вида to_dict(). Возврат: NeuralFiber."""
+        return NeuralFiber(  # создать слой
+            int(d["arity"]),  # число входов
+            float(d["input_scale"]),  # множитель входов
+            float(d["target_scale"]),  # множитель ответов
+            np.asarray(d["w1"], dtype=np.float64),  # w1
+            np.asarray(d["b1"], dtype=np.float64),  # b1
+            np.asarray(d["w2"], dtype=np.float64),  # w2
+            np.asarray(d["b2"], dtype=np.float64),  # b2
+            float(d.get("train_loss", float("nan"))),  # ошибка обучения (nan, если ключа нет)
+            float(d.get("validation_loss", float("nan"))),  # ошибка проверки (nan, если ключа нет)
+            float(d.get("validation_exact_accuracy", float("nan"))),  # точность (nan, если ключа нет)
         )
 
 
-# --------------------------------- Expert store ---------------------------------
 
+# --------------------------------- Хранилище экспертов ---------------------------------
 
-@dataclass
+@dataclass  # изменяемый класс данных
 class Expert:
-    name: str
-    family: str
-    program: Program
-    domains: tuple[tuple[int, ...], ...]
-    valid_rule: str
-    code_length: int
-    neural: Optional[NeuralFiber] = None
-    exhaustive_checks: int = 0
-    exhaustive_errors: int = 0
-    parents: tuple[str, ...] = ()
+    """Эксперт: найденная программа для задачи и область её применимости.
+
+                name: имя; family: семейство задач; program: программа; domains: допустимые значения каждого входа;
+                valid_rule: правило отсева входов; code_length: длина описания в битах; neural: необязательная нейросеть;
+        »    exhaustive_checks, exhaustive_errors: число проверок и ошибок при полной проверке; parents: имена экспертов-родителей."""
+    name: str  # имя эксперта
+    family: str  # семейство задач
+    program: Program  # программа эксперта
+    domains: tuple[tuple[int, ...], ...]  # допустимые значения входов
+    valid_rule: str  # правило отсева входов
+    code_length: int  # длина описания в битах
+    neural: Optional[NeuralFiber] = None  # нейросеть-приближение, по умолчанию нет
+    exhaustive_checks: int = 0  # число выполненных проверок
+    exhaustive_errors: int = 0  # число найденных ошибок
+    parents: tuple[str, ...] = ()  # имена экспертов-родителей, по умолчанию пусто
 
     def supports(self, xs: Sequence[int]) -> bool:
-        if len(xs) != len(self.domains):
-            return False
-        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):
-            return False
-        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:
-            return False
-        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):
-            return False
-        return True
+        """Проверить, применим ли эксперт к входу xs.
+
+                    xs: вход. Возврат: истина, если длина совпадает с числом областей, все значения в своих областях
+            »    и выполнено правило valid_rule ("nonzero_y": xs[1] ≠ 0; "ordered_yz": xs[1] ≤ xs[2])."""
+        if len(xs) != len(self.domains):  # длина обязана совпадать с числом областей
+            return False  # ложь при несовпадении длины
+        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):  # истина, если хотя бы одно значение вне своей области
+            return False  # ложь
+        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило nonzero_y и xs[1] = 0
+            return False  # ложь
+        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило ordered_yz и xs[1] > xs[2]
+            return False  # ложь
+        return True  # иначе применим
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "family": self.family,
-            "program": self.program.to_dict(),
-            "domains": [list(d) for d in self.domains],
-            "valid_rule": self.valid_rule,
-            "code_length": self.code_length,
-            "neural": self.neural.to_dict() if self.neural else None,
-            "exhaustive_checks": self.exhaustive_checks,
-            "exhaustive_errors": self.exhaustive_errors,
-            "parents": list(self.parents),
+        """Сохранить эксперта в словарь для записи в JSON.
+
+            »    Возврат: словарь со всеми полями; program — через to_dict(), neural — словарь или None."""
+        return {  # начало словаря
+            "name": self.name,  # имя
+            "family": self.family,  # семейство
+            "program": self.program.to_dict(),  # программа
+            "domains": [list(d) for d in self.domains],  # области как списки списков
+            "valid_rule": self.valid_rule,  # правило отсева
+            "code_length": self.code_length,  # длина описания
+            "neural": self.neural.to_dict() if self.neural else None,  # нейросеть, если есть
+            "exhaustive_checks": self.exhaustive_checks,  # число проверок
+            "exhaustive_errors": self.exhaustive_errors,  # число ошибок
+            "parents": list(self.parents),  # родители как список
         }
 
-    @staticmethod
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def from_dict(d: dict[str, Any]) -> "Expert":
-        return Expert(
-            str(d["name"]),
-            str(d["family"]),
-            Program.from_dict(d["program"]),
-            tuple(tuple(int(v) for v in x) for x in d["domains"]),
-            str(d["valid_rule"]),
-            int(d["code_length"]),
-            NeuralFiber.from_dict(d["neural"]) if d.get("neural") else None,
-            int(d.get("exhaustive_checks", 0)),
-            int(d.get("exhaustive_errors", 0)),
-            tuple(str(x) for x in d.get("parents", [])),
+        """Восстановить эксперта из словаря.
+
+            »    d: словарь вида to_dict(). Возврат: Expert."""
+        return Expert(  # создать эксперта
+            str(d["name"]),  # имя
+            str(d["family"]),  # семейство
+            Program.from_dict(d["program"]),  # программа
+            tuple(tuple(int(v) for v in x) for x in d["domains"]),  # области — кортежи целых
+            str(d["valid_rule"]),  # правило отсева
+            int(d["code_length"]),  # длина описания
+            NeuralFiber.from_dict(d["neural"]) if d.get("neural") else None,  # нейросеть, если она сохранена
+            int(d.get("exhaustive_checks", 0)),  # число проверок (0, если ключа нет)
+            int(d.get("exhaustive_errors", 0)),  # число ошибок (0, если ключа нет)
+            tuple(str(x) for x in d.get("parents", [])),  # родители — кортеж строк
         )
 
 
-@dataclass
+@dataclass  # изменяемый класс данных
 class GrowthEvent:
-    version: int
-    task: str
-    action: str
-    reason: str
-    program: str = ""
-    code_length: int = 0
-    train_examples: int = 0
-    validation_examples: int = 0
-    exact_accuracy: float = 0.0
+    """Запись о событии роста: что и почему добавлено.
+
+                version: номер версии; task: задача; action: действие; reason: причина; program: текст программы;
+        »    code_length: длина описания в битах; train_examples, validation_examples: число примеров; exact_accuracy: точность."""
+    version: int  # номер версии
+    task: str  # задача
+    action: str  # действие
+    reason: str  # причина
+    program: str = ""  # текст программы, по умолчанию пусто
+    code_length: int = 0  # длина описания, по умолчанию 0
+    train_examples: int = 0  # число обучающих примеров
+    validation_examples: int = 0  # число проверочных примеров
+    exact_accuracy: float = 0.0  # точность, по умолчанию 0
 
 
 def _bounded_int(value: Any, lo: int, hi: int) -> int:
-    iv = int(value)
-    if iv < lo or iv > hi:
-        raise ValueError(f"integer argument must be in [{lo},{hi}]")
-    return iv
+    """Целое значение в границах [lo, hi].
+
+        »    value: приводимое к целому; lo, hi — границы. Вне границ — ValueError. Возврат: int(value)."""
+    iv = int(value)  # привести к целому
+    if iv < lo or iv > hi:  # истина, если вне границ
+        raise ValueError(f"integer argument must be in [{lo},{hi}]")  # ошибка: аргумент вне [lo, hi]
+    return iv  # вернуть целое
 
 
-class SafeExpression:
-    """Bounded arithmetic/logic expression interpreter; never uses eval()."""
+class SafeExpression:  # класс без декоратора dataclass
+    """Ограниченный интерпретатор арифметико-логических выражений по синтаксическому дереву Python.
 
-    BINOPS = {
-        ast.Add: lambda a, b: a + b,
-        ast.Sub: lambda a, b: a - b,
-        ast.Mult: lambda a, b: a * b,
-        ast.Div: lambda a, b: a / b,
-        ast.FloorDiv: lambda a, b: a // b,
-        ast.Mod: lambda a, b: a % b,
-        ast.Pow: lambda a, b: a**b,
-        ast.BitAnd: lambda a, b: int(a) & int(b),
-        ast.BitOr: lambda a, b: int(a) | int(b),
-        ast.BitXor: lambda a, b: int(a) ^ int(b),
-        ast.LShift: lambda a, b: int(a) << int(b),
-        ast.RShift: lambda a, b: int(a) >> int(b),
-    }
-    UNARY = {
-        ast.UAdd: lambda a: +a,
-        ast.USub: lambda a: -a,
-        ast.Invert: lambda a: ~int(a),
-        ast.Not: lambda a: int(not bool(a)),
-    }
-    CMP = {
-        ast.Eq: lambda a, b: a == b,
-        ast.NotEq: lambda a, b: a != b,
-        ast.Lt: lambda a, b: a < b,
-        ast.LtE: lambda a, b: a <= b,
-        ast.Gt: lambda a, b: a > b,
-        ast.GtE: lambda a, b: a >= b,
-    }
-    CALLS = {
-        "abs": abs,
-        "min": min,
-        "max": max,
-        "gcd": math.gcd,
-        "lcm": math.lcm,
-        "sign": _sign,
-        "bit_not8": _bit_not8,
-        "clamp": lambda x, lo, hi: min(max(x, lo), hi),
-        "nand8": _bit_nand8,
-        "nor8": _bit_nor8,
-        "xnor8": _bit_xnor8,
-        "sqrt": math.sqrt,
-        "exp": math.exp,
-        "log": math.log,
-        "log2": math.log2,
-        "log10": math.log10,
-        "sin": math.sin,
-        "cos": math.cos,
-        "tan": math.tan,
-        "asin": math.asin,
-        "acos": math.acos,
-        "atan": math.atan,
-        "atan2": math.atan2,
-        "sinh": math.sinh,
-        "cosh": math.cosh,
-        "tanh": math.tanh,
-        "floor": math.floor,
-        "ceil": math.ceil,
-        "hypot": math.hypot,
-        "degrees": math.degrees,
-        "radians": math.radians,
-        "factorial": lambda n: math.factorial(_bounded_int(n, 0, 1000)),
-        "comb": lambda n, k: math.comb(
-            _bounded_int(n, 0, 1000), _bounded_int(k, 0, 1000)
-        ),
-        "perm": lambda n, k=None: math.perm(
-            _bounded_int(n, 0, 1000), None if k is None else _bounded_int(k, 0, 1000)
-        ),
-    }
+                Функция eval() не используется: дерево обходится вручную, число узлов и размер результата ограничены.
+        »    Таблицы BINOPS, UNARY, CMP, CALLS задают допустимые операции и вызовы. evaluate(выражение, переменные) — вход."""
 
-    def evaluate(
-        self, expression: str, variables: dict[str, int | float]
-    ) -> int | float | bool:
-        if len(expression) > 1000:
-            raise ValueError("expression too long")
-        tree = ast.parse(expression, mode="eval")
-        nodes = list(ast.walk(tree))
-        if len(nodes) > 200:
-            raise ValueError("expression too complex")
-        result = self._visit(tree.body, variables)
-        if isinstance(result, (int, np.integer)) and int(result).bit_length() > 4096:
-            raise OverflowError("result exceeds 4096-bit safety cap")
-        if isinstance(result, (float, np.floating)) and not math.isfinite(
-            float(result)
-        ):
-            raise OverflowError("non-finite floating-point result")
-        return result
+    BINOPS = {  # бинарные операции: класс узла -> функция
+        ast.Add: lambda a, b: a + b,  # сложение
+        ast.Sub: lambda a, b: a - b,  # вычитание
+        ast.Mult: lambda a, b: a * b,  # умножение
+        ast.Div: lambda a, b: a / b,  # деление
+        ast.FloorDiv: lambda a, b: a // b,  # деление с округлением вниз
+        ast.Mod: lambda a, b: a % b,  # остаток
+        ast.Pow: lambda a, b: a**b,  # степень
+        ast.BitAnd: lambda a, b: int(a) & int(b),  # побитовое «и»
+        ast.BitOr: lambda a, b: int(a) | int(b),  # побитовое «или»
+        ast.BitXor: lambda a, b: int(a) ^ int(b),  # исключающее «или»
+        ast.LShift: lambda a, b: int(a) << int(b),  # сдвиг влево
+        ast.RShift: lambda a, b: int(a) >> int(b),  # сдвиг вправо
+    }  # конец таблицы
+    UNARY = {  # унарные операции: класс узла -> функция
+        ast.UAdd: lambda a: +a,  # унарный плюс
+        ast.USub: lambda a: -a,  # унарный минус
+        ast.Invert: lambda a: ~int(a),  # побитовая инверсия
+        ast.Not: lambda a: int(not bool(a)),  # логическое «не» как 0 или 1
+    }  # конец таблицы
+    CMP = {  # сравнения: класс узла -> функция
+        ast.Eq: lambda a, b: a == b,  # равно
+        ast.NotEq: lambda a, b: a != b,  # не равно
+        ast.Lt: lambda a, b: a < b,  # меньше
+        ast.LtE: lambda a, b: a <= b,  # меньше или равно
+        ast.Gt: lambda a, b: a > b,  # больше
+        ast.GtE: lambda a, b: a >= b,  # больше или равно
+    }  # конец таблицы
+    CALLS = {  # допустимые вызовы функций: имя -> функция
+        "abs": abs,  # модуль
+        "min": min,  # минимум
+        "max": max,  # максимум
+        "gcd": math.gcd,  # наибольший общий делитель
+        "lcm": math.lcm,  # наименьшее общее кратное
+        "sign": _sign,  # знак
+        "bit_not8": _bit_not8,  # побитовое «не» в байте
+        "clamp": lambda x, lo, hi: min(max(x, lo), hi),  # ограничение диапазоном
+        "nand8": _bit_nand8,  # не-и в байте
+        "nor8": _bit_nor8,  # не-или в байте
+        "xnor8": _bit_xnor8,  # эквивалентность в байте
+        "sqrt": math.sqrt,  # квадратный корень
+        "exp": math.exp,  # экспонента
+        "log": math.log,  # натуральный логарифм
+        "log2": math.log2,  # логарифм по основанию 2
+        "log10": math.log10,  # логарифм по основанию 10
+        "sin": math.sin,  # синус
+        "cos": math.cos,  # косинус
+        "tan": math.tan,  # тангенс
+        "asin": math.asin,  # арксинус
+        "acos": math.acos,  # арккосинус
+        "atan": math.atan,  # арктангенс
+        "atan2": math.atan2,  # арктангенс двух аргументов
+        "sinh": math.sinh,  # гиперболический синус
+        "cosh": math.cosh,  # гиперболический косинус
+        "tanh": math.tanh,  # гиперболический тангенс
+        "floor": math.floor,  # округление вниз
+        "ceil": math.ceil,  # округление вверх
+        "hypot": math.hypot,  # длина гипотенузы √(a² + b²)
+        "degrees": math.degrees,  # радианы в градусы
+        "radians": math.radians,  # градусы в радианы
+        "factorial": lambda n: math.factorial(_bounded_int(n, 0, 1000)),  # факториал n, n в границах 0..1000
+        "comb": lambda n, k: math.comb(  # число сочетаний C(n, k) (начало выражения)
+            _bounded_int(n, 0, 1000), _bounded_int(k, 0, 1000)  # n и k в границах 0..1000
+        ),  # конец выражения
+        "perm": lambda n, k=None: math.perm(  # число размещений P(n, k) (начало выражения); k по умолчанию нет — тогда n!
+            _bounded_int(n, 0, 1000), None if k is None else _bounded_int(k, 0, 1000)  # n в границах 0..1000; k в границах 0..1000 или None
+        ),  # конец выражения
+    }  # конец таблицы вызовов
+
+    def evaluate(  # вычислить выражение (начало сигнатуры)
+        self, expression: str, variables: dict[str, int | float]  # expression — текст выражения, variables — значения переменных
+    ) -> int | float | bool:  # возврат: число или истина/ложь
+        """Вычислить значение выражения с подставленными переменными.
+
+                    expression: текст выражения Python; variables: словарь «имя -> число».
+                    Ограничения: длина текста ≤ 1000, узлов ≤ 200, целый результат ≤ 4096 бит, дробный результат конечен.
+            »    Возврат: число или логическое значение."""
+        if len(expression) > 1000:  # длина текста не больше 1000
+            raise ValueError("expression too long")  # ошибка: выражение слишком длинное
+        tree = ast.parse(expression, mode="eval")  # разобрать выражение как выражение (не операторы)
+        nodes = list(ast.walk(tree))  # все узлы дерева
+        if len(nodes) > 200:  # узлов не больше 200
+            raise ValueError("expression too complex")  # ошибка: выражение слишком сложное
+        result = self._visit(tree.body, variables)  # вычислить корень дерева
+        if isinstance(result, (int, np.integer)) and int(result).bit_length() > 4096:  # целый результат не длиннее 4096 бит
+            raise OverflowError("result exceeds 4096-bit safety cap")  # ошибка переполнения
+        if isinstance(result, (float, np.floating)) and not math.isfinite(  # дробный результат обязан быть конечным (начало условия)
+            float(result)  # приведение к float
+        ):  # конец условия
+            raise OverflowError("non-finite floating-point result")  # ошибка: не конечный дробный результат
+        return result  # вернуть результат
 
     def _visit(self, node: ast.AST, variables: dict[str, int | float]):
-        if isinstance(node, ast.Constant) and isinstance(
-            node.value, (int, float, bool)
-        ):
-            if isinstance(node.value, float) and not math.isfinite(node.value):
-                raise ValueError("non-finite numeric literal")
-            return node.value
-        if isinstance(node, ast.Name):
-            if node.id in {"pi", "e", "tau"}:
-                return {"pi": math.pi, "e": math.e, "tau": math.tau}[node.id]
-            if node.id not in variables:
-                raise ValueError(f"unknown variable: {node.id}")
-            value = variables[node.id]
-            if isinstance(value, float):
-                if not math.isfinite(value) or abs(value) > 1e12:
-                    raise OverflowError("floating input outside safe finite range")
-            elif abs(int(value)).bit_length() > 1024:
-                raise OverflowError("input exceeds 1024-bit safety cap")
-            return value
-        if isinstance(node, ast.BinOp) and type(node.op) in self.BINOPS:
-            a, b = self._visit(node.left, variables), self._visit(node.right, variables)
-            if isinstance(node.op, ast.Pow) and abs(float(b)) > 64:
-                raise ValueError("absolute exponent must be at most 64")
-            if isinstance(node.op, (ast.LShift, ast.RShift)) and not (
-                0 <= int(b) <= 4096
-            ):
-                raise ValueError("shift must be in [0,4096]")
-            return self.BINOPS[type(node.op)](a, b)
-        if isinstance(node, ast.UnaryOp) and type(node.op) in self.UNARY:
-            return self.UNARY[type(node.op)](self._visit(node.operand, variables))
-        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
-            vals = [self._visit(v, variables) for v in node.values]
-            return int(
-                all(bool(v) for v in vals)
-                if isinstance(node.op, ast.And)
-                else any(bool(v) for v in vals)
+        """Вычислить узел дерева с подстановкой переменных.
+
+                    node: узел синтаксического дерева; variables: значения переменных. Возврат: число или логическое значение.
+            »    Константы, имена (pi, e, tau), бинарные и унарные операции, «и»/«или» вычисляются напрямую."""
+        if isinstance(node, ast.Constant) and isinstance(  # узел-константа числа или логического значения (начало условия)
+            node.value, (int, float, bool)  # конец условия типа значения
+        ):  # конец условия
+            if isinstance(node.value, float) and not math.isfinite(node.value):  # дробная константа обязана быть конечной
+                raise ValueError("non-finite numeric literal")  # ошибка: не конечный числовой литерал
+            return node.value  # вернуть константу
+        if isinstance(node, ast.Name):  # узел-имя
+            if node.id in {"pi", "e", "tau"}:  # имя из набора констант pi, e, tau
+                return {"pi": math.pi, "e": math.e, "tau": math.tau}[node.id]  # значение константы
+            if node.id not in variables:  # имя не задано в variables
+                raise ValueError(f"unknown variable: {node.id}")  # ошибка: неизвестная переменная
+            value = variables[node.id]  # взять значение переменной
+            if isinstance(value, float):  # дробное значение
+                if not math.isfinite(value) or abs(value) > 1e12:  # оно обязано быть конечным и не превосходить 10¹² по модулю
+                    raise OverflowError("floating input outside safe finite range")  # ошибка переполнения
+            elif abs(int(value)).bit_length() > 1024:  # целое значение длиннее 1024 бит
+                raise OverflowError("input exceeds 1024-bit safety cap")  # ошибка переполнения
+            return value  # вернуть значение
+        if isinstance(node, ast.BinOp) and type(node.op) in self.BINOPS:  # бинарная операция из таблицы BINOPS
+            a, b = self._visit(node.left, variables), self._visit(node.right, variables)  # a, b — значения левой и правой частей
+            if isinstance(node.op, ast.Pow) and abs(float(b)) > 64:  # степень: |b| ≤ 64
+                raise ValueError("absolute exponent must be at most 64")  # ошибка: модуль показателя больше 64
+            if isinstance(node.op, (ast.LShift, ast.RShift)) and not (  # сдвиг: b в границах 0..4096 (начало условия)
+                0 <= int(b) <= 4096  # сдвиг b в границах от 0 до 4096
+            ):  # конец условия
+                raise ValueError("shift must be in [0,4096]")  # ошибка: сдвиг вне [0, 4096]
+            return self.BINOPS[type(node.op)](a, b)  # применить операцию к a, b
+        if isinstance(node, ast.UnaryOp) and type(node.op) in self.UNARY:  # унарная операция из таблицы UNARY
+            return self.UNARY[type(node.op)](self._visit(node.operand, variables))  # применить операцию к значению операнда
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):  # логическая операция «и» или «или»
+            vals = [self._visit(v, variables) for v in node.values]  # значения всех операндов
+            return int(  # вернуть 0 или 1 (начало выражения)
+                all(bool(v) for v in vals)  # истина, если все значения истинны
+                if isinstance(node.op, ast.And)  # условие: операция «и»
+                else any(bool(v) for v in vals)  # иначе «или»: хотя бы одно значение истинно
             )
-        if isinstance(node, ast.Compare):
-            left = self._visit(node.left, variables)
-            ok = True
-            for op, comparator in zip(node.ops, node.comparators):
-                if type(op) not in self.CMP:
-                    raise ValueError("comparison operator not allowed")
-                right = self._visit(comparator, variables)
-                ok = ok and bool(self.CMP[type(op)](left, right))
-                left = right
-            return int(ok)
-        if isinstance(node, ast.IfExp):
-            cond = self._visit(node.test, variables)
-            return self._visit(node.body if bool(cond) else node.orelse, variables)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in self.CALLS
-        ):
-            if node.keywords:
-                raise ValueError("keyword arguments are not supported")
-            args = [self._visit(a, variables) for a in node.args]
-            return self.CALLS[node.func.id](*args)
-        raise ValueError(f"unsupported syntax: {type(node).__name__}")
+        if isinstance(node, ast.Compare):  # узел-сравнение
+            left = self._visit(node.left, variables)  # левое значение
+            ok = True  # цепочка сравнений пока истинна
+            for op, comparator in zip(node.ops, node.comparators):  # по парам (операция, правый операнд)
+                if type(op) not in self.CMP:  # операция сравнения не из таблицы CMP
+                    raise ValueError("comparison operator not allowed")  # ошибка: операция сравнения не разрешена
+                right = self._visit(comparator, variables)  # правое значение
+                ok = ok and bool(self.CMP[type(op)](left, right))  # ok = ok и (left операция right)
+                left = right  # следующий операнд сравнивается с текущим правым
+            return int(ok)  # вернуть 1 или 0
+        if isinstance(node, ast.IfExp):  # узел-условное выражение «a if cond else b»
+            cond = self._visit(node.test, variables)  # значение условия
+            return self._visit(node.body if bool(cond) else node.orelse, variables)  # вычислить ветку body, если cond истинно, иначе else
+        if (  # узел-вызов разрешённой функции (начало условия)
+            isinstance(node, ast.Call)  # это вызов
+            and isinstance(node.func, ast.Name)  # вызывается имя
+            and node.func.id in self.CALLS  # имя есть в таблице CALLS
+        ):  # конец условия
+            if node.keywords:  # есть именованные аргументы
+                raise ValueError("keyword arguments are not supported")  # ошибка: именованные аргументы не поддерживаются
+            args = [self._visit(a, variables) for a in node.args]  # значения позиционных аргументов
+            return self.CALLS[node.func.id](*args)  # вызвать функцию с аргументами
+        raise ValueError(f"unsupported syntax: {type(node).__name__}")  # прочий синтаксис не поддерживается
 
 
-class GrowingMathProcessor:
-    """An expert-growing processor with exact finite-domain guards and neural fibers."""
+class GrowingMathProcessor:  # класс без декоратора dataclass
+    """Процессор, растущий за счёт экспертов.
+
+                Хранит словарь экспертов «имя задачи -> Expert» с точными проверками на конечных областях
+                и необязательными нейронными слоями. learn(spec) ищет программу для задачи; predict(name, xs)
+        »    даёт точный ответ или отказ; evaluate_expression считает выражение ограниченным интерпретатором."""
 
     def __init__(self, lookup_limit: int = 16, mdl_lambda: float = 0.001):
-        self.lookup_limit = int(lookup_limit)
-        self.mdl_lambda = float(mdl_lambda)
-        self.experts: dict[str, Expert] = {}
-        self.version = 0
-        self.growth_log: list[GrowthEvent] = []
-        self.total_commits = 0
-        self.total_holds = 0
+        """Создать пустой процессор.
+
+                    lookup_limit: предел размера области для таблицы ответов; mdl_lambda: вес длины кода в оценке.
+            »    Инициализирует experts, version, growth_log, total_commits, total_holds."""
+        self.lookup_limit = int(lookup_limit)  # предел таблицы ответов как целое
+        self.mdl_lambda = float(mdl_lambda)  # вес длины кода как дробное
+        self.experts: dict[str, Expert] = {}  # словарь экспертов, изначально пуст
+        self.version = 0  # номер версии модели 0
+        self.growth_log: list[GrowthEvent] = []  # журнал событий роста, пуст
+        self.total_commits = 0  # счётчик закреплений 0
+        self.total_holds = 0  # счётчик отказов 0
 
     def _candidate_list(self, spec: TaskSpec) -> list[Program]:
-        if spec.family == "BoolVenn":
-            return [Program(2, venn_mask=m) for m in range(16)]
-        return candidate_programs(spec.arity)
+        """Список программ-кандидатов для задачи.
 
-    @staticmethod
+                    spec: описание задачи. Для семейства BoolVenn — все 16 масок; иначе candidate_programs(arity).
+            »    Возврат: список Program."""
+        if spec.family == "BoolVenn":  # семейство булевых функций
+            return [Program(2, venn_mask=m) for m in range(16)]  # 16 программ с масками 0..15
+        return candidate_programs(spec.arity)  # кандидаты по числу входов
+
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def _same(a: Any, b: Any) -> bool:
-        try:
-            return int(a) == int(b)
-        except Exception:
-            return False
+        """Сравнить a и b как целые; при невозможности — ложь.
 
-    def learn(
-        self,
-        spec: TaskSpec,
-        seed: int = 0,
-        train_fraction: float = 0.70,
-        poison_one_label: bool = False,
-        train_neural: bool = True,
-    ) -> GrowthEvent:
-        """Discover and attempt to commit one expert from supervised examples.
+            »    Возврат: int(a) == int(b), а при любой ошибке приведения — False."""
+        try:  # попытаться сравнить
+            return int(a) == int(b)  # равенство целых значений
+        except Exception:  # любая ошибка приведения
+            return False  # ложь
 
-        The oracle is used only by this offline experiment's validation/exhaustive
-        audit. In deployed use, replace it with an independently supplied verifier.
-        """
-        if spec.name in self.experts:
-            ev = GrowthEvent(self.version, spec.name, "REUSE", "already learned")
-            self.growth_log.append(ev)
-            return ev
-        domain = spec.inputs()
-        if not domain:
-            return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)
-        rng = np.random.default_rng(seed)
-        perm = rng.permutation(len(domain))
-        if spec.family == "BoolVenn":
-            n_train = max(1, len(domain) - 1)  # keep one truth-table atom as holdout
-        else:
-            n_train = max(
-                1, min(len(domain) - 1, int(round(len(domain) * train_fraction)))
-            )
-        train_idx, val_idx = perm[:n_train], perm[n_train:]
-        train_x = [domain[int(i)] for i in train_idx]
-        val_x = [domain[int(i)] for i in val_idx]
-        all_y = {xs: int(spec.teacher(*xs)) for xs in domain}
-        train_y = [all_y[xs] for xs in train_x]
-        val_y = [all_y[xs] for xs in val_x]
-        if poison_one_label and train_y:
-            # deterministic corruption used as an adversarial hold/rollback test
-            train_y[0] = int(train_y[0]) + 1
+    def learn(  # метод learn: найти и закрепить эксперта
+        self,  # описание задачи
+        spec: TaskSpec,  # зерно случайности, по умолчанию 0
+        seed: int = 0,  # доля обучающих примеров, по умолчанию 0.70
+        train_fraction: float = 0.70,  # портить ли одну метку, по умолчанию нет
+        poison_one_label: bool = False,  # обучать ли нейросеть, по умолчанию да
+        train_neural: bool = True,  # конец сигнатуры
+    ) -> GrowthEvent:  # возврат — событие роста
+        """Найти и попытаться закрепить одного эксперта по обучающим примерам.
 
-        # Fit an approximate neural fiber from the same visible training examples.
-        neural = None
-        if train_neural and val_x:
-            try:
-                neural = NeuralFiber.fit(
-                    train_x, train_y, val_x, val_y, seed=seed + 991, epochs=120
-                )
-            except (FloatingPointError, ValueError, np.linalg.LinAlgError):
-                neural = None
+                    spec: задача; seed: зерно; train_fraction: доля обучающих примеров; poison_one_label: испортить одну метку;
+                    train_neural: обучать ли нейросеть. Возврат: GrowthEvent с действием REUSE, HOLD или COMMIT.
+                    Ход: (1) при уже известной задаче — REUSE; (2) случайное разбиение области на обучение и проверку;
+                    n_train = max(1, round(train_fraction·N)) (для BoolVenn N − 1); (3) нейросеть на обучающих примерах;
+                    (4) кандидаты, верные на всём обучении; (5) проверка на holdout и на всей области;
+            »    (6) оценка mdl = λ·code_length, code_length = cost ≤ 32; (7) закрепление."""
+        """Найти и попытаться закрепить одного эксперта по обучающим примерам.
 
-        candidates = self._candidate_list(spec)
-        train_matches: list[Program] = []
-        for program in candidates:
-            try:
-                if all(
-                    self._same(program.eval(xs), yy) for xs, yy in zip(train_x, train_y)
-                ):
-                    train_matches.append(program)
-            except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                continue
-        train_matches.sort(key=lambda p: (p.cost, p.pretty()))
+                    Учитель (функция-оракул) используется только для проверки и полного перебора в этом офлайновом эксперименте;
+            »    во внедрённой системе его заменяет независимо поставляемый проверяющий."""
+        if spec.name in self.experts:  # задача уже изучена
+            ev = GrowthEvent(self.version, spec.name, "REUSE", "already learned")  # событие REUSE «уже изучено»
+            self.growth_log.append(ev)  # добавить событие в журнал
+            return ev  # вернуть событие
+        domain = spec.inputs()  # domain — все допустимые входы задачи
+        if not domain:  # пустая область
+            return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)  # отказ «пустая область»
+        rng = np.random.default_rng(seed)  # генератор с зерном seed
+        perm = rng.permutation(len(domain))  # случайная перестановка номеров входов
+        if spec.family == "BoolVenn":  # семейство булевых функций
+            n_train = max(1, len(domain) - 1)  # n_train = N − 1: один атом таблицы остаётся на проверку
+        else:  # иначе
+            n_train = max(  # n_train = max(1, min(N − 1, round(N·train_fraction))) (начало выражения)
+                1, min(len(domain) - 1, int(round(len(domain) * train_fraction)))  # число обучающих: минимум из N − 1 и round(N·train_fraction)
+            )  # конец max
+        train_idx, val_idx = perm[:n_train], perm[n_train:]  # первые n_train номеров — обучение, остальные — проверка
+        train_x = [domain[int(i)] for i in train_idx]  # обучающие входы
+        val_x = [domain[int(i)] for i in val_idx]  # проверочные входы
+        all_y = {xs: int(spec.teacher(*xs)) for xs in domain}  # ответы учителя на всей области: all_y[xs] = teacher(xs)
+        train_y = [all_y[xs] for xs in train_x]  # обучающие ответы
+        val_y = [all_y[xs] for xs in val_x]  # проверочные ответы
+        if poison_one_label and train_y:  # портить метку и есть обучающие примеры
+            train_y[0] = int(train_y[0]) + 1  # первая обучающая метка увеличена на 1
+            # детерминированное повреждение: состязательная проверка отказа и отката
 
-        # Independent validation first, then exhaustive comparison with the finite oracle.
-        for program in train_matches:
-            try:
-                if not all(
-                    self._same(program.eval(xs), yy) for xs, yy in zip(val_x, val_y)
-                ):
-                    continue
-                errors = 0
-                for xs in domain:
-                    if not self._same(program.eval(xs), all_y[xs]):
-                        errors += 1
-                if errors != 0:
-                    continue
-                # MDL-style objective: exact predictive error plus explicit code length.
-                code_length = int(program.cost)
-                mdl_score = 0.0 + self.mdl_lambda * code_length
-                if not np.isfinite(mdl_score) or code_length > 32:
-                    continue
-                expert = Expert(
-                    spec.name,
-                    spec.family,
-                    program,
-                    spec.domains,
-                    spec.valid_rule,
-                    code_length,
-                    neural,
-                    len(domain),
-                    0,
-                )
-                self.experts[spec.name] = expert
-                self.version += 1
-                self.total_commits += 1
-                ev = GrowthEvent(
-                    self.version,
-                    spec.name,
-                    "COMMIT",
-                    "validation+exhaustive pass",
-                    program.pretty(),
-                    code_length,
-                    len(train_x),
-                    len(val_x),
-                    1.0,
-                )
-                self.growth_log.append(ev)
-                return ev
-            except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                continue
+        neural = None  # нейросети пока нет
+        # Приближающая нейросеть на тех же видимых обучающих примерах.
+        if train_neural and val_x:  # обучать нейросеть и есть проверочные примеры
+            try:  # попытка обучения
+                neural = NeuralFiber.fit(  # обучить слой на обучающих примерах
+                    train_x, train_y, val_x, val_y, seed=seed + 991, epochs=120  # зерно seed + 991, 120 эпох
+                )  # конец вызова
+            except (FloatingPointError, ValueError, np.linalg.LinAlgError):  # численные ошибки обучения
+                neural = None  # нейросеть не создана
 
-        # Finite lookup is allowed only for complete support <= configured limit.
-        if (
-            len(domain) <= self.lookup_limit
-            and not poison_one_label
-            and len(train_x) == len(domain)
-        ):
-            # Current benchmark deliberately has no lookup task; this branch is reserved
-            # for future complete-support micro-domains and does not silently extrapolate.
-            pass
-        return self._hold(
-            spec, "NO_VALIDATED_PROGRAM", len(train_x), len(val_x), neural
-        )
+        candidates = self._candidate_list(spec)  # кандидаты для задачи
+        train_matches: list[Program] = []  # кандидаты, верные на всём обучении
+        for program in candidates:  # по кандидатам
+            try:  # попытка вычисления
+                if all(  # истина, если кандидат верен на всех обучающих примерах (начало all)
+                    self._same(program.eval(xs), yy) for xs, yy in zip(train_x, train_y)  # program(xs) = y для каждой пары (xs, y)
+                ):  # конец all
+                    train_matches.append(program)  # добавить кандидата
+            except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибки вычисления — кандидат пропускается
+                continue  # следующий кандидат
+        train_matches.sort(key=lambda p: (p.cost, p.pretty()))  # сортировка по (стоимость, текст)
 
-    def _hold(
-        self,
-        spec: TaskSpec,
-        reason: str,
-        ntrain: int,
-        nval: int,
-        neural: Optional[NeuralFiber] = None,
-    ) -> GrowthEvent:
-        self.total_holds += 1
-        ev = GrowthEvent(
-            self.version, spec.name, "HOLD", reason, "", 0, ntrain, nval, 0.0
-        )
-        self.growth_log.append(ev)
-        return ev
+        for program in train_matches:  # по кандидатам в порядке возраста
+        # Сначала независимая проверка, затем полное сравнение с конечным оракулом.
+            try:  # попытка
+                if not all(  # неверно хотя бы на одном проверочном примере (начало all)
+                    self._same(program.eval(xs), yy) for xs, yy in zip(val_x, val_y)  # program(xs) = y для проверочных пар
+                ):  # конец all
+                    continue  # кандидат отбрасывается
+                errors = 0  # счётчик ошибок на всей области
+                for xs in domain:  # по всем входам области
+                    if not self._same(program.eval(xs), all_y[xs]):  # ошибка на входе xs
+                        errors += 1  # ошибок стало на одну больше
+                if errors != 0:  # есть ошибки
+                    continue  # кандидат отбрасывается
+                code_length = int(program.cost)  # длина кода = стоимость программы
+                # Оценка в духе минимальной длины описания: точная предсказательная ошибка (здесь 0) плюс явная длина кода.
+                mdl_score = 0.0 + self.mdl_lambda * code_length  # оценка mdl_score = 0 + λ·code_length
+                if not np.isfinite(mdl_score) or code_length > 32:  # оценка не конечна или код длиннее 32
+                    continue  # кандидат отбрасывается
+                expert = Expert(  # создать эксперта
+                    spec.name,  # имя задачи
+                    spec.family,  # семейство
+                    program,  # программа
+                    spec.domains,  # области входов
+                    spec.valid_rule,  # правило отсева
+                    code_length,  # длина кода
+                    neural,  # нейросеть
+                    len(domain),  # число проверок = размер области
+                    0,  # ошибок 0
+                )  # конец описания
+                self.experts[spec.name] = expert  # записать эксперта в словарь
+                self.version += 1  # версия + 1
+                self.total_commits += 1  # счётчик закреплений + 1
+                ev = GrowthEvent(  # событие COMMIT
+                    self.version,  # номер версии
+                    spec.name,  # имя задачи
+                    "COMMIT",  # действие COMMIT
+                    "validation+exhaustive pass",  # причина: проверка и полный перебор пройдены
+                    program.pretty(),  # текст программы
+                    code_length,  # длина кода
+                    len(train_x),  # число обучающих примеров
+                    len(val_x),  # число проверочных примеров
+                    1.0,  # точность 1.0
+                )  # конец описания события
+                self.growth_log.append(ev)  # добавить событие в журнал
+                return ev  # вернуть событие
+            except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления — следующий кандидат
+                continue  # продолжить
+
+        if (  # область не больше lookup_limit (начало условия)
+        # Таблица ответов разрешена только при полной опоре не больше заданного предела.
+            len(domain) <= self.lookup_limit  # размер области не больше lookup_limit
+            and not poison_one_label  # метки не испорчены
+            and len(train_x) == len(domain)  # обучающие примеры — вся область
+        ):  # конец условия
+            pass  # ничего не делать (заготовка)
+        return self._hold(  # отказ «нет проверенной программы»
+            # В текущем наборе задач нет задач на таблицу ответов; ветка оставлена для будущих
+            # полных микрообластей и не экстраполирует молча.
+            spec, "NO_VALIDATED_PROGRAM", len(train_x), len(val_x), neural  # задача, причина, число обучающих и проверочных примеров, нейросеть
+        )  # конец вызова
+
+    def _hold(  # метод _hold: зарегистрировать отказ
+        self,  # задача
+        spec: TaskSpec,  # причина отказа
+        reason: str,  # число обучающих примеров
+        ntrain: int,  # число проверочных примеров
+        nval: int,  # нейросеть, по умолчанию нет
+        neural: Optional[NeuralFiber] = None,  # конец сигнатуры
+    ) -> GrowthEvent:  # возврат — событие роста
+        """Зарегистрировать отказ (HOLD) по задаче.
+
+                    spec: задача; reason: причина; ntrain, nval: число обучающих и проверочных примеров; neural: нейросеть, если обучалась.
+            »    Счётчик total_holds увеличивается на 1. Возврат: GrowthEvent."""
+        self.total_holds += 1  # счётчик отказов + 1
+        ev = GrowthEvent(  # событие HOLD
+            self.version, spec.name, "HOLD", reason, "", 0, ntrain, nval, 0.0  # версия, задача, действие HOLD, причина, без программы и с нулевой длиной кода
+        )  # конец описания события
+        self.growth_log.append(ev)  # добавить в журнал
+        return ev  # вернуть событие
 
     def predict(self, name: str, *xs: int, mode: str = "exact") -> dict[str, Any]:
-        expert = self.experts.get(name)
-        if expert is None:
-            return {"status": "ABSTAIN", "reason": "unknown operation"}
-        if not expert.supports(xs):
-            return {"status": "ABSTAIN", "reason": "outside certified finite domain"}
-        if mode == "exact":
-            return {
-                "status": "OK",
-                "value": expert.program.eval(xs),
-                "source": "verified-symbolic",
-                "model_version": self.version,
-            }
-        if mode == "neural":
-            if expert.neural is None:
-                return {"status": "ABSTAIN", "reason": "neural fiber unavailable"}
-            return {
-                "status": "APPROXIMATE",
-                "value": expert.neural.predict(xs),
-                "source": "neural-fiber-no-exact-guarantee",
-                "model_version": self.version,
-            }
-        raise ValueError("mode must be 'exact' or 'neural'")
+        """Ответ эксперта по имени операции.
+
+                    name: имя операции; xs: вход; mode: "exact" — точная программа, "neural" — нейросеть.
+                    Возврат: словарь со status: ABSTAIN (неизвестная операция или вне области), OK (точное значение)
+            »    или APPROXIMATE (нейросеть без гарантии точности)."""
+        expert = self.experts.get(name)  # взять эксперта по имени
+        if expert is None:  # эксперта нет
+            return {"status": "ABSTAIN", "reason": "unknown operation"}  # отказ: неизвестная операция
+        if not expert.supports(xs):  # вход вне области эксперта
+            return {"status": "ABSTAIN", "reason": "outside certified finite domain"}  # отказ: вне проверенной конечной области
+        if mode == "exact":  # точный режим
+            return {  # начало словаря ответа
+                "status": "OK",  # статус OK
+                "value": expert.program.eval(xs),  # значение программы
+                "source": "verified-symbolic",  # источник — проверенная символьная программа
+                "model_version": self.version,  # версия модели
+            }  # конец словаря
+        if mode == "neural":  # нейронный режим
+            if expert.neural is None:  # нейросети нет
+                return {"status": "ABSTAIN", "reason": "neural fiber unavailable"}  # отказ: нейрослой недоступен
+            return {  # начало словаря ответа
+                "status": "APPROXIMATE",  # статус APPROXIMATE
+                "value": expert.neural.predict(xs),  # прогноз нейросети
+                "source": "neural-fiber-no-exact-guarantee",  # источник — нейрослой без гарантии точности
+                "model_version": self.version,  # версия модели
+            }  # конец словаря
+        raise ValueError("mode must be 'exact' or 'neural'")  # ошибка: режим обязан быть exact или neural
 
     def verify_all(self, specs: Sequence[TaskSpec]) -> dict[str, Any]:
-        records = []
-        total = correct = 0
-        for spec in specs:
-            expert = self.experts.get(spec.name)
-            if expert is None:
-                records.append(
-                    {
-                        "task": spec.name,
-                        "committed": False,
-                        "accuracy": 0.0,
-                        "n": len(spec.inputs()),
-                    }
-                )
-                continue
-            rows = spec.inputs()
-            ok = sum(
-                int(expert.program.eval(xs) == int(spec.teacher(*xs))) for xs in rows
-            )
-            total += len(rows)
-            correct += ok
-            records.append(
-                {
-                    "task": spec.name,
-                    "committed": True,
-                    "accuracy": ok / max(1, len(rows)),
-                    "n": len(rows),
-                    "program": expert.program.pretty(),
-                    "code_length": expert.code_length,
-                }
-            )
-        return {
-            "records": records,
-            "checked": total,
-            "correct": correct,
-            "accuracy": correct / max(1, total),
-            "committed": len(self.experts),
-        }
+        """Проверить всех экспертов по всем задачам specs.
+
+                    Для каждой задачи: если эксперт закреплён — число верных ответов на всех входах и точность ok/max(1, n).
+            »    Возврат: словарь records, checked, correct, accuracy = correct/max(1, checked), committed."""
+        records = []  # записи по задачам
+        total = correct = 0  # всего входов и верных ответов
+        for spec in specs:  # по задачам
+            expert = self.experts.get(spec.name)  # эксперт задачи
+            if expert is None:  # эксперт не закреплён
+                records.append(  # добавить запись (начало словаря)
+                    {  # начало словаря записи
+                        "task": spec.name,  # имя задачи
+                        "committed": False,  # не закреплён
+                        "accuracy": 0.0,  # точность 0
+                        "n": len(spec.inputs()),  # число входов задачи
+                    }  # конец словаря
+                )  # конец вызова append
+                continue  # следующая задача
+            rows = spec.inputs()  # входы задачи
+            ok = sum(  # число верных ответов ok (начало sum)
+                int(expert.program.eval(xs) == int(spec.teacher(*xs))) for xs in rows  # 1, если program(xs) = teacher(xs), суммируется по входам
+            )  # конец sum
+            total += len(rows)  # total = total + число входов
+            correct += ok  # верных ответов стало на ok больше
+            records.append(  # добавить запись (начало словаря)
+                {  # начало словаря записи
+                    "task": spec.name,  # имя задачи
+                    "committed": True,  # закреплён
+                    "accuracy": ok / max(1, len(rows)),  # точность ok / max(1, n)
+                    "n": len(rows),  # число входов
+                    "program": expert.program.pretty(),  # текст программы
+                    "code_length": expert.code_length,  # длина кода
+                }  # конец словаря
+            )  # конец вызова append
+        return {  # возврат — словарь итогов
+            "records": records,  # записи по задачам
+            "checked": total,  # всего проверено входов
+            "correct": correct,  # верных ответов
+            "accuracy": correct / max(1, total),  # точность correct / max(1, total)
+            "committed": len(self.experts),  # число закреплённых экспертов
+        }  # конец словаря
 
     def evaluate_expression(
-        self, expression: str, **variables: int | float
-    ) -> dict[str, Any]:
-        """Evaluate a composed integer/logic expression in the bounded safe DSL."""
-        try:
-            value = SafeExpression().evaluate(expression, variables)
-            return {
-                "status": "OK",
-                "value": value,
-                "source": "safe-expression-dsl",
-                "model_version": self.version,
+        self, expression: str, **variables: int | float  # self, expression — текст выражения, variables — значения переменных по имени
+    ) -> dict[str, Any]:  # возврат — словарь с результатом или ошибкой
+        """Вычислить составное целое или логическое выражение ограниченным интерпретатором.
+
+                    expression: текст выражения; variables: значения переменных по имени.
+                Возврат: словарь со status OK и значением либо status ERROR и текстом причины."""
+        try:  # попытка вычисления
+            value = SafeExpression().evaluate(expression, variables)  # значение выражения через ограниченный интерпретатор
+            return {  # возврат — словарь ответа
+                "status": "OK",  # статус OK
+                "value": value,  # значение выражения
+                "source": "safe-expression-dsl",  # источник — ограниченный язык выражений
+                "model_version": self.version,  # версия модели
             }
-        except (
-            ValueError,
-            TypeError,
-            ZeroDivisionError,
-            OverflowError,
-            SyntaxError,
-        ) as exc:
-            return {
-                "status": "ERROR",
-                "reason": str(exc),
-                "model_version": self.version,
+        except (  # перехват ошибок (начало кортежа типов)
+            ValueError,  # неверное значение
+            TypeError,  # неверный тип
+            ZeroDivisionError,  # деление на ноль
+            OverflowError,  # арифметическое переполнение
+            SyntaxError,  # синтаксическая ошибка
+        ) as exc:  # конец кортежа; exc — исключение
+            return {  # возврат — словарь ошибки
+                "status": "ERROR",  # статус ERROR
+                "reason": str(exc),  # текст причины
+                "model_version": self.version,  # версия модели
             }
 
-    def save(self, path: str | Path) -> None:
-        data = {
-            "format": "HAGI-GrowingMathProcessor",
-            "version": VERSION,
-            "model_version": self.version,
-            "lookup_limit": self.lookup_limit,
-            "mdl_lambda": self.mdl_lambda,
-            "total_commits": self.total_commits,
-            "total_holds": self.total_holds,
-            "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},
-            "growth_log": [vars(x) for x in self.growth_log],
-        }
-        Path(path).write_text(
-            json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
+    def save(self, path: str | Path) -> None:  # сохранить модель в файл JSON
+        data = {  # начало словаря состояния
+            "format": "HAGI-GrowingMathProcessor",  # формат файла
+            "version": VERSION,  # версия схемы
+            "model_version": self.version,  # версия модели
+            "lookup_limit": self.lookup_limit,  # предел таблицы ответов
+            "mdl_lambda": self.mdl_lambda,  # вес длины кода
+            "total_commits": self.total_commits,  # число закреплений
+            "total_holds": self.total_holds,  # число отказов
+            "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},  # эксперты по именам в отсортированном порядке
+            "growth_log": [vars(x) for x in self.growth_log],  # журнал событий — словари полей
+        }  # конец словаря
+        Path(path).write_text(  # записать файл
+            json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"  # JSON с отступом 2 и сортировкой ключей
         )
 
-    @staticmethod
+    @staticmethod  # статический метод — вызывается через класс, без экземпляра
     def load(path: str | Path) -> "GrowingMathProcessor":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("format") != "HAGI-GrowingMathProcessor":
-            raise ValueError("not a HAGI Growing Math Processor state file")
-        model = GrowingMathProcessor(
-            int(data.get("lookup_limit", 16)), float(data.get("mdl_lambda", 0.001))
+        """Загрузить модель из файла JSON.
+
+                path: путь к файлу, записанному save(). Проверяет поле format. Возврат: GrowingMathProcessor."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))  # прочитать и разобрать JSON
+        if data.get("format") != "HAGI-GrowingMathProcessor":  # формат не совпадает
+            raise ValueError("not a HAGI Growing Math Processor state file")  # ошибка: это не файл состояния процессора
+        model = GrowingMathProcessor(  # создать модель
+            int(data.get("lookup_limit", 16)), float(data.get("mdl_lambda", 0.001))  # предел таблицы (по умолчанию 16) и вес длины кода (по умолчанию 0.001)
         )
-        model.version = int(data.get("model_version", 0))
-        model.total_commits = int(data.get("total_commits", 0))
-        model.total_holds = int(data.get("total_holds", 0))
-        model.experts = {
-            k: Expert.from_dict(v) for k, v in data.get("experts", {}).items()
+        model.version = int(data.get("model_version", 0))  # версия модели
+        model.total_commits = int(data.get("total_commits", 0))  # число закреплений
+        model.total_holds = int(data.get("total_holds", 0))  # число отказов
+        model.experts = {  # восстановить экспертов
+            k: Expert.from_dict(v) for k, v in data.get("experts", {}).items()  # каждый эксперт через from_dict
         }
-        model.growth_log = [GrowthEvent(**x) for x in data.get("growth_log", [])]
-        return model
+        model.growth_log = [GrowthEvent(**x) for x in data.get("growth_log", [])]  # журнал событий из словарей полей
+        return model  # вернуть модель
 
 
-# ---------------------------- Autonomous experiment ----------------------------
 
+# ---------------------------- Автономный эксперимент ----------------------------
 
-def run_experiment(
-    seeds: Sequence[int] = (0, 1, 2), out_dir: str = "."
-) -> dict[str, Any]:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    suite = make_task_suite()
-    per_seed = []
-    main_model: Optional[GrowingMathProcessor] = None
-    main_seed = int(seeds[0]) if seeds else 0
-    start = time.time()
-    for seed in seeds:
-        model = GrowingMathProcessor()
-        seed_t0 = time.time()
-        events: list[GrowthEvent] = []
-        # Ordered curriculum: logic -> unary -> arithmetic -> predicates/bitwise -> compositions.
-        stage_order = ["BoolVenn", "unary", "integer-binary", "composed-ternary"]
-        growth_curve = []
-        for stage in stage_order:
-            stage_tasks = [s for s in suite if s.family == stage]
-            # Deterministic within-stage ordering, shuffled by seed to expose order effects.
-            rng = np.random.default_rng(seed + len(stage) * 101)
-            if len(stage_tasks) > 1:
-                order = rng.permutation(len(stage_tasks))
-                stage_tasks = [stage_tasks[int(i)] for i in order]
-            for j, spec in enumerate(stage_tasks):
-                events.append(
-                    model.learn(spec, seed=seed * 1009 + j * 17 + len(spec.name))
-                )
-            growth_curve.append(
-                {
-                    "stage": stage,
-                    "new_experts": len(stage_tasks),
-                    "cumulative_experts": len(model.experts),
-                    "cumulative_code_length": sum(
-                        e.code_length for e in model.experts.values()
-                    ),
-                }
-            )
-        verification = model.verify_all(suite)
-        committed = len(model.experts)
-        neural_scores = [
-            e.neural.validation_exact_accuracy
-            for e in model.experts.values()
-            if e.neural is not None and np.isfinite(e.neural.validation_exact_accuracy)
-        ]
-        neural_rmse = [
-            math.sqrt(max(0.0, e.neural.validation_loss))
-            for e in model.experts.values()
-            if e.neural is not None and np.isfinite(e.neural.validation_loss)
-        ]
-        # Guard audit: every known operation must abstain on an input outside its guard.
-        ood_checks = ood_abstains = 0
-        for spec in suite:
-            if spec.name not in model.experts:
-                continue
-            outside = [d[-1] + 1 for d in spec.domains]
-            result = model.predict(spec.name, *outside)
-            ood_checks += 1
-            ood_abstains += int(result["status"] == "ABSTAIN")
-        # Poison test: one mislabeled ADD example must not create a new committed expert.
-        poison_model = GrowingMathProcessor()
-        add_spec = next(s for s in suite if s.name == "ADD")
-        poison_event = poison_model.learn(
-            add_spec, seed=seed + 44001, poison_one_label=True
-        )
-        # Unknown nontrivial function has 17-point support: finite lookup limit 16 -> hold.
-        prime_spec = TaskSpec(
-            "IS_PRIME",
-            1,
-            (tuple(range(-8, 9)),),
-            lambda x: int(
-                x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))
-            ),
-            family="unseen",
-        )
-        unknown_event = GrowingMathProcessor().learn(prime_spec, seed=seed + 99001)
-        elapsed = time.time() - seed_t0
-        row = {
-            "seed": int(seed),
-            "committed": committed,
-            "expected": len(suite),
-            "commit_rate": committed / len(suite),
-            "symbolic_exact_accuracy": verification["accuracy"],
-            "symbolic_examples_checked": verification["checked"],
-            "neural_holdout_exact_accuracy_mean": (
-                float(np.mean(neural_scores)) if neural_scores else float("nan")
-            ),
-            "neural_holdout_rmse_mean": (
-                float(np.mean(neural_rmse)) if neural_rmse else float("nan")
-            ),
-            "ood_checks": ood_checks,
-            "ood_abstains": ood_abstains,
-            "poison_action": poison_event.action,
-            "unknown_is_prime_action": unknown_event.action,
-            "growth_curve": growth_curve,
-            "elapsed_seconds": elapsed,
-        }
-        per_seed.append(row)
-        if seed == main_seed:
-            main_model = model
-            # Full detail by task for the primary seed.
-            with (out / f"hagi_growing_math_seed{seed}_tasks.csv").open(
-                "w", encoding="utf-8"
-            ) as f:
-                f.write(
-                    "task,family,committed,program,code_length,neural_val_exact_acc,neural_val_mse\n"
-                )
-                for spec in suite:
-                    ex = model.experts.get(spec.name)
-                    if ex is None:
-                        f.write(f"{spec.name},{spec.family},0,,0,,\n")
-                    else:
-                        na = (
-                            ex.neural.validation_exact_accuracy
-                            if ex.neural
-                            else float("nan")
-                        )
-                        nm = ex.neural.validation_loss if ex.neural else float("nan")
-                        prog = ex.program.pretty().replace('"', '""')
-                        f.write(
-                            f'"{spec.name}","{spec.family}",1,"{prog}",{ex.code_length},{na},{nm}\n'
-                        )
-    assert main_model is not None
-    model_path = out / "hagi_growing_math_model.json"
-    main_model.save(model_path)
+def run_experiment(  # run_experiment: провести эксперимент по росту на нескольких зёрнах
+    seeds: Sequence[int] = (0, 1, 2), out_dir: str = "."  # seeds — зёрна случайности, out_dir — каталог результатов
+) -> dict[str, Any]:  # возврат — словарь итогов
+    out = Path(out_dir)  # out — каталог результатов
+    out.mkdir(parents=True, exist_ok=True)  # создать каталог при необходимости
+    suite = make_task_suite()  # набор задач
+    per_seed = []  # строки итогов по зёрнам
+    main_model: Optional[GrowingMathProcessor] = None  # модель основного зерна, пока нет
+    main_seed = int(seeds[0]) if seeds else 0  # основное зерно — первое из списка (0, если список пуст)
+    start = time.time()  # время начала
+    for seed in seeds:  # по зернам
+        model = GrowingMathProcessor()  # новая модель для зерна
+        seed_t0 = time.time()  # время начала зерна
+        events: list[GrowthEvent] = []  # список событий роста
+        stage_order = ["BoolVenn", "unary", "integer-binary", "composed-ternary"]  # порядок стадий по семействам
+        # Упорядоченная программа обучения: логика -> унарные -> арифметика -> предикаты и биты -> композиции.
+        growth_curve = []  # кривая роста по стадиям
+        for stage in stage_order:  # по стадиям
+            stage_tasks = [s for s in suite if s.family == stage]  # задачи данной стадии
+            rng = np.random.default_rng(seed + len(stage) * 101)  # генератор с зернем seed + длина_имени_стадии·101
+            # Порядок внутри стадии детерминирован, но перемешивается зерном, чтобы проявить влияние порядка.
+            if len(stage_tasks) > 1:  # если задач больше одной
+                order = rng.permutation(len(stage_tasks))  # случайный порядок номеров задач
+                stage_tasks = [stage_tasks[int(i)] for i in order]  # переставить задачи
+            for j, spec in enumerate(stage_tasks):  # по задачам стадии с номером j
+                events.append(  # добавить событие обучения (начало вызова)
+                    model.learn(spec, seed=seed * 1009 + j * 17 + len(spec.name))  # зерно задачи seed·1009 + j·17 + длина имени
+                )  # конец вызова append
+            growth_curve.append(  # добавить точку кривой роста (начало словаря)
+                {  # начало словаря
+                    "stage": stage,  # имя стадии
+                    "new_experts": len(stage_tasks),  # число задач стадии
+                    "cumulative_experts": len(model.experts),  # накопленное число экспертов
+                    "cumulative_code_length": sum(  # накопленная длина кода экспертов (начало sum)
+                        e.code_length for e in model.experts.values()  # сумма code_length по экспертам
+                    ),  # конец sum
+                }  # конец словаря
+            )  # конец вызова append
+        verification = model.verify_all(suite)  # проверить всех экспертов по всем задачам
+        committed = len(model.experts)  # число закреплённых экспертов
+        neural_scores = [  # точности нейросетей на проверке (начало списка)
+            e.neural.validation_exact_accuracy  # validation_exact_accuracy эксперта
+            for e in model.experts.values()  # по экспертам
+            if e.neural is not None and np.isfinite(e.neural.validation_exact_accuracy)  # нейросеть есть и точность конечна
+        ]  # конец списка
+        neural_rmse = [  # корни из средних квадратов ошибок нейросетей (начало списка)
+            math.sqrt(max(0.0, e.neural.validation_loss))  # корень из квадрата ошибки: √max(0, validation_loss)
+            for e in model.experts.values()  # по экспертам
+            if e.neural is not None and np.isfinite(e.neural.validation_loss)  # нейросеть есть и ошибка конечна
+        ]  # конец списка
+        ood_checks = ood_abstains = 0  # счётчики проверок и отказов — нули
+        # Проверка ограждений: каждая известная операция обязана отказать на входе вне своей области.
+        for spec in suite:  # по всем задачам
+            if spec.name not in model.experts:  # задача не изучена
+                continue  # пропустить
+            outside = [d[-1] + 1 for d in spec.domains]  # вход вне области: каждое значение на 1 больше наибольшего допустимого
+            result = model.predict(spec.name, *outside)  # запрос модели
+            ood_checks += 1  # проверок + 1
+            ood_abstains += int(result["status"] == "ABSTAIN")  # отказов + 1, если статус ABSTAIN
+        poison_model = GrowingMathProcessor()  # отдельная модель для теста
+        # Тест с испорченной меткой: одна неверная метка ADD не должна дать нового закреплённого эксперта.
+        add_spec = next(s for s in suite if s.name == "ADD")  # задача ADD
+        poison_event = poison_model.learn(  # обучение с испорченной меткой (начало вызова)
+            add_spec, seed=seed + 44001, poison_one_label=True  # зерно seed + 44001, портить одну метку
+        )  # конец вызова
+        prime_spec = TaskSpec(  # задача «простое ли число» (начало описания)
+        # Неизвестная нетривиальная функция имеет область из 17 точек: предел таблицы 16 меньше — должен быть отказ.
+            "IS_PRIME",  # имя IS_PRIME
+            1,  # один вход
+            (tuple(range(-8, 9)),),  # область — целые от −8 до 8
+            lambda x: int(  # ответ: 1, если x ≥ 2 и x не делится ни на одно d от 2 до ⌊√x⌋ (начало выражения)
+                x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))  # x ≥ 2 и все остатки x mod d ненулевые для d = 2..⌊√x⌋
+            ),  # конец выражения
+            family="unseen",  # семейство «невиданное»
+        )  # конец описания
+        unknown_event = GrowingMathProcessor().learn(prime_spec, seed=seed + 99001)  # обучение на неизвестной задаче
+        elapsed = time.time() - seed_t0  # время работы зерна
+        row = {  # строка итогов зерна (начало словаря)
+            "seed": int(seed),  # зерно
+            "committed": committed,  # число закреплённых экспертов
+            "expected": len(suite),  # ожидаемое число — размер набора задач
+            "commit_rate": committed / len(suite),  # доля закреплений committed / len(suite)
+            "symbolic_exact_accuracy": verification["accuracy"],  # точная точность символьных программ
+            "symbolic_examples_checked": verification["checked"],  # число проверенных примеров
+            "neural_holdout_exact_accuracy_mean": (  # средняя точность нейросетей на проверке (начало выражения)
+                float(np.mean(neural_scores)) if neural_scores else float("nan")  # среднее по списку или nan, если список пуст
+            ),  # конец выражения
+            "neural_holdout_rmse_mean": (  # средний корень из квадрата ошибки нейросетей (начало выражения)
+                float(np.mean(neural_rmse)) if neural_rmse else float("nan")  # среднее по списку или nan, если список пуст
+            ),  # конец выражения
+            "ood_checks": ood_checks,  # число проверок вне области
+            "ood_abstains": ood_abstains,  # число отказов вне области
+            "poison_action": poison_event.action,  # действие при испорченной метке
+            "unknown_is_prime_action": unknown_event.action,  # действие на неизвестной задаче
+            "growth_curve": growth_curve,  # кривая роста
+            "elapsed_seconds": elapsed,  # время работы зерна в секундах
+        }  # конец словаря
+        per_seed.append(row)  # добавить строку к итогам
+        if seed == main_seed:  # зерно основное
+            main_model = model  # запомнить основную модель
+            with (out / f"hagi_growing_math_seed{seed}_tasks.csv").open(  # открыть файл таблицы задач (начало with)
+            # Полная таблица по задачам для основного зерна.
+                "w", encoding="utf-8"  # режим записи, utf-8
+            ) as f:  # конец заголовка with
+                f.write(  # записать заголовок таблицы (начало вызова)
+                    "task,family,committed,program,code_length,neural_val_exact_acc,neural_val_mse\n"  # строка заголовка столбцов
+                )  # конец вызова
+                for spec in suite:  # по задачам
+                    ex = model.experts.get(spec.name)  # эксперт задачи
+                    if ex is None:  # эксперта нет
+                        f.write(f"{spec.name},{spec.family},0,,0,,\n")  # строка: не закреплён, пустые поля
+                    else:  # иначе
+                        na = (  # точность нейросети (начало выражения)
+                            ex.neural.validation_exact_accuracy  # точность нейросети на проверке
+                            if ex.neural  # если нейросеть есть
+                            else float("nan")  # иначе nan
+                        )  # конец выражения
+                        nm = ex.neural.validation_loss if ex.neural else float("nan")  # ошибка нейросети или nan
+                        prog = ex.program.pretty().replace('"', '""')  # текст программы с удвоенными кавычками
+                        f.write(  # записать строку таблицы (начало вызова)
+                            f'"{spec.name}","{spec.family}",1,"{prog}",{ex.code_length},{na},{nm}\n'  # имя, семейство, 1, программа, длина кода, точность, ошибка
+                        )  # конец вызова
+    assert main_model is not None  # гарантия: основная модель найдена
+    model_path = out / "hagi_growing_math_model.json"  # путь к файлу модели
+    main_model.save(model_path)  # сохранить основную модель
 
-    # Adversarial/guard smoke test on the saved and reloaded model.
-    reloaded = GrowingMathProcessor.load(model_path)
-    reload_ok = reloaded.predict("ADD", 7, -3).get("value") == 4
-    ood_ok = reloaded.predict("ADD", 99, 2).get("status") == "ABSTAIN"
+    reloaded = GrowingMathProcessor.load(model_path)  # загрузить модель
+    # Состязательная проверка ограждений на сохранённой и заново загруженной модели.
+    reload_ok = reloaded.predict("ADD", 7, -3).get("value") == 4  # ADD(7, −3) = 4
+    ood_ok = reloaded.predict("ADD", 99, 2).get("status") == "ABSTAIN"  # ADD(99, 2) вне области — отказ
 
-    aggregate: dict[str, Any] = {}
-    metric_keys = (
-        "committed",
-        "symbolic_exact_accuracy",
-        "neural_holdout_exact_accuracy_mean",
-        "neural_holdout_rmse_mean",
-        "ood_abstains",
-        "elapsed_seconds",
+    aggregate: dict[str, Any] = {}  # агрегаты по зёрнам
+    metric_keys = (  # метрики для усреднения (начало кортежа)
+        "committed",  # число закреплённых
+        "symbolic_exact_accuracy",  # точная точность
+        "neural_holdout_exact_accuracy_mean",  # средняя точность нейросетей
+        "neural_holdout_rmse_mean",  # средний корень из квадрата ошибки
+        "ood_abstains",  # число отказов вне области
+        "elapsed_seconds",  # время работы
+    )  # конец кортежа
+    for key in metric_keys:  # по метрикам
+        vals = [float(r[key]) for r in per_seed]  # значения метрики по зёрнам
+        base = key[:-5] if key.endswith("_mean") else key  # базовое имя: без суффикса «_mean», если он есть
+        aggregate[base + "_mean"] = float(np.mean(vals))  # среднее по зёрнам
+        aggregate[base + "_sd"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0  # несмещённое стандартное отклонение (0 при одном значении)
+    aggregate.update(  # дополнить агрегаты (начало словаря)
+        {  # начало словаря
+            "seeds": list(map(int, seeds)),  # зёрна
+            "expected_operations": len(suite),  # ожидаемое число операций
+            "finite_support_examples_per_operation": [len(s.inputs()) for s in suite],  # число входов у каждой операции
+            "total_finite_support_examples": int(sum(len(s.inputs()) for s in suite)),  # суммарное число входов по всем операциям
+            "reload_roundtrip_pass": bool(reload_ok),  # запись-чтение модели прошло
+            "ood_abstain_pass": bool(ood_ok),  # отказ вне области сработал
+            "total_runtime_seconds": time.time() - start,  # общее время работы
+        }  # конец словаря
+    )  # конец вызова update
+    result = {  # итоговый словарь (начало)
+        "version": VERSION,  # версия
+        "scope": "integer inputs -8..8 (with task-specific subdomains) + all 16 two-input Boolean functions",  # область применения: целые входы от −8 до 8 и 16 булевых функций
+        "per_seed": per_seed,  # итоги по зёрнам
+        "aggregate": aggregate,  # агрегаты
+        "interpretation": [  # интерпретация (список строк)
+            "Exact results are certified only on each operation's finite declared support.",  # точные результаты заверены только на конечной области каждой операции
+            "The neural fibers are approximate and are not the exact inference path.",  # нейросети приближённые и не являются точным путём вывода
+            "Unknown functions outside the learned library abstain; no claim of all mathematics is made.",  # неизвестные функции дают отказ; утверждение обо всей математике не делается
+            "The teacher oracle is used by the offline experiment's independent validation/exhaustive audit.",  # учитель используется офлайновым экспериментом для независимой проверки
+        ],  # конец списка
+    }  # конец словаря
+    (out / "hagi_growing_math_experiment.json").write_text(  # записать файл итогов эксперимента
+        json.dumps(result, indent=2), encoding="utf-8"  # JSON с отступом 2
     )
-    for key in metric_keys:
-        vals = [float(r[key]) for r in per_seed]
-        base = key[:-5] if key.endswith("_mean") else key
-        aggregate[base + "_mean"] = float(np.mean(vals))
-        aggregate[base + "_sd"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    aggregate.update(
-        {
-            "seeds": list(map(int, seeds)),
-            "expected_operations": len(suite),
-            "finite_support_examples_per_operation": [len(s.inputs()) for s in suite],
-            "total_finite_support_examples": int(sum(len(s.inputs()) for s in suite)),
-            "reload_roundtrip_pass": bool(reload_ok),
-            "ood_abstain_pass": bool(ood_ok),
-            "total_runtime_seconds": time.time() - start,
-        }
-    )
-    result = {
-        "version": VERSION,
-        "scope": "integer inputs -8..8 (with task-specific subdomains) + all 16 two-input Boolean functions",
-        "per_seed": per_seed,
-        "aggregate": aggregate,
-        "interpretation": [
-            "Exact results are certified only on each operation's finite declared support.",
-            "The neural fibers are approximate and are not the exact inference path.",
-            "Unknown functions outside the learned library abstain; no claim of all mathematics is made.",
-            "The teacher oracle is used by the offline experiment's independent validation/exhaustive audit.",
-        ],
-    }
-    (out / "hagi_growing_math_experiment.json").write_text(
-        json.dumps(result, indent=2), encoding="utf-8"
-    )
-    _write_report(result, out / "hagi_growing_math_report.md")
-    return result
+    _write_report(result, out / "hagi_growing_math_report.md")  # записать текстовый отчёт
+    return result  # вернуть итоги
 
 
 def _write_report(result: dict[str, Any], path: Path) -> None:
-    agg = result["aggregate"]
-    lines = [
-        "# HAGI Growing Math Processor — autonomous experiment",
-        "",
-        f"Version: {result['version']}",
-        f"Seeds: {', '.join(map(str, agg['seeds']))}",
-        f"Declared operation set: {agg['expected_operations']} tasks (16 BoolVenn + integer unary/binary + ternary compositions).",
-        "",
-        "## Learned operation catalogue",
-        "",
-        "- 16 BoolVenn functions: every two-input Boolean truth table (FALSE, NOR, implications, XOR/XNOR, AND/NAND, OR, TRUE, projections and negations).",
-        "- 7 unary integer functions: NEG, ABS, SIGN, SQUARE, CUBE, BIT_NOT8, CLAMP_TO_3.",
-        "- 23 binary integer functions: ADD, SUB, MUL, FLOORDIV, MOD, GCD, LCM, MIN, MAX, ABSDIFF, EQ/NE/LT/LE/GT/GE, BIT_AND/OR/XOR/NAND8/NOR8/XNOR8, POW_INT.",
-        "- 3 ternary compositions: FMA, CLAMP, MEDIAN3.",
-        "",
-        "The expression interpreter additionally supports bounded integer arithmetic/bitwise expressions and selected real functions (sqrt, exp, log, trigonometric and hyperbolic functions). Those calculator functions are not part of the 49-operation exhaustive-learning score.",
-        "",
-        "## Aggregate results",
-        "",
-        "| Metric | Mean | SD |",
-        "|---|---:|---:|",
-        f"| Committed experts | {agg['committed_mean']:.2f} | {agg['committed_sd']:.2f} |",
-        f"| Exhaustive symbolic accuracy | {100*agg['symbolic_exact_accuracy_mean']:.2f}% | {100*agg['symbolic_exact_accuracy_sd']:.2f} pp |",
-        f"| Neural holdout exact accuracy | {100*agg['neural_holdout_exact_accuracy_mean']:.2f}% | {100*agg['neural_holdout_exact_accuracy_sd']:.2f} pp |",
-        f"| Neural holdout RMSE | {agg['neural_holdout_rmse_mean']:.4f} | {agg['neural_holdout_rmse_sd']:.4f} |",
-        f"| OOD abstentions | {agg['ood_abstains_mean']:.2f} | {agg['ood_abstains_sd']:.2f} |",
-        f"| Runtime per seed | {agg['elapsed_seconds_mean']:.2f}s | {agg['elapsed_seconds_sd']:.2f}s |",
-        "",
-        "## Per-seed results",
-        "",
-        "| Seed | Experts | Symbolic exact | Neural holdout exact | Neural RMSE | OOD abstain | Poison | Unknown IS_PRIME |",
-        "|---:|---:|---:|---:|---:|---:|---|---|",
-    ]
-    for r in result["per_seed"]:
-        lines.append(
-            f"| {r['seed']} | {r['committed']}/{r['expected']} | {100*r['symbolic_exact_accuracy']:.2f}% | {100*r['neural_holdout_exact_accuracy_mean']:.2f}% | {r['neural_holdout_rmse_mean']:.4f} | {r['ood_abstains']}/{r['ood_checks']} | {r['poison_action']} | {r['unknown_is_prime_action']} |"
-        )
-    lines += [
-        "",
-        "## Growth curve (seed 0)",
-        "",
-        "| Stage | New experts | Cumulative experts | Cumulative code units |",
-        "|---|---:|---:|---:|",
-    ]
-    for stage in result["per_seed"][0].get("growth_curve", []):
-        lines.append(
-            f"| {stage['stage']} | {stage['new_experts']} | {stage['cumulative_experts']} | {stage['cumulative_code_length']} |"
-        )
-    lines += [
-        "",
-        "## Interpretation and limits",
-        "",
-        "The operation library grows by adding one expert after program synthesis, held-out validation, and exhaustive comparison over that operation's finite support. Each expert also receives a small trained neural fiber; approximate neural predictions are available separately, but exact inference uses the verified symbolic program.",
-        "",
-        "The 16 two-input Boolean functions are the complete BoolVenn truth-table family. Integer functions are certified only on the finite input ranges recorded in the task table. This is not a proof of correctness for unbounded integers, real analysis, transcendental functions, arbitrary user-defined functions, or every possible mathematical operation. The safe expression interpreter computes selected transcendental functions but does not discover or formally certify them as learned experts.",
-        "",
-        "Out-of-domain inputs abstain. The poisoned-label and unknown-prime probes are expected to HOLD rather than silently commit. The training oracle is available in the offline experiment; a deployed learner needs an independent verifier or new labelled examples to certify a new function.",
-        "",
-        "The design is MDL-inspired: candidates are ordered by AST description length and exact-fit programs are required to pass a hard finite-domain commit check. This is not a complete implementation of the repository's probabilistic/energy CommitGate or its Lean proof obligations. BoolVenn follows the 16-function finite lattice; the growth controller adds experts in stages. These formal components do not establish generalization beyond the specified finite domains.",
-        "",
-        "## Related Lean specifications",
-        "",
-        "- BoolVenn: https://github.com/ShmidtS/primes/blob/main/Hagi/Data/BoolVenn.lean",
-        "- MDL objective: https://github.com/ShmidtS/primes/blob/main/Hagi/Step/MDLObjective.lean",
-        "- Safe commit gate: https://github.com/ShmidtS/primes/blob/main/Hagi/Unified/CommitGate.lean",
-        "- Self-development search: https://github.com/ShmidtS/primes/blob/main/Hagi/Growth/SelfDevelopment.lean",
-        "- Recursive growth conditions: https://github.com/ShmidtS/primes/blob/main/Hagi/Growth/RecursiveSelfDevelopment.lean",
-    ]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    """Провести автономный эксперимент по росту процессора на нескольких зёрнах.
+
+                seeds: зёрна случайности; out_dir: каталог для модели, таблицы задач, итогов и отчёта.
+                Для каждого зерна: новая модель учится по стадиям (логика, унарные, бинарные, композиции),
+                проверяется на всех задачах, на отказах вне области, на испорченной метке и на неизвестной задаче.
+            Возврат: словарь с version, scope, per_seed, aggregate и interpretation."""
+    """Записать текстовый отчёт об эксперименте в файл path.
+
+                result: словарь, возвращённый run_experiment(). Строит список строк Markdown: заголовок, каталог операций,
+            агрегаты (среднее и отклонение), строки по зёрнам, кривая роста, толкование и ограничения — и записывает их в path."""
+    agg = result["aggregate"]  # агрегаты результата
+    lines = [  # строки отчёта (начало списка)
+        "# HAGI Growing Math Processor — autonomous experiment",  # заголовок
+        "",  # пустая строка
+        f"Version: {result['version']}",  # версия
+        f"Seeds: {', '.join(map(str, agg['seeds']))}",  # зёрна
+        f"Declared operation set: {agg['expected_operations']} tasks (16 BoolVenn + integer unary/binary + ternary compositions).",  # объявленный набор операций
+        "",  # пустая строка
+        "## Learned operation catalogue",  # раздел «изученный каталог операций»
+        "",  # пустая строка
+        "- 16 BoolVenn functions: every two-input Boolean truth table (FALSE, NOR, implications, XOR/XNOR, AND/NAND, OR, TRUE, projections and negations).",  # пункт про 16 булевых функций
+        "- 7 unary integer functions: NEG, ABS, SIGN, SQUARE, CUBE, BIT_NOT8, CLAMP_TO_3.",  # пункт про 7 унарных функций
+        "- 23 binary integer functions: ADD, SUB, MUL, FLOORDIV, MOD, GCD, LCM, MIN, MAX, ABSDIFF, EQ/NE/LT/LE/GT/GE, BIT_AND/OR/XOR/NAND8/NOR8/XNOR8, POW_INT.",  # пункт про 23 бинарные функции
+        "- 3 ternary compositions: FMA, CLAMP, MEDIAN3.",  # пункт про 3 тернарные композиции
+        "",  # пустая строка
+        "The expression interpreter additionally supports bounded integer arithmetic/bitwise expressions and selected real functions (sqrt, exp, log, trigonometric and hyperbolic functions). Those calculator functions are not part of the 49-operation exhaustive-learning score.",  # пункт про интерпретатор выражений
+        "",  # пустая строка
+        "## Aggregate results",  # раздел «агрегированные результаты»
+        "",  # пустая строка
+        "| Metric | Mean | SD |",  # заголовок таблицы метрик
+        "|---|---:|---:|",  # разделитель таблицы
+        f"| Committed experts | {agg['committed_mean']:.2f} | {agg['committed_sd']:.2f} |",  # строка: закреплённые эксперты
+        f"| Exhaustive symbolic accuracy | {100*agg['symbolic_exact_accuracy_mean']:.2f}% | {100*agg['symbolic_exact_accuracy_sd']:.2f} pp |",  # строка: точная символьная точность
+        f"| Neural holdout exact accuracy | {100*agg['neural_holdout_exact_accuracy_mean']:.2f}% | {100*agg['neural_holdout_exact_accuracy_sd']:.2f} pp |",  # строка: точность нейросетей
+        f"| Neural holdout RMSE | {agg['neural_holdout_rmse_mean']:.4f} | {agg['neural_holdout_rmse_sd']:.4f} |",  # строка: корень из квадрата ошибки нейросетей
+        f"| OOD abstentions | {agg['ood_abstains_mean']:.2f} | {agg['ood_abstains_sd']:.2f} |",  # строка: отказы вне области
+        f"| Runtime per seed | {agg['elapsed_seconds_mean']:.2f}s | {agg['elapsed_seconds_sd']:.2f}s |",  # строка: время на зерно
+        "",  # пустая строка
+        "## Per-seed results",  # раздел «результаты по зёрнам»
+        "",  # пустая строка
+        "| Seed | Experts | Symbolic exact | Neural holdout exact | Neural RMSE | OOD abstain | Poison | Unknown IS_PRIME |",  # заголовок таблицы по зёрнам
+        "|---:|---:|---:|---:|---:|---:|---|---|",  # разделитель таблицы
+    ]  # конец списка
+    for r in result["per_seed"]:  # по строкам результатов зёрен
+        lines.append(  # добавить строку таблицы (начало вызова)
+            f"| {r['seed']} | {r['committed']}/{r['expected']} | {100*r['symbolic_exact_accuracy']:.2f}% | {100*r['neural_holdout_exact_accuracy_mean']:.2f}% | {r['neural_holdout_rmse_mean']:.4f} | {r['ood_abstains']}/{r['ood_checks']} | {r['poison_action']} | {r['unknown_is_prime_action']} |"  # зерно, эксперты, точности, ошибка, отказы, отравление, неизвестная задача
+        )  # конец вызова
+    lines += [  # дополнить список (начало)
+        "",  # пустая строка
+        "## Growth curve (seed 0)",  # раздел «кривая роста (зерно 0)»
+        "",  # пустая строка
+        "| Stage | New experts | Cumulative experts | Cumulative code units |",  # заголовок таблицы кривой
+        "|---|---:|---:|---:|",  # разделитель таблицы
+    ]  # конец списка
+    for stage in result["per_seed"][0].get("growth_curve", []):  # по стадиям кривой роста первого зерна
+        lines.append(  # добавить строку таблицы (начало вызова)
+            f"| {stage['stage']} | {stage['new_experts']} | {stage['cumulative_experts']} | {stage['cumulative_code_length']} |"  # стадия, новые эксперты, накопленные эксперты, накопленная длина кода
+        )  # конец вызова
+    lines += [  # дополнить список (начало)
+        "",  # пустая строка
+        "## Interpretation and limits",  # раздел «толкование и ограничения»
+        "",  # пустая строка
+        "The operation library grows by adding one expert after program synthesis, held-out validation, and exhaustive comparison over that operation's finite support. Each expert also receives a small trained neural fiber; approximate neural predictions are available separately, but exact inference uses the verified symbolic program.",  # абзац: библиотека растёт по одному эксперту после синтеза, проверки и полного перебора
+        "",  # пустая строка
+        "The 16 two-input Boolean functions are the complete BoolVenn truth-table family. Integer functions are certified only on the finite input ranges recorded in the task table. This is not a proof of correctness for unbounded integers, real analysis, transcendental functions, arbitrary user-defined functions, or every possible mathematical operation. The safe expression interpreter computes selected transcendental functions but does not discover or formally certify them as learned experts.",  # абзац: 16 булевых функций полны, целые заверены на конечных областях
+        "",  # пустая строка
+        "Out-of-domain inputs abstain. The poisoned-label and unknown-prime probes are expected to HOLD rather than silently commit. The training oracle is available in the offline experiment; a deployed learner needs an independent verifier or new labelled examples to certify a new function.",  # абзац: вне области отказ; отравление и неизвестная задача дают отказ
+        "",  # пустая строка
+        "The design is MDL-inspired: candidates are ordered by AST description length and exact-fit programs are required to pass a hard finite-domain commit check. This is not a complete implementation of the repository's probabilistic/energy CommitGate or its Lean proof obligations. BoolVenn follows the 16-function finite lattice; the growth controller adds experts in stages. These formal components do not establish generalization beyond the specified finite domains.",  # абзац: дизайн навеян минимальной длиной описания
+        "",  # пустая строка
+        "## Related Lean specifications",  # раздел со ссылками на родственные формальные спецификации
+        "",  # пустая строка
+        "- BoolVenn: https://github.com/ShmidtS/primes/blob/main/Hagi/Data/BoolVenn.lean",  # ссылка на спецификацию булевых функций
+        "- MDL objective: https://github.com/ShmidtS/primes/blob/main/Hagi/Step/MDLObjective.lean",  # ссылка на спецификацию оценки длины описания
+        "- Safe commit gate: https://github.com/ShmidtS/primes/blob/main/Hagi/Unified/CommitGate.lean",  # ссылка на спецификацию стыка закрепления
+        "- Self-development search: https://github.com/ShmidtS/primes/blob/main/Hagi/Growth/SelfDevelopment.lean",  # ссылка на спецификацию поиска саморазвития
+        "- Recursive growth conditions: https://github.com/ShmidtS/primes/blob/main/Hagi/Growth/RecursiveSelfDevelopment.lean",  # ссылка на спецификацию условий рекурсивного роста
+    ]  # конец списка
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")  # записать строки в файл с переводами строк
 
 
-# ----------------------------------- Tests --------------------------------------
 
+# ----------------------------------- Тесты --------------------------------------
 
 def self_test() -> None:
-    suite = make_task_suite()
-    model = GrowingMathProcessor()
-    for i, spec in enumerate(suite):
-        ev = model.learn(spec, seed=10_000 + i, train_neural=False)
-        assert ev.action == "COMMIT", (spec.name, ev)
-    check = model.verify_all(suite)
-    assert check["committed"] == len(suite)
-    assert check["accuracy"] == 1.0
-    assert all(
-        model.predict("ADD", x, y)["value"] == x + y
-        for x in range(-8, 9)
-        for y in range(-8, 9)
-    )
-    assert model.predict("ADD", 100, 3)["status"] == "ABSTAIN"
-    assert model.predict("BOOL_XOR", 1, 0)["value"] == 1
-    assert model.predict("BOOL_NAND", 1, 1)["value"] == 0
-    with_path = Path("/tmp/hagi_growing_math_selftest.json")
-    model.save(with_path)
-    loaded = GrowingMathProcessor.load(with_path)
-    assert loaded.predict("FMA", 2, 3, 4)["value"] == 10
-    assert loaded.predict("CLAMP", 99, -2, 2)["status"] == "ABSTAIN"
-    assert loaded.evaluate_expression("x*y + gcd(x,y)", x=7, y=3)["value"] == 22
-    assert (
-        loaded.evaluate_expression("(x < y) and (y % 2 == 1)", x=2, y=3)["value"] == 1
-    )
-    trig = loaded.evaluate_expression("sqrt(x*x) + sin(pi/2)", x=3)
-    assert trig["status"] == "OK" and abs(trig["value"] - 4.0) < 1e-10
-    assert (
-        loaded.evaluate_expression("__import__('os').system('false')", x=1)["status"]
-        == "ERROR"
-    )
-    # Poisoned data and unsupported larger-support algorithm must be rejected.
-    poisoned = GrowingMathProcessor().learn(
-        next(s for s in suite if s.name == "ADD"),
-        seed=77,
-        poison_one_label=True,
-        train_neural=False,
-    )
-    assert poisoned.action == "HOLD"
-    unknown = TaskSpec(
-        "IS_PRIME",
-        1,
-        (tuple(range(-8, 9)),),
-        lambda x: int(x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))),
-    )
-    assert (
-        GrowingMathProcessor().learn(unknown, seed=78, train_neural=False).action
-        == "HOLD"
-    )
-    print(
-        f"SELF_TEST PASS: {len(suite)} operation experts, exhaustive finite-support checks, serialization, OOD abstain, poison hold"
-    )
+    """Самопроверка процессора: обучение, проверка, сериализация и отказы.
+
+                Обучает по всем задачам без нейросетей, требует закрепления каждой и точности 1.0,
+                проверяет ответы, отказ вне области, запись-чтение модели, интерпретатор выражений,
+            отказ на импорте модуля, на испорченной метке и на неизвестной задаче. В конце печатает SELF_TEST PASS."""
+    suite = make_task_suite()  # набор задач
+    model = GrowingMathProcessor()  # модель
+    for i, spec in enumerate(suite):  # по задачам с номером i
+        ev = model.learn(spec, seed=10_000 + i, train_neural=False)  # обучить без нейросети с зерном 10 000 + i
+        assert ev.action == "COMMIT", (spec.name, ev)  # каждая задача закреплена
+    check = model.verify_all(suite)  # проверить всех экспертов
+    assert check["committed"] == len(suite)  # закреплено столько же, сколько задач
+    assert check["accuracy"] == 1.0  # точность 1.0
+    assert all(  # ADD верна на всей области (начало all)
+        model.predict("ADD", x, y)["value"] == x + y  # ADD(x, y) = x + y
+        for x in range(-8, 9)  # x от −8 до 8
+        for y in range(-8, 9)  # y от −8 до 8
+    )  # конец all
+    assert model.predict("ADD", 100, 3)["status"] == "ABSTAIN"  # ADD(100, 3) — отказ
+    assert model.predict("BOOL_XOR", 1, 0)["value"] == 1  # XOR(1, 0) = 1
+    assert model.predict("BOOL_NAND", 1, 1)["value"] == 0  # NAND(1, 1) = 0
+    with_path = Path("/tmp/hagi_growing_math_selftest.json")  # путь файла модели
+    model.save(with_path)  # сохранить модель
+    loaded = GrowingMathProcessor.load(with_path)  # загрузить модель
+    assert loaded.predict("FMA", 2, 3, 4)["value"] == 10  # FMA(2, 3, 4) = 10
+    assert loaded.predict("CLAMP", 99, -2, 2)["status"] == "ABSTAIN"  # CLAMP(99, −2, 2) — отказ
+    assert loaded.evaluate_expression("x*y + gcd(x,y)", x=7, y=3)["value"] == 22  # x·y + gcd(x, y) при x = 7, y = 3 равно 22
+    assert (  # выражение с сравнением и логикой (начало assert)
+        loaded.evaluate_expression("(x < y) and (y % 2 == 1)", x=2, y=3)["value"] == 1  # (x < y) и (y mod 2 = 1) при x = 2, y = 3 равно 1
+    )  # конец assert
+    trig = loaded.evaluate_expression("sqrt(x*x) + sin(pi/2)", x=3)  # √(x²) + sin(π/2) при x = 3
+    assert trig["status"] == "OK" and abs(trig["value"] - 4.0) < 1e-10  # статус OK и значение 4 с точностью 10⁻¹⁰
+    assert (  # запрет импорта модулей в выражении (начало assert)
+        loaded.evaluate_expression("__import__('os').system('false')", x=1)["status"]  # выражение с __import__ — статус ERROR
+        == "ERROR"  # сравнение со строкой ERROR
+    )  # конец assert
+    poisoned = GrowingMathProcessor().learn(  # обучение с испорченной меткой (начало вызова)
+    # Испорченные данные и неподдерживаемый алгоритм с большей областью обязаны быть отклонены.
+        next(s for s in suite if s.name == "ADD"),  # задача ADD
+        seed=77,  # зерно 77
+        poison_one_label=True,  # портить одну метку
+        train_neural=False,  # без нейросети
+    )  # конец вызова
+    assert poisoned.action == "HOLD"  # действие — отказ
+    unknown = TaskSpec(  # неизвестная задача «простое ли число» (начало описания)
+        "IS_PRIME",  # имя
+        1,  # один вход
+        (tuple(range(-8, 9)),),  # область от −8 до 8
+        lambda x: int(x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))),  # ответ: x ≥ 2 и нет делителей до ⌊√x⌋
+    )  # конец описания
+    assert (  # обучение на неизвестной задаче (начало assert)
+        GrowingMathProcessor().learn(unknown, seed=78, train_neural=False).action  # зерно 78, без нейросети; действие
+        == "HOLD"  # равно HOLD
+    )  # конец assert
+    print(  # печать итога (начало вызова)
+        f"SELF_TEST PASS: {len(suite)} operation experts, exhaustive finite-support checks, serialization, OOD abstain, poison hold"  # строка SELF_TEST PASS с перечнем проверенного
+    )  # конец вызова
 
 
-def query_model(
-    model_path: str, name: str, args: Sequence[int], mode: str = "exact"
-) -> None:
-    model = GrowingMathProcessor.load(model_path)
-    print(json.dumps(model.predict(name, *map(int, args), mode=mode), indent=2))
+def query_model(  # query_model: запросить операцию у сохранённой модели
+    model_path: str, name: str, args: Sequence[int], mode: str = "exact"  # model_path, name, args, mode
+) -> None:  # без возврата
+    model = GrowingMathProcessor.load(model_path)  # загрузить модель
+    print(json.dumps(model.predict(name, *map(int, args), mode=mode), indent=2))  # напечатать JSON ответа с аргументами, приведёнными к целым
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="HAGI Growing Math Processor")
-    p.add_argument("--self-test", action="store_true")
-    p.add_argument(
-        "--experiment", action="store_true", help="run autonomous growth experiment"
-    )
-    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--out-dir", default="hagi_growing_math_results")
-    p.add_argument(
-        "--query", nargs="+", metavar=("OP", "ARG"), help="query saved model: OP ARG..."
-    )
-    p.add_argument(
-        "--expr",
-        help="evaluate a safe arithmetic/logic expression, e.g. 'x*y + gcd(x,y)'",
-    )
-    p.add_argument(
-        "--var",
-        action="append",
-        default=[],
+    """Загрузить модель и напечатать ответ операции в JSON.
+
+            model_path: файл модели; name: имя операции; args: аргументы; mode: exact или neural. Ничего не возвращает."""
+    """Точка входа командной строки процессора.
+
+                Разбирает аргументы: --self-test, --experiment, --seeds, --out-dir, --query, --expr, --var, --mode, --model.
+            Выполняет самопроверку, запрос к модели, вычисление выражения или полный эксперимент."""
+    p = argparse.ArgumentParser(description="HAGI Growing Math Processor")  # разборщик аргументов
+    p.add_argument("--self-test", action="store_true")  # флаг --self-test
+    p.add_argument(  # флаг --experiment (начало описания аргумента)
+        "--experiment", action="store_true", help="run autonomous growth experiment"  # запустить автономный эксперимент
+    )  # конец описания аргумента
+    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])  # зёрна, по умолчанию 0 1 2
+    p.add_argument("--out-dir", default="hagi_growing_math_results")  # каталог результатов
+    p.add_argument(  # --query: операция и аргументы (начало описания)
+        "--query", nargs="+", metavar=("OP", "ARG"), help="query saved model: OP ARG..."  # имя операции и её аргументы
+    )  # конец описания аргумента
+    p.add_argument(  # --expr (начало описания аргумента)
+        "--expr",  # вычислить безопасное выражение, например x*y + gcd(x,y)
+        help="evaluate a safe arithmetic/logic expression, e.g. 'x*y + gcd(x,y)'",  # конец описания аргумента
+    )  # --var (начало описания аргумента)
+    p.add_argument(  # режим добавления значения
+        "--var",  # по умолчанию пустой список
+        action="append",  # присваивание переменной вида x=7 или x=0.5
+        default=[],  # по умолчанию пустой список значений
         help="expression variable assignment, e.g. x=7 or x=0.5",
-    )
+    )  # режим: exact или neural, по умолчанию exact
     p.add_argument("--mode", choices=["exact", "neural"], default="exact")
-    p.add_argument(
-        "--model", default="hagi_growing_math_results/hagi_growing_math_model.json"
-    )
-    args = p.parse_args()
-    if args.self_test:
-        self_test()
-    elif args.query:
-        if len(args.query) < 2:
-            p.error("--query needs an operation name and at least one integer argument")
-        query_model(args.model, args.query[0], args.query[1:], args.mode)
-    elif args.expr:
-        vals = {}
-        for item in args.var:
-            if "=" not in item:
-                p.error(f"invalid --var {item!r}; expected name=integer")
-            k, v = item.split("=", 1)
-            raw = v.strip()
-            vals[k.strip()] = (
-                float(raw) if any(ch in raw.lower() for ch in (".", "e")) else int(raw)
-            )
-        model = GrowingMathProcessor.load(args.model)
-        print(json.dumps(model.evaluate_expression(args.expr, **vals), indent=2))
-    else:
-        result = run_experiment(args.seeds, args.out_dir)
-        print(json.dumps(result["aggregate"], indent=2))
-        print(f"Report: {Path(args.out_dir) / 'hagi_growing_math_report.md'}")
-        print(f"Model:  {Path(args.out_dir) / 'hagi_growing_math_model.json'}")
+    p.add_argument(  # --model (начало описания аргумента)
+        "--model", default="hagi_growing_math_results/hagi_growing_math_model.json"  # путь к файлу модели по умолчанию
+    )  # конец описания аргумента
+    args = p.parse_args()  # разобрать аргументы
+    if args.self_test:  # флаг самопроверки
+        self_test()  # запустить самопроверку
+    elif args.query:  # иначе, если задан запрос
+        if len(args.query) < 2:  # меньше двух элементов — ошибка
+            p.error("--query needs an operation name and at least one integer argument")  # сообщение об ошибке
+        query_model(args.model, args.query[0], args.query[1:], args.mode)  # запрос: имя, остальные аргументы, режим
+    elif args.expr:  # иначе, если задано выражение
+        vals = {}  # значения переменных
+        for item in args.var:  # по элементам --var
+            if "=" not in item:  # нет знака равенства — ошибка
+                p.error(f"invalid --var {item!r}; expected name=integer")  # сообщение об ошибке
+            k, v = item.split("=", 1)  # разбить на имя и значение по первому «=»
+            raw = v.strip()  # значение без пробелов
+            vals[k.strip()] = (  # присвоить переменной (начало выражения)
+                float(raw) if any(ch in raw.lower() for ch in (".", "e")) else int(raw)  # дробное, если есть точка или e, иначе целое
+            )  # конец выражения
+        model = GrowingMathProcessor.load(args.model)  # загрузить модель
+        print(json.dumps(model.evaluate_expression(args.expr, **vals), indent=2))  # напечатать JSON результата выражения
+    else:  # иначе — полный эксперимент
+        result = run_experiment(args.seeds, args.out_dir)  # провести эксперимент с заданными зёрнами и каталогом
+        print(json.dumps(result["aggregate"], indent=2))  # напечатать агрегаты
+        print(f"Report: {Path(args.out_dir) / 'hagi_growing_math_report.md'}")  # напечатать путь к текстовому отчёту
+        print(f"Model:  {Path(args.out_dir) / 'hagi_growing_math_model.json'}")  # напечатать путь к модели
 
+
+
+import sys as _sys  # псевдоним модуля sys под именем _sys
 
 # ==============================================================================
-# PART II — v7.4 optimal layer (alias bindings for the unified namespace)
+# ЧАСТЬ II — оптимальный слой v7.4 (привязки имён для общего пространства имён)
 # ==============================================================================
+h5 = _sys.modules[__name__]  # h5 — ссылка на этот же модуль
+hagi_v7 = _sys.modules[__name__]  # hagi_v7 — ссылка на этот же модуль
 
-import sys as _sys
+V5Processor = GrowingMathProcessor  # V5Processor — процессор V5
+# Слой V7 импортировал эти имена слоя V5 под псевдонимами или напрямую:
+Expr = Expr  # то же имя Expr (тождественная привязка для ясности)
+Program = Program  # то же имя Program
+Expert = Expert  # то же имя Expert
+GrowthEvent = GrowthEvent  # то же имя GrowthEvent
+TaskSpec = TaskSpec  # то же имя TaskSpec
+NeuralFiber = NeuralFiber  # то же имя NeuralFiber
+SafeExpression = SafeExpression  # то же имя SafeExpression
+OPS = OPS  # то же имя OPS
+_make_task_suite = make_task_suite  # _make_task_suite — набор задач
+_bit_not8 = _bit_not8  # то же имя _bit_not8
+_bit_nand8 = _bit_nand8  # то же имя _bit_nand8
+_bit_nor8 = _bit_nor8  # то же имя _bit_nor8
+_bit_xnor8 = _bit_xnor8  # то же имя _bit_xnor8
+_pow_int = _pow_int  # то же имя _pow_int
+_sign = _sign  # то же имя _sign
+candidate_programs = candidate_programs  # то же имя candidate_programs
 
-h5 = _sys.modules[__name__]
-hagi_v7 = _sys.modules[__name__]
+"""Слой V7.4 (исследовательский): точный многомерный символьный обучатель на конечных областях.
 
-# v7 imported these v5 names under aliases / directly:
-V5Processor = GrowingMathProcessor
-Expr = Expr  # (identity, kept for clarity)
-Program = Program
-Expert = Expert
-GrowthEvent = GrowthEvent
-TaskSpec = TaskSpec
-NeuralFiber = NeuralFiber
-SafeExpression = SafeExpression
-OPS = OPS
-_make_task_suite = make_task_suite
-_bit_not8 = _bit_not8
-_bit_nand8 = _bit_nand8
-_bit_nor8 = _bit_nor8
-_bit_xnor8 = _bit_xnor8
-_pow_int = _pow_int
-_sign = _sign
-candidate_programs = candidate_programs
+            Отличия от прототипа v7.2:
+            1. Точные дешёвые шаблоны и индукция рациональных многочленов выполняются до ограниченного
+               поиска по общей грамматике.
+            2. Пробные значения служат только ситом отсева; разные деревья не сливаются лишь потому,
+               что совпадают на малой выборке. Общий поиск упорядочивает кандидатов по явной длине
+               префиксного кода, но грамматика ограничена и бюджет поиска может оборвать его:
+               глобальный оптимум длины описания не утверждается.
+            3. Повторное использование библиотеки учитывается как справочная стоимость, а не
+               произвольная скидка на длину кода. Объявленный битовый код — мера размера модели, не байты файла.
+            4. Фильтр на int64 консервативен: он может лишь отклонить внутри ограниченной оболочки
+               операций и входов. Все сомнительные случаи считаются скалярными целыми Python;
+               полная скалярная проверка конечной области остаётся окончательной инстанцией закрепления.
+            5. Обучение нейрослоя включается явно и заведомо приближённо. Путь на CPU не импортирует
+               PyTorch; поддержка CUDA загружается лениво.
+            6. Добыча теорем проверяет только допустимые входы и требует замкнутости перед
+               композицией унарных функций. Синтетическая композиция остаётся внутри заверенных
+               областей экспертов-родителей.
 
-"""HAGI v7.4 research — exact multivariate finite-domain symbolic learner.
+            Это исследовательский прототип для конечных областей, а не общая модель интеллекта.
+            Закрепление ограничено полной объявленной конечной областью; вне её прогноз — отказ.
+        Зависимости: Python ≥ 3.10, NumPy (PyTorch необязателен)."""
 
-Changes over the uploaded v7.2 prototype:
-
-1. Exact low-cost templates and rational polynomial induction run before the
-   bounded generic grammar search.
-2. Probe values are a rejection sieve only; distinct ASTs are not merged just
-   because they agree on a small sample. The generic search orders candidates
-   by an explicit prefix-code length, but the grammar is restricted and the
-   search budget can truncate it: no global MDL optimum is claimed.
-3. Library reuse is recorded as a reference cost, not an arbitrary 0.5x code
-   discount. The declared bit code is a model-size proxy, not file bytes.
-4. The int64 prefilter is conservative and can only reject inside a bounded
-   operation/input envelope. All uncertain cases use scalar Python integers;
-   full finite-support scalar validation remains the commit authority.
-5. Neural fiber fitting is opt-in and explicitly approximate. The CPU path
-   does not import PyTorch; CUDA support is loaded lazily.
-6. Theorem mining checks only supported inputs and requires closure before
-   composing unary functions. Synthetic composition stays inside parent
-   experts' certified supports.
-
-This is a finite-domain research prototype, not a general intelligence model.
-Commit is limited to the complete declared finite support; predictions outside
-that support abstain. Dependencies: Python >=3.10, NumPy (PyTorch optional).
-"""
-
-from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Iterator, Optional, Sequence
+from concurrent.futures import ProcessPoolExecutor  # пул процессов для параллельной проверки
+from typing import Any, Iterator, Optional, Sequence  # типы для аннотаций
 
 
-V7_VERSION = "7.4.0-research"
-SIEVE_SIZE = 5  # probe points for cheap pruning
-DEFAULT_NODE_BUDGET = 20_000  # max generated candidates per task
-DEFAULT_POP_BUDGET = 50_000  # hard bound on frontier pops (compute cap)
-VALIDATION_CHUNK = 64  # candidates per batched prefilter
-MAX_REUSE_EXPANSIONS = 8  # cap expert-substitution fanout per search pop
+V7_VERSION = "7.4.0-research"  # версия слоя V7
+SIEVE_SIZE = 5  # размер сита: число пробных точек для дешёвого отсева
+DEFAULT_NODE_BUDGET = 20_000  # бюджет узлов: не более 20 000 кандидатов на задачу
+DEFAULT_POP_BUDGET = 50_000  # бюджет выборок из фронтира: не более 50 000 (предел вычислений)
+VALIDATION_CHUNK = 64  # размер пачки кандидатов для векторного фильтра
+MAX_REUSE_EXPANSIONS = 8  # не более 8 подстановок экспертов на одну выборку из фронтира
 
 
-# --------------------- vectorized batch prefilter (numpy) ----------------------
 
-_MAG_LIMIT = 1 << 62  # prefilter is "unsure" beyond this; scalar check decides
+# --------------------- векторный пакетный предварительный фильтр (numpy) ----------------------
+_MAG_LIMIT = 1 << 62  # предел модуля 2^62: за ним фильтр «не знает», решает скалярная проверка
 
 
 def _vec_binary(op: str, a: np.ndarray, b: np.ndarray):
-    """Vectorized int64 op. Returns (values, ok_mask). ok=False lanes are
-    lanes where the scalar implementation raises (div0, pow range)."""
-    if op == "add":
-        return a + b, np.ones(a.shape, bool)
-    if op == "sub":
-        return a - b, np.ones(a.shape, bool)
-    if op == "mul":
-        return a * b, np.ones(a.shape, bool)
-    if op in ("floordiv", "mod"):
-        ok = b != 0
-        safe_b = np.where(ok, b, np.ones_like(b))
-        if op == "floordiv":
-            return np.floor_divide(a, safe_b), ok
-        return np.mod(a, safe_b), ok
-    if op == "gcd":
-        return np.gcd(a, b), np.ones(a.shape, bool)
-    if op == "lcm":
-        ok = (a != 0) & (b != 0)
-        sa = np.where(ok, a, np.ones_like(a))
-        sb = np.where(ok, b, np.ones_like(b))
-        return np.abs(sa * sb) // np.gcd(sa, sb), ok
-    if op == "min":
-        return np.minimum(a, b), np.ones(a.shape, bool)
-    if op == "max":
-        return np.maximum(a, b), np.ones(a.shape, bool)
-    if op == "eq":
-        return (a == b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "ne":
-        return (a != b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "lt":
-        return (a < b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "le":
-        return (a <= b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "gt":
-        return (a > b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "ge":
-        return (a >= b).astype(np.int64), np.ones(a.shape, bool)
-    if op == "bit_and":
-        return a & b, np.ones(a.shape, bool)
-    if op == "bit_or":
-        return a | b, np.ones(a.shape, bool)
-    if op == "bit_xor":
-        return a ^ b, np.ones(a.shape, bool)
-    if op == "bit_nand8":
-        return (~(a & b)) & 0xFF, np.ones(a.shape, bool)
-    if op == "bit_nor8":
-        return (~(a | b)) & 0xFF, np.ones(a.shape, bool)
-    if op == "bit_xnor8":
-        return (~(a ^ b)) & 0xFF, np.ones(a.shape, bool)
-    if op == "pow_int":
-        ok = (b >= 0) & (b <= 8)
-        sb = np.where(ok, b, np.zeros_like(b))
-        return a**sb, ok
-    raise ValueError(f"no vectorized op: {op}")
+    """Векторная бинарная операция над массивами int64.
+
+                op: имя операции; a, b: массивы одинаковой формы. Возврат: (значения, маска ok).
+            ok = False там, где скалярная реализация бросает ошибку (деление на 0, степень вне диапазона)."""
+    if op == "add":  # сложение
+        return a + b, np.ones(a.shape, bool)  # a + b, все дорожки допустимы
+    if op == "sub":  # вычитание
+        return a - b, np.ones(a.shape, bool)  # разность a − b, все дорожки допустимы
+    if op == "mul":  # умножение
+        return a * b, np.ones(a.shape, bool)  # произведение a·b, все дорожки допустимы
+    if op in ("floordiv", "mod"):  # деление вниз или остаток
+        ok = b != 0  # маска допустимости: b ≠ 0
+        safe_b = np.where(ok, b, np.ones_like(b))  # заменить нулевой делитель на 1, чтобы не делить на 0
+        if op == "floordiv":  # деление вниз
+            return np.floor_divide(a, safe_b), ok  # a // safe_b и маска ok
+        return np.mod(a, safe_b), ok  # a mod safe_b и маска ok
+    if op == "gcd":  # наибольший общий делитель
+        return np.gcd(a, b), np.ones(a.shape, bool)  # наибольший общий делитель gcd(a, b)
+    if op == "lcm":  # наименьшее общее кратное
+        ok = (a != 0) & (b != 0)  # ok: оба не равны 0
+        sa = np.where(ok, a, np.ones_like(a))  # нулевые a заменить на 1
+        sb = np.where(ok, b, np.ones_like(b))  # нулевые b заменить на 1
+        return np.abs(sa * sb) // np.gcd(sa, sb), ok  # lcm = |a·b| / gcd(a, b) и маска ok
+    if op == "min":  # минимум
+        return np.minimum(a, b), np.ones(a.shape, bool)  # минимум min(a, b)
+    if op == "max":  # максимум
+        return np.maximum(a, b), np.ones(a.shape, bool)  # максимум max(a, b)
+    if op == "eq":  # равно
+        return (a == b).astype(np.int64), np.ones(a.shape, bool)  # (a = b) как int64
+    if op == "ne":  # не равно
+        return (a != b).astype(np.int64), np.ones(a.shape, bool)  # (a ≠ b) как int64
+    if op == "lt":  # меньше
+        return (a < b).astype(np.int64), np.ones(a.shape, bool)  # (a < b) как int64
+    if op == "le":  # меньше или равно
+        return (a <= b).astype(np.int64), np.ones(a.shape, bool)  # (a ≤ b) как int64
+    if op == "gt":  # больше
+        return (a > b).astype(np.int64), np.ones(a.shape, bool)  # (a > b) как int64
+    if op == "ge":  # больше или равно
+        return (a >= b).astype(np.int64), np.ones(a.shape, bool)  # (a ≥ b) как int64
+    if op == "bit_and":  # побитовое «и»
+        return a & b, np.ones(a.shape, bool)  # побитовое «и»: a & b
+    if op == "bit_or":  # побитовое «или»
+        return a | b, np.ones(a.shape, bool)  # побитовое «или»: a | b
+    if op == "bit_xor":  # исключающее «или»
+        return a ^ b, np.ones(a.shape, bool)  # исключающее «или»: a ^ b
+    if op == "bit_nand8":  # не-и в байте
+        return (~(a & b)) & 0xFF, np.ones(a.shape, bool)  # не-и в байте: ~(a & b) & 0xFF
+    if op == "bit_nor8":  # не-или в байте
+        return (~(a | b)) & 0xFF, np.ones(a.shape, bool)  # не-или в байте: ~(a | b) & 0xFF
+    if op == "bit_xnor8":  # эквивалентность в байте
+        return (~(a ^ b)) & 0xFF, np.ones(a.shape, bool)  # эквивалентность в байте: ~(a ^ b) & 0xFF
+    if op == "pow_int":  # целая степень
+        ok = (b >= 0) & (b <= 8)  # маска допустимости: 0 ≤ b ≤ 8
+        sb = np.where(ok, b, np.zeros_like(b))  # недопустимый показатель заменить нулём
+        return a**sb, ok  # a ** sb и маска ok
+    raise ValueError(f"no vectorized op: {op}")  # ошибка: нет векторной операции
 
 
 def _vec_unary(op: str, a: np.ndarray):
-    if op == "neg":
-        return -a, np.ones(a.shape, bool)
-    if op == "abs":
-        return np.abs(a), np.ones(a.shape, bool)
-    if op == "sign":
-        return np.sign(a).astype(np.int64), np.ones(a.shape, bool)
-    if op == "bit_not8":
-        return (~a) & 0xFF, np.ones(a.shape, bool)
-    if op == "clamp3":
-        return np.clip(a, -3, 3), np.ones(a.shape, bool)
-    if op == "square":
-        return a * a, np.ones(a.shape, bool)
-    if op == "cube":
-        return a * a * a, np.ones(a.shape, bool)
-    raise ValueError(f"no vectorized unary op: {op}")
+    """Векторная унарная операция над массивом int64.
+
+            op: имя операции; a: массив. Возврат: (значения, маска ok — всегда все истинны)."""
+    if op == "neg":  # отрицание
+        return -a, np.ones(a.shape, bool)  # отрицание: −a
+    if op == "abs":  # модуль
+        return np.abs(a), np.ones(a.shape, bool)  # модуль: |a|
+    if op == "sign":  # знак
+        return np.sign(a).astype(np.int64), np.ones(a.shape, bool)  # sign(a) как int64
+    if op == "bit_not8":  # побитовое «не» в байте
+        return (~a) & 0xFF, np.ones(a.shape, bool)  # инверсия младших 8 бит: ~a & 0xFF
+    if op == "clamp3":  # ограничение отрезком [−3, 3]
+        return np.clip(a, -3, 3), np.ones(a.shape, bool)  # ограничение отрезком: clip(a, −3, 3)
+    if op == "square":  # квадрат
+        return a * a, np.ones(a.shape, bool)  # квадрат: a·a
+    if op == "cube":  # куб
+        return a * a * a, np.ones(a.shape, bool)  # куб: a·a·a
+    raise ValueError(f"no vectorized unary op: {op}")  # ошибка: нет векторной унарной операции
 
 
 def _vec_eval_expr(e: Expr, cols: list[np.ndarray]):
-    """Evaluate Expr over column arrays. Returns (values, ok_mask, big_mask).
-    big_mask lanes exceeded the safe magnitude: the caller must fall back to
-    the scalar authority instead of trusting the vectorized verdict."""
-    if e.op == "var":
-        return cols[int(e.value or 0)], None, None
-    if e.op == "const":
-        v = np.full(cols[0].shape, int(e.value), dtype=np.int64)
-        return v, None, None
-    vals = []
-    oks = []
-    bigs = []
-    for a in e.args:
-        v, ok, big = _vec_eval_expr(a, cols)
-        vals.append(v)
-        if ok is not None:
-            oks.append(ok)
-        if big is not None:
-            bigs.append(big)
-    if e.op == "absdiff":
-        v, ok = np.abs(vals[0] - vals[1]), None
-    elif e.op == "fma":
-        v, ok = vals[0] * vals[1] + vals[2], None
-    elif e.op == "clamp":
-        v, ok = np.minimum(np.maximum(vals[0], vals[1]), vals[2]), None
-    elif e.op == "median3":
-        v, ok = np.sort(np.stack(vals), axis=0)[1], None
-    elif e.op == "clamp3":
-        v, ok = np.clip(vals[0], -3, 3), None
-    elif e.op == "mul3":
-        v, ok = vals[0] * vals[1] * vals[2], None
-    elif len(vals) == 2 and e.op in OPS:
-        v, ok = _vec_binary(e.op, vals[0], vals[1])
-    elif len(vals) == 1:
-        v, ok = _vec_unary(e.op, vals[0])
-    else:
-        raise ValueError(f"unsupported expression opcode: {e.op}")
-    big = np.abs(v) > _MAG_LIMIT
-    if bigs:
-        big = big | bigs[0]
-        for bb in bigs[1:]:
-            big = big | bb
-    if ok is None:
-        ok = np.ones(v.shape, bool)
-    # Every child must be defined at a lane for the parent expression
-    # to have Python scalar semantics at that lane.
-    for child_ok in oks:
-        ok = ok & child_ok
-    return v, ok, big
+    """Вычислить выражение над столбцами-массивами.
+
+                e: выражение; cols: столбец значений каждой переменной. Возврат: (значения, маска ok, маска big).
+                ok = False там, где операция недопустима; big = True там, где модуль превысил безопасный предел:
+            тогда вызывающий обязан вернуться к скалярной проверке, а не верить векторному вердикту."""
+    if e.op == "var":  # узел-переменная
+        return cols[int(e.value or 0)], None, None  # столбец с индексом value, без масок
+    if e.op == "const":  # узел-константа
+        v = np.full(cols[0].shape, int(e.value), dtype=np.int64)  # массив, заполненный константой, типа int64
+        return v, None, None  # вернуть массив, без масок
+    vals = []  # значения аргументов
+    oks = []  # маски допустимости аргументов
+    bigs = []  # маски превышения предела аргументов
+    for a in e.args:  # по аргументам
+        v, ok, big = _vec_eval_expr(a, cols)  # рекурсивно вычислить аргумент
+        vals.append(v)  # добавить значение
+        if ok is not None:  # если маска есть — добавить её
+            oks.append(ok)  # добавить маску допустимости аргумента
+        if big is not None:  # если есть маска превышения предела
+            bigs.append(big)  # добавить её
+    if e.op == "absdiff":  # модуль разности
+        v, ok = np.abs(vals[0] - vals[1]), None  # v = |v0 − v1|, без маски недопустимости
+    elif e.op == "fma":  # умножение-сложение
+        v, ok = vals[0] * vals[1] + vals[2], None  # v = v0·v1 + v2, без маски недопустимости
+    elif e.op == "clamp":  # ограничение диапазоном
+        v, ok = np.minimum(np.maximum(vals[0], vals[1]), vals[2]), None  # v = min(max(v0, v1), v2), без маски
+    elif e.op == "median3":  # медиана трёх
+        v, ok = np.sort(np.stack(vals), axis=0)[1], None  # отсортировать столбец из трёх значений и взять среднее (индекс 1)
+    elif e.op == "clamp3":  # ограничение отрезком [−3, 3]
+        v, ok = np.clip(vals[0], -3, 3), None  # v = clip(v0, −3, 3), без маски
+    elif e.op == "mul3":  # произведение трёх
+        v, ok = vals[0] * vals[1] * vals[2], None  # v = v0·v1·v2, без маски
+    elif len(vals) == 2 and e.op in OPS:  # два аргумента и операция из таблицы OPS
+        v, ok = _vec_binary(e.op, vals[0], vals[1])  # векторная бинарная операция
+    elif len(vals) == 1:  # один аргумент
+        v, ok = _vec_unary(e.op, vals[0])  # векторная унарная операция
+    else:  # прочее
+        raise ValueError(f"unsupported expression opcode: {e.op}")  # ошибка: неподдерживаемая операция
+    big = np.abs(v) > _MAG_LIMIT  # маска превышения предела: |v| > 2^62
+    if bigs:  # если есть маски аргументов
+        big = big | bigs[0]  # объединить с первой
+        for bb in bigs[1:]:  # по остальным маскам аргументов
+            big = big | bb  # объединить маску big с маской аргумента bb
+    if ok is None:  # если маски допустимости нет
+        ok = np.ones(v.shape, bool)  # все дорожки допустимы
+    for child_ok in oks:  # по маскам аргументов
+        ok = ok & child_ok  # ok = ok и маска аргумента
+    # Каждый аргумент обязан быть определён на дорожке, чтобы выражение имело
+    # на ней ту же семантику, что скалярный Python.
+    return v, ok, big  # вернуть значения, маску допустимости, маску превышения
 
 
 def _batch_fits_unchecked(
     programs: Sequence[Program], X: np.ndarray, Y: np.ndarray, device: str = "cpu"
-) -> list[Optional[bool]]:
+) -> list[Optional[bool]]:  # возврат — список «подходит / не подходит / неясно» по программам
+    """Пакетный надёжный предварительный фильтр соответствия программ примерам X -> Y.
+
+                programs: программы; X: матрица входов (N, arity); Y: столбец ответов; device: "cpu" или "cuda...".
+                Возврат: список по программам: True — доказанно подходит, False — доказанно не подходит
+                (есть дорожка, где скалярное вычисление бросает ошибку), None — неясно (решает скалярная проверка).
+            На CUDA при доступном torch используется _batch_fits_torch."""
     """Batched sound prefilter: True = provably fits X->Y, False = provably
     fails (a lane where the scalar eval would raise), None = unsure (must be
     settled by the scalar authority check)."""
-    out: list[Optional[bool]] = []
-    if device.startswith("cuda") and _ensure_torch():
-        return _batch_fits_torch(programs, X, Y, device)
-    for p in programs:
-        if p.expr is None:
-            out.append(None)
-            continue
-        try:
-            cols = [np.ascontiguousarray(X[:, i]) for i in range(X.shape[1])]
-            v, ok, big = _vec_eval_expr(p.expr, cols)
-            if not bool(np.all(ok)) or bool(np.any(big)):
-                out.append(None)
-                continue
-            out.append(bool(np.array_equal(v, Y)))
-        except (ValueError, OverflowError):
-            out.append(None)
-    return out
+    out: list[Optional[bool]] = []  # результат по программам
+    if device.startswith("cuda") and _ensure_torch():  # устройство cuda и torch доступен
+        return _batch_fits_torch(programs, X, Y, device)  # векторный фильтр на torch
+    for p in programs:  # по программам
+        if p.expr is None:  # у программы нет выражения (булева маска)
+            out.append(None)  # неясно
+            continue  # следующая программа
+        try:  # попытка векторной оценки
+            cols = [np.ascontiguousarray(X[:, i]) for i in range(X.shape[1])]  # столбцы входов — по одному на переменную
+            v, ok, big = _vec_eval_expr(p.expr, cols)  # векторная оценка выражения
+            if not bool(np.all(ok)) or bool(np.any(big)):  # есть недопустимая дорожка или превышение предела
+                out.append(None)  # неясно
+                continue  # следующая программа
+            out.append(bool(np.array_equal(v, Y)))  # истина, если значения совпадают с Y на всех дорожках
+        except (ValueError, OverflowError):  # ошибка значения или переполнение
+            out.append(None)  # неясно
+    return out  # вернуть результаты
 
 
-# --------------------------- optional GPU (torch) path --------------------------
 
-_TORCH_OK = False
-_TORCH_CHECKED = False
-_torch = None
+# --------------------------- необязательный путь на GPU (torch) --------------------------
+_TORCH_OK = False  # torch доступен — пока не проверено, ложь
+_TORCH_CHECKED = False  # наличие torch уже проверено — ложь
+_torch = None  # сам модуль torch, пока нет
 
 
 def _ensure_torch() -> bool:
-    """Load PyTorch only when CUDA functionality is explicitly requested."""
-    global _TORCH_OK, _TORCH_CHECKED, _torch
-    if _TORCH_CHECKED:
-        return _TORCH_OK
-    _TORCH_CHECKED = True
-    try:
-        import importlib
+    """Загрузить PyTorch только когда явно запрошена работа на CUDA.
 
-        _torch = importlib.import_module("torch")
-        _TORCH_OK = True
-    except ImportError:
-        _torch = None
-        _TORCH_OK = False
-    return _TORCH_OK
+            Возврат: истина, если torch импортировался. Результат запоминается в глобальных переменных."""
+    global _TORCH_OK, _TORCH_CHECKED, _torch  # глобальные переменные модуля
+    if _TORCH_CHECKED:  # наличие torch уже проверено
+        return _TORCH_OK  # вернуть запомненный результат
+    _TORCH_CHECKED = True  # отметить, что проверка выполнена
+    try:  # попытка импорта
+        import importlib  # импорт модуля importlib
+
+        _torch = importlib.import_module("torch")  # импортировать torch
+        _TORCH_OK = True  # torch доступен
+    except ImportError:  # torch не установлен
+        _torch = None  # модуля нет
+        _TORCH_OK = False  # torch недоступен
+    return _TORCH_OK  # вернуть доступность torch
 
 
 def _batch_fits_torch(
-    programs: Sequence[Program], X: np.ndarray, Y: np.ndarray, device: str
-) -> list[Optional[bool]]:
-    """GPU batch prefilter. Same contract as batch_fits (numpy path).
-    Integer-exact on int64; unsure-lane semantics identical."""
-    dev = _torch.device(device)
-    Xt = _torch.from_numpy(X).to(dev)
-    Yt = _torch.from_numpy(Y).to(dev)
-    cols = [Xt[:, i].contiguous() for i in range(X.shape[1])]
-    one = _torch.ones_like(cols[0])
+    programs: Sequence[Program], X: np.ndarray, Y: np.ndarray, device: str  # programs, X, Y — программы, входы, ответы; device — устройство
+) -> list[Optional[bool]]:  # возврат — список «подходит / не подходит / неясно» по программам
+    """Пакетный фильтр на GPU. Тот же договор, что у numpy-пути фильтра.
 
-    def teval(e: Expr):
-        if e.op == "var":
-            return cols[int(e.value or 0)], None, None
-        if e.op == "const":
-            v = _torch.full_like(cols[0], int(e.value))
-            return v, None, None
-        vs, oks, bigs = [], [], []
-        for a in e.args:
-            v, ok, big = teval(a)
-            vs.append(v)
-            if ok is not None:
-                oks.append(ok)
-            if big is not None:
-                bigs.append(big)
-        op = e.op
-        if op == "absdiff":
-            v, ok = (vs[0] - vs[1]).abs(), None
-        elif op == "fma":
-            v, ok = vs[0] * vs[1] + vs[2], None
-        elif op == "clamp":
-            v, ok = torch_clamp = (
-                _torch.minimum(_torch.maximum(vs[0], vs[1]), vs[2]),
-                None,
-            )
-        elif op == "median3":
-            v, ok = _torch.sort(_torch.stack(vs), dim=0).values[1], None
-        elif op == "clamp3":
-            v, ok = _torch.clamp(vs[0], -3, 3), None
-        elif op == "mul3":
-            v, ok = vs[0] * vs[1] * vs[2], None
-        elif op == "add":
-            v, ok = vs[0] + vs[1], None
-        elif op == "sub":
-            v, ok = vs[0] - vs[1], None
-        elif op == "mul":
-            v, ok = vs[0] * vs[1], None
-        elif op in ("floordiv", "mod"):
-            b0 = vs[1]
-            ok = b0 != 0
-            sb = _torch.where(ok, b0, one)
-            v = (
-                _torch.div(vs[0], sb, rounding_mode="floor")
-                if op == "floordiv"
-                else _torch.remainder(vs[0], sb)
-            )
-        elif op == "gcd":
-            v, ok = _torch.gcd(vs[0], vs[1]), None
-        elif op == "lcm":
-            a0, b0 = vs[0], vs[1]
-            ok = (a0 != 0) & (b0 != 0)
-            sa = _torch.where(ok, a0, one)
-            sb = _torch.where(ok, b0, one)
-            v = _torch.abs(sa * sb) // _torch.gcd(sa, sb)
-        elif op == "min":
-            v, ok = _torch.minimum(vs[0], vs[1]), None
-        elif op == "max":
-            v, ok = _torch.maximum(vs[0], vs[1]), None
-        elif op in ("eq", "ne", "lt", "le", "gt", "ge"):
-            fn = {
-                "eq": _torch.eq,
-                "ne": _torch.ne,
-                "lt": _torch.lt,
-                "le": _torch.le,
-                "gt": _torch.gt,
-                "ge": _torch.ge,
-            }[op]
-            v, ok = fn(vs[0], vs[1]).to(_torch.int64), None
-        elif op == "bit_and":
-            v, ok = vs[0] & vs[1], None
-        elif op == "bit_or":
-            v, ok = vs[0] | vs[1], None
-        elif op == "bit_xor":
-            v, ok = vs[0] ^ vs[1], None
-        elif op == "bit_nand8":
-            v, ok = (~(vs[0] & vs[1])) & 0xFF, None
-        elif op == "bit_nor8":
-            v, ok = (~(vs[0] | vs[1])) & 0xFF, None
-        elif op == "bit_xnor8":
-            v, ok = (~(vs[0] ^ vs[1])) & 0xFF, None
-        elif op == "pow_int":
-            b0 = vs[1]
-            ok = (b0 >= 0) & (b0 <= 8)
-            sb = _torch.where(ok, b0, _torch.zeros_like(b0))
-            v = vs[0] ** sb
-        elif op == "neg":
-            v, ok = -vs[0], None
-        elif op == "abs":
-            v, ok = vs[0].abs(), None
-        elif op == "sign":
-            v, ok = _torch.sign(vs[0]).to(_torch.int64), None
-        elif op == "bit_not8":
-            v, ok = (~(vs[0])) & 0xFF, None
-        elif op == "clamp3":
-            v, ok = _torch.clamp(vs[0], -3, 3), None
-        elif op == "square":
-            v, ok = vs[0] * vs[0], None
-        elif op == "cube":
-            v, ok = vs[0] * vs[0] * vs[0], None
-        else:
-            raise ValueError(f"unsupported torch opcode: {op}")
-        big = v.abs() > _MAG_LIMIT
-        for bb in bigs:
-            big = big | bb
-        if ok is None:
-            ok = _torch.ones_like(big)
-        # Propagate child domain failures through the complete AST.
-        for child_ok in oks:
-            ok = ok & child_ok
-        return v, ok, big
+            Точен для int64; семантика дорожек «неясно» совпадает с numpy-путем."""
+    dev = _torch.device(device)  # устройство torch
+    Xt = _torch.from_numpy(X).to(dev)  # X как тензор на устройстве
+    Yt = _torch.from_numpy(Y).to(dev)  # Y как тензор на устройстве
+    cols = [Xt[:, i].contiguous() for i in range(X.shape[1])]  # столбцы входов
+    one = _torch.ones_like(cols[0])  # тензор из единиц той же формы
 
-    results: list[Optional[bool]] = []
-    for p in programs:
-        if p.expr is None:
-            results.append(None)
-            continue
-        try:
-            v, ok, big = teval(p.expr)
-            if ok is None:
-                ok = _torch.ones(v.shape, dtype=_torch.bool, device=v.device)
-            if bool((~ok).any()) or bool(big is not None and big.any()):
-                results.append(None)
-                continue
-            results.append(bool(_torch.equal(v, Yt)))
-        except (ValueError, RuntimeError, OverflowError):
-            results.append(None)
-    return results
+    def teval(e: Expr):  # вложенная функция teval: вычислить выражение тензорно (возврат — значения, маска ok, маска big)
+        if e.op == "var":  # узел-переменная
+            return cols[int(e.value or 0)], None, None  # столбец с индексом value, без масок
+        if e.op == "const":  # узел-константа
+            v = _torch.full_like(cols[0], int(e.value))  # тензор, заполненный константой
+            return v, None, None  # вернуть, без масок
+        vs, oks, bigs = [], [], []  # значения, маски допустимости, маски превышения аргументов
+        for a in e.args:  # по аргументам
+            v, ok, big = teval(a)  # рекурсивно вычислить аргумент
+            vs.append(v)  # добавить значение
+            if ok is not None:  # если маска ok есть
+                oks.append(ok)  # добавить её
+            if big is not None:  # если маска big есть
+                bigs.append(big)  # добавить её
+        op = e.op  # имя операции
+        if op == "absdiff":  # модуль разности
+            v, ok = (vs[0] - vs[1]).abs(), None  # модуль разности |v0 − v1|, без маски
+        elif op == "fma":  # умножение-сложение
+            v, ok = vs[0] * vs[1] + vs[2], None  # произведение-сложение v0·v1 + v2, без маски
+        elif op == "clamp":  # ограничение диапазоном
+            v, ok = torch_clamp = (  # v = min(max(v0, v1), v2) (начало кортежа; результат дублируется в torch_clamp)
+                _torch.minimum(_torch.maximum(vs[0], vs[1]), vs[2]),  # минимум из максимума и v2
+                None,  # маски нет
+            )  # конец кортежа
+        elif op == "median3":  # медиана трёх
+            v, ok = _torch.sort(_torch.stack(vs), dim=0).values[1], None  # средний элемент отсортированного столбца
+        elif op == "clamp3":  # ограничение отрезком [−3, 3]
+            v, ok = _torch.clamp(vs[0], -3, 3), None  # ограничение clamp(v0, −3, 3), без маски
+        elif op == "mul3":  # произведение трёх
+            v, ok = vs[0] * vs[1] * vs[2], None  # произведение v0·v1·v2, без маски
+        elif op == "add":  # сложение
+            v, ok = vs[0] + vs[1], None  # сумма v0 + v1, без маски
+        elif op == "sub":  # вычитание
+            v, ok = vs[0] - vs[1], None  # разность v0 − v1, без маски
+        elif op == "mul":  # умножение
+            v, ok = vs[0] * vs[1], None  # произведение v0·v1, без маски
+        elif op in ("floordiv", "mod"):  # деление вниз или остаток
+            b0 = vs[1]  # делитель b0
+            ok = b0 != 0  # маска: b0 ≠ 0
+            sb = _torch.where(ok, b0, one)  # заменить нулевой делитель на 1
+            v = (  # вычислить (начало условия)
+                _torch.div(vs[0], sb, rounding_mode="floor")  # деление с округлением вниз
+                if op == "floordiv"  # если floordiv
+                else _torch.remainder(vs[0], sb)  # иначе остаток
+            )  # конец условия
+        elif op == "gcd":  # наибольший общий делитель
+            v, ok = _torch.gcd(vs[0], vs[1]), None  # наибольший общий делитель gcd(v0, v1), без маски
+        elif op == "lcm":  # наименьшее общее кратное
+            a0, b0 = vs[0], vs[1]  # a0, b0 — операнды
+            ok = (a0 != 0) & (b0 != 0)  # маска: оба не нули
+            sa = _torch.where(ok, a0, one)  # нулевые a0 заменить на 1
+            sb = _torch.where(ok, b0, one)  # нулевые b0 заменить на 1
+            v = _torch.abs(sa * sb) // _torch.gcd(sa, sb)  # наименьшее общее кратное |a0·b0| // gcd(a0, b0)
+        elif op == "min":  # минимум
+            v, ok = _torch.minimum(vs[0], vs[1]), None  # минимум minimum(v0, v1), без маски
+        elif op == "max":  # максимум
+            v, ok = _torch.maximum(vs[0], vs[1]), None  # максимум maximum(v0, v1), без маски
+        elif op in ("eq", "ne", "lt", "le", "gt", "ge"):  # сравнения
+            fn = {  # таблица «имя -> функция torch» (начало словаря)
+                "eq": _torch.eq,  # равно
+                "ne": _torch.ne,  # не равно
+                "lt": _torch.lt,  # меньше
+                "le": _torch.le,  # меньше или равно
+                "gt": _torch.gt,  # больше
+                "ge": _torch.ge,  # больше или равно
+            }[op]  # выбрать функцию по имени
+            v, ok = fn(vs[0], vs[1]).to(_torch.int64), None  # применить и привести к int64
+        elif op == "bit_and":  # побитовое «и»
+            v, ok = vs[0] & vs[1], None  # побитовое «и» v0 & v1, без маски
+        elif op == "bit_or":  # побитовое «или»
+            v, ok = vs[0] | vs[1], None  # побитовое «или» v0 | v1, без маски
+        elif op == "bit_xor":  # исключающее «или»
+            v, ok = vs[0] ^ vs[1], None  # исключающее «или» v0 ^ v1, без маски
+        elif op == "bit_nand8":  # не-и в байте
+            v, ok = (~(vs[0] & vs[1])) & 0xFF, None  # не-и в байте ~(v0 & v1) & 0xFF, без маски
+        elif op == "bit_nor8":  # не-или в байте
+            v, ok = (~(vs[0] | vs[1])) & 0xFF, None  # не-или в байте ~(v0 | v1) & 0xFF, без маски
+        elif op == "bit_xnor8":  # эквивалентность в байте
+            v, ok = (~(vs[0] ^ vs[1])) & 0xFF, None  # эквивалентность ~(v0 ^ v1) & 0xFF, без маски
+        elif op == "pow_int":  # целая степень
+            b0 = vs[1]  # показатель b0
+            ok = (b0 >= 0) & (b0 <= 8)  # маска: 0 ≤ b0 ≤ 8
+            sb = _torch.where(ok, b0, _torch.zeros_like(b0))  # недопустимый показатель заменить нулём
+            v = vs[0] ** sb  # степень v0 ** sb
+        elif op == "neg":  # отрицание
+            v, ok = -vs[0], None  # отрицание −v0, без маски
+        elif op == "abs":  # модуль
+            v, ok = vs[0].abs(), None  # модуль |v0|, без маски
+        elif op == "sign":  # знак
+            v, ok = _torch.sign(vs[0]).to(_torch.int64), None  # sign(v0) как int64
+        elif op == "bit_not8":  # побитовое «не» в байте
+            v, ok = (~(vs[0])) & 0xFF, None  # инверсия байта ~v0 & 0xFF, без маски
+        elif op == "clamp3":  # ограничение отрезком
+            v, ok = _torch.clamp(vs[0], -3, 3), None  # ограничение clamp(v0, −3, 3), без маски
+        elif op == "square":  # квадрат
+            v, ok = vs[0] * vs[0], None  # квадрат v0·v0, без маски
+        elif op == "cube":  # куб
+            v, ok = vs[0] * vs[0] * vs[0], None  # куб v0·v0·v0, без маски
+        else:  # прочее
+            raise ValueError(f"unsupported torch opcode: {op}")  # ошибка: нет такой операции torch
+        big = v.abs() > _MAG_LIMIT  # маска превышения: |v| > 2^62
+        for bb in bigs:  # по маскам аргументов
+            big = big | bb  # объединить маску big с маской аргумента bb
+        if ok is None:  # если маски допустимости нет
+            ok = _torch.ones_like(big)  # все дорожки допустимы
+        for child_ok in oks:  # по маскам аргументов
+        # Провести сбои областей аргументов через всё дерево выражения.
+            ok = ok & child_ok  # ok = ok и маска аргумента
+        return v, ok, big  # вернуть значения, маску ok, маску big
+
+    results: list[Optional[bool]] = []  # результаты по программам
+    for p in programs:  # по программам
+        if p.expr is None:  # нет выражения
+            results.append(None)  # неясно
+            continue  # следующая программа
+        try:  # попытка тензорной оценки
+            v, ok, big = teval(p.expr)  # значения, маска ok, маска big
+            if ok is None:  # если маска ok не задана
+                ok = _torch.ones(v.shape, dtype=_torch.bool, device=v.device)  # все дорожки допустимы
+            if bool((~ok).any()) or bool(big is not None and big.any()):  # есть недопустимая дорожка или превышение предела
+                results.append(None)  # неясно
+                continue  # следующая программа
+            results.append(bool(_torch.equal(v, Yt)))  # истина, если значения равны Yt
+        except (ValueError, RuntimeError, OverflowError):  # ошибка torch или переполнение
+            results.append(None)  # неясно
+    return results  # вернуть результаты
 
 
-# --------------------- code length and safe prefilter contract -----------------
 
+# --------------------- длина кода и договор безопасного фильтра -----------------
 
 def _gamma_bits(n: int) -> int:
-    """Length of Elias-gamma code for positive integer n."""
-    n = int(n)
-    if n < 1:
-        raise ValueError("gamma code accepts positive integers")
-    return 2 * (n.bit_length() - 1) + 1
+    """Длина гамма-кода Элиаса для положительного целого n.
+
+            n: положительное целое. Формула: 2·(bit_length(n) − 1) + 1. Для n < 1 — ValueError."""
+    n = int(n)  # привести к целому
+    if n < 1:  # n < 1 — ошибка
+        raise ValueError("gamma code accepts positive integers")  # сообщение об ошибке
+    return 2 * (n.bit_length() - 1) + 1  # длина кода = 2·(число бит − 1) + 1
 
 
 def _zigzag(n: int) -> int:
-    n = int(n)
-    return 2 * n if n >= 0 else -2 * n - 1
+    """Зигзаг-кодирование целого: неотрицательные на чётные, отрицательные на нечётные.
+
+            n: целое. Возврат: 2n при n ≥ 0, иначе −2n − 1."""
+    n = int(n)  # привести к целому
+    return 2 * n if n >= 0 else -2 * n - 1  # 2n, если n ≥ 0, иначе −2n − 1
 
 
-_TOKEN_BITS = 6  # fixed-width opcode namespace (64 reserved tokens)
+_TOKEN_BITS = 6  # ширина токена операции: 6 бит (64 зарезервированных токена)
 
 
 def _expr_description_bits(expr: Expr) -> int:
-    """A concrete prefix-code proxy; unlike AST-node count, constants cost bits.
+    """Длина описания выражения в битах по конкретному префиксному коду.
 
-    Every node begins with a 6-bit token. Variable indices, signed integer
-    constants and polynomial coefficients use self-delimiting gamma payloads.
-    It is a declared encoding for this DSL, not Kolmogorov complexity.
-    """
-    if expr.op == "var":
-        return _TOKEN_BITS + _gamma_bits(int(expr.value or 0) + 1)
-    if expr.op == "const":
-        return _TOKEN_BITS + _gamma_bits(_zigzag(int(expr.value)) + 1)
-    if expr.op == "poly":
-        coeffs = tuple(int(v) for v in (expr.value or ()))
-        payload = _gamma_bits(len(coeffs) + 1)
-        payload += sum(_gamma_bits(_zigzag(v) + 1) for v in coeffs)
-        return _TOKEN_BITS + payload + sum(_expr_description_bits(a) for a in expr.args)
-    if expr.op == "poly_nd":
-        terms = tuple(expr.value or ())
-        payload = _gamma_bits(len(terms) + 1)
-        for coefficient, powers in terms:
-            payload += _gamma_bits(_zigzag(int(coefficient)) + 1)
-            payload += _gamma_bits(len(powers) + 1)
-            payload += sum(_gamma_bits(int(power) + 1) for power in powers)
-        return _TOKEN_BITS + payload
-    return _TOKEN_BITS + sum(_expr_description_bits(a) for a in expr.args)
+                В отличие от подсчёта узлов дерева, константы тоже стоят бит. Каждый узел начинается с 6-битного токена;
+                индексы переменных, целые константы со знаком и коэффициенты многочлена кодируются самоделимитирующимися
+                гамма-пayload-ами: gamma(x) = 2·(bit_length(x) − 1) + 1, где x = zigzag(значение) + 1 > 0.
+            Это объявленное кодирование для данного языка выражений, а не колмогоровская сложность. Возврат: биты."""
+    if expr.op == "var":  # узел-переменная
+        return _TOKEN_BITS + _gamma_bits(int(expr.value or 0) + 1)  # 6 бит + gamma(индекс + 1)
+    if expr.op == "const":  # узел-константа
+        return _TOKEN_BITS + _gamma_bits(_zigzag(int(expr.value)) + 1)  # 6 бит + gamma(zigzag(значение) + 1)
+    if expr.op == "poly":  # многочлен одной переменной
+        coeffs = tuple(int(v) for v in (expr.value or ()))  # коэффициенты как кортеж целых
+        payload = _gamma_bits(len(coeffs) + 1)  # payload = gamma(число коэффициентов + 1)
+        payload += sum(_gamma_bits(_zigzag(v) + 1) for v in coeffs)  # payload += Σ gamma(zigzag(c) + 1) по коэффициентам
+        return _TOKEN_BITS + payload + sum(_expr_description_bits(a) for a in expr.args)  # 6 бит + payload + сумма бит аргументов
+    if expr.op == "poly_nd":  # многочлен многих переменных
+        terms = tuple(expr.value or ())  # члены (коэффициент, показатели)
+        payload = _gamma_bits(len(terms) + 1)  # payload = gamma(число членов + 1)
+        for coefficient, powers in terms:  # по членам
+            payload += _gamma_bits(_zigzag(int(coefficient)) + 1)  # payload += gamma(zigzag(коэффициент) + 1)
+            payload += _gamma_bits(len(powers) + 1)  # payload += gamma(число показателей + 1)
+            payload += sum(_gamma_bits(int(power) + 1) for power in powers)  # payload += Σ gamma(показатель + 1)
+        return _TOKEN_BITS + payload  # 6 бит + payload
+    return _TOKEN_BITS + sum(_expr_description_bits(a) for a in expr.args)  # прочий узел: 6 бит + сумма бит аргументов
 
 
 def _program_description_bits(program: Program) -> int:
-    if program.venn_mask is not None:
-        return _TOKEN_BITS + 4
-    if program.expr is None:
-        return 10**9
-    return _expr_description_bits(program.expr)
+    """Длина описания программы в битах.
+
+            Булева маска: 6 бит токена + 4 бита маски; нет выражения — 10^9; иначе длина описания выражения."""
+    if program.venn_mask is not None:  # булева маска
+        return _TOKEN_BITS + 4  # 10 бит
+    if program.expr is None:  # нет выражения
+        return 10**9  # 10^9 — заведомо неприменимая длина
+    return _expr_description_bits(program.expr)  # длина описания выражения
 
 
-_VECTOR_SAFE_OPS = {
-    "neg",
-    "abs",
-    "sign",
-    "bit_not8",
-    "clamp3",
-    "add",
-    "sub",
-    "mul",
-    "floordiv",
-    "mod",
-    "gcd",
-    "lcm",
-    "min",
-    "max",
-    "eq",
-    "ne",
-    "lt",
-    "le",
-    "gt",
-    "ge",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "bit_nand8",
-    "bit_nor8",
-    "bit_xnor8",
-    "absdiff",
-    "clamp",
-    "median3",
+_VECTOR_SAFE_OPS = {  # операции, безопасные для векторного фильтра int64
+    "neg",  # отрицание
+    "abs",  # модуль
+    "sign",  # знак
+    "bit_not8",  # инверсия байта
+    "clamp3",  # ограничение отрезком [−3, 3]
+    "add",  # сложение
+    "sub",  # вычитание
+    "mul",  # умножение
+    "floordiv",  # деление вниз
+    "mod",  # остаток
+    "gcd",  # наибольший общий делитель
+    "lcm",  # наименьшее общее кратное
+    "min",  # минимум
+    "max",  # максимум
+    "eq",  # равно
+    "ne",  # не равно
+    "lt",  # меньше
+    "le",  # меньше или равно
+    "gt",  # больше
+    "ge",  # больше или равно
+    "bit_and",  # побитовое «и»
+    "bit_or",  # побитовое «или»
+    "bit_xor",  # исключающее «или»
+    "bit_nand8",  # не-и в байте
+    "bit_nor8",  # не-или в байте
+    "bit_xnor8",  # эквивалентность в байте
+    "absdiff",  # модуль разности
+    "clamp",  # ограничение диапазоном
+    "median3",  # медиана трёх
 }
-_VECTOR_INPUT_LIMIT = 1 << 7
-_VECTOR_MAX_DEPTH = 3
+_VECTOR_INPUT_LIMIT = 1 << 7  # предел модуля листа: 2^7 = 128
+_VECTOR_MAX_DEPTH = 3  # наибольшая глубина вложенности операций: 3
 
 
 def _vector_prefilter_safe(expr: Expr, depth: int = 0) -> bool:
-    """Prove a conservative int64 envelope for the vectorized DSL subset.
+    """Доказать консервативную оболочку int64 для векторного подмножества языка выражений.
 
-    With at most 3 operator levels and |leaf|<=128, a binary expression has
-    at most 8 leaves; even a product/lcm of all leaves is <=2**56. Additive
-    combinations remain below 2**63. Powers, cubes, FMA, mul3 and arbitrary
-    constants deliberately use scalar Python-int authority instead.
-    """
-    if depth > _VECTOR_MAX_DEPTH:
-        return False
-    if expr.op == "var":
-        return True
-    if expr.op == "const":
-        return abs(int(expr.value or 0)) <= _VECTOR_INPUT_LIMIT
-    if expr.op not in _VECTOR_SAFE_OPS:
-        return False
-    return all(_vector_prefilter_safe(a, depth + 1) for a in expr.args)
+                expr: выражение; depth: текущая глубина. При не более 3 уровнях операций и |лист| ≤ 128 бинарное выражение
+                имеет не более 8 листьев; даже произведение или наименьшее общее кратное всех листьев ≤ 2^56,
+                аддитивные комбинации остаются ниже 2^63. Степени, кубы, fma, mul3 и произвольные константы
+            намеренно считаются скалярными целыми Python. Возврат: истина, если выражение в оболочке."""
+    if depth > _VECTOR_MAX_DEPTH:  # глубина больше 3 — небезопасно
+        return False  # ложь
+    if expr.op == "var":  # переменная
+        return True  # безопасна
+    if expr.op == "const":  # константа
+        return abs(int(expr.value or 0)) <= _VECTOR_INPUT_LIMIT  # безопасна, если |значение| ≤ 128
+    if expr.op not in _VECTOR_SAFE_OPS:  # операция не из безопасного набора
+        return False  # ложь
+    return all(_vector_prefilter_safe(a, depth + 1) for a in expr.args)  # все аргументы безопасны на глубине + 1
 
 
 def batch_fits_safe(
-    programs: Sequence[Program],
-    X: Optional[np.ndarray],
-    Y: Optional[np.ndarray],
+    programs: Sequence[Program],  # programs — программы-кандидаты
+    X: Optional[np.ndarray],  # X — входы или None
+    Y: Optional[np.ndarray],  # Y — ответы или None
     device: str = "cpu",
-) -> list[Optional[bool]]:
+) -> list[Optional[bool]]:  # возврат — список «подходит / не подходит / неясно» по программам
+    """Консервативный фильтр: None означает «нужна скалярная проверка».
+
+                programs: программы; X, Y: входы и ответы или None; device: устройство. Возврат: список True/False/None.
+                Через int64 в NumPy/Torch идут только ограниченные выражения; прочие кандидаты минуют быстрый путь,
+                поэтому переполнение не может дать ложный отказ. Векторный результат — никогда не свидетель закрепления:
+            выжившие всё равно проверяются скалярно на обучении, проверке и всей конечной области."""
     """Conservative filter: None means scalar check required.
 
     Only bounded expressions are sent through NumPy/Torch int64. All other
@@ -2022,480 +2280,515 @@ def batch_fits_safe(
     A vector result is never a commit certificate; scalar Python-int checks
     still validate every possible survivor on train/val/full finite support.
     """
-    if X is None or Y is None:
-        return [None] * len(programs)
-    if X.size and (
-        int(X.min()) < -_VECTOR_INPUT_LIMIT or int(X.max()) > _VECTOR_INPUT_LIMIT
-    ):
-        return [None] * len(programs)
-    out: list[Optional[bool]] = [None] * len(programs)
-    safe_indices = [
-        i
-        for i, p in enumerate(programs)
-        if p.expr is not None and _vector_prefilter_safe(p.expr)
-    ]
-    if safe_indices:
-        safe_programs = [programs[i] for i in safe_indices]
-        safe_results = _batch_fits_unchecked(safe_programs, X, Y, device=device)
-        for i, result in zip(safe_indices, safe_results):
-            out[i] = result
-    return out
+    if X is None or Y is None:  # нет входов или ответов
+        return [None] * len(programs)  # всем программам — неясно
+    if X.size and (  # есть примеры и вход вне пределов (начало условия)
+        int(X.min()) < -_VECTOR_INPUT_LIMIT or int(X.max()) > _VECTOR_INPUT_LIMIT  # min(X) < −128 или max(X) > 128
+    ):  # конец условия
+        return [None] * len(programs)  # всем программам — неясно
+    out: list[Optional[bool]] = [None] * len(programs)  # результат, изначально «неясно» для всех
+    safe_indices = [  # номера программ с выражением в безопасной оболочке (начало списка)
+        i  # номер i
+        for i, p in enumerate(programs)  # по парам (номер, программа)
+        if p.expr is not None and _vector_prefilter_safe(p.expr)  # выражение есть и фильтр безопасен
+    ]  # конец списка
+    if safe_indices:  # если безопасные есть
+        safe_programs = [programs[i] for i in safe_indices]  # безопасные программы
+        safe_results = _batch_fits_unchecked(safe_programs, X, Y, device=device)  # векторная оценка без дополнительной проверки
+        for i, result in zip(safe_indices, safe_results):  # по парам (номер, результат)
+            out[i] = result  # записать результат на своё место
+    return out  # вернуть результаты
 
 
-# ------------------------- best-first candidate synthesis ----------------------
 
-UNARY_OPS = ("neg", "abs", "sign", "bit_not8", "clamp3")
-BINARY_OPS = (
-    "add",
-    "sub",
-    "mul",
-    "floordiv",
-    "mod",
-    "gcd",
-    "lcm",
-    "min",
-    "max",
-    "eq",
-    "ne",
-    "lt",
-    "le",
-    "gt",
-    "ge",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "bit_nand8",
-    "bit_nor8",
-    "bit_xnor8",
-    "pow_int",
+# ------------------------- синтез кандидатов «сначала лучший» ----------------------
+UNARY_OPS = ("neg", "abs", "sign", "bit_not8", "clamp3")  # унарные операции синтеза
+BINARY_OPS = (  # бинарные операции синтеза (начало кортежа)
+    "add",  # сложение
+    "sub",  # вычитание
+    "mul",  # умножение
+    "floordiv",  # деление вниз
+    "mod",  # остаток
+    "gcd",  # наибольший общий делитель
+    "lcm",  # наименьшее общее кратное
+    "min",  # минимум
+    "max",  # максимум
+    "eq",  # равно
+    "ne",  # не равно
+    "lt",  # меньше
+    "le",  # меньше или равно
+    "gt",  # больше
+    "ge",  # больше или равно
+    "bit_and",  # побитовое «и»
+    "bit_or",  # побитовое «или»
+    "bit_xor",  # исключающее «или»
+    "bit_nand8",  # не-и в байте
+    "bit_nor8",  # не-или в байте
+    "bit_xnor8",  # эквивалентность в байте
+    "pow_int",  # целая степень
 )
-CONSTS = (0, 1, -1)
+CONSTS = (0, 1, -1)  # константы синтеза: 0, 1, −1
 
 
-TERNARY_PRIMS = ("fma", "clamp", "median3", "mul3")
+TERNARY_PRIMS = ("fma", "clamp", "median3", "mul3")  # тернарные примитивы
 
 
-def iter_candidates_mdl(
-    arity: int,
-    node_budget: int = DEFAULT_NODE_BUDGET,
-    probe_x: Sequence[Sequence[int]] = (),
-    probe_y: Sequence[int] = (),
-    extra_binops: Sequence[tuple[str, Program]] = (),
-    pop_budget: int = 50_000,
-    deadline: Optional[float] = None,
-) -> Iterator[Expr]:
-    """Yield probe-consistent ASTs in true prefix-code-length order.
+def iter_candidates_mdl(  # iter_candidates_mdl: перебор выражений-кандидатов в порядке длины описания
+    arity: int,  # arity — число входов
+    node_budget: int = DEFAULT_NODE_BUDGET,  # node_budget — предел числа выданных кандидатов
+    probe_x: Sequence[Sequence[int]] = (),  # probe_x — пробные входы
+    probe_y: Sequence[int] = (),  # probe_y — пробные ответы
+    extra_binops: Sequence[tuple[str, Program]] = (),  # extra_binops — дополнительные пары (имя, программа) для подстановки экспертов
+    pop_budget: int = 50_000,  # pop_budget — предел выборок из кучи
+    deadline: Optional[float] = None,  # deadline — предельный момент времени или None
+) -> Iterator[Expr]:  # возврат — генератор выражений
+    """Выдавать выражения, согласные с пробами, в порядке возраста длины префиксного кода.
 
-    The generator explores the implemented restricted grammar: unary ops,
-    self-combinations, binary op with one leaf, ternary primitives on variables,
-    and committed-expert substitutions. It is NOT a complete enumeration of
-    all possible DSL trees; node/pop/deadline limits can also truncate it.
-    Probe values are used only as a cheap consistency sieve: no two different
-    ASTs are discarded merely because they coincide on five probes.
-    """
-    probe = tuple(tuple(int(v) for v in xs) for xs in probe_x)
-    n = len(probe)
-    pop_budget = int(pop_budget)
+                Генератор обходит реализованную ограниченную грамматику: унарные операции, применение операции
+                к двум копиям узла, бинарная операция с листом, тернарные примитивы над переменными
+                и подстановки закреплённых экспертов. Это НЕ полный перебор всех деревьев языка;
+                пределы node/pop/deadline тоже могут оборвать его. Пробные значения служат только дешёвым
+                ситом согласованности: разные деревья не отбрасываются лишь за совпадение на пяти пробах.
 
-    def apply_bin(
-        op: str, a: tuple[int, ...], b: tuple[int, ...]
-    ) -> Optional[tuple[int, ...]]:
-        fn = OPS.get(op)
-        if fn is None:
-            return None
-        try:
-            return tuple(int(fn(a[i], b[i])) for i in range(n))
-        except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-            return None
+                Алгоритм: куча с ключом (число бит описания, порядковый номер). Из кучи достаётся кратчайший
+                кандидат; если его пробные значения равны probe_y (или probe_y не задано), он выдаётся;
+            затем расширяются его потомки и кладутся в кучу. Значения на пробах считаются вместе с деревом."""
+    probe = tuple(tuple(int(v) for v in xs) for xs in probe_x)  # probe — пробные входы как кортежи целых
+    n = len(probe)  # n — число проб
+    pop_budget = int(pop_budget)  # pop_budget как целое
 
-    def apply_un(op: str, a: tuple[int, ...]) -> Optional[tuple[int, ...]]:
-        fn = (lambda v: min(max(v, -3), 3)) if op == "clamp3" else OPS.get(op)
-        if fn is None:
-            return None
-        try:
-            return tuple(int(fn(a[i])) for i in range(n))
-        except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-            return None
+    def apply_bin(  # вложенная функция apply_bin: бинарная операция над столбцами пробных значений a и b
+        op: str, a: tuple[int, ...], b: tuple[int, ...]  # op — имя операции; a, b — наборы значений по пробам; возврат — набор результатов или None
+    ) -> Optional[tuple[int, ...]]:  # конец сигнатуры
+        fn = OPS.get(op)  # функция операции из OPS
+        if fn is None:  # операции нет
+            return None  # неопределено
+        try:  # попытка
+            return tuple(int(fn(a[i], b[i])) for i in range(n))  # (fn(a_i, b_i)) по всем пробам i
+        except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления на пробе
+            return None  # неопределено
 
-    def apply_tern(
-        op: str, a: tuple[int, ...], b: tuple[int, ...], c: tuple[int, ...]
-    ) -> Optional[tuple[int, ...]]:
-        try:
-            if op == "fma":
-                return tuple(a[i] * b[i] + c[i] for i in range(n))
-            if op == "mul3":
-                return tuple(a[i] * b[i] * c[i] for i in range(n))
-            if op == "clamp":
-                return tuple(min(max(a[i], b[i]), c[i]) for i in range(n))
-            return tuple(sorted((a[i], b[i], c[i]))[1] for i in range(n))
-        except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-            return None
+    def apply_un(op: str, a: tuple[int, ...]) -> Optional[tuple[int, ...]]:  # вложенная функция apply_un: унарная операция над столбцом пробных значений a
+        fn = (lambda v: min(max(v, -3), 3)) if op == "clamp3" else OPS.get(op)  # clamp3 — ограничение отрезком, иначе функция из OPS
+        if fn is None:  # операции нет
+            return None  # неопределено
+        try:  # попытка
+            return tuple(int(fn(a[i])) for i in range(n))  # (fn(a_i)) по всем пробам
+        except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+            return None  # неопределено
 
-    counter = itertools.count()
-    leaves = [Expr.var(i) for i in range(arity)] + [Expr.const(c) for c in CONSTS]
-    leaf_vals: list[tuple[Expr, Optional[tuple[int, ...]]]] = []
-    for leaf in leaves:
-        if leaf.op == "var":
-            lv = tuple(row[int(leaf.value or 0)] for row in probe) if n else None
-        else:
-            lv = tuple(int(leaf.value) for _ in probe) if n else None
-        leaf_vals.append((leaf, lv))
+    def apply_tern(  # вложенная функция apply_tern: тернарный примитив над столбцами a, b, c
+        op: str, a: tuple[int, ...], b: tuple[int, ...], c: tuple[int, ...]  # op — примитив; a, b, c — наборы значений; возврат — результаты или None
+    ) -> Optional[tuple[int, ...]]:  # конец сигнатуры
+        try:  # попытка
+            if op == "fma":  # fma: a·b + c
+                return tuple(a[i] * b[i] + c[i] for i in range(n))  # (a_i·b_i + c_i) по пробам
+            if op == "mul3":  # mul3: произведение трёх
+                return tuple(a[i] * b[i] * c[i] for i in range(n))  # (a_i·b_i·c_i) по пробам
+            if op == "clamp":  # clamp
+                return tuple(min(max(a[i], b[i]), c[i]) for i in range(n))  # min(max(a_i, b_i), c_i) по пробам
+            return tuple(sorted((a[i], b[i], c[i]))[1] for i in range(n))  # иначе median3: среднее из трёх по пробам
+        except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+            return None  # неопределено
 
-    heap: list[tuple[int, int, Expr, tuple[int, ...]]] = []
-    expr_seen: set[Expr] = set()
-    target: Optional[tuple[int, ...]] = (
-        tuple(int(v) for v in probe_y) if probe_y else None
-    )
-    max_nodes = 24
+    counter = itertools.count()  # счётчик порядка поступления для развязки равных ключей
+    leaves = [Expr.var(i) for i in range(arity)] + [Expr.const(c) for c in CONSTS]  # листья: переменные x_0..x_{arity−1} и константы из CONSTS
+    leaf_vals: list[tuple[Expr, Optional[tuple[int, ...]]]] = []  # пары (лист, его значения на пробах)
+    for leaf in leaves:  # по листьям
+        if leaf.op == "var":  # переменная
+            lv = tuple(row[int(leaf.value or 0)] for row in probe) if n else None  # значения переменной на пробах (нет, если проб нет)
+        else:  # константа
+            lv = tuple(int(leaf.value) for _ in probe) if n else None  # константа, повторённая на каждой пробе (нет, если проб нет)
+        leaf_vals.append((leaf, lv))  # добавить пару
 
-    def push(expr: Expr, vals: Optional[tuple[int, ...]]) -> None:
-        if vals is None or expr.cost > max_nodes or expr in expr_seen:
-            return
-        expr_seen.add(expr)
-        heapq.heappush(heap, (_expr_description_bits(expr), next(counter), expr, vals))
+    heap: list[tuple[int, int, Expr, tuple[int, ...]]] = []  # куча: (число бит, порядковый номер, выражение, значения на пробах)
+    expr_seen: set[Expr] = set()  # множество уже добавленных выражений
+    target: Optional[tuple[int, ...]] = (  # целевые значения на пробах (начало выражения)
+        tuple(int(v) for v in probe_y) if probe_y else None  # probe_y как кортеж целых, если пробы заданы
+    )  # конец выражения; иначе None
+    max_nodes = 24  # наибольшая допустимая стоимость выражения — 24 узла
 
-    for leaf, lv in leaf_vals:
-        push(leaf, lv)
+    def push(expr: Expr, vals: Optional[tuple[int, ...]]) -> None:  # вложенная функция push: положить выражение в кучу, если оно допустимо
+        if vals is None or expr.cost > max_nodes or expr in expr_seen:  # нет значений, стоимость больше 24 или уже добавлено — выход
+            return  # выход
+        expr_seen.add(expr)  # запомнить выражение
+        heapq.heappush(heap, (_expr_description_bits(expr), next(counter), expr, vals))  # положить (биты описания, номер, выражение, значения) в кучу
 
-    # Ternary primitive atoms are generated once, not redundantly at every pop.
-    if arity == 3:
-        for a, va in leaf_vals[:3]:
-            for b, vb in leaf_vals[:3]:
-                for c, vc in leaf_vals[:3]:
-                    for prim in TERNARY_PRIMS:
-                        push(Expr(prim, (a, b, c)), apply_tern(prim, va, vb, vc))
+    for leaf, lv in leaf_vals:  # по листьям с их значениями
+        push(leaf, lv)  # положить лист в кучу
 
-    generated = 0
-    pops = 0
-    extra_ops = tuple(
-        sorted(
-            ((nm, prog) for nm, prog in extra_binops),
-            key=lambda pair: (_program_description_bits(pair[1]), pair[0]),
-        )[:MAX_REUSE_EXPANSIONS]
-    )
+    if arity == 3:  # три входа
+    # Атомы тернарных примитивов порождаются один раз, а не заново при каждой выборке.
+        for a, va in leaf_vals[:3]:  # по первым трём листьям-переменным a
+            for b, vb in leaf_vals[:3]:  # по b
+                for c, vc in leaf_vals[:3]:  # по c
+                    for prim in TERNARY_PRIMS:  # по тернарным примитивам
+                        push(Expr(prim, (a, b, c)), apply_tern(prim, va, vb, vc))  # положить prim(a, b, c) с его пробными значениями
 
-    def expired() -> bool:
-        return deadline is not None and time.monotonic() >= deadline
+    generated = 0  # число выданных кандидатов
+    pops = 0  # число выборок из кучи
+    extra_ops = tuple(  # дополнительные операции-эксперты (начало выражения)
+        sorted(  # отсортировать
+            ((nm, prog) for nm, prog in extra_binops),  # пары (имя, программа)
+            key=lambda pair: (_program_description_bits(pair[1]), pair[0]),  # ключ сортировки: (биты описания программы, имя)
+        )[:MAX_REUSE_EXPANSIONS]  # не более MAX_REUSE_EXPANSIONS = 8 штук
+    )  # конец выражения
 
-    while heap and generated < node_budget and pops < pop_budget:
-        if deadline is not None and time.monotonic() >= deadline:
-            break
-        _, _, expr, vals = heapq.heappop(heap)
-        pops += 1
-        if target is None or vals == target:
-            generated += 1
-            yield expr
+    def expired() -> bool:  # вложенная функция expired: истёк ли срок
+        return deadline is not None and time.monotonic() >= deadline  # deadline задан и монотонное время не меньше него
 
-        base = expr.cost
-        for op in UNARY_OPS:
-            if expired():
-                return
-            push(Expr(op, (expr,)), apply_un(op, vals))
+    while heap and generated < node_budget and pops < pop_budget:  # пока куча не пуста и не исчерпаны бюджеты узлов и выборок
+        if deadline is not None and time.monotonic() >= deadline:  # срок истёк
+            break  # выход из цикла
+        _, _, expr, vals = heapq.heappop(heap)  # достать из кучи выражение с наименьшим числом бит
+        pops += 1  # выборок + 1
+        if target is None or vals == target:  # цели нет или пробные значения совпали
+            generated += 1  # выданных + 1
+            yield expr  # выдать выражение
 
-        for op in BINARY_OPS:
-            if expired():
-                return
-            push(Expr(op, (expr, expr)), apply_bin(op, vals, vals))
-            for leaf, lv in leaf_vals:
-                if expired():
-                    return
-                push(Expr(op, (expr, leaf)), apply_bin(op, vals, lv))
-                push(Expr(op, (leaf, expr)), apply_bin(op, lv, vals))
+        base = expr.cost  # стоимость базового узла (не используется далее)
+        for op in UNARY_OPS:  # по унарным операциям
+            if expired():  # срок истёк
+                return  # закончить генератор
+            push(Expr(op, (expr,)), apply_un(op, vals))  # потомок op(expr) с его пробными значениями
 
-        for _name, prog in extra_ops:
-            if expired():
-                return
-            if prog.arity != 2 or prog.expr is None:
-                continue
-            exp = _program_to_substitutable_expr(prog)
-            combos = [(expr, vals, expr, vals)]
-            for leaf, lv in leaf_vals:
-                combos.append((expr, vals, leaf, lv))
-                combos.append((leaf, lv, expr, vals))
-            for a, _av, b, _bv in combos:
-                if expired():
-                    return
-                if _subst_cost(exp, {0: a.cost, 1: b.cost}) > max_nodes:
-                    continue
-                child = _substitute(exp, {0: a, 1: b})
-                # A reusable expert that ignores both inputs can collapse to
-                # a cheaper leaf; do not insert a lower-cost key after popping
-                # a more expensive node, which would break best-first ordering.
-                if _expr_description_bits(child) <= _expr_description_bits(expr):
-                    continue
-                try:
-                    out = tuple(int(child.eval(row)) for row in probe)
-                except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                    out = None
-                push(child, out)
+        for op in BINARY_OPS:  # по бинарным операциям
+            if expired():  # срок истёк
+                return  # закончить генератор
+            push(Expr(op, (expr, expr)), apply_bin(op, vals, vals))  # потомок op(expr, expr)
+            for leaf, lv in leaf_vals:  # по листьям
+                if expired():  # срок истёк
+                    return  # закончить генератор
+                push(Expr(op, (expr, leaf)), apply_bin(op, vals, lv))  # потомок op(expr, лист)
+                push(Expr(op, (leaf, expr)), apply_bin(op, lv, vals))  # потомок op(лист, expr)
+
+        for _name, prog in extra_ops:  # по дополнительным экспертам (имя, программа)
+            if expired():  # срок истёк
+                return  # закончить генератор
+            if prog.arity != 2 or prog.expr is None:  # эксперт обязан быть бинарным с выражением
+                continue  # пропустить
+            exp = _program_to_substitutable_expr(prog)  # выражение эксперта с переменными для подстановки
+            combos = [(expr, vals, expr, vals)]  # комбинации (левый, правый):(expr, expr) и далее с листьями
+            for leaf, lv in leaf_vals:  # по листьям
+                combos.append((expr, vals, leaf, lv))  # комбинация (expr, лист)
+                combos.append((leaf, lv, expr, vals))  # комбинация (лист, expr)
+            for a, _av, b, _bv in combos:  # по комбинациям (левое подвыражение a, правое b)
+                if expired():  # срок истёк
+                    return  # закончить генератор
+                if _subst_cost(exp, {0: a.cost, 1: b.cost}) > max_nodes:  # стоимость после подстановки больше 24
+                    continue  # пропустить
+                child = _substitute(exp, {0: a, 1: b})  # подставить a и b на места переменных 0 и 1
+                if _expr_description_bits(child) <= _expr_description_bits(expr):  # битов описания не больше, чем у родителя
+                    continue  # пропустить
+                try:  # попытка
+                # Эксперт, не зависящий ни от одного входа, может свернуться в более дешёвый лист;
+                # не вставлять ключ с меньшей стоимостью после выборки более дорогого узла —
+                # это нарушило бы порядок «сначала лучший».
+                    out = tuple(int(child.eval(row)) for row in probe)  # значения потомка на пробах
+                except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                    out = None  # значения не определены
+                push(child, out)  # положить потомка в кучу
 
 
 def _poly_nd_to_ast(expr: Expr) -> Expr:
+    """Развернуть компактный многочлен многих переменных в обычные операции языка.
+
+                expr: выражение poly_nd. Каждый член c·Π x_i^{p_i} собирается из констант, переменных, pow_int и mul;
+            члены соединяются add. Возврат: Expr; для пустого многочлена — константа 0."""
     """Expand the compact multivariate opcode into ordinary DSL operations."""
-    terms = []
-    for coefficient, powers in expr.value or ():
-        factors: list[Expr] = [Expr.const(int(coefficient))]
-        for index, power in enumerate(powers):
-            power = int(power)
-            if power == 0:
-                continue
-            variable = Expr.var(index)
-            factor = (
-                variable
-                if power == 1
-                else Expr("pow_int", (variable, Expr.const(power)))
-            )
-            factors.append(factor)
-        term = factors[0]
-        for factor in factors[1:]:
-            term = Expr("mul", (term, factor))
-        terms.append(term)
-    if not terms:
-        return Expr.const(0)
-    result = terms[0]
-    for term in terms[1:]:
-        result = Expr("add", (result, term))
-    return result
+    terms = []  # список членов-деревьев
+    for coefficient, powers in expr.value or ():  # по парам (коэффициент, показатели)
+        factors: list[Expr] = [Expr.const(int(coefficient))]  # множители члена: константа-коэффициент
+        for index, power in enumerate(powers):  # по парам (индекс переменной, степень)
+            power = int(power)  # степень как целое
+            if power == 0:  # степень 0 — переменная не входит
+                continue  # пропустить
+            variable = Expr.var(index)  # переменная x_index
+            factor = (  # множитель (начало условия)
+                variable  # сама переменная
+                if power == 1  # если степень 1
+                else Expr("pow_int", (variable, Expr.const(power)))  # иначе pow_int(переменная, степень)
+            )  # конец условия
+            factors.append(factor)  # добавить множитель
+        term = factors[0]  # член — первый множитель
+        for factor in factors[1:]:  # по остальным множителям
+            term = Expr("mul", (term, factor))  # член = mul(член, множитель)
+        terms.append(term)  # добавить член
+    if not terms:  # членов нет
+        return Expr.const(0)  # вернуть константу 0
+    result = terms[0]  # результат — первый член
+    for term in terms[1:]:  # по остальным членам
+        result = Expr("add", (result, term))  # результат = add(результат, член)
+    return result  # вернуть результат
 
 
 def _program_to_substitutable_expr(program: Program) -> Expr:
-    if program.expr is None:
-        raise ValueError("truth-table programs are not arithmetic ASTs")
-    if program.expr.op == "poly_nd":
-        return _poly_nd_to_ast(program.expr)
-    return program.expr
+    """Выражение программы, пригодное для подстановки вместо переменных.
+
+                program: программа. Булевы таблицы истинности не являются деревьями — ValueError.
+            poly_nd разворачивается в операции. Возврат: Expr."""
+    if program.expr is None:  # выражения нет
+        raise ValueError("truth-table programs are not arithmetic ASTs")  # ошибка: программы-таблицы истинности не арифметические деревья
+    if program.expr.op == "poly_nd":  # компактный многочлен
+        return _poly_nd_to_ast(program.expr)  # развернуть его
+    return program.expr  # иначе вернуть выражение как есть
 
 
 def _composition_hint(spec: TaskSpec) -> Optional[Program]:
-    """Build an exact AST witness from the parent experts stored in a proposal.
+    """Построить точное дерево-свидетеля по экспертам-родителям, хранящимся в предложении задачи.
 
-    The hint is never trusted: GrowingMathProcessorV7.learn exhaustively
-    verifies it before commit. It simply avoids rediscovering a known tree
-    through a large general grammar frontier.
-    """
-    parents = getattr(spec.teacher, "__defaults__", None)
-    if not parents or len(parents) < 2:
-        return None
-    outer, inner = parents[0], parents[1]
-    if not isinstance(outer, Expert) or not isinstance(inner, Expert):
-        return None
-    if outer.program.arity != 2 or spec.arity != 2:
-        return None
-    if outer.program.venn_mask is not None and inner.program.venn_mask is not None:
-        mask = 0
-        for x in (0, 1):
-            for y in (0, 1):
-                value = int(spec.teacher(x, y)) & 1
-                mask |= value << ((x << 1) | y)
-        return Program(2, venn_mask=mask)
-    if outer.program.expr is None or inner.program.expr is None:
-        return None
-    outer_expr = _program_to_substitutable_expr(outer.program)
-    inner_expr = _program_to_substitutable_expr(inner.program)
-    if inner.program.arity == 1:
-        mapping = {0: inner_expr, 1: Expr.var(1)}
-    elif inner.program.arity == 2:
-        mapping = {0: Expr.var(0), 1: inner_expr}
-    else:
-        return None
-    return Program(2, _substitute(outer_expr, mapping))
+                Указание никогда не принимается на веру: learn процесса V7 проверяет его полным перебором перед
+                закреплением. Оно лишь избавляет от повторного поиска уже известного дерева через большой
+                общий фронт грамматики. Родители берутся из стандартных значений функции-учителя (два первых).
+
+                Если оба родителя — булевы маски, маска результата строится по четырём входам: bit(2·x + y) = teacher(x, y).
+                Если внутренний эксперт унарный, он подставляется на место x; если бинарный — на место y.
+            Возврат: Program или None, если построить нельзя."""
+    parents = getattr(spec.teacher, "__defaults__", None)  # стандартные значения аргументов функции-учителя
+    if not parents or len(parents) < 2:  # родителей меньше двух
+        return None  # указания нет
+    outer, inner = parents[0], parents[1]  # внешний и внутренний родители
+    if not isinstance(outer, Expert) or not isinstance(inner, Expert):  # оба обязаны быть экспертами
+        return None  # иначе нет
+    if outer.program.arity != 2 or spec.arity != 2:  # внешний эксперт и задача обязаны быть бинарными
+        return None  # иначе нет
+    if outer.program.venn_mask is not None and inner.program.venn_mask is not None:  # оба родителя — булевы маски
+        mask = 0  # маска результата
+        for x in (0, 1):  # x из {0, 1}
+            for y in (0, 1):  # y из {0, 1}
+                value = int(spec.teacher(x, y)) & 1  # значение учителя, взятое по модулю 2
+                mask |= value << ((x << 1) | y)  # маска: бит с номером 2·x + y принимает значение учителя
+        return Program(2, venn_mask=mask)  # вернуть булеву программу с маской
+    if outer.program.expr is None or inner.program.expr is None:  # хотя бы у одного родителя нет выражения
+        return None  # нет
+    outer_expr = _program_to_substitutable_expr(outer.program)  # выражение внешнего эксперта
+    inner_expr = _program_to_substitutable_expr(inner.program)  # выражение внутреннего эксперта
+    if inner.program.arity == 1:  # внутренний эксперт унарный
+        mapping = {0: inner_expr, 1: Expr.var(1)}  # подстановка: x -> внутренний, y -> переменная y
+    elif inner.program.arity == 2:  # внутренний эксперт бинарный
+        mapping = {0: Expr.var(0), 1: inner_expr}  # подстановка: x -> переменная x, y -> внутренний
+    else:  # прочее
+        return None  # нет
+    return Program(2, _substitute(outer_expr, mapping))  # вернуть программу outer с подстановкой
 
 
 def _substitute(e: Expr, mapping: dict[int, Expr]) -> Expr:
-    if e.op == "var":
-        return mapping[int(e.value or 0)]
-    if e.op == "const":
-        return e
-    return Expr(e.op, tuple(_substitute(a, mapping) for a in e.args))
+    """Подставить выражения вместо переменных дерева.
+
+            e: выражение; mapping: «индекс переменной -> выражение». Возврат: новое дерево Expr; константы не меняются."""
+    if e.op == "var":  # переменная
+        return mapping[int(e.value or 0)]  # заменить по словарю
+    if e.op == "const":  # константа
+        return e  # вернуть как есть
+    return Expr(e.op, tuple(_substitute(a, mapping) for a in e.args))  # тот же узел с рекурсивно подставленными аргументами
 
 
 def _subst_cost(e: Expr, costs: dict[int, int]) -> int:
-    """Cost of _substitute(e, vars->exprs with given costs), without building it."""
-    if e.op == "var":
-        return costs[int(e.value or 0)]
-    if e.op == "const":
-        return 1
-    return 1 + sum(_subst_cost(a, costs) for a in e.args)
+    """Стоимость подстановки _substitute(e, переменные -> выражения с данными стоимостями) без построения дерева.
+
+            e: выражение; costs: «индекс переменной -> стоимость». Формула: var -> costs[i]; const -> 1; иначе 1 + Σ по аргументам."""
+    if e.op == "var":  # переменная
+        return costs[int(e.value or 0)]  # стоимость подставляемого выражения
+    if e.op == "const":  # константа
+        return 1  # стоимость 1
+    return 1 + sum(_subst_cost(a, costs) for a in e.args)  # 1 + сумма стоимостей аргументов
 
 
-class SynthesisStats:
-    __slots__ = ("candidates_generated", "evals", "sieve_survivors")
+class SynthesisStats:  # класс без декоратора dataclass
+    __slots__ = ("candidates_generated", "evals", "sieve_survivors")  # имена полей без словаря атрибутов
 
-    def __init__(self) -> None:
-        self.candidates_generated = 0
-        self.evals = 0
-        self.sieve_survivors = 0
+    def __init__(self) -> None:  # создать счётчики нулями
+        self.candidates_generated = 0  # порождено 0
+        self.evals = 0  # вычислений 0
+        self.sieve_survivors = 0  # прошедших сито 0
 
 
-# ------------------------------- v7 processor ----------------------------------
 
+# ------------------------------- процессор v7 ----------------------------------
 
 class GrowingMathProcessorV7(V5Processor):
+    """Счётчики синтеза кандидатов.
+
+                candidates_generated — число порождённых кандидатов; evals — число вычислений на пробах;
+            sieve_survivors — число прошедших сито. Поля ограничены __slots__."""
+    """Символьный обучатель на конечных областях с консервативными ускоряющими ограждениями.
+
+                Наследует GrowingMathProcessor (слой V5). Отличия: кандидаты перебираются от коротких описаний к длинным
+                (iter_candidates_mdl), пробные значения отсекают заведомо неверных, векторный фильтр batch_fits_safe
+            только отсекает, а окончательное слово за скалярной проверкой всей конечной области."""
     """Finite-domain symbolic learner with conservative acceleration guards."""
 
-    def __init__(
-        self,
-        lookup_limit: int = 16,
-        mdl_lambda: float = 0.001,
-        node_budget: int = 20_000,
-        pop_budget: int = 50_000,
-        device: str = "cpu",
-    ):
-        if float(mdl_lambda) <= 0:
-            raise ValueError(
-                "mdl_lambda must be positive for the exact-fit MDL tie-break"
-            )
-        super().__init__(lookup_limit, mdl_lambda)
-        self.node_budget = int(node_budget)
-        self.pop_budget = int(pop_budget)
-        self.device = device
-        self.stats = SynthesisStats()
-        self.theorems: list[Theorem] = []
+    def __init__(  # создать процессор V7 (начало сигнатуры)
+        self,  # self — экземпляр
+        lookup_limit: int = 16,  # предел таблицы ответов
+        mdl_lambda: float = 0.001,  # вес длины кода
+        node_budget: int = 20_000,  # бюджет узлов
+        pop_budget: int = 50_000,  # бюджет выборок
+        device: str = "cpu",  # устройство
+    ):  # конец сигнатуры
+        if float(mdl_lambda) <= 0:  # вес длины кода обязан быть положительным
+            raise ValueError(  # ошибка (начало вызова)
+                "mdl_lambda must be positive for the exact-fit MDL tie-break"  # текст: mdl_lambda положителен для развязки по длине описания
+            )  # конец вызова
+        super().__init__(lookup_limit, mdl_lambda)  # инициализировать базовый процессор
+        self.node_budget = int(node_budget)  # бюджет узлов как целое
+        self.pop_budget = int(pop_budget)  # бюджет выборок как целое
+        self.device = device  # устройство
+        self.stats = SynthesisStats()  # счётчики синтеза
+        self.theorems: list[Theorem] = []  # список теорем, пока пуст
 
-    def learn(
-        self,
-        spec: TaskSpec,
-        seed: int = 0,
-        train_fraction: float = 0.70,
-        poison_one_label: bool = False,
-        train_neural: bool = False,
-        deadline: Optional[float] = None,
-        candidate_hint: Optional[Program] = None,
-    ) -> GrowthEvent:
-        if spec.name in self.experts:
-            return GrowthEvent(self.version, spec.name, "REUSE", "already learned")
-        if deadline is not None and time.monotonic() >= deadline:
-            return self._hold(spec, "TIME_BUDGET_EXHAUSTED", 0, 0)
-        domain = spec.inputs()
-        if not domain:
-            return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)
-        if len(domain) > 1:
-            train_fraction = min(max(float(train_fraction), 0.05), 0.95)
-        rng = np.random.default_rng(seed)
-        perm = rng.permutation(len(domain))
-        if spec.family == "BoolVenn":
-            n_train = max(1, len(domain) - 1)
-        else:
-            n_train = max(
-                1, min(len(domain) - 1, int(round(len(domain) * train_fraction)))
-            )
-        train_x = [domain[int(i)] for i in perm[:n_train]]
-        val_x = [domain[int(i)] for i in perm[n_train:]]
-        all_y = {xs: int(spec.teacher(*xs)) for xs in domain}
-        train_y = [all_y[xs] for xs in train_x]
-        val_y = [all_y[xs] for xs in val_x]
-        if poison_one_label and train_y:
-            train_y[0] = int(train_y[0]) + 1
-            # Explicit adversarial test injection: never search for a program
-            # from a label set known to contain the injected corruption.
-            return self._hold(
-                spec, "POISONED_LABEL_INJECTION", len(train_x), len(val_x)
-            )
+    def learn(  # метод learn слоя V7
+        self,  # self — экземпляр
+        spec: TaskSpec,  # задача
+        seed: int = 0,  # зерно
+        train_fraction: float = 0.70,  # доля обучающих примеров
+        poison_one_label: bool = False,  # портить ли одну метку
+        train_neural: bool = False,  # обучать ли нейросеть, по умолчанию нет
+        deadline: Optional[float] = None,  # предельное время
+        candidate_hint: Optional[Program] = None,  # подсказка-кандидат
+    ) -> GrowthEvent:  # возврат — событие роста
+        """Найти и закрепить эксперта для задачи слоя V7.
 
-        neural: Optional[NeuralFiber] = None
+                    spec: задача; seed: зерно; train_fraction: доля обучения; poison_one_label: портить метку;
+                    train_neural: обучать нейросеть; deadline: предельное время; candidate_hint: подсказка-кандидат.
+                    Возврат: GrowthEvent (REUSE, HOLD или COMMIT). Ход: разбиение области на обучение и проверку;
+                    при испорченной метке — HOLD без поиска; попытки: готовый эксперт из библиотеки, точные шаблоны,
+                    подсказка-кандидат, перебор iter_candidates_mdl с ситом проб и векторным фильтром;
+                каждый выживший проверяется на обучении, проверке и всей области (validate_candidate), затем commit."""
+        if spec.name in self.experts:  # задача уже изучена — событие REUSE
+            return GrowthEvent(self.version, spec.name, "REUSE", "already learned")  # вернуть событие REUSE «уже изучено»
+        if deadline is not None and time.monotonic() >= deadline:  # срок истёк
+            return self._hold(spec, "TIME_BUDGET_EXHAUSTED", 0, 0)  # отказ «бюджет времени исчерпан»
+        domain = spec.inputs()  # все допустимые входы
+        if not domain:  # область пуста
+            return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)  # отказ «пустая область»
+        if len(domain) > 1:  # больше одного входа: долю обучения ограничить отрезком [0.05, 0.95]
+            train_fraction = min(max(float(train_fraction), 0.05), 0.95)  # доля обучения ограничена отрезком [0.05, 0.95]
+        rng = np.random.default_rng(seed)  # генератор с зерном
+        perm = rng.permutation(len(domain))  # случайная перестановка номеров входов
+        if spec.family == "BoolVenn":  # булевы функции
+            n_train = max(1, len(domain) - 1)  # число обучающих: на один меньше области
+        else:  # иначе
+            n_train = max(  # n_train = max(1, min(N − 1, round(N·train_fraction))) (начало выражения)
+                1, min(len(domain) - 1, int(round(len(domain) * train_fraction)))  # минимум из N − 1 и округлённой доли
+            )  # конец max
+        train_x = [domain[int(i)] for i in perm[:n_train]]  # обучающие входы — первые n_train из перестановки
+        val_x = [domain[int(i)] for i in perm[n_train:]]  # проверочные входы — остальные
+        all_y = {xs: int(spec.teacher(*xs)) for xs in domain}  # ответы учителя на всей области
+        train_y = [all_y[xs] for xs in train_x]  # обучающие ответы
+        val_y = [all_y[xs] for xs in val_x]  # проверочные ответы
+        if poison_one_label and train_y:  # портить метку и есть обучающие примеры
+            train_y[0] = int(train_y[0]) + 1  # первая метка увеличена на 1
+            return self._hold(  # отказ «испорченная метка» (начало вызова)
+                spec, "POISONED_LABEL_INJECTION", len(train_x), len(val_x)  # задача, причина, размеры выборок
+            # Явная состязательная инъекция: никогда не искать программу по набору меток,
+            # в который заведомо внесено повреждение.
+            )  # конец вызова
 
-        def maybe_fit_neural() -> Optional[NeuralFiber]:
-            if not train_neural or not val_x:
-                return None
-            try:
-                return fit_fiber_guarded(
-                    train_x, train_y, val_x, val_y, seed=seed + 991, epochs=120
-                )
-            except (FloatingPointError, ValueError, np.linalg.LinAlgError):
-                try:
-                    return NeuralFiber.fit(
-                        train_x, train_y, val_x, val_y, seed=seed + 991, epochs=60
-                    )
-                except (FloatingPointError, ValueError, np.linalg.LinAlgError):
-                    return None
+        neural: Optional[NeuralFiber] = None  # нейросеть, пока нет
 
-        def commit(
-            program: Program, reason: str, code_length: Optional[int] = None
-        ) -> GrowthEvent:
-            nonlocal neural
-            if neural is None and train_neural:
-                neural = maybe_fit_neural()
-            bits = int(
-                _program_description_bits(program)
-                if code_length is None
-                else code_length
-            )
-            parent_names: tuple[str, ...] = ()
-            parent_defaults = getattr(spec.teacher, "__defaults__", None)
-            if (
-                candidate_hint is not None
-                and parent_defaults
-                and len(parent_defaults) >= 2
-            ):
-                outer_parent, inner_parent = parent_defaults[0], parent_defaults[1]
-                if isinstance(outer_parent, Expert) and isinstance(
-                    inner_parent, Expert
-                ):
-                    parent_names = (outer_parent.name, inner_parent.name)
-            expert = Expert(
-                spec.name,
-                spec.family,
-                program,
-                spec.domains,
-                spec.valid_rule,
-                bits,
-                neural,
-                len(domain),
-                0,
-                parent_names,
-            )
-            self.experts[spec.name] = expert
-            self.version += 1
-            self.total_commits += 1
-            ev = GrowthEvent(
-                self.version,
-                spec.name,
-                "COMMIT",
-                reason,
-                program.pretty(),
-                bits,
-                len(train_x),
-                len(val_x),
-                1.0,
-            )
-            self.growth_log.append(ev)
-            return ev
+        def maybe_fit_neural() -> Optional[NeuralFiber]:  # вложенная функция maybe_fit_neural: обучить нейросеть, если разрешено
+            if not train_neural or not val_x:  # обучение не разрешено или нет проверочных примеров
+                return None  # вернуть None
+            try:  # попытка ограниченного обучения
+                return fit_fiber_guarded(  # ограниченная подгонка слоя (начало вызова)
+                    train_x, train_y, val_x, val_y, seed=seed + 991, epochs=120  # зерно seed + 991, 120 эпох
+                )  # конец вызова
+            except (FloatingPointError, ValueError, np.linalg.LinAlgError):  # численная ошибка
+                try:  # попытка обычного обучения
+                    return NeuralFiber.fit(  # подгонка слоя (начало вызова)
+                        train_x, train_y, val_x, val_y, seed=seed + 991, epochs=60  # зерно seed + 991, 60 эпох
+                    )  # конец вызова
+                except (FloatingPointError, ValueError, np.linalg.LinAlgError):  # снова численная ошибка
+                    return None  # вернуть None
 
-        def validate_candidate(program: Program) -> Optional[GrowthEvent]:
-            if deadline is not None and time.monotonic() >= deadline:
-                return None
-            try:
-                if not all(
-                    self._same(program.eval(xs), yy) for xs, yy in zip(probe_x, probe_y)
-                ):
-                    self.stats.evals += len(probe_x)
-                    return None
-                self.stats.sieve_survivors += 1
-                if not self._fits(program, train_x, train_y):
-                    return None
-                if val_x and not self._fits(program, val_x, val_y):
-                    return None
-                # Authoritative finite-support verification uses Python integers.
-                if any(not self._same(program.eval(xs), all_y[xs]) for xs in domain):
-                    return None
-                if program.cost > 32:
-                    return None
-                return commit(program, "exact-validation+full-finite-support", None)
-            except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                return None
+        def commit(  # вложенная функция commit: закрепить программу за задачей
+            program: Program, reason: str, code_length: Optional[int] = None  # program — программа; reason — причина; code_length — длина кода или None
+        ) -> GrowthEvent:  # конец сигнатуры
+            nonlocal neural  # neural — переменная объёмлющей функции
+            if neural is None and train_neural:  # нейросети нет, но обучение разрешено
+                neural = maybe_fit_neural()  # обучить нейросеть
+            bits = int(  # длина кода в битах (начало выражения)
+                _program_description_bits(program)  # биты описания программы
+                if code_length is None  # если code_length не задана
+                else code_length  # иначе заданная длина
+            )  # конец выражения
+            parent_names: tuple[str, ...] = ()  # имена родителей, пока пусто
+            parent_defaults = getattr(spec.teacher, "__defaults__", None)  # стандартные значения функции-учителя
+            if (  # есть подсказка и минимум два родителя (начало условия)
+                candidate_hint is not None  # подсказка задана
+                and parent_defaults  # родители есть
+                and len(parent_defaults) >= 2  # их не меньше двух
+            ):  # конец условия
+                outer_parent, inner_parent = parent_defaults[0], parent_defaults[1]  # внешний и внутренний родители
+                if isinstance(outer_parent, Expert) and isinstance(  # оба — эксперты (начало условия)
+                    inner_parent, Expert  # внутренний родитель
+                ):  # конец условия
+                    parent_names = (outer_parent.name, inner_parent.name)  # запомнить их имена
+            expert = Expert(  # создать эксперта
+                spec.name,  # имя задачи
+                spec.family,  # семейство
+                program,  # программа
+                spec.domains,  # области входов
+                spec.valid_rule,  # правило отсева
+                bits,  # длина кода в битах
+                neural,  # нейросеть
+                len(domain),  # число проверок — размер области
+                0,  # ошибок 0
+                parent_names,  # имена родителей
+            )  # конец описания
+            self.experts[spec.name] = expert  # записать эксперта
+            self.version += 1  # версия + 1
+            self.total_commits += 1  # закреплений + 1
+            ev = GrowthEvent(  # событие COMMIT
+                self.version,  # версия
+                spec.name,  # задача
+                "COMMIT",  # действие COMMIT
+                reason,  # причина
+                program.pretty(),  # текст программы
+                bits,  # длина кода
+                len(train_x),  # число обучающих примеров
+                len(val_x),  # число проверочных примеров
+                1.0,  # точность 1.0
+            )  # конец описания события
+            self.growth_log.append(ev)  # добавить в журнал
+            return ev  # вернуть событие
 
-        # Reuse: pay for a library reference, not an arbitrary 0.5x discount.
-        known_items = list(sorted(self.experts.items()))
-        for index, (name, ex) in enumerate(known_items):
-            if ex.program.arity != spec.arity:
-                continue
-            # Alias-free REUSE is valid only when the existing certificate
-            # already covers the complete new support; otherwise the same
-            # formula may legitimately acquire a wider certified scope.
-            if not all(ex.supports(xs) for xs in domain):
-                continue
-            if not self._fits(ex.program, train_x, train_y):
-                continue
+        def validate_candidate(program: Program) -> Optional[GrowthEvent]:  # вложенная функция validate_candidate: проверить кандидата и закрепить
+            if deadline is not None and time.monotonic() >= deadline:  # срок истёк
+                return None  # вернуть None
+            try:  # попытка
+                if not all(  # кандидат неверен хотя бы на одной пробе (начало all)
+                    self._same(program.eval(xs), yy) for xs, yy in zip(probe_x, probe_y)  # program(xs) = y по пробам
+                ):  # конец all
+                    self.stats.evals += len(probe_x)  # учтены вычисления на пробах
+                    return None  # кандидат отброшен
+                self.stats.sieve_survivors += 1  # прошедших сито + 1
+                if not self._fits(program, train_x, train_y):  # неверен на обучении
+                    return None  # отброшен
+                if val_x and not self._fits(program, val_x, val_y):  # есть проверочные примеры и неверен на них
+                    return None  # отброшен
+                if any(not self._same(program.eval(xs), all_y[xs]) for xs in domain):  # есть ошибка хотя бы на одном входе области
+                # Окончательная проверка конечной области идёт на целых Python.
+                    return None  # отброшен
+                if program.cost > 32:  # стоимость больше 32 узлов
+                    return None  # отброшен
+                return commit(program, "exact-validation+full-finite-support", None)  # закрепить с причиной «точная проверка и полная конечная область»
+            except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                return None  # отброшен
+
+        known_items = list(sorted(self.experts.items()))  # известные эксперты по именам в порядке
+        # Повторное использование: платим за ссылку на библиотеку, а не произвольную скидку 0.5x.
+        for index, (name, ex) in enumerate(known_items):  # по парам (номер, имя, эксперт)
+            if ex.program.arity != spec.arity:  # число входов не совпадает
+                continue  # пропустить
+            # Повторное использование без псевдонима допустимо, только если имеющееся заверение
+            # уже покрывает всю новую область; иначе та же формула может законно получить
+            # более широкую заверенную область действия.
+            if not all(ex.supports(xs) for xs in domain):  # эксперт применим не ко всем входам области
+                continue  # пропустить
+            if not self._fits(ex.program, train_x, train_y):  # эксперт неверен на обучающих примерах
+                continue  # пропустить
             if not self._fits(ex.program, val_x, val_y):
                 continue
             if any(not self._same(ex.program.eval(xs), all_y[xs]) for xs in domain):
@@ -2518,2526 +2811,2559 @@ class GrowingMathProcessorV7(V5Processor):
         # A tiny probe is only a rejection sieve, never a semantic equivalence key.
         probe_n = min(SIEVE_SIZE, len(train_x))
         probe_idx = rng.choice(len(train_x), size=probe_n, replace=False)
-        probe_x = [train_x[int(i)] for i in probe_idx]
-        probe_y = [train_y[int(i)] for i in probe_idx]
+        probe_x = [train_x[int(i)] for i in probe_idx]  # входы пробы: train_x[i] по номерам i из probe_idx
+        probe_y = [train_y[int(i)] for i in probe_idx]  # выходы пробы: train_y[i] по тем же номерам
 
-        def make_train_arrays():
-            lo64, hi64 = -(1 << 63), (1 << 63) - 1
-            flat = [int(v) for row in train_x for v in row] + [int(v) for v in train_y]
-            if any(v < lo64 or v > hi64 for v in flat):
-                return None, None
-            return (
-                np.asarray(train_x, dtype=np.int64),
-                np.asarray(train_y, dtype=np.int64),
+        def make_train_arrays():  # целочисленные массивы int64 обучающих входов и выходов
+            lo64, hi64 = -(1 << 63), (1 << 63) - 1  # границы int64: lo64 = −2^63, hi64 = 2^63 − 1
+            flat = [int(v) for row in train_x for v in row] + [int(v) for v in train_y]  # все значения входов и выходов одним списком
+            if any(v < lo64 or v > hi64 for v in flat):  # есть значение вне диапазона int64
+                return None, None  # массивы не строятся
+            return (  # пара массивов
+                np.asarray(train_x, dtype=np.int64),  # X — матрица входов (N, arity), int64
+                np.asarray(train_y, dtype=np.int64),  # Y — вектор выходов (N,), int64
             )
 
-        train_X, train_Yv = make_train_arrays()
+        train_X, train_Yv = make_train_arrays()  # массивы для векторного фильтра (None, None — если вне int64)
 
-        # Fast exact templates first: the old v5 candidate family covers common
-        # arithmetic/Boolean primitives with negligible search cost.
-        if spec.family == "BoolVenn":
-            direct_candidates: Sequence[Program] = [
-                Program(2, venn_mask=m) for m in range(16)
+        # Сначала быстрые точные шаблоны: старое семейство кандидатов покрывает обычные
+        # арифметические и логические примитивы с ничтожной ценой поиска.
+        if spec.family == "BoolVenn":  # семейство — логические функции двух аргументов
+            direct_candidates: Sequence[Program] = [  # прямые кандидаты — все 16 масок Венна
+                Program(2, venn_mask=m) for m in range(16)  # программа с m битами таблицы истинности, m = 0..15
             ]
-        else:
-            direct_candidates = sorted(
-                candidate_programs(spec.arity),
-                key=lambda p: (_program_description_bits(p), p.pretty()),
+        else:  # прочие семейства
+            direct_candidates = sorted(  # кандидаты старой грамматики, отсортированные
+                candidate_programs(spec.arity),  # все программы на spec.arity входов
+                key=lambda p: (_program_description_bits(p), p.pretty()),  # ключ: (число бит описания, текст программы) — дешёвые первыми
             )
-        # A parent-composition hint is a proposal, not an authority: validate
-        # it on train, held-out, and every declared point before accepting.
-        # When an explicit hint was supplied and fails, HOLD rather than
-        # launching an unbounded blind search for a different function.
-        if candidate_hint is not None:
-            hinted = validate_candidate(candidate_hint)
-            if hinted is not None:
-                hinted.reason = "verified-composition-hint+full-finite-support"
-                if self.growth_log:
-                    self.growth_log[-1].reason = hinted.reason
-                return hinted
-            return self._hold(
-                spec, "COMPOSITION_HINT_NOT_CERTIFIED", len(train_x), len(val_x)
+        # Подсказка композиции от родителя — предложение, а не истина: она принимается
+        # только после проверки на обучении, на отложенных примерах и на каждой
+        # объявленной точке. Если подсказка задана явно и не прошла — удержание, а не
+        # неограниченный слепой поиск другой функции.
+        if candidate_hint is not None:  # задана подсказка — программа, предложенная родителем
+            hinted = validate_candidate(candidate_hint)  # проверить подсказку как обычного кандидата
+            if hinted is not None:  # подсказка прошла все проверки
+                hinted.reason = "verified-composition-hint+full-finite-support"  # причина: проверенная подсказка композиции и полная конечная область
+                if self.growth_log:  # журнал роста не пуст
+                    self.growth_log[-1].reason = hinted.reason  # ту же причину записать в последнее событие журнала
+                return hinted  # вернуть событие закрепления
+            return self._hold(  # иначе — удержание (отказ от закрепления)
+                spec, "COMPOSITION_HINT_NOT_CERTIFIED", len(train_x), len(val_x)  # причина: подсказка композиции не заверена
             )
 
-        for program in direct_candidates:
-            ev = validate_candidate(program)
-            if ev is not None:
-                return ev
-            if deadline is not None and time.monotonic() >= deadline:
-                return self._hold(
-                    spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x)
+        for program in direct_candidates:  # по прямым кандидатам
+            ev = validate_candidate(program)  # проверить кандидата
+            if ev is not None:  # кандидат прошёл проверки
+                return ev  # закрепить и вернуть событие
+            if deadline is not None and time.monotonic() >= deadline:  # задан срок и текущее время его достигло
+                return self._hold(  # удержание
+                    spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x)  # причина: бюджет времени исчерпан
                 )
 
-        # Closed-form polynomial induction precedes the general grammar search.
-        # Unary interpolation keeps the compact Horner representation.
-        if spec.arity == 1 and not spec.family.startswith("Bool"):
-            coeffs = _exact_poly_fit([xs[0] for xs in train_x], train_y, max_degree=5)
-            if coeffs is not None and val_x:
-                if all(
-                    _eval_poly(coeffs, xs[0]) == yy for xs, yy in zip(val_x, val_y)
-                ) and all(_eval_poly(coeffs, xs[0]) == all_y[xs] for xs in domain):
-                    program = Program(1, _poly_expr(coeffs))
-                    if program.cost <= 32:
-                        return commit(
-                            program, "exact-rational-polynomial+full-finite-support"
+        # Замкнутая индукция многочлена идёт до общего поиска по грамматике.
+        # Унарная интерполяция сохраняет компактную запись по схеме Горнера.
+        if spec.arity == 1 and not spec.family.startswith("Bool"):  # один вход и не логическое семейство
+            coeffs = _exact_poly_fit([xs[0] for xs in train_x], train_y, max_degree=5)  # точная рациональная интерполяция p(x) = Σ c_i·x^i степени ≤ 5
+            if coeffs is not None and val_x:  # многочлен найден и есть отложенные примеры
+                if all(  # верно на всех отложенных и всех входах области
+                    _eval_poly(coeffs, xs[0]) == yy for xs, yy in zip(val_x, val_y)  # p(x) = y на каждой отложенной паре
+                ) and all(_eval_poly(coeffs, xs[0]) == all_y[xs] for xs in domain):  # p(x) = y на каждом входе x области
+                    program = Program(1, _poly_expr(coeffs))  # программа — выражение многочлена по схеме Горнера
+                    if program.cost <= 32:  # стоимость не выше предела 32
+                        return commit(  # закрепить
+                            program, "exact-rational-polynomial+full-finite-support"  # причина: точный рациональный многочлен и полная конечная область
                         )
 
-        # Exact multivariate interpolation extends induction to 2-3 variables.
-        # It solves an overdetermined rational linear system; a candidate is
-        # usable only when the coefficient vector is unique and integral, and
-        # the ordinary held-out + exhaustive scalar checks still pass.
-        elif 2 <= spec.arity <= 3 and not spec.family.startswith("Bool"):
-            terms = _exact_multivariate_poly_fit(
-                train_x, train_y, arity=spec.arity, max_degree=4
+        # Точная многомерная интерполяция распространяет индукцию на 2–3 переменных.
+        # Решается переопределённая рациональная линейная система; кандидат годен,
+        # только когда вектор коэффициентов единственен и целочислен, а обычные проверки
+        # на отложенных примерах и полным перебором области тоже пройдены.
+        elif 2 <= spec.arity <= 3 and not spec.family.startswith("Bool"):  # 2–3 входа и не логическое семейство
+            terms = _exact_multivariate_poly_fit(  # точная многомерная интерполяция p(x_1..x_n) = Σ c_m·Π x_i^{m_i}
+                train_x, train_y, arity=spec.arity, max_degree=4  # по обучающим примерам, степень ≤ 4
             )
-            if terms is not None and val_x:
-                program = Program(spec.arity, _multivariate_poly_expr(terms))
-                if (
-                    all(program.eval(xs) == yy for xs, yy in zip(val_x, val_y))
-                    and all(program.eval(xs) == all_y[xs] for xs in domain)
-                    and program.cost <= 32
+            if terms is not None and val_x:  # многочлен найден и есть отложенные примеры
+                program = Program(spec.arity, _multivariate_poly_expr(terms))  # программа — выражение многочлена
+                if (  # все четыре условия выполнены
+                    all(program.eval(xs) == yy for xs, yy in zip(val_x, val_y))  # верно на всех отложенных примерах
+                    and all(program.eval(xs) == all_y[xs] for xs in domain)  # верно на всех входах области
+                    and program.cost <= 32  # стоимость не выше 32
                 ):
-                    return commit(
-                        program,
-                        "exact-multivariate-rational-polynomial+full-finite-support",
+                    return commit(  # закрепить
+                        program,  # программа многочлена
+                        "exact-multivariate-rational-polynomial+full-finite-support",  # причина: точный многомерный рациональный многочлен и полная область
                     )
 
-        # Bounded grammar search. Only proven-safe int64 cases use the vector
-        # rejection filter; all other candidates go through scalar validation.
-        if deadline is not None and time.monotonic() >= deadline:
-            return self._hold(spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x))
-        reuse_binops = [
-            (nm, ex.program)
-            for nm, ex in self.experts.items()
-            if ex.program.arity == spec.arity
+        # Ограниченный поиск по грамматике. Векторный фильтр отсева применяется только
+        # к доказанно безопасным случаям int64; остальные идут через скалярную проверку.
+        if deadline is not None and time.monotonic() >= deadline:  # задан срок и текущее время его достигло
+            return self._hold(spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x))  # удержание: бюджет времени исчерпан
+        reuse_binops = [  # бинарные операции уже закреплённых программ той же арности
+            (nm, ex.program)  # пара (имя эксперта, его программа)
+            for nm, ex in self.experts.items()  # по всем экспертам
+            if ex.program.arity == spec.arity  # с тем же числом входов
         ]
-        candidates = (
-            Program(spec.arity, e)
-            for e in iter_candidates_mdl(
-                spec.arity,
-                self.node_budget,
-                probe_x,
-                probe_y,
-                reuse_binops,
-                self.pop_budget,
-                deadline,
+        candidates = (  # генератор кандидатов по возрастанию стоимости описания
+            Program(spec.arity, e)  # программа из выражения e
+            for e in iter_candidates_mdl(  # выражения перебора грамматики
+                spec.arity,  # число входов
+                self.node_budget,  # предел числа узлов
+                probe_x,  # входы пробы для сита
+                probe_y,  # выходы пробы
+                reuse_binops,  # известные программы для повторного использования
+                self.pop_budget,  # предел популяции
+                deadline,  # срок
             )
         )
-        chunk: list[Program] = []
+        chunk: list[Program] = []  # накопитель кандидатов для векторного фильтра
 
-        def flush(buf: list[Program]) -> Optional[GrowthEvent]:
-            if not buf:
-                return None
-            verdicts = batch_fits_safe(buf, train_X, train_Yv, device=self.device)
-            for program, ok in zip(buf, verdicts):
-                self.stats.candidates_generated += 1
-                # Only a False from the guarded bounded vector subset is allowed
-                # to skip scalar validation. None always falls through.
-                if ok is False:
-                    self.stats.evals += len(train_x)
-                    continue
-                ev = validate_candidate(program)
-                if ev is not None:
-                    return ev
-            return None
+        def flush(buf: list[Program]) -> Optional[GrowthEvent]:  # пропустить пачку buf через векторный фильтр и скалярную проверку
+            if not buf:  # пачка пуста
+                return None  # ничего не найдено
+            verdicts = batch_fits_safe(buf, train_X, train_Yv, device=self.device)  # вердикты по каждому кандидату: True / False / None (недоказуемо)
+            for program, ok in zip(buf, verdicts):  # по парам (кандидат, вердикт)
+                self.stats.candidates_generated += 1  # счётчик порождённых кандидатов + 1
+                # Пропустить скалярную проверку можно только по False из защищённого
+                # векторного подмножества. None всегда идёт дальше.
+                if ok is False:  # векторный фильтр доказал ошибку на обучении
+                    self.stats.evals += len(train_x)  # засчитать N вычислений
+                    continue  # пропустить кандидата без скалярной проверки
+                ev = validate_candidate(program)  # скалярная проверка (True и None оба попадают сюда)
+                if ev is not None:  # кандидат закреплён
+                    return ev  # вернуть событие
+            return None  # в пачке годного кандидата нет
 
-        for program in candidates:
-            chunk.append(program)
-            if len(chunk) >= VALIDATION_CHUNK:
-                ev = flush(chunk)
-                if ev is not None:
-                    return ev
-                chunk = []
-            if deadline is not None and time.monotonic() >= deadline:
-                return self._hold(
-                    spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x)
+        for program in candidates:  # по всем кандидатам перебора
+            chunk.append(program)  # добавить кандидата в пачку
+            if len(chunk) >= VALIDATION_CHUNK:  # пачка достигла размера VALIDATION_CHUNK = 64
+                ev = flush(chunk)  # обработать пачку
+                if ev is not None:  # найден годный кандидат
+                    return ev  # вернуть событие
+                chunk = []  # очистить пачку
+            if deadline is not None and time.monotonic() >= deadline:  # задан срок и текущее время его достигло
+                return self._hold(  # удержание
+                    spec, "TIME_BUDGET_EXHAUSTED", len(train_x), len(val_x)  # причина: бюджет времени исчерпан
                 )
-        ev = flush(chunk)
-        if ev is not None:
-            return ev
-        return self._hold(spec, "NO_VALIDATED_PROGRAM", len(train_x), len(val_x))
+        ev = flush(chunk)  # обработать последнюю неполную пачку
+        if ev is not None:  # найден годный кандидат
+            return ev  # вернуть событие
+        return self._hold(spec, "NO_VALIDATED_PROGRAM", len(train_x), len(val_x))  # удержание: годной программы не найдено
 
-    def save(self, path: str | Path) -> None:
-        data = {
-            "format": "HAGI-GrowingMathProcessor",
-            "version": V7_VERSION,
-            "model_version": self.version,
-            "lookup_limit": self.lookup_limit,
-            "mdl_lambda": self.mdl_lambda,
-            "node_budget": self.node_budget,
-            "pop_budget": self.pop_budget,
-            "device": self.device,
-            "total_commits": self.total_commits,
-            "total_holds": self.total_holds,
-            "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},
-            "growth_log": [vars(x) for x in self.growth_log],
-            "theorems": [vars(x) for x in self.theorems],
-            "synthesis_stats": {
-                "candidates_generated": self.stats.candidates_generated,
-                "evals": self.stats.evals,
-                "sieve_survivors": self.stats.sieve_survivors,
+    def save(self, path: str | Path) -> None:  # сохранить состояние процессора в файл path (JSON, через временный файл)
+        data = {  # словарь состояния
+            "format": "HAGI-GrowingMathProcessor",  # имя формата файла
+            "version": V7_VERSION,  # версия формата
+            "model_version": self.version,  # номер версии модели (число закреплений)
+            "lookup_limit": self.lookup_limit,  # предел размера таблицы
+            "mdl_lambda": self.mdl_lambda,  # вес стоимости описания λ
+            "node_budget": self.node_budget,  # предел числа узлов
+            "pop_budget": self.pop_budget,  # предел популяции
+            "device": self.device,  # устройство вычислений
+            "total_commits": self.total_commits,  # всего закреплений
+            "total_holds": self.total_holds,  # всего удержаний
+            "experts": {k: v.to_dict() for k, v in sorted(self.experts.items())},  # эксперты по именам в порядке имён, каждый — словарём
+            "growth_log": [vars(x) for x in self.growth_log],  # журнал роста — список словарей атрибутов событий
+            "theorems": [vars(x) for x in self.theorems],  # теоремы — список словарей атрибутов
+            "synthesis_stats": {  # статистика синтеза
+                "candidates_generated": self.stats.candidates_generated,  # порождено кандидатов
+                "evals": self.stats.evals,  # число вычислений
+                "sieve_survivors": self.stats.sieve_survivors,  # прошедших сито
             },
         }
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(target.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(target)
+        target = Path(path)  # целевой путь
+        target.parent.mkdir(parents=True, exist_ok=True)  # создать каталог, если его нет
+        tmp = target.with_name(target.name + ".tmp")  # временный файл рядом с целевым: имя + «.tmp»
+        with tmp.open("w", encoding="utf-8") as handle:  # открыть временный файл на запись
+            json.dump(data, handle, indent=2, sort_keys=True)  # записать JSON с отступом 2 и сортировкой ключей
+            handle.flush()  # сбросить буферы Python
+            os.fsync(handle.fileno())  # сбросить на диск
+        tmp.replace(target)  # атомарно заменить целевой файл временным
 
-    @classmethod
-    def load(cls, path: str | Path) -> "GrowingMathProcessorV7":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("format") != "HAGI-GrowingMathProcessor":
-            raise ValueError("not a HAGI Growing Math Processor state file")
-        model = cls(
-            int(data.get("lookup_limit", 16)),
-            float(data.get("mdl_lambda", 0.001)),
-            int(data.get("node_budget", DEFAULT_NODE_BUDGET)),
-            int(data.get("pop_budget", DEFAULT_POP_BUDGET)),
-            str(data.get("device", "cpu")),
+    @classmethod  # метод класса: конструктор из файла
+    def load(cls, path: str | Path) -> "GrowingMathProcessorV7":  # загрузить состояние из JSON-файла path
+        data = json.loads(Path(path).read_text(encoding="utf-8"))  # прочитать файл и разобрать JSON
+        if data.get("format") != "HAGI-GrowingMathProcessor":  # формат не тот
+            raise ValueError("not a HAGI Growing Math Processor state file")  # ошибка: это не файл состояния
+        model = cls(  # создать процессор с параметрами из файла
+            int(data.get("lookup_limit", 16)),  # предел таблицы (по умолчанию 16)
+            float(data.get("mdl_lambda", 0.001)),  # вес стоимости описания (по умолчанию 0.001)
+            int(data.get("node_budget", DEFAULT_NODE_BUDGET)),  # предел узлов (по умолчанию DEFAULT_NODE_BUDGET)
+            int(data.get("pop_budget", DEFAULT_POP_BUDGET)),  # предел популяции (по умолчанию DEFAULT_POP_BUDGET)
+            str(data.get("device", "cpu")),  # устройство (по умолчанию cpu)
         )
-        model.version = int(data.get("model_version", 0))
-        model.total_commits = int(data.get("total_commits", 0))
-        model.total_holds = int(data.get("total_holds", 0))
-        model.experts = {
-            k: Expert.from_dict(v) for k, v in data.get("experts", {}).items()
+        model.version = int(data.get("model_version", 0))  # версия модели (по умолчанию 0)
+        model.total_commits = int(data.get("total_commits", 0))  # всего закреплений (по умолчанию 0)
+        model.total_holds = int(data.get("total_holds", 0))  # всего удержаний (по умолчанию 0)
+        model.experts = {  # эксперты из файла
+            k: Expert.from_dict(v) for k, v in data.get("experts", {}).items()  # k — имя, v — словарь; словарь по умолчанию пуст
         }
-        if data.get("version") != V7_VERSION:
-            for expert in model.experts.values():
-                expert.code_length = _program_description_bits(expert.program)
-        model.growth_log = [GrowthEvent(**x) for x in data.get("growth_log", [])]
-        model.theorems = [Theorem(**x) for x in data.get("theorems", [])]
-        stats = data.get("synthesis_stats", {})
-        model.stats.candidates_generated = int(stats.get("candidates_generated", 0))
-        model.stats.evals = int(stats.get("evals", 0))
-        model.stats.sieve_survivors = int(stats.get("sieve_survivors", 0))
-        return model
+        if data.get("version") != V7_VERSION:  # версия формата файла отличается от текущей
+            for expert in model.experts.values():  # по всем экспертам
+                expert.code_length = _program_description_bits(expert.program)  # пересчитать длину кода по текущему описанию
+        model.growth_log = [GrowthEvent(**x) for x in data.get("growth_log", [])]  # журнал роста из списка словарей
+        model.theorems = [Theorem(**x) for x in data.get("theorems", [])]  # теоремы из списка словарей
+        stats = data.get("synthesis_stats", {})  # статистика синтеза (по умолчанию пустой словарь)
+        model.stats.candidates_generated = int(stats.get("candidates_generated", 0))  # порождено кандидатов
+        model.stats.evals = int(stats.get("evals", 0))  # число вычислений
+        model.stats.sieve_survivors = int(stats.get("sieve_survivors", 0))  # прошедших сито
+        return model  # восстановленный процессор
 
-    def _fits(
-        self, program: Program, xs_list: Sequence[Sequence[int]], ys: Sequence[int]
-    ) -> bool:
-        self.stats.evals += len(xs_list)
-        try:
-            return all(self._same(program.eval(xs), yy) for xs, yy in zip(xs_list, ys))
-        except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-            return False
-
-
-# ------------------- certified guarded optimizer (ALGORITHMS §3.2/§9) -----------
+    def _fits(  # верно ли program на всех парах (xs, yy): число вычислений засчитывается в stats
+        self, program: Program, xs_list: Sequence[Sequence[int]], ys: Sequence[int]  # program — программа, xs_list — входы, ys — ожидаемые выходы
+    ) -> bool:  # вернуть True, если программа верна на всех парах
+        self.stats.evals += len(xs_list)  # засчитать вычисления: evals += |xs_list|
+        try:  # вычисление может упасть
+            return all(self._same(program.eval(xs), yy) for xs, yy in zip(xs_list, ys))  # True, если program(xs) == yy на всех парах
+        except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+            return False  # программа не годится
 
 
-def _fiber_forward(params, x, hidden_scale=1.0):
-    w1, b1, w2, b2 = params
-    return np.tanh(x @ w1 + b1) @ w2 + b2
+# ------------------- обучаемый защищённый оптимизатор -------------------------------------------
 
 
-def fit_fiber_guarded(
-    inputs, targets, val_inputs, val_targets, seed, hidden: int = 24, epochs: int = 300
-) -> "NeuralFiber":
-    """Empirically guarded full-batch MSE fitting for the optional tanh fiber.
+def _fiber_forward(params, x, hidden_scale=1.0):  # прямой проход волокна: y = tanh(x·w1 + b1)·w2 + b2
+    w1, b1, w2, b2 = params  # распаковать параметры: w1 (d, h), b1 (1, h), w2 (h, 1), b2 (1, 1)
+    return np.tanh(x @ w1 + b1) @ w2 + b2  # h = tanh(x·w1 + b1); выход y = h·w2 + b2
 
-    Candidate updates are accepted only when measured training MSE does not
-    increase. This is an implementation-level regression guard, NOT a proof
-    of the Lean finite log-linear cross-entropy step theorem, not a held-out
-    guarantee, and not a convergence theorem for a Transformer backbone.
-    """
-    x = np.asarray(inputs, dtype=np.float64).reshape(-1, len(inputs[0]))
-    y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
-    xv = np.asarray(val_inputs, dtype=np.float64).reshape(-1, x.shape[1])
-    yv = np.asarray(val_targets, dtype=np.float64).reshape(-1, 1)
-    sx = max(1.0, float(np.max(np.abs(x))))
-    sy = max(1.0, float(np.max(np.abs(y))))
-    x, y, xv, yv = x / sx, y / sy, xv / sx, yv / sy
-    rng = np.random.default_rng(seed)
-    params = [
-        rng.normal(0.0, 0.32, (x.shape[1], hidden)),
-        np.zeros((1, hidden)),
-        rng.normal(0.0, 0.12, (hidden, 1)),
-        np.zeros((1, 1)),
+
+def fit_fiber_guarded(  # обучить волокно: спуск с приёмом только шагов, уменьшающих MSE
+    inputs, targets, val_inputs, val_targets, seed, hidden: int = 24, epochs: int = 300  # входы и выходы, отложенные входы и выходы, зерно, ширина h = 24, число эпох = 300
+) -> "NeuralFiber":  # вернуть обученное волокно
+    """Подбор необязательного волокна tanh полным пакетом с защитой по MSE.
+
+        Обновление-кандидат принимается, только когда измеренная обучающая MSE
+        не возрастает. Это рабочая защита от регрессии на уровне реализации,
+        а не доказательство шага, не гарантия на отложенных данных и не теорема
+        сходимости. Параметры: inputs, targets — обучение, val_inputs, val_targets —
+        отложенные данные, seed — зерно, hidden — ширина h, epochs — число эпох.
+        Градиент MSE L = mean((f(x) − y)²), f = tanh(x·w1 + b1)·w2 + b2:
+        dL/dw1 = xᵀ·d, dL/db1 = Σ d, d = (2/N·e·w2ᵀ) ⊙ (1 − h²),
+        dL/dw2 = hᵀ·p, dL/db2 = Σ p, p = (2/N)·e. Возвращает NeuralFiber с
+        удостоверением guard_certificate."""
+    x = np.asarray(inputs, dtype=np.float64).reshape(-1, len(inputs[0]))  # X — матрица входов (N, d)
+    y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)  # Y — столбец выходов (N, 1)
+    xv = np.asarray(val_inputs, dtype=np.float64).reshape(-1, x.shape[1])  # X_val — отложенные входы (N_val, d)
+    yv = np.asarray(val_targets, dtype=np.float64).reshape(-1, 1)  # Y_val — отложенные выходы (N_val, 1)
+    sx = max(1.0, float(np.max(np.abs(x))))  # масштаб входов s_x = max(1, max|x|)
+    sy = max(1.0, float(np.max(np.abs(y))))  # масштаб выходов s_y = max(1, max|y|)
+    x, y, xv, yv = x / sx, y / sy, xv / sx, yv / sy  # нормировка: x' = x / s_x, y' = y / s_y (отложенные — теми же масштабами)
+    rng = np.random.default_rng(seed)  # генератор случайных чисел с зерном seed
+    params = [  # параметры [w1, b1, w2, b2]
+        rng.normal(0.0, 0.32, (x.shape[1], hidden)),  # w1 ~ N(0, 0.32), форма (d, h)
+        np.zeros((1, hidden)),  # b1 = 0, форма (1, h)
+        rng.normal(0.0, 0.12, (hidden, 1)),  # w2 ~ N(0, 0.12), форма (h, 1)
+        np.zeros((1, 1)),  # b2 = 0, форма (1, 1)
     ]
 
-    def loss(p):
-        err = _fiber_forward(p, x) - y
-        return float(np.mean(err * err))
+    def loss(p):  # среднеквадратичная ошибка MSE на обучении для параметров p
+        err = _fiber_forward(p, x) - y  # остаток e = f_p(x) − y
+        return float(np.mean(err * err))  # средний квадрат: MSE = mean(e²)
 
-    cur = loss(params)
-    best = [q.copy() for q in params]
-    best_val = float("inf")
-    total_drop = 0.0
-    accepted = 0
-    held = 0
-    for _ in range(epochs):
-        pred = _fiber_forward(params, x)
-        err = pred - y
-        # batch direction D = -ḡ (meanResidualTranspose analogue)
-        h_act = np.tanh(x @ params[0] + params[1])
-        dh = (2.0 / len(x) * err) @ params[2].T
-        dh = dh * (1.0 - h_act**2)
-        dp = 2.0 / len(x) * err
-        grads = [
-            x.T @ dh,
-            np.sum(dh, axis=0, keepdims=True),
-            h_act.T @ dp,
-            np.sum(dp, axis=0, keepdims=True),
+    cur = loss(params)  # текущие потери
+    best = [q.copy() for q in params]  # лучшие параметры — копии текущих
+    best_val = float("inf")  # лучшие отложенные потери +∞
+    total_drop = 0.0  # суммарное сертифицированное убывание потерь
+    accepted = 0  # число принятых шагов
+    held = 0  # число удержанных шагов
+    for _ in range(epochs):  # по эпохам
+        pred = _fiber_forward(params, x)  # предсказание f(x) на обучении
+        err = pred - y  # остаток e = f(x) − y
+        # направление спуска D = −ḡ (аналог транспонированной средней невязки)
+        h_act = np.tanh(x @ params[0] + params[1])  # скрытый слой h = tanh(x·w1 + b1)
+        dh = (2.0 / len(x) * err) @ params[2].T  # градиент dL/dh = (2/N)·e·w2ᵀ
+        dh = dh * (1.0 - h_act**2)  # умножить на производную тангенса: dL/dz = dL/dh ⊙ (1 − h²)
+        dp = 2.0 / len(x) * err  # градиент dL/dp = (2/N)·e
+        grads = [  # градиенты [w1, b1, w2, b2]
+            x.T @ dh,  # градиент dL/dw1 = xᵀ·(dL/dz)
+            np.sum(dh, axis=0, keepdims=True),  # dL/db1 = Σ_n dL/dz_n (строка 1×h)
+            h_act.T @ dp,  # градиент dL/dw2 = hᵀ·(dL/dp)
+            np.sum(dp, axis=0, keepdims=True),  # градиент dL/db2 = Σ_n dL/dp_n
         ]
-        gnorm2 = sum(float(np.sum(g * g)) for g in grads)
-        if gnorm2 <= 0:
-            held += 1
-            continue
-        # safe-step candidates: backtracking grid on the majorizer ratio;
-        # accept the first candidate whose measured loss strictly drops
-        improved = False
-        for step in (1.0, 0.5, 0.25, 0.1, 0.03):
-            cand = [p - step * g for p, g in zip(params, grads)]
-            cand_loss = loss(cand)
-            if cand_loss < cur:
-                drop = cur - cand_loss
-                params = cand
-                cur = cand_loss
-                total_drop += drop
-                accepted += 1
-                improved = True
-                break
-        if not improved:
-            held += 1
-            # HoldStep: parameters unchanged, certificate records zero drop
-        hv = _fiber_forward(params, xv)
-        vl = float(np.mean((hv - yv) ** 2))
-        if np.isfinite(vl) and vl < best_val:
-            best_val = vl
-            best = [q.copy() for q in params]
-    w1, b1, w2, b2 = best
-    h = np.tanh(x @ w1 + b1)
-    tr_loss = float(np.mean((h @ w2 + b2 - y) ** 2)) * sy * sy
-    hv = np.tanh(xv @ w1 + b1)
-    predv = (hv @ w2 + b2).reshape(-1) * sy
-    val_loss = float(np.mean((predv - np.asarray(val_targets, dtype=float)) ** 2))
-    exact = float(
-        np.mean(
-            np.rint(predv).astype(np.int64) == np.asarray(val_targets, dtype=np.int64)
+        gnorm2 = sum(float(np.sum(g * g)) for g in grads)  # квадрат нормы градиента ‖g‖² = Σ по всем параметрам g²
+        if gnorm2 <= 0:  # градиент нулевой
+            held += 1  # шаг удержан
+            continue  # перейти к следующей эпохе
+        # кандидаты безопасного шага: сетка с возвратом по дроблению шага;
+        # принять первый, чьи измеренные потери строго меньше текущих
+        improved = False  # улучшение на этой эпохе пока не найдено
+        for step in (1.0, 0.5, 0.25, 0.1, 0.03):  # шаги спуска от 1 до 0.03 (половинное дробление)
+            cand = [p - step * g for p, g in zip(params, grads)]  # кандидат p' = p − step·g
+            cand_loss = loss(cand)  # потери кандидата
+            if cand_loss < cur:  # потери строго уменьшились
+                drop = cur - cand_loss  # убывание Δ = L_old − L_new
+                params = cand  # принять кандидата
+                cur = cand_loss  # обновить текущие потери
+                total_drop += drop  # суммарное убывание + Δ
+                accepted += 1  # принятых шагов + 1
+                improved = True  # улучшение достигнуто
+                break  # остальные шаги не пробуются
+        if not improved:  # ни один шаг не уменьшил потери
+            held += 1  # шаг удержан
+        # удержанный шаг: параметры не меняются, в удостоверении убывание ноль
+        hv = _fiber_forward(params, xv)  # предсказание на отложенных
+        vl = float(np.mean((hv - yv) ** 2))  # отложенные потери MSE_val = mean((f(x_val) − y_val)²)
+        if np.isfinite(vl) and vl < best_val:  # потери конечны и лучше рекорда
+            best_val = vl  # новый рекорд
+            best = [q.copy() for q in params]  # запомнить копии параметров
+    w1, b1, w2, b2 = best  # лучшие параметры
+    h = np.tanh(x @ w1 + b1)  # h = tanh(x·w1 + b1) на обучении
+    tr_loss = float(np.mean((h @ w2 + b2 - y) ** 2)) * sy * sy  # обучающие потери в исходном масштабе: MSE·s_y²
+    hv = np.tanh(xv @ w1 + b1)  # h на отложенных
+    predv = (hv @ w2 + b2).reshape(-1) * sy  # предсказание в исходном масштабе: ŷ = f(x_val)·s_y, вектор
+    val_loss = float(np.mean((predv - np.asarray(val_targets, dtype=float)) ** 2))  # отложенные потери в исходном масштабе
+    exact = float(  # точность округлённых предсказаний
+        np.mean(  # доля совпадений
+            np.rint(predv).astype(np.int64) == np.asarray(val_targets, dtype=np.int64)  # доля: round(ŷ_n) = y_n
         )
     )
-    fiber = NeuralFiber(
-        len(inputs[0]), sx, sy, w1, b1, w2, b2, tr_loss, val_loss, exact
+    fiber = NeuralFiber(  # собрать волокно
+        len(inputs[0]), sx, sy, w1, b1, w2, b2, tr_loss, val_loss, exact  # d, масштабы, параметры, потери, точность
     )
-    fiber.guard_certificate = {
-        "accepted_steps": accepted,
-        "hold_steps": held,
-        "total_certified_drop": total_drop,
+    fiber.guard_certificate = {  # удостоверение защитника
+        "accepted_steps": accepted,  # принято шагов
+        "hold_steps": held,  # удержано шагов
+        "total_certified_drop": total_drop,  # суммарное убывание потерь
     }
-    return fiber
+    return fiber  # обученное волокно
 
 
-# --------------- certified ternary compression (ALGORITHMS §TernaryGrad) --------
+# --------------- сертифицированное тернарное сжатие ---------------------------------------------
 
 
-# ------------------- CRAM energy solver (E-track, E1/E2/P1/A5) ------------------
+# ------------------- решатель энергии CRAM ------------------------------------------------------
 
 
-def solve_coloring(
-    edges,
-    n_nodes: int,
-    num_colors: int,
-    givens: Optional[dict[int, int]] = None,
-    max_sweeps: int = 10000,
-) -> dict[str, Any]:
-    """CRAM single-cell energy descent for graph coloring (theory: E1 pairwise
-    energy = conflict counter; C261 single_cell_move_energy_delta_symm;
-    greedy_strict_search_terminates on finite configs; A5 zero-energy iff
-    valid). Strict-improvement moves only; result exactly verified.
+def solve_coloring(  # раскраска графа спуском по числу конфликтов (энергия)
+    edges,  # список рёбер (a, b)
+    n_nodes: int,  # число вершин 0..n_nodes−1
+    num_colors: int,  # число цветов 0..num_colors−1
+    givens: Optional[dict[int, int]] = None,  # фиксированные цвета вершин (по умолчанию нет)
+    max_sweeps: int = 10000,  # предел проходов по вершинам
+) -> dict[str, Any]:  # вернуть словарь с раскраской и итогами
+    """Спуск по энергии одной ячейки для раскраски графа: энергия равна числу
+    конфликтных рёбер; ход — смена цвета одной вершины; принимаются только ходы
+    со строгим убыванием энергии. На конечном множестве состояний строгий спуск
+    конечен; результат проверяется точно: энергия 0 равносильна правильной
+    раскраске. Параметры: edges — рёбра, n_nodes — число вершин, num_colors —
+    число цветов, givens — фиксированные цвета, max_sweeps — предел проходов.
+    Возвращает {'coloring', 'valid', 'energy', 'sweeps', 'verified',
+    'givens_respected'}."""
+    from collections import defaultdict  # словарь с заводом множества
 
-    Returns {'coloring', 'valid', 'energy', 'sweeps', 'verified'}.
-    """
-    from collections import defaultdict
+    adj = defaultdict(set)  # списки смежности: adj[v] — соседи вершины v
+    for a, b in edges:  # по рёбрам
+        adj[a].add(b)  # b — сосед a
+        adj[b].add(a)  # a — сосед b (граф неориентированный)
+    rng = np.random.default_rng(42)  # генератор с фиксированным зерном 42
+    givens = givens or {}  # пустой словарь вместо None
+    y = {i: givens.get(i, int(rng.integers(0, num_colors))) for i in range(n_nodes)}  # начальная раскраска: цвет i равен заданному либо случайному из 0..num_colors−1
 
-    adj = defaultdict(set)
-    for a, b in edges:
-        adj[a].add(b)
-        adj[b].add(a)
-    rng = np.random.default_rng(42)
-    givens = givens or {}
-    y = {i: givens.get(i, int(rng.integers(0, num_colors))) for i in range(n_nodes)}
+    def energy(state) -> int:  # энергия состояния: число рёбер с одинаковыми цветами концов
+        return sum(1 for a, b in edges if state[a] == state[b])  # энергия E = Σ_{(a,b)} [y_a = y_b]
 
-    def energy(state) -> int:
-        return sum(1 for a, b in edges if state[a] == state[b])
-
-    cur = energy(y)
-    sweeps = 0
-    while sweeps < max_sweeps:
-        improved = False
-        for i in range(n_nodes):
-            if i in givens:
-                continue
-            # exact local field: conflict counts per candidate color (C261:
-            # delta = L_i(a) - L_i(y_i), no partition terms)
-            counts = {c: sum(1 for j in adj[i] if y[j] == c) for c in range(num_colors)}
-            best_c, best_conf = y[i], counts[y[i]]
-            for c in range(num_colors):
-                if counts[c] < best_conf:
-                    best_c, best_conf = c, counts[c]
-            if best_conf < counts[y[i]]:  # strict drop only (certified descent)
-                y[i] = best_c
-                improved = True
-        cur = energy(y)
-        sweeps += 1
-        if cur == 0:
-            break
-        if not improved:
-            # coordinate minimum reached (not global): restart with new seed
-            y = {
-                i: givens.get(i, int(rng.integers(0, num_colors)))
-                for i in range(n_nodes)
+    cur = energy(y)  # текущая энергия
+    sweeps = 0  # число сделанных проходов
+    while sweeps < max_sweeps:  # пока не исчерпан предел проходов
+        improved = False  # в этом проходе улучшений пока нет
+        for i in range(n_nodes):  # по вершинам
+            if i in givens:  # цвет вершины зафиксирован
+                continue  # не менять
+            # точное локальное поле: число конфликтов по цветам кандидата;
+            # Δ = L_i(a) − L_i(y_i), слагаемых разбиения нет
+            counts = {c: sum(1 for j in adj[i] if y[j] == c) for c in range(num_colors)}  # counts[c] = число соседей i цвета c = L_i(c)
+            best_c, best_conf = y[i], counts[y[i]]  # лучший цвет — текущий, число его конфликтов L_i(y_i)
+            for c in range(num_colors):  # по цветам
+                if counts[c] < best_conf:  # у цвета c меньше конфликтов, чем у лучшего
+                    best_c, best_conf = c, counts[c]  # он становится лучшим
+            if best_conf < counts[y[i]]:  # строгое убывание: Δ = L_i(best_c) − L_i(y_i) < 0
+                y[i] = best_c  # перекрасить вершину i
+                improved = True  # проход с улучшением
+        cur = energy(y)  # энергия после прохода
+        sweeps += 1  # проходов + 1
+        if cur == 0:  # конфликтов нет
+            break  # стоп
+        if not improved:  # локальный (не глобальный) минимум достигнут
+            # достигнут координатный минимум (не глобальный): перезапуск с новым зерном
+            y = {  # новая случайная раскраска
+                i: givens.get(i, int(rng.integers(0, num_colors)))  # фиксированный цвет либо случайный из 0..num_colors−1
+                for i in range(n_nodes)  # по всем вершинам i = 0..n_nodes−1
             }
-    # A5 separation: zero conflict energy iff proper coloring (exact verify)
-    valid = all(y[a] != y[b] for a, b in edges) and all(
-        0 <= y[i] < num_colors for i in range(n_nodes)
+    # нулевая энергия конфликтов равносильна правильной раскраске (точная сверка)
+    valid = all(y[a] != y[b] for a, b in edges) and all(  # правильная раскраска: на каждом ребре цвета различны и
+        0 <= y[i] < num_colors for i in range(n_nodes)  # каждый цвет в диапазоне 0..num_colors−1
     )
-    return {
-        "coloring": y,
-        "valid": bool(valid),
-        "energy": int(cur),
-        "sweeps": int(sweeps),
-        "verified": bool(valid) == (cur == 0),
-        "givens_respected": all(y[i] == g for i, g in givens.items()),
+    return {  # словарь результата
+        "coloring": y,  # раскраска: вершина → цвет
+        "valid": bool(valid),  # правильность
+        "energy": int(cur),  # конечная энергия
+        "sweeps": int(sweeps),  # число проходов
+        "verified": bool(valid) == (cur == 0),  # сверка: (раскраска правильна) ⇔ (энергия 0)
+        "givens_respected": all(y[i] == g for i, g in givens.items()),  # фиксированные цвета сохранены
     }
 
 
-# ------------------- exact formula induction & theorem mining ------------------
+# ------------------- точная индукция формул и поиск теорем ------------------------------------
 
 
-def _exact_poly_fit(
-    xs: Sequence[int], ys: Sequence[int], max_degree: int = 5
-) -> Optional[tuple[int, ...]]:
-    """Exact rational polynomial interpolation (Fractions, machine precision:
-    no floating point anywhere). Returns integer coefficient tuple (c0..cd)
-    of the unique interpolant of degree <= max_degree through the points,
-    or None if the system is inconsistent / ill-conditioned. All arithmetic
-    is exact; verification is deferred to the caller."""
-    pts = sorted({(int(x), int(y)) for x, y in zip(xs, ys)})
-    if len({x for x, _ in pts}) < 2:
-        return None
-    for degree in range(1, min(max_degree, len(pts) - 1) + 1):
-        k = degree + 1
-        sample = pts[:k]
-        # exact Gaussian elimination on the Vandermonde system
-        a = [[Fraction(x) ** i for i in range(k)] + [Fraction(y)] for x, y in sample]
-        n = k
-        for col in range(n):
-            piv = next((r for r in range(col, n) if a[r][col] != 0), None)
-            if piv is None:
-                break
-            a[col], a[piv] = a[piv], a[col]
-            pv = a[col][col]
-            a[col] = [v / pv for v in a[col]]
-            for r in range(n):
-                if r != col and a[r][col] != 0:
-                    f = a[r][col]
-                    a[r] = [vr - f * vc for vr, vc in zip(a[r], a[col])]
-        else:
-            coeffs = [row[n] for row in a]
-            if any(c.denominator != 1 for c in coeffs):
-                continue  # non-integer coefficients: not a compact integer formula
-            icoeffs = tuple(int(c) for c in coeffs)
-            # verify exactly on ALL points (not just the interpolation sample)
-            if all(sum(ci * x**i for i, ci in enumerate(icoeffs)) == y for x, y in pts):
-                return icoeffs
-    return None
+def _exact_poly_fit(  # точная рациональная интерполяция многочлена p(x) = Σ c_i·x^i по точкам
+    xs: Sequence[int], ys: Sequence[int], max_degree: int = 5  # абсциссы, ординаты, наибольшая степень 5
+) -> Optional[tuple[int, ...]]:  # вернуть коэффициенты (c0..cd) либо None
+    """Точная рациональная интерполяция многочлена (дроби, без плавающей точки).
+
+        Возвращает кортеж целых коэффициентов (c0..cd) единственного интерполянта
+        p(x) = Σ c_i·x^i степени ≤ max_degree через точки либо None, если система
+        несовместна или не имеет единственного решения. Степень d подбирается от 1
+        до max_degree; система d + 1 уравнений решается точным исключением Гаусса
+        над Fraction. Вся арифметика точная; проверка на остальных точках —
+        дело вызывающего."""
+    pts = sorted({(int(x), int(y)) for x, y in zip(xs, ys)})  # различные точки (x, y) в порядке возрастания
+    if len({x for x, _ in pts}) < 2:  # различных абсцисс меньше двух
+        return None  # многочлен не определяется
+    for degree in range(1, min(max_degree, len(pts) - 1) + 1):  # степени 1..min(max_degree, |pts| − 1)
+        k = degree + 1  # число неизвестных коэффициентов k = d + 1
+        sample = pts[:k]  # первые k точек
+        # точное исключение Гаусса над рациональными числами для системы Вандермонда
+        a = [[Fraction(x) ** i for i in range(k)] + [Fraction(y)] for x, y in sample]  # матрица Вандермонда: строка [1, x, .., x^d | y] из рациональных дробей
+        n = k  # размер системы n = k
+        for col in range(n):  # прямой ход исключения Гаусса по столбцам
+            piv = next((r for r in range(col, n) if a[r][col] != 0), None)  # первая строка r ≥ col с ненулевым элементом в столбце col
+            if piv is None:  # ведущего элемента нет — система вырождена
+                break  # прервать (for … else не сработает)
+            a[col], a[piv] = a[piv], a[col]  # поменять строки местами
+            pv = a[col][col]  # ведущий элемент pv
+            a[col] = [v / pv for v in a[col]]  # нормировать строку: a[col] /= pv
+            for r in range(n):  # по всем строкам
+                if r != col and a[r][col] != 0:  # другая строка с ненулевым элементом в столбце col
+                    f = a[r][col]  # множитель f
+                    a[r] = [vr - f * vc for vr, vc in zip(a[r], a[col])]  # новая строка a[r] = a[r] − f·a[col]
+        else:  # иначе — степень от 2 до min(max_degree, |pts| − 1)
+            coeffs = [row[n] for row in a]  # коэффициенты c_0..c_d — последний столбец приведённой матрицы
+            if any(c.denominator != 1 for c in coeffs):  # есть нецелый коэффициент (знаменатель ≠ 1)
+                continue  # нецелые коэффициенты — не компактная целочисленная формула
+            icoeffs = tuple(int(c) for c in coeffs)  # целый кортеж коэффициентов c_i
+            # точная проверка на ВСЕХ точках, а не только на использованных для интерполяции
+            if all(sum(ci * x**i for i, ci in enumerate(icoeffs)) == y for x, y in pts):  # p(x) = Σ_i c_i·x^i = y на ВСЕХ точках
+                return icoeffs  # вернуть коэффициенты
+    return None  # ни одна степень не подошла
 
 
-def _monomial_exponents(arity: int, max_degree: int) -> tuple[tuple[int, ...], ...]:
-    """All exponent vectors with total degree <= max_degree, constant first."""
-    if arity < 1 or max_degree < 0:
-        raise ValueError("arity must be positive and max_degree nonnegative")
-    return tuple(
-        sorted(
-            (
-                powers
-                for powers in itertools.product(range(max_degree + 1), repeat=arity)
-                if sum(powers) <= max_degree
+def _monomial_exponents(arity: int, max_degree: int) -> tuple[tuple[int, ...], ...]:  # все векторы показателей (m_1..m_n) с суммой ≤ max_degree, сначала младшие
+    """Все векторы показателей (m_1..m_arity) с полной степенью Σ m_i ≤ max_degree,
+        первыми идут младшие (сортировка по сумме, затем по самому вектору)."""
+    if arity < 1 or max_degree < 0:  # арность < 1 или отрицательная степень
+        raise ValueError("arity must be positive and max_degree nonnegative")  # ошибка аргументов
+    return tuple(  # вернуть кортеж
+        sorted(  # отсортированный
+            (  # генератор
+                powers  # вектор показателей
+                for powers in itertools.product(range(max_degree + 1), repeat=arity)  # по всем m_i ∈ 0..max_degree
+                if sum(powers) <= max_degree  # с суммой Σ m_i ≤ max_degree
             ),
-            key=lambda powers: (sum(powers), powers),
+            key=lambda powers: (sum(powers), powers),  # ключ: (полная степень, лексикографически сам вектор)
         )
     )
 
 
-def _exact_multivariate_poly_fit(
-    inputs: Sequence[Sequence[int]],
-    targets: Sequence[int],
-    arity: int,
-    max_degree: int = 4,
-) -> Optional[tuple[tuple[int, tuple[int, ...]], ...]]:
-    """Find the minimum-total-degree integer polynomial fitting all rows.
+def _exact_multivariate_poly_fit(  # точный целочисленный многочлен p(x) = Σ c_m·Π x_i^{m_i} минимальной степени по всем строкам
+    inputs: Sequence[Sequence[int]],  # строки входов
+    targets: Sequence[int],  # ожидаемые выходы
+    arity: int,  # число переменных n
+    max_degree: int = 4,  # наибольшая полная степень 4
+) -> Optional[tuple[tuple[int, tuple[int, ...]], ...]]:  # вернуть кортеж слагаемых ((c, m), ...) либо None
+    """Найти целочисленный многочлен минимальной полной степени, проходящий через все строки.
 
-    Uses exact Fraction Gauss-Jordan elimination on an overdetermined system.
-    A result is returned only when the design matrix has full column rank,
-    the system is consistent, and every coefficient is an integer. Thus no
-    floating-point tolerance or arbitrary regularizer enters formula discovery.
-    The caller must still check held-out data and the complete finite support.
-    """
+            Решается переопределённая система A·c = y точным методом Гаусса — Жордана
+            над дробями Fraction: строка A — значения мономов Π x_i^{m_i} входа.
+            Степень d перебирается от 0 вверх; результат возвращается, только если
+            матрица имеет полный ранг по столбцам (решение единственно), система
+            совместна и все коэффициенты целые. Плавающие допуски и регуляризация
+            в поиск формулы не входят. Проверку на отложенных данных и на всей
+            конечной области делает вызывающий."""
 
-    if len(inputs) != len(targets) or not inputs or arity < 1:
-        return None
-    rows = [tuple(int(v) for v in row) for row in inputs]
-    if any(len(row) != arity for row in rows):
-        return None
-    ys = [int(v) for v in targets]
-    for degree in range(max_degree + 1):
-        monomials = _monomial_exponents(arity, degree)
-        ncols = len(monomials)
-        if len(rows) < ncols:
-            continue
-        matrix = []
-        for row, y in zip(rows, ys):
-            features = [
-                Fraction(math.prod(x**power for x, power in zip(row, powers)))
-                for powers in monomials
+    if len(inputs) != len(targets) or not inputs or arity < 1:  # длины не совпадают, нет данных или арность < 1
+        return None  # многочлен не ищется
+    rows = [tuple(int(v) for v in row) for row in inputs]  # строки входов — целые кортежи
+    if any(len(row) != arity for row in rows):  # есть строка длины ≠ arity
+        return None  # отказ
+    ys = [int(v) for v in targets]  # выходы — целые
+    for degree in range(max_degree + 1):  # по полным степеням 0..max_degree (первая подходящая — минимальная)
+        monomials = _monomial_exponents(arity, degree)  # векторы показателей степени ≤ degree
+        ncols = len(monomials)  # число неизвестных = число мономов
+        if len(rows) < ncols:  # уравнений меньше, чем неизвестных
+            continue  # система недоопределена — следующая степень
+        matrix = []  # расширенная матрица системы
+        for row, y in zip(rows, ys):  # по строкам данных
+            features = [  # значения мономов строки
+                Fraction(math.prod(x**power for x, power in zip(row, powers)))  # m-й моном = Π_i x_i^{m_i}
+                for powers in monomials  # по векторам показателей
             ]
-            matrix.append(features + [Fraction(y)])
+            matrix.append(features + [Fraction(y)])  # строка [значения мономов | y]
 
-        pivot_row = 0
-        pivot_rows: list[int] = []
-        full_rank = True
-        for col in range(ncols):
-            pivot = next(
-                (r for r in range(pivot_row, len(matrix)) if matrix[r][col] != 0), None
+        pivot_row = 0  # номер текущей ведущей строки
+        pivot_rows: list[int] = []  # номера строк, выбранных ведущими по столбцам
+        full_rank = True  # предположение: столбцы линейно независимы
+        for col in range(ncols):  # исключение Гаусса — Жордана по столбцам
+            pivot = next(  # ведущая строка
+                (r for r in range(pivot_row, len(matrix)) if matrix[r][col] != 0), None  # первая строка r ≥ pivot_row с ненулевым элементом; иначе None
             )
-            if pivot is None:
-                full_rank = False
-                break
-            matrix[pivot_row], matrix[pivot] = matrix[pivot], matrix[pivot_row]
-            scale = matrix[pivot_row][col]
-            matrix[pivot_row] = [v / scale for v in matrix[pivot_row]]
-            for r in range(len(matrix)):
-                if r == pivot_row:
-                    continue
-                factor = matrix[r][col]
-                if factor:
-                    matrix[r] = [
-                        a - factor * b for a, b in zip(matrix[r], matrix[pivot_row])
+            if pivot is None:  # в столбце нет ненулевого элемента
+                full_rank = False  # столбцы зависимы
+                break  # прекратить исключение
+            matrix[pivot_row], matrix[pivot] = matrix[pivot], matrix[pivot_row]  # поднять ведущую строку на место pivot_row
+            scale = matrix[pivot_row][col]  # ведущий элемент
+            matrix[pivot_row] = [v / scale for v in matrix[pivot_row]]  # нормировать ведущую строку: ведущий элемент станет 1
+            for r in range(len(matrix)):  # по всем строкам
+                if r == pivot_row:  # сама ведущая строка
+                    continue  # не менять
+                factor = matrix[r][col]  # множитель a[r][col]
+                if factor:  # он ненулевой
+                    matrix[r] = [  # вычесть приведённую ведущую строку
+                        a - factor * b for a, b in zip(matrix[r], matrix[pivot_row])  # новая строка: a[r] = a[r] − factor·a[pivot_row]
                     ]
-            pivot_rows.append(pivot_row)
-            pivot_row += 1
-        if not full_rank:
-            continue
-        if any(
-            all(row[c] == 0 for c in range(ncols)) and row[-1] != 0 for row in matrix
+            pivot_rows.append(pivot_row)  # запомнить ведущую строку столбца col
+            pivot_row += 1  # перейти к следующей строке
+        if not full_rank:  # решение не единственно
+            continue  # следующая степень
+        if any(  # есть противоречивая строка
+            all(row[c] == 0 for c in range(ncols)) and row[-1] != 0 for row in matrix  # все коэффициенты 0, а свободный член ≠ 0
         ):
-            continue
-        coefficients = [matrix[pivot_rows[col]][-1] for col in range(ncols)]
-        if any(value.denominator != 1 for value in coefficients):
-            continue
-        terms = tuple(
-            (int(coefficient), powers)
-            for coefficient, powers in zip(coefficients, monomials)
-            if coefficient
+            continue  # система несовместна
+        coefficients = [matrix[pivot_rows[col]][-1] for col in range(ncols)]  # решение: свободный член ведущей строки каждого столбца
+        if any(value.denominator != 1 for value in coefficients):  # есть дробный коэффициент
+            continue  # не целочисленный многочлен
+        terms = tuple(  # кортеж (коэффициент, вектор показателей) ненулевых мономов
+            (int(coefficient), powers)  # пара (c, m)
+            for coefficient, powers in zip(coefficients, monomials)  # по найденным коэффициентам и мономам
+            if coefficient  # только ненулевые
         )
 
-        # Recheck every supplied row independently of the elimination path.
-        def evaluate(row: Sequence[int]) -> int:
-            return sum(
-                c * math.prod(int(x) ** p for x, p in zip(row, powers))
-                for c, powers in terms
+        # перепроверка каждой поданной строки независимо от пути исключения
+        def evaluate(row: Sequence[int]) -> int:  # значение многочлена p(row) = Σ c·Π x_i^{m_i}
+            return sum(  # сумма по мономам
+                c * math.prod(int(x) ** p for x, p in zip(row, powers))  # слагаемое c·Π_i x_i^{m_i}
+                for c, powers in terms  # по слагаемым
             )
 
-        if all(evaluate(row) == y for row, y in zip(rows, ys)):
-            return terms
-    return None
+        if all(evaluate(row) == y for row, y in zip(rows, ys)):  # перепроверка: p(row) = y на каждой строке
+            return terms  # вернуть слагаемые
+    return None  # ни одна степень не дала целочисленного решения
 
 
-def _multivariate_poly_expr(
-    terms: tuple[tuple[int, tuple[int, ...]], ...],
-) -> Expr:
-    return Expr(
-        "poly_nd",
-        (),
-        tuple((int(c), tuple(int(p) for p in powers)) for c, powers in terms),
+def _multivariate_poly_expr(  # выражение «poly_nd» из слагаемых многочлена
+    terms: tuple[tuple[int, tuple[int, ...]], ...],  # слагаемые (c, m)
+) -> Expr:  # вернуть выражение
+    return Expr(  # узел выражения
+        "poly_nd",  # имя операции
+        (),  # без дочерних выражений
+        tuple((int(c), tuple(int(p) for p in powers)) for c, powers in terms),  # payload: ((c, (m_1..m_n)), ...) целыми
     )
 
 
-def _poly_expr(coeffs: tuple[int, ...]) -> Expr:
-    return Expr("poly", (Expr.var(0),), coeffs)
+def _poly_expr(coeffs: tuple[int, ...]) -> Expr:  # выражение «poly» от переменной 0 с коэффициентами coeffs
+    return Expr("poly", (Expr.var(0),), coeffs)  # узел poly(Var0; c_0..c_d)
 
 
-def _eval_poly(coeffs: tuple[int, ...], x: int) -> int:
-    acc = 0
-    for ci in reversed(coeffs):
-        acc = acc * x + ci
-    return acc
+def _eval_poly(coeffs: tuple[int, ...], x: int) -> int:  # значение p(x) по схеме Горнера
+    acc = 0  # аккумулятор 0
+    for ci in reversed(coeffs):  # от старшего коэффициента к младшему
+        acc = acc * x + ci  # Горнер: acc = acc·x + c_i
+    return acc  # значение p(x)
 
 
-@dataclass
-class Theorem:
-    name: str
-    statement: str
-    domain_points: int
-    verified: bool = True
+@dataclass  # класс данных
+class Theorem:  # найденное конечное тождество
+    name: str  # имя
+    statement: str  # текст утверждения
+    domain_points: int  # число проверенных точек
+    verified: bool = True  # проверено (по умолчанию да)
 
 
-class TheoremMiner:
-    """Mine finite-domain identities only where every evaluation is supported.
+class TheoremMiner:  # поиск конечных тождеств среди экспертов
+    """Поиск тождеств на конечной области — только там, где поддержано каждое вычисление.
 
-    Results are finite-support statements, not unbounded algebraic theorems.
-    Unary iteration identities additionally require closure of the declared
-    input domain under the expert's outputs.
-    """
+            Результат — утверждения о конечной области, а не безграничные алгебраические
+            теоремы. Для унарных тождеств итерации e(e(x)) дополнительно требуется,
+            объявленная область была замкнута относительно выходов эксперта."""
 
-    def mine(
-        self, model: "GrowingMathProcessorV7", max_experts: int = 24
-    ) -> list[Theorem]:
-        found: list[Theorem] = []
-        known = {t.name for t in model.theorems}
-        bin_e = [e for e in model.experts.values() if e.program.arity == 2][
-            :max_experts
+    def mine(  # найти тождества
+        self, model: "GrowingMathProcessorV7", max_experts: int = 24  # модель и предел числа экспертов каждой арности
+    ) -> list[Theorem]:  # вернуть список найденных теорем
+        found: list[Theorem] = []  # найденные в этом запуске теоремы
+        known = {t.name for t in model.theorems}  # имена уже известных теорем
+        bin_e = [e for e in model.experts.values() if e.program.arity == 2][  # бинарные эксперты, срез
+            :max_experts  # первые max_experts штук
         ]
-        un_e = [e for e in model.experts.values() if e.program.arity == 1][:max_experts]
+        un_e = [e for e in model.experts.values() if e.program.arity == 1][:max_experts]  # унарные эксперты, не более max_experts
 
-        for e in bin_e:
-            dx, dy = e.domains[0], e.domains[1]
-            declared_pairs = [(x, y) for x in dx for y in dy if e.supports((x, y))]
-            comm_pairs = [(x, y) for x, y in declared_pairs if e.supports((y, x))]
-            # Do not label a tiny symmetric overlap as global commutativity:
-            # every supported declared pair must have its swapped support.
-            if comm_pairs and len(comm_pairs) == len(declared_pairs):
-                name = f"commutativity({e.name})"
-                if name not in known:
-                    try:
-                        ok = all(
-                            e.program.eval((int(x), int(y)))
-                            == e.program.eval((int(y), int(x)))
-                            for x, y in comm_pairs
+        for e in bin_e:  # по бинарным экспертам
+            dx, dy = e.domains[0], e.domains[1]  # объявленные области первого и второго аргументов
+            declared_pairs = [(x, y) for x in dx for y in dy if e.supports((x, y))]  # все поддержанные пары декартова произведения dx × dy
+            comm_pairs = [(x, y) for x, y in declared_pairs if e.supports((y, x))]  # пары, у которых поддержана и переставленная (y, x)
+            # Небольшое симметричное пересечение нельзя называть глобальной коммутативностью:
+            # у каждой поддержанной объявленной пары должна быть поддержана и переставленная.
+            if comm_pairs and len(comm_pairs) == len(declared_pairs):  # коммутативные пары есть и совпадают со всеми объявленными
+                name = f"commutativity({e.name})"  # имя теоремы
+                if name not in known:  # ещё не доказана
+                    try:  # вычисление может упасть
+                        ok = all(  # верно на всех парах
+                            e.program.eval((int(x), int(y)))  # значение e(x, y)
+                            == e.program.eval((int(y), int(x)))  # равно e(y, x)
+                            for x, y in comm_pairs  # по всем парам
                         )
-                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                        ok = False
-                    if ok:
-                        th = Theorem(
-                            name,
-                            f"for all declared pairs with both orders supported: {e.name}(x,y) = {e.name}(y,x)",
-                            len(comm_pairs),
-                        )
-                        model.theorems.append(th)
-                        found.append(th)
-                        known.add(name)
+                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                        ok = False  # теорема не подтверждена
+                    if ok:  # тождество выполнено
+                        th = Theorem(  # новая теорема
+                            name,  # имя
+                            f"for all declared pairs with both orders supported: {e.name}(x,y) = {e.name}(y,x)",  # текст утверждения
+                            len(comm_pairs),  # число проверенных пар
+                        )  # конец аргументов
+                        model.theorems.append(th)  # добавить в модель
+                        found.append(th)  # и в найденные
+                        known.add(name)  # запомнить имя
 
-            self_pairs = [x for x in dx if x in dy and e.supports((x, x))]
-            name = f"self-absorption({e.name})"
-            if self_pairs and len(self_pairs) == len(dx) and name not in known:
-                try:
-                    ok = all(
-                        e.program.eval((int(x), int(x))) == int(x) for x in self_pairs
+            self_pairs = [x for x in dx if x in dy and e.supports((x, x))]  # x из dx, лежащие в dy, с поддержанной парой (x, x)
+            name = f"self-absorption({e.name})"  # имя теоремы
+            if self_pairs and len(self_pairs) == len(dx) and name not in known:  # диагональных пар не меньше, чем элементов dx, и теорема новая
+                try:  # вычисление может упасть
+                    ok = all(  # верно на всех диагональных парах
+                        e.program.eval((int(x), int(x))) == int(x) for x in self_pairs  # верно e(x, x) = x на всех таких x
                     )
-                except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                    ok = False
-                if ok:
-                    th = Theorem(
-                        name,
-                        f"for all x in the declared overlap with (x,x) supported: {e.name}(x,x) = x",
-                        len(self_pairs),
-                    )
-                    model.theorems.append(th)
-                    found.append(th)
-                    known.add(name)
+                except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                    ok = False  # теорема не подтверждена
+                if ok:  # тождество выполнено
+                    th = Theorem(  # новая теорема
+                        name,  # имя
+                        f"for all x in the declared overlap with (x,x) supported: {e.name}(x,x) = x",  # текст утверждения
+                        len(self_pairs),  # число проверенных точек
+                    )  # конец аргументов
+                    model.theorems.append(th)  # добавить в модель
+                    found.append(th)  # и в найденные
+                    known.add(name)  # запомнить имя
 
-            zero_pairs = [x for x in dx if 0 in dy and e.supports((x, 0))]
-            name = f"annihilator-zero({e.name})"
-            if zero_pairs and len(zero_pairs) == len(dx) and name not in known:
-                try:
-                    ok = all(e.program.eval((int(x), 0)) == int(x) for x in zero_pairs)
-                except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                    ok = False
-                if ok:
-                    th = Theorem(
-                        name,
-                        f"for all declared x with (x,0) supported: {e.name}(x,0) = x",
-                        len(zero_pairs),
-                    )
-                    model.theorems.append(th)
-                    found.append(th)
-                    known.add(name)
+            zero_pairs = [x for x in dx if 0 in dy and e.supports((x, 0))]  # x из dx с поддержанной парой (x, 0) (0 должно быть в dy)
+            name = f"annihilator-zero({e.name})"  # имя теоремы
+            if zero_pairs and len(zero_pairs) == len(dx) and name not in known:  # таких x не меньше, чем в dx, и теорема новая
+                try:  # вычисление может упасть
+                    ok = all(e.program.eval((int(x), 0)) == int(x) for x in zero_pairs)  # e(x, 0) = x на всех таких x
+                except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                    ok = False  # теорема не подтверждена
+                if ok:  # тождество выполнено
+                    th = Theorem(  # новая теорема
+                        name,  # имя
+                        f"for all declared x with (x,0) supported: {e.name}(x,0) = x",  # текст утверждения
+                        len(zero_pairs),  # число проверенных точек
+                    )  # конец аргументов
+                    model.theorems.append(th)  # добавить в модель
+                    found.append(th)  # и в найденные
+                    known.add(name)  # запомнить имя
 
-        for e in un_e:
-            dom = tuple(int(x) for x in e.domains[0])
-            image: dict[int, int] = {}
-            closed = True
-            try:
-                for x in dom:
-                    if not e.supports((x,)):
-                        closed = False
-                        break
-                    y = int(e.program.eval((x,)))
-                    if not e.supports((y,)):
-                        closed = False
-                        break
-                    image[x] = y
-            except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                closed = False
+        for e in un_e:  # по унарным экспертам
+            dom = tuple(int(x) for x in e.domains[0])  # объявленная область — целые
+            image: dict[int, int] = {}  # образ: x → e(x)
+            closed = True  # предположение: область замкнута относительно e
+            try:  # вычисление может упасть
+                for x in dom:  # по всем x области
+                    if not e.supports((x,)):  # вход не поддержан
+                        closed = False  # замыкания нет
+                        break  # стоп
+                    y = int(e.program.eval((x,)))  # образ y = e(x)
+                    if not e.supports((y,)):  # выход не входит в поддержанную область
+                        closed = False  # замыкания нет
+                        break  # стоп
+                    image[x] = y  # запомнить образ
+            except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                closed = False  # замыкания нет
 
-            if closed:
-                name = f"involutivity({e.name})"
-                if name not in known:
-                    try:
-                        ok = all(int(e.program.eval((image[x],))) == x for x in dom)
-                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                        ok = False
-                    if ok:
-                        th = Theorem(
-                            name,
-                            f"for all x in the declared domain: {e.name}({e.name}(x)) = x",
-                            len(dom),
+            if closed:  # область замкнута: e(e(x)) определено
+                name = f"involutivity({e.name})"  # имя теоремы
+                if name not in known:  # новая
+                    try:  # вычисление может упасть
+                        ok = all(int(e.program.eval((image[x],))) == x for x in dom)  # e(e(x)) = x на всей области
+                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                        ok = False  # не подтверждено
+                    if ok:  # тождество выполнено
+                        th = Theorem(  # новая теорема
+                            name,  # имя
+                            f"for all x in the declared domain: {e.name}({e.name}(x)) = x",  # текст утверждения
+                            len(dom),  # число проверенных точек
+                        )  # конец аргументов
+                        model.theorems.append(th)  # добавить в модель
+                        found.append(th)  # и в найденные
+                        known.add(name)  # запомнить имя
+
+                name = f"idempotence({e.name})"  # имя теоремы
+                if name not in known:  # новая
+                    try:  # вычисление может упасть
+                        ok = all(  # верно на всей области
+                            int(e.program.eval((image[x],))) == image[x] for x in dom  # верно e(e(x)) = e(x) на всей области
                         )
-                        model.theorems.append(th)
-                        found.append(th)
-                        known.add(name)
+                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                        ok = False  # не подтверждено
+                    if ok:  # тождество выполнено
+                        th = Theorem(  # новая теорема
+                            name,  # имя
+                            f"for all x in the declared domain: {e.name}({e.name}(x)) = {e.name}(x)",  # текст утверждения
+                            len(dom),  # число проверенных точек
+                        )  # конец аргументов
+                        model.theorems.append(th)  # добавить в модель
+                        found.append(th)  # и в найденные
+                        known.add(name)  # запомнить имя
 
-                name = f"idempotence({e.name})"
-                if name not in known:
-                    try:
-                        ok = all(
-                            int(e.program.eval((image[x],))) == image[x] for x in dom
+            if 0 in dom:  # ноль входит в область
+                name = f"zero-fixpoint({e.name})"  # имя теоремы
+                if name not in known:  # новая
+                    try:  # вычисление может упасть
+                        ok = int(e.program.eval((0,))) == 0  # верно e(0) = 0
+                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                        ok = False  # не подтверждено
+                    if ok:  # тождество выполнено
+                        th = Theorem(  # новая теорема
+                            name, f"at the supported point x=0: {e.name}(0) = 0", 1  # имя, текст утверждения, одна точка
                         )
-                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                        ok = False
-                    if ok:
-                        th = Theorem(
-                            name,
-                            f"for all x in the declared domain: {e.name}({e.name}(x)) = {e.name}(x)",
-                            len(dom),
-                        )
-                        model.theorems.append(th)
-                        found.append(th)
-                        known.add(name)
-
-            if 0 in dom:
-                name = f"zero-fixpoint({e.name})"
-                if name not in known:
-                    try:
-                        ok = int(e.program.eval((0,))) == 0
-                    except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                        ok = False
-                    if ok:
-                        th = Theorem(
-                            name, f"at the supported point x=0: {e.name}(0) = 0", 1
-                        )
-                        model.theorems.append(th)
-                        found.append(th)
-                        known.add(name)
-        return found
+                        model.theorems.append(th)  # добавить в модель
+                        found.append(th)  # и в найденные
+                        known.add(name)  # запомнить имя
+        return found  # найденные теоремы
 
 
-# ------------------------- resource governor (unlimited loop) --------------------
+# ------------------------- регулятор ресурсов (неограниченный цикл) --------------------------
 
 
-def _ram_available_bytes() -> int:
-    try:
-        import psutil
+def _ram_available_bytes() -> int:  # доступная оперативная память в байтах (0 — неизвестно)
+    try:  # psutil может отсутствовать
+        import psutil  # библиотека сведений о системе
 
-        return int(psutil.virtual_memory().available)
-    except ImportError:
-        if sys.platform == "win32":
-            import ctypes
+        return int(psutil.virtual_memory().available)  # доступные байты
+    except ImportError:  # psutil нет
+        if sys.platform == "win32":  # ОС Windows
+            import ctypes  # вызовы системных библиотек
 
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            class MEMORYSTATUSEX(ctypes.Structure):  # структура сведений о памяти Windows
+                _fields_ = [  # поля структуры
+                    ("dwLength", ctypes.c_ulong),  # размер структуры
+                    ("dwMemoryLoad", ctypes.c_ulong),  # загрузка памяти, %
+                    ("ullTotalPhys", ctypes.c_ulonglong),  # вся физическая память
+                    ("ullAvailPhys", ctypes.c_ulonglong),  # доступная физическая память
+                    ("ullTotalPageFile", ctypes.c_ulonglong),  # предел файла подкачки
+                    ("ullAvailPageFile", ctypes.c_ulonglong),  # доступный файл подкачки
+                    ("ullTotalVirtual", ctypes.c_ulonglong),  # предел виртуальной памяти процесса
+                    ("ullAvailVirtual", ctypes.c_ulonglong),  # доступная виртуальная память процесса
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),  # доступная расширенная виртуальная память
                 ]
 
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
-            return int(st.ullAvailPhys)
-        return 0
+            st = MEMORYSTATUSEX()  # структура-приёмник
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)  # поле dwLength = размер структуры (требование системы)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))  # заполнить st системным вызовом
+            return int(st.ullAvailPhys)  # доступная физическая память
+        return 0  # другая платформа без psutil: неизвестно
 
 
-def _vram_free_bytes(device: str) -> int:
-    if not (device.startswith("cuda") and _ensure_torch()):
-        return 0
-    try:
-        free, _total = _torch.cuda.mem_get_info(_torch.device(device))
-        return int(free)
-    except Exception:
-        return 0
+def _vram_free_bytes(device: str) -> int:  # свободная видеопамять устройства в байтах (0 — неизвестно)
+    if not (device.startswith("cuda") and _ensure_torch()):  # не cuda или torch недоступен
+        return 0  # неизвестно
+    try:  # вызов может упасть
+        free, _total = _torch.cuda.mem_get_info(_torch.device(device))  # свободная и вся память устройства
+        return int(free)  # свободные байты
+    except Exception:  # любая ошибка
+        return 0  # неизвестно
 
 
-class ResourceGovernor:
-    """Convert available RAM/VRAM into bounded per-task search budgets.
+class ResourceGovernor:  # регулятор ресурсов: переводит свободную оперативную и видеопамять в ограниченные бюджеты поиска
+    """Переводит свободную оперативную и видеопамять в ограниченные бюджеты поиска
+            на задачу: node_budget, pop_budget, chunk.
 
-    A separate monotonic deadline/round cap bounds the outer growth loop.
-    Budgets degrade gracefully instead of allowing search to consume all RAM.
-    """
+            Внешний цикл роста ограничен отдельно монотонным сроком и пределом раундов.
+            При нехватке памяти бюджеты плавно уменьшаются, а не позволяют поиск
+            занять всю память."""
 
-    RAM_FLOOR_BYTES = 300 * 1024 * 1024  # below this: pause/skip, never OOM-kill
-    VRAM_FLOOR_BYTES = 300 * 1024 * 1024
+    RAM_FLOOR_BYTES = 300 * 1024 * 1024  # нижний порог оперативной памяти 300 МиБ: ниже — пропуск задачи
+    VRAM_FLOOR_BYTES = 300 * 1024 * 1024  # нижний порог видеопамяти 300 МиБ
 
-    def __init__(self, device: str = "cpu"):
-        self.device = device
-        self.node_budget = DEFAULT_NODE_BUDGET
-        self.pop_budget = DEFAULT_POP_BUDGET
-        self.chunk = VALIDATION_CHUNK
-        self.total_skips = 0
+    def __init__(self, device: str = "cpu"):  # создать регулятор для устройства device
+        self.device = device  # устройство
+        self.node_budget = DEFAULT_NODE_BUDGET  # бюджет узлов по умолчанию
+        self.pop_budget = DEFAULT_POP_BUDGET  # бюджет популяции по умолчанию
+        self.chunk = VALIDATION_CHUNK  # размер пачки по умолчанию
+        self.total_skips = 0  # всего пропущенных задач
 
-    def _scale(self) -> float:
-        ram = _ram_available_bytes()
-        if ram <= 0:
-            return 1.0
-        # full speed above 6 GB, linear degradation to zero at the floor
-        hi, lo, floor = 6 * 2**30, 1 * 2**30, self.RAM_FLOOR_BYTES
-        s = min(1.0, max(0.0, (ram - floor) / max(1, hi - floor)))
-        if ram < lo:
-            s = min(s, max(0.05, (ram - floor) / max(1, lo - floor)))
-        if self.device.startswith("cuda") and _ensure_torch():
-            vram = _vram_free_bytes(self.device)
-            if vram < self.VRAM_FLOOR_BYTES:
-                s = 0.0
-        return s
+    def _scale(self) -> float:  # масштаб s ∈ [0, 1] по свободной памяти
+        ram = _ram_available_bytes()  # доступная оперативная память
+        if ram <= 0:  # неизвестна
+            return 1.0  # без ограничения
+        # полная скорость выше 6 ГиБ, линейное убывание до нуля на нижнем пороге
+        hi, lo, floor = 6 * 2**30, 1 * 2**30, self.RAM_FLOOR_BYTES  # hi = 6 ГиБ, lo = 1 ГиБ, floor = нижний порог
+        s = min(1.0, max(0.0, (ram - floor) / max(1, hi - floor)))  # масштаб s = clip((ram − floor)/(hi − floor), 0, 1)
+        if ram < lo:  # памяти меньше 1 ГиБ
+            s = min(s, max(0.05, (ram - floor) / max(1, lo - floor)))  # жёстче: s = min(s, max(0.05, (ram − floor)/(lo − floor)))
+        if self.device.startswith("cuda") and _ensure_torch():  # cuda и torch доступен
+            vram = _vram_free_bytes(self.device)  # свободная видеопамять
+            if vram < self.VRAM_FLOOR_BYTES:  # ниже порога
+                s = 0.0  # полный стоп
+        return s  # масштаб
 
-    def before_task(self) -> bool:
-        """Re-budget for the next task. False = resources exhausted: skip."""
-        s = self._scale()
-        if s <= 0.0:
-            self.total_skips += 1
-            return False
-        self.node_budget = max(1_000, int(DEFAULT_NODE_BUDGET * s))
-        self.pop_budget = max(2_000, int(DEFAULT_POP_BUDGET * s))
-        self.chunk = max(8, int(VALIDATION_CHUNK * min(1.0, s * 2)))
-        return True
+    def before_task(self) -> bool:  # пересчитать бюджеты перед задачей; False — ресурсы исчерпаны, задачу пропустить
+        """Пересчитать бюджеты перед следующей задачей. False — ресурсы исчерпаны, задачу пропустить."""
+        s = self._scale()  # масштаб
+        if s <= 0.0:  # ресурсов нет
+            self.total_skips += 1  # пропусков + 1
+            return False  # пропустить
+        self.node_budget = max(1_000, int(DEFAULT_NODE_BUDGET * s))  # бюджет узлов = max(1000, ⌊DEFAULT·s⌋)
+        self.pop_budget = max(2_000, int(DEFAULT_POP_BUDGET * s))  # бюджет популяции = max(2000, ⌊DEFAULT·s⌋)
+        self.chunk = max(8, int(VALIDATION_CHUNK * min(1.0, s * 2)))  # пачка = max(8, ⌊VALIDATION_CHUNK·min(1, 2s)⌋)
+        return True  # работать
 
-    def recover(self, exc: BaseException) -> None:
-        """After a memory error: shrink hard, drop caches, keep going."""
-        DEFAULT_NODE_BUDGET_S = 10_000
-        self.node_budget = min(self.node_budget, DEFAULT_NODE_BUDGET_S)
-        self.pop_budget = min(self.pop_budget, 20_000)
-        self.chunk = max(4, self.chunk // 4)
-        if self.device.startswith("cuda") and _ensure_torch():
-            try:
-                _torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-
-# ---------------------- unlimited self-development loop -------------------------
+    def recover(self, exc: BaseException) -> None:  # после ошибки памяти: резко урезать бюджеты, сбросить кэш, продолжать
+        """После ошибки памяти: резко урезать бюджеты, сбросить кэш видеопамяти, продолжать работу."""
+        DEFAULT_NODE_BUDGET_S = 10_000  # аварийный предел узлов
+        self.node_budget = min(self.node_budget, DEFAULT_NODE_BUDGET_S)  # узлов не более 10 000
+        self.pop_budget = min(self.pop_budget, 20_000)  # популяция не более 20 000
+        self.chunk = max(4, self.chunk // 4)  # пачка вчетверо меньше, но не менее 4
+        if self.device.startswith("cuda") and _ensure_torch():  # cuda и torch доступен
+            try:  # вызов может упасть
+                _torch.cuda.empty_cache()  # освободить кэш видеопамяти
+            except Exception:  # любая ошибка
+                pass  # игнорировать
 
 
-def _propose_task_from_experts(
-    experts: dict[str, Any],
-    rng: np.random.Generator,
-    round_index: int,
-    depth: int = 1,
-    domain_radius: int = 6,
-) -> Optional[TaskSpec]:
-    """Propose a composition only on the parents' jointly certified support.
+# ---------------------- неограниченный цикл саморазвития -------------------------------------
 
-    No parent program is evaluated outside its Expert.supports() domain. The
-    generated task inherits the relevant input validity rule and its whole
-    Cartesian support is pre-checked before a teacher closure is returned.
-    This grows a finite compositional curriculum, not independent capability.
-    """
-    arity2 = [
-        e for e in experts.values() if e.program.arity == 2 and e.family != "BoolVenn"
+
+def _propose_task_from_experts(  # предложить задачу-композицию на общей заверенной области родителей
+    experts: dict[str, Any],  # эксперты по именям
+    rng: np.random.Generator,  # генератор случайных чисел
+    round_index: int,  # номер раунда
+    depth: int = 1,  # глубина композиции 1
+    domain_radius: int = 6,  # радиус области 6
+) -> Optional[TaskSpec]:  # вернуть задачу TaskSpec либо None
+    """Предложить композицию только на совместно заверенной области родителей.
+
+            Ни одна родительская программа не вычисляется вне области Expert.supports().
+            Порождённая задача наследует соответствующее правило допустимости входа,
+            и вся её декартова область проверяется заранее, прежде чем вернуть
+            замыкание учителя. Так растёт конечная композиционная программа задач,
+            а не самостоятельная способность. Параметры: experts — эксперты по именам,
+            rng — генератор случайных чисел, round_index — номер раунда, depth — глубина
+            композиции, domain_radius — радиус области. Возвращает TaskSpec или None."""
+    arity2 = [  # эксперты с двумя входами не из семейства BoolVenn
+        e for e in experts.values() if e.program.arity == 2 and e.family != "BoolVenn"  # условие отбора
     ]
-    arity1 = [
-        e for e in experts.values() if e.program.arity == 1 and e.family != "BoolVenn"
+    arity1 = [  # эксперты с одним входом не из BoolVenn
+        e for e in experts.values() if e.program.arity == 1 and e.family != "BoolVenn"  # условие отбора
     ]
-    bool2 = [
-        e for e in experts.values() if e.program.arity == 2 and e.family == "BoolVenn"
+    bool2 = [  # логические эксперты с двумя входами
+        e for e in experts.values() if e.program.arity == 2 and e.family == "BoolVenn"  # условие отбора
     ]
 
-    # Boolean composition: every intermediate and outer call is support-checked.
-    if bool2 and len(bool2) >= 2 and rng.random() < 0.4:
-        for _ in range(8):
-            outer = bool2[int(rng.choice(len(bool2)))]
-            inner = bool2[int(rng.choice(len(bool2)))]
-            if inner is outer and len(bool2) > 1:
-                continue
-            rows = [
-                (x, y)
-                for x in (0, 1)
-                for y in (0, 1)
-                if inner.supports((x, y))
-                and outer.supports((int(inner.program.eval((x, y))), y))
+    # логическая композиция: каждый промежуточный и внешний вызов проверяется на поддержку
+    if bool2 and len(bool2) >= 2 and rng.random() < 0.4:  # логических не меньше двух и случайное число < 0.4
+        for _ in range(8):  # до 8 попыток
+            outer = bool2[int(rng.choice(len(bool2)))]  # внешняя функция — случайная
+            inner = bool2[int(rng.choice(len(bool2)))]  # внутренняя функция — случайная
+            if inner is outer and len(bool2) > 1:  # совпали, а выбор есть
+                continue  # другая попытка
+            rows = [  # допустимые пары входов
+                (x, y)  # пара (x, y)
+                for x in (0, 1)  # по x из множества {0, 1}
+                for y in (0, 1)  # по y из множества {0, 1}
+                if inner.supports((x, y))  # внутренняя функция поддерживает (x, y)
+                and outer.supports((int(inner.program.eval((x, y))), y))  # внешняя поддерживает (inner(x, y), y)
             ]
-            if len(rows) != 4:
-                continue
-            teacher = lambda x, y, o=outer, i=inner: int(
-                o.program.eval((int(i.program.eval((int(x), int(y)))), int(y)))
+            if len(rows) != 4:  # допустимых пар не все четыре
+                continue  # другая попытка
+            teacher = lambda x, y, o=outer, i=inner: int(  # учитель: outer(inner(x, y), y)
+                o.program.eval((int(i.program.eval((int(x), int(y)))), int(y)))  # результат o(i(x, y), y)
             )
-            return TaskSpec(
-                f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",
-                2,
-                ((0, 1), (0, 1)),
-                teacher,
-                family="auto-composed",
+            return TaskSpec(  # задача композиции
+                f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",  # имя задачи: номер раунда, внутренний и внешний эксперты
+                2,  # два входа
+                ((0, 1), (0, 1)),  # области обоих входов {0, 1}
+                teacher,  # замыкание учителя
+                family="auto-composed",  # семейство — автоматическая композиция
             )
 
-    if not arity2:
-        return None
-    inner_pool = arity2 + arity1
+    if not arity2:  # бинарных экспертов нет
+        return None  # предложить нечего
+    inner_pool = arity2 + arity1  # внутренняя функция может быть любой: бинарной или унарной
 
-    # A proposal must have enough rows to support an actual train/validation split.
-    min_rows = 4
-    max_radius = max(1, min(int(domain_radius), 12))
-    for _ in range(12):
-        outer = arity2[int(rng.choice(len(arity2)))]
-        inner = inner_pool[int(rng.choice(len(inner_pool)))]
+    # Для предложения нужно достаточно строк для разбиения на обучение и отложенную проверку.
+    min_rows = 4  # минимум строк данных для разбиения на обучение и проверку
+    max_radius = max(1, min(int(domain_radius), 12))  # максимальный радиус области: не больше 12 и не меньше 1
+    for _ in range(12):  # до 12 попыток
+        outer = arity2[int(rng.choice(len(arity2)))]  # внешняя функция — случайный бинарный эксперт
+        inner = inner_pool[int(rng.choice(len(inner_pool)))]  # внутренняя — случайной арности
 
-        if inner.program.arity == 1:
-            # outer(inner(x), y). Keep x inside the unary expert domain and
-            # every inner(x) inside the outer expert's first-argument domain.
-            xs0 = tuple(
-                x
-                for x in inner.domains[0]
-                if abs(int(x)) <= max_radius
-                and inner.supports((int(x),))
-                and int(inner.program.eval((int(x),))) in outer.domains[0]
+        if inner.program.arity == 1:  # внутренняя функция унарная: outer(inner(x), y)
+            # outer(inner(x), y): x лежит в области унарного эксперта, а
+            # каждое inner(x) — в области первого аргумента внешнего эксперта.
+            xs0 = tuple(  # допустимые x
+                x  # значение x
+                for x in inner.domains[0]  # из области внутреннего эксперта
+                if abs(int(x)) <= max_radius  # модуль |x| ≤ max_radius
+                and inner.supports((int(x),))  # вход поддержан внутренним экспертом
+                and int(inner.program.eval((int(x),))) in outer.domains[0]  # inner(x) лежит в области первого аргумента внешнего
             )
-            ys0 = tuple(
-                y
-                for y in outer.domains[1]
-                if abs(int(y)) <= max_radius
-                and (outer.valid_rule != "nonzero_y" or int(y) != 0)
+            ys0 = tuple(  # допустимые y
+                y  # значение y
+                for y in outer.domains[1]  # из области второго аргумента внешнего эксперта
+                if abs(int(y)) <= max_radius  # модуль |y| ≤ max_radius
+                and (outer.valid_rule != "nonzero_y" or int(y) != 0)  # если второе слагаемое требует y ≠ 0, то y ≠ 0
             )
-            if not xs0 or not ys0:
-                continue
-            for radius in range(max_radius, 0, -1):
-                xs = tuple(x for x in xs0 if abs(int(x)) <= radius)
-                ys = tuple(y for y in ys0 if abs(int(y)) <= radius)
-                ys = tuple(
-                    y
-                    for y in ys
-                    if all(
-                        outer.supports((int(inner.program.eval((int(x),))), int(y)))
-                        for x in xs
+            if not xs0 or not ys0:  # пусто
+                continue  # другая попытка
+            for radius in range(max_radius, 0, -1):  # радиус от max_radius вниз до 1
+                xs = tuple(x for x in xs0 if abs(int(x)) <= radius)  # срез xs = {x из xs0 : |x| ≤ radius}
+                ys = tuple(y for y in ys0 if abs(int(y)) <= radius)  # срез ys = {y из ys0 : |y| ≤ radius}
+                ys = tuple(  # оставить только безопасные y
+                    y  # значение y
+                    for y in ys  # по ys
+                    if all(  # для всех x из xs
+                        outer.supports((int(inner.program.eval((int(x),))), int(y)))  # внешний поддерживает (inner(x), y)
+                        for x in xs  # по x
                     )
                 )
-                if len(xs) * len(ys) < min_rows:
-                    continue
-                if not all(inner.supports((int(x),)) for x in xs):
-                    continue
-                teacher = lambda x, y, o=outer, i=inner: int(
-                    o.program.eval((int(i.program.eval((int(x),))), int(y)))
+                if len(xs) * len(ys) < min_rows:  # строк |xs|·|ys| меньше четырёх
+                    continue  # меньший радиус
+                if not all(inner.supports((int(x),)) for x in xs):  # не каждый x поддержан внутренним экспертом
+                    continue  # меньший радиус
+                teacher = lambda x, y, o=outer, i=inner: int(  # учитель: outer(inner(x), y)
+                    o.program.eval((int(i.program.eval((int(x),))), int(y)))  # результат o(i(x), y)
                 )
-                return TaskSpec(
-                    f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",
-                    2,
-                    (xs, ys),
-                    teacher,
-                    valid_rule=outer.valid_rule,
-                    family="auto-composed",
+                return TaskSpec(  # задача композиции
+                    f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",  # имя задачи: номер раунда, внутренний и внешний эксперты
+                    2,  # два входа
+                    (xs, ys),  # области: xs по первому входу, ys по второму
+                    teacher,  # замыкание учителя
+                    valid_rule=outer.valid_rule,  # правило допустимости — как у внешнего эксперта
+                    family="auto-composed",  # семейство — автоматическая композиция
                 )
 
-        elif inner.program.arity == 2:
-            # outer(x, inner(x,y)). The input rectangle is deliberately shrunk
-            # until every call to both parent experts remains certified.
-            xs0 = tuple(
-                x
-                for x in inner.domains[0]
-                if x in outer.domains[0] and abs(int(x)) <= max_radius
+        elif inner.program.arity == 2:  # внутренняя функция бинарная: outer(x, inner(x, y))
+            # outer(x, inner(x,y)): прямоугольник входов намеренно сужается,
+            # пока каждый вызов обоих родителей остаётся заверенным.
+            xs0 = tuple(  # допустимые x
+                x  # значение x
+                for x in inner.domains[0]  # из области первого аргумента внутреннего эксперта
+                if x in outer.domains[0] and abs(int(x)) <= max_radius  # x в области первого аргумента внешнего и |x| ≤ max_radius
             )
-            ys0 = tuple(y for y in inner.domains[1] if abs(int(y)) <= max_radius)
-            if not xs0 or not ys0:
-                continue
-            for radius in range(max_radius, 0, -1):
-                xs = tuple(x for x in xs0 if abs(int(x)) <= radius)
-                ys = tuple(y for y in ys0 if abs(int(y)) <= radius)
-                if not xs or not ys:
-                    continue
-                # Remove y-columns unless every selected x has a supported
-                # inner and outer evaluation. This is a rectangular safe subset.
-                safe_ys = []
-                for y in ys:
-                    good = True
-                    for x in xs:
-                        if not inner.supports((int(x), int(y))):
-                            good = False
-                            break
-                        inner_value = int(inner.program.eval((int(x), int(y))))
-                        if not outer.supports((int(x), inner_value)):
-                            good = False
-                            break
-                    if good:
-                        safe_ys.append(y)
-                ys = tuple(safe_ys)
-                if len(xs) * len(ys) < min_rows:
-                    continue
-                teacher = lambda x, y, o=outer, i=inner: int(
-                    o.program.eval((int(x), int(i.program.eval((int(x), int(y))))))
+            ys0 = tuple(y for y in inner.domains[1] if abs(int(y)) <= max_radius)  # кандидаты ys0 = {y из области второго аргумента внутреннего : |y| ≤ max_radius}
+            if not xs0 or not ys0:  # пусто
+                continue  # другая попытка
+            for radius in range(max_radius, 0, -1):  # радиус от max_radius вниз до 1
+                xs = tuple(x for x in xs0 if abs(int(x)) <= radius)  # срез xs = {x из xs0 : |x| ≤ radius}
+                ys = tuple(y for y in ys0 if abs(int(y)) <= radius)  # срез ys = {y из ys0 : |y| ≤ radius}
+                if not xs or not ys:  # пусто
+                    continue  # меньший радиус
+                # Убрать столбцы y, где не для каждого выбранного x поддержаны вычисления
+                # внутреннего и внешнего экспертов. Получается прямоугольное безопасное подмножество.
+                safe_ys = []  # безопасные значения y
+                for y in ys:  # по y
+                    good = True  # пока столбец y безопасен
+                    for x in xs:  # по всем x
+                        if not inner.supports((int(x), int(y))):  # внутренний не поддерживает (x, y)
+                            good = False  # столбец небезопасен
+                            break  # стоп
+                        inner_value = int(inner.program.eval((int(x), int(y))))  # промежуточное значение inner_value = inner(x, y)
+                        if not outer.supports((int(x), inner_value)):  # внешний не поддерживает (x, inner(x, y))
+                            good = False  # столбец небезопасен
+                            break  # стоп
+                    if good:  # все проверки пройдены
+                        safe_ys.append(y)  # оставить y
+                ys = tuple(safe_ys)  # ys — только безопасные столбцы
+                if len(xs) * len(ys) < min_rows:  # строк |xs|·|ys| меньше четырёх
+                    continue  # меньший радиус
+                teacher = lambda x, y, o=outer, i=inner: int(  # учитель: outer(x, inner(x, y))
+                    o.program.eval((int(x), int(i.program.eval((int(x), int(y))))))  # результат o(x, i(x, y))
                 )
-                return TaskSpec(
-                    f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",
-                    2,
-                    (xs, ys),
-                    teacher,
-                    valid_rule=inner.valid_rule,
-                    family="auto-composed",
+                return TaskSpec(  # задача композиции
+                    f"AUTO_R{round_index}_{inner.name}_IN_{outer.name}",  # имя задачи: номер раунда, внутренний и внешний эксперты
+                    2,  # два входа
+                    (xs, ys),  # области: xs по первому входу, ys по второму
+                    teacher,  # замыкание учителя
+                    valid_rule=inner.valid_rule,  # правило допустимости — как у внутреннего эксперта
+                    family="auto-composed",  # семейство — автоматическая композиция
                 )
 
-    return None
+    return None  # композицию предложить не удалось
 
 
-def verify_growth_lineage(model: "GrowingMathProcessorV7") -> dict[str, Any]:
-    """Recheck every stored compositional expert against its parent pair.
+def verify_growth_lineage(model: "GrowingMathProcessorV7") -> dict[str, Any]:  # сверить каждого эксперта-композицию с парой его родителей
+    """Перепроверить каждый сохранённый эксперт-композицию по паре его родителей.
 
-    This is an executable audit over each child's complete declared finite
-    support. It is not a proof outside that support.
-    """
-    checked = 0
-    errors: list[dict[str, Any]] = []
-    for child in model.experts.values():
-        if not child.parents:
-            continue
-        if len(child.parents) != 2:
-            errors.append({"expert": child.name, "reason": "invalid_parent_arity"})
-            continue
-        outer = model.experts.get(child.parents[0])
-        inner = model.experts.get(child.parents[1])
-        if outer is None or inner is None:
-            errors.append({"expert": child.name, "reason": "missing_parent"})
-            continue
-        ok = True
-        checked += 1
-        for xs in itertools.product(*child.domains):
-            xs = tuple(int(x) for x in xs)
-            if not child.supports(xs):
-                continue
-            try:
-                if (
-                    outer.program.venn_mask is not None
-                    and inner.program.venn_mask is not None
+            Это исполняемая сверка на всей объявленной конечной области каждого потомка:
+            child(xs) должен равняться outer от входа, собранного из inner и xs. Вне этой
+            области это не доказательство. Возвращает {'lineage_checked', 'lineage_errors',
+            'lineage_pass'}."""
+    checked = 0  # число проверенных экспертов-композиций
+    errors: list[dict[str, Any]] = []  # список ошибок
+    for child in model.experts.values():  # по всем экспертам
+        if not child.parents:  # нет родителей
+            continue  # не композиция
+        if len(child.parents) != 2:  # родителей не два
+            errors.append({"expert": child.name, "reason": "invalid_parent_arity"})  # ошибка: неверное число родителей
+            continue  # взять другую пару
+        outer = model.experts.get(child.parents[0])  # внешний родитель
+        inner = model.experts.get(child.parents[1])  # внутренний родитель
+        if outer is None or inner is None:  # родитель отсутствует
+            errors.append({"expert": child.name, "reason": "missing_parent"})  # ошибка: родитель потерян
+            continue  # взять другую пару
+        ok = True  # предположение: композиция верна
+        checked += 1  # проверено ещё один
+        for xs in itertools.product(*child.domains):  # по всем входам декартова произведения областей
+            xs = tuple(int(x) for x in xs)  # вход — целыми
+            if not child.supports(xs):  # вход не поддержан
+                continue  # взять другую пару
+            try:  # вычисление может упасть
+                if (  # оба родителя — логические функции с маской Венна
+                    outer.program.venn_mask is not None  # у внешнего есть маска Венна
+                    and inner.program.venn_mask is not None  # и у внутреннего есть маска Венна
                 ):
-                    if not inner.supports(xs):
-                        ok = False
-                        break
-                    middle = int(inner.program.eval(xs))
-                    parent_input = (middle, xs[1])
-                elif inner.program.arity == 1:
-                    if not inner.supports((xs[0],)):
-                        ok = False
-                        break
-                    middle = int(inner.program.eval((xs[0],)))
-                    parent_input = (middle, xs[1])
-                elif inner.program.arity == 2:
-                    if not inner.supports(xs):
-                        ok = False
-                        break
-                    middle = int(inner.program.eval(xs))
-                    parent_input = (xs[0], middle)
-                else:
-                    ok = False
-                    break
-                if not outer.supports(parent_input):
-                    ok = False
-                    break
-                expected = int(outer.program.eval(parent_input))
-                if expected != int(child.program.eval(xs)):
-                    ok = False
-                    break
-            except (ValueError, ZeroDivisionError, OverflowError, IndexError):
-                ok = False
-                break
-        if not ok:
-            errors.append(
-                {"expert": child.name, "reason": "parent_composition_mismatch"}
+                    if not inner.supports(xs):  # внутренний не поддерживает вход
+                        ok = False  # несовпадение
+                        break  # стоп
+                    middle = int(inner.program.eval(xs))  # промежуточное значение middle = inner(x, y)
+                    parent_input = (middle, xs[1])  # вход внешнего: (middle, y)
+                elif inner.program.arity == 1:  # внутренний унарный
+                    if not inner.supports((xs[0],)):  # не поддерживает первый аргумент
+                        ok = False  # несовпадение
+                        break  # стоп
+                    middle = int(inner.program.eval((xs[0],)))  # промежуточное значение middle = inner(x)
+                    parent_input = (middle, xs[1])  # вход внешнего: (inner(x), y)
+                elif inner.program.arity == 2:  # внутренний бинарный
+                    if not inner.supports(xs):  # не поддерживает вход
+                        ok = False  # несовпадение
+                        break  # стоп
+                    middle = int(inner.program.eval(xs))  # промежуточное значение middle = inner(x, y)
+                    parent_input = (xs[0], middle)  # вход внешнего: (x, inner(x, y))
+                else:  # прочая арность
+                    ok = False  # неподдерживаемая арность
+                    break  # стоп
+                if not outer.supports(parent_input):  # внешний не поддерживает свой вход
+                    ok = False  # несовпадение
+                    break  # стоп
+                expected = int(outer.program.eval(parent_input))  # ожидаемый результат outer(вход внешнего)
+                if expected != int(child.program.eval(xs)):  # не совпадает с результатом потомка
+                    ok = False  # несовпадение
+                    break  # стоп
+            except (ValueError, ZeroDivisionError, OverflowError, IndexError):  # ошибка вычисления
+                ok = False  # ошибка вычисления
+                break  # стоп
+        if not ok:  # нашли расхождение
+            errors.append(  # записать ошибку
+                {"expert": child.name, "reason": "parent_composition_mismatch"}  # ошибка: композиция родителей не совпадает
             )
-    return {
-        "lineage_checked": checked,
-        "lineage_errors": errors,
-        "lineage_pass": not errors,
+    return {  # итог
+        "lineage_checked": checked,  # сколько проверено
+        "lineage_errors": errors,  # список ошибок
+        "lineage_pass": not errors,  # успешно, если ошибок нет
     }
 
 
-def grow_forever(
-    model: "GrowingMathProcessorV7",
-    suite: Sequence[TaskSpec],
-    device: str = "cpu",
-    max_rounds: Optional[int] = None,
-    snapshot_every: int = 10,
-    out_dir: str = ".omc/hagi_grow",
-    log_every: int = 1,
-    budget_cap: Optional[int] = None,
-    deadline: Optional[float] = None,
-) -> dict[str, Any]:
-    """Bounded compositional growth loop with explicit checkpoints.
+def grow_forever(  # цикл композиционного роста: обучение, композиции, снимки состояния
+    model: "GrowingMathProcessorV7",  # растущая модель
+    suite: Sequence[TaskSpec],  # базовый набор задач
+    device: str = "cpu",  # устройство
+    max_rounds: Optional[int] = None,  # предел раундов (None — без предела)
+    snapshot_every: int = 10,  # снимок состояния после каждых 10 закреплений
+    out_dir: str = ".omc/hagi_grow",  # каталог вывода
+    log_every: int = 1,  # печатать строку журнала каждый раунд (1) или только при закреплениях (0)
+    budget_cap: Optional[int] = None,  # потолок бюджета узлов
+    deadline: Optional[float] = None,  # монотонный срок окончания
+) -> dict[str, Any]:  # вернуть словарь итогов
+    """Ограниченный цикл композиционного роста с явными снимками состояния.
 
-    Each round learns the base curriculum, proposes finite-domain compositions
-    only inside parent supports, and snapshots state. The caller may impose a
-    monotonic deadline and/or round cap; the resource governor limits each
-    search. This is curriculum recombination, not proof of new general ability.
-    """
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    gov = ResourceGovernor(device)
-    log_path = out / "growth_log.jsonl"
-    start = time.time()
-    rnd = np.random.default_rng(20260101)
-    report: dict[str, Any] = {"device": device, "rounds": [], "stopped": None}
-    round_index = 0
-    commits_since_snapshot = 0
-    idle_rounds = 0
-    depth = 1
-    domain_radius = 6
-    try:
-        while max_rounds is None or round_index < max_rounds:
-            if deadline is not None and time.monotonic() >= deadline:
-                report["stopped"] = "TIME_LIMIT"
-                break
-            t0 = time.time()
-            committed_this_round = 0
-            # (1) base curriculum (idempotent: already-committed tasks REUSE)
-            for spec in suite:
-                if deadline is not None and time.monotonic() >= deadline:
-                    report["stopped"] = "TIME_LIMIT"
-                    break
-                if not gov.before_task():
-                    break
-                model.node_budget = (
-                    min(gov.node_budget, budget_cap) if budget_cap else gov.node_budget
+            Каждый раунд: учит базовую программу задач, предлагает конечные композиции
+            только внутри областей поддержки родителей и снимает состояние. Вызывающий
+            может задать монотонный срок и предел раундов; регулятор ресурсов ограничивает
+            каждый поиск. Это рекомбинация программы задач, а не доказательство новой
+            общей способности. Параметры: model — модель, suite — базовый набор задач,
+            device — устройство, max_rounds — предел раундов, snapshot_every — снимок
+            после стольких закреплений, out_dir — каталог вывода, log_every — печатать
+            журнал каждый раунд, budget_cap — потолок бюджета узлов, deadline — срок.
+            Возвращает словарь с записями раундов и причиной остановки."""
+    out = Path(out_dir)  # каталог вывода
+    out.mkdir(parents=True, exist_ok=True)  # создать его при отсутствии
+    gov = ResourceGovernor(device)  # регулятор ресурсов
+    log_path = out / "growth_log.jsonl"  # путь журнала раундов
+    start = time.time()  # время начала
+    rnd = np.random.default_rng(20260101)  # генератор случайных чисел с фиксированным зерном
+    report: dict[str, Any] = {"device": device, "rounds": [], "stopped": None}  # итоговый словарь: устройство, записи раундов, причина остановки
+    round_index = 0  # номер раунда
+    commits_since_snapshot = 0  # закреплений с последнего снимка
+    idle_rounds = 0  # раундов подряд без закреплений
+    depth = 1  # глубина композиции
+    domain_radius = 6  # радиус области
+    try:  # тело цикла охраняется от прерывания
+        while max_rounds is None or round_index < max_rounds:  # пока не достигнут предел раундов
+            if deadline is not None and time.monotonic() >= deadline:  # срок настал
+                report["stopped"] = "TIME_LIMIT"  # причина остановки — лимит времени
+                break  # стоп: срок настал
+            t0 = time.time()  # время начала раунда
+            committed_this_round = 0  # закреплений в этом раунде
+            # (1) базовый набор задач (повторно: уже закреплённые задачи используются заново)
+            for spec in suite:  # по задачам базового набора
+                if deadline is not None and time.monotonic() >= deadline:  # срок настал
+                    report["stopped"] = "TIME_LIMIT"  # причина остановки — лимит времени
+                    break  # стоп: ресурсы исчерпаны
+                if not gov.before_task():  # ресурсы исчерпаны
+                    break  # стоп: срок настал
+                model.node_budget = (  # бюджет узлов модели
+                    min(gov.node_budget, budget_cap) if budget_cap else gov.node_budget  # min(бюджет регулятора, потолок) либо бюджет регулятора
                 )
-                model.pop_budget = (
-                    min(gov.pop_budget, budget_cap * 2)
-                    if budget_cap
-                    else gov.pop_budget
+                model.pop_budget = (  # бюджет популяции модели
+                    min(gov.pop_budget, budget_cap * 2)  # min(бюджет регулятора, 2·потолок)
+                    if budget_cap  # если задан потолок бюджета
+                    else gov.pop_budget  # иначе — бюджет регулятора
                 )
-                try:
-                    ev = model.learn(
-                        spec,
-                        seed=10_000 + round_index * 7919 + len(spec.name),
-                        deadline=deadline,
-                        train_neural=os.environ.get("HAGI_NO_NEURAL") != "1",
+                try:  # обучение может упасть
+                    ev = model.learn(  # обучиться задаче
+                        spec,  # задача
+                        seed=10_000 + round_index * 7919 + len(spec.name),  # зерно = 10000 + раунд·7919 + длина имени
+                        deadline=deadline,  # срок
+                        train_neural=os.environ.get("HAGI_NO_NEURAL") != "1",  # обучать нейроволокно, если HAGI_NO_NEURAL ≠ 1
                     )
-                    if ev.action == "COMMIT":
-                        committed_this_round += 1
-                        commits_since_snapshot += 1
-                except (MemoryError, RuntimeError, ValueError) as exc:
-                    gov.recover(exc)
-            # (2) self-proposed tasks: compose committed experts
-            proposed = 0
-            attempts = min(12, max(2, len(model.experts) // 3))
-            for k in range(attempts):
-                if deadline is not None and time.monotonic() >= deadline:
-                    report["stopped"] = "TIME_LIMIT"
-                    break
-                if not gov.before_task():
-                    break
-                spec = _propose_task_from_experts(
-                    model.experts,
-                    rnd,
-                    round_index,
-                    depth=depth,
-                    domain_radius=domain_radius,
+                    if ev.action == "COMMIT":  # задача закреплена
+                        committed_this_round += 1  # закреплений в раунде + 1
+                        commits_since_snapshot += 1  # с последнего снимка + 1
+                except (MemoryError, RuntimeError, ValueError) as exc:  # ошибка памяти или выполнения
+                    gov.recover(exc)  # урезать бюджеты и продолжать
+            # (2) самостоятельно предложенные задачи: композиции закреплённых экспертов
+            proposed = 0  # число предложенных задач
+            attempts = min(12, max(2, len(model.experts) // 3))  # попыток = min(12, max(2, ⌊число экспертов / 3⌋))
+            for k in range(attempts):  # по попыткам
+                if deadline is not None and time.monotonic() >= deadline:  # срок настал
+                    report["stopped"] = "TIME_LIMIT"  # причина остановки — лимит времени
+                    break  # стоп: срок настал
+                if not gov.before_task():  # ресурсы исчерпаны
+                    break  # стоп: ресурсы исчерпаны
+                spec = _propose_task_from_experts(  # предложить композицию
+                    model.experts,  # эксперты
+                    rnd,  # генератор
+                    round_index,  # номер раунда
+                    depth=depth,  # глубина
+                    domain_radius=domain_radius,  # радиус области
                 )
-                if spec is None or spec.name in model.experts:
-                    continue
-                model.node_budget = (
-                    min(gov.node_budget, budget_cap) if budget_cap else gov.node_budget
+                if spec is None or spec.name in model.experts:  # ничего не предложено либо такая задача уже есть
+                    continue  # пропустить: ничего не предложено или задача уже есть
+                model.node_budget = (  # бюджет узлов модели
+                    min(gov.node_budget, budget_cap) if budget_cap else gov.node_budget  # min(бюджет регулятора, потолок) либо бюджет регулятора
                 )
-                model.pop_budget = (
-                    min(gov.pop_budget, budget_cap * 2)
-                    if budget_cap
-                    else gov.pop_budget
+                model.pop_budget = (  # бюджет популяции модели
+                    min(gov.pop_budget, budget_cap * 2)  # min(бюджет регулятора, 2·потолок)
+                    if budget_cap  # если задан потолок бюджета
+                    else gov.pop_budget  # иначе — бюджет регулятора
                 )
-                try:
-                    hint = (
-                        _composition_hint(spec)
-                        if spec.family == "auto-composed"
-                        else None
+                try:  # обучение может упасть
+                    hint = (  # подсказка композиции
+                        _composition_hint(spec)  # выражение по задаче
+                        if spec.family == "auto-composed"  # только для автоматических композиций
+                        else None  # иначе подсказки нет
                     )
-                    if spec.family == "auto-composed" and hint is None:
-                        # The proposal is not representable in the current safe
-                        # hint grammar. Do not fall back to blind synthesis.
-                        continue
-                    ev = model.learn(
-                        spec,
-                        seed=500_000 + round_index * 104_729 + k,
-                        deadline=deadline,
-                        candidate_hint=hint,
-                        train_neural=os.environ.get("HAGI_NO_NEURAL") != "1",
+                    if spec.family == "auto-composed" and hint is None:  # композиция не выражается в безопасной грамматике подсказок
+                    # Предложение не выражается в текущей безопасной грамматике
+                    # подсказок. Слепой синтез вместо него не запускается.
+                        continue  # не подбирать вслепую
+                    ev = model.learn(  # обучиться задаче
+                        spec,  # задача
+                        seed=500_000 + round_index * 104_729 + k,  # зерно = 500000 + раунд·104729 + k
+                        deadline=deadline,  # срок
+                        candidate_hint=hint,  # подсказка
+                        train_neural=os.environ.get("HAGI_NO_NEURAL") != "1",  # обучать нейроволокно, если HAGI_NO_NEURAL ≠ 1
                     )
-                    proposed += 1
-                    if ev.action == "COMMIT":
-                        committed_this_round += 1
-                        commits_since_snapshot += 1
-                except (
-                    MemoryError,
-                    RuntimeError,
-                    ValueError,
-                    ZeroDivisionError,
-                    OverflowError,
-                ) as exc:
-                    gov.recover(exc)
-            # (3) autonomous theorem mining over the certified expert base
-            try:
-                new_theorems = TheoremMiner().mine(model, max_experts=16)
-            except (
-                MemoryError,
-                RuntimeError,
-                ValueError,
-                ZeroDivisionError,
-                OverflowError,
+                    proposed += 1  # предложенных + 1
+                    if ev.action == "COMMIT":  # задача закреплена
+                        committed_this_round += 1  # закреплений в раунде + 1
+                        commits_since_snapshot += 1  # с последнего снимка + 1
+                except (  # ловим ошибки памяти и выполнения
+                    MemoryError,  # ошибка памяти
+                    RuntimeError,  # ошибка выполнения
+                    ValueError,  # ошибка значения
+                    ZeroDivisionError,  # деление на ноль
+                    OverflowError,  # переполнение
+                ) as exc:  # исключение exc
+                    gov.recover(exc)  # урезать бюджеты и продолжать
+            # (3) самостоятельный поиск теорем по заверенной базе экспертов
+            try:  # поиск теорем может упасть
+                new_theorems = TheoremMiner().mine(model, max_experts=16)  # найти новые тождества (не более 16 экспертов каждой арности)
+            except (  # ловим ошибки памяти и выполнения
+                MemoryError,  # ошибка памяти
+                RuntimeError,  # ошибка выполнения
+                ValueError,  # ошибка значения
+                ZeroDivisionError,  # деление на ноль
+                OverflowError,  # переполнение
             ):
-                new_theorems = []
-            lineage = verify_growth_lineage(model)
-            round_rec = {
-                "round": round_index,
-                **lineage,
-                "experts": len(model.experts),
-                "unique_programs": len({e.program for e in model.experts.values()}),
-                "unique_certified_scopes": len(
-                    {
-                        (e.program, e.domains, e.valid_rule)
-                        for e in model.experts.values()
+                new_theorems = []  # новых теорем нет
+            lineage = verify_growth_lineage(model)  # сверить родословную композиций
+            round_rec = {  # запись о раунде
+                "round": round_index,  # номер
+                **lineage,  # поля сверки родословной
+                "experts": len(model.experts),  # число экспертов
+                "unique_programs": len({e.program for e in model.experts.values()}),  # число различных программ
+                "unique_certified_scopes": len(  # число различных заверенных областей
+                    {  # множество ключей
+                        (e.program, e.domains, e.valid_rule)  # ключ: (программа, области, правило допустимости)
+                        for e in model.experts.values()  # по всем экспертам
                     }
                 ),
-                "committed_this_round": committed_this_round,
-                "proposed_tasks": proposed,
-                "theorems_total": len(model.theorems),
-                "theorems_new": len(new_theorems),
-                "total_code_length": sum(e.code_length for e in model.experts.values()),
-                "node_budget": gov.node_budget,
-                "pop_budget": gov.pop_budget,
-                "ram_avail_gb": round(_ram_available_bytes() / 2**30, 2),
-                "vram_free_gb": round(_vram_free_bytes(device) / 2**30, 2),
-                "elapsed": round(time.time() - t0, 2),
+                "committed_this_round": committed_this_round,  # закреплений в раунде
+                "proposed_tasks": proposed,  # предложенных задач
+                "theorems_total": len(model.theorems),  # всего теорем
+                "theorems_new": len(new_theorems),  # новых теорем
+                "total_code_length": sum(e.code_length for e in model.experts.values()),  # суммарная длина кода экспертов, бит
+                "node_budget": gov.node_budget,  # бюджет узлов
+                "pop_budget": gov.pop_budget,  # бюджет популяции
+                "ram_avail_gb": round(_ram_available_bytes() / 2**30, 2),  # доступная оперативная память, ГиБ (2 знака)
+                "vram_free_gb": round(_vram_free_bytes(device) / 2**30, 2),  # свободная видеопамять, ГиБ (2 знака)
+                "elapsed": round(time.time() - t0, 2),  # длительность раунда, с (2 знака)
             }
-            report["rounds"].append(round_rec)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(round_rec) + "\n")
-            if log_every or committed_this_round:
-                print(
-                    f"[grow r{round_index}] experts={round_rec['experts']} "
-                    f"commits={committed_this_round} code={round_rec['total_code_length']}bits "
-                    f"ram={round_rec['ram_avail_gb']}GB "
-                    f"vram={round_rec['vram_free_gb']}GB",
-                    flush=True,
+            report["rounds"].append(round_rec)  # добавить запись
+            with open(log_path, "a", encoding="utf-8") as f:  # открыть журнал на дозапись
+                f.write(json.dumps(round_rec) + "\n")  # записать строку JSON с переводом строки
+            if log_every or committed_this_round:  # печатать каждый раунд либо были закрепления
+                print(  # напечатать строку журнала
+                    f"[grow r{round_index}] experts={round_rec['experts']} "  # раунд и число экспертов
+                    f"commits={committed_this_round} code={round_rec['total_code_length']}bits "  # закреплений и длина кода в битах
+                    f"ram={round_rec['ram_avail_gb']}GB "  # доступная память, ГиБ
+                    f"vram={round_rec['vram_free_gb']}GB",  # свободная видеопамять, ГиБ
+                    flush=True,  # сбросить вывод сразу
                 )
-            if commits_since_snapshot >= snapshot_every:
-                model.save(out / "hagi_grow_model.json")
-                commits_since_snapshot = 0
-            if committed_this_round > 0:
-                idle_rounds = 0
-            else:
-                idle_rounds += 1
-                if idle_rounds >= 3:
-                    # saturation escalation: deepen the composition algebra and
-                    # widen certified domains -> unbounded curriculum growth
-                    depth += 1
-                    domain_radius = min(12, domain_radius + 2)
-                    idle_rounds = 0
-            round_index += 1
-            if deadline is not None and time.monotonic() >= deadline:
-                report["stopped"] = "TIME_LIMIT"
-                break
-            if (
-                _ram_available_bytes()
-                and _ram_available_bytes() < ResourceGovernor.RAM_FLOOR_BYTES
+            if commits_since_snapshot >= snapshot_every:  # накоплено достаточно закреплений для снимка
+                model.save(out / "hagi_grow_model.json")  # сохранить снимок модели
+                commits_since_snapshot = 0  # сбросить счётчик
+            if committed_this_round > 0:  # были закрепления
+                idle_rounds = 0  # простой прерван
+            else:  # закреплений не было
+                idle_rounds += 1  # простой + 1
+                if idle_rounds >= 3:  # три раунда подряд пусто
+                    # насыщение: углубить алгебру композиций и расширить
+                    # заверенные области — неограниченный рост программы задач
+                    depth += 1  # углубить композицию
+                    domain_radius = min(12, domain_radius + 2)  # расширить область на 2, не более 12
+                    idle_rounds = 0  # сбросить счётчик простоя
+            round_index += 1  # следующий раунд
+            if deadline is not None and time.monotonic() >= deadline:  # срок настал
+                report["stopped"] = "TIME_LIMIT"  # причина остановки — лимит времени
+                break  # стоп: срок настал
+            if (  # память
+                _ram_available_bytes()  # доступная оперативная память известна (≠ 0)
+                and _ram_available_bytes() < ResourceGovernor.RAM_FLOOR_BYTES  # и меньше нижнего порога
             ):
-                report["stopped"] = "RAM_FLOOR"
-                break
-    except KeyboardInterrupt:
-        report["stopped"] = "INTERRUPTED"
-    finally:
-        model.save(out / "hagi_grow_model.json")
-        (out / "theorems.json").write_text(
-            json.dumps(
-                {
-                    "count": len(model.theorems),
-                    "theorems": [vars(t) for t in model.theorems],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        report["total_experts"] = len(model.experts)
-        report.update(verify_growth_lineage(model))
-        report["total_elapsed"] = round(time.time() - start, 1)
-        (out / "growth_report.json").write_text(
-            json.dumps(report, indent=2), encoding="utf-8"
-        )
-    return report
+                report["stopped"] = "RAM_FLOOR"  # причина остановки — нижний порог памяти
+                break  # стоп: памяти ниже порога
+    except KeyboardInterrupt:  # прервано с клавиатуры
+        report["stopped"] = "INTERRUPTED"  # причина остановки — прерывание
+    finally:  # выполняется всегда
+        model.save(out / "hagi_grow_model.json")  # сохранить модель
+        (out / "theorems.json").write_text(  # записать теоремы
+            json.dumps(  # сериализовать
+                {  # словарь
+                    "count": len(model.theorems),  # число теорем
+                    "theorems": [vars(t) for t in model.theorems],  # список словарей атрибутов
+                },  # конец словаря
+                indent=2,  # с отступом 2
+            ),  # конец аргументов dumps
+            encoding="utf-8",  # в кодировке utf-8
+        )  # конец вызова write_text
+        report["total_experts"] = len(model.experts)  # всего экспертов
+        report.update(verify_growth_lineage(model))  # добавить итоги сверки родословной
+        report["total_elapsed"] = round(time.time() - start, 1)  # общее время, с (1 знак)
+        (out / "growth_report.json").write_text(  # записать итоговый словарь
+            json.dumps(report, indent=2), encoding="utf-8"  # JSON с отступом 2 в кодировке utf-8
+        )  # конец вызова write_text
+    return report  # вернуть итоги
 
 
-# ---------------------------- experiment & benchmark ---------------------------
+# ---------------------------- эксперимент и замеры -------------------------------------------
 
 
-def _run_seed_worker(args: tuple[int, str, str]) -> dict[str, Any]:
-    """One seed per process: seeds are independent, so this parallelizes
-    linearly across CPU cores. The worker's governor bounds its own memory.
-    Also saves the seed's model snapshot into out_dir."""
-    seed, device, out_dir = args
-    train_neural = os.environ.get("HAGI_NO_NEURAL") != "1"
-    out = Path(out_dir)
-    suite = make_task_suite()
-    model = GrowingMathProcessorV7(device=device)
-    t0 = time.time()
-    stats0 = SynthesisStats()
-    stats0.candidates_generated = model.stats.candidates_generated
-    stats0.evals = model.stats.evals
-    stage_order = ["BoolVenn", "unary", "integer-binary", "composed-ternary"]
-    for stage in stage_order:
-        stage_tasks = [s for s in suite if s.family == stage]
-        rng = np.random.default_rng(seed + len(stage) * 101)
-        if len(stage_tasks) > 1:
-            order = rng.permutation(len(stage_tasks))
-            stage_tasks = [stage_tasks[int(i)] for i in order]
-        for j, spec in enumerate(stage_tasks):
-            model.learn(
-                spec,
-                seed=seed * 1009 + j * 17 + len(spec.name),
-                train_neural=train_neural,
+def _run_seed_worker(args: tuple[int, str, str]) -> dict[str, Any]:  # один процесс — одно зерно: обучение модели и её снимок
+    """Один процесс — одно зерно: зерна независимы, поэтому работа распределяется
+            по ядрам процессора почти линейно. Регулятор ресурсов процесса ограничивает
+            его собственную память. Снимок модели зерна сохраняется в out_dir.
+            Возвращает словарь итогов."""
+    seed, device, out_dir = args  # распаковать аргументы: зерно, устройство, каталог вывода
+    train_neural = os.environ.get("HAGI_NO_NEURAL") != "1"  # обучать нейроволокно, если HAGI_NO_NEURAL ≠ 1
+    out = Path(out_dir)  # каталог вывода
+    suite = make_task_suite()  # базовый набор задач
+    model = GrowingMathProcessorV7(device=device)  # свежая модель
+    t0 = time.time()  # время начала
+    stats0 = SynthesisStats()  # начальная статистика
+    stats0.candidates_generated = model.stats.candidates_generated  # базовые показания счётчика порождённых кандидатов
+    stats0.evals = model.stats.evals  # базовые показания счётчика вычислений
+    stage_order = ["BoolVenn", "unary", "integer-binary", "composed-ternary"]  # порядок этапов по семействам
+    for stage in stage_order:  # по этапам
+        stage_tasks = [s for s in suite if s.family == stage]  # задачи этапа
+        rng = np.random.default_rng(seed + len(stage) * 101)  # генератор с зерном seed + длина_имени_этапа·101
+        if len(stage_tasks) > 1:  # задач больше одной
+            order = rng.permutation(len(stage_tasks))  # случайный порядок номеров
+            stage_tasks = [stage_tasks[int(i)] for i in order]  # задачи в этом порядке
+        for j, spec in enumerate(stage_tasks):  # по задачам этапа с номером j
+            model.learn(  # обучиться задаче
+                spec,  # задача
+                seed=seed * 1009 + j * 17 + len(spec.name),  # зерно = seed·1009 + j·17 + длина имени
+                train_neural=train_neural,  # обучать ли нейроволокно
             )
-    verification = model.verify_all(suite)
-    ood_checks = ood_abstains = 0
-    for spec in suite:
-        if spec.name not in model.experts:
-            continue
-        outside = [d[-1] + 1 for d in spec.domains]
-        ood_checks += 1
-        ood_abstains += int(model.predict(spec.name, *outside)["status"] == "ABSTAIN")
-    poison_model = GrowingMathProcessorV7()
-    poison_event = poison_model.learn(
-        next(s for s in suite if s.name == "ADD"),
-        seed=seed + 44001,
-        poison_one_label=True,
+    verification = model.verify_all(suite)  # проверить все задачи набора
+    ood_checks = ood_abstains = 0  # счётчики проверок вне области и отказов
+    for spec in suite:  # по задачам набора
+        if spec.name not in model.experts:  # задача не закреплена
+            continue  # пропустить: задача не закреплена
+        outside = [d[-1] + 1 for d in spec.domains]  # вход вне области: каждый аргумент на 1 больше максимума своей области
+        ood_checks += 1  # проверок вне области + 1
+        ood_abstains += int(model.predict(spec.name, *outside)["status"] == "ABSTAIN")  # +1, если модель отказалась отвечать
+    poison_model = GrowingMathProcessorV7()  # модель для опыта с испорченной меткой
+    poison_event = poison_model.learn(  # обучить задаче ADD с одной неверной меткой
+        next(s for s in suite if s.name == "ADD"),  # задача ADD из набора
+        seed=seed + 44001,  # зерно
+        poison_one_label=True,  # испортить одну метку
     )
-    prime_spec = TaskSpec(
-        "IS_PRIME",
-        1,
-        (tuple(range(-8, 9)),),
-        lambda x: int(x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))),
-        family="unseen",
+    prime_spec = TaskSpec(  # незнакомая задача: простота числа
+        "IS_PRIME",  # имя задачи
+        1,  # один вход
+        (tuple(range(-8, 9)),),  # область x ∈ −8..8
+        lambda x: int(x >= 2 and all(x % d for d in range(2, int(math.sqrt(x)) + 1))),  # учитель: x ≥ 2 и x не делится ни на одно d из 2..⌊√x⌋
+        family="unseen",  # семейство «незнакомая»
     )
-    unknown_event = GrowingMathProcessorV7().learn(prime_spec, seed=seed + 99001)
-    reuse_count = sum(1 for e in model.growth_log if e.reason == "expert-reuse")
-    gen = model.stats.candidates_generated - stats0.candidates_generated
-    evs = model.stats.evals - stats0.evals
-    model.save(out / f"hagi_v7_model_seed{seed}.json")
-    return {
-        "seed": int(seed),
-        "committed": len(model.experts),
-        "expected": len(suite),
-        "commit_rate": len(model.experts) / len(suite),
-        "symbolic_exact_accuracy": verification["accuracy"],
-        "total_code_length": sum(e.code_length for e in model.experts.values()),
-        "candidates_generated": gen,
-        "program_evals": evs,
-        "sieve_survivors": model.stats.sieve_survivors,
-        "expert_reuse_commits": reuse_count,
-        "ood_abstains": ood_abstains,
-        "ood_checks": ood_checks,
-        "poison_action": poison_event.action,
-        "unknown_is_prime_action": unknown_event.action,
-        "elapsed_seconds": time.time() - t0,
+    unknown_event = GrowingMathProcessorV7().learn(prime_spec, seed=seed + 99001)  # попытка выучить незнакомую задачу
+    reuse_count = sum(1 for e in model.growth_log if e.reason == "expert-reuse")  # число закреплений повторным использованием
+    gen = model.stats.candidates_generated - stats0.candidates_generated  # порождено кандидатов за опыт
+    evs = model.stats.evals - stats0.evals  # вычислений за опыт
+    model.save(out / f"hagi_v7_model_seed{seed}.json")  # сохранить модель зерна
+    return {  # словарь итогов зерна
+        "seed": int(seed),  # зерно
+        "committed": len(model.experts),  # число закреплённых экспертов
+        "expected": len(suite),  # ожидаемое число задач
+        "commit_rate": len(model.experts) / len(suite),  # доля закреплений = закреплено / ожидается
+        "symbolic_exact_accuracy": verification["accuracy"],  # точность на наборе
+        "total_code_length": sum(e.code_length for e in model.experts.values()),  # суммарная длина кода, бит
+        "candidates_generated": gen,  # порождено кандидатов
+        "program_evals": evs,  # вычислений программ
+        "sieve_survivors": model.stats.sieve_survivors,  # прошедших сито
+        "expert_reuse_commits": reuse_count,  # закреплений повторным использованием
+        "ood_abstains": ood_abstains,  # отказов вне области
+        "ood_checks": ood_checks,  # проверок вне области
+        "poison_action": poison_event.action,  # действие при испорченной метке
+        "unknown_is_prime_action": unknown_event.action,  # действие для незнакомой задачи
+        "elapsed_seconds": time.time() - t0,  # длительность, с
     }
 
 
-def run_v7_experiment(
-    seeds: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7),
-    out_dir: str = ".omc/hagi_v7_results",
-    workers: int = 0,
-    device: str = "cpu",
-) -> dict[str, Any]:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    suite = make_task_suite()
-    start = time.time()
-    args = [(int(s), device, str(out)) for s in seeds]
-    if workers <= 0:
-        workers = min(len(args), max(1, (os.cpu_count() or 2) - 1))
-    workers = min(workers, len(args))
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            per_seed = list(ex.map(_run_seed_worker, args))
-    else:
-        per_seed = [_run_seed_worker(a) for a in args]
-    per_seed.sort(key=lambda r: r["seed"])
-    main_model_path = out / f"hagi_v7_model_seed{int(seeds[0])}.json"
-    if main_model_path.exists():
-        GrowingMathProcessorV7.load(main_model_path)
-        main_model_path.replace(out / "hagi_v7_model.json")
+def run_v7_experiment(  # прогнать опыт по нескольким зернам и усреднить
+    seeds: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7),  # зерна 0..7
+    out_dir: str = ".omc/hagi_v7_results",  # каталог вывода
+    workers: int = 0,  # число процессов (0 — автоматически)
+    device: str = "cpu",  # устройство cpu
+) -> dict[str, Any]:  # вернуть словарь с результатами по зёрнам и агрегатами
+    out = Path(out_dir)  # каталог вывода
+    out.mkdir(parents=True, exist_ok=True)  # создать при отсутствии
+    suite = make_task_suite()  # базовый набор задач
+    start = time.time()  # время начала
+    args = [(int(s), device, str(out)) for s in seeds]  # аргументы процессов: (зерно, устройство, каталог)
+    if workers <= 0:  # автоматический выбор
+        workers = min(len(args), max(1, (os.cpu_count() or 2) - 1))  # min(число зёрен, max(1, число ядер − 1))
+    workers = min(workers, len(args))  # процессов не больше, чем зёрен
+    if workers > 1:  # параллельно
+        with ProcessPoolExecutor(max_workers=workers) as ex:  # пул процессов
+            per_seed = list(ex.map(_run_seed_worker, args))  # результаты по зёрнам
+    else:  # последовательно
+        per_seed = [_run_seed_worker(a) for a in args]  # по одному зерну за раз
+    per_seed.sort(key=lambda r: r["seed"])  # отсортировать по зерну
+    main_model_path = out / f"hagi_v7_model_seed{int(seeds[0])}.json"  # путь модели первого зерна
+    if main_model_path.exists():  # файл есть
+        GrowingMathProcessorV7.load(main_model_path)  # убедиться, что он загружается
+        main_model_path.replace(out / "hagi_v7_model.json")  # переименовать в основную модель
 
-    aggregate: dict[str, Any] = {}
-    for key in (
-        "committed",
-        "symbolic_exact_accuracy",
-        "total_code_length",
-        "candidates_generated",
-        "program_evals",
-        "ood_abstains",
-        "elapsed_seconds",
+    aggregate: dict[str, Any] = {}  # агрегаты по зёрнам
+    for key in (  # по усредняемым показателям
+        "committed",  # число закреплённых
+        "symbolic_exact_accuracy",  # точность
+        "total_code_length",  # длина кода
+        "candidates_generated",  # порождено кандидатов
+        "program_evals",  # вычисления программ
+        "ood_abstains",  # отказы вне области
+        "elapsed_seconds",  # длительность
     ):
-        vals = [float(r[key]) for r in per_seed]
-        aggregate[key + "_mean"] = float(np.mean(vals))
-        aggregate[key + "_sd"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    aggregate.update(
-        {
-            "seeds": list(map(int, seeds)),
-            "expert_reuse_commits_total": int(
-                sum(r["expert_reuse_commits"] for r in per_seed)
+        vals = [float(r[key]) for r in per_seed]  # значения показателя по зёрнам
+        aggregate[key + "_mean"] = float(np.mean(vals))  # среднее = Σ vals / n
+        aggregate[key + "_sd"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0  # несмещённое отклонение sqrt(Σ(v − mean)² / (n − 1)); 0 при одном значении
+    aggregate.update(  # добавить прочие агрегаты
+        {  # открытие словаря аргументов
+            "seeds": list(map(int, seeds)),  # список зёрен
+            "expert_reuse_commits_total": int(  # всего повторных закреплений
+                sum(r["expert_reuse_commits"] for r in per_seed)  # сумма по зёрнам
             ),
-            "poison_all_hold": all(r["poison_action"] == "HOLD" for r in per_seed),
-            "unknown_all_hold": all(
-                r["unknown_is_prime_action"] == "HOLD" for r in per_seed
+            "poison_all_hold": all(r["poison_action"] == "HOLD" for r in per_seed),  # испорченная метка везде даёт удержание
+            "unknown_all_hold": all(  # незнакомая задача везде даёт удержание
+                r["unknown_is_prime_action"] == "HOLD" for r in per_seed  # по зёрнам
             ),
-            "reload_roundtrip_pass": GrowingMathProcessorV7.load(
-                out / "hagi_v7_model.json"
+            "reload_roundtrip_pass": GrowingMathProcessorV7.load(  # сохранение-загрузка: ADD(7, −3) = 4
+                out / "hagi_v7_model.json"  # из основной модели
             )
-            .predict("ADD", 7, -3)
-            .get("value")
-            == 4,
-            "total_runtime_seconds": time.time() - start,
+            .predict("ADD", 7, -3)  # предсказать ADD(7, −3)
+            .get("value")  # взять значение
+            == 4,  # равно 4
+            "total_runtime_seconds": time.time() - start,  # общее время, с
         }
     )
-    result = {"version": V7_VERSION, "per_seed": per_seed, "aggregate": aggregate}
-    (out / "hagi_v7_experiment.json").write_text(
-        json.dumps(result, indent=2), encoding="utf-8"
+    result = {"version": V7_VERSION, "per_seed": per_seed, "aggregate": aggregate}  # итоговый словарь: версия, результаты по зёрнам, агрегаты
+    (out / "hagi_v7_experiment.json").write_text(  # записать итоги
+        json.dumps(result, indent=2), encoding="utf-8"  # JSON с отступом 2
     )
-    return result
+    return result  # вернуть итоги
 
 
-def self_test_v7() -> None:
-    suite = make_task_suite()
-    model = GrowingMathProcessorV7()
-    for i, spec in enumerate(suite):
-        ev = model.learn(spec, seed=10_000 + i, train_neural=False)
-        assert ev.action == "COMMIT", (spec.name, ev)
-    check = model.verify_all(suite)
-    assert check["committed"] == len(suite) and check["accuracy"] == 1.0
-    assert model.predict("ADD", 100, 3)["status"] == "ABSTAIN"
-    # The exact median3 template is checked over the full declared support.
-    med = model.experts["MEDIAN3"].program
-    assert med.eval((1, 5, 3)) == 3 and med.eval((9, 2, 7)) == 7
-    poisoned = GrowingMathProcessorV7().learn(
-        next(s for s in suite if s.name == "ADD"),
-        seed=77,
-        poison_one_label=True,
-        train_neural=False,
+def self_test_v7() -> None:  # самопроверка: обучение набора, отказы вне области, точные многочлены, теоремы
+    suite = make_task_suite()  # базовый набор
+    model = GrowingMathProcessorV7()  # модель
+    for i, spec in enumerate(suite):  # по задачам
+        ev = model.learn(spec, seed=10_000 + i, train_neural=False)  # обучить без нейроволокна
+        assert ev.action == "COMMIT", (spec.name, ev)  # каждая задача обязана закрепиться
+    check = model.verify_all(suite)  # проверить набор
+    assert check["committed"] == len(suite) and check["accuracy"] == 1.0  # закреплены все и точность 1
+    assert model.predict("ADD", 100, 3)["status"] == "ABSTAIN"  # вне области — отказ
+    # точный шаблон медианы трёх проверяется на всей объявленной области
+    med = model.experts["MEDIAN3"].program  # программа медианы трёх
+    assert med.eval((1, 5, 3)) == 3 and med.eval((9, 2, 7)) == 7  # медиана (1,5,3) = 3; (9,2,7) = 7
+    poisoned = GrowingMathProcessorV7().learn(  # опыт с испорченной меткой
+        next(s for s in suite if s.name == "ADD"),  # задача ADD из набора
+        seed=77,  # зерно 77
+        poison_one_label=True,  # испортить одну метку
+        train_neural=False,  # без нейроволокна
     )
-    assert poisoned.action == "HOLD"
-    # exact formula induction: teacher = 2x^3 - x^2 + 7x - 4 must be learned
-    # as a closed-form polynomial with EXACT (machine-precision) arithmetic
-    poly_spec = TaskSpec(
-        "POLY_CUBIC",
-        1,
-        (tuple(range(-12, 13)),),
-        lambda x: 2 * x**3 - x**2 + 7 * x - 4,
-        family="poly-unseen",
+    assert poisoned.action == "HOLD"  # ожидается удержание
+    # точная индукция формулы: учитель 2x³ − x² + 7x − 4 должен быть выучен
+    # как замкнутый многочлен с точной арифметикой
+    poly_spec = TaskSpec(  # задача — кубический многочлен
+        "POLY_CUBIC",  # имя
+        1,  # один вход
+        (tuple(range(-12, 13)),),  # область x ∈ −12..12
+        lambda x: 2 * x**3 - x**2 + 7 * x - 4,  # учитель p(x) = 2x³ − x² + 7x − 4
+        family="poly-unseen",  # семейство
     )
-    pev = GrowingMathProcessorV7().learn(poly_spec, seed=31337, train_neural=False)
-    assert pev.action == "COMMIT" and "poly(" in pev.program, (pev.action, pev.program)
+    pev = GrowingMathProcessorV7().learn(poly_spec, seed=31337, train_neural=False)  # выучить многочлен
+    assert pev.action == "COMMIT" and "poly(" in pev.program, (pev.action, pev.program)  # закреплён как многочлен
 
-    # 2-D exact polynomial discovery; support is checked exhaustively.
-    poly2 = TaskSpec(
-        "POLY2_QUADRATIC",
-        2,
-        (tuple(range(-4, 5)), tuple(range(-3, 4))),
-        lambda x, y: 3 * x * x - 2 * x * y + y * y + 4 * x - 5 * y + 7,
-        family="poly2-unseen",
+    # точное открытие многочлена двух переменных; область проверяется полным перебором
+    poly2 = TaskSpec(  # задача — многочлен двух переменных
+        "POLY2_QUADRATIC",  # имя
+        2,  # два входа
+        (tuple(range(-4, 5)), tuple(range(-3, 4))),  # области x ∈ −4..4, y ∈ −3..3
+        lambda x, y: 3 * x * x - 2 * x * y + y * y + 4 * x - 5 * y + 7,  # учитель 3x² − 2xy + y² + 4x − 5y + 7
+        family="poly2-unseen",  # семейство
     )
-    p2ev = GrowingMathProcessorV7().learn(poly2, seed=31338, train_neural=False)
-    assert p2ev.action == "COMMIT" and "poly_nd(" in p2ev.program, (
-        p2ev.action,
-        p2ev.program,
+    p2ev = GrowingMathProcessorV7().learn(poly2, seed=31338, train_neural=False)  # выучить
+    assert p2ev.action == "COMMIT" and "poly_nd(" in p2ev.program, (  # закреплён как многомерный многочлен
+        p2ev.action,  # действие
+        p2ev.program,  # текст программы
     )
-    p2model = GrowingMathProcessorV7()
-    p2model.learn(poly2, seed=31338, train_neural=False)
-    assert p2model.verify_all([poly2])["accuracy"] == 1.0
+    p2model = GrowingMathProcessorV7()  # отдельная модель
+    p2model.learn(poly2, seed=31338, train_neural=False)  # выучить
+    assert p2model.verify_all([poly2])["accuracy"] == 1.0  # точность 1 на всей области
 
-    # 3-D exact polynomial discovery with a cubic mixed interaction.
-    poly3 = TaskSpec(
-        "POLY3_CUBIC",
-        3,
-        (tuple(range(-3, 4)), tuple(range(-3, 4)), tuple(range(-3, 4))),
-        lambda x, y, z: 2 * x**3 - 3 * x * y * z + 4 * y * y - 5 * z + 11,
-        family="poly3-unseen",
+    # точное открытие многочлена трёх переменных с кубическим смешанным членом
+    poly3 = TaskSpec(  # задача — многочлен трёх переменных
+        "POLY3_CUBIC",  # имя
+        3,  # три входа
+        (tuple(range(-3, 4)), tuple(range(-3, 4)), tuple(range(-3, 4))),  # каждая область −3..3
+        lambda x, y, z: 2 * x**3 - 3 * x * y * z + 4 * y * y - 5 * z + 11,  # учитель 2x³ − 3xyz + 4y² − 5z + 11
+        family="poly3-unseen",  # семейство
     )
-    p3model = GrowingMathProcessorV7()
-    p3ev = p3model.learn(poly3, seed=31339, train_neural=False)
-    assert p3ev.action == "COMMIT" and "poly_nd(" in p3ev.program, (
-        p3ev.action,
-        p3ev.program,
+    p3model = GrowingMathProcessorV7()  # отдельная модель
+    p3ev = p3model.learn(poly3, seed=31339, train_neural=False)  # выучить
+    assert p3ev.action == "COMMIT" and "poly_nd(" in p3ev.program, (  # закреплён как многомерный многочлен
+        p3ev.action,  # действие
+        p3ev.program,  # текст программы
     )
-    assert p3model.verify_all([poly3])["accuracy"] == 1.0
+    assert p3model.verify_all([poly3])["accuracy"] == 1.0  # точность 1 на всей области
 
-    assert model.predict("ADD", 7, -3)["value"] == 4
-    assert model.experts["ADD"].code_length == _program_description_bits(
-        model.experts["ADD"].program
+    assert model.predict("ADD", 7, -3)["value"] == 4  # проверка: предсказание ADD(7, −3) равно 4
+    assert model.experts["ADD"].code_length == _program_description_bits(  # длина кода ADD равна числу бит описания
+        model.experts["ADD"].program  # программа эксперта ADD
     )
-    # theorem mining: exhaustive verification only, no unverified statements
-    ths = TheoremMiner().mine(model)
-    assert ths, "theorem miner found nothing"
-    names = [t.name for t in model.theorems]
-    assert all(t.verified for t in model.theorems)
-    assert any("commutativity(MIN)" in n for n in names), names
-    assert any("idempotence(ABS)" in n for n in names), names
-    print(
-        f"V7.4 SELF_TEST PASS: {len(suite)} experts, accuracy 1.0, OOD abstain, poison hold, "
-        f"exact poly commit '{pev.program}', {len(model.theorems)} theorems"
+    # поиск теорем: только исчерпывающая проверка, непроверенных утверждений нет
+    ths = TheoremMiner().mine(model)  # найти теоремы
+    assert ths, "theorem miner found nothing"  # что-то найдено
+    names = [t.name for t in model.theorems]  # имена теорем
+    assert all(t.verified for t in model.theorems)  # все проверены
+    assert any("commutativity(MIN)" in n for n in names), names  # есть коммутативность MIN
+    assert any("idempotence(ABS)" in n for n in names), names  # есть идемпотентность ABS
+    print(  # напечатать итог
+        f"V7.4 SELF_TEST PASS: {len(suite)} experts, accuracy 1.0, OOD abstain, poison hold, "  # первая часть строки итога
+        f"exact poly commit '{pev.program}', {len(model.theorems)} theorems"  # вторая часть строки итога
     )
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(
-        description="HAGI v7.4 exact multivariate finite-domain research prototype"
+def main() -> None:  # разбор аргументов командной строки и запуск выбранного режима
+    p = argparse.ArgumentParser(  # разборщик аргументов
+        description="HAGI v7.4 exact multivariate finite-domain research prototype"  # описание программы
     )
-    p.add_argument("--self-test", action="store_true")
-    p.add_argument("--experiment", action="store_true")
-    p.add_argument(
-        "--grow",
-        action="store_true",
-        help="bounded compositional growth loop (10-minute default cap)",
-    )
-    p.add_argument(
-        "--device", default="cpu", help="cpu or cuda:0 (GPU batch prefilter)"
-    )
-    p.add_argument(
-        "--max-minutes",
-        type=float,
-        default=10.0,
-        help="wall-clock cap for --grow (default: 10 minutes)",
-    )
-    p.add_argument("--max-rounds", type=int, default=None)
-    p.add_argument("--snapshot-every", type=int, default=10)
-    p.add_argument(
-        "--no-neural",
-        action="store_true",
-        help="disable neural fallback training (fastest pure-symbolic)",
-    )
-    p.add_argument(
-        "--search-budget",
-        type=int,
-        default=2_500,
-        help="per-task candidate budget during --grow; pop budget is twice this",
-    )
-    p.add_argument(
-        "--workers", type=int, default=0, help="parallel seed processes (0=auto)"
-    )
-    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7])
-    p.add_argument("--out-dir", default=".omc/hagi_v7_results")
-    args = p.parse_args()
-    if args.self_test:
-        self_test_v7()
-    elif args.grow:
-        suite = make_task_suite()
-        model = GrowingMathProcessorV7(device=args.device)
-        deadline = (
-            time.monotonic() + max(0.0, args.max_minutes * 60)
-            if args.max_minutes is not None
-            else None
+    p.add_argument("--self-test", action="store_true")  # флаг самопроверки
+    p.add_argument("--experiment", action="store_true")  # флаг опыта по зернам
+    p.add_argument(  # флаг цикла роста
+        "--grow",  # имя
+        action="store_true",  # без значения
+        help="bounded compositional growth loop (10-minute default cap)",  # справка
+    )  # конец аргумента
+    p.add_argument(  # аргумент устройства
+        "--device", default="cpu", help="cpu or cuda:0 (GPU batch prefilter)"  # по умолчанию cpu
+    )  # конец аргумента
+    p.add_argument(  # аргумент лимита времени
+        "--max-minutes",  # имя
+        type=float,  # вещественное
+        default=10.0,  # по умолчанию 10 минут
+        help="wall-clock cap for --grow (default: 10 minutes)",  # справка
+    )  # конец аргумента
+    p.add_argument("--max-rounds", type=int, default=None)  # предел раундов
+    p.add_argument("--snapshot-every", type=int, default=10)  # снимок после каждых N закреплений
+    p.add_argument(  # флаг отключения нейроволокна
+        "--no-neural",  # имя
+        action="store_true",  # без значения
+        help="disable neural fallback training (fastest pure-symbolic)",  # справка
+    )  # конец аргумента
+    p.add_argument(  # аргумент бюджета поиска
+        "--search-budget",  # имя
+        type=int,  # целое
+        default=2_500,  # по умолчанию 2500
+        help="per-task candidate budget during --grow; pop budget is twice this",  # справка
+    )  # конец аргумента
+    p.add_argument(  # аргумент числа процессов
+        "--workers", type=int, default=0, help="parallel seed processes (0=auto)"  # по умолчанию автоматически
+    )  # конец аргумента
+    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7])  # список зёрен
+    p.add_argument("--out-dir", default=".omc/hagi_v7_results")  # каталог вывода
+    args = p.parse_args()  # разобрать аргументы
+    if args.self_test:  # самопроверка
+        self_test_v7()  # выполнить
+    elif args.grow:  # цикл роста
+        suite = make_task_suite()  # базовый набор
+        model = GrowingMathProcessorV7(device=args.device)  # модель на устройстве
+        deadline = (  # срок
+            time.monotonic() + max(0.0, args.max_minutes * 60)  # сейчас + max(0, минуты·60)
+            if args.max_minutes is not None  # если лимит задан
+            else None  # иначе без срока
         )
-        if args.no_neural:
-            os.environ["HAGI_NO_NEURAL"] = "1"
-        report = grow_forever(
-            model,
-            suite,
-            device=args.device,
-            max_rounds=args.max_rounds,
-            snapshot_every=args.snapshot_every,
-            out_dir=args.out_dir,
-            budget_cap=max(1, args.search_budget),
-            deadline=deadline,
+        if args.no_neural:  # нейроволокно отключено
+            os.environ["HAGI_NO_NEURAL"] = "1"  # переменная окружения
+        report = grow_forever(  # запустить цикл роста
+            model,  # модель
+            suite,  # набор задач
+            device=args.device,  # устройство
+            max_rounds=args.max_rounds,  # предел раундов
+            snapshot_every=args.snapshot_every,  # период снимков
+            out_dir=args.out_dir,  # каталог вывода
+            budget_cap=max(1, args.search_budget),  # потолок бюджета не меньше 1
+            deadline=deadline,  # срок
         )
-        print(
-            json.dumps(
-                {
-                    k: report[k]
-                    for k in ("device", "stopped", "total_experts", "total_elapsed")
+        print(  # напечатать итог
+            json.dumps(  # сериализовать
+                {  # открытие словаря
+                    k: report[k]  # ключ k
+                    for k in ("device", "stopped", "total_experts", "total_elapsed")  # по четырём ключам
                 },
-                indent=2,
+                indent=2,  # с отступом 2
             )
         )
-    elif args.experiment:
-        result = run_v7_experiment(
-            args.seeds, args.out_dir, workers=args.workers, device=args.device
+    elif args.experiment:  # опыт по зернам
+        result = run_v7_experiment(  # запустить
+            args.seeds, args.out_dir, workers=args.workers, device=args.device  # зёрна, каталог, процессы, устройство
         )
-        print(json.dumps(result["aggregate"], indent=2))
-    else:
-        p.print_help()
+        print(json.dumps(result["aggregate"], indent=2))  # напечатать агрегаты
+    else:  # режим не задан
+        p.print_help()  # напечатать справку
 
 
 # ==============================================================================
-# PART III — v8.0 unified system
+# ЧАСТЬ III — единая система v8.0
 # ==============================================================================
 
-"""HAGI v8.0 — Unified Optimal-Architecture, Minimal-Volume, Minimal-Compute
-Self-Developing Neuro-Symbolic + Energy-Based System.
-"""
+"""HAGI v8.0 — единая саморазвивающаяся нейросимвольная система с энергетическим
+        подходом: оптимальная архитектура, минимальный объём описания, минимальный
+        объём вычислений."""
 
 
-import sys as _sys
+import sys as _sys  # модуль sys под именем _sys
 
-h5 = _sys.modules[__name__]  # v5 layer (same namespace)
-hagi_v7 = _sys.modules[__name__]  # v7 layer (same namespace)
+h5 = _sys.modules[__name__]  # слой V5 — тот же модуль (пространство имён общее)
+hagi_v7 = _sys.modules[__name__]  # слой V7 — тот же модуль
 
-V8_VERSION = "8.4.0"
+V8_VERSION = "8.4.0"  # версия формата V8
 
 # ==============================================================================
-# 1. Exact Prefix-Code Bits & Generalized Call-DAG / ANF / Piecewise Expr
+# 1. точные биты префиксного кода, обобщённый граф вызовов, АНФ и кусочные выражения
 # ==============================================================================
 
-TOKEN_BITS = 6
-VAR_NAMES = ("x", "y", "z", "u", "v", "w")
-DYADIC_LEVELS = np.array([(c + 1) / 128.0 for c in range(255)], dtype=np.float64)
-MAX_RANGE_EVAL = 100_000
-_RANGE_FOLD_OPS = {"all_range", "any_range", "sum_range", "prod_range"}
+TOKEN_BITS = 6  # бит на токен префиксного кода
+VAR_NAMES = ("x", "y", "z", "u", "v", "w")  # имена переменных
+DYADIC_LEVELS = np.array([(c + 1) / 128.0 for c in range(255)], dtype=np.float64)  # двоичные уровни (c + 1)/128, c = 0..254
+MAX_RANGE_EVAL = 100_000  # предел суммарного числа итераций свёрток диапазона
+_RANGE_FOLD_OPS = {"all_range", "any_range", "sum_range", "prod_range"}  # операции свёртки диапазона
 
 
-def _expr_contains_range(expr: "ExprV8") -> bool:
-    return expr.op in _RANGE_FOLD_OPS or any(_expr_contains_range(a) for a in expr.args)
+def _expr_contains_range(expr: "ExprV8") -> bool:  # содержит ли выражение свёртку диапазона
+    return expr.op in _RANGE_FOLD_OPS or any(_expr_contains_range(a) for a in expr.args)  # сам узел — свёртка или есть свёртка в каком-либо аргументе
 
 
-def gamma_bits(n: int) -> int:
-    n = int(n)
-    if n < 1:
-        raise ValueError("gamma_bits expects positive integer")
-    return 2 * (n.bit_length() - 1) + 1
+def gamma_bits(n: int) -> int:  # длина гамма-кода Элиаса числа n
+    n = int(n)  # целое
+    if n < 1:  # не положительное
+        raise ValueError("gamma_bits expects positive integer")  # ошибка
+    return 2 * (n.bit_length() - 1) + 1  # длина кода γ(n) = 2·⌊log2 n⌋ + 1
 
 
-def zigzag(n: int) -> int:
-    n = int(n)
-    return 2 * n if n >= 0 else -2 * n - 1
+def zigzag(n: int) -> int:  # зигзаг-кодирование целого: 0, −1, 1, −2, 2 … → 0, 1, 2, 3, 4 …
+    n = int(n)  # целое
+    return 2 * n if n >= 0 else -2 * n - 1  # если n ≥ 0: код 2n; иначе код −2n − 1
 
 
-@dataclass(frozen=True)
-class ExprV8:
-    """Extended immutable AST supporting arbitrary arity, DAG calls, ANF, and piecewise."""
+@dataclass(frozen=True)  # неизменяемый класс данных
+class ExprV8:  # расширенное неизменяемое синтаксическое дерево выражения
+    """Расширенное неизменяемое синтаксическое дерево выражения: любая арность,
+            вызовы экспертов (граф вызовов), алгебраическая нормальная форма (АНФ) и
+            кусочные выражения. Поля: op — операция, args — кортеж аргументов,
+            value — номер переменной, константа, имя вызываемого эксперта или параметры."""
 
-    op: str
-    args: tuple["ExprV8", ...] = ()
-    value: Optional[Any] = None
+    op: str  # имя операции
+    args: tuple["ExprV8", ...] = ()  # аргументы-подвыражения
+    value: Optional[Any] = None  # значение (номер переменной, константа, имя вызываемого эксперта, параметры)
 
-    @staticmethod
-    def var(i: int) -> "ExprV8":
-        return ExprV8("var", (), int(i))
+    @staticmethod  # статический метод
+    def var(i: int) -> "ExprV8":  # узел переменной № i
+        return ExprV8("var", (), int(i))  # узел переменной var(i)
 
-    @staticmethod
-    def const(v: int) -> "ExprV8":
-        return ExprV8("const", (), int(v))
+    @staticmethod  # статический метод
+    def const(v: int) -> "ExprV8":  # узел константы
+        return ExprV8("const", (), int(v))  # узел константы const(v)
 
-    @staticmethod
-    def from_h5(e: h5.Expr) -> "ExprV8":
-        return ExprV8(e.op, tuple(ExprV8.from_h5(a) for a in e.args), e.value)
+    @staticmethod  # статический метод
+    def from_h5(e: h5.Expr) -> "ExprV8":  # преобразовать выражение V5 в ExprV8
+        return ExprV8(e.op, tuple(ExprV8.from_h5(a) for a in e.args), e.value)  # та же операция, рекурсивно преобразованные аргументы, то же значение
 
-    def eval(
-        self,
-        xs: Sequence[int],
-        env: Optional[dict[str, "ExpertV8"]] = None,
-        _budget: Optional[list[int]] = None,
-        _fold_depth: int = 0,
-    ) -> int:
-        # A mutable per-evaluation counter is shared across symbolic calls. This
-        # prevents an expert call from multiplying the range cap invisibly.
-        if _budget is None:
-            _budget = [0]
-        if self.op == "var":
-            return int(xs[int(self.value)])
-        if self.op == "const":
-            return int(self.value)
-        if self.op == "call":
-            if env is None or self.value not in env:
-                raise ValueError(f"missing called expert: {self.value}")
-            vals = tuple(a.eval(xs, env, _budget, _fold_depth) for a in self.args)
-            callee = env[self.value]
-            if not callee.supports(vals):
-                raise ValueError(
-                    f"call to {self.value} outside certified support: {vals}"
+    def eval(  # вычислить выражение на входах xs
+        self,  # само выражение
+        xs: Sequence[int],  # значения входных переменных
+        env: Optional[dict[str, "ExpertV8"]] = None,  # среда вызовов: имя эксперта → эксперт
+        _budget: Optional[list[int]] = None,  # общий счётчик итераций (список из одного элемента)
+        _fold_depth: int = 0,  # глубина вложенности свёрток
+    ) -> int:  # вернуть целое значение
+        # Изменяемый счётчик общий для всех символьных вызовов одного вычисления:
+        # вызов эксперта не может незаметно умножить предел диапазона.
+        if _budget is None:  # счётчик не передан
+            _budget = [0]  # новый счётчик 0
+        if self.op == "var":  # переменная
+            return int(xs[int(self.value)])  # значение входа № value
+        if self.op == "const":  # константа
+            return int(self.value)  # сама константа
+        if self.op == "call":  # вызов эксперта
+            if env is None or self.value not in env:  # среды нет или эксперта в ней нет
+                raise ValueError(f"missing called expert: {self.value}")  # ошибка
+            vals = tuple(a.eval(xs, env, _budget, _fold_depth) for a in self.args)  # значения аргументов вызова
+            callee = env[self.value]  # вызываемый эксперт
+            if not callee.supports(vals):  # аргументы вне заверенной области
+                raise ValueError(  # ошибка
+                    f"call to {self.value} outside certified support: {vals}"  # текст
                 )
-            return callee.program.eval(vals, env, _budget, _fold_depth)
-        if self.op == "anf":
-            n_vars, coeffs = self.value
-            mask_x = 0
-            for i in range(n_vars):
-                b = int(xs[i])
-                if b not in (0, 1):
-                    raise ValueError("anf expects boolean inputs")
-                if b:
-                    mask_x |= 1 << (n_vars - 1 - i)
-            acc = 0
-            for s, c in coeffs:
-                if (s & mask_x) == s:
-                    acc ^= c
-            return int(acc)
-        if self.op in _RANGE_FOLD_OPS:
-            if len(self.args) != 3:
-                raise ValueError(f"{self.op} expects start, stop, body")
-            # Static nested folds are rejected, and dynamic nested folds through
-            # calls are rejected by the propagated depth flag.
-            if _fold_depth >= 1 or any(_expr_contains_range(a) for a in self.args):
-                raise ValueError(
-                    "nested range folds (including calls) are not supported"
+            return callee.program.eval(vals, env, _budget, _fold_depth)  # результат программы вызываемого на аргументах
+        if self.op == "anf":  # алгебраическая нормальная форма
+            n_vars, coeffs = self.value  # число переменных и список (маска S, коэффициент c)
+            mask_x = 0  # битовая маска входа
+            for i in range(n_vars):  # по переменным
+                b = int(xs[i])  # значение бита
+                if b not in (0, 1):  # не булево
+                    raise ValueError("anf expects boolean inputs")  # ошибка
+                if b:  # бит 1
+                    mask_x |= 1 << (n_vars - 1 - i)  # установить бит n_vars − 1 − i
+            acc = 0  # аккумулятор
+            for s, c in coeffs:  # по мономам
+                if (s & mask_x) == s:  # все биты монома S входят во вход: S ⊆ x
+                    acc ^= c  # XOR коэффициента: f = ⊕_{S ⊆ x} c_S
+            return int(acc)  # значение АНФ
+        if self.op in _RANGE_FOLD_OPS:  # свёртка диапазона
+            if len(self.args) != 3:  # не три аргумента
+                raise ValueError(f"{self.op} expects start, stop, body")  # ошибка
+            # Статически вложенные свёртки отклоняются, динамически вложенные через
+            # вызовы отклоняются передаваемым флагом глубины.
+            if _fold_depth >= 1 or any(_expr_contains_range(a) for a in self.args):  # уже внутри свёртки или есть вложенная свёртка
+                raise ValueError(  # ошибка
+                    "nested range folds (including calls) are not supported"  # текст
                 )
-            start = int(self.args[0].eval(xs, env, _budget, _fold_depth))
-            stop = int(self.args[1].eval(xs, env, _budget, _fold_depth))
-            span = max(0, stop - start)
-            if span > MAX_RANGE_EVAL or _budget[0] + span > MAX_RANGE_EVAL:
-                raise ValueError(
-                    f"cumulative range-fold budget exceeds {MAX_RANGE_EVAL} iterations"
+            start = int(self.args[0].eval(xs, env, _budget, _fold_depth))  # начало диапазона
+            stop = int(self.args[1].eval(xs, env, _budget, _fold_depth))  # конец диапазона (не включая)
+            span = max(0, stop - start)  # длина диапазона max(0, stop − start)
+            if span > MAX_RANGE_EVAL or _budget[0] + span > MAX_RANGE_EVAL:  # диапазон или суммарный бюджет превышает предел
+                raise ValueError(  # ошибка
+                    f"cumulative range-fold budget exceeds {MAX_RANGE_EVAL} iterations"  # текст
                 )
-            body = self.args[2]
-            if self.op == "all_range":
-                for k in range(start, stop):
-                    _budget[0] += 1
-                    if not body.eval(
-                        tuple(xs) + (int(k),), env, _budget, _fold_depth + 1
+            body = self.args[2]  # тело свёртки
+            if self.op == "all_range":  # «для всех k»
+                for k in range(start, stop):  # по k от start до stop − 1
+                    _budget[0] += 1  # счётчик итераций + 1
+                    if not body.eval(  # тело ложно
+                        tuple(xs) + (int(k),), env, _budget, _fold_depth + 1  # на входах xs + k
                     ):
-                        return 0
-                return 1
-            if self.op == "any_range":
-                for k in range(start, stop):
-                    _budget[0] += 1
-                    if body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1):
-                        return 1
-                return 0
-            if self.op == "sum_range":
-                acc = 0
-                for k in range(start, stop):
-                    _budget[0] += 1
-                    acc += int(
-                        body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1)
+                        return 0  # результат 0
+                return 1  # все истинны — 1
+            if self.op == "any_range":  # «существует k»
+                for k in range(start, stop):  # по k
+                    _budget[0] += 1  # счётчик + 1
+                    if body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1):  # тело истинно
+                        return 1  # результат 1
+                return 0  # ничего не истинно — 0
+            if self.op == "sum_range":  # сумма по k
+                acc = 0  # аккумулятор
+                for k in range(start, stop):  # по k
+                    _budget[0] += 1  # счётчик итераций + 1
+                    acc += int(  # прибавить значение тела
+                        body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1)  # значение тела body(xs, k)
                     )
-                    if abs(acc).bit_length() > 4096:
-                        raise OverflowError(
-                            "range-fold accumulator exceeds 4096-bit cap"
+                    if abs(acc).bit_length() > 4096:  # сумма стала длиннее 4096 бит
+                        raise OverflowError(  # переполнение
+                            "range-fold accumulator exceeds 4096-bit cap"  # текст ошибки
                         )
-                return acc
-            acc = 1
-            for k in range(start, stop):
-                _budget[0] += 1
-                acc *= int(
-                    body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1)
+                return acc  # сумма Σ_k body(xs, k)
+            acc = 1  # произведение начинается с 1
+            for k in range(start, stop):  # по k
+                _budget[0] += 1  # счётчик + 1
+                acc *= int(  # умножить на значение тела
+                    body.eval(tuple(xs) + (int(k),), env, _budget, _fold_depth + 1)  # значение тела body(xs, k)
                 )
-                if abs(acc).bit_length() > 4096:
-                    raise OverflowError("range-fold product exceeds 4096-bit cap")
-            return acc
-        if self.op == "if_cond":
-            cond_val = self.args[0].eval(xs, env, _budget, _fold_depth)
-            return (
-                self.args[1].eval(xs, env, _budget, _fold_depth)
-                if cond_val
-                else self.args[2].eval(xs, env, _budget, _fold_depth)
+                if abs(acc).bit_length() > 4096:  # произведение длиннее 4096 бит
+                    raise OverflowError("range-fold product exceeds 4096-bit cap")  # переполнение
+            return acc  # произведение Π_k body(xs, k)
+        if self.op == "if_cond":  # условное выражение
+            cond_val = self.args[0].eval(xs, env, _budget, _fold_depth)  # значение условия
+            return (  # вернуть
+                self.args[1].eval(xs, env, _budget, _fold_depth)  # ветвь «то», если условие истинно
+                if cond_val  # при cond_val ≠ 0
+                else self.args[2].eval(xs, env, _budget, _fold_depth)  # иначе ветвь «иначе»
             )
-        vals = [a.eval(xs, env, _budget, _fold_depth) for a in self.args]
-        if self.op == "poly":
-            acc = 0
-            for ci in reversed(list(self.value or ())):
-                acc = acc * vals[0] + int(ci)
-            return int(acc)
-        if self.op == "poly_nd":
-            total = 0
-            for coef, powers in self.value or ():
-                term = int(coef)
-                for x_val, p in zip(xs, powers):
-                    term *= int(x_val) ** int(p)
-                total += term
-            return int(total)
-        if self.op == "absdiff":
-            return abs(vals[0] - vals[1])
-        if self.op == "fma":
-            return vals[0] * vals[1] + vals[2]
-        if self.op == "clamp":
-            return min(max(vals[0], vals[1]), vals[2])
-        if self.op == "median3":
-            return sorted(vals)[1]
-        if self.op == "clamp3":
-            return min(max(vals[0], -3), 3)
-        if self.op == "mul3":
-            return vals[0] * vals[1] * vals[2]
-        if self.op == "isqrt":
-            value = int(vals[0])
-            if value < 0:
-                raise ValueError("isqrt is undefined for negative integers")
-            return math.isqrt(value)
-        if self.op == "reified":
-            rfn = REIFIED_V8.get(str(self.value))
-            if rfn is None:
-                raise ValueError(f"reified op not registered: {self.op}")
-            # leaf macro over the RAW inputs (args empty at leaf level;
-            # composition happens by wrapping in arithmetic ops)
-            return int(rfn(*[int(v) for v in xs]))
-        fn = h5.OPS.get(self.op)
-        if fn is None:
-            raise ValueError(f"unsupported op: {self.op}")
-        return int(fn(*vals))
+        vals = [a.eval(xs, env, _budget, _fold_depth) for a in self.args]  # значения всех аргументов
+        if self.op == "poly":  # многочлен одной переменной
+            acc = 0  # аккумулятор
+            for ci in reversed(list(self.value or ())):  # от старшего коэффициента к младшему
+                acc = acc * vals[0] + int(ci)  # схема Горнера: acc = acc·x + c_i
+            return int(acc)  # значение p(x)
+        if self.op == "poly_nd":  # многочлен нескольких переменных
+            total = 0  # сумма
+            for coef, powers in self.value or ():  # по слагаемым (коэффициент, показатели)
+                term = int(coef)  # слагаемое начинается с коэффициента
+                for x_val, p in zip(xs, powers):  # по парам (переменная, степень)
+                    term *= int(x_val) ** int(p)  # слагаемое term = c·Π x_i^{p_i}
+                total += term  # сумма total = Σ слагаемых
+            return int(total)  # значение многочлена
+        if self.op == "absdiff":  # модуль разности
+            return abs(vals[0] - vals[1])  # модуль разности |a − b|
+        if self.op == "fma":  # умножение-сложение
+            return vals[0] * vals[1] + vals[2]  # произведение плюс слагаемое a·b + c
+        if self.op == "clamp":  # ограничение снизу и сверху
+            return min(max(vals[0], vals[1]), vals[2])  # ограничение min(max(x, lo), hi)
+        if self.op == "median3":  # медиана трёх
+            return sorted(vals)[1]  # средний элемент отсортированного списка
+        if self.op == "clamp3":  # ограничение отрезком [−3, 3]
+            return min(max(vals[0], -3), 3)  # ограничение min(max(x, −3), 3)
+        if self.op == "mul3":  # произведение трёх
+            return vals[0] * vals[1] * vals[2]  # произведение a·b·c
+        if self.op == "isqrt":  # целочисленный корень
+            value = int(vals[0])  # целое значение
+            if value < 0:  # отрицательное
+                raise ValueError("isqrt is undefined for negative integers")  # ошибка
+            return math.isqrt(value)  # целый корень ⌊√value⌋
+        if self.op == "reified":  # именованная операция
+            rfn = REIFIED_V8.get(str(self.value))  # её функция по имени
+            if rfn is None:  # не зарегистрирована
+                raise ValueError(f"reified op not registered: {self.op}")  # ошибка
+        # листовой макрос над ИСХОДНЫМИ входами (на листе аргументов нет;
+        # композиция получается обёртыванием в арифметические операции)
+            return int(rfn(*[int(v) for v in xs]))  # применить к целым исходным входам
+        fn = h5.OPS.get(self.op)  # операция V5 по имени
+        if fn is None:  # неизвестна
+            raise ValueError(f"unsupported op: {self.op}")  # ошибка
+        return int(fn(*vals))  # применить к значениям аргументов
 
-    @property
-    def cost(self) -> int:
-        c = self.__dict__.get("_cost_memo")
-        if c is None:
-            if self.op in ("var", "const"):
-                c = 1
-            elif self.op == "anf":
-                _, coeffs = self.value
-                c = 1 + len(coeffs)
-            elif self.op == "poly":
-                c = 1 + len(self.value or ())
-            elif self.op == "poly_nd":
-                c = 1 + len(self.value or ())
-            else:
-                c = 1 + sum(a.cost for a in self.args)
-            object.__setattr__(self, "_cost_memo", c)
-        return c
+    @property  # свойство
+    def cost(self) -> int:  # стоимость выражения в узлах (с запоминанием)
+        c = self.__dict__.get("_cost_memo")  # запомненное значение
+        if c is None:  # ещё не вычислено
+            if self.op in ("var", "const"):  # лист
+                c = 1  # стоимость 1
+            elif self.op == "anf":  # АНФ
+                _, coeffs = self.value  # список мономов
+                c = 1 + len(coeffs)  # 1 + число мономов
+            elif self.op == "poly":  # многочлен
+                c = 1 + len(self.value or ())  # 1 + число коэффициентов
+            elif self.op == "poly_nd":  # многомерный многочлен
+                c = 1 + len(self.value or ())  # 1 + число слагаемых
+            else:  # прочая операция
+                c = 1 + sum(a.cost for a in self.args)  # 1 + сумма стоимостей аргументов
+            object.__setattr__(self, "_cost_memo", c)  # запомнить (объект неизменяемый)
+        return c  # стоимость
 
-    def bits(self, expert_index: Optional[dict[str, int]] = None) -> int:
-        if self.op == "var":
-            return TOKEN_BITS + gamma_bits(int(self.value or 0) + 1)
-        if self.op == "const":
-            return TOKEN_BITS + gamma_bits(zigzag(int(self.value)) + 1)
-        if self.op == "call":
-            idx = expert_index.get(str(self.value), 0) if expert_index else 0
-            return (
-                TOKEN_BITS
-                + gamma_bits(idx + 1)
-                + sum(a.bits(expert_index) for a in self.args)
+    def bits(self, expert_index: Optional[dict[str, int]] = None) -> int:  # длина префиксного кода выражения, бит
+        if self.op == "var":  # переменная
+            return TOKEN_BITS + gamma_bits(int(self.value or 0) + 1)  # токен + γ(номер + 1)
+        if self.op == "const":  # константа
+            return TOKEN_BITS + gamma_bits(zigzag(int(self.value)) + 1)  # токен + γ(zigzag(c) + 1)
+        if self.op == "call":  # вызов
+            idx = expert_index.get(str(self.value), 0) if expert_index else 0  # номер вызываемого эксперта (0, если нет)
+            return (  # вернуть
+                TOKEN_BITS  # токен
+                + gamma_bits(idx + 1)  # + γ(номер + 1)
+                + sum(a.bits(expert_index) for a in self.args)  # + сумма длин аргументов
             )
-        if self.op == "anf":
-            n_vars, coeffs = self.value
-            payload = gamma_bits(n_vars + 1) + gamma_bits(len(coeffs) + 1)
-            payload += sum(gamma_bits(s + 1) for s, _ in coeffs)
-            return TOKEN_BITS + payload
-        if self.op == "poly":
-            coeffs = tuple(int(v) for v in (self.value or ()))
-            payload = gamma_bits(len(coeffs) + 1) + sum(
-                gamma_bits(zigzag(v) + 1) for v in coeffs
+        if self.op == "anf":  # АНФ
+            n_vars, coeffs = self.value  # число переменных и мономы
+            payload = gamma_bits(n_vars + 1) + gamma_bits(len(coeffs) + 1)  # γ(n + 1) + γ(число мономов + 1)
+            payload += sum(gamma_bits(s + 1) for s, _ in coeffs)  # + Σ γ(маска + 1)
+            return TOKEN_BITS + payload  # токен + нагрузка
+        if self.op == "poly":  # многочлен
+            coeffs = tuple(int(v) for v in (self.value or ()))  # коэффициенты
+            payload = gamma_bits(len(coeffs) + 1) + sum(  # γ(число + 1) + Σ
+                gamma_bits(zigzag(v) + 1) for v in coeffs  # код γ(zigzag(c) + 1) по коэффициентам
             )
-            return TOKEN_BITS + payload + sum(a.bits(expert_index) for a in self.args)
-        if self.op == "poly_nd":
-            terms = tuple(self.value or ())
-            payload = gamma_bits(len(terms) + 1)
-            for c, powers in terms:
-                payload += gamma_bits(zigzag(int(c)) + 1) + gamma_bits(len(powers) + 1)
-                payload += sum(gamma_bits(int(p) + 1) for p in powers)
-            return TOKEN_BITS + payload
-        return TOKEN_BITS + sum(a.bits(expert_index) for a in self.args)
+            return TOKEN_BITS + payload + sum(a.bits(expert_index) for a in self.args)  # токен + нагрузка + аргументы
+        if self.op == "poly_nd":  # многомерный многочлен
+            terms = tuple(self.value or ())  # слагаемые
+            payload = gamma_bits(len(terms) + 1)  # γ(число слагаемых + 1)
+            for c, powers in terms:  # по слагаемым
+                payload += gamma_bits(zigzag(int(c)) + 1) + gamma_bits(len(powers) + 1)  # + γ(zigzag(c) + 1) + γ(число переменных + 1)
+                payload += sum(gamma_bits(int(p) + 1) for p in powers)  # + Σ γ(степень + 1)
+            return TOKEN_BITS + payload  # токен + нагрузка
+        return TOKEN_BITS + sum(a.bits(expert_index) for a in self.args)  # токен + сумма по аргументам
 
-    def pretty(self) -> str:
-        if self.op == "var":
-            idx = int(self.value or 0)
-            return VAR_NAMES[idx] if idx < len(VAR_NAMES) else f"x{idx}"
-        if self.op == "const":
-            return str(self.value)
-        if self.op == "call":
-            return f"{self.value}({', '.join(a.pretty() for a in self.args)})"
-        if self.op == "anf":
-            n_vars, coeffs = self.value
-            terms = []
-            for s, _ in coeffs:
-                if s == 0:
-                    terms.append("1")
-                else:
-                    vs = [
-                        VAR_NAMES[i] if i < len(VAR_NAMES) else f"x{i}"
-                        for i in range(n_vars)
-                        if (s >> (n_vars - 1 - i)) & 1
+    def pretty(self) -> str:  # текстовое представление выражения
+        if self.op == "var":  # переменная
+            idx = int(self.value or 0)  # номер
+            return VAR_NAMES[idx] if idx < len(VAR_NAMES) else f"x{idx}"  # имя из списка либо x{номер}
+        if self.op == "const":  # константа
+            return str(self.value)  # её текст
+        if self.op == "call":  # вызов
+            return f"{self.value}({', '.join(a.pretty() for a in self.args)})"  # имя(аргументы через запятую)
+        if self.op == "anf":  # АНФ
+            n_vars, coeffs = self.value  # число переменных и мономы
+            terms = []  # тексты мономов
+            for s, _ in coeffs:  # по маскам мономов
+                if s == 0:  # пустой моном
+                    terms.append("1")  # константа 1
+                else:  # непустой
+                    vs = [  # имена входящих переменных
+                        VAR_NAMES[i] if i < len(VAR_NAMES) else f"x{i}"  # имя переменной i
+                        for i in range(n_vars)  # по переменным
+                        if (s >> (n_vars - 1 - i)) & 1  # бит i маски установлен
                     ]
-                    terms.append("&".join(vs))
-            return "anf(" + (" ^ ".join(terms) if terms else "0") + ")"
-        if self.op in _RANGE_FOLD_OPS:
-            label = {
-                "all_range": "forall",
-                "any_range": "exists",
-                "sum_range": "sum",
-                "prod_range": "prod",
-            }[self.op]
-            return f"{label}[y={self.args[0].pretty()}..{self.args[1].pretty()}):{self.args[2].pretty()}]"
-        if self.op == "if_cond":
-            return f"({self.args[1].pretty()} if {self.args[0].pretty()} else {self.args[2].pretty()})"
-        if self.op == "poly":
-            return h5.Expr("poly", (h5.Expr.var(0),), self.value).pretty()
-        if self.op == "poly_nd":
-            return h5.Expr("poly_nd", (), self.value).pretty()
-        if self.op == "clamp3":
-            return f"min(max({self.args[0].pretty()}, -3), 3)"
-        if self.op == "absdiff":
-            return f"abs({self.args[0].pretty()} - {self.args[1].pretty()})"
-        if len(self.args) == 1:
-            return f"{self.op}({self.args[0].pretty()})"
-        if len(self.args) == 2:
-            return f"({self.args[0].pretty()} {self.op} {self.args[1].pretty()})"
-        return f"{self.op}({', '.join(a.pretty() for a in self.args)})"
+                    terms.append("&".join(vs))  # моном — переменные через &
+            return "anf(" + (" ^ ".join(terms) if terms else "0") + ")"  # anf(мономы через ^) или anf(0)
+        if self.op in _RANGE_FOLD_OPS:  # свёртка диапазона
+            label = {  # имя операции для текста
+                "all_range": "forall",  # метка «для всех»
+                "any_range": "exists",  # метка «существует»
+                "sum_range": "sum",  # метка «сумма»
+                "prod_range": "prod",  # метка «произведение»
+            }[self.op]  # по операции
+            return f"{label}[y={self.args[0].pretty()}..{self.args[1].pretty()}):{self.args[2].pretty()}]"  # имя[y=начало..конец):тело
+        if self.op == "if_cond":  # условное выражение
+            return f"({self.args[1].pretty()} if {self.args[0].pretty()} else {self.args[2].pretty()})"  # (то если условие иначе иначе)
+        if self.op == "poly":  # многочлен
+            return h5.Expr("poly", (h5.Expr.var(0),), self.value).pretty()  # текст через выражение V5
+        if self.op == "poly_nd":  # многомерный многочлен
+            return h5.Expr("poly_nd", (), self.value).pretty()  # текст через выражение V5
+        if self.op == "clamp3":  # ограничение [−3, 3]
+            return f"min(max({self.args[0].pretty()}, -3), 3)"  # текст min(max(x, −3), 3)
+        if self.op == "absdiff":  # модуль разности
+            return f"abs({self.args[0].pretty()} - {self.args[1].pretty()})"  # текст abs(a − b)
+        if len(self.args) == 1:  # один аргумент
+            return f"{self.op}({self.args[0].pretty()})"  # операция(аргумент)
+        if len(self.args) == 2:  # два аргумента
+            return f"({self.args[0].pretty()} {self.op} {self.args[1].pretty()})"  # (левый операция правый)
+        return f"{self.op}({', '.join(a.pretty() for a in self.args)})"  # операция(аргументы через запятую)
 
-    def subtrees(self) -> list["ExprV8"]:
-        out = [self]
-        for a in self.args:
-            out.extend(a.subtrees())
-        return out
+    def subtrees(self) -> list["ExprV8"]:  # все поддеревья, начиная с самого выражения
+        out = [self]  # начать с себя
+        for a in self.args:  # по аргументам
+            out.extend(a.subtrees())  # добавить их поддеревья
+        return out  # список
 
-    def replace_subtree(self, target: "ExprV8", replacement: "ExprV8") -> "ExprV8":
-        if self == target:
-            return replacement
-        if not self.args:
-            return self
-        return ExprV8(
-            self.op,
-            tuple(a.replace_subtree(target, replacement) for a in self.args),
-            self.value,
+    def replace_subtree(self, target: "ExprV8", replacement: "ExprV8") -> "ExprV8":  # заменить поддерево target на replacement
+        if self == target:  # само выражение — цель
+            return replacement  # вернуть замену
+        if not self.args:  # лист, не равный цели
+            return self  # без изменений
+        return ExprV8(  # тот же узел с заменами внутри аргументов
+            self.op,  # операция
+            tuple(a.replace_subtree(target, replacement) for a in self.args),  # рекурсивно обработанные аргументы
+            self.value,  # значение
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        val = self.value
-        if self.op == "anf" and val is not None:
-            val = [int(val[0]), [[int(s), int(c)] for s, c in val[1]]]
-        return {"op": self.op, "value": val, "args": [a.to_dict() for a in self.args]}
+    def to_dict(self) -> dict[str, Any]:  # словарь для сериализации
+        val = self.value  # значение
+        if self.op == "anf" and val is not None:  # АНФ: кортежи превращаются в списки
+            val = [int(val[0]), [[int(s), int(c)] for s, c in val[1]]]  # [n, [[маска, коэффициент], ...]]
+        return {"op": self.op, "value": val, "args": [a.to_dict() for a in self.args]}  # словарь
 
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ExprV8":
-        op = str(d["op"])
-        val = d.get("value")
-        if op == "poly" and val is not None:
-            val = tuple(int(v) for v in val)
-        elif op == "poly_nd" and val is not None:
-            val = tuple((int(t[0]), tuple(int(p) for p in t[1])) for t in val)
-        elif op == "anf" and val is not None:
-            val = (int(val[0]), tuple((int(s), int(c)) for s, c in val[1]))
-        return ExprV8(op, tuple(ExprV8.from_dict(a) for a in d.get("args", [])), val)
+    @staticmethod  # статический метод
+    def from_dict(d: dict[str, Any]) -> "ExprV8":  # восстановить выражение из словаря
+        op = str(d["op"])  # операция
+        val = d.get("value")  # значение
+        if op == "poly" and val is not None:  # многочлен
+            val = tuple(int(v) for v in val)  # кортеж целых коэффициентов
+        elif op == "poly_nd" and val is not None:  # многомерный многочлен
+            val = tuple((int(t[0]), tuple(int(p) for p in t[1])) for t in val)  # кортеж (c, (степени))
+        elif op == "anf" and val is not None:  # АНФ
+            val = (int(val[0]), tuple((int(s), int(c)) for s, c in val[1]))  # (n, ((маска, коэффициент), ...))
+        return ExprV8(op, tuple(ExprV8.from_dict(a) for a in d.get("args", [])), val)  # выражение
 
 
-@dataclass(frozen=True)
-class ProgramV8:
-    arity: int
-    expr: Optional[ExprV8] = None
-    venn_mask: Optional[int] = None
+@dataclass(frozen=True)  # неизменяемый класс данных
+class ProgramV8:  # программа: выражение либо маска Венна
+    arity: int  # число входов
+    expr: Optional[ExprV8] = None  # выражение
+    venn_mask: Optional[int] = None  # 4-битная маска таблицы истинности
 
-    @property
-    def cost(self) -> int:
-        return (
-            4
-            if self.venn_mask is not None
-            else (self.expr.cost if self.expr else 10**9)
+    @property  # свойство
+    def cost(self) -> int:  # стоимость программы
+        return (  # вернуть
+            4  # 4 для маски Венна
+            if self.venn_mask is not None  # если маска задана
+            else (self.expr.cost if self.expr else 10**9)  # иначе стоимость выражения, а без выражения 10^9
         )
 
-    def bits(self, expert_index: Optional[dict[str, int]] = None) -> int:
-        if self.venn_mask is not None:
-            return TOKEN_BITS + 4
-        if self.expr is None:
-            return 10**9
-        return self.expr.bits(expert_index)
+    def bits(self, expert_index: Optional[dict[str, int]] = None) -> int:  # длина кода программы, бит
+        if self.venn_mask is not None:  # маска Венна
+            return TOKEN_BITS + 4  # токен + 4 бита маски
+        if self.expr is None:  # выражения нет
+            return 10**9  # бесконечно большая длина
+        return self.expr.bits(expert_index)  # длина кода выражения
 
-    def eval(
-        self,
-        xs: Sequence[int],
-        env: Optional[dict[str, "ExpertV8"]] = None,
-        _budget: Optional[list[int]] = None,
-        _fold_depth: int = 0,
-    ) -> int:
-        if _budget is None:
-            _budget = [0]
-        if len(xs) != self.arity:
-            raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")
-        if self.venn_mask is not None:
-            if self.arity != 2 or int(xs[0]) not in (0, 1) or int(xs[1]) not in (0, 1):
-                raise ValueError("BoolVenn expects two binary inputs")
-            return (int(self.venn_mask) >> ((int(xs[0]) << 1) | int(xs[1]))) & 1
-        if self.expr is None:
-            raise RuntimeError("empty program")
-        return self.expr.eval(xs, env, _budget, _fold_depth)
+    def eval(  # вычислить программу на входах xs
+        self,  # сама программа
+        xs: Sequence[int],  # входы
+        env: Optional[dict[str, "ExpertV8"]] = None,  # среда вызовов
+        _budget: Optional[list[int]] = None,  # общий счётчик итераций
+        _fold_depth: int = 0,  # глубина свёрток
+    ) -> int:  # вернуть целое значение
+        if _budget is None:  # счётчик не передан
+            _budget = [0]  # новый
+        if len(xs) != self.arity:  # число входов не совпадает
+            raise ValueError(f"expected {self.arity} inputs, got {len(xs)}")  # ошибка
+        if self.venn_mask is not None:  # маска Венна
+            if self.arity != 2 or int(xs[0]) not in (0, 1) or int(xs[1]) not in (0, 1):  # не два булевых входа
+                raise ValueError("BoolVenn expects two binary inputs")  # ошибка
+            return (int(self.venn_mask) >> ((int(xs[0]) << 1) | int(xs[1]))) & 1  # бит маски № (2·x_1 + x_0)
+        if self.expr is None:  # выражения нет
+            raise RuntimeError("empty program")  # ошибка
+        return self.expr.eval(xs, env, _budget, _fold_depth)  # вычислить выражение
 
-    def pretty(self) -> str:
-        if self.venn_mask is not None:
-            return f"BoolVenn(mask={self.venn_mask:04b})"
-        assert self.expr is not None
-        return self.expr.pretty()
+    def pretty(self) -> str:  # текст программы
+        if self.venn_mask is not None:  # маска Венна
+            return f"BoolVenn(mask={self.venn_mask:04b})"  # текст с маской в 4 битах
+        assert self.expr is not None  # выражение обязательно есть
+        return self.expr.pretty()  # текст выражения
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "arity": self.arity,
-            "venn_mask": self.venn_mask,
-            "expr": self.expr.to_dict() if self.expr else None,
+    def to_dict(self) -> dict[str, Any]:  # словарь для сериализации
+        return {  # вернуть словарь
+            "arity": self.arity,  # число входов
+            "venn_mask": self.venn_mask,  # маска
+            "expr": self.expr.to_dict() if self.expr else None,  # словарь выражения либо None
         }
 
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ProgramV8":
-        return ProgramV8(
-            int(d["arity"]),
-            ExprV8.from_dict(d["expr"]) if d.get("expr") else None,
-            d.get("venn_mask"),
+    @staticmethod  # статический метод
+    def from_dict(d: dict[str, Any]) -> "ProgramV8":  # восстановить программу из словаря
+        return ProgramV8(  # программа
+            int(d["arity"]),  # число входов
+            ExprV8.from_dict(d["expr"]) if d.get("expr") else None,  # выражение либо None
+            d.get("venn_mask"),  # маска
         )
 
 
 # ==============================================================================
-# 2. VennHead + VennPacking + ANF Engine (C242, C251, C301, C302)
+# 2. голова Венна, упаковка Венна и двигатель АНФ
 # ==============================================================================
 
 
-def venn_atoms(s1: np.ndarray, s2: np.ndarray) -> np.ndarray:
-    """Exact 4-ReLU-neuron Venn atom basis on {-1, +1} inputs (C242)."""
-    return np.column_stack(
-        [
-            np.maximum(0.0, (-s1 - s2) * 0.5),
-            np.maximum(0.0, (-s1 + s2) * 0.5),
-            np.maximum(0.0, (s1 - s2) * 0.5),
-            np.maximum(0.0, (s1 + s2) * 0.5),
+def venn_atoms(s1: np.ndarray, s2: np.ndarray) -> np.ndarray:  # базис из четырёх атомов Венна на входах {−1, +1}
+    """Точный базис из четырёх нейронов ReLU для атомов Венна на входах {−1, +1}:
+            каждый столбец — ReLU(±s1 ± s2)/2, ровно один атом равен 1 для каждой пары."""
+    return np.column_stack(  # столбцы — атомы
+        [  # список столбцов
+            np.maximum(0.0, (-s1 - s2) * 0.5),  # ReLU((−s1 − s2)/2) — атом (−1, −1)
+            np.maximum(0.0, (-s1 + s2) * 0.5),  # ReLU((−s1 + s2)/2) — атом (−1, +1)
+            np.maximum(0.0, (s1 - s2) * 0.5),  # ReLU((s1 − s2)/2) — атом (+1, −1)
+            np.maximum(0.0, (s1 + s2) * 0.5),  # ReLU((s1 + s2)/2) — атом (+1, +1)
         ]
     )
 
 
-def venn_head_eval(mask: int, x_bin: Sequence[int]) -> int:
-    s1 = np.array([2.0 * int(x_bin[0]) - 1.0])
-    s2 = np.array([2.0 * int(x_bin[1]) - 1.0])
-    atoms = venn_atoms(s1, s2)[0]
-    w = np.array([(mask >> idx) & 1 for idx in range(4)], dtype=np.float64)
-    return int(round(float(atoms @ w)))
+def venn_head_eval(mask: int, x_bin: Sequence[int]) -> int:  # значение головы Венна: маска на паре битов
+    s1 = np.array([2.0 * int(x_bin[0]) - 1.0])  # s1 = 2·x_1 − 1 (бит → ±1)
+    s2 = np.array([2.0 * int(x_bin[1]) - 1.0])  # второй сигнал s2 = 2·x_2 − 1
+    atoms = venn_atoms(s1, s2)[0]  # атомы — строка из 4 значений
+    w = np.array([(mask >> idx) & 1 for idx in range(4)], dtype=np.float64)  # веса — биты маски
+    return int(round(float(atoms @ w)))  # round(Σ_i атом_i·w_i)
 
 
-def pack_venn_16_flat() -> bytes:
-    """C251: 16 masks x 4 trits -> 13 bytes flat (tight lower bound)."""
-    trits = []
-    for mask in range(16):
-        for idx in range(4):
-            trits.append((mask >> idx) & 1)
-    while len(trits) % 5 != 0:
-        trits.append(0)
-    out = bytearray()
-    for off in range(0, len(trits), 5):
-        b = 0
-        for t in trits[off : off + 5]:
-            b = b * 3 + t
-        out.append(b)
-    assert len(out) == 13
-    return bytes(out)
+def pack_venn_16_flat() -> bytes:  # упаковать 16 масок × 4 бита в 13 байт
+    """Упаковать 16 масок по 4 трита в 13 байт плоским кодом (плотная нижняя граница:
+            64 трита по 5 на байт в основании 3 дают 13 байт)."""
+    trits = []  # триты (здесь — биты) упаковки
+    for mask in range(16):  # по маскам
+        for idx in range(4):  # по битам
+            trits.append((mask >> idx) & 1)  # бит idx маски
+    while len(trits) % 5 != 0:  # пока длина не кратна 5
+        trits.append(0)  # дополнить нулём
+    out = bytearray()  # выходные байты
+    for off in range(0, len(trits), 5):  # по группам из 5
+        b = 0  # байт-накопитель
+        for t in trits[off : off + 5]:  # по тритам группы
+            b = b * 3 + t  # b = 3·b + t (основание 3: значение ≤ 80 < 256)
+        out.append(b)  # добавить байт
+    assert len(out) == 13  # ровно 13 байт
+    return bytes(out)  # упакованные байты
 
 
-def unpack_venn_16_flat(buf: bytes) -> list[int]:
-    assert len(buf) == 13
-    trits = []
-    for b in buf:
-        chunk = [0] * 5
-        v = b
-        for i in range(4, -1, -1):
-            chunk[i] = v % 3
-            v //= 3
-        trits.extend(chunk)
-    masks = []
-    for m in range(16):
-        val = 0
-        for idx in range(4):
-            val |= (trits[m * 4 + idx] & 1) << idx
-        masks.append(val)
-    return masks
+def unpack_venn_16_flat(buf: bytes) -> list[int]:  # распаковать 13 байт в 16 масок
+    assert len(buf) == 13  # ожидается 13 байт
+    trits = []  # триты
+    for b in buf:  # по байтам
+        chunk = [0] * 5  # группа из 5 тритов
+        v = b  # остаток
+        for i in range(4, -1, -1):  # от младшего трита к старшему
+            chunk[i] = v % 3  # трит i = v mod 3
+            v //= 3  # остаток v = ⌊v / 3⌋
+        trits.extend(chunk)  # добавить группу
+    masks = []  # маски
+    for m in range(16):  # по маскам
+        val = 0  # значение маски
+        for idx in range(4):  # по битам
+            val |= (trits[m * 4 + idx] & 1) << idx  # установить бит idx из трита 4·m + idx
+        masks.append(val)  # добавить маску
+    return masks  # 16 масок
 
 
-def anf_transform(truth_table: Sequence[int]) -> list[int]:
-    """Exact C301 Zhegalkin butterfly. O(n 2^n)."""
-    n_tot = len(truth_table)
-    if n_tot == 0 or (n_tot & (n_tot - 1)) != 0:
-        raise ValueError("truth_table length must be a power of 2")
-    coeffs = [int(v) & 1 for v in truth_table]
-    step = 1
-    while step < n_tot:
-        for i in range(0, n_tot, step * 2):
-            for j in range(step):
-                coeffs[i + step + j] ^= coeffs[i + j]
-        step <<= 1
-    return coeffs
+def anf_transform(truth_table: Sequence[int]) -> list[int]:  # преобразование Жегалкина: таблица истинности → коэффициенты АНФ, O(n·2^n)
+    """Точное преобразование Жегалкина («бабочка»): таблица истинности длины 2^n →
+            коэффициенты АНФ; сложность O(n·2^n)."""
+    n_tot = len(truth_table)  # длина таблицы
+    if n_tot == 0 or (n_tot & (n_tot - 1)) != 0:  # не степень двойки
+        raise ValueError("truth_table length must be a power of 2")  # ошибка
+    coeffs = [int(v) & 1 for v in truth_table]  # копия таблицы по модулю 2
+    step = 1  # шаг бабочки 1
+    while step < n_tot:  # пока шаг меньше длины
+        for i in range(0, n_tot, step * 2):  # по блокам длины 2·step
+            for j in range(step):  # по первой половине блока
+                coeffs[i + step + j] ^= coeffs[i + j]  # вторая половина XOR первая: c[i+step+j] ⊕= c[i+j]
+        step <<= 1  # шаг ·2
+    return coeffs  # коэффициенты АНФ
 
 
-def anf_support_vars(coeffs: Sequence[int], n_vars: int) -> tuple[int, ...]:
-    used = 0
-    for s, c in enumerate(coeffs):
-        if c:
-            used |= s
-    return tuple(i for i in range(n_vars) if (used >> (n_vars - 1 - i)) & 1)
+def anf_support_vars(coeffs: Sequence[int], n_vars: int) -> tuple[int, ...]:  # номера переменных, входящих хоть в один моном
+    used = 0  # маска использованных переменных
+    for s, c in enumerate(coeffs):  # по коэффициентам (номер = маска монома)
+        if c:  # коэффициент ненулевой
+            used |= s  # объединить маски
+    return tuple(i for i in range(n_vars) if (used >> (n_vars - 1 - i)) & 1)  # переменные с установленным битом
 
 
-def anf_to_expr_v8(coeffs: Sequence[int], n_vars: int) -> ExprV8:
-    sparse = tuple((s, 1) for s, c in enumerate(coeffs) if c)
-    if len(sparse) == 0:
-        return ExprV8.const(0)
-    if len(sparse) == 1 and sparse[0][0] == 0:
-        return ExprV8.const(1)
-    if len(sparse) <= 4:
-        mons = []
-        for s, _ in sparse:
-            if s == 0:
-                mons.append(ExprV8.const(1))
-            else:
-                vs = [
-                    ExprV8.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1
+def anf_to_expr_v8(coeffs: Sequence[int], n_vars: int) -> ExprV8:  # коэффициенты АНФ → выражение ExprV8
+    sparse = tuple((s, 1) for s, c in enumerate(coeffs) if c)  # ненулевые мономы (маска, 1)
+    if len(sparse) == 0:  # мономов нет
+        return ExprV8.const(0)  # константа 0
+    if len(sparse) == 1 and sparse[0][0] == 0:  # только константный моном
+        return ExprV8.const(1)  # константа 1
+    if len(sparse) <= 4:  # не более четырёх мономов — явное дерево
+        mons = []  # мономы-выражения
+        for s, _ in sparse:  # по мономам
+            if s == 0:  # константный
+                mons.append(ExprV8.const(1))  # моном — константа 1
+            else:  # произведение переменных
+                vs = [  # переменные монома
+                    ExprV8.var(i) for i in range(n_vars) if (s >> (n_vars - 1 - i)) & 1  # переменная i, если бит маски установлен
                 ]
-                t = vs[0]
-                for v in vs[1:]:
-                    t = ExprV8("bit_and", (t, v))
-                mons.append(t)
-        res = mons[0]
-        for m in mons[1:]:
-            res = ExprV8("bit_xor", (res, m))
-        return res
-    return ExprV8("anf", (), (n_vars, sparse))
+                t = vs[0]  # начать с первой
+                for v in vs[1:]:  # по остальным
+                    t = ExprV8("bit_and", (t, v))  # t = t И v
+                mons.append(t)  # добавить моном
+        res = mons[0]  # начать с первого монома
+        for m in mons[1:]:  # по остальным
+            res = ExprV8("bit_xor", (res, m))  # результат res = res XOR m
+        return res  # выражение
+    return ExprV8("anf", (), (n_vars, sparse))  # иначе — компактный узел АНФ
 
 
 # ==============================================================================
-# 3. Certified Range-Safe CE + EF21-Muon + BitAlloc RVQ
+# 3. сертифицированный безопасный по диапазону шаг CE, EF21-Muon и битовое выделение RVQ
 # ==============================================================================
 
 
-def batch_logit_safe_step_ce(
-    X_feat: np.ndarray,
-    y_int: np.ndarray,
-    num_classes: int,
-    steps: int = 80,
-    l2_reg: Optional[np.ndarray] = None,
-    eps_pert: float = 0.0,
-) -> dict[str, Any]:
-    """C223/C230: eta = 4*A / R'^2 with 4*eps gate, CertStepGen fields tracked."""
-    X_feat = np.asarray(X_feat, dtype=np.float64)
-    raw_y = np.asarray(y_int)
-    if (
-        raw_y.ndim != 1
-        or not np.all(np.isfinite(raw_y))
-        or np.any(raw_y != np.floor(raw_y))
+def batch_logit_safe_step_ce(  # сертифицированный шаг логистической регрессии по перекрёстной энтропии
+    X_feat: np.ndarray,  # матрица признаков (B, d)
+    y_int: np.ndarray,  # метки классов (B,)
+    num_classes: int,  # число классов
+    steps: int = 80,  # число шагов 80
+    l2_reg: Optional[np.ndarray] = None,  # L2-регуляризация по признакам (нет по умолчанию)
+    eps_pert: float = 0.0,  # допуск возмущения 0
+) -> dict[str, Any]:  # вернуть словарь итогов шага
+    """Сертифицированный шаг: η = 4·A / R'² с воротами 4·eps; отслеживаются поля
+            шага CertStepGen. Аргументы: X_feat (B, d), y_int (B,), num_classes, steps,
+            l2_reg, eps_pert. Возвращает словарь итогов шага."""
+    X_feat = np.asarray(X_feat, dtype=np.float64)  # признаки — float64
+    raw_y = np.asarray(y_int)  # метки как массив
+    if (  # проверка меток
+        raw_y.ndim != 1  # не одномерные
+        or not np.all(np.isfinite(raw_y))  # или есть нечисловые
+        or np.any(raw_y != np.floor(raw_y))  # или нецелые
     ):
-        raise ValueError("y_int must be a one-dimensional array of integer labels")
-    y_int = raw_y.astype(np.int64)
-    if X_feat.ndim != 2 or X_feat.shape[0] == 0 or X_feat.shape[1] == 0:
-        raise ValueError("X_feat must be a nonempty rank-2 matrix")
-    B, d = X_feat.shape
-    if not np.all(np.isfinite(X_feat)):
-        raise ValueError("X_feat must contain only finite values")
-    if int(num_classes) < 2:
-        raise ValueError("num_classes must be at least 2")
-    if y_int.shape != (B,) or np.any(y_int < 0) or np.any(y_int >= int(num_classes)):
-        raise ValueError("y_int must contain one valid class index per row")
-    if int(steps) < 0:
-        raise ValueError("steps must be nonnegative")
-    if not math.isfinite(float(eps_pert)) or float(eps_pert) < 0:
-        raise ValueError("eps_pert must be finite and nonnegative")
-    theta = np.zeros((int(num_classes), d), dtype=np.float64)
-    reg = (
-        np.zeros(d, dtype=np.float64)
-        if l2_reg is None
-        else np.asarray(l2_reg, dtype=np.float64)
+        raise ValueError("y_int must be a one-dimensional array of integer labels")  # ошибка
+    y_int = raw_y.astype(np.int64)  # метки — int64
+    if X_feat.ndim != 2 or X_feat.shape[0] == 0 or X_feat.shape[1] == 0:  # не матрица или пуста
+        raise ValueError("X_feat must be a nonempty rank-2 matrix")  # ошибка
+    B, d = X_feat.shape  # B — число строк, d — число признаков
+    if not np.all(np.isfinite(X_feat)):  # есть нечисловые признаки
+        raise ValueError("X_feat must contain only finite values")  # ошибка
+    if int(num_classes) < 2:  # классов меньше двух
+        raise ValueError("num_classes must be at least 2")  # ошибка
+    if y_int.shape != (B,) or np.any(y_int < 0) or np.any(y_int >= int(num_classes)):  # размер меток неверен или метки вне 0..K−1
+        raise ValueError("y_int must contain one valid class index per row")  # ошибка
+    if int(steps) < 0:  # шагов меньше нуля
+        raise ValueError("steps must be nonnegative")  # ошибка
+    if not math.isfinite(float(eps_pert)) or float(eps_pert) < 0:  # допуск не конечен или отрицателен
+        raise ValueError("eps_pert must be finite and nonnegative")  # ошибка
+    theta = np.zeros((int(num_classes), d), dtype=np.float64)  # веса θ — нулевая матрица (K, d)
+    reg = (  # регуляризация
+        np.zeros(d, dtype=np.float64)  # нулевой вектор d
+        if l2_reg is None  # если не задана
+        else np.asarray(l2_reg, dtype=np.float64)  # иначе — заданный вектор
     )
-    if reg.shape != (d,) or not np.all(np.isfinite(reg)) or np.any(reg < 0):
-        raise ValueError("l2_reg must be a finite nonnegative vector of length d")
+    if reg.shape != (d,) or not np.all(np.isfinite(reg)) or np.any(reg < 0):  # не длины d, есть нечисловые или отрицательные
+        raise ValueError("l2_reg must be a finite nonnegative vector of length d")  # ошибка
 
-    def ce_loss(th: np.ndarray) -> float:
-        lg = X_feat @ th.T
-        lg_s = lg - np.max(lg, axis=1, keepdims=True)
-        lse = np.max(lg, axis=1) + np.log(np.sum(np.exp(lg_s), axis=1))
-        target_l = lg[np.arange(B), y_int]
-        reg_term = 0.5 * float(np.sum(reg[None, :] * (th**2)))
-        return float(np.mean(lse - target_l)) + reg_term
+    def ce_loss(th: np.ndarray) -> float:  # перекрёстная энтропия для весов th
+        lg = X_feat @ th.T  # логиты z = X·θᵀ
+        lg_s = lg - np.max(lg, axis=1, keepdims=True)  # логиты минус максимум по строке: z − max_k z_k
+        lse = np.max(lg, axis=1) + np.log(np.sum(np.exp(lg_s), axis=1))  # logsumexp: максимум по классам плюс логарифм суммы exp(z − max z)
+        target_l = lg[np.arange(B), y_int]  # логит правильного класса z_{y_n}
+        reg_term = 0.5 * float(np.sum(reg[None, :] * (th**2)))  # регуляризация 0.5·Σ reg_j·θ_j²
+        return float(np.mean(lse - target_l)) + reg_term  # CE = mean_n(lse_n − z_{y_n}) + регуляризация
 
-    loss0 = ce_loss(theta)
-    cur_loss = loss0
-    accepted = held = 0
-    for _ in range(steps):
-        lg = X_feat @ theta.T
-        lg_s = lg - np.max(lg, axis=1, keepdims=True)
-        exp_l = np.exp(lg_s)
-        probs = exp_l / np.sum(exp_l, axis=1, keepdims=True)
-        res = probs.copy()
-        res[np.arange(B), y_int] -= 1.0
-        g_bar = (res.T @ X_feat) / B + (reg[None, :] * theta)
-        D = -g_bar
-        A = float(np.sum(g_bar * g_bar))
-        if A < 1e-18:
-            held += 1
-            break
-        d_logits = X_feat @ D.T
-        r_prime = np.max(d_logits, axis=1) - np.min(d_logits, axis=1)
-        Q_prime = float(np.mean(r_prime * r_prime))
-        curv_reg = (
-            2.0 * float(np.max(reg)) * float(np.sum(D * D)) if np.any(reg > 0) else 0.0
+    loss0 = ce_loss(theta)  # начальные потери
+    cur_loss = loss0  # текущие потери
+    accepted = held = 0  # счётчики принятых и удержанных шагов
+    for _ in range(steps):  # по шагам
+        lg = X_feat @ theta.T  # логиты z = X·θᵀ
+        lg_s = lg - np.max(lg, axis=1, keepdims=True)  # z − max z по строке
+        exp_l = np.exp(lg_s)  # экспоненты exp(z − max z)
+        probs = exp_l / np.sum(exp_l, axis=1, keepdims=True)  # софтмакс p_k = exp(z_k − max z) / Σ_j exp(z_j − max z)
+        res = probs.copy()  # остаток — копия вероятностей
+        res[np.arange(B), y_int] -= 1.0  # на месте правильного класса p_{y_n} − 1
+        g_bar = (res.T @ X_feat) / B + (reg[None, :] * theta)  # средний градиент ḡ = (1/B)·resᵀ·X + reg ⊙ θ
+        D = -g_bar  # направление спуска D = −ḡ
+        A = float(np.sum(g_bar * g_bar))  # квадрат нормы A = ‖ḡ‖²
+        if A < 1e-18:  # градиент почти нулевой
+            held += 1  # шаг удержан
+            break  # стоп
+        d_logits = X_feat @ D.T  # изменение логитов Δz = X·Dᵀ
+        r_prime = np.max(d_logits, axis=1) - np.min(d_logits, axis=1)  # размах по классам r'_n = max_k Δz_nk − min_k Δz_nk
+        Q_prime = float(np.mean(r_prime * r_prime))  # средний квадрат размаха Q' = mean_n(r'_n²)
+        curv_reg = (  # кривизна регуляризации
+            2.0 * float(np.max(reg)) * float(np.sum(D * D)) if np.any(reg > 0) else 0.0  # 2·max(reg)·‖D‖², если регуляризация есть, иначе 0
         )
-        denom = Q_prime + 4.0 * curv_reg
-        if denom <= 1e-18:
-            held += 1
-            break
-        eta = 4.0 * A / denom
-        cert_drop = 2.0 * (A**2) / denom
-        if eps_pert > 0.0 and 4.0 * eps_pert >= cert_drop:
-            held += 1
-            break
-        cand = theta + eta * D
-        cand_loss = ce_loss(cand)
-        if cand_loss <= cur_loss + 1e-12:
-            theta = cand
-            cur_loss = cand_loss
-            accepted += 1
-        else:
-            held += 1
-            break
-    return {
-        "theta": theta,
-        "loss0": loss0,
-        "loss_final": cur_loss,
-        "total_drop": loss0 - cur_loss,
-        "accepted_steps": accepted,
-        "hold_steps": held,
+        denom = Q_prime + 4.0 * curv_reg  # знаменатель Q' + 4·кривизна
+        if denom <= 1e-18:  # знаменатель почти нулевой
+            held += 1  # шаг удержан
+            break  # стоп
+        eta = 4.0 * A / denom  # размер шага η = 4A / (Q' + 4·кривизна)
+        cert_drop = 2.0 * (A**2) / denom  # гарантированное убывание 2A² / знаменатель
+        if eps_pert > 0.0 and 4.0 * eps_pert >= cert_drop:  # возмущение съедает всю гарантию
+            held += 1  # шаг удержан
+            break  # стоп
+        cand = theta + eta * D  # кандидат θ' = θ + η·D
+        cand_loss = ce_loss(cand)  # потери кандидата
+        if cand_loss <= cur_loss + 1e-12:  # потери не выросли
+            theta = cand  # принять
+            cur_loss = cand_loss  # обновить потери
+            accepted += 1  # принятых + 1
+        else:  # потери выросли
+            held += 1  # шаг удержан
+            break  # стоп
+    return {  # словарь итогов
+        "theta": theta,  # итоговые веса
+        "loss0": loss0,  # начальные потери
+        "loss_final": cur_loss,  # конечные потери
+        "total_drop": loss0 - cur_loss,  # полное убывание
+        "accepted_steps": accepted,  # принято шагов
+        "hold_steps": held,  # удержано шагов
     }
 
 
-def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 5) -> np.ndarray:
-    """C296/C297: X <- X(3I - X^T X)/2."""
-    X = G.astype(np.float64).copy()
-    norm = float(np.linalg.norm(X))
-    if norm < 1e-12:
-        return X
-    X /= norm
-    transposed = False
-    if X.shape[0] > X.shape[1]:
-        X = X.T
-        transposed = True
-    I_m = np.eye(X.shape[0], dtype=np.float64)
-    for _ in range(iters):
-        X = 0.5 * (3.0 * I_m - X @ X.T) @ X
-    return X.T if transposed else X
+def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 5) -> np.ndarray:  # ортогонализация Ньютона — Шульца: итерации X ← X(3I − XᵀX)/2
+    """Ортогонализация Ньютона — Шульца: X ← X(3I − XᵀX)/2, iters итераций;
+    нормирует вход, при высоком входе работает с транспонированным."""
+    X = G.astype(np.float64).copy()  # копия в float64
+    norm = float(np.linalg.norm(X))  # норма Фробениуса ‖X‖
+    if norm < 1e-12:  # почти нулевая
+        return X  # без изменений
+    X /= norm  # нормировать X = X / ‖X‖
+    transposed = False  # признак транспонирования
+    if X.shape[0] > X.shape[1]:  # строк больше, чем столбцов
+        X = X.T  # транспонировать
+        transposed = True  # запомнить
+    I_m = np.eye(X.shape[0], dtype=np.float64)  # единичная матрица размера m×m
+    for _ in range(iters):  # по итерациям
+        X = 0.5 * (3.0 * I_m - X @ X.T) @ X  # итерация X ← (3I − X·Xᵀ)·X / 2
+    return X.T if transposed else X  # вернуть, вернув транспонирование при необходимости
 
 
-def quantize_5block_single(
-    blk: np.ndarray,
-) -> tuple[np.ndarray, tuple[int, int, int], int]:
-    """Fin 255 dyadic + 5-trit encoding with verified ternary_split_le bound."""
-    blk = np.asarray(blk, dtype=np.float64)
-    if blk.shape != (5,) or not np.all(np.isfinite(blk)):
-        raise ValueError("quantize_5block_single expects five finite values")
-    m = float(np.max(np.abs(blk)))
-    if m == 0.0:
-        # Five zero trits are encoded as base-3 digits 1 (offset code +1).
-        return np.zeros_like(blk), (0, 0, 121), 0
-    exp2 = math.ceil(math.log2(m / 1.5 + 1e-18))
-    sc = 2.0**exp2
-    bn = blk / sc
-    s = DYADIC_LEVELS[:, None]
-    q_int = np.where(
-        bn[None, :] / s > 0.5, 1.0, np.where(bn[None, :] / s < -0.5, -1.0, 0.0)
+def quantize_5block_single(  # квантовать блок из 5 значений в двоичные уровни с 5-тритовым кодом
+    blk: np.ndarray,  # блок из 5 значений
+) -> tuple[np.ndarray, tuple[int, int, int], int]:  # вернуть (квантованный блок, (экспонента, уровень, код), номер уровня)
+    """Квантование блока из 5 значений: 255 двоичных уровней (c + 1)/128 и код из 5
+    тритов; выбор уровня минимизирует ошибку, проверяется её верхняя граница."""
+    blk = np.asarray(blk, dtype=np.float64)  # массив float64
+    if blk.shape != (5,) or not np.all(np.isfinite(blk)):  # не 5 значений или есть нечисловые
+        raise ValueError("quantize_5block_single expects five finite values")  # ошибка
+    m = float(np.max(np.abs(blk)))  # максимум модуля m = max |b_i|
+    if m == 0.0:  # все нули
+        # Пять нулевых тритов кодируются цифрами основания 3, равными 1 (смещённый код +1).
+        return np.zeros_like(blk), (0, 0, 121), 0  # нулевой блок, код 121 = 1 + 3 + 9 + 27 + 81 (пять смещённых нулей)
+    exp2 = math.ceil(math.log2(m / 1.5 + 1e-18))  # экспонента e = ⌈log2(m / 1.5)⌉
+    sc = 2.0**exp2  # масштаб sc = 2^e
+    bn = blk / sc  # нормированный блок b = blk / sc
+    s = DYADIC_LEVELS[:, None]  # уровни s — столбец
+    q_int = np.where(  # триты по каждому уровню
+        bn[None, :] / s > 0.5, 1.0, np.where(bn[None, :] / s < -0.5, -1.0, 0.0)  # t = 1, если b/s > 0.5; −1, если b/s < −0.5; иначе 0
     )
-    q = q_int * s
-    errs = np.sum((bn[None, :] - q) ** 2, axis=1)
-    best = int(np.argmin(errs))
-    s_best = float(DYADIC_LEVELS[best])
-    trits = q_int[best].astype(int)
-    in_mask = np.abs(bn) <= 1.5 * s_best
-    sat_tail = float(np.sum(np.where(~in_mask, (np.abs(bn) - s_best) ** 2, 0.0)))
-    bound = int(np.sum(in_mask)) * (s_best / 2.0) ** 2 + sat_tail
-    assert float(errs[best]) <= bound + 1e-9
-    bval = 0
-    for t in trits:
-        bval = bval * 3 + (int(t) + 1)
-    return q[best] * sc, (exp2, best, bval), int(best)
+    q = q_int * s  # квантованные значения q = t·s
+    errs = np.sum((bn[None, :] - q) ** 2, axis=1)  # ошибка по каждому уровню E_s = Σ (b_i − q_i)²
+    best = int(np.argmin(errs))  # лучший уровень — с минимальной ошибкой
+    s_best = float(DYADIC_LEVELS[best])  # его шаг s*
+    trits = q_int[best].astype(int)  # триты лучшего уровня
+    in_mask = np.abs(bn) <= 1.5 * s_best  # не насыщенные координаты: |b_i| ≤ 1.5·s*
+    sat_tail = float(np.sum(np.where(~in_mask, (np.abs(bn) - s_best) ** 2, 0.0)))  # хвост насыщения: Σ_{насыщенные} (|b_i| − s*)²
+    bound = int(np.sum(in_mask)) * (s_best / 2.0) ** 2 + sat_tail  # верхняя граница ошибки: n_внутри·(s*/2)² + хвост
+    assert float(errs[best]) <= bound + 1e-9  # ошибка не выше границы
+    bval = 0  # упакованный код
+    for t in trits:  # по тритам
+        bval = bval * 3 + (int(t) + 1)  # код = Σ (t_i + 1)·3^(4−i), цифры 0..2
+    return q[best] * sc, (exp2, best, bval), int(best)  # блок в исходном масштабе, метаданные, номер уровня
 
 
-def quantize_bitalloc_ef21(
-    Phi: np.ndarray,
-    idx: np.ndarray,
-    wk: np.ndarray,
-    y: np.ndarray,
-    sy: float,
-    lam: float,
-    max_extra_stages: int = 10,
-) -> tuple[np.ndarray, int, list[Any]]:
-    """BitAlloc (imbalance_yields_gain) + EF21 Data-Aware ResidualVQ."""
-    if idx.size == 0:
-        return np.zeros(Phi.shape[1], dtype=np.float64), 1, []
-    mag_order = np.argsort(-np.abs(wk))
-    idx_sorted = idx[mag_order]
-    Sub_s = Phi[:, idx_sorted]
-    col_energy = np.mean(Sub_s**2, axis=0)
-    A = Sub_s.T @ Sub_s + max(lam, 1e-9) * np.eye(idx.size)
+def quantize_bitalloc_ef21(  # остаточное векторное квантование с поблочным выделением бит
+    Phi: np.ndarray,  # матрица признаков (N, D)
+    idx: np.ndarray,  # номера выбранных признаков
+    wk: np.ndarray,  # их веса
+    y: np.ndarray,  # нормированные целевые значения
+    sy: float,  # масштаб выхода
+    lam: float,  # параметр регуляризации
+    max_extra_stages: int = 10,  # максимум дополнительных стадий 10
+) -> tuple[np.ndarray, int, list[Any]]:  # вернуть (квантованные веса, число байт, записи стадий)
+    """Поблочное выделение бит и остаточное векторное квантование, учитывающее данные:
+    первая стадия квантует все блоки, далее добавляются стадии для блока с наибольшим
+    вкладом остатка. Возвращает (веса, число байт, записи стадий)."""
+    if idx.size == 0:  # признаков нет
+        return np.zeros(Phi.shape[1], dtype=np.float64), 1, []  # нулевые веса, 1 байт, без записей
+    mag_order = np.argsort(-np.abs(wk))  # порядок номеров по убыванию |w|
+    idx_sorted = idx[mag_order]  # номера в этом порядке
+    Sub_s = Phi[:, idx_sorted]  # подматрица выбранных столбцов
+    col_energy = np.mean(Sub_s**2, axis=0)  # энергия столбца: средний квадрат
+    A = Sub_s.T @ Sub_s + max(lam, 1e-9) * np.eye(idx.size)  # матрица A = SᵀS + max(λ, 1e-9)·I
 
-    k = idx.size
-    n_blocks = (k + 4) // 5
-    wq_s = np.zeros(k, dtype=np.float64)
-    dw = wk[mag_order].copy()
-    records = []
+    k = idx.size  # число выбранных признаков
+    n_blocks = (k + 4) // 5  # число блоков по 5: ⌈k / 5⌉
+    wq_s = np.zeros(k, dtype=np.float64)  # квантованная сумма стадий
+    dw = wk[mag_order].copy()  # веса в порядке убывания модуля
+    records = []  # записи (номер блока, метаданные)
 
-    for b in range(n_blocks):
-        sl = slice(b * 5, min((b + 1) * 5, k))
-        blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))
-        q_blk, meta, _ = quantize_5block_single(blk)
-        wq_s[sl] += q_blk[: sl.stop - sl.start]
-        records.append((b, meta))
+    for b in range(n_blocks):  # по блокам — первая стадия
+        sl = slice(b * 5, min((b + 1) * 5, k))  # срез 5·b .. min(5·b + 5, k)
+        blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))  # блок, дополненный нулями до 5
+        q_blk, meta, _ = quantize_5block_single(blk)  # квантовать блок
+        wq_s[sl] += q_blk[: sl.stop - sl.start]  # прибавить квантованные значения
+        records.append((b, meta))  # записать стадию
 
-    for _ in range(max_extra_stages):
-        r_data = y - Sub_s @ wq_s
-        mse_raw = float(np.mean((r_data * sy) ** 2))
-        if mse_raw < 0.01:
-            break
-        dw = np.linalg.solve(A, Sub_s.T @ r_data)
-        blk_errs = [
-            float(
-                np.sum(
-                    (dw[b * 5 : min((b + 1) * 5, k)] ** 2)
-                    * col_energy[b * 5 : min((b + 1) * 5, k)]
+    for _ in range(max_extra_stages):  # дополнительные стадии
+        r_data = y - Sub_s @ wq_s  # остаток данных r = y − S·w_q
+        mse_raw = float(np.mean((r_data * sy) ** 2))  # его MSE в исходном масштабе
+        if mse_raw < 0.01:  # остаток мал
+            break  # хватит
+        dw = np.linalg.solve(A, Sub_s.T @ r_data)  # поправка Δw = A⁻¹·Sᵀ·r
+        blk_errs = [  # важность каждого блока
+            float(  # число
+                np.sum(  # сумма
+                    (dw[b * 5 : min((b + 1) * 5, k)] ** 2)  # квадраты поправок блока
+                    * col_energy[b * 5 : min((b + 1) * 5, k)]  # умноженные на энергию столбцов
                 )
             )
-            for b in range(n_blocks)
+            for b in range(n_blocks)  # по блокам
         ]
-        best_b = int(np.argmax(blk_errs))
-        if blk_errs[best_b] * (sy * sy) < 1e-5:
-            break
-        sl = slice(best_b * 5, min((best_b + 1) * 5, k))
-        blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))
-        q_blk, meta, _ = quantize_5block_single(blk)
-        wq_s[sl] += q_blk[: sl.stop - sl.start]
-        records.append((best_b, meta))
+        best_b = int(np.argmax(blk_errs))  # самый важный блок
+        if blk_errs[best_b] * (sy * sy) < 1e-5:  # его вклад мал в исходном масштабе
+            break  # хватит
+        sl = slice(best_b * 5, min((best_b + 1) * 5, k))  # срез блока
+        blk = np.pad(dw[sl], (0, 5 - (sl.stop - sl.start)))  # блок до 5 значений
+        q_blk, meta, _ = quantize_5block_single(blk)  # квантовать
+        wq_s[sl] += q_blk[: sl.stop - sl.start]  # прибавить
+        records.append((best_b, meta))  # записать стадию
 
-    out = np.zeros(Phi.shape[1], dtype=np.float64)
-    out[idx_sorted] = wq_s
-    nbytes = 1 + k + n_blocks * 3 + (len(records) - n_blocks) * 4
-    return out, nbytes, records
+    out = np.zeros(Phi.shape[1], dtype=np.float64)  # полные веса — нули
+    out[idx_sorted] = wq_s  # на места выбранных признаков — квантованная сумма
+    nbytes = 1 + k + n_blocks * 3 + (len(records) - n_blocks) * 4  # байты: 1 + k + 3·блоков + 4·доп. стадий
+    return out, nbytes, records  # веса, размер, записи
 
 
-class FactorizedSharedCore:
-    """Shared universal multi-scale core C + modular quantized task residuals R_i."""
+class FactorizedSharedCore:  # общее универсальное многошкальное ядро и модульные квантованные остатки задач
+    """Общее универсальное многошкальное ядро C и модульные квантованные остатки
+            задач R_i. Поля: W1, b1 — тангенсный слой трёх масштабов (0.8, 1.6, 3.2);
+            W1_q, b1_q — его квантованная копия; core_bytes — размер квантованного ядра."""
 
-    def __init__(self, seed: int = 42, tanh_units: int = 48):
-        if int(tanh_units) < 3 or int(tanh_units) % 3 != 0:
-            raise ValueError("tanh_units must be a positive multiple of 3 (at least 3)")
-        rng = np.random.default_rng(seed)
-        Q_raw = rng.normal(0.0, 1.0, size=(3, tanh_units))
-        Q_T, _ = np.linalg.qr(Q_raw.T)
-        scales = np.repeat(np.array([0.8, 1.6, 3.2]), tanh_units // 3)
-        self.W1 = Q_T.T * scales[None, :]
-        self.b1 = rng.uniform(-1.5, 1.5, size=(1, tanh_units))
-        core_vec = np.concatenate([self.W1.ravel(), self.b1.ravel()])
-        n_blk = (core_vec.size + 4) // 5
-        rem = core_vec.copy()
-        q_core = np.zeros_like(core_vec)
-        for _ in range(3):
-            r5 = np.pad(rem, (0, (-rem.size) % 5)).reshape(n_blk, 5)
-            q_st = np.concatenate(
-                [quantize_5block_single(r5[b])[0] for b in range(n_blk)]
-            )[: core_vec.size]
-            q_core += q_st
-            rem -= q_st
-        self.W1_q = q_core[: self.W1.size].reshape(self.W1.shape)
-        self.b1_q = q_core[self.W1.size :].reshape(self.b1.shape)
-        self.core_bytes = 3 * n_blk * 3
+    def __init__(self, seed: int = 42, tanh_units: int = 48):  # создать ядро с зерном 42 и 48 тангенсными юнитами
+        if int(tanh_units) < 3 or int(tanh_units) % 3 != 0:  # меньше 3 или не кратно 3
+            raise ValueError("tanh_units must be a positive multiple of 3 (at least 3)")  # ошибка
+        rng = np.random.default_rng(seed)  # генератор
+        Q_raw = rng.normal(0.0, 1.0, size=(3, tanh_units))  # гауссовы 3×h
+        Q_T, _ = np.linalg.qr(Q_raw.T)  # QR-разложение: ортонормированные столбцы
+        scales = np.repeat(np.array([0.8, 1.6, 3.2]), tanh_units // 3)  # три масштаба, каждый h/3 раз
+        self.W1 = Q_T.T * scales[None, :]  # W1 = Q·scales — форма (3, h)
+        self.b1 = rng.uniform(-1.5, 1.5, size=(1, tanh_units))  # смещение b1 равномерно на [−1.5, 1.5]
+        core_vec = np.concatenate([self.W1.ravel(), self.b1.ravel()])  # ядро одним вектором
+        n_blk = (core_vec.size + 4) // 5  # число блоков по 5
+        rem = core_vec.copy()  # остаток
+        q_core = np.zeros_like(core_vec)  # квантованное ядро — нули
+        for _ in range(3):  # три стадии остаточного квантования
+            r5 = np.pad(rem, (0, (-rem.size) % 5)).reshape(n_blk, 5)  # остаток блоками по 5
+            q_st = np.concatenate(  # стадия — конкатенация квантованных блоков
+                [quantize_5block_single(r5[b])[0] for b in range(n_blk)]  # квантованный блок b
+            )[: core_vec.size]  # обрезать дополнение
+            q_core += q_st  # добавить стадию
+            rem -= q_st  # остаток минус стадия
+        self.W1_q = q_core[: self.W1.size].reshape(self.W1.shape)  # квантованная W1
+        self.b1_q = q_core[self.W1.size :].reshape(self.b1.shape)  # квантованная b1
+        self.core_bytes = 3 * n_blk * 3  # байты ядра: 3 стадии · блоков · 3 байта
 
-    def features(
-        self, branch: str, xs_arr: np.ndarray, sx: float, quantized: bool = True
-    ) -> np.ndarray:
-        N, d = xs_arr.shape
-        xn = xs_arr.astype(np.float64) / sx
-        if branch == "poly":
-            cols = [xn[:, i] for i in range(d)]
-            fs = [np.ones((N, 1), dtype=np.float64)]
-            for i in range(d):
-                fs.append(cols[i][:, None])
-            for i in range(d):
-                for j in range(i, d):
-                    fs.append((cols[i] * cols[j])[:, None])
-            for i in range(d):
-                for j in range(i, d):
-                    for k in range(j, d):
-                        fs.append((cols[i] * cols[j] * cols[k])[:, None])
-            for i in range(d):
-                fs.append((cols[i] ** 4)[:, None])
-            return np.hstack(fs)
-        if branch == "hinge":
-            fs = [np.ones((N, 1), dtype=np.float64)]
-            for i in range(d):
-                fs.append(xn[:, i : i + 1])
-                for knot in (-0.375, 0.0, 0.375):
-                    fs.append(np.maximum(0.0, xn[:, i] - knot)[:, None])
-                    fs.append(np.maximum(0.0, knot - xn[:, i])[:, None])
-            for i in range(d):
-                for j in range(i + 1, d):
-                    diff = xn[:, i] - xn[:, j]
-                    fs.append(np.maximum(0.0, diff)[:, None])
-                    fs.append(np.maximum(0.0, -diff)[:, None])
-            return np.hstack(fs)
-        if branch == "bit":
-            xi = np.rint(xs_arr).astype(np.int64)
-            fs = [np.ones((N, 1), dtype=np.float64)]
-            for i in range(d):
-                fs.append((xi[:, i] < 0).astype(np.float64)[:, None])
-                for b in range(4):
-                    fs.append(((xi[:, i] >> b) & 1).astype(np.float64)[:, None])
-            if d >= 2:
-                for b in range(4):
-                    fs.append(
-                        (((xi[:, 0] >> b) & 1) * ((xi[:, 1] >> b) & 1)).astype(
-                            np.float64
-                        )[:, None]
+    def features(  # признаки ветви branch для входов
+        self, branch: str, xs_arr: np.ndarray, sx: float, quantized: bool = True  # ветвь, входы (N, d), масштаб входа, использовать ли квантованное ядро
+    ) -> np.ndarray:  # вернуть матрицу признаков
+        N, d = xs_arr.shape  # N строк, d входов
+        xn = xs_arr.astype(np.float64) / sx  # нормированные входы x / s_x
+        if branch == "poly":  # полиномиальная ветвь
+            cols = [xn[:, i] for i in range(d)]  # столбцы входов
+            fs = [np.ones((N, 1), dtype=np.float64)]  # начать с столбца единиц
+            for i in range(d):  # линейные члены
+                fs.append(cols[i][:, None])  # линейный член x_i
+            for i in range(d):  # квадраты и произведения
+                for j in range(i, d):  # по j от i до d − 1
+                    fs.append((cols[i] * cols[j])[:, None])  # произведение x_i·x_j
+            for i in range(d):  # кубы
+                for j in range(i, d):  # по j от i до d − 1
+                    for k in range(j, d):  # по k от j до d − 1
+                        fs.append((cols[i] * cols[j] * cols[k])[:, None])  # произведение x_i·x_j·x_k
+            for i in range(d):  # четвёртые степени
+                fs.append((cols[i] ** 4)[:, None])  # четвёртая степень x_i⁴
+            return np.hstack(fs)  # соединить столбцы
+        if branch == "hinge":  # ветвь шарнирных функций
+            fs = [np.ones((N, 1), dtype=np.float64)]  # столбец единиц
+            for i in range(d):  # по входам
+                fs.append(xn[:, i : i + 1])  # линейный член x_i
+                for knot in (-0.375, 0.0, 0.375):  # три узла
+                    fs.append(np.maximum(0.0, xn[:, i] - knot)[:, None])  # ReLU(x_i − узел)
+                    fs.append(np.maximum(0.0, knot - xn[:, i])[:, None])  # ReLU(узел − x_i)
+            for i in range(d):  # попарные разности
+                for j in range(i + 1, d):  # по j от i + 1 до d − 1
+                    diff = xn[:, i] - xn[:, j]  # разность x_i − x_j
+                    fs.append(np.maximum(0.0, diff)[:, None])  # ReLU(разность)
+                    fs.append(np.maximum(0.0, -diff)[:, None])  # ReLU(−разность)
+            return np.hstack(fs)  # соединить
+        if branch == "bit":  # битовая ветвь
+            xi = np.rint(xs_arr).astype(np.int64)  # округлённые целые входы
+            fs = [np.ones((N, 1), dtype=np.float64)]  # единицы
+            for i in range(d):  # по входам
+                fs.append((xi[:, i] < 0).astype(np.float64)[:, None])  # знак: 1, если x_i < 0
+                for b in range(4):  # младшие 4 бита
+                    fs.append(((xi[:, i] >> b) & 1).astype(np.float64)[:, None])  # бит b числа x_i
+            if d >= 2:  # для двух входов — совместные биты
+                for b in range(4):  # по битам
+                    fs.append(  # добавить
+                        (((xi[:, 0] >> b) & 1) * ((xi[:, 1] >> b) & 1)).astype(  # И битов: бит b первого × бит b второго
+                            np.float64  # как float64
+                        )[:, None]  # столбцом
                     )
-                fs.append(((xi[:, 0] < 0) * (xi[:, 1] < 0)).astype(np.float64)[:, None])
-            return np.hstack(fs)
-        x_pad = np.zeros((N, 3), dtype=np.float64)
-        x_pad[:, : min(3, d)] = xn[:, : min(3, d)]
-        W1 = self.W1_q if quantized else self.W1
-        b1 = self.b1_q if quantized else self.b1
-        h = np.tanh(x_pad @ W1 + b1)
-        return np.hstack(
-            [
-                self.features("poly", xs_arr, sx, quantized),
-                self.features("hinge", xs_arr, sx, quantized)[:, 1:],
-                h,
+                fs.append(((xi[:, 0] < 0) * (xi[:, 1] < 0)).astype(np.float64)[:, None])  # оба отрицательны
+            return np.hstack(fs)  # соединить
+        x_pad = np.zeros((N, 3), dtype=np.float64)  # вход, дополненный нулями до 3
+        x_pad[:, : min(3, d)] = xn[:, : min(3, d)]  # первые min(3, d) входов
+        W1 = self.W1_q if quantized else self.W1  # квантованная либо точная W1
+        b1 = self.b1_q if quantized else self.b1  # квантованная либо точная b1
+        h = np.tanh(x_pad @ W1 + b1)  # скрытый слой h = tanh(x·W1 + b1)
+        return np.hstack(  # соединить
+            [  # открытие списка столбцов
+                self.features("poly", xs_arr, sx, quantized),  # полиномиальные признаки
+                self.features("hinge", xs_arr, sx, quantized)[:, 1:],  # шарнирные без столбца единиц
+                h,  # скрытый слой
             ]
         )
 
-    def fit_residual(
-        self,
-        train_x: Sequence[Sequence[int]],
-        train_y: Sequence[int],
-        val_x: Sequence[Sequence[int]],
-        val_y: Sequence[int],
-    ) -> "FactorizedAdapter":
-        tx = np.asarray(train_x, dtype=np.float64)
-        ty = np.asarray(train_y, dtype=np.float64)
-        vx = np.asarray(val_x, dtype=np.float64) if val_x else tx
-        vy = np.asarray(val_y, dtype=np.float64) if val_y else ty
-        sx = max(1.0, float(np.max(np.abs(tx))))
-        sy = max(1.0, float(np.max(np.abs(ty))))
-        y = ty / sy
-        best = (float("inf"), "poly", None, None, 9999)
-        for bname in ("poly", "hinge", "bit", "core"):
-            Phi = self.features(bname, tx, sx, quantized=True)
-            N, D = Phi.shape
-            for lam in (1e-7, 1e-4, 1e-2):
-                A = Phi.T @ Phi + lam * np.eye(D)
-                w = np.linalg.solve(A, Phi.T @ y)
-                order = np.argsort(-np.abs(w))
-                ks = [k for k in (1, 2, 3, 4, 6, 8, 12, 16, 24, D) if k <= D]
-                for k in ks:
-                    idx = order[:k]
-                    Ak = Phi[:, idx].T @ Phi[:, idx] + max(lam, 1e-9) * np.eye(k)
-                    wk = np.linalg.solve(Ak, Phi[:, idx].T @ y)
-                    if np.max(np.abs(wk)) > 30.0:
-                        continue
-                    wc = np.zeros(D, dtype=np.float64)
-                    wc[idx] = wk
-                    wq, nb, _ = quantize_bitalloc_ef21(Phi, idx, wk, y, sy, lam)
-                    pred_q = (Phi @ wq) * sy
-                    mse_q = float(np.mean((pred_q - ty) ** 2))
-                    acc_tr = float(np.mean(np.rint(pred_q) == ty))
-                    obj = mse_q + 0.002 * nb + (1.0 - acc_tr) * 0.5
-                    if obj < best[0]:
-                        best = (obj, bname, wc, wq, nb)
-                    if mse_q < 1e-3:
-                        break
-                if best[0] < 0.05:
-                    break
-            if best[0] < 0.02:
-                break
+    def fit_residual(  # подобрать остаток (адаптер) под задачу
+        self,  # само ядро
+        train_x: Sequence[Sequence[int]],  # обучающие входы
+        train_y: Sequence[int],  # обучающие выходы
+        val_x: Sequence[Sequence[int]],  # отложенные входы
+        val_y: Sequence[int],  # отложенные выходы
+    ) -> "FactorizedAdapter":  # вернуть адаптер
+        tx = np.asarray(train_x, dtype=np.float64)  # обучающие входы
+        ty = np.asarray(train_y, dtype=np.float64)  # обучающие выходы
+        vx = np.asarray(val_x, dtype=np.float64) if val_x else tx  # отложенные входы (если нет — обучающие)
+        vy = np.asarray(val_y, dtype=np.float64) if val_y else ty  # отложенные выходы
+        sx = max(1.0, float(np.max(np.abs(tx))))  # масштаб входа s_x = max(1, max|x|)
+        sy = max(1.0, float(np.max(np.abs(ty))))  # масштаб выхода s_y
+        y = ty / sy  # нормированный выход
+        best = (float("inf"), "poly", None, None, 9999)  # лучший вариант: (цель, ветвь, точные веса, квантованные, байты)
+        for bname in ("poly", "hinge", "bit", "core"):  # по ветвям
+            Phi = self.features(bname, tx, sx, quantized=True)  # признаки
+            N, D = Phi.shape  # размеры
+            for lam in (1e-7, 1e-4, 1e-2):  # по регуляризациям
+                A = Phi.T @ Phi + lam * np.eye(D)  # матрица A = ΦᵀΦ + λ·I
+                w = np.linalg.solve(A, Phi.T @ y)  # гребнёвая оценка w = A⁻¹·Φᵀ·y
+                order = np.argsort(-np.abs(w))  # порядок признаков по убыванию |w|
+                ks = [k for k in (1, 2, 3, 4, 6, 8, 12, 16, 24, D) if k <= D]  # числа отобранных признаков
+                for k in ks:  # по ним
+                    idx = order[:k]  # первые k признаков
+                    Ak = Phi[:, idx].T @ Phi[:, idx] + max(lam, 1e-9) * np.eye(k)  # матрица A_k = Φ_kᵀΦ_k + max(λ, 1e-9)·I
+                    wk = np.linalg.solve(Ak, Phi[:, idx].T @ y)  # веса подмножества
+                    if np.max(np.abs(wk)) > 30.0:  # слишком большие веса
+                        continue  # пропустить
+                    wc = np.zeros(D, dtype=np.float64)  # полные точные веса
+                    wc[idx] = wk  # на места отобранных
+                    wq, nb, _ = quantize_bitalloc_ef21(Phi, idx, wk, y, sy, lam)  # квантовать
+                    pred_q = (Phi @ wq) * sy  # квантованные предсказания в исходном масштабе
+                    mse_q = float(np.mean((pred_q - ty) ** 2))  # их MSE
+                    acc_tr = float(np.mean(np.rint(pred_q) == ty))  # точность округлённых предсказаний
+                    obj = mse_q + 0.002 * nb + (1.0 - acc_tr) * 0.5  # цель: MSE + 0.002·байты + 0.5·(1 − точность)
+                    if obj < best[0]:  # лучше рекорда
+                        best = (obj, bname, wc, wq, nb)  # новый рекорд
+                    if mse_q < 1e-3:  # MSE достаточно мала
+                        break  # хватит
+                if best[0] < 0.05:  # цель достаточно хороша
+                    break  # не перебирать λ
+            if best[0] < 0.02:  # цель очень хороша
+                break  # не перебирать ветви
 
-        _, bname, wc, wq, nb = best
-        Phi_va = self.features(bname, vx, sx, quantized=True)
-        pred_f = (Phi_va @ wc) * sy
-        pred_q = (Phi_va @ wq) * sy
-        return FactorizedAdapter(
-            arity=tx.shape[1],
-            branch=bname,
-            sx=sx,
-            sy=sy,
-            w_float=wc,
-            w_quant=wq,
-            compressed_bytes=nb + 9,
-            val_exact_acc_float=float(np.mean(np.rint(pred_f) == vy)),
-            val_exact_acc_quant=float(np.mean(np.rint(pred_q) == vy)),
-            val_mse_float=float(np.mean((pred_f - vy) ** 2)),
-            val_mse_quant=float(np.mean((pred_q - vy) ** 2)),
+        _, bname, wc, wq, nb = best  # лучший вариант
+        Phi_va = self.features(bname, vx, sx, quantized=True)  # признаки отложенных
+        pred_f = (Phi_va @ wc) * sy  # точные предсказания
+        pred_q = (Phi_va @ wq) * sy  # квантованные предсказания
+        return FactorizedAdapter(  # адаптер
+            arity=tx.shape[1],  # число входов
+            branch=bname,  # ветвь
+            sx=sx,  # масштаб входа
+            sy=sy,  # масштаб выхода
+            w_float=wc,  # точные веса
+            w_quant=wq,  # квантованные веса
+            compressed_bytes=nb + 9,  # байты + 9 служебных
+            val_exact_acc_float=float(np.mean(np.rint(pred_f) == vy)),  # отложенная точность точных
+            val_exact_acc_quant=float(np.mean(np.rint(pred_q) == vy)),  # отложенная точность квантованных
+            val_mse_float=float(np.mean((pred_f - vy) ** 2)),  # отложенная MSE точных
+            val_mse_quant=float(np.mean((pred_q - vy) ** 2)),  # отложенная MSE квантованных
         )
 
 
-@dataclass
-class FactorizedAdapter:
-    arity: int
-    branch: str
-    sx: float
-    sy: float
-    w_float: np.ndarray
-    w_quant: np.ndarray
-    compressed_bytes: int
-    val_exact_acc_float: float
-    val_exact_acc_quant: float
-    val_mse_float: float
-    val_mse_quant: float
+@dataclass  # класс данных
+class FactorizedAdapter:  # адаптер задачи: ветвь признаков и два набора весов
+    arity: int  # число входов
+    branch: str  # ветвь признаков
+    sx: float  # масштаб входа
+    sy: float  # масштаб выхода
+    w_float: np.ndarray  # точные веса
+    w_quant: np.ndarray  # квантованные веса
+    compressed_bytes: int  # оценка размера сжатых весов
+    val_exact_acc_float: float  # отложенная точность точных
+    val_exact_acc_quant: float  # отложенная точность квантованных
+    val_mse_float: float  # отложенная MSE точных
+    val_mse_quant: float  # отложенная MSE квантованных
 
-    def predict(
-        self, core: FactorizedSharedCore, xs: Sequence[int], quantized: bool = True
-    ) -> float:
-        x = np.asarray(xs, dtype=np.float64).reshape(1, -1)
-        Phi = core.features(self.branch, x, self.sx, quantized=quantized)
-        w = self.w_quant if quantized else self.w_float
-        return float((Phi @ w)[0] * self.sy)
+    def predict(  # предсказать выход для входа xs
+        self, core: FactorizedSharedCore, xs: Sequence[int], quantized: bool = True  # ядро, вход, квантованные ли веса
+    ) -> float:  # вернуть вещественное предсказание
+        x = np.asarray(xs, dtype=np.float64).reshape(1, -1)  # вход строкой (1, d)
+        Phi = core.features(self.branch, x, self.sx, quantized=quantized)  # признаки
+        w = self.w_quant if quantized else self.w_float  # веса
+        return float((Phi @ w)[0] * self.sy)  # предсказание ŷ = (Φ·w)·s_y
 
-    def to_dict(self) -> dict[str, Any]:
-        # Persist both dense arrays for an exact state round-trip. The reported
-        # compressed_bytes remains a FORMAT ESTIMATE, not the JSON/RAM footprint.
-        return {
-            "arity": self.arity,
-            "branch": self.branch,
-            "sx": self.sx,
-            "sy": self.sy,
-            "w_float": self.w_float.tolist(),
-            "w_quant": self.w_quant.tolist(),
-            "compressed_bytes": self.compressed_bytes,
-            "val_exact_acc_float": self.val_exact_acc_float,
-            "val_exact_acc_quant": self.val_exact_acc_quant,
-            "val_mse_float": self.val_mse_float,
-            "val_mse_quant": self.val_mse_quant,
+    def to_dict(self) -> dict[str, Any]:  # словарь для сериализации
+        # Сохраняются оба плотных массива для точного восстановления состояния.
+        # compressed_bytes остаётся оценкой формата, а не размером JSON или памяти.
+        return {  # вернуть словарь
+            "arity": self.arity,  # число входов
+            "branch": self.branch,  # ветвь
+            "sx": self.sx,  # масштаб входа
+            "sy": self.sy,  # масштаб выхода
+            "w_float": self.w_float.tolist(),  # точные веса списком
+            "w_quant": self.w_quant.tolist(),  # квантованные веса списком
+            "compressed_bytes": self.compressed_bytes,  # размер
+            "val_exact_acc_float": self.val_exact_acc_float,  # точность точных
+            "val_exact_acc_quant": self.val_exact_acc_quant,  # точность квантованных
+            "val_mse_float": self.val_mse_float,  # MSE точных
+            "val_mse_quant": self.val_mse_quant,  # MSE квантованных
         }
 
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "FactorizedAdapter":
-        wf = np.asarray(d.get("w_float", d.get("w_quant", [])), dtype=np.float64)
-        wq = np.asarray(d.get("w_quant", []), dtype=np.float64)
-        if wf.ndim != 1 or wq.ndim != 1 or wf.shape != wq.shape:
-            raise ValueError("invalid serialized adapter coefficient arrays")
-        return FactorizedAdapter(
-            int(d["arity"]),
-            str(d["branch"]),
-            float(d["sx"]),
-            float(d["sy"]),
-            wf,
-            wq,
-            int(d.get("compressed_bytes", 0)),
-            float(d.get("val_exact_acc_float", float("nan"))),
-            float(d.get("val_exact_acc_quant", float("nan"))),
-            float(d.get("val_mse_float", float("nan"))),
-            float(d.get("val_mse_quant", float("nan"))),
+    @staticmethod  # статический метод
+    def from_dict(d: dict[str, Any]) -> "FactorizedAdapter":  # восстановить адаптер из словаря
+        wf = np.asarray(d.get("w_float", d.get("w_quant", [])), dtype=np.float64)  # точные веса (если нет — квантованные)
+        wq = np.asarray(d.get("w_quant", []), dtype=np.float64)  # квантованные веса
+        if wf.ndim != 1 or wq.ndim != 1 or wf.shape != wq.shape:  # не векторы или разной длины
+            raise ValueError("invalid serialized adapter coefficient arrays")  # ошибка
+        return FactorizedAdapter(  # адаптер
+            int(d["arity"]),  # число входов
+            str(d["branch"]),  # ветвь
+            float(d["sx"]),  # масштаб входа
+            float(d["sy"]),  # масштаб выхода
+            wf,  # точные веса
+            wq,  # квантованные веса
+            int(d.get("compressed_bytes", 0)),  # размер (0 по умолчанию)
+            float(d.get("val_exact_acc_float", float("nan"))),  # точность точных (NaN по умолчанию)
+            float(d.get("val_exact_acc_quant", float("nan"))),  # точность квантованных
+            float(d.get("val_mse_float", float("nan"))),  # MSE точных
+            float(d.get("val_mse_quant", float("nan"))),  # MSE квантованных
         )
 
 
 # ==============================================================================
-# 4. Continual GPM + SpaceDecoupling + EF21-Muon Adapter
+# 4. непрерывная память GPM, разделение пространств и адаптер EF21-Muon
 # ==============================================================================
 
 
-class ContinualGPMMemory:
-    """GPM + SpaceDecoupling + EF21Markov: P_R = I - U U^T, zero drift on protected cortex."""
+class ContinualGPMMemory:  # непрерывная память: обучение с защитой подпространства и адаптер EF21-Muon; P_R = I − U·Uᵀ, нулевой дрейф на защищённом слое
+    """Память GPM с разделением пространств и оценкой EF21Markov: проектор
+            P_R = I − U·Uᵀ обнуляет дрейф весов на защищённом подпространстве U."""
 
-    def __init__(self, d_in: int, d_out: int, seed: int = 0):
-        rng = np.random.default_rng(seed)
-        self.W = rng.normal(0.0, 0.1, size=(d_in, d_out))
-        self.U_basis = np.zeros((d_in, 0), dtype=np.float64)
-        self.ef_v = np.zeros_like(self.W)
+    def __init__(self, d_in: int, d_out: int, seed: int = 0):  # создать память с весами d_in × d_out
+        rng = np.random.default_rng(seed)  # генератор
+        self.W = rng.normal(0.0, 0.1, size=(d_in, d_out))  # веса W — гауссовы с дисперсией 0.1
+        self.U_basis = np.zeros((d_in, 0), dtype=np.float64)  # базис защищённого подпространства — пустой
+        self.ef_v = np.zeros_like(self.W)  # состояние марковской оценки EF21 — нули
 
-    def project_orthogonal(self, G: np.ndarray) -> np.ndarray:
-        if self.U_basis.shape[1] == 0:
-            return G
-        return G - self.U_basis @ (self.U_basis.T @ G)
+    def project_orthogonal(self, G: np.ndarray) -> np.ndarray:  # спроецировать G на дополнение защищённого подпространства
+        if self.U_basis.shape[1] == 0:  # базиса нет
+            return G  # без изменений
+        return G - self.U_basis @ (self.U_basis.T @ G)  # проекция (I − U·Uᵀ)·G
 
-    def train_task_ef21_muon(
-        self, X: np.ndarray, Y: np.ndarray, steps: int = 40, lr: float = 0.2
-    ) -> float:
-        for _ in range(steps):
-            err = X @ self.W - Y
-            grad = (2.0 / len(X)) * (X.T @ err)
-            g_proj = self.project_orthogonal(grad)
-            diff = g_proj - self.ef_v
-            comp = 0.5 * diff
-            self.ef_v = self.ef_v + comp
-            step_dir = newton_schulz_orthogonalize(self.ef_v, iters=4)
-            step_dir = self.project_orthogonal(step_dir)
-            cur = float(np.mean((X @ self.W - Y) ** 2))
-            for eta in (lr, lr * 0.5, lr * 0.1, 0.01):
-                cand = self.W - eta * step_dir
-                if float(np.mean((X @ cand - Y) ** 2)) < cur:
-                    self.W = cand
-                    break
-        return float(np.mean((X @ self.W - Y) ** 2))
+    def train_task_ef21_muon(  # обучить задачу методом EF21-Muon; вернуть итоговую MSE
+        self, X: np.ndarray, Y: np.ndarray, steps: int = 40, lr: float = 0.2  # входы, выходы, 40 шагов, скорость 0.2
+    ) -> float:  # вернуть MSE
+        for _ in range(steps):  # по шагам
+            err = X @ self.W - Y  # ошибка e = X·W − Y
+            grad = (2.0 / len(X)) * (X.T @ err)  # градиент ∇ = (2/N)·Xᵀ·e
+            g_proj = self.project_orthogonal(grad)  # проекция градиента
+            diff = g_proj - self.ef_v  # разность v̄ = P·∇ − v
+            comp = 0.5 * diff  # поправка 0.5·v̄
+            self.ef_v = self.ef_v + comp  # оценка v ← v + 0.5·(P·∇ − v)
+            step_dir = newton_schulz_orthogonalize(self.ef_v, iters=4)  # ортогонализовать направление
+            step_dir = self.project_orthogonal(step_dir)  # и спроецировать
+            cur = float(np.mean((X @ self.W - Y) ** 2))  # текущая MSE
+            for eta in (lr, lr * 0.5, lr * 0.1, 0.01):  # шаги от lr до 0.01
+                cand = self.W - eta * step_dir  # кандидат W' = W − η·направление
+                if float(np.mean((X @ cand - Y) ** 2)) < cur:  # MSE уменьшилась
+                    self.W = cand  # принять
+                    break  # стоп перебора
+        return float(np.mean((X @ self.W - Y) ** 2))  # итоговая MSE
 
-    def consolidate_subspace(self, X: np.ndarray, energy_thresh: float = 0.999) -> None:
+    def consolidate_subspace(self, X: np.ndarray, energy_thresh: float = 0.999) -> None:  # закрепить подпространство задачи с долей энергии 0.999
         res_X = (
             X if self.U_basis.shape[1] == 0 else X - (X @ self.U_basis) @ self.U_basis.T
         )
