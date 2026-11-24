@@ -131,7 +131,7 @@ def main() -> None:
     chunk_bytes = 0  # число байтов текущего куска
     files_now = 0  # число файлов текущего куска
     t0 = time.time()  # начало отсчёта
-    print(f"sweep start: visited={st['visited']} sampled={st['sampled']} "
+    print(f"sweep start: visited={st['visited']} sampled={st['sampled']} "  # начало печати: счётчики посещённых, выбранных и принятых байтов
           f"ingested={st['bytes_ingested']}B chunks={st['chunks']}",  # печать начальных счётчиков
           flush=True)  # сразу сбросить вывод
     for path in iter_files("C:/"):  # по всем файлам диска C:/
@@ -178,13 +178,13 @@ def main() -> None:
                  epochs=EPOCHS_PER_CHUNK, repeat=1)  # 8 эпох, 1 повтор
         st["chunks"] += 1  # кусков: +1
     save_state(st)  # сохранить состояние
-    print(f"sweep done: visited={st['visited']} sampled={st['sampled']} "
+    print(f"sweep done: visited={st['visited']} sampled={st['sampled']} "  # начало печати итога: посещено, выбрано, заблокировано
           f"locked={st['skipped_locked']} ingested="  # печать итоговых счётчиков
           f"{st['bytes_ingested']/1e6:.0f}MB chunks={st['chunks']} "  # печать принятых МБ и кусков
           f"domains={len(u.domains)}", flush=True)  # печать числа доменов
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # запуск файла как скрипта
     main()  # выполнить просмотр
 
 
