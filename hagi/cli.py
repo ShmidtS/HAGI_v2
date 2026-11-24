@@ -1,50 +1,76 @@
-"""Unified CLI (WAVE 190): one entry point for every HAGI tool.
+"""Единая командная строка: один вход для всех инструментов HAGI.
 
-    python -m hagi.cli <command> [args...]
+Запуск:  python -m hagi.cli <команда> [аргументы...]
+Работает это так: при запуске модуля как сценария Python выполняет
+его тело, а блок в конце файла вызывает main().
 
-Commands map to the module CLIs (thin dispatch, no logic here):
-  core       self-test / grow / benchmark (canonical kernel)
-  lm         train / generate (neural body)
-  ingest     learn from any data file
-  execute    run a written program
-  loop       self-development loop
-  rewrite    self-rewrite loop
-  genesis    architecture genesis
-  certificates   portable certificate suite
+Логики здесь нет — только диспетчеризация. Схема работы main():
+  1. argv = аргументы после имени сценария (sys.argv[1:]);
+     пусто или первый аргумент -h/--help → напечатать эту справку
+     и список команд, код возврата 0;
+  2. команда не найдена в таблице COMMANDS → сообщение об ошибке
+     в поток stderr и SystemExit(2);
+  3. иначе: импортировать модуль нужного инструмента, взять из
+     него функцию-точку входа, подменить sys.argv на
+     ["hagi <команда>"] + остальные аргументы (чтобы внутренний
+     argparse видел свои флаги с 1-го элемента, как обычно при
+     запуске отдельного сценария) и вызвать эту функцию.
+
+Команды — и что делает каждая (имя → модуль, функция):
+  core          hagi.core._cli        — самопроверка ядра, циклы
+                                        роста, замер скорости
+  lm            hagi.lm.main          — обучение и генерация
+                                        байтовой языковой модели
+  ingest        hagi.io.ingest_main   — извлечение точных программ
+                                        из любого файла с данными
+  execute       hagi.io.execute_main  — запуск программ, которые
+                                        написала модель
+  loop          hagi.loop.main        — цикл саморазвития
+  rewrite       hagi.rewrite.main     — цикл само-переписывания
+  genesis       hagi.genesis.main     — генезис архитектур
+  certificates  hagi.certificates.main — проверка переносимого
+                                        конечного сертификата
 """
-from __future__ import annotations
+from __future__ import annotations  # отложить вычисление аннотаций типов: имена в них не разрешаются до момента запроса
 
-import sys
+import sys  # доступ к sys.argv (аргументы командной строки) и sys.stderr (поток ошибок)
 
-COMMANDS = {
-    "core": ("hagi.core", "_cli"),
-    "lm": ("hagi.lm", "main"),
-    "ingest": ("hagi.io", "ingest_main"),
-    "execute": ("hagi.io", "execute_main"),
-    "loop": ("hagi.loop", "main"),
-    "rewrite": ("hagi.rewrite", "main"),
-    "genesis": ("hagi.genesis", "main"),
-    "certificates": ("hagi.certificates", "main"),
+COMMANDS = {  # таблица команд: ключ — имя команды в командной строке, значение — (полное имя модуля, имя функции входа в нём)
+    "core": ("hagi.core", "_cli"),  # команда core → модуль hagi.core, функция _cli (самопроверка и рост ядра)
+    "lm": ("hagi.lm", "main"),  # команда lm → модуль hagi.lm, функция main (обучение/генерация нейронного тела)
+    "ingest": ("hagi.io", "ingest_main"),  # команда ingest → модуль hagi.io, функция ingest_main (учёба на файле данных)
+    "execute": ("hagi.io", "execute_main"),  # команда execute → модуль hagi.io, функция execute_main (исполнение написанных программ)
+    "loop": ("hagi.loop", "main"),  # команда loop → модуль hagi.loop, функция main (цикл саморазвития)
+    "rewrite": ("hagi.rewrite", "main"),  # команда rewrite → модуль hagi.rewrite, функция main (цикл само-переписывания)
+    "genesis": ("hagi.genesis", "main"),  # команда genesis → модуль hagi.genesis, функция main (генезис архитектур)
+    "certificates": ("hagi.certificates", "main"),  # команда certificates → модуль hagi.certificates, функция main (проверка сертификата)
 }
 
 
 def main(argv: list[str] | None = None) -> None:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__)
-        print("commands:", ", ".join(sorted(COMMANDS)))
-        return
-    cmd = argv[0]
-    if cmd not in COMMANDS:
-        print(f"unknown command: {cmd}", file=sys.stderr)
-        print("commands:", ", ".join(sorted(COMMANDS)), file=sys.stderr)
-        raise SystemExit(2)
-    mod_name, fn_name = COMMANDS[cmd]
-    module = __import__(mod_name, fromlist=[fn_name])
-    fn = getattr(module, fn_name)
-    sys.argv = [f"hagi {cmd}"] + argv[1:]
-    fn()
+    """Разобрать аргументы командной строки и вызвать нужный инструмент.
+
+    Аргумент argv: список аргументов без имени сценария; если None —
+    берётся sys.argv[1:]. Возврата нет: результат — побочный эффект
+    (вызов инструмента или печать). При неизвестной команде
+    возбуждается SystemExit(2).
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)  # argv = собственная копия списка аргументов: срез sys.argv[1:], если аргумент не передан, иначе сам argv (list — чтобы дальше можно было менять)
+    if not argv or argv[0] in ("-h", "--help"):  # если аргументов нет или первый аргумент — флаг помощи
+        print(__doc__)  # напечатать docstring модуля (справку по командам) в stdout
+        print("commands:", ", ".join(sorted(COMMANDS)))  # напечатать имена команд: sorted возвращает ключи словаря по алфавиту, ", ".join склеивает их через запятую с пробелом
+        return  # выйти из main с кодом возврата 0
+    cmd = argv[0]  # имя команды — первый аргумент (остальные argv[1:] пойдут инструменту)
+    if cmd not in COMMANDS:  # если такого ключа нет в таблице команд
+        print(f"unknown command: {cmd}", file=sys.stderr)  # сообщить в stderr имя команды, которой нет в таблице
+        print("commands:", ", ".join(sorted(COMMANDS)), file=sys.stderr)  # туда же — список допустимых команд (ключи COMMANDS по алфавиту через запятую)
+        raise SystemExit(2)  # прервать выполнение с кодом возврата 2 (ошибка запуска)
+    mod_name, fn_name = COMMANDS[cmd]  # распаковать кортеж таблицы: mod_name — имя модуля, fn_name — имя функции входа
+    module = __import__(mod_name, fromlist=[fn_name])  # импортировать модуль по имени; fromlist заставляет вернуть сам модуль mod_name, а не его корневой пакет hagi
+    fn = getattr(module, fn_name)  # взять из модуля атрибут с именем fn_name — функцию, которая будет вызвана
+    sys.argv = [f"hagi {cmd}"] + argv[1:]  # подменить sys.argv: элемент 0 = "hagi <команда>" (имя сценария), дальше — аргументы после команды; инструмент читает их как свои собственные
+    fn()  # вызвать функцию входа инструмента без аргументов (она читает sys.argv сама)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # если файл запущен как сценарий (python -m hagi.cli), а не импортирован
+    main()  # передать управление диспетчеру команд
