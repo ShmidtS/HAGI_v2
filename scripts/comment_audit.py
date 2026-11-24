@@ -64,8 +64,14 @@ def code_line_numbers(tree: ast.AST, src_lines: list[str]) -> set[int]:
     nums: set[int] = set()
     literal: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):  # docstring / строка-описание — целиком не код
             for ln in range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1):
+                literal.add(ln)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            # исключаем только ВНУТРЕННИЕ строки многострочного литерала (без кода на них);
+            # первая и последняя строки содержат код (присваивание, вызов)
+            end = getattr(node, "end_lineno", node.lineno)
+            for ln in range(node.lineno + 1, end):
                 literal.add(ln)
         if isinstance(node, (ast.stmt, ast.expr)):
             end = getattr(node, "end_lineno", node.lineno)
