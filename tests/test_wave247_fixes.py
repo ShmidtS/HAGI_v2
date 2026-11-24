@@ -43,10 +43,10 @@ def test_merge_bound_matches_lean_linearisation():
     L = lambda w: 10.0 + float(np.sum(np.asarray(w) ** 2))  # потеря L(w) = 10 + Σ_i w_i²
     g = lambda w: 2 * np.asarray(w, float)  # градиент g(w) = 2w
     r = merge_bound(L, g([0., 0.]), [0., 0.], [2., 0.])  # граница для w1 = (0, 0), w2 = (2, 0)
-    assert r["delta_mid"] == pytest.approx(1.0)   # was 11.0 (L1 dropped)
-    assert r["delta_end"] == pytest.approx(4.0)
-    assert r["bound"] == pytest.approx(15.0)      # was 25.0
-    assert r["L_mid"] == pytest.approx(11.0) and r["certified"]
+    assert r["delta_mid"] == pytest.approx(1.0)  # середина: δ_mid = |L(mid) − L1| = |11 − 10| = 1
+    assert r["delta_end"] == pytest.approx(4.0)  # конец: δ_end = |L2 − L1| = |14 − 10| = 4
+    assert r["bound"] == pytest.approx(15.0)  # граница: bound = (L1 + L2)/2 + δ_mid + δ_end/2 = 12 + 1 + 2 = 15
+    assert r["L_mid"] == pytest.approx(11.0) and r["certified"]  # L(mid) = 11, и граница сертифицирована
 
 
 def test_merge_bound_is_valid_on_a_nonconvex_loss():
@@ -60,7 +60,7 @@ def test_merge_bound_is_valid_on_a_nonconvex_loss():
                        - L(np.where(np.arange(6) == j, w1 - eps, w1))) / (2 * eps)  # (продолжение: вычитание L со сдвигом −eps и деление на 2·eps)
                       for j in range(6)])  # по координатам j = 0..5
         r = merge_bound(L, g, w1, w2)  # сертифицированная граница для пары (w1, w2)
-        assert r["L_mid"] <= r["bound"] + 1e-9
+        assert r["L_mid"] <= r["bound"] + 1e-9  # проверка: L(mid) ≤ bound + 1e-9
 
 
 # ---- 2. таксономия причин задержки ----
@@ -113,11 +113,11 @@ def _reference(pairs):
     for p in range(2, 257):  # перебор периода p
         for o in range(p):  # перебор смещения o
             if all((x + o) % p == y for x, y in pairs):  # все пары удовлетворяют (x + o) mod p = y — базис найден
-                return {"kind": "OUT_PERIOD", "p": p, "o": o}
+                return {"kind": "OUT_PERIOD", "p": p, "o": o}  # найден базис вида «период»: период p и смещение o
     return None  # ни одна пара (p, o) не подошла
 
 
-@pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("seed", range(12))  # тест повторяется для зёрен seed = 0..11
 def test_basis_out_period_equals_exhaustive_scan(seed):
     """basis_out_period совпадает с полным перебором на 150 случайных наборах пар для каждого из 12 зёрен
     (шесть видов зависимостей y от x)."""
@@ -159,7 +159,7 @@ def _stream(period, fn, n=3000, seed=0):
     return [(tuple(data[i - K:i]), data[i]) for i in range(K, len(data))]  # пары (контекст из 3 байтов, следующий байт)
 
 
-@pytest.mark.parametrize("period", [3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("period", [3, 4, 5, 6, 7, 8])  # тест повторяется для периодов 3..8
 def test_invent_multi_finds_laws_on_every_period_up_to_8(period):
     """Закон y = a + 2b − c + 7 на каждом периоде 3..8 находится: статус PARTIAL_LAW,
     n_shifts = period, точность на слое фазы > 0,99."""
@@ -335,7 +335,7 @@ def test_invent_multi_survives_a_sampled_miss_list():
     assert with_pos["status"] == "PARTIAL_LAW" and with_pos["n_shifts"] == 3  # закон найден: период 3
   # те же пары без позиций дают NO_LAW
     # (это объясняет, почему конвейер обязан передавать позиции)
-    assert invent_multi([(c, y) for c, y, _ in pairs], random.Random(7))["status"] == "NO_LAW"
+    assert invent_multi([(c, y) for c, y, _ in pairs], random.Random(7))["status"] == "NO_LAW"  # те же пары без позиций: статус NO_LAW (закон не найден)
 
 
 def test_invent_multi_without_positions_keeps_the_old_contract():
