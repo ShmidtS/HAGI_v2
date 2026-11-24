@@ -26,9 +26,9 @@ def main():
     # позиции начала строк
     starts = [0] + [i + 1 for i, b in enumerate(data) if b == 0x0A]  # начало 0 и позиция после каждого перевода строки 0x0A
     starts = [s for s in starts if s + 1 < len(idx)]  # оставить только начала, за которыми есть хотя бы один байт
-    print(f"corpus {len(data)} bytes, {len(starts)} line starts")
+    print(f"corpus {len(data)} bytes, {len(starts)} line starts")  # печать числа байтов корпуса и числа начал строк
     lm = RopeAttentionByteLM(dim=256, hidden=512, seed=1)  # модель d = 256, h = 512, зерно 1
-    print("device:", lm.device)
+    print("device:", lm.device)  # печать устройства модели
     t = lm.t  # библиотека torch из модели
     opt = t.optim.Adam(lm.params(), lr=8e-4)  # Adam со скоростью 8e-4 по параметрам модели
     rng = np.random.default_rng(7)  # генератор с зерном 7
@@ -56,7 +56,7 @@ def main():
             continue  # перейти к следующей строке
         prefix = idx[max(0, s - 64):s]  # префикс — до 64 байтов до начала строки
         samples.append((prefix, line))  # добавить пример (префикс, строка)
-    print(f"line samples: {len(samples)}")
+    print(f"line samples: {len(samples)}")  # печать числа примеров
     hold_s = set(rng.choice(len(samples), max(8, len(samples)//7), replace=False))  # контрольные номера примеров: max(8, ⌊N/7⌋)
     tr = [s for i, s in enumerate(samples) if i not in hold_s]  # обучающие примеры
     va = [s for i, s in enumerate(samples) if i in hold_s]  # контрольные примеры
@@ -72,12 +72,12 @@ def main():
                 logits = lm.full_logits(ids[:-1].unsqueeze(0))[0, -L:, :]  # логиты последних L позиций: для каждой предсказывается следующий байт
                 tgt = torch.as_tensor(line[1:], dtype=torch.long, device=dev)  # цели — строка без первого байта
                 tot += float(t.nn.functional.cross_entropy(  # сумма CE по позициям (без усреднения)
-                    logits, tgt, reduction='sum'))
+                    logits, tgt, reduction='sum'))  # продолжение: логиты, цели и сумма по позициям
                 cnt += L  # число позиций cnt += L
         return tot / max(1, cnt)  # средняя CE = tot / max(1, cnt)
 
     best = vce()  # начальная лучшая контрольная CE
-    print(f"init holdout CE {best:.4f}")
+    print(f"init holdout CE {best:.4f}")  # печать начальной контрольной CE с 4 знаками
     t0 = time.time()  # время начала обучения
     for ep in range(150):  # 150 эпох
         order = rng.permutation(len(tr))  # случайный порядок обучающих примеров
@@ -103,7 +103,7 @@ def main():
                 loss_mask[j, -L:] = True  # учитываются только последние L позиций — сама строка
             logits = lm.full_logits(Xt)  # логиты для всего пакета
             loss = t.nn.functional.cross_entropy(  # CE каждой позиции без усреднения: форма (число позиций, 256) против целей
-                logits.view(-1, 256), Yt.view(-1), reduction='none')
+                logits.view(-1, 256), Yt.view(-1), reduction='none')  # продолжение: логиты (число позиций, 256), цели и CE каждой позиции
             loss = (loss * loss_mask.view(-1)).sum() / loss_mask.sum()  # средняя CE по позициям строки: Σ loss·mask / Σ mask
             opt.zero_grad()  # обнулить градиенты
             loss.backward()  # обратный проход
@@ -114,10 +114,10 @@ def main():
             if v < best:  # если CE улучшилась
                 best = v  # запомнить лучшую CE
                 torch.save({nm: getattr(lm, nm).detach().cpu()  # сохранить тензоры emb, q, W1, b1, W2, b2 на CPU
-                            for nm in ("emb", "q", "W1", "b1", "W2", "b2")}
-                           | {"dim": lm.dim, "hidden": lm.hidden,
-                              "theta0": lm.theta0, "lam": lm.lam}, CKPT)
-    print(f"best CE {best:.4f}; saved {CKPT}")
+                            for nm in ("emb", "q", "W1", "b1", "W2", "b2")}  # генератор словаря: nm -> тензор параметра без градиента на CPU
+                           | {"dim": lm.dim, "hidden": lm.hidden,  # объединение со словарём гиперпараметров: dim, hidden, …
+                              "theta0": lm.theta0, "lam": lm.lam}, CKPT)  # продолжение: theta0, lam; сохранить в CKPT
+    print(f"best CE {best:.4f}; saved {CKPT}")  # печать лучшей CE и пути сохранённой модели
     # проверка грамотности (argmax при низкой температуре)
     from hagi.lm import load_rope  # загрузка модели rope
     lm2 = load_rope(CKPT)  # загрузить сохранённую модель
@@ -126,8 +126,8 @@ def main():
         nm.data = nm.data.to(lm2.device)  # перенести параметр на устройство модели
     ok = 0  # число верных ответов
   # формат задач совпадает со сгенерированным корпусом (4-битные таблицы)
-    tests = [("0101 XOR 0011 = ", "0110"), ("0101 AND 0011 = ", "0001"),
-             ("1100 XOR 1010 = ", "0110"), ("NOT 0101 = ", "1010"),
+    tests = [("0101 XOR 0011 = ", "0110"), ("0101 AND 0011 = ", "0001"),  # первые две проверки: вопрос -> ожидаемый ответ
+             ("1100 XOR 1010 = ", "0110"), ("NOT 0101 = ", "1010"),  # ещё две проверки: вопрос -> ожидаемый ответ
              ("6 XOR 3 = ", "5"), ("CHR 97 ", "HEX 61")]  # 6 проверок
     for tt, want in tests:  # по парам (вопрос, ответ)
         out = lm2.generate(tt, n_bytes=len(want)+2, temp=0.1)  # сгенерировать len(want) + 2 байтов при температуре 0,1
@@ -135,7 +135,7 @@ def main():
         hit = gen.startswith(want)  # ответ начинается с ожидаемого
         ok += hit  # верные ответы + hit (1 или 0)
         print(f"  {tt!r} -> {gen!r} want {want!r} {'OK' if hit else 'MISS'}")  # печать вопроса, ответа, ожидания и вердикта
-    print(f"LITERACY: {ok}/{len(tests)}")
+    print(f"LITERACY: {ok}/{len(tests)}")  # печать числа верных ответов и числа проверок
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # истинно, когда файл запущен как сценарий
     main()  # вызов основной функции
