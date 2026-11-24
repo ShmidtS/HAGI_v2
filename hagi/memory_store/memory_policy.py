@@ -298,7 +298,8 @@ class PolicyMemoryStore:
         db = memory.db  # соединение SQLite
         # таблица отобранных записей: номер, текст, класс, уверенность (вероятность сохранить),
         # источник, границы текста в архиве (начало и конец в символах), хэш текста (уникальный)
-        db.execute("""CREATE TABLE IF NOT EXISTS policy_memory (
+        db.execute("""\
+CREATE TABLE IF NOT EXISTS policy_memory (
             memory_id INTEGER PRIMARY KEY,
             content TEXT NOT NULL,
             category TEXT NOT NULL,
@@ -310,11 +311,13 @@ class PolicyMemoryStore:
         # полнотекстовый индекс по тексту отобранных записей (внешняя таблица policy_memory, ключ memory_id)
         db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS policy_memory_fts USING fts5(content, content='policy_memory', content_rowid='memory_id')")  # создать индекс fts5
         # триггер после вставки: добавить текст новой записи в полнотекстовый индекс
-        db.execute("""CREATE TRIGGER IF NOT EXISTS policy_memory_ai AFTER INSERT ON policy_memory BEGIN
+        db.execute("""\
+CREATE TRIGGER IF NOT EXISTS policy_memory_ai AFTER INSERT ON policy_memory BEGIN
             INSERT INTO policy_memory_fts(rowid,content) VALUES (new.memory_id,new.content);
         END""")  # создать триггер
         # триггер после удаления: убрать текст удалённой записи из полнотекстового индекса
-        db.execute("""CREATE TRIGGER IF NOT EXISTS policy_memory_ad AFTER DELETE ON policy_memory BEGIN
+        db.execute("""\
+CREATE TRIGGER IF NOT EXISTS policy_memory_ad AFTER DELETE ON policy_memory BEGIN
             INSERT INTO policy_memory_fts(policy_memory_fts,rowid,content) VALUES('delete',old.memory_id,old.content);
         END""")  # создать триггер
         db.commit()  # зафиксировать создание объектов
@@ -342,7 +345,8 @@ class PolicyMemoryStore:
             self.memory.append(text + "\n")  # записать текст в исходный архив (с переводом строки)
             if retain_prob >= keep_threshold and (keep_decisions or category != "decision"):  # вероятность сохранить не ниже порога и решение разрешено либо класс не решение
                 cur = self.memory.db.execute(  # вставить отобранную запись (дубликат по хэшу игнорируется)
-                    """INSERT OR IGNORE INTO policy_memory
+                    """\
+INSERT OR IGNORE INTO policy_memory
                     (content,category,confidence,source,char_start,char_end,content_hash)
                     VALUES (?,?,?,?,?,?,?)""",  # вставка семи полей; конфликт по уникальному хэшу пропускается
                     (text, category, retain_prob, str(source), start, start + len(text), digest),  # текст, класс, вероятность сохранить, источник, границы, хэш
@@ -368,7 +372,8 @@ class PolicyMemoryStore:
         # ранг bm25 (меньше — лучше), текст и фрагмент с выделением совпадений в [match]...[/match],
         # соединение с policy_memory по номеру; сортировка по рангу, не более limit строк
         rows = self.memory.db.execute(  # выполнить поиск
-            """SELECT p.memory_id,p.char_start,p.char_end,bm25(policy_memory_fts),p.content,
+            """\
+SELECT p.memory_id,p.char_start,p.char_end,bm25(policy_memory_fts),p.content,
                       snippet(policy_memory_fts,0,'[match]','[/match]',' … ',32)
                FROM policy_memory_fts f JOIN policy_memory p ON p.memory_id=f.rowid
                WHERE policy_memory_fts MATCH ? ORDER BY bm25(policy_memory_fts) LIMIT ?""",  # текст запроса; фрагмент до 32 символов с « … » между кусками
