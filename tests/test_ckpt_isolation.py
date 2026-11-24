@@ -35,7 +35,7 @@ def test_sandboxed_save_never_touches_production(tmp_path, monkeypatch):
     по времени изменения (st_mtime_ns) и размеру (st_size); load() читает ту же временную копию."""
     before = (U._PROD_CKPT / "unified.pt")  # путь к рабочему файлу весов
     stamp = (before.stat().st_mtime_ns, before.stat().st_size) if before.exists() else None  # снимок рабочего файла (время, размер) либо None, если его нет
-    monkeypatch.setattr(U, "CKPT_DIR", tmp_path / "sb")  # CKPT_DIR := tmp_path/sb
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path / "sb")  # каталог контрольной точки := tmp_path/sb
     u = U.Unified()  # новая единая модель
     u.domains["t"] = {"sha": "x", "bytes": 1, "ce": 0.5}  # запись домена t в книге
     u.save()  # сохранить модель и книгу во временную копию
