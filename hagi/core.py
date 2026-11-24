@@ -132,22 +132,22 @@ class TaskSpec:
 
 
 BOOL_NAMES = {  # имена всех 16 булевых функций двух аргументов по номеру таблицы истинности m
-    0: "BOOL_FALSE",  # m = 0: f = 0
+    0: "BOOL_FALSE",  # тождественный ноль: m = 0: f = 0
     1: "BOOL_NOR",  # m = 1: f = НЕ(x ИЛИ y)
     2: "BOOL_NOT_X_AND_Y",  # m = 2: f = (НЕ x) И y
     3: "BOOL_NOT_X",  # m = 3: f = НЕ x
     4: "BOOL_X_AND_NOT_Y",  # m = 4: f = x И (НЕ y)
     5: "BOOL_NOT_Y",  # m = 5: f = НЕ y
-    6: "BOOL_XOR",  # m = 6: f = x XOR y
+    6: "BOOL_XOR",  # исключающее или: m = 6: f = x XOR y
     7: "BOOL_NAND",  # m = 7: f = НЕ(x И y)
     8: "BOOL_AND",  # m = 8: f = x И y
     9: "BOOL_XNOR",  # m = 9: f = НЕ(x XOR y)
-    10: "BOOL_Y",  # m = 10: f = y
+    10: "BOOL_Y",  # второй аргумент: m = 10: f = y
     11: "BOOL_X_IMPLIES_Y",  # m = 11: f = x → y, то есть (НЕ x) ИЛИ y
-    12: "BOOL_X",  # m = 12: f = x
+    12: "BOOL_X",  # первый аргумент: m = 12: f = x
     13: "BOOL_Y_IMPLIES_X",  # m = 13: f = y → x, то есть x ИЛИ (НЕ y)
     14: "BOOL_OR",  # m = 14: f = x ИЛИ y
-    15: "BOOL_TRUE",  # m = 15: f = 1
+    15: "BOOL_TRUE",  # тождественная единица: m = 15: f = 1
 }
 
 
@@ -170,36 +170,36 @@ def make_task_suite() -> list[TaskSpec]:
         )  # добавление TaskSpec в список
     U = tuple(range(-8, 9))  # U = {−8, …, 8} — область значений аргументов
     unary = [  # список (имя, функция) унарных задач
-        ("NEG", lambda x: -x),  # NEG: f(x) = −x
-        ("ABS", abs),  # ABS: f(x) = |x|
+        ("NEG", lambda x: -x),  # отрицание: NEG: f(x) = −x
+        ("ABS", abs),  # модуль: ABS: f(x) = |x|
         ("SIGN", _sign),  # SIGN: знак x
-        ("SQUARE", lambda x: x * x),  # SQUARE: f(x) = x²
-        ("CUBE", lambda x: x * x * x),  # CUBE: f(x) = x³
+        ("SQUARE", lambda x: x * x),  # квадрат: SQUARE: f(x) = x²
+        ("CUBE", lambda x: x * x * x),  # куб: CUBE: f(x) = x³
         ("BIT_NOT8", _bit_not8),  # BIT_NOT8: побитовое НЕ по младшим 8 битам
-        ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),  # CLAMP_TO_3: f(x) = min(max(x, −3), 3)
+        ("CLAMP_TO_3", lambda x: min(max(x, -3), 3)),  # усечение в отрезок [−3, 3]: CLAMP_TO_3: f(x) = min(max(x, −3), 3)
     ]
     for name, fn in unary:  # по каждой унарной задаче
         suite.append(TaskSpec(name, 1, (U,), fn, family="unary"))  # задача арности 1 с областью U
     binary = [  # список (имя, функция, правило допустимости) бинарных задач
-        ("ADD", lambda x, y: x + y, "all"),  # ADD: x + y
-        ("SUB", lambda x, y: x - y, "all"),  # SUB: x − y
-        ("MUL", lambda x, y: x * y, "all"),  # MUL: x·y
-        ("FLOORDIV", lambda x, y: x // y, "nonzero_y"),  # FLOORDIV: ⌊x / y⌋, y ≠ 0
+        ("ADD", lambda x, y: x + y, "all"),  # сложение: ADD: x + y
+        ("SUB", lambda x, y: x - y, "all"),  # вычитание: SUB: x − y
+        ("MUL", lambda x, y: x * y, "all"),  # умножение: MUL: x·y
+        ("FLOORDIV", lambda x, y: x // y, "nonzero_y"),  # деление нацело: FLOORDIV: ⌊x / y⌋, y ≠ 0
         ("MOD", lambda x, y: x % y, "nonzero_y"),  # MOD: остаток x mod y, y ≠ 0
         ("GCD", math.gcd, "all"),  # GCD: наибольший общий делитель
         ("LCM", math.lcm, "all"),  # LCM: наименьшее общее кратное
-        ("MIN", min, "all"),  # MIN: min(x, y)
-        ("MAX", max, "all"),  # MAX: max(x, y)
-        ("ABSDIFF", lambda x, y: abs(x - y), "all"),  # ABSDIFF: |x − y|
+        ("MIN", min, "all"),  # минимум: MIN: min(x, y)
+        ("MAX", max, "all"),  # максимум: MAX: max(x, y)
+        ("ABSDIFF", lambda x, y: abs(x - y), "all"),  # модуль разности: ABSDIFF: |x − y|
         ("EQ", lambda x, y: int(x == y), "all"),  # EQ: 1, если x = y, иначе 0
         ("NE", lambda x, y: int(x != y), "all"),  # NE: 1, если x ≠ y, иначе 0
         ("LT", lambda x, y: int(x < y), "all"),  # LT: 1, если x < y, иначе 0
         ("LE", lambda x, y: int(x <= y), "all"),  # LE: 1, если x ≤ y, иначе 0
         ("GT", lambda x, y: int(x > y), "all"),  # GT: 1, если x > y, иначе 0
         ("GE", lambda x, y: int(x >= y), "all"),  # GE: 1, если x ≥ y, иначе 0
-        ("BIT_AND", lambda x, y: x & y, "all"),  # BIT_AND: x & y
-        ("BIT_OR", lambda x, y: x | y, "all"),  # BIT_OR: x | y
-        ("BIT_XOR", lambda x, y: x ^ y, "all"),  # BIT_XOR: x ^ y
+        ("BIT_AND", lambda x, y: x & y, "all"),  # побитовое «и»: BIT_AND: x & y
+        ("BIT_OR", lambda x, y: x | y, "all"),  # побитовое «или»: BIT_OR: x | y
+        ("BIT_XOR", lambda x, y: x ^ y, "all"),  # побитовое «исключающее или»: BIT_XOR: x ^ y
         ("BIT_NAND8", _bit_nand8, "all"),  # BIT_NAND8: И-НЕ по младшим 8 битам
         ("BIT_NOR8", _bit_nor8, "all"),  # BIT_NOR8: ИЛИ-НЕ по младшим 8 битам
         ("BIT_XNOR8", _bit_xnor8, "all"),  # BIT_XNOR8: исключающее ИЛИ-НЕ по младшим 8 битам
@@ -299,7 +299,7 @@ def make_task_suite() -> list[TaskSpec]:
     BK = tuple(range(0, 256))  # BK = {0, …, 255} — ключ
     suite.extend(  # добавить четыре байтовые языковые задачи
         [  # начало списка задач
-            TaskSpec("LANG8_ATBASH", 1, (B,), lambda c: 255 - c, family="language"),  # LANG8_ATBASH: f(c) = 255 − c
+            TaskSpec("LANG8_ATBASH", 1, (B,), lambda c: 255 - c, family="language"),  # задача: LANG8_ATBASH: f(c) = 255 − c
             TaskSpec(  # задача циклического сдвига байта на 1
                 "LANG8_CAESAR1", 1, (B,), lambda c: (c + 1) % 256, family="language"  # арность 1; f(c) = (c + 1) mod 256
             ),
@@ -360,7 +360,7 @@ class Expr:
         return Expr("const", (), int(v))  # узел const со значением v
 
     def eval(
-        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None
+        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None  # аргументы: вход xs и среда env (по умолчанию нет)
     ) -> int:  # возвращает целое значение
         """Вычислить выражение на входе xs: значение int.
 
@@ -697,7 +697,7 @@ class Expr:
             from hagi.representations import construct_from_dict_safe  # импортируется здесь, чтобы избежать циклического импорта
   # восстановить значение конструкции из словаря
             val = construct_from_dict_safe(val)  # новый узел с рекурсивно восстановленными аргументами
-        return Expr(op, tuple(Expr.from_dict(a) for a in d.get("args", [])), val)
+        return Expr(op, tuple(Expr.from_dict(a) for a in d.get("args", [])), val)  # новый узел: операция, аргументы из словаря, значение
 
 
 @dataclass(frozen=True)  # неизменяемый класс
@@ -729,7 +729,7 @@ class Program:
         return self.expr.bits(expert_index)  # биты выражения
 
     def eval(
-        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None
+        self, xs: Sequence[int], env: Optional[dict[str, "Expert"]] = None  # аргументы: вход xs и среда env (по умолчанию нет)
     ) -> int:  # возвращает значение int
         """Вычислить программу на входе xs: значение int или ошибка.
 
@@ -774,7 +774,7 @@ _VEC_MAG_LIMIT = 1 << 28  # предел модуля числа для вект
 
 
 def eval_expr_vec(
-    expr: Expr, X: np.ndarray, env: Optional[dict[str, "Expert"]] = None
+    expr: Expr, X: np.ndarray, env: Optional[dict[str, "Expert"]] = None  # аргументы: выражение, матрица входов, среда env
 ) -> tuple[np.ndarray, np.ndarray]:  # возвращает кортеж (значения, флаги)
     """Векторизованный вычислитель выражения на матрице входов X: (значения, флаги ok).
 
@@ -2215,7 +2215,7 @@ class FactorizedSharedCore:
             pred_q = np.array(  # прогноз на val
                 [  # по каждому примеру
                     ce_meta["classes"][i]  # класс с индексом максимальной логиты
-                    for i in np.argmax(Pv @ ce_meta["theta"].T, axis=1)  # i = argmax(Pv·thetaᵀ)
+                    for i in np.argmax(Pv @ ce_meta["theta"].T, axis=1)  # выбранные классы: i = argmax(Pv·thetaᵀ)
                 ],
                 dtype=np.float64,  # в float64
             )
@@ -2225,8 +2225,8 @@ class FactorizedSharedCore:
             base_va = _align_cols(Phi_va, len(wq)) @ wq  # базовый прогноз: Phi_va (выровненная)·wq
             Xv_mlp = self._mlp_encode(vx, sx)  # входы корректора на val
             r_va = (  # поправка корректора на val
-                np.tanh(Xv_mlp @ mlp_meta["W1"] + mlp_meta["b1"]) @ mlp_meta["W2"]  # tanh(X·W1 + b1)·W2
-                + mlp_meta["b2"]  # + b2
+                np.tanh(Xv_mlp @ mlp_meta["W1"] + mlp_meta["b1"]) @ mlp_meta["W2"]  # скрытый слой: tanh(X·W1 + b1)·W2
+                + mlp_meta["b2"]  # смещение: + b2
             ).ravel()  # развёрнуто в вектор
             pred_q = (base_va + r_va) * sy  # прогноз на val: (base + поправка)·sy
             nb_total = 6 + len(packed) + len(mlp_meta["packed"])  # всего байтов: 6 + байты регрессии + байты корректора
@@ -2291,9 +2291,9 @@ class FactorizedAdapter:  # обученный компактный адапте
             Xm = core._mlp_encode(x, self.sx)  # входы корректора
             r = float(  # поправка корректора
                 (  # открытие выражения
-                    np.tanh(Xm @ self.mlp_meta["W1"] + self.mlp_meta["b1"])  # tanh(X·W1 + b1)
-                    @ self.mlp_meta["W2"]  # · W2
-                    + self.mlp_meta["b2"]  # + b2
+                    np.tanh(Xm @ self.mlp_meta["W1"] + self.mlp_meta["b1"])  # скрытый слой: tanh(X·W1 + b1)
+                    @ self.mlp_meta["W2"]  # умножение: · W2
+                    + self.mlp_meta["b2"]  # смещение: + b2
                 )[0, 0]  # взять единственный элемент
             )
             val += r  # val = val + поправка
@@ -2550,7 +2550,7 @@ class CRAMEngine:  # движок CRAM: энергия, среднее поле,
             for i in range(N):  # по вершинам
                 hz = (  # локальное поле вершины
                     B[i]  # унарное поле B_i
-                    + np.einsum("jab,jb->a", K_sym[i], p_cur)  # + Σ_{j,b} K_sym[i,j,a,b]·p_jb
+                    + np.einsum("jab,jb->a", K_sym[i], p_cur)  # симметричный вклад: + Σ_{j,b} K_sym[i,j,a,b]·p_jb
                     - np.einsum("ab,b->a", K_sym[i, i], p_cur[i])  # − Σ_b K_sym[i,i,a,b]·p_ib (без самосвязи)
                 )
                 logits = -beta * hz  # логиты: −beta·h
@@ -2696,7 +2696,7 @@ class CRAMEngine:  # движок CRAM: энергия, среднее поле,
                     y[i] = best_c  # перекрасить
         ef = pair_e(y)  # конечная энергия
         return {  # вернуть
-            "z": z,  # z
+            "z": z,  # запомнить: z
             "y": y,  # раскраска
             "energy_0": e0,  # энергия до
             "energy_final": ef,  # энергия после
@@ -2722,7 +2722,7 @@ class CRAMEngine:  # движок CRAM: энергия, среднее поле,
             res = batch_logit_safe_step_ce(  # обучить логиты
                 X_i, y_i, num_colors, steps=steps, l2_reg=np.array([1e-4])  # по одному признаку, L2 1e-4
             )
-            B_learned[i] = -res["theta"][:, 0] / beta  # B_i = −theta_i / beta
+            B_learned[i] = -res["theta"][:, 0] / beta  # сдвиг: B_i = −theta_i / beta
             losses.append(res["loss_final"])  # запомнить потерю
         return {"B": B_learned, "mean_pl_loss": float(np.mean(losses))}  # вернуть B и среднюю потерю
 
@@ -2917,7 +2917,7 @@ class AuditLedger:  # журнал аудита: непересекающиес�
         hi = lo + max(1, int(n_samples))  # конец: lo + max(1, n_samples)
         assert (  # проверка
             hi <= self.final_test_lo  # поток не заходит в диапазон финального теста
-        ), "audit stream overlapped held-out final test range"
+        ), "audit stream overlapped held-out final test range"  # сообщение ошибки утверждения
         st = AuditStream(lo=lo, hi=hi, cursor=lo)  # создать поток с курсором в начале
         self.streams[task] = st  # запомнить поток
         self.next_cursor_base = hi  # следующий поток начнётся с hi
@@ -3015,7 +3015,7 @@ def ram_available_bytes() -> int:  # доступная оперативная �
         return int(psutil.virtual_memory().available)  # доступная память
     except ImportError:  # библиотеки нет
         pass  # следующий способ
-    if sys.platform == "win32":  # Windows
+    if sys.platform == "win32":  # ветка для: Windows
         try:  # попытка 3: WinAPI
             import ctypes  # импорт ctypes
 
@@ -3299,25 +3299,25 @@ def exact_piecewise_poly_fit(  # точная кусочно-полиномиа�
                 cr = _fit_poly_or_const(right)  # подгонка справа
                 if cl is not None and cr is not None and cl != cr:  # обе найдены и различны
                     return Expr(  # условное выражение
-                        "if_cond",
+                        "if_cond",  # имя узла — условный выбор
                         (Expr("lt", (Expr.var(0), Expr.const(thr))), cl, cr),  # if(x < thr, p_лев, p_прав)
                     )
     elif 2 <= arity <= 3:  # арность 2 или 3
         preds: list[tuple[Expr, Callable[[tuple[int, ...]], bool]]] = [  # кандидаты-предикаты (выражение, функция)
-            (Expr("lt", (Expr.var(0), Expr.var(1))), lambda r: r[0] < r[1]),  # x_0 < x_1
-            (Expr("le", (Expr.var(0), Expr.var(1))), lambda r: r[0] <= r[1]),  # x_0 ≤ x_1
-            (Expr("eq", (Expr.var(0), Expr.var(1))), lambda r: r[0] == r[1]),  # x_0 = x_1
+            (Expr("lt", (Expr.var(0), Expr.var(1))), lambda r: r[0] < r[1]),  # предикат «меньше»: x_0 < x_1
+            (Expr("le", (Expr.var(0), Expr.var(1))), lambda r: r[0] <= r[1]),  # предикат «меньше или равно»: x_0 ≤ x_1
+            (Expr("eq", (Expr.var(0), Expr.var(1))), lambda r: r[0] == r[1]),  # предикат равенства: x_0 = x_1
             (  # открытие кортежа
-                Expr("bit_and", (Expr.var(0), Expr.const(1))),  # x_0 & 1
+                Expr("bit_and", (Expr.var(0), Expr.const(1))),  # выделение младшего бита: x_0 & 1
                 lambda r: (r[0] & 1) != 0,  # нечётность x_0
             ),
         ]
         if arity == 2:  # арность 2 — добавить знаковые предикаты
             preds.append(  # добавить
-                (Expr("lt", (Expr.var(0), Expr.const(0))), lambda r: r[0] < 0)  # x_0 < 0
+                (Expr("lt", (Expr.var(0), Expr.const(0))), lambda r: r[0] < 0)  # отрицательность первого: x_0 < 0
             )
             preds.append(  # добавить
-                (Expr("lt", (Expr.var(1), Expr.const(0))), lambda r: r[1] < 0)  # x_1 < 0
+                (Expr("lt", (Expr.var(1), Expr.const(0))), lambda r: r[1] < 0)  # отрицательность второго: x_1 < 0
             )
         for cond_expr, fn in preds:  # по предикатам
             true_pts = [(r, y) for r, y in zip(train_x, train_y) if fn(r)]  # точки, где предикат истинен
@@ -3381,8 +3381,8 @@ def _mod_affine_expr(X, Y, arity: int):  # точная модульно-афф�
                 b = (y0 - a * int(X0[0])) % m  # сдвиг из первого примера: b = (y_0 − a·x_0) mod m
                 if np.array_equal((a * x + b) % m, Y):  # совпадает на всех примерах
                     return Expr("mod", (  # mod(выражение, m)
-                        Expr("add", (  # add(
-                            Expr("mul", (Expr.var(0), Expr.const(a))),  # mul(x, a)
+                        Expr("add", (  # узел сложения: add(
+                            Expr("mul", (Expr.var(0), Expr.const(a))),  # умножение на коэффициент: mul(x, a)
                             Expr.const(b))),  # константа b
                         Expr.const(m)))  # mod-константа m
         elif arity == 2:  # два аргумента
@@ -3392,10 +3392,10 @@ def _mod_affine_expr(X, Y, arity: int):  # точная модульно-афф�
                     b = (y0 - a1 * int(X0[0]) - a2 * int(X0[1])) % m  # сдвиг: b = (y_0 − a_1·x_10 − a_2·x_20) mod m
                     if np.array_equal((a1 * x1 + a2 * x2 + b) % m, Y):  # совпадает на всех примерах
                         e = Expr("add", (  # сумма
-                            Expr("mul", (Expr.var(0), Expr.const(a1))),  # mul(x_1, a_1)
-                            Expr("mul", (Expr.var(1), Expr.const(a2)))))  # mul(x_2, a_2)
+                            Expr("mul", (Expr.var(0), Expr.const(a1))),  # умножение на коэффициент: mul(x_1, a_1)
+                            Expr("mul", (Expr.var(1), Expr.const(a2)))))  # умножение на коэффициент: mul(x_2, a_2)
                         return Expr("mod", (  # mod(выражение, m)
-                            Expr("add", (e, Expr.const(int(b)))),  # add(e, b)
+                            Expr("add", (e, Expr.const(int(b)))),  # прибавление константы: add(e, b)
                             Expr.const(m)))  # mod-константа m
     # Кусочно-аффинная форма — алфавиты со смещением: y = (x − lo + c) mod m + lo
     # внутри отрезка [lo, hi); вне отрезка вход отбрасывается проверяющим.
@@ -3423,11 +3423,11 @@ def _mod_affine_expr(X, Y, arity: int):  # точная модульно-афф�
                         cand_y = ((seg_x - lo + c) % mm) + lo  # кандидат: ((x − lo + c) mod m) + lo
                         if np.array_equal(cand_y, seg_y):  # совпадает на отрезке
                             # выражение ((x − lo + c) mod m) + lo собирается из доступных операций
-                            shifted = Expr("add", (Expr.var(0),  # x + (c − lo)
+                            shifted = Expr("add", (Expr.var(0),  # сдвиг входа: x + (c − lo)
                                                    Expr.const(c - lo)))  # константа c − lo
                             inner = Expr("mod", (shifted,  # mod(сдвиг, m)
                                                  Expr.const(mm)))  # модуль m
-                            inner = Expr("add", (inner,  # + lo
+                            inner = Expr("add", (inner,  # прибавление нижней границы: + lo
                                                  Expr.const(lo)))  # константа lo
                             in_rng = Expr("in_ranges",  # условие x ∈ [x_нач, x_кон]
                                           (Expr.var(0),),  # аргумент x
@@ -3514,7 +3514,7 @@ def synthesize_batched_mdl(  # синтез выражения методом м
                 pass  # продолжить
         # разреженная принадлежность (семейство задаётся извне; только бинарный унарный выход)
         # семейство — языковое, выходы только 0/1
-        if arity == 1 and _CURRENT_FAMILY[0] == "language"                 and set(np.unique(Y)) <= {0, 1}:
+        if arity == 1 and _CURRENT_FAMILY[0] == "language"                 and set(np.unique(Y)) <= {0, 1}:  # условие: унарная задача языкового семейства, выходы только 0 и 1
             cand = _sparse_membership(X, Y)  # кандидат
             if cand is not None:  # найден
                 try:  # попытка
@@ -3667,8 +3667,8 @@ def synthesize_batched_mdl(  # синтез выражения методом м
         V_sq_ok = np.where(np.abs(V) <= 32768, V * V, MAG_CAP + 1)  # квадрат, если |V| ≤ 32768, иначе метка переполнения
         V_cb_ok = np.where(np.abs(V) <= 1024, V * V * V, MAG_CAP + 1)  # куб, если |V| ≤ 1024, иначе метка переполнения
         for uop, ures in (  # по унарным операциям
-            ("neg", -V),  # −V
-            ("abs", np.abs(V)),  # |V|
+            ("neg", -V),  # кандидат: −V
+            ("abs", np.abs(V)),  # кандидат: |V|
             ("sign", np.sign(V).astype(np.int64)),  # знак V
             ("bit_not8", (~V) & 0xFF),  # побитное НЕ в 8 битах
             ("clamp3", np.clip(V, -3, 3)),  # обрезка в [−3, 3]
@@ -3719,7 +3719,7 @@ def synthesize_batched_mdl(  # синтез выражения методом м
                     lv_min, lv_max = int(np.min(lv)), int(np.max(lv))  # его минимум и максимум
                     base_mask = (  # базовая маска
                         non_const_mask  # для константы-листа — только неконстанты
-                        if lf.op == "const"
+                        if lf.op == "const"  # условие: лист — константа
                         else np.ones(B_len, dtype=bool)  # иначе все
                     )
                     for order_idx in (0, 1):  # по порядкам аргументов (B, лист) и (лист, B)
@@ -4054,7 +4054,7 @@ class TheoremMiner:
                 теорем model.theorems. Возвращает список новых объектов Theorem; найденные
                 теоремы добавляются в model.theorems."""
 
-    def mine(self, model: "GrowingHagiProcessor") -> list[Theorem]:
+    def mine(self, model: "GrowingHagiProcessor") -> list[Theorem]:  # найти в модели новые теоремы и вернуть их список
         found: list[Theorem] = []  # список новых теорем
         known = {t.name for t in model.theorems}  # имена уже известных теорем
         env = model.experts  # среда вычисления — эксперты модели
@@ -4074,7 +4074,7 @@ class TheoremMiner:
                             ):
                                 th = Theorem(  # новая теорема
                                     nm,  # имя
-                                    f"for all supported pairs: {e.name}(x,y)={e.name}(y,x)",
+                                    f"for all supported pairs: {e.name}(x,y)={e.name}(y,x)",  # текст теоремы о перестановке аргументов
                                     len(swapped),  # число проверенных пар
                                 )
                                 model.theorems.append(th)  # добавить в теоремы модели
@@ -4089,7 +4089,7 @@ class TheoremMiner:
                         if all(e.program.eval((x, x), env) == x for x in self_pairs):  # если для всех x: e(x, x) = x
                             th = Theorem(  # новая теорема
                                 nm,  # имя
-                                f"for all overlapping x: {e.name}(x,x)=x",
+                                f"for all overlapping x: {e.name}(x,x)=x",  # текст теоремы о совпадающих аргументах
                                 len(self_pairs),  # число проверенных точек
                             )
                             model.theorems.append(th)  # добавить в теоремы модели
@@ -4103,7 +4103,7 @@ class TheoremMiner:
                     try:  # попытка проверки
                         if all(e.program.eval((x, 0), env) == x for x in zero_pairs):  # если для всех x: e(x, 0) = x
                             th = Theorem(  # новая теорема
-                                nm, f"for all x: {e.name}(x,0)=x", len(zero_pairs)
+                                nm, f"for all x: {e.name}(x,0)=x", len(zero_pairs)  # текст теоремы о нейтральном нуле, число проверенных пар
                             )
                             model.theorems.append(th)  # добавить в теоремы модели
                             found.append(th)  # добавить в найденные
@@ -4162,7 +4162,7 @@ class TheoremMiner:
                                 ):
                                     th = Theorem(  # новая теорема
                                         nm,  # имя
-                                        f"{e.name}(-x)={'+' if sgn == 1 else '-'}{e.name}(x)",
+                                        f"{e.name}(-x)={'+' if sgn == 1 else '-'}{e.name}(x)",  # текст теоремы о значении на отрицательном аргументе
                                         len(dom),  # число проверенных точек
                                     )
                                     model.theorems.append(th)  # добавить в теоремы модели
@@ -4336,7 +4336,7 @@ class GrowingHagiProcessor:
         if not domain:  # область пуста
             return self._hold(spec, "EMPTY_VALID_DOMAIN", 0, 0)  # удержать задачу: пустая допустимая область
         # запомнить семейство задачи для языкового критерия синтеза (атрибут family или пустая строка)
-        _CURRENT_FAMILY[0] = getattr(spec, "family", "")
+        _CURRENT_FAMILY[0] = getattr(spec, "family", "")  # запомнить семейство задачи (атрибут family или пустая строка)
         # кандидат на всю область: значения учителя по ВСЕЙ объявленной области;
         # каждый кандидат всё равно проходит полную проверку на train, val и всей области
         # при принятии
@@ -4818,13 +4818,13 @@ class GrowingHagiProcessor:
         all_ok = (telescope_ok and holds_ok and commits_ok and ledger_ok  # все признаки вместе
                   and state_complete and history_ok)  # (продолжение условия)
         return {  # итог словарём
-            "telescope_ok": telescope_ok,
-            "holds_ok": holds_ok,
-            "commits_ok": commits_ok,
-            "ledger_ok": ledger_ok,
-            "state_complete": state_complete,
-            "history_ok": history_ok,
-            "all_ok": all_ok,
+            "telescope_ok": telescope_ok,  # поле telescope_ok
+            "holds_ok": holds_ok,  # поле holds_ok
+            "commits_ok": commits_ok,  # поле commits_ok
+            "ledger_ok": ledger_ok,  # поле ledger_ok
+            "state_complete": state_complete,  # поле state_complete
+            "history_ok": history_ok,  # поле history_ok
+            "all_ok": all_ok,  # поле all_ok
         }
 
     def total_neural_bytes(self) -> int:
@@ -4973,7 +4973,7 @@ class GrowingHagiProcessor:
         m.cert_log = [CertStepGen(**row) for row in gs.get("cert_log", [])]  # сертификаты из словарей полей
         streams = {  # потоки аудита
             str(k): AuditStream(**v)  # по записям потоков
-            for k, v in ledger_data.get("streams", {}).items()
+            for k, v in ledger_data.get("streams", {}).items()  # по ключам и значениям словаря потоков
         }  # закрытие словаря
         m.ledger = AuditLedger(  # журнал аудита
             delta_total=float(ledger_data["delta_total"]),  # общий бюджет значимости
@@ -5416,7 +5416,7 @@ def self_test_core() -> None:
     model.save(save_path)  # сохранить модель
     reloaded = GrowingHagiProcessor.load(save_path)  # загрузить модель
     assert reloaded.verify_all(suite)["accuracy"] == 1.0  # точность загруженной модели 1.0
-    assert reloaded.predict("ADD", 7, -3)["value"] == 4  # ADD(7, −3) = 4
+    assert reloaded.predict("ADD", 7, -3)["value"] == 4  # проверка: ADD(7, −3) = 4
     assert reloaded.predict("ADD", 99, 1)["status"] == "ABSTAIN"  # ADD(99, 1) вне области — отказ
     for nm, ex in model.experts.items():  # по экспертам
         if ex.adapter is not None:  # у которых есть адаптер
