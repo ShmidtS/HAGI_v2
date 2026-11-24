@@ -26,7 +26,7 @@ from dataclasses import dataclass  # декоратор класса-запис�
 from pathlib import Path  # работа с путями файлов
 from typing import Callable, Iterable  # типы «функция» и «итератор» для аннотаций
 
-DEFAULT_ISSUER = "HAGI_TEMPORAL_AGENT_V40"
+DEFAULT_ISSUER = "HAGI_TEMPORAL_AGENT_V40"  # имя издателя по умолчанию (строка-константа)
 GLOBAL_N = 24  # входные биты глобальной схемы: S0..S21 — состояние (биты 0..21), U0..U1 — вход (биты 22..23)
 AUDIT_CAP = 12  # предел полного перебора: при числе переменных не больше 12 — полная проверка и минимизация, свыше — модульная композиция с доказательством уплотнения
 
@@ -175,7 +175,7 @@ def symbolic_eval_net_general(net: dict, input_polys=None) -> tuple[frozenset[in
             net: схема, input_polys: многочлены входных проводов (по умолчанию провод i = x_i).
             Вентиль по mask: 0 -> 0, 15 -> 1, 6 -> XOR многочленов, 8 -> произведение.
             Возвращает кортеж многочленов выходов."""
-    n = net["n_inputs"]
+    n = net["n_inputs"]  # n — число входов сети
     w = [frozenset({1 << i}) for i in range(n)] if input_polys is None else list(input_polys)  # вход i — многочлен из одного монома x_i (если многочлены входов не заданы)
     for i, g in enumerate(net["gates"]):  # по каждому вентилю i
         a, b, m = g["a"], g["b"], g["mask"]  # входы и маска вентиля
@@ -229,22 +229,22 @@ def compact_netlist_with_proof(net: dict) -> tuple[dict, dict]:
         w = n + len(new_gates); new_gates.append({"a": 0, "b": 0, "mask": 15 if c else 0})  # новый вентиль-константа: маска 15 при c = 1, иначе 0
         struct[sig] = w; val.append(c); proof_steps.append({"raw_wire": raw_w, "rule": rule + "_NEW", "opt_wire": w}); return w  # запомнить провод, значение и шаг «новый вентиль»; вернуть провод
   # вернуть номер провода константы
-    for idx, g in enumerate(net["gates"]):
+    for idx, g in enumerate(net["gates"]):  # по номеру idx и элементу g списка элементов сети
         raw_w = n + idx; a, b, m = alias[g["a"]], alias[g["b"]], g["mask"]  # по каждому вентилю исходной схемы (idx — номер, raw_w — его провод n + idx)
         if m == 0: alias.append(get_const(0, raw_w, "CONST0")); continue  # входы через alias (уже перенесённые провода), маска
         if m == 15: alias.append(get_const(1, raw_w, "CONST1")); continue  # константа 0 -> провод константы нуля, правило CONST0
         va, vb = val[a], val[b]  # константа 1 -> провод константы единицы, правило CONST1
         if m == 6:  # XOR: правила сокращения
-            if a == b: alias.append(get_const(0, raw_w, "XOR_SELF")); continue  # u ⊕ u = 0
+            if a == b: alias.append(get_const(0, raw_w, "XOR_SELF")); continue  # самоисключение: u ⊕ u = 0
             if va == 0: alias.append(b); proof_steps.append({"raw_wire": raw_w, "rule": "XOR_ZERO_L", "opt_wire": b}); continue  # 0 ⊕ v = v (левый вход — константа 0), правило XOR_ZERO_L
             if vb == 0: alias.append(a); proof_steps.append({"raw_wire": raw_w, "rule": "XOR_ZERO_R", "opt_wire": a}); continue  # u ⊕ 0 = u, правило XOR_ZERO_R
-            if va == 1 and vb == 1: alias.append(get_const(0, raw_w, "XOR_ONE_ONE")); continue  # 1 ⊕ 1 = 0
+            if va == 1 and vb == 1: alias.append(get_const(0, raw_w, "XOR_ONE_ONE")); continue  # сумма двух единиц: 1 ⊕ 1 = 0
             if b < a: a, b = b, a  # коммутативность: упорядочить входы a ≤ b
         elif m == 8:  # AND: правила сокращения
             if a == b: alias.append(a); proof_steps.append({"raw_wire": raw_w, "rule": "AND_IDEM", "opt_wire": a}); continue  # u ∧ u = u (идемпотентность)
             if va == 0 or vb == 0: alias.append(get_const(0, raw_w, "AND_ZERO")); continue  # 0 ∧ v = 0 или u ∧ 0 = 0
             if va == 1: alias.append(b); proof_steps.append({"raw_wire": raw_w, "rule": "AND_ONE_L", "opt_wire": b}); continue  # 1 ∧ v = v (левый вход — константа 1)
-            if vb == 1: alias.append(a); proof_steps.append({"raw_wire": raw_w, "rule": "AND_ONE_R", "opt_wire": a}); continue  # u ∧ 1 = u
+            if vb == 1: alias.append(a); proof_steps.append({"raw_wire": raw_w, "rule": "AND_ONE_R", "opt_wire": a}); continue  # правая единица: u ∧ 1 = u
             if b < a: a, b = b, a  # коммутативность: упорядочить входы a ≤ b
         sig = (m, a, b)  # сигнатура вентиля после упрощения
         if sig in struct:  # такой вентиль уже строился
@@ -252,9 +252,9 @@ def compact_netlist_with_proof(net: dict) -> tuple[dict, dict]:
         else:  # иначе
             w = n + len(new_gates); new_gates.append({"a": a, "b": b, "mask": m})  # новый вентиль с номером провода n + len(new_gates)
             struct[sig] = w; val.append(None); alias.append(w)  # запомнить сигнатуру, значение неизвестно, alias, шаг EMIT_GATE
-            proof_steps.append({"raw_wire": raw_w, "rule": "EMIT_GATE", "opt_wire": w})
+            proof_steps.append({"raw_wire": raw_w, "rule": "EMIT_GATE", "opt_wire": w})  # шаг доказательства: исходный провод, правило EMIT_GATE, новый провод w
   # выходы до удаления неиспользуемых вентилей (через alias)
-    outs_pre = [alias[o] for o in net["outs"]]
+    outs_pre = [alias[o] for o in net["outs"]]  # выходы до чистки: подстановка alias для каждого выхода o
     used = {o for o in outs_pre if o >= n}; stack = list(used)  # обход в ширину от выходов: used — используемые провода вентилей (≥ n)
     while stack:  # пока есть непросмотренные провода
         w = stack.pop(); g = new_gates[w - n]  # взять провод w и его вентиль
@@ -265,7 +265,7 @@ def compact_netlist_with_proof(net: dict) -> tuple[dict, dict]:
         g = new_gates[old_w - n]; remap_w[old_w] = n + idx  # новый номер провода = n + idx
         final_gates.append({"a": remap_w[g["a"]], "b": remap_w[g["b"]], "mask": g["mask"]})  # вентиль с перенумерованными входами
     opt_net = _finalize_net(n, final_gates, [remap_w[o] for o in outs_pre])  # итоговая схема: выходы перенумерованы; вместе с доказательством (dce_remap — ключи строками для JSON)
-    return opt_net, {"proof_steps": proof_steps, "pre_dce_gates": new_gates, "pre_dce_outs": outs_pre, "dce_remap": {str(k): v for k, v in remap_w.items()}}
+    return opt_net, {"proof_steps": proof_steps, "pre_dce_gates": new_gates, "pre_dce_outs": outs_pre, "dce_remap": {str(k): v for k, v in remap_w.items()}}  # вернуть оптимизированную сеть и сведения о доказательстве (шаги, элементы и выходы до чистки, перенумерация проводов)
 
 def compact_netlist(net: dict) -> dict:
     """Уплотнить схему (без доказательства).
@@ -665,7 +665,7 @@ class ProofCarryingANFLearner:
     def fit(self, n_inputs: int, n_outputs: int, oracle: Callable[[int], tuple[int, ...]],  # обучение по оракулу; описание в docstring после сигнатуры
             contract: DegreeContract | None = None, allow_full_support: bool = True,  # продолжение сигнатуры: контракт и разрешения
             audit_full_support: bool = False) -> tuple[ANFCandidate | None, dict]:  # конец сигнатуры: тип возврата
-        if n_inputs < 1 or n_outputs < 1: raise ValueError("input/output arity must be positive")
+        if n_inputs < 1 or n_outputs < 1: raise ValueError("input/output arity must be positive")  # ошибка, если входов или выходов меньше одного
         if contract is not None:  # контракт задан — обучение по контракту
             valid, reason = contract.validate(self.trusted_issuers)  # проверка контракта: valid — доверие и границы, reason — причина отказа
             if valid and contract.n_inputs == n_inputs:  # контракт действителен и число входов совпадает
@@ -690,7 +690,7 @@ class ProofCarryingANFLearner:
                         full_net = self.compile_optimal(n_inputs, full_outputs)  # схема для уточнённой АНФ
                         if not self.symbolic_verify(full_net, full_outputs): return None, {"action": "HOLD", "reason": "fallback symbolic verification failed"}  # символьная проверка не пройдена — отказ
                         # кандидат с уточнённой АНФ (режим full-support-escalated)
-                        return ANFCandidate(n_inputs, full_outputs, full_net, q, "full-support-escalated",
+                        return ANFCandidate(n_inputs, full_outputs, full_net, q, "full-support-escalated",  # вернуть кандидата в режиме полного перебора
                                             # его сертификат: полный перебор, число запросов
                                             {"kind": "full-support-mobius", "full_support": True, "queries": q}, full_net["metrics"]), \
                                {"action": "COMMIT_CANDIDATE", "mode": "full-support-escalated", "query_count": q, "support_size": q, "degree_contract_rejected": True}  # решение COMMIT_CANDIDATE: режим, число запросов, размер опоры, контракт отклонён
@@ -1017,8 +1017,8 @@ def compose_net_mux_2in(net_a: dict, ns1: int, net_b: dict, ns2: int) -> dict:
     oa = _emit_subcircuit(net_a, list(range(ns1)) + [u0], n, gates)  # A: состояние A и вход u0
     ob = _emit_subcircuit(net_b, list(range(ns1, ns1 + ns2)) + [u0], n, gates)  # B: состояние B и вход u0
     ya, yb = oa[ns1], ob[ns2]  # выходы A и B (по одному биту)
-    gd = n + len(gates); gates.append({"a": ya, "b": yb, "mask": 6})  # gd = ya ⊕ yb
-    gs = n + len(gates); gates.append({"a": u1, "b": gd, "mask": 8})  # gs = u1 ∧ gd
+    gd = n + len(gates); gates.append({"a": ya, "b": yb, "mask": 6})  # элемент «исключающее или»: gd = ya ⊕ yb
+    gs = n + len(gates); gates.append({"a": u1, "b": gd, "mask": 8})  # элемент «и»: gs = u1 ∧ gd
     gy = n + len(gates); gates.append({"a": ya, "b": gs, "mask": 6})  # y = ya ⊕ gs; итог: y = ya ⊕ (u1 ∧ (ya ⊕ yb))
     return {"n_inputs": n, "gates": gates, "outs": oa[:ns1] + ob[:ns2] + [gy]}  # выходы: состояние A, состояние B, y
 
@@ -1032,9 +1032,9 @@ def compose_net_moe_mux(net_s: dict, ns_s: int, net_a: dict, ns_a: int, net_b: d
     oa = _emit_subcircuit(net_a, list(range(ns_s, ns_s + ns_a)) + u_wires, n, gates)  # A: состояние A и входы
     ob = _emit_subcircuit(net_b, list(range(ns_s + ns_a, off_u)) + u_wires, n, gates)  # B: состояние B и входы
     ys, ya, yb = os_[-1], oa[-1], ob[-1]  # выходы S, A, B (последние биты)
-    gd = n + len(gates); gates.append({"a": ya, "b": yb, "mask": 6})  # gd = ya ⊕ yb
-    gs = n + len(gates); gates.append({"a": ys, "b": gd, "mask": 8})  # gs = ys ∧ gd
-    gy = n + len(gates); gates.append({"a": ya, "b": gs, "mask": 6})  # y = ya ⊕ gs = ya ⊕ (ys ∧ (ya ⊕ yb))
+    gd = n + len(gates); gates.append({"a": ya, "b": yb, "mask": 6})  # элемент «исключающее или»: gd = ya ⊕ yb
+    gs = n + len(gates); gates.append({"a": ys, "b": gd, "mask": 8})  # элемент «и»: gs = ys ∧ gd
+    gy = n + len(gates); gates.append({"a": ya, "b": gs, "mask": 6})  # элемент «исключающее или»: y = ya ⊕ gs = ya ⊕ (ys ∧ (ya ⊕ yb))
     return {"n_inputs": n, "gates": gates, "outs": os_[:-1] + oa[:-1] + ob[:-1] + [gy]}  # выходы: новые состояния S, A, B + y
 
 def compose_net_delayed_feedback(net_m: dict, ns: int) -> dict:
@@ -1090,7 +1090,7 @@ def _compose_anf_and_rows(op: str, pa: Skill, pb: Skill | None = None, pc: Skill
             r1 = pa.rows[s1 | (u << ns1)]; r2 = pb.rows[s2 | (sum(v << i for i, v in enumerate(r1[ns1:])) << ns2)]  # r1 — шаг A; r2 — шаг B с входом, равным выходу A (в виде числа)
             rows.append(tuple(list(r1[:ns1]) + list(r2)))  # строка: новое состояние A + строка B
         return anf, rows  # вернуть (АНФ, строки)
-    if op == "PARALLEL_PAIR":
+    if op == "PARALLEL_PAIR":  # ветка параллельной пары
         ns1, ns2, ni = pa.ns, pb.ns, pa.ni  # параллельная пара: разрядности
         ao = tuple(remap(p, tuple(list(range(ns1)) + [ns1 + ns2 + j for j in range(ni)])) for p in pa.anf)  # АНФ A в общих переменных
         bo = tuple(remap(p, tuple(list(range(ns1, ns1 + ns2)) + [ns1 + ns2 + j for j in range(ni)])) for p in pb.anf)  # АНФ B в общих переменных
@@ -1101,7 +1101,7 @@ def _compose_anf_and_rows(op: str, pa: Skill, pb: Skill | None = None, pc: Skill
                       list(pb.rows[((x >> ns1) & ((1 << ns2) - 1)) | ((x >> (ns1 + ns2)) << ns2)][ns2:]))  # выход B; строка = новое состояние A + новое состояние B + выход A + выход B
                 for x in range(1 << (ns1 + ns2 + ni))]  # перебор всех x
         return anf, rows  # вернуть (АНФ, строки)
-    if op == "PARALLEL_LUT":
+    if op == "PARALLEL_LUT":  # ветка параллельной пары с общей таблицей функции
         ns1, ns2, ni = pa.ns, pb.ns, pa.ni  # параллельная пара с LUT: разрядности
         ao = tuple(remap(p, tuple(list(range(ns1)) + [ns1 + ns2 + j for j in range(ni)])) for p in pa.anf)  # АНФ A в общих переменных
         bo = tuple(remap(p, tuple(list(range(ns1, ns1 + ns2)) + [ns1 + ns2 + j for j in range(ni)])) for p in pb.anf)  # АНФ B в общих переменных
@@ -1112,7 +1112,7 @@ def _compose_anf_and_rows(op: str, pa: Skill, pb: Skill | None = None, pc: Skill
             r2 = pb.rows[((x >> ns1) & ((1 << ns2) - 1)) | ((x >> (ns1 + ns2)) << ns2)]  # шаг B
             rows.append(tuple(list(r1[:ns1]) + list(r2[:ns2]) + [lut4_eval(lut4, r1[ns1], r2[ns2])]))  # строка: состояние A + состояние B + lut4(ya, yb)
         return anf, rows  # вернуть (АНФ, строки)
-    if op == "MUX_2IN":
+    if op == "MUX_2IN":  # ветка мультиплексора двух входов
         ns1, ns2 = pa.ns, pb.ns; u0, u1 = ns1 + ns2, ns1 + ns2 + 1  # мультиплексор 2 в 1: разрядности; номера входов u0 (общий) и u1 (выбор)
         ao = tuple(remap(p, tuple(list(range(ns1)) + [u0])) for p in pa.anf)  # АНФ A в общих переменных (вход u0)
         bo = tuple(remap(p, tuple(list(range(ns1, ns1 + ns2)) + [u0])) for p in pb.anf)  # АНФ B в общих переменных (вход u0)
@@ -1123,7 +1123,7 @@ def _compose_anf_and_rows(op: str, pa: Skill, pb: Skill | None = None, pc: Skill
             r2 = pb.rows[((x >> ns1) & ((1 << ns2) - 1)) | (((x >> (ns1 + ns2)) & 1) << ns2)]  # шаг B с входом u0
             rows.append(tuple(list(r1[:ns1]) + list(r2[:ns2]) + [r2[ns2] if ((x >> (ns1 + ns2 + 1)) & 1) else r1[ns1]]))  # строка: состояние A + состояние B + (yb, если u1 = 1, иначе ya)
         return anf, rows  # вернуть (АНФ, строки)
-    if op == "MOE_MUX":
+    if op == "MOE_MUX":  # ветка мультиплексора смеси экспертов
         ns_s, ns_a, ns_b, ni = pa.ns, pb.ns, pc.ns, pa.ni; off_a, off_b, off_u = ns_s, ns_s + ns_a, ns_s + ns_a + ns_b  # «смесь экспертов»: разрядности; смещения состояния A, состояния B и входов
         u_map = [off_u + j for j in range(ni)]  # номера входных проводов u_map = off_u + j
         so = tuple(remap(p, tuple(list(range(ns_s)) + u_map)) for p in pa.anf)  # АНФ схемы S (переключателя) в общих переменных
@@ -1138,7 +1138,7 @@ def _compose_anf_and_rows(op: str, pa: Skill, pb: Skill | None = None, pc: Skill
             rb = pc.rows[((x >> off_b) & ((1 << ns_b) - 1)) | (u << ns_b)]  # шаг B
             rows.append(tuple(list(rs[:ns_s]) + list(ra[:ns_a]) + list(rb[:ns_b]) + [rb[ns_b] if rs[ns_s] else ra[ns_a]]))  # строка: состояния S, A, B + (yb, если ys = 1, иначе ya)
         return anf, rows  # вернуть (АНФ, строки)
-    if op == "DELAYED_FEEDBACK":
+    if op == "DELAYED_FEEDBACK":  # ветка задержанной обратной связи
         ns = pa.ns; mo = tuple(remap(p, tuple(list(range(ns)) + [ns + 1, ns])) for p in pa.anf)  # задержанная обратная связь: АНФ A с входами (задержка d = бит ns + 1, вход u0 = бит ns)
         anf = tuple(mo[:ns]) + (mo[ns], mo[ns])  # АНФ: новое состояние + y + y
         rows = []  # строки
@@ -1165,34 +1165,34 @@ def compose_quotient(op: str, pa: Skill, pb: Skill | None = None, pc: Skill | No
             op: операция, pa, pb, pc: навыки, lut4: таблица функции. Произведение состояний кодируется числом
             (s1·k2 + s2) (или вложенно для трёх автоматов). Возвращает (k, хеш, T) — первые три результата
             minimize_quotient_table. Неизвестная операция — ValueError."""
-    if op == "CASCADE":
+    if op == "CASCADE":  # ветка каскада (выход первого автомата — вход второго)
         Ta, Tb = pa.quotient_T, pb.quotient_T; ka, kb, ni = len(Ta), len(Tb), pa.ni  # каскад: фактор-таблицы, числа состояний, вход A
         raw = [tuple((Ta[s1][u][0] * kb + Tb[s2][sum(v << i for i, v in enumerate(Ta[s1][u][1]))][0],  # сырая таблица: состояние (s1·kb + s2), по входу u: A переходит, его выход (как число) — вход B
                       Tb[s2][sum(v << i for i, v in enumerate(Ta[s1][u][1]))][1]) for u in range(1 << ni))  # продолжение: выход B
                for s1 in range(ka) for s2 in range(kb)]  # перебор всех пар состояний
         return minimize_quotient_table(ka * kb, ni, pb.no, raw, 0)[:3]  # минимизация произведения; вернуть (k, хеш, T)
-    if op == "PARALLEL_PAIR":
+    if op == "PARALLEL_PAIR":  # ветка параллельной пары
         Ta, Tb = pa.quotient_T, pb.quotient_T; ka, kb, ni = len(Ta), len(Tb), pa.ni  # параллельная пара
         raw = [tuple((Ta[s1][u][0] * kb + Tb[s2][u][0], Ta[s1][u][1] + Tb[s2][u][1]) for u in range(1 << ni)) for s1 in range(ka) for s2 in range(kb)]  # сырая таблица: один вход u, переходы обоих, выход — конкатенация выходов
         return minimize_quotient_table(ka * kb, ni, pa.no + pb.no, raw, 0)[:3]  # минимизация, вернуть (k, хеш, T)
-    if op == "PARALLEL_LUT":
+    if op == "PARALLEL_LUT":  # ветка параллельной пары с общей таблицей функции
         Ta, Tb = pa.quotient_T, pb.quotient_T; ka, kb, ni = len(Ta), len(Tb), pa.ni  # параллельная пара с LUT
         raw = [tuple((Ta[s1][u][0] * kb + Tb[s2][u][0], (lut4_eval(lut4, Ta[s1][u][1][0], Tb[s2][u][1][0]),)) for u in range(1 << ni)) for s1 in range(ka) for s2 in range(kb)]  # сырая таблица: выход = lut4(ya, yb)
         return minimize_quotient_table(ka * kb, ni, 1, raw, 0)[:3]  # минимизация с одним выходным битом
-    if op == "MUX_2IN":
+    if op == "MUX_2IN":  # ветка мультиплексора двух входов
         Ta, Tb = pa.quotient_T, pb.quotient_T; ka, kb = len(Ta), len(Tb)  # мультиплексор 2 в 1: вход u = (u0, u1)
         raw = [tuple((Ta[s1][u & 1][0] * kb + Tb[s2][u & 1][0], Tb[s2][u & 1][1] if ((u >> 1) & 1) else Ta[s1][u & 1][1]) for u in range(4)) for s1 in range(ka) for s2 in range(kb)]  # сырая таблица: вход u0 = u & 1; выход B, если u1 = 1, иначе выход A
         return minimize_quotient_table(ka * kb, 2, 1, raw, 0)[:3]  # минимизация с двумя входными битами
-    if op == "MOE_MUX":
+    if op == "MOE_MUX":  # ветка мультиплексора смеси экспертов
         Ts, Ta, Tb = pa.quotient_T, pb.quotient_T, pc.quotient_T; ks, ka, kb, ni = len(Ts), len(Ta), len(Tb), pa.ni  # «смесь экспертов»: три фактор-таблицы
         raw = [tuple((((Ts[ss][u][0] * ka) + Ta[sa][u][0]) * kb + Tb[sb][u][0], (Tb[sb][u][1][0] if Ts[ss][u][1][0] else Ta[sa][u][1][0],)) for u in range(1 << ni))  # сырая таблица: состояние ((s_s·ka + s_a)·kb + s_b); выход B, если ys = 1, иначе A
                for ss in range(ks) for sa in range(ka) for sb in range(kb)]  # перебор всех троек состояний
         return minimize_quotient_table(ks * ka * kb, ni, 1, raw, 0)[:3]  # минимизация
-    if op == "DELAYED_FEEDBACK":
+    if op == "DELAYED_FEEDBACK":  # ветка задержанной обратной связи
         Tm = pa.quotient_T; km = len(Tm)  # задержанная обратная связь: модуль M, km состояний
         raw = [tuple((Tm[sm][u0 | (d << 1)][0] * 2 + Tm[sm][u0 | (d << 1)][1][0], (Tm[sm][u0 | (d << 1)][1][0],)) for u0 in (0, 1)) for sm in range(km) for d in (0, 1)]  # сырая таблица: состояние (s_m·2 + d); вход u0 | (d << 1); выход модуля; новое d = выход
         return minimize_quotient_table(km * 2, 1, 1, raw, 0)[:3]  # минимизация с одним входным битом
-    if op == "COUPLED_FEEDBACK_2BIT":
+    if op == "COUPLED_FEEDBACK_2BIT":  # ветка связанной обратной связи на 2 бита
         Ta, Tb = pa.quotient_T, pb.quotient_T; ka, kb = len(Ta), len(Tb)  # связанная обратная связь
         raw = [tuple(((((Ta[sa][u0 | (db << 1)][0] * kb + Tb[sb][u0 | (da << 1)][0]) * 2 + Ta[sa][u0 | (db << 1)][1][0]) * 2 + Tb[sb][u0 | (da << 1)][1][0]),  # сырая таблица: состояние ((s_a·kb + s_b)·2 + da)·2 + db; выход B
                       (Tb[sb][u0 | (da << 1)][1][0],)) for u0 in (0, 1))  # продолжение: выход
@@ -2231,7 +2231,7 @@ class AutonomousTemporalAgent:
                                 if lc not in (0, 15, 3, 5, 10, 12):  # таблица не должна быть вырожденной (константа, отрицание, проекция)
                                     if (res := try_commit("PARALLEL_LUT", (a, b), lut4_val=lc, fam_tag=fam)) is not None: return res  # проверить и собрать; при неудаче пробы могли пополниться — пересчитать вектор цели
                                     g_vec, mask_all = build_probe_bitvec(probe_obs)  # пересчитать вектор цели и маску
-            elif fam == "PAIR2_TO_2IN" and ni == 1 and no == 1:
+            elif fam == "PAIR2_TO_2IN" and ni == 1 and no == 1:  # семейство «модуль на два входа к одному» с одним входом и одним выходом
                 small11 = [s for s in s11 if s.ns <= 2]  # малые навыки (состояние ≤ 2 бит)
                 for m in s21:  # по модулям m с ni = 2
                     for a in small11:  # по a
@@ -2252,7 +2252,7 @@ class AutonomousTemporalAgent:
                                     solved = self.compose("CASCADE", pair_sk, m, name, route_override="GOAL_PAIR2_CASCADE_SOLVED", extra_queries=bb.queries, generation=generation)  # собрать каскад пары и m
                                     return solved, {"solved_by": "COMPOSITION(PAIR2_TO_2IN)" + ("+PAC" if bb.pac_mode else ""), "parents": [a.name, b.name, m.name], "bb_ticks": bb.queries, "k_states": k_f, "pac_samples": bb.pac_samples}  # вернуть навык и отчёт
                                 probe_obs.append((cex, bb.eval_seq(cex)))  # иначе — запомнить контрпример
-            elif fam == "RECURRENT_MUX_FB" and ni == 1 and no == 1:
+            elif fam == "RECURRENT_MUX_FB" and ni == 1 and no == 1:  # семейство рекуррентного мультиплексора с обратной связью, один вход и один выход
                 small11 = [s for s in s11 if s.ns <= 2]  # малые навыки (состояние ≤ 2 бит)
                 for a in small11:  # по a
                     for b in small11:  # по b
@@ -2272,7 +2272,7 @@ class AutonomousTemporalAgent:
                                 solved = self.compose("DELAYED_FEEDBACK", mux_sk, None, name, route_override="GOAL_RECURRENT_MUX_FB_SOLVED", extra_queries=bb.queries, generation=generation)  # собрать задержанную обратную связь мультиплексора
                                 return solved, {"solved_by": "COMPOSITION(RECURRENT_MUX_FB)" + ("+PAC" if bb.pac_mode else ""), "parents": [a.name, b.name], "bb_ticks": bb.queries, "k_states": k_fb, "pac_samples": bb.pac_samples}  # вернуть навык и отчёт
                             probe_obs.append((cex, bb.eval_seq(cex)))  # иначе — запомнить контрпример
-            elif fam == "MOE_MUX" and ni == 1 and no == 1:
+            elif fam == "MOE_MUX" and ni == 1 and no == 1:  # семейство мультиплексора смеси экспертов, один вход и один выход
                 g_vec, mask_all = build_probe_bitvec(probe_obs); sv = [skill_probe_vec(s.quotient_T, probe_obs) for s in s11]  # «смесь экспертов»: вектор цели, маска, векторы кандидатов
                 for i_s, sel in enumerate(s11):  # по переключателю sel
                     if sel.ns > 3: continue  # переключатель не шире 3 бит
@@ -2342,7 +2342,7 @@ class AutonomousTemporalAgent:
             if len(committed) >= max_new: break  # набрано max_new — стоп
             k_q, bdig_q, _ = compose_quotient(op, a, b, lut4=l4)  # фактор-автомат композиции
             if 2 <= k_q <= 64 and bdig_q not in self.lib.by_behav:  # от 2 до 64 состояний и новое поведение — собрать навык
-                committed.append(self.compose(op, a, b, f"novel_{generation}_{len(committed):02d}", lut4=l4, generation=generation))
+                committed.append(self.compose(op, a, b, f"novel_{generation}_{len(committed):02d}", lut4=l4, generation=generation))  # собрать новый навык с именем novel_<поколение>_<номер> и добавить в список принятых
         return committed  # вернуть добавленные
 
     def repair_skill_netlist(self, skill_name: str, corrupted_net: dict) -> tuple[dict, list[int], int]:
