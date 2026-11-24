@@ -266,3 +266,138 @@ def decompress_file(u, path, out_path, domain: str | None = None) -> bytes:
     data = decompress_bytes(u, pathlib.Path(path).read_bytes(), domain)
     pathlib.Path(out_path).write_bytes(data)
     return data
+
+
+# ---- WAVE 264: neural + multi-order context table (stream codec) ----------
+# From "HAGI Exact Generation v3" (checkpoints/HAGI_EXACT_GENERATION_V3,
+# src/adaptive_context_codec.py). For each byte the full-support neural
+# distribution p is mixed with the empirical continuation distribution r
+# of the LONGEST already-seen suffix context (16/12/8/4/2 bytes):
+#     q = (1 - lam) * p + lam * r,   lam < 1
+# so every byte keeps positive probability and surprises go into the
+# residual. The table is updated only with bytes the decoder already
+# holds — this needs SEQUENTIAL decoding (one forward per byte), hence
+# a separate codec from the column-batched one above.
+CONTEXT_LENGTHS = (16, 12, 8, 4, 2)
+MAGIC4 = b"HAGI4"
+
+
+class ContextTable:
+    """Causal suffix table: orders longest-first, a context counts only
+    if it has seen >= min_count continuations."""
+
+    def __init__(self, prefix: bytes = b"", lengths=CONTEXT_LENGTHS, min_count: int = 1):
+        self.lengths, self.min_count = tuple(lengths), int(min_count)
+        self.t = {L: {} for L in self.lengths}
+        for L in self.lengths:
+            for i in range(L - 1, len(prefix) - 1):
+                d = self.t[L].setdefault(bytes(prefix[i - L + 1:i + 1]), {})
+                b = prefix[i + 1]
+                d[b] = d.get(b, 0) + 1
+
+    def choose(self, hist):
+        for L in self.lengths:
+            if len(hist) < L:
+                continue
+            d = self.t[L].get(bytes(hist[-L:]))
+            if d is not None and sum(d.values()) >= self.min_count:
+                return d
+        return None
+
+    def update(self, hist, sym):
+        for L in self.lengths:
+            if len(hist) >= L:
+                d = self.t[L].setdefault(bytes(hist[-L:]), {})
+                d[sym] = d.get(sym, 0) + 1
+
+
+def mix_probs(p: np.ndarray, counts, lam: float) -> np.ndarray:
+    if counts is None or lam <= 0.0:
+        return p
+    q = (1.0 - lam) * p
+    tot = sum(counts.values())
+    for s, c in counts.items():
+        q[int(s)] += lam * c / tot
+    return q / q.sum()
+
+
+def model_fingerprint(model) -> bytes:
+    import hashlib
+    h = hashlib.sha256()
+    h.update(f"{getattr(model, 'ARCH', '?')}|{model.k}|{model.dim}|{model.hidden}".encode())
+    for p in model.params():
+        h.update(p.detach().cpu().numpy().tobytes())
+    return h.digest()[:16]
+
+
+def _pad_ctx(hist: bytes, k: int) -> np.ndarray:
+    tail = hist[-k:]
+    x = np.zeros(k, dtype=np.int64)
+    x[k - len(tail):] = np.frombuffer(tail, dtype=np.uint8).astype(np.int64)
+    return x[None, :]
+
+
+def _pack_lam(lam: float) -> int:
+    if not 0.0 <= lam < 1.0:
+        raise ValueError("lambda must be in [0, 1): the neural prior keeps full support")
+    return min(65534, int(round(lam * 65535)))
+
+
+def compress_stream(model, data: bytes, prefix: bytes = b"", lam: float = 0.70,
+                    min_count: int = 1) -> bytes:
+    """Sequential codec with a context table (one forward per byte).
+    `prefix` must be known to the decoder (e.g. the head of the same
+    file). Stored if the result would not beat the plain archive."""
+    import hashlib
+    import zlib
+    if len(data) < 64:
+        return compress(model, data)
+    lam_q = _pack_lam(lam)
+    tab = ContextTable(prefix, min_count=min_count)
+    hist = bytearray(prefix)
+    enc = ArithEncoder()
+    for s in data:
+        q = mix_probs(_probs(model, _pad_ctx(bytes(hist), model.k))[0].astype(np.float64), tab.choose(hist), lam_q / 65535.0)
+        enc.encode_step(np.asarray([s], dtype=np.int64), q[None, :].astype(np.float32))
+        tab.update(hist, s)
+        hist.append(s)
+    payload = enc.finish()
+    head = (MAGIC4 + struct.pack(">IBBHI", len(data), model.k, min_count, lam_q, len(payload))
+            + model_fingerprint(model) + hashlib.sha256(prefix).digest()
+            + hashlib.sha256(data).digest()[:16] + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF))
+    arc = head + payload
+    return arc if len(arc) < len(compress(model, data)) else compress(model, data)
+
+
+def decompress_stream(model, payload: bytes, prefix: bytes = b"") -> bytes:
+    import hashlib
+    import zlib
+    if payload[:len(MAGIC4)] != MAGIC4:
+        return decompress(model, payload)
+    n, k, min_count, lam_q, plen = struct.unpack(">IBBHI", payload[5:17])
+    off = 17
+    fp, ph, th = payload[off:off + 16], payload[off + 16:off + 48], payload[off + 48:off + 64]; off += 64
+    (crc,) = struct.unpack(">I", payload[off:off + 4]); off += 4
+    body = payload[off:]
+    if k != model.k:
+        raise ValueError("model context length mismatch")
+    if fp != model_fingerprint(model):
+        raise ValueError("model fingerprint mismatch")
+    if ph != hashlib.sha256(prefix).digest():
+        raise ValueError("prefix checksum mismatch")
+    if len(body) != plen or (zlib.crc32(body) & 0xFFFFFFFF) != crc:
+        raise ValueError("payload corrupt")
+    tab = ContextTable(prefix, min_count=min_count)
+    hist = bytearray(prefix)
+    dec = ArithDecoder(body)
+    out = bytearray()
+    lam = lam_q / 65535.0
+    for _ in range(n):
+        q = mix_probs(_probs(model, _pad_ctx(bytes(hist), model.k))[0].astype(np.float64), tab.choose(hist), lam)
+        s = int(dec.decode_step(q[None, :].astype(np.float32))[0])
+        out.append(s)
+        tab.update(hist, s)
+        hist.append(s)
+    if hashlib.sha256(bytes(out)).digest()[:16] != th:
+        raise ValueError("decoded bytes do not match the archive checksum")
+    return bytes(out)

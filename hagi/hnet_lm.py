@@ -56,6 +56,7 @@ class HNetByteLM:
         self.b2 = t.nn.Parameter(t.zeros(256))
         self.W_out = rn(d, 256, s=1 / math.sqrt(d))
         self._extra = []
+        self.rms_eps = 1e-5
         if bi_buckets > 0:
             self.bi_emb = rn(bi_buckets, d_bi, s=0.05)
             self.W_bi = rn(d_bi, 256, s=1 / math.sqrt(d_bi))
@@ -93,6 +94,64 @@ class HNetByteLM:
         return [self.emb, self.W_loc, self.p_pool, self.W_q, self.W_k, self.W_v, self.W_o,
                 self.rms1, self.rms2, self.W_g, self.W_u, self.W_d, self.b2, self.W_out] + self._extra
 
+    def _rope_tables(self, M: int, half: int):
+        t = self.t
+        freq = self.theta0 ** (-2.0 * t.arange(half, dtype=t.float32) / max(1, self.hd))
+        ang = t.arange(M, dtype=t.float32)[:, None] * freq[None, :]
+        return t.cos(ang)[None, :, None, :], t.sin(ang)[None, :, None, :]
+
+    def grow_width(self, d_new: int, h_new: int, seed: int = 0) -> "HNetByteLM":
+        """WAVE 263 — WIDTH growth that preserves the logits EXACTLY
+        (Hagi/Theory/NadyaOptimal.lean, `wlogits_width_preserved`, n_heads = 1):
+          rms_eps *= d0/d1;  rms1, rms2 *= sqrt(d0/d1), new coords 0;
+          emb/pool/W_loc/W_k/W_v/W_o/W_g/W_u/W_d/W_out: zero-padded blocks;
+          W_q: old block *= sqrt(hd1/hd0);
+          RoPE: old frequencies kept, new pairs cos=sin=0 (padTo);
+          b2, alibi unchanged.
+        Not a heuristic: the theorem says logits_new(x) = logits_old(x)."""
+        assert self.nh == 1, "width growth is proven for n_heads = 1 only"
+        t = self.t
+        d0, h0 = self.dim, self.hidden
+        assert d_new >= d0 and h_new >= h0 and d_new % 2 == 0
+        m = HNetByteLM(dim=d_new, hidden=h_new, pool_r=self.r, n_heads=1,
+                       bi_buckets=self.bi_buckets, d_bi=self.d_bi,
+                       theta0=self.theta0, lam=self.lam, seed=seed)
+        rs = math.sqrt(d0 / d_new)
+        with t.no_grad():
+            m.emb.zero_(); m.emb[:, :d0] = self.emb
+            m.p_pool.fill_(1.0 / self.r); m.p_pool[:, :d0] = self.p_pool
+            m.rms1.zero_(); m.rms1[:d0] = self.rms1 * rs
+            m.rms2.zero_(); m.rms2[:d0] = self.rms2 * rs
+            m.b2.copy_(self.b2)
+            n_loc = len(self.loc_idx)
+            m.W_loc.zero_()
+            for si in range(n_loc):
+                m.W_loc[si * d_new:si * d_new + d0, :d0] = self.W_loc[si * d0:(si + 1) * d0, :]
+            qsc = math.sqrt(d_new / d0)
+            for name, sc in (("W_q", qsc), ("W_k", 1.0), ("W_v", 1.0)):
+                getattr(m, name).zero_(); getattr(m, name)[:d0, :d0] = getattr(self, name) * sc
+            m.W_o.zero_(); m.W_o[:d0, :d0] = self.W_o
+            m.W_g.zero_(); m.W_g[:d0, :h0] = self.W_g
+            m.W_u.zero_(); m.W_u[:d0, :h0] = self.W_u
+            m.W_d.zero_(); m.W_d[:h0, :d0] = self.W_d
+            m.W_out.zero_(); m.W_out[:d0, :] = self.W_out
+            if self._extra:
+                m.bi_emb.copy_(self.bi_emb); m.W_bi.copy_(self.W_bi)
+        # RoPE: old frequencies exactly as before, new pairs zero (padTo)
+        half0, half1 = d0 // 2, d_new // 2
+        c0, s0 = self._rope_tables(m.k // m.r, half0)
+        M = m.k // m.r
+        zeros = t.zeros((1, M, 1, half1 - half0), device=c0.device)
+        m.cos_m = t.cat([c0, zeros], dim=-1); m.sin_m = t.cat([s0, zeros], dim=-1)
+        m.alibi = self.alibi.clone()
+        m.rms_eps = self.rms_eps * (d0 / d_new)
+        m.device = self.device
+        if self.device == "cuda":
+            for p_ in m.params():
+                p_.data = p_.data.to(self.device)
+            m.cos_m, m.sin_m, m.alibi = (x.to(self.device) for x in (m.cos_m, m.sin_m, m.alibi))
+        return m
+
     def grow(self, seed: int = 0) -> int:      # interface compat; no-op identity
         return len(self.blocks)
 
@@ -100,7 +159,8 @@ class HNetByteLM:
         return h
 
     # -- model -----------------------------------------------------------
-    def _rms(self, x, g, eps=1e-5):
+    def _rms(self, x, g, eps=None):
+        eps = self.rms_eps if eps is None else eps
         return x / (x.pow(2).mean(-1, keepdim=True) + eps).sqrt() * g
 
     def _rot(self, x, cos, sin):
@@ -206,11 +266,19 @@ class HNetByteLM:
 
 
 def t_stack_logits(m, ctx):
+    """(B, L, 256): logits of the next byte after every prefix. HNet
+    needs exactly k columns (pooling by r), so short prefixes are
+    LEFT-padded with byte 0 — the same construction train_guarded uses
+    for the first k positions of a file."""
     t = m.t
     B, L = ctx.shape
     outs = []
     for i in range(1, L + 1):
-        outs.append(m.logits(ctx[:, max(0, i - m.k):i]))
+        if i >= m.k:
+            outs.append(m.logits(ctx[:, i - m.k:i]))
+        else:
+            pad = t.zeros((B, m.k - i), dtype=ctx.dtype, device=ctx.device)
+            outs.append(m.logits(t.cat([pad, ctx[:, :i]], dim=1)))
     return t.stack(outs, dim=1)
 
 

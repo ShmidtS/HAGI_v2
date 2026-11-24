@@ -552,6 +552,28 @@ class Unified:
                 "forgot": None if post is None else round(post - pre, 4)}
 
 
+    def grow_width(self, d_new: int, h_new: int) -> dict:
+        """WAVE 263: exact WIDTH growth of the trunk (HNetByteLM.
+        grow_width — logits preserved, Hagi/Theory/NadyaOptimal.lean
+        `wlogits_width_preserved`) together with every domain adapter:
+        A (r x d) gets zero columns, B (d x r) zero rows, so
+        h + (h @ A^T) @ B^T is unchanged as well. Blocks (Rope depth
+        growth) are not supported here: HNet only."""
+        import numpy as _np
+        m = self.model
+        assert getattr(m, "ARCH", "") == "hnet", "grow_width: hnet only"
+        d0, d1 = m.dim, d_new
+        self.model = m.grow_width(d_new, h_new)
+        bank = getattr(self, "adapter_bank", None)
+        if bank is not None and d1 != d0:
+            for ad in bank._adapters.values():
+                A = _np.zeros((ad.r, d1), dtype=_np.float64); A[:, :ad.A.shape[1]] = ad.A
+                B = _np.zeros((d1, ad.r), dtype=_np.float64); B[:ad.B.shape[0], :] = ad.B
+                ad.A, ad.B, ad.d = A, B, d1
+            bank.d = d1
+        return {"d": [d0, d1], "h": [m.hidden, h_new],
+                "params": sum(q.numel() for q in self.model.params())}
+
     def _maybe_grow(self, source: str, data: bytes) -> dict:
         import torch as _t
         import numpy as _np
@@ -714,8 +736,17 @@ class Unified:
         if not names:
             return None, None
         rng = np.random.default_rng(11)
-        sample = list(rng.choice(names, min(max_domains, len(names)),
-                                 replace=False))
+        # WAVE 263: measure where knowledge actually IS. The book holds
+        # >1000 domains of which only the recently trained ones carry
+        # anything to forget; a uniform sample of 8 almost never hits
+        # them (measured: 18 repair runs, yet trained domains still
+        # drifted +1.8 nats). Trained domains first, the rest fills up.
+        trained = [n for n in names if self.domains[n].get("ce") is not None]
+        rest = [n for n in names if self.domains[n].get("ce") is None]
+        sample = list(trained) if len(trained) <= max_domains else             list(rng.choice(trained, max_domains, replace=False))
+        if len(sample) < max_domains and rest:
+            k_ = min(max_domains - len(sample), len(rest))
+            sample += list(rng.choice(rest, k_, replace=False))
         t = self.model.t
         vec = []
         with t.no_grad():
