@@ -62,7 +62,7 @@ def _fn_hash(name: str) -> str:  # короткое имя функции для
     """Устойчивое короткое хэш-имя для экспортируемой функции: детерминировано по имени,
     один эксперт всегда получает один и тот же хэш: "f" + первые 10 знаков sha1(имя)."""
     import hashlib  # хэширование имени
-    return "f" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]  # "f" + sha1(name)[:10]
+    return "f" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]  # имя функции: "f" + sha1(name)[:10]
 
 
 def transpile(e, names: tuple[str, ...] = VAR_NAMES) -> str:  # выражение Expr -> текст Python
@@ -121,15 +121,15 @@ def transpile(e, names: tuple[str, ...] = VAR_NAMES) -> str:  # выражени
     if op in _SIMPLE2:  # бинарная из таблицы
         return _SIMPLE2[op].format(a[0], a[1])  # шаблон с подставленными a0, a1
     if op == "fma":  # умножить-сложить
-        return f"({a[0]} * {a[1]} + {a[2]})"  # (a0·a1 + a2)
+        return f"({a[0]} * {a[1]} + {a[2]})"  # текст умножения со сложением: (a0·a1 + a2)
     if op == "clamp":  # ограничить диапазоном
-        return f"min(max({a[0]}, {a[1]}), {a[2]})"  # min(max(a0, a1), a2)
+        return f"min(max({a[0]}, {a[1]}), {a[2]})"  # текст усечения: min(max(a0, a1), a2)
     if op == "clamp3":  # ограничить отрезком [−3, 3]
-        return f"min(max({a[0]}, -3), 3)"  # min(max(a0, −3), 3)
+        return f"min(max({a[0]}, -3), 3)"  # текст усечения: min(max(a0, −3), 3)
     if op == "median3":  # медиана трёх
         return f"sorted(({a[0]}, {a[1]}, {a[2]}))[1]"  # средний элемент отсортированной тройки
     if op == "mul3":  # произведение трёх
-        return f"({a[0]} * {a[1]} * {a[2]})"  # (a0·a1·a2)
+        return f"({a[0]} * {a[1]} * {a[2]})"  # текст тройного произведения: (a0·a1·a2)
     raise ValueError(f"unsupported op for transpile: {op}")  # неизвестная операция — ошибка
 
 
@@ -184,7 +184,7 @@ def _hagi_poly_nd(terms, xs):
             t *= x ** p
         total += t
     return total
-'''
+'''  # конец строкового литерала с текстом вспомогательных функций
 
 
 def _expert_domain(ex) -> list[tuple[int, ...]]:  # все допустимые входы эксперта
