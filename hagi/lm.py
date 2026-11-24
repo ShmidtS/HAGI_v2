@@ -1713,7 +1713,15 @@ class CertifiedStepLM:
 # default; "hnet" -> hagi.hnet_lm.HNetByteLM (torch port of the
 # "HAGI v2 Optimal" byte LM, see its module docstring for the A/B).
 def make_lm(arch: str, dim: int | None = None, hidden: int | None = None, **kw):
+    """WAVE 262: HNet default d=64 h=128 (105k params). Measured, 4 real
+    disk files, 8000 steps, whole-file CE: d24 1.445 | d32 1.344 |
+    d48 1.200 | d64 1.096 | d128(335k) 1.032 — past d=64 the gain per
+    parameter collapses; Rope(132k) reaches 1.81. HAGI_DIM/HAGI_HIDDEN
+    override (HNet ignores the Rope-sized dim/hidden of Unified)."""
+    import os as _o
     if arch == "hnet":
         from hagi.hnet_lm import HNetByteLM
-        return HNetByteLM(dim=dim or 24, hidden=hidden or 48, **kw)
+        d = int(_o.environ.get("HAGI_DIM", dim or 64) if _o.environ.get("HAGI_DIM") or dim is None else dim)
+        h = int(_o.environ.get("HAGI_HIDDEN", hidden or 128) if _o.environ.get("HAGI_HIDDEN") or hidden is None else hidden)
+        return HNetByteLM(dim=d, hidden=h, **kw)
     return RopeAttentionByteLM(dim=dim or 128, hidden=hidden or 256, **kw)

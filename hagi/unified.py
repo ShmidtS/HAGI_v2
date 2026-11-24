@@ -77,8 +77,18 @@ class Unified:
         self.k, self.dim, self.hidden = k, dim, hidden
         # WAVE 229 (URGENT): RopeAttentionByteLM — true attention,
         # 96-byte context (vs k=16 fixed window of CertifiedStepLM).
-        self.model = lm_mod.make_lm(self.ARCH, dim, hidden)
+        self.model = (lm_mod.make_lm(self.ARCH) if self.ARCH == "hnet"
+                        else lm_mod.make_lm(self.ARCH, dim, hidden))
         self.domains: dict[str, dict[str, Any]] = {}
+        # WAVE 262: a FRESH model keeps the domain BOOK. The book is the
+        # data (replay source), not the weights: starting from scratch
+        # with an empty book trained the first 40 chunks "blind" (no
+        # replay, old-domain gate = None) — measured on 2026-11-24.
+        if _ledger_js().exists():
+            try:
+                self.domains = json.loads(_ledger_js().read_text(encoding="utf-8"))
+            except Exception:
+                self.domains = {}
 
     # ---- ingest: ANY data ----
 

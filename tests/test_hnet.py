@@ -38,3 +38,13 @@ def test_hnet_unified_roundtrip_save_load_and_ingest(tmp_path, monkeypatch):
     assert type(v.model).__name__ == "HNetByteLM" and "a" in v.domains
     for a, b in zip(u.model.params(), v.model.params()):
         assert float((a.detach().cpu() - b.detach().cpu()).abs().max()) == 0.0
+
+
+def test_fresh_model_keeps_the_domain_book(tmp_path, monkeypatch):
+    """WAVE 262: Unified() on a fresh checkpoint must not start blind."""
+    import json
+    from hagi import unified as U
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)
+    (tmp_path / "unified_ledger.json").write_text(json.dumps({"x": {"sha": "s", "bytes": 9, "ce": None}}), encoding="utf-8")
+    u = U.Unified()
+    assert "x" in u.domains
