@@ -137,8 +137,8 @@ def _vfeat(kind: str, param, X) -> "np.ndarray":  # тип характерис�
 
 def _kind(name: str) -> str:  # имя характеристики
     """Вернуть тип характеристики по префиксу её имени."""
-    for pre, kind in (("aff", "aff"), ("diff", "diff"), ("fxor", "xfull"),
-                      ("xor", "xorm"), ("pos", "pos")):
+    for pre, kind in (("aff", "aff"), ("diff", "diff"), ("fxor", "xfull"),  # по парам (префикс имени, тип)
+                      ("xor", "xorm"), ("pos", "pos")):  # продолжение списка пар
         if name.startswith(pre):  # имя начинается с префикса
             return kind  # соответствующий тип
     raise KeyError(name)  # неизвестное имя — ошибка
