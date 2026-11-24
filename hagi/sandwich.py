@@ -1,131 +1,133 @@
-"""Certified softmax sandwich (primes C489/C495/C502).
+"""Сертифицированная «сэндвич»-оценка softmax: точные рациональные границы вероятностей.
 
-Every formula here is the direct Python image of a proven Lean
-theorem (Hagi.Theory.RationalSoftmax / SandwichMonotone /
-BandTightening):
+Каждая формула здесь — прямой образ на Python доказанного утверждения о рациональном
+softmax, монотонности двусторонних границ и их сужении:
 
-  lo  = (1 + sv/nm) ** nm          — lower exp bound (bernoulliLower_mono)
-  hi  = (1 - sv/nm) ** (-nm)       — upper exp bound (expUpper_base_mono)
-  sv  = z - max(z)                 — max-shifted logits, in [-R, 0]
+  lo  = (1 + sv/nm) ** nm          — нижняя граница exp(sv) (следствие неравенства Бернулли)
+  hi  = (1 - sv/nm) ** (-nm)       — верхняя граница exp(sv)
+  sv  = z - max(z)                 — логиты со сдвигом на максимум, sv ∈ [−R, 0]
 
-Monotone in nm (C502): growing the denominator tightens both
-walls, so an eval-time loop doubling nm eventually separates any
-truly separable top-1 and certifies the argmax (cert_pred_adaptive).
+Обе границы монотонны по nm: с ростом знаменателя обе «стены» прижимаются к exp(sv),
+поэтому цикл с удвоением nm рано или поздно разделяет любой действительно различимый
+лидер и сертифицирует argmax.
 
-Range guard: sv must satisfy -sv < nm (else the upper base 1-sv/nm
-leaves (0,1]); the function honestly returns None = HOLD.
+Охрана диапазона: sv ≤ 0 и должно выполняться −sv < nm (иначе верхнее основание
+1 − sv/nm выходит из (0, 1]); при нарушении функция честно возвращает None = HOLD.
 
-Use Fraction inputs for exact rational arithmetic (bench parity);
-floats work for advisory checks.
-"""
-from __future__ import annotations
+Для точной рациональной арифметики подавайте Fraction; float годится только для
+ориентировочных проверок.
 
-from fractions import Fraction
+Экспортирует sandwich_terms (границы lo/hi), sandwich_mid (середина интервала),
+certified_argmax (сертифицированный argmax) и band_drift_check (проверка того, что
+интервал всё ещё накрывает настоящий softmax)."""
+from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-DEFAULT_NM = 4
-EVAL_NM_MAX = 1024
+from fractions import Fraction  # точные рациональные числа
+
+DEFAULT_NM = 4  # параметр nm по умолчанию
+EVAL_NM_MAX = 1024  # наибольшее nm в цикле удвоения
 
 
 def sandwich_terms(z, nm: int = DEFAULT_NM):
-    """lo/hi sandwich bounds on max-shifted logits.
+    """Нижняя и верхняя границы exp(sv) для логитов z со сдвигом на максимум.
 
-    Returns (lo, hi) lists, or None = HOLD when the range guard
-    -min(s) >= nm fails (the certificate does not exist at nm).
-    """
-    from fractions import Fraction as F
-    M = max(z)
-    s = [v - M for v in z]
-    if -min(s) >= nm:
-        return None
-    lo = [(F(1) + sv / nm) ** nm for sv in s]
-    hi = [(F(1) - sv / nm) ** (-nm) for sv in s]
-    return lo, hi
+    M = max(z); sv_i = z_i − M; lo_i = (1 + sv_i/nm)^nm; hi_i = (1 − sv_i/nm)^(−nm).
+    Возвращает списки (lo, hi) либо None = HOLD, когда охрана диапазона −min(sv) ≥ nm
+    не выполнена (при таком nm сертификата не существует)."""
+    from fractions import Fraction as F  # конструктор рационального числа (локальный импорт)
+    M = max(z)  # наибольший логит M
+    s = [v - M for v in z]  # сдвинутые логиты s_i = z_i − M
+    if -min(s) >= nm:  # охрана диапазона: −min(s) ≥ nm — верхнее основание выйдет из (0, 1]
+        return None  # сертификата нет — HOLD
+    lo = [(F(1) + sv / nm) ** nm for sv in s]  # нижние границы lo_i = (1 + sv_i/nm)^nm
+    hi = [(F(1) - sv / nm) ** (-nm) for sv in s]  # верхние границы hi_i = (1 − sv_i/nm)^(−nm)
+    return lo, hi  # вернуть оба списка
 
 
 def sandwich_mid(z, nm: int = DEFAULT_NM):
-    """Midpoint surrogate (sandwichMid): accurate to half band width
-    (sandwich_mid_acc). None = HOLD."""
-    t = sandwich_terms(z, nm)
-    if t is None:
-        return None
-    lo, hi = t
-    slo, shi = sum(lo, type(lo[0])(0)), sum(hi, type(hi[0])(0))
-    return [(hi_v / shi + lo_v / slo) / 2
-            for lo_v, hi_v in zip(lo, hi)]
+    """Середина интервала как пробная оценка: среднее нормированных границ.
+
+    slo = Σ lo_i, shi = Σ hi_i; mid_i = (hi_i/shi + lo_i/slo)/2. Точность — половина
+    ширины интервала. None = HOLD (охрана диапазона не выполнена)."""
+    t = sandwich_terms(z, nm)  # границы lo/hi или None
+    if t is None:  # охрана диапазона не выполнена
+        return None  # отказ: HOLD
+    lo, hi = t  # нижние и верхние границы
+    slo, shi = sum(lo, type(lo[0])(0)), sum(hi, type(hi[0])(0))  # суммы границ slo = Σ lo_i, shi = Σ hi_i (нулевое значение того же типа)
+    return [(hi_v / shi + lo_v / slo) / 2  # середина mid_i = (hi_i/shi + lo_i/slo) / 2
+            for lo_v, hi_v in zip(lo, hi)]  # по парам (lo_i, hi_i)
 
 
 def certified_argmax(z, nm: int = DEFAULT_NM, nm_max: int = EVAL_NM_MAX):
-    """C502 cert_pred_adaptive: the top-1 by rational midpoint,
-    certified, with nm doubling until the band separates the top-2
-    (bandWidth_mono guarantees refinement only shrinks the band).
+    """Сертифицированный argmax: лидер по рациональной середине, с удвоением nm до разделения.
 
-    Returns (class, nm_used) or (None, None) = HOLD.
-    """
-    nm = nm
-    while nm <= nm_max:
-        mid = sandwich_mid(z, nm)
-        if mid is None:
-            # WAVE 203 FIX (P0, research report): the range guard
-            # (-min(s) >= nm) failing at the CURRENT nm does NOT mean
-            # the certificate is impossible — C502 BandTightening
-            # guarantees larger nm tightens the band AND relaxes the
-            # guard (guard is -min(s) < nm). Double and retry instead
-            # of HOLDing separable logits like [10, 0, 0].
-            nm *= 2
-            continue
-        # WAVE 204 FIX (P1.5, audit bundle v2): correct probability
-        # bounds. lo_i/sum(lo) was NOT a valid lower bound — the
-        # denominator must use the OPPOSITE extremes of the rest:
-        #   L_i = l_i / (l_i + sum_{j!=i} u_j)
-        #   U_i = u_i / (u_i + sum_{j!=i} l_j)
-        # A tie (e.g. [3,3,0]) can no longer be falsely certified.
-        t = sandwich_terms(z, nm)
-        if t is None:
-            nm *= 2
-            continue
-        lo, hi = t
-        n = len(z)
-        order = sorted(range(n), key=lambda i: mid[i], reverse=True)
-        L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))
-             for i in range(n)]
-        U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))
-             for i in range(n)]
-        a = order[0]
-        if all(L[a] > U[j] for j in range(n) if j != a):
-            return a, nm
-        nm *= 2
-    return None, None
+    Границы вероятностей (знаменатель берёт ПРОТИВОПОЛОЖНЫЕ крайности остальных):
+      L_i = l_i / (l_i + Σ_{j≠i} u_j)
+      U_i = u_i / (u_i + Σ_{j≠i} l_j)
+    Кандидат a — номер наибольшей середины; он сертифицирован, если L_a > U_j для всех
+    j ≠ a. Иначе nm удваивается (интервал только сужается), пока nm ≤ nm_max.
+    Ничья (например, [3, 3, 0]) сертифицирована быть не может.
+    Возвращает (a, nm) либо (None, None) = HOLD."""
+    nm = nm  # текущий параметр nm (изменяется в цикле)
+    while nm <= nm_max:  # пока nm не превысил предел
+        mid = sandwich_mid(z, nm)  # середины интервалов при текущем nm
+        if mid is None:  # охрана диапазона −min(s) < nm не выполнена при текущем nm
+            # Это НЕ значит, что сертификат невозможен: с ростом nm интервал сужается,
+            # а сама охрана (условие −min(s) < nm) ослабевает. Нужно удвоить nm и
+            # повторить, а не удерживать различимые логиты вроде [10, 0, 0].
+            nm *= 2  # удвоить: nm = 2·nm
+            continue  # повторить с большим nm
+        # Корректные границы вероятностей: lo_i/Σ lo_j нижней границей НЕ является —
+        # знаменатель обязан брать противоположные крайности остальных членов:
+        #   нижняя L_i = l_i / (l_i + Σ_{j≠i} u_j)
+        #   верхняя U_i = u_i / (u_i + Σ_{j≠i} l_j)
+        # Теперь ничья не может быть ложно сертифицирована.
+        t = sandwich_terms(z, nm)  # границы lo/hi (mid уже не None, поэтому и здесь не None)
+        if t is None:  # охрана диапазона не выполнена
+            nm *= 2  # удвоить: nm = 2·nm
+            continue  # повторить
+        lo, hi = t  # нижние и верхние границы
+        n = len(z)  # число классов
+        order = sorted(range(n), key=lambda i: mid[i], reverse=True)  # номера классов по убыванию середины
+        L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))  # нижние границы L_i = l_i / (l_i + Σ_{j≠i} u_j)
+             for i in range(n)]  # по всем классам i
+        U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))  # верхние границы U_i = u_i / (u_i + Σ_{j≠i} l_j)
+             for i in range(n)]  # по всем классам i
+        a = order[0]  # кандидат — класс с наибольшей серединой
+        if all(L[a] > U[j] for j in range(n) if j != a):  # нижняя граница кандидата выше верхних границ всех остальных
+            return a, nm  # сертифицировано: класс a при данном nm
+        nm *= 2  # интервалы ещё не разделились — nm = 2·nm
+    return None, None  # предел nm исчерпан — HOLD
 
 
 def band_drift_check(z, nm: int = DEFAULT_NM) -> dict:
-    """WAVE 213 (C568 band describes measurement): drift detector
-    between the certified rational band and the actual softmax.
-    bandDescribes holds for genuine certified bands — this measures
-    whether the band still DESCRIBES the measurement (if the true
-    softmax point escapes the [L_i, U_i] interval, the band is stale:
-    wrong logits domain or float precision drift)."""
-    from fractions import Fraction as F
-    import math
-    t = sandwich_terms(z, nm)
-    if t is None:
-        if nm * 2 <= EVAL_NM_MAX:
-            return band_drift_check(z, nm * 2)
-        return {"ok": False, "reason": "range guard failed at nm_max"}
-    lo, hi = t
-    n = len(z)
-    L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))
-         for i in range(n)]
-    U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))
-         for i in range(n)]
-    mx = max(z)
-    probs = [math.exp(float(v - mx)) for v in z]
-    s = sum(probs)
-    probs = [p / s for p in probs]
-    escapes = [i for i in range(n)
-               if not (float(L[i]) <= probs[i] <= float(U[i]))]
-    # WAVE 213b: range-guard / escapes at current nm — double like
-    # certified_argmax (BandTightening: larger nm tightens walls).
-    if escapes and nm * 2 <= EVAL_NM_MAX:
-        return band_drift_check(z, nm * 2)
-    return {"ok": not escapes, "escapes": escapes,
-            "nm": nm, "widths": [float(U[i] - L[i]) for i in range(n)]}
+    """Детектор устаревания интервала между сертифицированными границами и настоящим softmax.
+
+    Интервал [L_i, U_i] по построению накрывает настоящие вероятности softmax. Если
+    вычисленная точка softmax выходит из него, интервал устарел: логиты не из того
+    диапазона или накопилась погрешность float. Возвращает словарь ok (нет выходов),
+    escapes (номера вышедших классов), nm и ширины интервалов U_i − L_i."""
+    from fractions import Fraction as F  # конструктор рационального числа (локальный импорт)
+    import math  # экспонента для softmax (локальный импорт)
+    t = sandwich_terms(z, nm)  # границы lo/hi или None
+    if t is None:  # охрана диапазона не выполнена
+        if nm * 2 <= EVAL_NM_MAX:  # удвоенное nm ещё в пределах
+            return band_drift_check(z, nm * 2)  # повторить проверку с nm = 2·nm
+        return {"ok": False, "reason": "range guard failed at nm_max"}  # отказ: охрана диапазона не выполнена на наибольшем nm
+    lo, hi = t  # нижние и верхние границы
+    n = len(z)  # число классов
+    L = [lo[i] / (lo[i] + sum(hi[j] for j in range(n) if j != i))  # нижние границы L_i = l_i / (l_i + Σ_{j≠i} u_j)
+         for i in range(n)]  # по всем классам
+    U = [hi[i] / (hi[i] + sum(lo[j] for j in range(n) if j != i))  # верхние границы U_i = u_i / (u_i + Σ_{j≠i} l_j)
+         for i in range(n)]  # по всем классам
+    mx = max(z)  # наибольший логит для сдвига
+    probs = [math.exp(float(v - mx)) for v in z]  # экспоненты e_i = exp(z_i − mx)
+    s = sum(probs)  # знаменатель s = Σ e_i
+    probs = [p / s for p in probs]  # настоящие вероятности p_i = e_i / Σ_j e_j
+    escapes = [i for i in range(n)  # классы, для которых НЕ верно L_i ≤ p_i ≤ U_i
+               if not (float(L[i]) <= probs[i] <= float(U[i]))]  # условие накрытия
+    # При выходах на текущем nm — удвоить, как в certified_argmax (интервал сужается).
+    if escapes and nm * 2 <= EVAL_NM_MAX:  # есть выходы и удвоенное nm в пределах
+        return band_drift_check(z, nm * 2)  # повторить с nm = 2·nm
+    return {"ok": not escapes, "escapes": escapes,  # итог: ok = (выходов нет), номера выходов
+            "nm": nm, "widths": [float(U[i] - L[i]) for i in range(n)]}  # использованное nm и ширины интервалов U_i − L_i
