@@ -38,8 +38,8 @@ FABRIC_LOG = _CKPT / "self" / "fabric.json"  # журнал результато
 # 3,2,1,0 (бит 3 = значение при (И, И), бит 0 = при (Л, Л)) ---
 MASKS = {  # имя булевой функции -> маска
     "FALSE": 0b0000, "AND": 0b1000, "A_GT_B": 0b0100, "A": 0b1010,  # константа 0; a ∧ b; a ∧ ¬b; a
-    "B_GT_A": 0b0010, "B": 0b1100, "XOR": 0b0110, "OR": 0b1110,  # ¬a ∧ b; b; a ⊕ b; a ∨ b
-    "NOR": 0b0001, "XNOR": 0b1001, "NOT_B": 0b0011, "B_LE_A": 0b1011,  # ¬(a ∨ b); ¬(a ⊕ b); ¬b; a ∨ ¬b
+    "B_GT_A": 0b0010, "B": 0b1100, "XOR": 0b0110, "OR": 0b1110,  # маски: ¬a ∧ b; b; a ⊕ b; a ∨ b
+    "NOR": 0b0001, "XNOR": 0b1001, "NOT_B": 0b0011, "B_LE_A": 0b1011,  # маски: ¬(a ∨ b); ¬(a ⊕ b); ¬b; a ∨ ¬b
     "NOT_A": 0b0101, "A_LE_B": 0b1101, "NAND": 0b0111, "TRUE": 0b1111,  # ¬a; ¬a ∨ b; ¬(a ∧ b); константа 1
 }
 ALL_MASKS = dict(MASKS)  # рабочая копия таблицы масок
@@ -224,7 +224,7 @@ def crossover(a: dict, b: dict, rng: random.Random) -> dict:
 
 def evolve(truth: dict, inputs_from: callable, n_inputs: int = 2,
            pop_size: int = 40, generations: int = 300, seed: int = 7,  # pop_size — размер популяции; generations — предел поколений; seed — зерно
-           log: bool = True, profile: str = "adder",
+           log: bool = True, profile: str = "adder",  # аргументы: вести ли журнал, профиль
            seed_cells: list[dict] | None = None) -> dict:  # seed_cells — готовые ячейки для стартовой популяции; возвращает итог
     """Эволюция генома до сертифицированного и затем дешёвого решения.
 
