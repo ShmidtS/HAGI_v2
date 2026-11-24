@@ -354,8 +354,8 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"  # тип хране�
         def __init__(self, tensor, transpose):  # tensor — тензор; transpose — транспонировать ли
             self.weight = tensor if not transpose else tensor.T.contiguous()  # weight = tensor или tensorᵀ (непрерывная копия)
     # W1 и W2 — троичные; они экспортируются транспонированными
-    specs_tr = [("W1.weight", model.W1, True),  # W1
-                ("W2.weight", model.W2, True)]  # W2
+    specs_tr = [("W1.weight", model.W1, True),  # параметры: W1
+                ("W2.weight", model.W2, True)]  # параметры: W2
     class _Model:  # объект-«утка» для export_ternary_payload
         """Объект с атрибутами, которых ждёт export_ternary_payload."""
         pass  # атрибуты задаются ниже
@@ -450,7 +450,7 @@ def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):  # в
                            dim=int(header["dim"]),  # размерность
                            hidden=int(header["hidden"]), seed=0)  # скрытый слой, зерно 0
     params = {"emb.weight": None, "W1.weight": template.W1,  # целевые параметры матриц; эмбеддинг — None (едёт хвостом)
-              "W2.weight": template.W2}  # W2
+              "W2.weight": template.W2}  # параметры: W2
     for m in header["matrices"]:  # по матрицам заголовка
         if m["name"] == "emb.weight":  # это заглушка
             continue  # настоящий эмбеддинг восстанавливается ниже
