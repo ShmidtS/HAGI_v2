@@ -12,7 +12,7 @@ def test_neural_guess_uses_training_window_order(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HAGI_CKPT_DIR", str(tmp_path / "ckpt"))  # изолированный каталог
     monkeypatch.setenv("HAGI_DEVICE", "cpu")  # процессор
     monkeypatch.setenv("HAGI_NO_NEURAL", "1")  # не обучать
-    u = Unified.load()  # пустая модель в изолированном каталоге
+    u = Unified(k=16, dim=16, hidden=32)  # свежая модель в изолированном каталоге
     m = u.model  # модель
     k = m.k  # контекст
     with t.no_grad():  # фиксированные «weights»: случайный логит-шум по байтам окна
@@ -25,7 +25,7 @@ def test_neural_guess_uses_training_window_order(tmp_path, monkeypatch) -> None:
             lg = t.zeros((1, 256)); lg[0, int(s) % 256] = 10.0  # один «уверенный» байт
             return lg  # логиты
         m.logits = fake_logits  # подменить
-        ctx = bytes(range(10, 10 + 3 * k))  # контекст длиннее k
+        ctx = bytes((i * 7) % 200 + 20 for i in range(3 * k))  # контекст длиннее k, байты в диапазоне
         r = u.predict_next_byte(ctx, allow_neural=True)  # нейронная догадка
     assert r["status"] == "NEURAL_GUESS"  # статус
     assert len(seen) == 1  # один вызов

@@ -472,7 +472,7 @@ class Unified:
     # мерить заново. Нет улучшения -> снять блок (точный откат) и стоп;
     # есть улучшение, но всё ещё > 0 -> ещё один блок.
     MAX_BLOCKS = 4          # всего блоков (включая резерв на починку забывания)
-    GROW_BLOCKS = 0         # рост выключен по умолчанию — замер (60 кусков, CE на первых 10 старых доменах): с блоками +2.07, без блоков +0.55
+    GROW_BLOCKS = int(os.environ.get("HAGI_GROW_BLOCKS", "2"))  # максимум блоков роста; рост включён: блок — точное тождество (W_d = 0), принимается только по гейту (выигрыш > Бернштейн + цена памяти), иначе откат. HAGI_GROW_BLOCKS=0 выключает
     FORGET_TOL = 0.0  # допуск забывания: 0, то есть любое ухудшение CE старых доменов считается забыванием
     # Раунд принимается, когда парный выигрыш больше границы эмпирического Бернштейна.
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
@@ -578,7 +578,7 @@ class Unified:
                 and len(getattr(m, "blocks", [])) < self.MAX_BLOCKS:  # и число блоков blocks < MAX_BLOCKS
             m.grow(seed=len(m.blocks) + 1)  # добавить блок-тождество, зерно = число блоков + 1
             blk = m.blocks[-1]  # свежий блок
-            opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=1e-3)  # оптимизатор только для параметров блока, lr = 10^−3
+            opt = _t.optim.Adam([v for v in blk.values() if isinstance(v, _t.Tensor)], lr=1e-3)  # оптимизатор только параметров блока (W1/b1/Wo у Rope; Wg/Wu/Wd у HNet)
             best_ce, best_blk = post, {k: v.detach().clone() for k, v in blk.items()}  # лучшая CE = текущая post; копия тензоров блока k -> копия v
             for step in range(600):  # до 600 шагов обучения
                 X, y = sets[int(rng.integers(0, len(sets)))]  # случайный набор окон: индекс ∈ [0, len(sets))
@@ -636,17 +636,15 @@ class Unified:
 
 
     def _maybe_grow(self, source: str, data: bytes) -> dict:
-        """Добавить блок роста на свежем домене, если сигнал ёмкости высок.
+        """Добавить блок роста на свежем домене по теории допуска (запас = выигрыш − граница − цена памяти > 0).
 
-            source: домен, data: его байты. Сигнал = 128·G²/(2·max(L, 10^−6)),
-            где G² = Σ_q Σ grad(L, q)² на батче из 128 окон, L — их CE;
-            сравнивается с c_add = 10·(dim·hidden + hidden²)/Σ_q numel(q).
-            Если signal <= c_add или блоков уже GROW_BLOCKS — HOLD/SKIP.
-            Иначе добавляется блок-тождество и прогревается на окнах [k, 0.9·n)
-            (ствол заморожен), хранится лучшее состояние; блок остаётся,
-            только если gain = mean(CE_до − CE_после) > margin
-            (граница эмпирического Бернштейна по n_eval состояниям),
-            иначе снимается и статус HOLD_UNCERTAIN."""
+            source: домен, data: его байты. Блоков уже GROW_BLOCKS или данных мало — SKIP.
+            Иначе добавляется блок-тождество (функция модели не меняется) и прогревается на окнах
+            [k, 0.9·n) ТОЛЬКО сертифицированными шагами: длина шага выводится из квадратичного
+            мажоризатора (dirMajorizer: η* = −4·Σa/ΣR²) и расширяется удвоением, пока фактическое
+            убывание положительно; параметров обучения (lr, эпох, числа шагов) нет. Остановка —
+            когда прирост лучшего holdout-выигрыша не превышает границу Бернштейна. Блок остаётся,
+            только если admissionMargin = gain − margin − λ_M·mem > 0, иначе снимается (HOLD_UNCERTAIN)."""
         import torch as _t  # локальный импорт torch
         import numpy as _np  # локальный импорт numpy
         m = self.model  # модель
@@ -666,18 +664,14 @@ class Unified:
             X = raw[p[:, None] + _t.arange(m.k, device=m.device)[None, :]]  # окна: X_i = raw[p_i + j], j = 0..k−1
             y = raw[p + m.k]  # y_i = raw[p_i + k] — следующий байт
         params = [q for q in m.params() if q is not getattr(m, "q", None)]  # все параметры, кроме q (если есть)
-        loss = _t.nn.functional.cross_entropy(m.logits(X), y)  # потери: L = CE(logit(X), y)
-        g = _t.autograd.grad(loss, params, allow_unused=True)  # градиенты ∂L/∂q по параметрам
-        G2 = float(sum((gi ** 2).sum() for gi in g if gi is not None))  # квадрат нормы градиента: G² = Σ_q Σ (∂L/∂q)²
-        L = float(loss)  # L как число
-        c_add = (m.dim * m.hidden + m.hidden * m.hidden) / max(1, sum(q.numel() for q in params)) * 10.0  # порог добавления: c_add = 10·(dim·hidden + hidden²)/max(1, Σ numel(q))
-        signal = 128 * G2 / (2 * max(L, 1e-6))  # сигнал ёмкости: signal = 128·G²/(2·max(L, 10^−6))
-        if signal <= c_add:  # сигнала мало: signal <= c_add
-            return {"status": "HOLD", "signal": round(signal, 1), "c_add": round(c_add, 1)}  # без роста, сигнал и порог с 1 знаком
+        # Эвристика ёмкости («signal > c_add») удалена: по теории допуска (правило admitRule:
+        # блок принят ⟺ запас строго положителен) блок добавляется ТОЛЬКО по admissionMargin = gain − r_conf − λ_M·mem − λ_R·risk;
+        # блок-тождество функцию не меняет (FunctionPreservingGrowth), поэтому проверять «сигнал» до прогрева не нужно.
         n_before = len(m.blocks)  # число блоков до роста
         n_before_params = sum(q.numel() for q in m.params())  # число параметров до роста (для доли нового блока)
         m.grow(seed=n_before + 1)  # добавить блок-тождество, зерно = n_before + 1
         blk = m.blocks[-1]  # свежий блок
+        blk_params = [v for v in (blk.values() if isinstance(blk, dict) else blk) if isinstance(v, _t.Tensor)]  # параметры блока (W1/b1/Wo у Rope; Wg/Wu/Wd у HNet)
         cut = int(n * 0.9)  # граница обучения: cut = ⌊0.9·n⌋, правее — отложенная выборка
         raw = _t.as_tensor(idx, dtype=_t.long, device=m.device)  # байты как тензор
         k = m.k  # длина контекста
@@ -690,38 +684,45 @@ class Unified:
 
         def hold_vec():  # CE отложенной выборки по окнам
             with _t.no_grad():  # без градиентов
-                return _t.nn.functional.cross_entropy(m.logits(Xv), yv, reduction="none").double().cpu().numpy()  # перекрёстная энтропия по строкам: CE_i = −log softmax(logit(Xv_i))[yv_i], numpy float64
+                return _t.nn.functional.cross_entropy(m.logits(Xv), yv, reduction="none").double().cpu().numpy()  # перекрёстная энтропия по окнам
 
         def hold_ce():  # средняя CE отложенной выборки
             return float(hold_vec().mean())  # средняя: CE = mean_i CE_i
         before = hold_ce()  # CE до прогрева
-        base_before = hold_vec()            # здесь блок — точное тождество: вектор CE_до
-        opt = _t.optim.Adam([blk["W1"], blk["b1"], blk["Wo"]], lr=1e-3)   # оптимизатор только параметров блока, lr = 10^−3; ствол заморожен
+        base_before = hold_vec()  # здесь блок — точное тождество: вектор CE_до
+        from hagi.models.optimal_lm import certified_step  # шаг с аналитической длиной из мажоризатора (η* = −4·Σa/ΣR²)
+        from hagi.base.trunk_ops import paired_margin_eb  # граница односторонней проверки парного выигрыша
+        # Прогрев — только сертифицированными шагами: старт η* выводится из данных (dirMajorizer),
+        # расширение — пока фактическое убывание положительно. Число шагов, lr и эпох НЕТ:
+        # остановка — когда прирост лучшего holdout-выигрыша за шаг не превышает свою границу Бернштейна.
+        best_ce, best_blk = before, {q: v.detach().clone() for q, v in enumerate(blk_params)}  # лучшая CE = before; копия параметров блока
+        n_eval = 1  # число состояний блока, оценённых на отложенной выборке
         tr = _np.arange(m.k, cut)  # обучающие начала: [k, cut)
-        # CE блока на отложенной выборке НЕ монотонна по прогреву (замер на
-        # рабочей модели: 4.11 -> 6.56 на шаге 100 -> 2.45 на шаге 400 при
-        # lr=1e-3). Хранится ЛУЧШЕЕ из виденных состояний блока, а не последнее.
-        best_ce, best_blk = before, {k: v.detach().clone() for k, v in blk.items()}  # лучшая CE = before; копия тензоров блока
-        n_eval = 1  # число оцененных на отложенной выборке состояний
-        for _ in range(2):  # 2 эпохи
-            for s in range(0, len(tr), 64):  # s = 0, 64, 128, ... по обучающим началам
-                sel = rng.choice(tr, min(64, len(tr)), replace=False)  # до 64 различных начал
-                Xb, yb = batch(sel)  # батч по выбранным началам
-                opt.zero_grad()  # обнулить градиенты
-                _t.nn.functional.cross_entropy(m.logits(Xb), yb).backward()  # обратный ход: CE(logit(Xb), yb)
-                opt.step()  # шаг оптимизатора
-                if s % (64 * 50) == 0:  # каждые 50 шагов (s кратно 3200)
-                    n_eval += 1  # ещё одно состояние оценено
-                    c = hold_ce()  # CE отложенной выборки
-                    if c < best_ce:  # улучшение: c < best_ce
-                        best_ce = c  # новая лучшая CE
-                        best_blk = {k: v.detach().clone() for k, v in blk.items()}  # копия тензоров лучшего блока
-                if s >= 64 * 300:  # прогрев ограничен: s >= 19200
-                    break                      # прогрев ограничен: ~300 шагов на эпоху
+        stall = 0  # счётчик шагов без значимого прироста
+        prev_gain = 0.0  # предыдущий лучший выигрыш (before − best_ce)
+        while stall < 3:  # три подряд шага без значимого прироста — стоп
+            sel = rng.choice(tr, min(64, len(tr)), replace=False)  # до 64 различных начал
+            Xb, yb = batch(sel)  # батч
+            r = certified_step(m, m.logits, blk_params, Xb, yb)  # сертифицированный шаг (η* из теории)
+            if r["eta"] <= 0.0:  # направления нет — блок в нуле
+                break  # конец прогрева
+            c = hold_ce()  # CE отложенной выборки
+            n_eval += 1  # ещё одно состояние оценено
+            gain_now = before - c  # выигрыш сейчас
+            # значимость прироста: прирост (gain_now − prev_gain) против границы Бернштейна для текущего вектора парного выигрыша
+            diff = base_before - hold_vec()  # парный выигрыш по окнам
+            margin = float(paired_margin_eb(diff, n_states=n_eval))  # граница (учитывает число оценённых состояний)
+            if c < best_ce:  # улучшение holdout
+                best_ce = c  # новая лучшая
+                best_blk = {q: v.detach().clone() for q, v in enumerate(blk_params)}  # копия лучших параметров
+                stall = 0 if (gain_now - prev_gain) > margin else stall + 1  # прирост значим — сброс; иначе счётчик
+            else:  # не улучшилось
+                stall += 1  # шаг без улучшения
+            prev_gain = max(prev_gain, gain_now)  # лучший выигрыш до сих пор
         with _t.no_grad():  # без градиентов
-            for k_ in blk:  # по тензорам блока
-                blk[k_].copy_(best_blk[k_])  # вернуть лучшее состояние
-        after = hold_ce()  # CE после прогрева
+            for q, v in enumerate(blk_params): blk_params[q].copy_(best_blk[q])  # вернуть лучшее состояние
+        after = hold_ce()  # CE после прогрева (с лучшим состоянием блока)
+
         # Гейт строгий: на рабочей модели блок с ce_before == ce_after
         # (3.4673 -> 3.4673) когда-то был принят как GROW. Принять можно,
         # только если парный выигрыш больше границы эмпирического Бернштейна
@@ -744,7 +745,7 @@ class Unified:
             m.blocks.pop()                    # не заработан — точный откат
             return {"status": "HOLD_UNCERTAIN", "ce_before": before, "ce_after": after,  # HOLD_UNCERTAIN: CE до и после ...
                     "gain": round(gain, 4), "margin": round(margin, 4), "mem_cost": round(mem_cost, 4)}  # ... выигрыш, граница и цена памяти с 4 знаками
-        return {"status": "GROW", "blocks": len(m.blocks), "signal": round(signal, 1),  # GROW: число блоков, сигнал с 1 знаком ...
+        return {"status": "GROW", "blocks": len(m.blocks), "n_eval": n_eval,  # GROW: число блоков, число оценённых состояний ...
                 "ce_before": round(before, 4), "ce_after": round(after, 4),  # ... CE до/после с 4 знаками ...
                 "gain": round(gain, 4), "margin": round(margin, 4), "mem_cost": round(mem_cost, 4),  # ... выигрыш, граница и цена памяти с 4 знаками ...
                 "params": sum(q.numel() for q in m.params())}  # ... и число параметров

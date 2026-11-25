@@ -598,7 +598,8 @@ class MirrorHedgeStreamPredictor:
         self.uni = np.ones(256, dtype=np.float64)  # счётчик порядка 0
         self.ctx: list[dict[int, dict[int, int]]] = [{}, {}, {}, {}]  # таблицы порядков 1..4
         self.hist: list[int] = []  # история ≤ 16 байтов
-        self.buf: list[int] = []  # буфер окна модели
+        self.st = StreamState(model) if model is not None else None  # побайтовое состояние модели (O(1) на байт)
+        self._lg = np.zeros(256)  # последние логиты состояния
         self._last: tuple[np.ndarray, np.ndarray] | None = None  # последние предсказания
 
     def _ctx_probs(self) -> np.ndarray:  # PPM 0..4 с интерполяцией
@@ -621,12 +622,11 @@ class MirrorHedgeStreamPredictor:
         p_ctx = self._ctx_probs()  # контекстная модель
         if self.model is None:  # без модели
             self._last = (p_ctx, p_ctx); return p_ctx  # только PPM
-        if not self.buf:  # истории нет
+        if self.st.n == 0:  # истории нет
             p_neu = np.full(256, 1.0 / 256.0)  # равномерно
-        else:  # прогон модели на буфере
-            with t.no_grad():  # без графа
-                lg = self.model.forward_seq(t.as_tensor(self.buf, dtype=t.long)[None])[:, -1, :]  # логиты последней позиции
-            e = np.exp(lg[0].double().numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
+        else:  # логиты уже посчитаны состоянием на предыдущем байте
+            lg = self._lg  # логиты следующего байта
+            e = np.exp(lg.double().numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
         self._last = (p_neu, p_ctx)  # запомнить
         return self.weights[0] * p_neu + self.weights[1] * p_ctx  # смесь
 
@@ -643,7 +643,8 @@ class MirrorHedgeStreamPredictor:
             for b in self.hist[-order:]: h = (h * 257 + b) & 0xFFFFFFFFFFFFFFFF  # хэш
             row = self.ctx[order - 1].setdefault(h, {}); row[s] = row.get(s, 0) + 1  # счётчик
         self.hist.append(s); self.hist = self.hist[-16:]  # обрезать
-        self.buf.append(s); self.buf = self.buf[-self.model.k:]  # буфер окна
+        if self.st is not None:  # модель есть
+            self._lg = self.st.step(int(s))  # один шаг состояния O(1): логиты следующего байта
 
 
 def hadamard_mat(n: int) -> np.ndarray:
@@ -710,3 +711,187 @@ def dequantize_into(model: "HagiOptimalLM", q: dict) -> None:
     with t.no_grad():  # без графа
         for name, par in q.items():  # по именам
             getattr(model, name).copy_(t.as_tensor(dequant_per_row(par, par["Q"]), dtype=getattr(model, name).dtype))  # записать
+
+
+class StreamState:
+    """Побайтовое O(1)-состояние HagiOptimalLM: каждый шаг — один байт, логит следующего байта.
+
+        Воспроизводит forward_seq точно (проверено тестом): буферы лагов, короткой свёртки,
+        предыдущего скрытого, матрицы состояния GDN по головам. Состояние — тензоры, обновление
+        на месте; без графа (инференс)."""
+
+    def __init__(self, model: "HagiOptimalLM") -> None:  # создать по модели
+        m = model; d, H, hd = m.dim, m.n_heads, m.dim // m.n_heads  # размеры
+        self.m = m; self.d, self.H, self.hd = d, H, hd  # запомнить
+        dev = "cpu"  # состояние на процессоре (побайтный шаг мал; GPU-переключение дороже)
+        f = lambda *shape: t.zeros(*shape, dtype=t.float32, device=dev)  # нулевой тензор
+        self.max_lag = max(m.LAGS)  # наибольший лаг
+        self.e_buf = f(self.max_lag, d)  # вложения последних байтов (старые — первые)
+        self.h_buf = f(2, d)  # скрытые для короткой свёртки: [-2], [-1]
+        self.h_prev = f(d)  # скрытое предыдущего шага (гейт границ)
+        self.x_prev = 0  # предыдущий байт (для хэша биграмм)
+        self.S1 = f(H, hd, hd)  # состояние GDN уровня 1
+        self.S2 = f(H, hd, hd)  # состояние GDN уровня 2
+        self.n = 0  # число шагов
+
+    def step(self, b: int) -> t.Tensor:
+        """Обработать байт b и вернуть логиты следующего байта (256). Равен forward_seq(ctx + [b])[:, -1]."""
+        m = self.m; d, H, hd = self.d, self.H, self.hd  # размеры
+        with t.no_grad():  # без графа
+            e = m.emb[b]  # вложение байта, (d)
+            acc = t.zeros(d)  # взвешенная сумма лагов
+            for li, lag in enumerate(m.LAGS):  # по лагам
+                if self.n >= lag:  # лаг уже есть в истории (до текущего байта)
+                    acc = acc + self.e_buf[-lag] * m.w_lag[li]  # вклад
+            self.e_buf = t.cat([self.e_buf[1:], e[None]], dim=0)  # сдвинуть буфер, добавить e
+            x0 = rms_norm(e + acc @ m.W_loc, m.g_loc)  # локальный признак
+            bi_idx = ((self.x_prev * 131) ^ b) % 256  # хэш пары (предыдущий, текущий)
+            self.x_prev = b  # запомнить
+            h = x0 + m.E_bi[bi_idx] @ m.W_bi  # с биграммным признаком
+            h_in = h * m.w_sc[0] + self.h_buf[-1] * m.w_sc[1] + self.h_buf[-2] * m.w_sc[2]  # короткая свёртка
+            self.h_buf = t.cat([self.h_buf[1:], h[None]], dim=0)  # сдвинуть
+            q = (h_in @ m.W_gq).reshape(H, hd); q = t.nn.functional.normalize(q, dim=-1)  # запросы по головам
+            k = (h_in @ m.W_gk).reshape(H, hd); k = t.nn.functional.normalize(k, dim=-1)  # ключи
+            v = (h_in @ m.W_gv).reshape(H, hd)  # значения
+            a = t.sigmoid(h_in @ m.W_alpha + m.b_alpha) * 0.96  # удержание, (H)
+            bb = t.sigmoid(h_in @ m.W_beta + m.b_beta)  # запись, (H)
+            Sk = (self.S1 @ k.unsqueeze(-1)).squeeze(-1)  # S k по головам, (H, hd)
+            self.S1 = a[:, None, None] * self.S1 + bb[:, None, None] * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # правило Δ
+            y1 = (self.S1 @ q.unsqueeze(-1)).squeeze(-1).reshape(d)  # выход уровня 1
+            if m.use_gdn_norm:  # нормировка
+                y1 = rms_norm(y1, m.g_gdn1)  # стабилизация
+            h = h + y1 @ m.W_go  # остаток
+            if m.use_hier_gdn:  # уровень 2
+                p_bnd = t.sigmoid(t.cat([h, self.h_prev]) @ m.w_bnd + m.b_bnd)  # вероятность границы, (1)
+                h_before = h  # скрытое до уровня 2 (для h_prev)
+                q2 = t.nn.functional.normalize((h @ m.W_hq).reshape(H, hd), dim=-1)  # запросы
+                k2 = t.nn.functional.normalize((h @ m.W_hk).reshape(H, hd), dim=-1)  # ключи
+                v2 = (h @ m.W_hv).reshape(H, hd)  # значения
+                a2 = (1.0 - p_bnd * (1.0 - t.sigmoid(m.a_slow))) * 0.985  # удержание, (H)
+                b2 = p_bnd * t.sigmoid(m.b_slow)  # запись, (H)
+                Sk2 = (self.S2 @ k2.unsqueeze(-1)).squeeze(-1)  # произведение состояния на ключ
+                self.S2 = a2[:, None, None] * self.S2 + b2[:, None, None] * ((v2 - Sk2).unsqueeze(-1) @ k2.unsqueeze(-2))  # правило Δ
+                y2 = (self.S2 @ q2.unsqueeze(-1)).squeeze(-1).reshape(d)  # выход
+                if m.use_gdn_norm:  # нормировка
+                    y2 = rms_norm(y2, m.g_gdn2)  # стабилизация
+                h = h + y2 @ m.W_ho  # остаток
+                self.h_prev = h_before  # h_prev следующего шага — скрытое ДО уровня 2 (как в forward_hidden: cat([h, h_prev]) с h_prev = h_t−1 после уровня 1)
+            hn = rms_norm(h, m.g_mlp)  # перед MLP
+            h = h + swiglu(hn, m.W_gate, m.W_up, m.W_down)  # основной блок
+            for Wg, Wu, Wd in m.blocks:  # дополнительные блоки
+                h = h + swiglu(rms_norm(h, m.g_mlp), Wg, Wu, Wd)  # добавить
+            h_out = rms_norm(h, m.g_out)  # выходное скрытое
+            h_out = m._apply_adapter(h_out[None])[0]  # доменный адаптер, если задан
+            lg = (h_out @ m.emb.T) * m.out_scale + m.b_out  # логиты
+            if m.use_bigram_logit_skip:  # скип
+                lg = lg + m.B_u[b] @ m.B_v  # по текущему байту
+        self.n += 1  # счётчик шагов
+        return lg  # логиты следующего байта
+
+
+def _slot(model, params: list[t.Tensor]):
+    """Найти слот параметров: (kind, container, keys). kind: "block" — блок модели (dict HNet или список optimal), "model" — атрибуты модели."""
+    for bi, blk in enumerate(getattr(model, "blocks", [])):  # по блокам
+        vals = list(blk.values()) if isinstance(blk, dict) else list(blk)  # значения блока
+        if params and all(any(v is p for v in vals) for p in params):  # все параметры — из этого блока
+            if isinstance(blk, dict):  # словарь HNet
+                return ("block", blk, [k for p in params for k, v in blk.items() if v is p])  # словарь и ключи
+            lst = list(blk); model.blocks[bi] = lst  # optimal: кортеж → список (изменяемый) на время шага
+            return ("block", lst, [next(i for i, v in enumerate(lst) if v is p) for p in params])  # список и индексы
+    return ("model", vars(model), [k for p in params for k, v in vars(model).items() if v is p])  # атрибуты модели
+
+
+def certified_step(model, logits_fn, params: list[t.Tensor], X: t.Tensor, y: t.Tensor) -> dict:
+    """Один шаг по антиградиенту с АНАЛИТИЧЕСКОЙ длиной из квадратичного мажоризатора.
+
+        Теория (квадратичный мажоризатор перекрёстной энтропии):
+            CE(θ + ηD) ≤ CE(θ) + η·dirAction + (η·dirRange)²/8,  dirAction = mean_i⟨r_i, JD_i⟩,
+        dirRange = 2·mean_i Σ_v |JD_iv|, JD = J·D (смещение логитов на единичный шаг). Минимум параболы:
+            η* = −4·dirAction / dirRange²,  гарантированное убывание 2·dirAction²/dirRange².
+        Learning rate отсутствует: длина шага выводится из данных. Шаг применяется только если
+        фактическое убывание неотрицательно (иначе откат)."""
+    from torch.autograd.forward_ad import dual_level, make_dual, unpack_dual  # прямой режим автодифференцирования
+    kind, cont, keys = _slot(model, params)  # слот параметров
+    loss = t.nn.functional.cross_entropy(logits_fn(X), y)  # кросс-энтропия до шага
+    ce0 = float(loss.detach())  # число
+    g = t.autograd.grad(loss, params)  # градиенты по параметрам
+    D = [-gi for gi in g]  # направление — антиградиент
+    A = float(sum((gi ** 2).sum() for gi in g))  # сумма квадратов градиентов
+    none = {"eta": 0.0, "gain_pred": 0.0, "ce_before": ce0, "ce_after": ce0, "gain": 0.0, "grad_norm_sq": A}  # итог без шага
+    if A == 0.0:  # градиент нулевой
+        return none  # шага нет
+    saved = [cont[k] for k in keys]  # прежние значения
+    try:  # с восстановлением
+        with dual_level():  # прямой режим
+            for k, p_, d_ in zip(keys, params, D): cont[k] = make_dual(p_, d_)  # пары (θ, D)
+            JD = unpack_dual(logits_fn(X)).tangent  # касательная = J·D, (B, 256)
+    finally:  # всегда
+        for k, v in zip(keys, saved): cont[k] = v  # вернуть
+        if kind == "block" and isinstance(cont, list):  # optimal: список → обратно в кортеж
+            model.blocks[model.blocks.index(cont)] = tuple(cont)  # вернуть кортеж
+    B = X.shape[0]  # число образцов
+    pr = t.softmax(logits_fn(X), dim=-1)  # вероятности (B, V)
+    r = pr - t.nn.functional.one_hot(y, pr.shape[-1]).to(pr.dtype)  # остаток (B, V)
+    a_b = (r * JD).sum(dim=-1)  # dirAction по образцам: ⟨r_b, JD_b⟩, (B,)
+    R_b = 2.0 * JD.abs().sum(dim=-1)  # dirRange по образцам: 2·Σ_v |JD_bv|, (B,)
+    a_sum = float(a_b.sum()); R2_sum = float((R_b ** 2).sum())  # Σ_b a_b и Σ_b R_b² (мажоризатор — сумма по пакету)
+    if R2_sum <= 0.0 or a_sum >= 0.0:  # направление не уменьшает CE (сумма dirAction ≥ 0) или смещения нет
+        return none  # шага нет
+    eta = -4.0 * a_sum / R2_sum  # η* = argmin параболы η·Σa + η²·ΣR²/8
+    gain_pred = 2.0 * a_sum ** 2 / R2_sum / B  # гарантированное убывание 2·(Σa)²/ΣR², на образец
+    with t.no_grad():  # применить шаг
+        for p_, d_ in zip(params, D): p_.add_(d_, alpha=eta)  # шаг по направлению
+        ce1 = float(t.nn.functional.cross_entropy(logits_fn(X), y))  # CE после
+        if ce1 > ce0:  # убывания нет (округление) — откат
+            for p_, d_ in zip(params, D): p_.add_(d_, alpha=-eta)  # вернуть
+            ce1 = ce0  # CE прежняя
+    return {"eta": eta, "gain_pred": gain_pred, "ce_before": ce0, "ce_after": ce1, "gain": ce0 - ce1, "grad_norm_sq": A, "dir": [d.detach() for d in D]}  # итог (dir — направление, для расширения шага)
+
+
+
+def derived_lipschitz(model, logits_fn, params: list[t.Tensor], X: t.Tensor, y: t.Tensor) -> dict:
+    """Вывести локальную липшицеву константу градиента L и оптимальный шаг γ* = 1/L из мажоризатора.
+
+        Теория (выводимая конфигурация обучения): γ* = 1/L (nlDrop максимален,
+        NegativeTransfer.nlDrop_le_optimal), η* = −4a/R² (FunctionPreservingGrowth.useful_first_step).
+        Обе величины — из одного квадратичного мажоризатора BatchCEDescent.dirMajorizer:
+            drop(η*) = 2a²/R²  и  drop(γ*) = G²/(2L)  ⇒  L = G²·R²/(4a²),  G = ‖grad‖.
+        Измеряется на одном батче; параметров нет. Возвращает L, γ*, η*, предсказанный спуск."""
+    from torch.autograd.forward_ad import dual_level, make_dual, unpack_dual  # прямой режим
+    kind, cont, keys = _slot(model, params)  # слот параметров
+    loss = t.nn.functional.cross_entropy(logits_fn(X), y)  # кросс-энтропия до шага
+    g = t.autograd.grad(loss, params)  # градиенты
+    D = [-gi for gi in g]  # антиградиент
+    G2 = float(sum((gi ** 2).sum() for gi in g))  # квадрат нормы градиента
+    if G2 == 0.0:  # нулевой градиент
+        return {"L": float("inf"), "gamma": 0.0, "eta": 0.0, "drop": 0.0}  # шага нет
+    saved = [cont[k] for k in keys]  # прежние значения
+    try:  # с восстановлением
+        with dual_level():  # прямой режим
+            for k, p_, d_ in zip(keys, params, D): cont[k] = make_dual(p_, d_)  # пары (θ, D)
+            JD = unpack_dual(logits_fn(X)).tangent  # смещение логитов на единичный шаг
+    finally:  # всегда
+        for k, v in zip(keys, saved): cont[k] = v  # вернуть
+        if kind == "block" and isinstance(cont, list):  # optimal: список → кортеж
+            model.blocks[model.blocks.index(cont)] = tuple(cont)  # вернуть
+    with t.no_grad():  # оценки
+        pr = t.softmax(logits_fn(X), dim=-1)  # вероятности
+        r = pr - t.nn.functional.one_hot(y, pr.shape[-1]).to(pr.dtype)  # остаток
+        a_b = (r * JD).sum(dim=-1)  # dirAction по образцам
+        R_b = 2.0 * JD.abs().sum(dim=-1)  # dirRange по образцам
+    a_sum = float(a_b.sum()); R2_sum = float((R_b ** 2).sum())  # суммы по пакету
+    if R2_sum <= 0.0 or a_sum >= 0.0:  # направления нет
+        return {"L": float("inf"), "gamma": 0.0, "eta": 0.0, "drop": 0.0}  # шага нет
+    L = G2 * R2_sum / (4.0 * a_sum ** 2)  # липшицева константа из мажоризатора
+    return {"L": L, "gamma": 1.0 / L, "eta": -4.0 * a_sum / R2_sum, "drop": 2.0 * a_sum ** 2 / R2_sum / X.shape[0]}  # γ* = 1/L, η*, спуск на образец
+
+
+def derived_probe_size(N: int, delta: float, eps: float, B: float) -> int:
+    """Минимальный размер пробы по теории: k ≥ ln(2N/δ) / (2·(ε/B)²).
+
+        N — число проверяемых гипотез (состояний блока), δ — вероятность ложного приёма,
+        ε — различие, которое надо заметить (нат CE), B — граница |выигрыш| на пробе (Hoeffding)."""
+    import math as _m  # логарифм
+    if eps <= 0 or B <= 0 or N <= 0:  # некорректные входы
+        return 1  # нейтрально
+    return int(_m.ceil(_m.log(2.0 * N / delta) / (2.0 * (eps / B) ** 2)))  # минимальный размер пробы

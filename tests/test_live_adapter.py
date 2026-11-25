@@ -149,7 +149,7 @@ def test_grow_rolls_back_a_block_that_gains_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(t.nn.functional, "cross_entropy", frozen)  # подменить cross_entropy константой
     r = u._maybe_grow("d", data)  # попытка роста: до и после CE одинакова
     monkeypatch.setattr(t.nn.functional, "cross_entropy", orig)  # вернуть исходную cross_entropy
-    assert r["status"] in ("ROLLBACK", "HOLD")  # блок не принят
+    assert r["status"] in ("ROLLBACK", "HOLD", "HOLD_UNCERTAIN")  # блок не принят (сертифицированные шаги не дают значимого прироста — HOLD_UNCERTAIN)
     assert len(u.model.blocks) == n0  # число блоков не изменилось
 
 

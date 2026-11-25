@@ -811,8 +811,9 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
             разворачивается лучший снимок. Возвращает "epochs",
             "best_holdout_ce", "holdout_role" = "selection"."""
         from hagi.base import config  # единое место настроек (размер пакета и шаг по умолчанию)
+        derived_lr = lr is None  # L измеряется всегда (для отчёта); применяется при HAGI_DERIVED_LR=1
         if lr is None:  # шаг не задан явно
-            lr = config.TRAIN_LR  # шаг Adam из настроек
+            lr = config.TRAIN_LR  # запасной шаг Adam из настроек (заменяется выводимым ниже)
         if batch is None:  # размер пакета не задан явно
             batch = config.TRAIN_BATCH  # размер пакета из настроек
         import numpy as np  # численные массивы
@@ -926,6 +927,15 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
             if i in getattr(self, "frozen_blocks", ()):   # блок заморожен — не обучать
                 continue  # пропустить блок
             live_params += [blk["W1"], blk["b1"], blk["Wo"]]  # добавить параметры блока
+        if derived_lr:  # шаг выводится из теории: γ* = 1/L, L — локальная липшицева константа градиента из мажоризатора
+            from hagi.models.optimal_lm import derived_lipschitz  # вывод L по первому пакету
+            probe = min(batch, len(train))  # размер пробного пакета
+            _sel = t.as_tensor(rng.permutation(len(train))[:probe], dtype=t.long, device=dev)  # случайные строки
+            _L = derived_lipschitz(self, self.logits, live_params, X_tr.index_select(0, _sel), y_tr.index_select(0, _sel))["L"]  # L на пробе
+            if 0.0 < _L < float("inf"):  # L измерена
+                self.last_derived_lr = 1.0 / _L  # γ* = 1/L записывается в отчёт; применяется только при HAGI_DERIVED_LR=1
+                if os.environ.get("HAGI_DERIVED_LR", "0") == "1":  # явно выбран выводимый шаг
+                    lr = 1.0 / _L  # γ* = 1/L (замер: holdout 2.07 против 1.33 при TRAIN_LR=1e-3 — мажоризатор свободен)
         opt = t.optim.Adam(live_params, lr=lr)  # оптимизатор Adam по живым параметрам
         sec_train, sec_eval = 0.0, 0.0  # счётчики времени: шаги обучения и замеры CE на удержанных данных, с
         best = eval_ce(hold)  # лучшая CE до обучения
