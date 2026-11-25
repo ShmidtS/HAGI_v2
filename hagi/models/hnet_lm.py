@@ -113,12 +113,15 @@ class HNetByteLM:
 
     def param_names(self):
         """Список имён параметров: 14 основных и, если включены bigram-вложения, bi_emb и W_bi."""
-        return list(self._NAMES) + (["bi_emb", "W_bi"] if self._extra else [])  # копия имён + ["bi_emb", "W_bi"], если self._extra непусто
+        return list(self._NAMES) + (["bi_emb", "W_bi"] if self._extra else []) + [f"blk{i}.{n}" for i, blk in enumerate(self.blocks) for n in ("Wg", "Wu", "Wd")]  # основные, bigram-вложения и блоки роста (в порядке params)
 
     def params(self):
         """Список обучаемых параметров в том же порядке, что имена из param_names."""
-        return [self.emb, self.W_loc, self.p_pool, self.W_q, self.W_k, self.W_v, self.W_o,  # первые 7 параметров: emb, W_loc, p_pool, W_q, W_k, W_v, W_o
+        out = [self.emb, self.W_loc, self.p_pool, self.W_q, self.W_k, self.W_v, self.W_o,  # первые 7 параметров: emb, W_loc, p_pool, W_q, W_k, W_v, W_o
                 self.rms1, self.rms2, self.W_g, self.W_u, self.W_d, self.b2, self.W_out] + self._extra  # + rms1, rms2, W_g, W_u, W_d, b2, W_out и дополнительные bi_emb, W_bi
+        for blk in self.blocks:  # параметры дополнительных блоков — тоже обучаемые и сохраняемые
+            out.extend([blk["Wg"], blk["Wu"], blk["Wd"]])  # добавить
+        return out  # вернуть список
 
     def _rope_tables(self, M: int, half: int):
         """Таблицы RoPE (cos, sin) для M позиций и half пар; каждая формы (1, M, 1, half).
@@ -139,11 +142,13 @@ class HNetByteLM:
               умноженный на sqrt(d1/d0); таблицы RoPE — старые частоты, новые пары
               cos = sin = 0; b2 и alibi копируются. Тогда logits_new(x) = logits_old(x).
             Возвращает новую модель."""
-        assert self.nh == 1, "width growth is proven for n_heads = 1 only"  # рост доказан только для одной головы
+        assert d_new % self.nh == 0 and (d_new // self.nh) % 2 == 0, "d_new must split into heads with an even head width"  # ширина делится на головы, голова — чётная (пары RoPE)овы
         t = self.t  # короткое имя torch
         d0, h0 = self.dim, self.hidden  # старые ширины d0, h0
         assert d_new >= d0 and h_new >= h0 and d_new % 2 == 0  # новая ширина не меньше старой и чётная
-        m = HNetByteLM(dim=d_new, hidden=h_new, pool_r=self.r, n_heads=1,  # новая модель шириной d_new, h_new, с теми же r, nh = 1, ...
+        nh, hd0 = self.nh, self.hd  # число голов и старая ширина головы
+        hd1 = d_new // nh  # новая ширина головы
+        m = HNetByteLM(dim=d_new, hidden=h_new, pool_r=self.r, n_heads=nh,  # новая модель шириной d_new, h_new, с теми же головамии же r, nh = 1, ...
                        bi_buckets=self.bi_buckets, d_bi=self.d_bi,  # ...теми же bi_buckets, d_bi, ...
                        theta0=self.theta0, lam=self.lam, seed=seed)  # ...theta0, lam и зерном seed
         rs = math.sqrt(d0 / d_new)  # множитель шкал нормирования rs = sqrt(d0/d1)
@@ -159,16 +164,28 @@ class HNetByteLM:
                 m.W_loc[si * d_new:si * d_new + d0, :d0] = self.W_loc[si * d0:(si + 1) * d0, :]  # блок si: строки si·d1..si·d1+d0−1, столбцы 0..d0−1 = старый блок строк si·d0..(si+1)·d0−1
             qsc = math.sqrt(d_new / d0)  # множитель блока W_q qsc = sqrt(d1/d0)
             for name, sc in (("W_q", qsc), ("W_k", 1.0), ("W_v", 1.0)):  # W_q умножается на qsc, W_k и W_v — на 1
-                getattr(m, name).zero_(); getattr(m, name)[:d0, :d0] = getattr(self, name) * sc  # новая матрица = 0; блок [:d0, :d0] = старая·sc
-            m.W_o.zero_(); m.W_o[:d0, :d0] = self.W_o  # формула:  W_o_new = 0; W_o_new[:d0, :d0] = W_o_old
+                Wn = getattr(m, name); Wo = getattr(self, name) * sc  # новая матрица и старая с масштабом
+                Wn.zero_(); Wn.reshape(d_new, nh, hd1)[:d0, :, :hd0] = Wo.reshape(d0, nh, hd0)  # входные проекции: по головам, блок на месте
+            m.W_o.zero_(); m.W_o.reshape(nh, hd1, d_new)[:, :hd0, :d0] = self.W_o.reshape(nh, hd0, d0)  # выходная проекция из голов: блок на месте:d0, :d0] = старая·sc
             m.W_g.zero_(); m.W_g[:d0, :h0] = self.W_g  # формула:  W_g_new = 0; W_g_new[:d0, :h0] = W_g_old
             m.W_u.zero_(); m.W_u[:d0, :h0] = self.W_u  # формула:  W_u_new = 0; W_u_new[:d0, :h0] = W_u_old
             m.W_d.zero_(); m.W_d[:h0, :d0] = self.W_d  # формула:  W_d_new = 0; W_d_new[:h0, :d0] = W_d_old
             m.W_out.zero_(); m.W_out[:d0, :] = self.W_out  # W_out_new = 0; W_out_new[:d0, :] = W_out_old (все 256 столбцов)
             if self._extra:  # bigram-вложения включены
                 m.bi_emb.copy_(self.bi_emb); m.W_bi.copy_(self.W_bi)  # их форма не зависит от d — копируются как есть
+            if getattr(self, "domain_adapter", None) is not None:  # доменный адаптер задан
+                A0 = t.as_tensor(self.domain_adapter.A, device=self.device).detach(); B0 = t.as_tensor(self.domain_adapter.B, device=self.device).detach()  # матрицы адаптера как тензоры (ранг на ширину, ширина на ранг)
+                A1 = t.zeros((A0.shape[0], d_new), dtype=A0.dtype, device=A0.device); A1[:, :d0] = A0  # новая A: старая и нули справа
+                B1 = t.zeros((d_new, B0.shape[1]), dtype=B0.dtype, device=B0.device); B1[:d0, :] = B0  # новая B: старая и нули снизу
+                m.domain_adapter = _AB(A1, B1)  # h2_new @ A_newᵀ = h2 @ Aᵀ, результат @ B_newᵀ = [h | 0] — добавка переносится точно
+            m.blocks = []  # блоки новой модели
+            for blk in self.blocks:  # по блокам старой
+                Wg = t.zeros((d_new, blk["Wg"].shape[1]), dtype=blk["Wg"].dtype); Wg[:d0, :] = blk["Wg"]  # вентиль — нулями вниз
+                Wu = t.zeros((d_new, blk["Wu"].shape[1]), dtype=blk["Wu"].dtype); Wu[:d0, :] = blk["Wu"]  # подъём — нулями вниз
+                Wd = t.zeros((blk["Wd"].shape[0], d_new), dtype=blk["Wd"].dtype); Wd[:, :d0] = blk["Wd"]  # выход — нулями вправо
+                m.blocks.append({"Wg": t.nn.Parameter(Wg), "Wu": t.nn.Parameter(Wu), "Wd": t.nn.Parameter(Wd)})  # добавить
         # RoPE: старые частоты в точности прежние, новые пары нулевые
-        half0, half1 = d0 // 2, d_new // 2  # число пар координат: старое half0 = d0/2, новое half1 = d1/2
+        half0, half1 = hd0 // 2, hd1 // 2  # число пар координат НА ГОЛОВУ: старое half0, новое half1
         c0, s0 = self._rope_tables(m.k // m.r, half0)  # таблицы cos, sin для старых half0 пар и M позиций
         M = m.k // m.r  # формула:  M = k // r
         zeros = t.zeros((1, M, 1, half1 - half0), device=c0.device)  # нули для новых пар, форма (1, M, 1, half1 − half0)
@@ -182,13 +199,26 @@ class HNetByteLM:
             m.cos_m, m.sin_m, m.alibi = (x.to(self.device) for x in (m.cos_m, m.sin_m, m.alibi))  # перенести таблицы
         return m  # вернуть новую модель
 
-    def grow(self, seed: int = 0) -> int:      # формула:  interface compat; no-op identity
-        """Ничего не делает (у модели нет блоков); возвращает число блоков — 0."""
-        return len(self.blocks)  # формула:  len(self.blocks) = 0
+    def grow(self, seed: int = 0) -> int:
+        """Точный рост глубины: добавить SwiGLU-остаток с нулевой выходной проекцией W_d = 0.
+
+            Блок: h ← h + (silu(rms(h)·W_g) ⊙ (rms(h)·W_u))·W_d; при W_d = 0 функция модели не меняется
+            (function-preserving), первый же шаг обучения имеет ненулевой градиент по W_d.
+            Возвращает число блоков."""
+        g = self.t.Generator(device="cpu").manual_seed(500 + len(self.blocks) + seed)  # генератор с зерном (модель seed не хранит)
+        Wg = self.t.randn((self.dim, self.hidden), generator=g) * 0.06  # вентиль
+        Wu = self.t.randn((self.dim, self.hidden), generator=g) * 0.06  # подъём
+        Wd = self.t.zeros((self.hidden, self.dim))  # нулевой выход — тождество
+        self.blocks.append({"Wg": self.t.nn.Parameter(Wg.to(self.device)), "Wu": self.t.nn.Parameter(Wu.to(self.device)), "Wd": self.t.nn.Parameter(Wd.to(self.device))})  # добавить блок
+        return len(self.blocks)  # число блоков
 
     def _block_add(self, a, h):
-        """Заглушка добавления блока: остаток не меняется, возвращается входной остаток a."""
-        return h  # вернуть h
+        """Применить дополнительные блоки к остатку h (форма (B, d)): каждый — SwiGLU-остаток с rms2."""
+        for blk in self.blocks:  # по блокам
+            hn = self._rms(h, self.rms2)  # нормированный остаток
+            gp = hn @ blk["Wg"]  # вентиль
+            h = h + ((gp * self.t.sigmoid(gp)) * (hn @ blk["Wu"])) @ blk["Wd"]  # SwiGLU-остаток
+        return h  # остаток после блоков
 
     # -- модель -----------------------------------------------------------
     def _rms(self, x, g, eps=None):
@@ -239,6 +269,7 @@ class HNetByteLM:
         h1_n = self._rms(h1, self.rms2)  # формула:  h1_n = rms(h1)·rms2
         gp = h1_n @ self.W_g  # ветка гейта gp = h1_n·W_g, форма (B, hidden)
         h2 = h1 + ((gp * t.sigmoid(gp)) * (h1_n @ self.W_u)) @ self.W_d  # формула:  h2 = h1 + (gp·σ(gp) ⊙ (h1_n·W_u))·W_d, σ(x) = 1/(1 + e^(−x))
+        h2 = self._block_add(None, h2)  # дополнительные блоки роста глубины (нет блоков — h2 без изменений)
         ad = getattr(self, "domain_adapter", None)  # доменный адаптер или None
         if ad is not None:                       # формула:  same residual form as Rope: h + (h@A^T)@B^T
             # адаптер задан: добавка того же вида, что у Rope-модели, h + (h·Aᵀ)·Bᵀ
