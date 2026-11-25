@@ -52,12 +52,19 @@ def _resolve_device(t, dim: int = 0, hidden: int = 0) -> str:
         работы, поэтому они остаются на процессоре."""
     from hagi.base import config  # единое место настроек
     pref = config.device()  # pref = HAGI_DEVICE из окружения, по умолчанию "auto"
-    if pref == "cpu":  # явно запрошен процессор
-        return "cpu"  # считать на процессоре
     cuda_ok = t.cuda.is_available()  # cuda_ok = доступна ли CUDA
     if pref == "cuda":  # явно запрошен GPU
-        return "cuda" if cuda_ok else "cpu"  # "cuda", если CUDA доступна, иначе "cpu"
-    return "cuda" if cuda_ok and dim * hidden >= 8192 else "cpu"  # "cuda", если CUDA доступна и dim·hidden >= 8192, иначе "cpu"
+        dev = "cuda" if cuda_ok else "cpu"  # "cuda", если CUDA доступна, иначе "cpu"
+    elif pref == "auto" and cuda_ok and dim * hidden >= 8192:  # "auto": GPU только для достаточно крупных моделей
+        dev = "cuda"  # у малых тестовых моделей время инициализации CUDA больше самой работы
+    else:  # иначе процессор
+        dev = "cpu"  # считать на процессоре
+    if dev == "cpu":  # процессор
+        n = config.cpu_threads()  # явно заданное число потоков или None
+        # Малые тензоры (dim 24..64) на многих потоках медленнее из-за синхронизации:
+        # замер обучения HNetByteLM d=64, одна эпоха — 5.6 с на 1 потоке против 6.8 с на 16.
+        t.set_num_threads(n if n else 1)  # заданное число, иначе один поток
+    return dev  # выбранное устройство192, иначе "cpu"
 
 
 from hagi.base.util import CKPT_DIR as _CKPT  # каталог для сохранения весов под именем _CKPT

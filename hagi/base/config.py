@@ -8,6 +8,8 @@
 Ручки (имя переменной → значение по умолчанию → смысл):
 - HAGI_DEVICE        → "auto"      : устройство обучения и инференса: auto / cpu / cuda;
 - HAGI_NEURAL_DEVICE → "auto"      : устройство нейронной части (та же шкала, нижний регистр);
+- HAGI_THREADS       → не задано   : число потоков torch на процессоре (не задано = 1)
+- HAGI_THREADS       → не задано   : число потоков torch на процессоре (не задано = 1)
 - HAGI_ARCH          → "rope"      : архитектура тела модели: rope / hnet;
 - HAGI_CKPT_DIR      → <корень>/checkpoints : каталог весов, книги доменов и журналов;
 - HAGI_SYMBOLIC      → "0"         : "1" — включить символьную фазу конвейера;
@@ -51,6 +53,18 @@ LEGACY_FILE_FORMATS = {"HAGI-MODEL": frozenset({"HAGI-V9"}), "HAGI-STATE": froze
 def device() -> str:
     """Устройство обучения/инференса: значение HAGI_DEVICE, иначе "auto"."""
     return os.environ.get("HAGI_DEVICE", "auto")  # читать в момент вызова
+
+
+def cpu_threads() -> int | None:
+    """Число потоков torch на процессоре: HAGI_THREADS, иначе None (тогда модель ставит 1)."""
+    v = os.environ.get("HAGI_THREADS")  # прочитать в момент вызова
+    return int(v) if v and v.strip() else None  # целое число или None
+
+
+def cpu_threads() -> int | None:
+    """Число потоков torch на процессоре: HAGI_THREADS, иначе None (тогда модель ставит 1)."""
+    v = os.environ.get("HAGI_THREADS")  # прочитать в момент вызова
+    return int(v) if v and v.strip() else None  # целое число или None
 
 
 def neural_device_mode() -> str:
