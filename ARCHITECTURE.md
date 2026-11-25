@@ -1,102 +1,110 @@
-# HAGI_v2 — архитектура (пост-рефакторинг 2026-11-19)
+# HAGI — архитектура
 
-## Пакет hagi/ — единый источник истины
+HAGI — саморазвивающаяся модель, работающая с любыми данными как с потоком
+байтов. В ней два «органа»: символьное ядро (программы над целыми числами,
+точное воспроизведение пар «вход → выход») и нейронная часть (языковая модель
+по байтам p(b | контекст)). Единая модель `hagi.selfdev.unified` принимает данные и
+связывает органы: адаптеры доменов, ремонт забывания, рост, законы, память.
 
-### Ядро и нейрон
-| Модуль | Роль | Теория (primes) |
-|---|---|---|
-| `core.py` | merged kernel: legacy + канонический конвейер (later definitions win shared names) | C278, CertifiedLoop |
-| `lm.py` | нейро-тело: CertifiedStepLM (§3.9 certified step, k=16/dim=128/hidden=256), rotating holdout | §3.9, PoEBound |
-| `unified.py` | ЕДИНАЯ модель: ingest любых байтов, fresh-first replay (contiguous ≥2KB), ledger | DataToQuality |
-| `fabric.py` | Venn-ткань: геномы, bitwise emulate, imply-оракул 256/256, GROW→OPTIMIZE | VennPacking |
-| `gpu.py` | GPU-бэкенд нейроядра | C328 |
 
-### Символьный синтез (стек модернизирован)
-| Модуль | Роль |
-|---|---|
-| `skill_engine.py` | Autonomous Temporal Skill Engine (пользовательский код, 1-в-1): factored GF(2) synthesis (Davio/divisors/resub), Mealy quotient, PAC-L*, AG>12, zero-import replay, transition-table → netlist компилятор (adder 5g, mux 3g) |
-| `env_temporal.py` | среды 5-бит (temporal): active identification, перенос памяти, drift |
-| `env_lut.py` | среды 4-бит (LUT-грамматика + OOD): банк гипотез, OOD LUT3, PROVEN_EXACT аудит |
-
-### Цикл и контроль
-| Модуль | Роль |
-|---|---|
-| `loop.py`, `rewrite.py` | certified self-development: GROW→DERIVE→OPTIMIZE→GATE, self-rewrite |
-| `selfmodel.py` | self-model + MDL prune (слит mdl.py, wave200) + controller/experiment/selfedit |
-| `school.py` | curriculum + lessons + mind (учебный контур) |
-| `io.py` | ingest + execute (слиты, wave195) |
-| `genesis.py` | поиск конфигураций + ec_lib |
-| `cycle.py` | CLI-библиотека derive/weave/grow (C492/C504/C506) |
-
-## ЕДИНЫЙ CLI (волна 190)
-
-`python -m hagi.cli <command>` — шлюз ко всем инструментам
-(core/lm/ingest/execute/loop/rewrite/genesis/certificates);
-старые `python -m hagi.<mod>` сохранены как тонкие обёртки.
-
-## ЕДИНЫЙ КОНВЕЙЕР (волна 185 — одна точка входа)
+## Слои и направление зависимостей (только вниз)
 
 ```
-hagi/pipeline.py: unified_ingest(u, source, data)
-  1. НЕЙРО:   u.ingest → certified LM step (eta=4A/R'²)
-  2. ДИАГНОЗ: residual profile → classify_hold (шум отсекается)
-  3. ИЗОБРЕТ: invent_blueprint на гэпе (data-born грамматика)
-  4. ГЕЙТ:    verify_blueprint STRICT (PROVEN_EXACT на всём домене)
-  5. ПРИЁМ:   reify_construct → операция доступна следующим доменам
+интерфейс      hagi/__init__.py (явный __all__), hagi/cli.py, hagi/__main__.py
+hagi/base      фундамент: config, util, hashing, gpu, embeddings, trunk_ops,
+               sandwich, measurement, certificates
+hagi/core      символьное ядро (6 групп: language, tasks, synthesis, neural,
+               processor, memory)
+hagi/models    lm (RopeAttentionByteLM, CertifiedStepLM), hnet_lm (HNetByteLM),
+               quantized, archiver
+hagi/invent    diagnosis, invention, invention_multi, representations
+hagi/data      io, env_lut, env_temporal, skill_engine, law_critique,
+               fabric, genesis; рядом memory_store/*
+hagi/selfdev   selfmodel, loop, school, rewrite, cycle, pipeline,
+               unified (единая модель)
 ```
 
-- `HAGI_SYMBOLIC=1` включает шаги 2–5 (default off — быстрый
-  реплей); `HAGI_CKPT_DIR` — все записи чекпоинтов через SSOT
-  `hagi.util.CKPT_DIR` (волна 185c: fabric/genesis/lessons/lm/
-  selfedit/execute/mind/rewrite/selfedit — все переведены, прямые
-  пути "checkpoints/..." в пакете запрещены).
-- scripts/neuro_symbolic_cycle.py вызывает unified_ingest когда
-  HAGI_SYMBOLIC=1 — тот же конвейер, что и в тестах/скриптах.
-- GapBuffer накапливает REPRESENTATION_GAP профили между доменами:
-  кластеры готовы к изобретению по K_min образцам.
+Зависимости идут только вниз: selfdev → data/invent → models → base; ядро
+(core) ни от кого, кроме base, не зависит.
 
-### Модули теории (primes-мосты)
-| Модуль | Теория | Статус |
-|---|---|---|
-| `pipeline.py` | единый конвейер | ГЛАВНЫЙ вход |
-| `cycle.py` | C492/C504/C506 derive/weave/grow | CLI-библиотека |
-| `sandwich.py` | C489/C495/C502 certified argmax | готов |
-| `trunk_ops.py` | C477/C479/C479v2/C450/C504/C506 (merge+hadamard+growth+cycle) | bench/tests |
-| `measurement.py` | measurement suite (5 бывших модулей) | тесты + core |
-| `school.py` | C330 curriculum + lessons + mind | учебный контур |
-| `io.py` | ingest + execute | CLI данных |
+## Символьное ядро
 
-## Классический цикл (fabric tape-out)
+`hagi/core/`
+
+| группа | модули | что делает |
+| --- | --- | --- |
+| `language` | `expressions`, `expr_dsl`, `call_dag`, `code_length` | дерево выражения, программа, векторизованный вычислитель; безопасный язык выражений; префиксный код и граф вызовов; длина кода |
+| `tasks` | `tasks`, `stored_tasks`, `candidates` | набор задач ядра; набор задач для хранимых экспертов; перечисление программ-кандидатов |
+| `synthesis` | `synthesis`, `venv_anf`, `venn`, `prefilter`, `best_first`, `fast_mdl`, `induction` | точная полиномиальная индукция и МДЛ-синтез; голова Венна, Жегалкин, Адамар, 5-тритовый кодек; векторизованный префильтр; поиск «лучшие первыми»; быстрый МДЛ; решатель раскраски и майнер теорем |
+| `neural` | `neural`, `segmentation`, `fiber`, `certified_ce`, `continual_memory`, `energy`, `chunking` | перекрёстная энтропия, EF21, GPM, CRAM; адаптивная сегментация; нейронное волокно; сертифицированная энтропия; непрерывная память; энергетический решатель; растущая адресная память и маршрутизатор |
+| `processor` | `processor`, `growth`, `stored_growth`, `experts`, `optimal_processor`, `unified_processor`, `benchmark`, `self_development` | эксперт, майнер теорем, `GrowingHagiProcessor`; цикл роста; хранилище экспертов (`GrowingMathProcessor`, `GrowthProcessorBase`); оптимум и саморазвитие; замеры |
+| `memory` | `audit`, `ledger`, `aliases`, `selfcheck`, `experiment`, `selftest`, `cli` | сертифицированный шаг и журнал аудита; журнал статистических проверок; арифметические/битовые операции и префиксные коды; самопроверки; эксперимент; командная строка ядра |
+
+
+
+## Нейронная часть и единая модель
+
+- `lm.py`: RopeAttentionByteLM (RoPE-внимание, окна oldest-first,
+  train_guarded с гейтом по holdout), CertifiedStepLM, `make_lm(arch)`.
+- `hnet_lm.py`: HNetByteLM (torch-порт), точный рост ширины `grow_width`.
+- `unified.py`: `Unified` — ingest доменов, низкоранговые адаптеры
+  (`trunk_ops.LowRankAdapter`, живой гейт), `_repair_forgetting`
+  (переучивание старых байт с доказательной границей `paired_margin_eb`),
+  `_maybe_grow`, `grow_width`, save/load, `reindex_domains`.
+- `archiver.py`: арифметический кодер поверх модели (пакетный и потоковый с
+  контекстной таблицей `q = (1−λ)p + λr`).
+
+## Конвейер приёма данных
 
 ```
-scripts/neuro_symbolic_cycle.py <minutes>
-свип C:/ → unified_ingest → derived tasks →
-fusion fast-path (ANF→GA) → processor_netlist.json
+hagi/selfdev/pipeline.py: unified_ingest(u, source, data)
+  1. нейро:   u.ingest (сертифицированный шаг)
+  2. диагноз: профиль остатка → classify_hold
+  3. изобрет: invent_blueprint на промежутке
+  4. гейт:    verify_blueprint (точность на всём домене)
+  5. приём:   reify_construct → операция доступна следующим доменам
+```
+Флаг `HAGI_SYMBOLIC=1` включает шаги 2–5. Все настройки окружения читаются
+только через `hagi/base/config.py`; каталог контрольной точки — `hagi.util.CKPT_DIR`
+(переменная `HAGI_CKPT_DIR`).
+
+## Командная строка
+
+```
+python -m hagi.cli <команда>     core | lm | ingest | execute | loop | rewrite | genesis | certificates
+python -m hagi core --help       --self-test, --self-test-core, --self-test-optimal, --self-test-legacy, --grow, --grow-deep, --benchmark-core
+python scripts/hagi_archive.py   compress | decompress | bench   (--prefix-head F — потоковый кодек)
+python scripts/comment_audit.py  аудит комментариев (0/0/0)
 ```
 
-Запуск: 1-поточный OpenBLAS (`OPENBLAS_NUM_THREADS=1` + `MAIN_FREE=1`)
-против gemm malloc. Артефакты: checkpoints/{unified.pt,
-unified_ledger.json, processor_netlist.json, domains/*.bin}.
+## Файлы контрольной точки
 
-## Верификация
+`checkpoints/unified.pt` (веса, адаптеры, законы), `unified_ledger.json`
+(книга доменов: sha, размер, CE), `domains/*.bin` (байты доменов),
+`cycle.log` (журнал цикла, UTF-16 LE).
 
-- tests/ — 24 теста (characterization, fusion_anf, rotating_holdout, rdl)
-- v4.0 self-verify: 57 skills, DAG exact, zero-import replay, tamper reject
-- env v4.4/v4.6: independent verifiers (260/100 записей PASS)
-- OOS-бенчмарк: scripts/oos_bench.py (фикс. тексты вне обучения)
 
-## Итог рефакторинга (волны 185–195)
+## Инструменты поддержки кода
 
-Пакет: **55 → 28 файлов** (-49%; wave200: logic.py удалён, mdl.py слит в selfmodel), объединение по смыслу:
-measurement(5→1), invention(+cegis/prior/while_loop/rdl),
-representations(+reifier), trunk_ops(full_pipeline+merge+hadamard+
-growth), school(lessons+curriculum+mind), env 7→2, selfmodel
-(+controller/experiment/selfedit), genesis(+ec_lib), io(ingest+
-execute). Единый CLI, единый pipeline, единый CKPT_DIR, полная
-дериверсификация. 101 тест зелёный.
+Все — в `scripts/`, импортируемые (`main(argv)`):
+
+- `comment_audit.py [путь] [--lines A B] [--ast-compare OLD NEW]` —
+  покрытие комментариями, русский язык, запрет отсылок; сравнение AST
+  до/после (код не изменён).
+- `prune_imports.py <файлы|каталоги>` — убрать неиспользуемые и повторные
+  импорты (учитывает имена, которые другие модули импортируют отсюда;
+  `__init__.py` и `import *` не трогает; `__future__` сохраняет).
+- `dead_audit.py <модуль> [...]` — функции/классы без единой ссылки в коде.
+
 
 ## Честные границы
 
-- Речь: морфемная (нужен порядок данных больше)
-- RDL: классы из генератора параметрических семей, не произвольные
-- OOD: точен внутри объявленной семьи + full-table fallback
+Известная граница модульности: статический анализатор (basedpyright) насчитывает
+22 цикла импорта — все проходят через фасады (`hagi/__init__`, `hagi/core/__init__`)
+или через импорты под `TYPE_CHECKING` (аннотации), во время выполнения не возникают.
+Устранение требует понизить зависимость модулей от фасада до прямых импортов.
+
+- Забывание при приёме новых доменов замедлено ремонтом, но не остановлено.
+- Архиватор с контекстной таблицей сжимает хуже zlib примерно на 25%.
+- Дубли хешей с разными параметрами канонизации не объединены: хеши
+  записаны в сохранённых законах и сертификатах.

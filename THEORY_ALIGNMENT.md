@@ -2109,7 +2109,7 @@ self-edit гейт работает (no-op фильтр активен), failure
 - Сверка с upstream Theory/EF21InStep.lean + scripts/bench_bridge.py
   (--mode ef21-step): m=g+e; d=qTern(m); e'=m−d; trial admit ТОЛЬКО
   по фактическому drop>0; reject → HOLD (веса и residual нетронуты).
-- hagi/lm.py: CertifiedStepLM._ef21_step + train_ef21. Fixed-scale
+- hagi/models/lm.py: CertifiedStepLM._ef21_step + train_ef21. Fixed-scale
   PIN (s замораживается на первом шаге, 0.2·max|m|), backtracking η
   (теоретический 1/L неизвестен для сети), честный reject-rollback.
 - НАЙДЕН И ИСПРАВЛЕН баг знака: θ'=θ+ηd вместо θ−ηd — гарантия
@@ -2130,7 +2130,7 @@ self-edit гейт работает (no-op фильтр активен), failure
 
 - Сверка с Theory/AdaptiveMajorizer.lean: adaptive_descent —
   η*=A/(2C), drop A²/(4C), кап η≤1; доминирование C ≤ R'²/8.
-- hagi/lm.py: CertifiedStepLM._adaptive_step — гибрид: если η* в
+- hagi/models/lm.py: CertifiedStepLM._adaptive_step — гибрид: если η* в
   капе — adaptive-ветка (A²/4C), иначе range-bound §3.9 (2A²/R'²,
   всегда сертифицирован). На 20 шагах CE 5.55→0.072.
 - 1 тест; всего 61/61 PASS.
@@ -2167,7 +2167,7 @@ self-edit гейт работает (no-op фильтр активен), failure
 ## Волна 161 (2026-11-20, круг 6) — РЕФАКТОРИНГ: минимум кода максимум смысла
 
 - DRY sha/digest: 8 копий канонического content-hash в 6 модулях →
-  hagi/util.py::sha (единая точка); digest = sha алиасы сохранены.
+  hagi/base/util.py::sha (единая точка); digest = sha алиасы сохранены.
 - Мёртвый артефакт env_model_bank_v4_4.json удалён (никем не читался).
 - Неиспользуемые hashlib-импорты вычищены после дедупа.
 - lm.py: общий каркас _train_split (split + holdout + windows) для
@@ -2430,7 +2430,7 @@ self-edit гейт работает (no-op фильтр активен), failure
 ## Сверка primes 2026-11-21 круг 15 (волна 182, C494–C502)
 - 8 новых коммитов: SandwichMonotone (C495), RationalSoftmax (C489),
   BandTightening (C502), GPMRelaxed (C498), MiniHagi/2, bench updates.
-- Sandwich certification: перенесена как hagi/sandwich.py —
+- Sandwich certification: перенесена как hagi/base/sandwich.py —
   lo=(1+sv/nm)^n, hi=(1-sv/nm)^(-nm), certified argmax с adaptive
   nm-удвоением (cert_pred_adaptive). Верифицирован на Lean-примере
   z=(0,1,2), n=m=10 → класс 2 сертифицирован.
@@ -2498,20 +2498,20 @@ self-edit гейт работает (no-op фильтр активен), failure
 ### 24.1 Четыре столпа теории → наш код (все мосты живы)
 
 1. **Rational softmax sandwich** (Theory/Softmax, BandTightening,
-   CertSandwichBench, TrainerBenchmark) → `hagi/sandwich.py`
+   CertSandwichBench, TrainerBenchmark) → `hagi/base/sandwich.py`
    `certified_argmax` — волна 204 исправила границы на корректные
    L_i/U_i (lo_i/Σlo не был валидной нижней границей; tie-кейсы
    [3,3,0] ложно сертифицировались — исправлено, 300-seeded
    panel 0 ложных).
 2. **CE safe-step контракт** (CEDescent, CEChain: η=4A/R²,
    drop 2A²/R²; BatchCEDescent consolidated C523) →
-   `hagi/lm.py::_certified_step` — точный JVP полного directional
+   `hagi/models/lm.py::_certified_step` — точный JVP полного directional
    displacement, контракт соблюдён. `_adaptive_step` —
    AdaptiveMajorizer (variance curvature C, η*=A/2C, cap η≤1).
 3. **GPM/snap/grow-адмиссия** (Continual, GrowSnap C521,
    AdapterGrowth C532, GrowTrunkBlock) → `hagi/core.py::hybrid_select`
    (fullGPM/agemFree/rankTrunc, wave201 добавил adaptive
-   conflict_threshold), `hagi/trunk_ops.py` (snap_rational q/2^k
+   conflict_threshold), `hagi/base/trunk_ops.py` (snap_rational q/2^k
    banker's, snap_denominator_reset, snap_obj_bound; LowRankAdapter
    B=0 one-factor neutrality, wave205).
 4. **Concentration-канон** (Hoeffding, Freedman, EmpiricalBernstein,
@@ -2542,7 +2542,7 @@ six_phase_cycle Σδ_i ≤ delta_total.
   наш save каждые 8 чанков — в разумном диапазоне √446≈21
   (консервативнее оптимума — допустимо).
 - **Ternary quant** (Energy/STEStep, Ternary.lean trits_fit_byte):
-  `hagi/lm.py::ternary_quant` b1.58 per-row scale, scale-invariant —
+  `hagi/models/lm.py::ternary_quant` b1.58 per-row scale, scale-invariant —
   соответствует; post-training, не в certified-пути.
 
 ### 24.4 Задокументированные дистанции (не баги, честные границы)
@@ -2643,7 +2643,7 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | Рост ствола против забывания | Свежая модель продакшн-размера, 60 чанков, CE первых 10 доменов после 60-го: без блоков **+0.553**; блоки роста **+2.07**; блоки ремонта +2.62; замороженные +3.48 | Рост ёмкости НЕ лечит забывание на этой модели (блоки переобучаются на выборке и не несут старую память). `_repair_forgetting` в режиме `block` оставлен как измеренный и отклонённый |
 | `RepairForgetting.lean` (итеративный ремонт, tol) | Режим `replay` (переучивание старых байтов с точным откатом): rounds=3/lr=1e-3 → **+0.343**; rounds=6/lr=3e-4 → **+0.036** (−93%), новые чанки не хуже (1.235 vs 1.216), цена ×10 времени. Формализация доказала только ЛИНЕЙНУЮ границу `z ≤ v − tol·a` — при `tol = 1e-4` она пуста | Принятие раунда теперь = парный выигрыш > **эмпирическая-Бернштейн граница** (`trunk_ops.paired_margin_eb`, формула `empirical_bernstein_mean_bound`, union bound по числу опробованных состояний). Граница перестала быть пустой: tol вычисляется из данных |
 | `HoldoutGateTwoWay.lean` (гейт «old vs candidate» на одной holdout-выборке, best-of-K = union bound) | Порог `_maybe_grow` был 1e-4 → о популяционном риске не гарантировал ничего. Замер paired-разностей (6 доменов): gain 0.50…2.11, Hoeffding-запас по диапазону 0.9…2.4 (отверг бы 4/6 реальных выигрышей — heavy tails), **EB-запас 0.29…0.62 при k=512, 0.12…0.26 при k=2048** | holdout 512 → 2048 окон; принятие `gain > margin_EB(n_states)`, иначе `HOLD_UNCERTAIN` + точный откат. Живая проверка: `GROW gain=2.36 margin=0.26`, `gain=1.74 margin=0.25` |
-| `ArchiverCodeLength.lean` (`H(p) ≤ E[⌈−log₂ q⌉₊] ≤ CE_bits + 1` для идеального кодера; реальный range-кодер — НЕ модель) | `hagi/archiver.py`: 32-бит range coder, 16-бит CDF (freq ≥ 1), фазовая столбцовая схема (`_phases`: фаза p кодирует блоки p, p+G, … — каждый столбец имеет полный k-байтный ПОТОКОВЫЙ контекст, декодер каузален). Lossless 11/11 на продакшн-чекпойнте, 0.535/0.553 b/B на периодике (trained/unseen), 5.16 b/B против zlib 2.40 на диске. WAVE 261: кодер кодирует НЕЗАВИСИМЫЕ блоки по k байт (контекст от нулевого пада в начале блока) — измеренная цена против полного потокового контекста всего +0.04 ната (Rope) / +0.13 (HNet); потоковый контекст длины k = L столбцово не батчится (блок j требует блок j−1 целиком — цепочка; три фазовых расписания WAVE 261 ломали lossless на файлах длиннее G·L байт). Кодек на известных распределениях: skewed 5.024 (идеал 4.99+квантование), random 8.002 | Мост ЖИВЁТ как внешний метрический прибор: отношение сжатия = CE ствола в битах. Проверка `coder ≤ CE_bits + 1` на реальных данных пока невозможна: текущий ствол даёт CE_bits 8.5–8.8 (> ln 256) на необученных чанках → архив честно пишется как stored |
+| `ArchiverCodeLength.lean` (`H(p) ≤ E[⌈−log₂ q⌉₊] ≤ CE_bits + 1` для идеального кодера; реальный range-кодер — НЕ модель) | `hagi/models/archiver.py`: 32-бит range coder, 16-бит CDF (freq ≥ 1), фазовая столбцовая схема (`_phases`: фаза p кодирует блоки p, p+G, … — каждый столбец имеет полный k-байтный ПОТОКОВЫЙ контекст, декодер каузален). Lossless 11/11 на продакшн-чекпойнте, 0.535/0.553 b/B на периодике (trained/unseen), 5.16 b/B против zlib 2.40 на диске. WAVE 261: кодер кодирует НЕЗАВИСИМЫЕ блоки по k байт (контекст от нулевого пада в начале блока) — измеренная цена против полного потокового контекста всего +0.04 ната (Rope) / +0.13 (HNet); потоковый контекст длины k = L столбцово не батчится (блок j требует блок j−1 целиком — цепочка; три фазовых расписания WAVE 261 ломали lossless на файлах длиннее G·L байт). Кодек на известных распределениях: skewed 5.024 (идеал 4.99+квантование), random 8.002 | Мост ЖИВЁТ как внешний метрический прибор: отношение сжатия = CE ствола в битах. Проверка `coder ≤ CE_bits + 1` на реальных данных пока невозможна: текущий ствол даёт CE_bits 8.5–8.8 (> ln 256) на необученных чанках → архив честно пишется как stored |
 | `AdamDirection.lean` (шог Адама — не безусловный спуск, ⟨g,d⟩ может быть < 0) | В коде шаг и так принимается измеренным гейтом (`train_guarded`: rollback-by-selection, certified refine с `d > 0`) | подтверждено, изменений не требует. `lr` 3e-3 → **1e-3** (wave256): Adam двигает каждый вес ≈ lr независимо от градиента; на 40 чанках rms(W2) 10.39 (3e-3, CE 1.85→2.08 растёт) против 5.02 (1e-3, CE 2.06→1.98 падает). Weight decay не помогает (любой wd ≥ 1e-3 схлопывает веса, CE хуже), RMSNorm перед головой — почти ничего (8.78 vs 10.32) |
 | `BatchCEDescentMgdaCode` (MGDA на нормированных градиентах = min-norm точки нормированной оболочки; canon верен только при равных нормах) | `selfmodel.mgda_weights` так и делает (wave254) | честная граница задокументирована в primes; изменений нет |
 | `BatchGlobalTelescope` (per-batch certified drops НЕ телескопируют в глобальный objective; ledger это честно пишет) | `train_guarded` refine: 8 раундов по 32 позиции, `scope: per-batch-sum, no telescoping guarantee` | подтверждено |
@@ -2670,7 +2670,7 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | BitAlloc-QAT (1.6 бита, 5.4–5.8×) | не проверялся (за пределами этой сверки) | отложено |
 | Обратный порядок байтов в `train_certified`/`predict_next_byte` (п. 2 отчёта) | совпадает с нашим wave258 | подтверждено независимо |
 
-**Перенос:** `hagi/hnet_lm.py` — torch-порт `HagiOptimalByteLM` (`HNetByteLM`, только forward; autograd — torch). Тот же интерфейс, что у Rope (`k, dim, hidden, params, param_names, logits, ce, train_guarded` через примесь, свой `train_certified` без certified-refine — честно помечено «selection, not a certificate», свой `adapter_head_step`). `Unified.ARCH` / env `HAGI_ARCH=hnet` выбирает модель; `save/load` именуют параметры через `model.param_names()` (Rope-чекпойнты совместимы: `arch` отсутствует → rope). End-to-end `ingest` на HNet: holdout 0.47–1.0 на реальных чанках (Rope 2.3), ремонт забывания срабатывает по EB-гейту, save/load и архиватор lossless (1.965 b/B на 30 КБ). Продакшн-цикл пока остаётся на rope — переключение после прогона на hnet в цикле (решение пользователя).
+**Перенос:** `hagi/models/hnet_lm.py` — torch-порт `HagiOptimalByteLM` (`HNetByteLM`, только forward; autograd — torch). Тот же интерфейс, что у Rope (`k, dim, hidden, params, param_names, logits, ce, train_guarded` через примесь, свой `train_certified` без certified-refine — честно помечено «selection, not a certificate», свой `adapter_head_step`). `Unified.ARCH` / env `HAGI_ARCH=hnet` выбирает модель; `save/load` именуют параметры через `model.param_names()` (Rope-чекпойнты совместимы: `arch` отсутствует → rope). End-to-end `ingest` на HNet: holdout 0.47–1.0 на реальных чанках (Rope 2.3), ремонт забывания срабатывает по EB-гейту, save/load и архиватор lossless (1.965 b/B на 30 КБ). Продакшн-цикл пока остаётся на rope — переключение после прогона на hnet в цикле (решение пользователя).
 
 ### 24.12 Волны 263–264: width-рост (NadyaOptimal.lean), гейт забывания на обученных доменах, контекстная таблица из HAGI_EXACT_GENERATION_V3
 
@@ -2679,7 +2679,49 @@ six_phase_cycle Σδ_i ≤ delta_total.
 | `NadyaOptimal.lean` §WidthGrowth (`wlogits_width_preserved`, nh = 1) | `HNetByteLM.grow_width(d,h)`: eps·d0/d1, rms·√(d0/d1), W_q·√(hd1/hd0), остальные — нулевые блоки, RoPE старые частоты + нулевые пары. Замер: max|Δlogit| 7e-6…1.1e-5 при логитах ±13 (24×48→48×96, 64×128→128×256, 64×128→96×128); градиенты доходят до новых столбцов. `Unified.grow_width` растит и адаптеры (нулевые строки/столбцы ⇒ residual не меняется: 1.1e-5) | МЕХАНИЗМ ЖИВ. **Эффект на забывание НЕ ИЗМЕРЕН**: A/B (12 реальных чанков, HNet с нуля) — триггер «после ROLLBACK ремонта» не сработал ни разу; A/B дал +1.25 и +0.91 drift при идентичных первых 8 чанках (недетерминизм GPU на границе гейта). Нужен триггер по drift обученных доменов |
 | `NadyaOptimal.lean` §BitAlloc, §Schedules, §LCB | trit5/int4 round-trip, cosine, Muon-норма, Hoeffding-граница paired-гейта — носители чужих компонентов; в наш код переносить нечего (оптимизатор и квантование не переносились, см. 24.11) | прочитано, изменений нет |
 | `RepairForgetting.lean` / `HoldoutGateTwoWay.lean` — что именно мерит гейт | `_old_domains_ce_vec` брал 8 случайных доменов из 1083, из них обученных ~40 → почти всегда 0 → «терять нечего», repair почти не запускался, а drift обученных доменов был +1.8 ната (замер 17 доменов). Теперь обученные домены первыми, остальное добирается | ИСПРАВЛЕНО (WAVE 263). Замер A (12 чанков): repair реально работает на каждом чанке (180 с/чанк против 100), drift +0.72 → +1.10 → +1.25 — медленнее, но не остановлено; нужен рост ёмкости или больший replay обученных |
-| `HAGI_EXACT_GENERATION_V3` (чужой прототип, `checkpoints/…`, отчёт + 9 тестов) | Идея: `q = (1−λ)p_neural + λ·r_context`, r — эмпирические продолжения самого длинного встречавшегося суффикса (16/12/8/4/2), λ<1 ⇒ полный носитель ⇒ lossless; таблица обновляется только уже декодированными байтами ⇒ нужен последовательный кодек. Перенесено в `hagi/archiver.py`: `ContextTable`, `mix_probs`, `compress_stream`/`decompress_stream`, формат `HAGI4` (k, min_count, λ_Q16, fingerprint модели, sha256 префикса/цели, crc32), CLI `--prefix-head`. Замер на продакшн-модели, 6 реальных файлов, префикс 80%, хвост 8 КБ: модель без таблицы **6.00** → с таблицей **2.19** b/B (в 2.7 раза; по файлам 1.36–3.32), zlib 1.75; lossless 6/6, чужой префикс/битый payload отвергаются, ~500 Б/с | ПЕРЕНЕСЕНО (WAVE 264). Что не переносилось: их модель d=14 и BitAlloc-файл (другая архитектура, «test» — продолжение того же файла, не независимый корпус). До zlib остаётся ~25%: основную работу делает таблица, вклад модели мал |
+| `HAGI_EXACT_GENERATION_V3` (чужой прототип, `checkpoints/…`, отчёт + 9 тестов) | Идея: `q = (1−λ)p_neural + λ·r_context`, r — эмпирические продолжения самого длинного встречавшегося суффикса (16/12/8/4/2), λ<1 ⇒ полный носитель ⇒ lossless; таблица обновляется только уже декодированными байтами ⇒ нужен последовательный кодек. Перенесено в `hagi/models/archiver.py`: `ContextTable`, `mix_probs`, `compress_stream`/`decompress_stream`, формат `HAGI4` (k, min_count, λ_Q16, fingerprint модели, sha256 префикса/цели, crc32), CLI `--prefix-head`. Замер на продакшн-модели, 6 реальных файлов, префикс 80%, хвост 8 КБ: модель без таблицы **6.00** → с таблицей **2.19** b/B (в 2.7 раза; по файлам 1.36–3.32), zlib 1.75; lossless 6/6, чужой префикс/битый payload отвергаются, ~500 Б/с | ПЕРЕНЕСЕНО (WAVE 264). Что не переносилось: их модель d=14 и BitAlloc-файл (другая архитектура, «test» — продолжение того же файла, не независимый корпус). До zlib остаётся ~25%: основную работу делает таблица, вклад модели мал |
 | их же раздел 7 «три режима» (Exact Bypass / вероятностная генерация / lossless reconstruction) | Совпадает с нашим `predict_next_byte` (PROVEN → HOLD → нейро только по явному запросу) и с архиватором | подтверждено независимо |
 
 Честные границы после этой волны: width-рост есть, но не включён (нет измеренного триггера); забывание замедлено, не остановлено; «нейросеть + таблица» сжимает хуже zlib на 25%.
+
+### 24.13 Рефакторинг 2026-11-26 и перенос из primes: ремонт по √c, WSD отклонён
+
+| Мост primes | Код-факт и замер | Итог |
+|---|---|---|
+| `Optimization/NeuronAlloc.lean` `neuron_alloc_opt_attained` (Σ c_i/n_i → min при n_i = √c_i·N/Σ√c_j) + `Learning/ContinualForgetting.lean` `floor_floor_telescope` (бюджет δ на аудиты старых задач) | `Unified._repair_bytes`: домены ремонта = домены парного гейта (`_old_domains_ce_vec`), байты между ними n_i = √c_i·N/Σ√c_j, c_i = mean(post_i) − mean(pre_i) по окнам. Дефекты прежде: (1) обучались 8 случайных доменов (включая необученные), а гейт мерил trained-first — разные множества; (2) срез `b"".join(...)[:400000]` давал байты только первым доменам конкатенации. A/B на 12 реальных чанках (HNet fresh, изолированный чекпойнт): drift обученных доменов после 12 чанков **+0.894 → +0.471 ната** (в 1.9 раза), worst +2.25 → +1.48, old_ce 2.57 → 1.61, время 1639 → 1524 с; до 4 чанков ветви идентичны (ремонт ещё не запускался) | ПЕРЕНЕСЕНО И ИЗМЕРЕНО (коммит 191a58a) |
+| `Optimization/LRSchedule.lean` `wsd_full_bound`, `cosLR_*` | WSD-расписание в `RopeAttentionByteLM.train_guarded` (последние 15…30 % эпох lr косинусно → 0). Замер (HNet/Rope d32, 20 эпох, реальные байты): holdout CE 2.288 (константный lr) → 2.302 (0.15) → 2.322 (0.30) | ОТКЛОНЕНО по замеру: посылка теоремы (шумовая фаза σ²η² доминирует) не выполнена — на наших объёмах обучение в фазе спуска, уменьшение шага теряет прогресс. Правка откатана |
+| `Training/Admission.lean` `admitRule` (ΔQ̂ − r_conf − λ_M·mem − λ_R·risk > 0) | `_maybe_grow`: после EB-гейта `gain > margin + λ_M·mem`; mem = numel(блок)/numel(модели ПОСЛЕ роста) (в документе выше сказано «/Σ numel» — знаменатель после роста); λ_M = 1.0 подобрана на одном тестовом блоке (gain 0.57 при доле 0.30 принят) | КОД ЕСТЬ, НО В РАБОЧЕМ ЦИКЛЕ НЕ ВЫПОЛНЯЕТСЯ: `GROW_BLOCKS = 0` (рост выключен по замеру: блоки роста ухудшают старые домена, +2.07 против +0.55 без блоков), `_maybe_grow` возвращает SKIP до замера сигнала. Правило приёма работает только в тестах; калибровка λ_M на рабочем цикле не проверена. Риск λ_R не отделён |
+| `Budget/RankBudget.lean` `rankResidual_allocation` | перебор рангов 1/2/4 — 9 шагов адаптера на домен, <1 % времени ingest; фит c·e^{−κr} требует тех же трёх замеров | ОТКЛОНЕНО (YAGNI): выигрыш в вычислениях незначим |
+| `Optimization/MirrorHedge.lean` `mirrorStep`/`router_regret_bound`, `SoftRouterMix.lean` | смесь адаптеров для домена без своего: нужна метрика близости доменов; сейчас bank.get(новый) = тождество | в очереди (требует embeddings-метрики, отдельная работа) |
+| `Optimization/Momentum.lean` `step_bracket`/`bracket_bisect`, `Optimization/SphericalDamping.lean` `angular_damping_window` | подбор lr биссекцией; потолок шага по модам | в очереди; ниже по приоритету, чем ремонт (ремонт дал drift ×1.9) |
+
+Цикл с новым ремонтом (10 чанков, продакшн-цикл): 10 RETRAIN / 1 ROLLBACK против прежних почти сплошных ROLLBACK; забывание после ремонта отрицательное (старые домены лучше, чем до приёма: −0.34, −0.06 ната); время 177 с/чанк против 113 с — ремонт реально выполняется.
+
+Рефакторинг (структура): `core.py` → `hagi/core/` (11 частей), `legacy_kernel.py` → `hagi/legacy/` (25 частей, имена без версий), `hagi/base/config.py`, `hagi/base/hashing.py`; границы пакета — `tests/test_architecture.py` (импорт всех модулей и скриптов в чистом процессе; нет `import hagi` вне `__init__`; звезда только внутри `core`; `__all__`; нет необъявленных имён в разрезанных подпакетах; learn/predict на 8 задачах). Каждая строка кода — русский комментарий (`scripts/comment_audit.py`: 106 файлов, 0/0/0).
+
+### 24.14 Рефакторинг 2026-11-27: чистка импортов, water-filling по наихудшему домену, карта непрочитанного в primes
+
+Структурный цикл: `scripts/prune_imports.py` убрал 538 неиспользуемых и
+повторных строк импорта (после разбиения монолита общий заголовок
+копировался в каждую часть); `scripts/fix_forward_refs.py` переносит
+приватные имена между частями через модуль-владелец; экспорт `hagi`,
+`hagi.core`, `hagi.legacy` совпадает с прежним (сняток имён до/после).
+README, ARCHITECTURE, pyproject и справка `hagi.cli` приведены к факту.
+
+Карта непрочитанного (`Cert/*`, `Training/CRMSM`, `TTCAT`, `Ctv2Telescope`,
+`AdaptiveAnytime`, `Budget/BitAlloc*`, `Optimization/PLConvergence`,
+`AdaptiveCycle`): почти всё — границы над абстрактными объектами.
+Переносимое:
+
+| Утверждение в primes | Где в коде | Статус |
+| --- | --- | --- |
+| `Budget/BitAlloc.lean` `imbalance_yields_gain`, `stable_factor_two` (обмен бит при модели ошибки `e = c/2^b`) | `_repair_forgetting`: стоп, когда `post <= pre + FORGET_TOL` и `max_i (post_i − pre_i) <= WORST_TOL = 0.25`; байты ремонта `n_i = √c_i·N/Σ√c_j` | ПЕРЕНОС ПО АНАЛОГИИ, не теорема: порог 0.25 на CE — не следствие BitAlloc; стоп возможен и раньше — по лимиту `REPAIR_ROUNDS = 6` или первому ROLLBACK, без отметки в статусе. `c_i` вычисляется один раз до раундов. Рабочий цикл, 4 куска: worst 0.003–0.035 ната |
+| `Training/AdaptiveAnytime.lean` `adaptive_anytime_budget_split` (порог α/K на раунд даёт ≤ α по всем раундам) | `paired_margin_eb(d, n_states=len(rounds)+1)` — граница каждого раунда ужесточается по числу уже сделанных проверок | УЖЕ БЫЛО; отдельной правки не потребовалось. Посылка супермартингала для наших статистик не проверялась |
+| `Budget/BitAlloc.lean` жадный побитный перенос при модели ошибки `e(b) = c/2^b` | модель ошибки от числа байтов ремонта не измерялась (нужна кривая CE(n) на одном домене); применённая формула `n_i ∝ √c_i` — оптимум для `Σ c_i/n_i` | НЕ ПЕРЕНЕСЕНО: нет измерения, выбирающего между моделями |
+| `Optimization/PLConvergence.lean` `η <= 1/(2L)`, горизонт из `μ/L` | μ, L для трансформера не известны; подбор шага биссекцией | НЕ ПЕРЕНЕСЕНО |
+| `Optimization/AdaptiveCycle.lean` `N <= C_0/δ` (число расширений ограничено бюджетом) | гейт роста: выигрыш должен превысить границу и цену памяти | СМЫСЛ СОВПАДАЕТ, бюджетной формы `Σ mem <= C_0` нет; блоков роста в рабочем цикле 0, потому что рост выключен (`GROW_BLOCKS = 0`), а не из-за сигнала ёмкости |
+
+Замер вне выборки (`scripts/oos_bench.py`, тексты вне доменов): модель на
+39 кусках 3.45 / 3.87 / 5.05 (англ. / код / рус.) → текущая
+(≈270 кусков) 2.91 / 3.74 / 3.76 ната на байт — генерализация растёт с
+числом кусков.
