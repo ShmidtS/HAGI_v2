@@ -183,6 +183,7 @@ def main() -> None:
         # семантическая дистилляция всегда включена в цикле полного диска —
         # тот же протокол, что в restore_domains: учитель -> косинусная
         # дистилляция скрытых признаков языковой модели на фрагментах куска
+        t_sem = time.time()  # начало семантической дистилляции (для отчёта о времени)
         try:  # сбой дистилляции не должен прерывать цикл
             from hagi.models.lm import SemanticDistillHead  # голова семантического выравнивания
             bank = getattr(u, "sem_head", None)  # существующая голова или None
@@ -221,7 +222,7 @@ def main() -> None:
         if gr.get("status") in ("GROW", "ROLLBACK"):  # статус — рост или откат
             print(f"    growth: {gr.get('status')} blocks={gr.get('blocks')} "  # печать статуса и числа блоков
                   f"signal={gr.get('signal')} CE {gr.get('ce_before')}->{gr.get('ce_after')}", flush=True)  # сигнала и CE до и после
-        t_sem = time.time()  # начало семантической дистилляции (для отчёта о времени)
+
         chunk, chunk_bytes, files_now = [], 0, 0  # обнулить накопитель куска
         # ---- 2+3. ВЫВОД + СБОРКА: самосборка схем ----
         model = u.model  # языковая модель
