@@ -24,9 +24,8 @@ from __future__ import annotations  # отложенное вычисление 
 
 from dataclasses import dataclass  # классы-записи
 import hashlib  # хэширование признаков и содержимого записей
-import json  # (импортирован, в коде ниже не используется)
+from hagi.base.hashing import hash_token_sign  # (целое, знак) из хеша слова
 import re  # регулярные выражения
-import sqlite3  # (импортирован, в коде ниже не используется напрямую)
 import time  # замер времени
 from pathlib import Path  # работа с путями файлов
 from typing import Iterable  # аннотации типов
@@ -42,10 +41,8 @@ _TOKEN_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)  # слово: цепочк
 _CLASSES = ("transient", "fact", "decision")  # имена классов по номерам 0, 1, 2
 
 
-def _stable_hash(token: str) -> tuple[int, float]:  # хэш слова: целое 64 бита и знак +1 или −1
-    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()  # хэш blake2b слова в 8 байт
-    value = int.from_bytes(digest, "little", signed=False)  # целое из байт (младший первым, без знака)
-    return value, (-1.0 if (value >> 63) else 1.0)  # (целое, знак: −1, если старший бит равен 1, иначе +1)
+def _stable_hash(token: str) -> tuple[int, float]:  # хэш слова: целое 64 бита и знак +1 или −1 (общая реализация — hagi.base.hashing)
+    return hash_token_sign(token)  # (v, s): v = blake2b-целое, s = −1, если старший бит v равен 1
 
 
 @dataclass(frozen=True)  # неизменяемая запись

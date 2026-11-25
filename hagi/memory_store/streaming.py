@@ -16,7 +16,8 @@ import os  # размер файлов базы
 import re  # выделение слов запроса
 import sqlite3  # база данных SQLite с полнотекстовым поиском FTS5
 from pathlib import Path  # создание каталога базы
-from typing import Iterable, Iterator  # типы для аннотаций
+from hagi.base.hashing import normalize_key  # нормализация ключа факта
+from typing import Iterable  # типы для аннотаций
 
 
 @dataclass(frozen=True)  # неизменяемый класс данных
@@ -266,10 +267,7 @@ SELECT p.rowid, m.char_start, m.char_end, bm25(pages), p.content,
         """Нормализовать ключ факта: нижний регистр, пробелы сжаты в один, крайние убраны.
 
         Пустой ключ — ValueError."""
-        normalized = " ".join(str(key).casefold().split())  # str(key) -> нижний регистр -> разбиение по пробелам -> соединение одним пробелом
-        if not normalized:  # ключ не содержит ни одного символа, кроме пробелов
-            raise ValueError("fact key must be non-empty")  # ошибка: ключ факта пуст
-        return normalized  # нормализованный ключ
+        return normalize_key(key)  # общая реализация: " ".join(str(key).casefold().split()); пусто — ValueError
 
     def store_fact(self, key: str, value: str, source: str = "") -> FactRecord:
         """Сохранить структурированный факт: и последнее значение, и всю историю версий.

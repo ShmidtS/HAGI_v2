@@ -12,6 +12,7 @@ from __future__ import annotations  # отложенное вычисление 
 from dataclasses import dataclass  # декоратор класса данных
 import time  # время в наносекундах
 
+from hagi.base.hashing import normalize_key  # нормализация ключа факта (общая реализация)
 from .streaming import DiskBackedContext  # дисковое хранилище с базой SQLite
 
 
@@ -118,10 +119,7 @@ CREATE TABLE IF NOT EXISTS guarded_fact_current (
     @staticmethod  # статический метод: не получает self
     def normalize_key(key: str) -> str:  # ключ факта; возвращает нормализованный ключ
         """Нормализовать ключ: нижний регистр, пробелы сжаты в один, крайние убраны; пустой ключ — ValueError."""
-        result = " ".join(str(key).casefold().split())  # str(key) -> нижний регистр -> разбиение по пробелам -> соединение одним пробелом
-        if not result:  # ключ пуст
-            raise ValueError("fact key must be non-empty")  # ошибка: ключ факта пуст
-        return result  # нормализованный ключ
+        return normalize_key(key)  # общая реализация: " ".join(str(key).casefold().split()); пусто — ValueError
 
     @staticmethod  # статический метод: не получает self
     def normalize_value(value: str) -> str:  # значение; возвращает нормализованное значение

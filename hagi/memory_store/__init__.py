@@ -46,7 +46,7 @@ class SemanticMemory:
             Читаются все страницы (rowid, content); внедряются только те rowid,
             которых нет в _vectors; текст страницы для эмбеддинга — первые
             512 символов."""
-        from hagi.embeddings import GemmaEmbedder  # кодировщик текста в вектор (импортируется лениво)
+        from hagi.base.embeddings import GemmaEmbedder  # кодировщик текста в вектор (импортируется лениво)
         gemma = GemmaEmbedder.get()  # единственный экземпляр кодировщика
         self.store._ensure_open()  # убедиться, что база открыта
         rows = self.store.db.execute(  # прочитать из таблицы pages все пары
@@ -86,7 +86,7 @@ class SemanticMemory:
             2) Фаза близости: score_p = q · v_p, где q — вектор первых 512
                символов запроса; список сортируется по score по убыванию."""
         import numpy as np  # численные массивы
-        from hagi.embeddings import GemmaEmbedder  # кодировщик текста в вектор
+        from hagi.base.embeddings import GemmaEmbedder  # кодировщик текста в вектор
         gemma = GemmaEmbedder.get()  # единственный экземпляр кодировщика
         self._ensure_vectors()  # у всех страниц должны быть векторы
         qv = gemma.embed([q[:512]])[0]  # вектор запроса по первым 512 символам

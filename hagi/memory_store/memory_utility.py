@@ -32,8 +32,7 @@
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
 from dataclasses import dataclass  # классы-записи
-import hashlib  # хэширование признаков
-import json  # (импортирован, в коде ниже не используется)
+from hagi.base.hashing import hash_feature_bin  # номер ячейки признака из хеша слова
 from pathlib import Path  # работа с путями файлов
 import re  # регулярные выражения
 import time  # замер времени
@@ -52,9 +51,8 @@ _STOP = {  # стоп-слова: не становятся признаками
 }
 
 
-def _hash_feature(token: str, bins: int) -> int:  # номер ячейки признака: 0..bins−1
-    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()  # хэш blake2b слова в 8 байт
-    return int.from_bytes(digest, "little", signed=False) % bins  # целое из байт (младший первым, без знака) mod bins
+def _hash_feature(token: str, bins: int) -> int:  # номер ячейки признака: 0..bins−1 (общая реализация — hagi.base.hashing)
+    return hash_feature_bin(token, bins)  # номер ячейки = hash_token_u64(token) mod bins
 
 
 @dataclass(frozen=True)  # неизменяемая запись
