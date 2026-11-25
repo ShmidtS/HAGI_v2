@@ -22,6 +22,8 @@ from hagi.selfdev import unified as U  # единая модель
 def _unified(tmp_path, monkeypatch):
     """Единая модель во временном каталоге с доменом d; байты домена — 0..255 ×12; тело обучено 3 эпохи."""
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # эти тесты — о механизмах Rope-модели (адаптеры A/B, рост блоков W1/Wo); оптимальная модель по умолчанию проверяется отдельно
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании Unified
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
     u._domain_bytes = lambda s, e: bytes(range(256)) * 12  # байты домена: 0..255, повторённые 12 раз
@@ -96,6 +98,8 @@ def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatc
     import torch as t  # тензоры
     from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # тест о Rope-механизмах (блоки W1/Wo, адаптеры)
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
     data = bytes(range(256)) * 30  # байты домена: 0..255 ×30
@@ -134,6 +138,8 @@ def test_grow_rolls_back_a_block_that_gains_nothing(tmp_path, monkeypatch):
     import torch as t  # тензоры
     from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # тест о Rope-механизмах (блоки W1/Wo, адаптеры A/B)
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
     data = bytes(range(256)) * 30  # байты домена
@@ -162,6 +168,8 @@ def test_repair_block_is_frozen_in_general_training_and_persisted(tmp_path, monk
     import torch as t  # тензоры
     from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # тест о Rope-механизмах (блоки W1/Wo, адаптеры A/B)
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
     data = bytes(range(256)) * 30  # байты домена
@@ -187,6 +195,8 @@ def test_repair_retrains_old_domains_until_forgetting_is_gone(tmp_path, monkeypa
     import torch as t  # тензоры
     from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # тест о Rope-механизмах (блоки W1/Wo, адаптеры A/B)
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании
     u = U.Unified()  # новая единая модель
     u.domains.update({"a": {}, "b": {}})  # два старых домена a и b
     old = bytes(range(0, 128, 2)) * 200  # старые байты: 0,2,4,…,126 ×200
@@ -213,6 +223,8 @@ def test_repair_continues_while_the_worst_domain_is_still_forgotten(tmp_path, mo
     (домен a — в норме, домен b — забыт; каждый раунд снижает CE домена b на 0.3)."""
     from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # тест о Rope-механизмах (блоки W1/Wo, адаптеры A/B)
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании
     u = U.Unified()  # новая единая модель
     u.domains.update({"a": {}, "b": {}})  # два старых домена a и b
     old = bytes(range(0, 128, 2)) * 200  # старые байты: 0,2,4,…,126 ×200

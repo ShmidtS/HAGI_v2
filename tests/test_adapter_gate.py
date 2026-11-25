@@ -37,6 +37,8 @@ def test_paired_gain_positive_only_when_clearly_better():
 def _unified(tmp_path, monkeypatch):
     """Единая модель во временном каталоге с доменом d; байты домена — 0..255, повторённые 8 раз."""
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    monkeypatch.setenv("HAGI_ARCH", "rope")  # эти тесты — о механизмах Rope-модели (адаптеры A/B, рост блоков W1/Wo); оптимальная модель по умолчанию проверяется отдельно
+    monkeypatch.setattr(U.Unified, "ARCH", "rope")  # атрибут класса читается при создании Unified
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
     u._domain_bytes = lambda s, e: bytes(range(256)) * 8  # байты домена: 0..255, повторённые 8 раз

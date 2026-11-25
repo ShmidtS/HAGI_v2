@@ -10,7 +10,7 @@
 - HAGI_NEURAL_DEVICE → "auto"      : устройство нейронной части (та же шкала, нижний регистр);
 - HAGI_THREADS       → не задано   : число потоков torch на процессоре (не задано = 1)
 - HAGI_THREADS       → не задано   : число потоков torch на процессоре (не задано = 1)
-- HAGI_ARCH          → "rope"      : архитектура тела модели: rope / hnet;
+- HAGI_ARCH          → "optimal"   : архитектура тела модели: optimal (причинная, по умолчанию) / hnet / rope;
 - HAGI_CKPT_DIR      → <корень>/checkpoints : каталог весов, книги доменов и журналов;
 - HAGI_SYMBOLIC      → "0"         : "1" — включить символьную фазу конвейера;
 - HAGI_NO_NEURAL     → не задано   : "1" — не обучать нейронную часть;
@@ -73,8 +73,8 @@ def neural_device_mode() -> str:
 
 
 def arch() -> str:
-    """Архитектура тела модели: HAGI_ARCH, иначе "rope"."""
-    return os.environ.get("HAGI_ARCH", "rope")  # читать в момент вызова
+    """Архитектура тела модели: HAGI_ARCH, иначе "optimal" (причинная модель; hnet/rope — прежние)."""
+    return os.environ.get("HAGI_ARCH", "optimal")  # читать в момент вызова
 
 
 def symbolic_enabled() -> bool:

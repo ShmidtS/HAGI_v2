@@ -224,6 +224,9 @@ class HagiOptimalLM:
             mats.extend([Wg, Wu, Wd])  # все — матрицы
         return mats, vecs  # вернуть группы
 
+    def train_guarded(self, data: bytes, epochs: int = 60, holdout: float = 0.15, batch: int | None = None, log_every: int = 0, holdout_seed: int | None = None, lr: float | None = None, **_ignored) -> dict:  # синоним train_certified (интерфейс Rope/HNet)
+        return self.train_certified(data, epochs=epochs, holdout=holdout, batch=batch, log_every=log_every, holdout_seed=holdout_seed, lr=lr)  # делегировать
+
     def grow(self, seed: int = 0) -> int:  # рост глубины (интерфейс Unified): блок-тождество, W_down = 0
         return grow_depth(self, seed)  # делегировать функции модуля
 

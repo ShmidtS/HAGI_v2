@@ -84,7 +84,7 @@ class Unified:
     # HAGI_ARCH=hnet выбирает HNetByteLM (измерено: CE по целым файлам 1.54 против
     # 1.81 у Rope на 4 реальных файлах, параметров в 4.7 раза меньше). По
     # умолчанию остаётся rope: полный цикл на hnet ещё не пройден.
-    ARCH = os.environ.get("HAGI_ARCH", "rope")  # архитектура тела: HAGI_ARCH из окружения, иначе "rope" (читается при импорте — атрибут класса)
+    ARCH = os.environ.get("HAGI_ARCH", "optimal")  # архитектура тела по умолчанию — причинная модель (мульти-лаги + GDN + SwiGLU, связанные эмбеддинги): 21 866 параметров против 105 088 у hnet, CE домена 2.25 против 3.28 при равном бюджете, забывание через волокна ≈ 0; HAGI_ARCH=hnet/rope — прежние модели
 
     def __init__(self, k: int = 16, dim: int = 128, hidden: int = 256):  # создать модель: контекст k, ширина dim, скрытый слой hidden
         from hagi.models import lm as lm_mod  # модуль языковой модели
@@ -93,7 +93,7 @@ class Unified:
         self.k, self.dim, self.hidden = k, dim, hidden  # запомнить k, dim, hidden
         # RopeAttentionByteLM — настоящее внимание и контекст 96 байт (у
         # CertifiedStepLM было фиксированное окно k=16).
-        self.model = (lm_mod.make_lm(self.ARCH) if self.ARCH == "hnet"  # hnet: создать модель без аргументов ширины
+        self.model = (lm_mod.make_lm(self.ARCH) if self.ARCH in ("hnet", "optimal")  # hnet/optimal: модель с её размерами по умолчанию (optimal — 24/48, k=64)
                         else lm_mod.make_lm(self.ARCH, dim, hidden))  # иначе: создать модель с шириной dim и hidden
         self.domains: dict[str, dict[str, Any]] = {}  # книга доменов: имя -> {sha, bytes, ce, ...}
         # СВЕЖАЯ модель сохраняет КНИГУ доменов. Книга — это данные (источник
