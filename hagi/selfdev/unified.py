@@ -814,8 +814,10 @@ class Unified:
         se = float(diff.std() / max(1, len(diff)) ** 0.5)  # стандартная ошибка
         return fib if float(diff.mean()) > 2.4 * se and float(diff.mean()) > 0 else None  # живой гейт
 
-    def _route_fiber(self, context: bytes):
-        """Маршрутизатор БЕЗ метки домена: волокно с наименьшей средней лог-потерей на последних 128 байтах контекста."""
+    def _route_fiber(self, context: bytes, return_probs: bool = False):
+        """Маршрутизация БЕЗ метки домена по Mirror-Hedge MWU: веса волокон exp(−η·Σпотерь) на последних
+            128 байтах контекста, пол 0.01/K (эксперт не умирает). Возвращает лучшее волокно (argmin потерь)
+            или, при return_probs, (смесь вероятностей следующего байта, веса)."""
         if not hasattr(self.model, "forward_seq") or not getattr(self, "fibers", None):  # нет волокон
             return None  # нет
         import numpy as _np2, torch as _t2  # массивы и тензоры
@@ -823,18 +825,30 @@ class Unified:
         if len(hist) < m.k + 8:  # мало истории
             return None  # нет
         arr = _np2.asarray(hist, dtype=_np2.int64)  # индексы
-        x = _t2.as_tensor(arr[:-1], dtype=_t2.long)[None]; y = _t2.as_tensor(arr[1:], dtype=_t2.long)  # вход и цели
-        best, best_l = None, float("inf")  # лучшее волокно и его потеря
+        x = _t2.as_tensor(arr[:-1], dtype=_t2.long)[None]; y = _t2.as_tensor(arr[1:], dtype=_t2.long)[None]  # вход и цели (1, T)
+        K = len(self.fibers); eta = 0.35  # число экспертов и темп MWU
         prev = m.active_fiber  # прежнее
         with _t2.no_grad():  # без графа
             h = m._rms(m.forward_hidden(x), m.g_out)  # скрытое
             base = (h @ m.emb.T) * m.out_scale + m.b_out + m.B_u[x] @ m.B_v  # логиты ствола
+            probs, last_lg = [], None  # вероятности по волокнам и логиты последней позиции
             for dom, fib in self.fibers.items():  # по волокнам
                 lg = base + fib.logits_delta(h, x)  # с волокном
-                loss = float(_t2.nn.functional.cross_entropy(lg.reshape(-1, 256), y.reshape(-1)))  # средняя лог-потеря
-                if loss < best_l: best, best_l = fib, loss  # лучше
+                pr = _t2.softmax(lg, dim=-1)[0]  # вероятности по позициям (T, 256)
+                probs.append(pr)  # добавить
+                last_lg = lg if last_lg is None else last_lg  # (не используется)
+            w = _np2.full(K, 1.0 / K)  # равные веса
+            yt = y[0]  # цели по позициям
+            for ti in range(yt.shape[0]):  # онлайн-обновление весов по позициям (причинно)
+                losses = [_np2.log(max(1e-12, float(probs[k][ti, int(yt[ti])]))) for k in range(K)]  # лог-вероятности фактического байта
+                for k in range(K): w[k] *= _np2.exp(eta * min(8.0, losses[k]))  # веса растут у точных экспертов
+                ssum = float(w.sum()); w = 0.99 * (w / ssum) + 0.01 / K  # нормировка с полом
             m.active_fiber = prev  # вернуть
-        return best  # выбранное волокно
+        best = int(_np2.argmax(w))  # лучшее волокно
+        if return_probs:  # смесь вероятностей следующего байта
+            p_next = sum(float(w[k]) * probs[k][-1].double().numpy() for k in range(K))  # взвешенная смесь вероятностей последней позиции
+            return p_next, w  # смесь и веса
+        return list(self.fibers.values())[best]  # лучшее волокно
 
     class _DomainScope:
         """Контекстный менеджер: на время нейронного вызова ставит адаптер
@@ -1245,7 +1259,7 @@ class Unified:
         ctx_list = list(context)[-self.model.k:]  # последние k байтов от СТАРОГО к НОВОМУ, как в _windows и train_guarded (раньше был обратный порядок — модель получала перевёрнутое окно)
         x = _t.as_tensor([ctx_list], dtype=_t.long, device=dev)  # тензор формы (1, k)
         with self._DomainScope(self, prefer_domain):  # с адаптером домена, если он проходит гейт
-            routed = self._route_fiber(context) if prefer_domain is None else None  # волокно без метки домена (по потерям на контексте)
+            routed = self._route_fiber(context) if prefer_domain is None else None  # волокно без метки домена (Mirror-Hedge по потерям на контексте)
             if routed is not None: self.model.active_fiber = routed  # поставить выбранное волокно
             b = int(self.model.logits(x)[0].argmax())  # b = argmax логитов (байт с максимальным логитом)
             used = self.model.domain_adapter is not None  # применялся ли адаптер

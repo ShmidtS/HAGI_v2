@@ -39,13 +39,14 @@ def swiglu(x: t.Tensor, W_gate: t.Tensor, W_up: t.Tensor, W_down: t.Tensor) -> t
     return (g_act * (x @ W_up)) @ W_down  # произведение и проекция назад
 
 
-def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta: t.Tensor) -> t.Tensor:
+def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta: t.Tensor, S_init: t.Tensor | None = None) -> tuple[t.Tensor, t.Tensor]:
     """Gated DeltaNet по времени: S_t = α_t S_{t−1} + β_t (v_t − S_{t−1} k_t) k_tᵀ; y_t = S_t q_t.
 
-        Q, K, V: (B, H, T, D); alpha, beta: (B, H, T). Возвращает (B, H, T, D).
-        Цикл по T с автоградиентом (state-carry BPTT по всей последовательности)."""
+        Q, K, V: (B, H, T, D); alpha, beta: (B, H, T); S_init — начальное состояние (B, H, D, D) или None.
+        Возвращает (y: (B, H, T, D), S_final: (B, H, D, D)) — финальное состояние для переноса между чанками
+        (state-carry: градиент через границу не течёт, вызывающий передаёт S_final.detach())."""
     B, H, T, D = Q.shape  # размеры
-    S = t.zeros((B, H, D, D), dtype=Q.dtype, device=Q.device)  # состояние — нулевая матрица на голову
+    S = t.zeros((B, H, D, D), dtype=Q.dtype, device=Q.device) if S_init is None else S_init.to(Q.dtype)  # состояние: нулевое или перенесённое
     outs = []  # выходы по шагам
     for i in range(T):  # по времени
         k = K[:, :, i]  # форма: пакет, головы, ширина головы
@@ -56,7 +57,7 @@ def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta:
         Sk = (S @ k.unsqueeze(-1)).squeeze(-1)  # произведение состояния на ключ
         S = a * S + b * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # обновление состояния (правило Δ)
         outs.append((S @ q.unsqueeze(-1)).squeeze(-1))  # выход: состояние на запрос
-    return t.stack(outs, dim=2)  # форма: пакет, головы, время, ширина головы
+    return t.stack(outs, dim=2), S  # выходы и финальное состояние
 
 
 def muon_orth(G: t.Tensor, iters: int = 5) -> t.Tensor:
@@ -331,7 +332,7 @@ class HagiOptimalLM:
     def _rms(self, x: t.Tensor, g: t.Tensor) -> t.Tensor:  # RMSNorm с eps модели
         return rms_norm(x, g, getattr(self, "rms_eps", 1e-6))  # нормировка
 
-    def forward_hidden(self, x_seq: t.Tensor, capture: dict[int, t.Tensor] | None = None) -> t.Tensor:  # скрытое состояние (B, T, d); capture — входы матриц (для GPM)
+    def forward_hidden(self, x_seq: t.Tensor, capture: dict[int, t.Tensor] | None = None, state: dict | None = None) -> t.Tensor:  # скрытое состояние (B, T, d); capture — входы матриц (для GPM)
         B, T = x_seq.shape  # размеры
         d, H = self.dim, self.n_heads  # ширина и головы
         hd = d // H  # ширина головы
@@ -356,7 +357,9 @@ class HagiOptimalLM:
         V1 = qkv(self.W_gv, h_in)  # значения
         a1 = t.sigmoid(h_in @ self.W_alpha + self.b_alpha).permute(0, 2, 1) * 0.96  # удержание < 1
         b1 = t.sigmoid(h_in @ self.W_beta + self.b_beta).permute(0, 2, 1)  # запись
-        y1 = gated_deltanet(Q1, K1, V1, a1, b1).permute(0, 2, 1, 3).reshape(B, T, d)  # уровень 1
+        y1, S1 = gated_deltanet(Q1, K1, V1, a1, b1, S_init=(state.get("S1") if state else None))  # уровень 1 (с перенесённым состоянием)
+        if state is not None: state["S1"] = S1.detach().clone()  # финальное состояние (копия: in-place сброс строк не должен трогать граф)
+        y1 = y1.permute(0, 2, 1, 3).reshape(B, T, d)  # в раскладку (B, T, d)
         if self.use_gdn_norm:  # нормировка
             y1 = rms_norm(y1, self.g_gdn1)  # стабилизирует длинные последовательности
         if capture is not None: capture[id(self.W_go)] = y1.detach().reshape(-1, d)  # вход W_go
@@ -373,7 +376,9 @@ class HagiOptimalLM:
             b2 = p_h * t.sigmoid(self.b_slow)[None, :, None]  # запись только на границах
             if capture is not None:  # входы уровня 2
                 for W in (self.W_hq, self.W_hk, self.W_hv): capture[id(W)] = h.detach().reshape(-1, d)  # h перед уровнем 2
-            y2 = gated_deltanet(Q2, K2, V2, a2, b2).permute(0, 2, 1, 3).reshape(B, T, d)  # уровень 2
+            y2, S2 = gated_deltanet(Q2, K2, V2, a2, b2, S_init=(state.get("S2") if state else None))  # уровень 2
+            if state is not None: state["S2"] = S2.detach().clone()  # финальное состояние (копия)
+            y2 = y2.permute(0, 2, 1, 3).reshape(B, T, d)  # в раскладку
             if self.use_gdn_norm:  # нормировка
                 y2 = rms_norm(y2, self.g_gdn2)  # стабилизация
             if capture is not None: capture[id(self.W_ho)] = y2.detach().reshape(-1, d)  # вход W_ho
@@ -394,8 +399,8 @@ class HagiOptimalLM:
             if capture is not None: capture[id(Wd)] = mid_b.detach().reshape(-1, mid_b.shape[-1])  # вход Wd
         return h  # форма: пакет, время, ширина
 
-    def forward_seq(self, x_seq: t.Tensor) -> t.Tensor:  # логиты по всем позициям (B, T, 256)
-        h_out = rms_norm(self.forward_hidden(x_seq), self.g_out)  # нормированный выход
+    def forward_seq(self, x_seq: t.Tensor, state: dict | None = None) -> t.Tensor:  # логиты по всем позициям (B, T, 256); state — перенос состояния GDN между чанками
+        h_out = rms_norm(self.forward_hidden(x_seq, state=state), self.g_out)  # нормированный выход
         lg = (h_out @ self.emb.T) * self.out_scale + self.b_out  # связанные эмбеддинги: выходная проекция = embᵀ
         if self.use_bigram_logit_skip:  # скип биграмм в логиты
             lg = lg + self.B_u[x_seq] @ self.B_v  # аддитивно
@@ -406,7 +411,7 @@ class HagiOptimalLM:
 
     def train_optimal(self, data: bytes, epochs: int = 5, batch: int = 16, seq_len: int = 64,  # обучение
                       lr_muon: float = 0.03, lr_adam: float = 5e-3, max_steps_per_epoch: int = 25,  # шаги
-                      holdout: float = 0.15, seed: int = 7, opt_override: Any = None, gpm_left: dict | None = None,  # контроль, оптимизатор, базисы GPM
+                      holdout: float = 0.15, seed: int = 7, opt_override: Any = None, gpm_left: dict | None = None, state_carry: bool = True,  # контроль, оптимизатор, базисы GPM, перенос состояния между чанками
                       log_every: int = 0) -> dict:  # печать
         import numpy as np  # численные массивы
         n = len(data); cut = int(n * (1.0 - holdout))  # граница обучение/контроль
@@ -430,8 +435,33 @@ class HagiOptimalLM:
                 return float(t.nn.functional.cross_entropy(self.forward_seq(vx).reshape(-1, self.VOCAB), vy.reshape(-1)))  # по всем позициям
         h0 = val_ce(); best_val = h0; best_snap = [p.detach().clone() for p in self.params()]  # до обучения
         max_start = max(1, len(tr_arr) - seq_len - 1)  # число стартов
+        warmup = max(6, total_steps // 15)  # число шагов разогрева масштаба
+        stride = max(1, max_start // batch)  # шаг потока: batch потоков равномерно по домену
+        stream_pos = np.array([(i * stride) % max_start for i in range(batch)], dtype=np.int64)  # позиции потоков
+        carry: dict = {}  # переносимое состояние GDN (state-carry BPTT: длинный контекст без удлинения T)
         for step in range(total_steps):  # по шагам
-            opt.set_lr_scale(0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, total_steps))))  # косинусный отжиг
+            opt.set_lr_scale((0.2 + 0.8 * (step + 1) / warmup) if step < warmup else (0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))))  # разогрев, затем косинусный отжиг
+            if state_carry:  # поток: подряд идущие чанки, состояние переносится
+                starts = stream_pos  # старты потоков
+                state = {k: v for k, v in carry.items()}  # состояние с предыдущего шага
+                bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long)  # входы
+                by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long)  # цели
+                opt.zero_grad()  # сброс
+                loss = t.nn.functional.cross_entropy(self.forward_seq(bx, state=state).reshape(-1, self.VOCAB), by.reshape(-1))  # потеря по всем T позициям
+                carry = {"S1": state["S1"], "S2": state.get("S2")}  # новое состояние (detached)
+                stream_pos = stream_pos + seq_len  # сдвинуть потоки
+                wrap = stream_pos >= max_start  # поток дошёл до конца
+                if np.any(wrap):  # есть обернувшиеся
+                    stream_pos[wrap] = rng.integers(0, max(1, len(tr_arr) // 3), size=int(np.sum(wrap)))  # новые случайные старты
+                    for bi in np.where(wrap)[0]:  # сброс состояния обернувшихся строк
+                        carry["S1"][bi] = 0  # нулевое состояние
+                        if carry["S2"] is not None: carry["S2"][bi] = 0  # нулевое
+                loss.backward(); opt.step()  # градиент и шаг
+                if (step + 1) % max(1, steps_ep // 2) == 0 or step == total_steps - 1:  # контроль
+                    hv = val_ce()  # контрольная кросс-энтропия
+                    if hv < best_val: best_val = hv; best_snap = [p.detach().clone() for p in self.params()]  # снимок
+                    if log_every and (step + 1) % log_every == 0: print(f"  шаг {step + 1}/{total_steps}: потеря {float(loss):.4f}, контроль {hv:.4f}", flush=True)  # прогресс
+                continue  # следующий шаг
             starts = rng.integers(0, max_start, size=batch)  # случайные старты
             bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long)  # входы
             by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long)  # цели
@@ -933,3 +963,31 @@ def derived_probe_size(N: int, delta: float, eps: float, B: float) -> int:
     if eps <= 0 or B <= 0 or N <= 0:  # некорректные входы
         return 1  # нейтрально
     return int(_m.ceil(_m.log(2.0 * N / delta) / (2.0 * (eps / B) ** 2)))  # минимальный размер пробы
+
+
+def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: float = 0.01, lr_adam: float = 1.5e-3) -> dict:
+    """Квантование с обучением (EF21-QAT): градиент берётся на КВАНТОВАННЫХ весах, шаг применяется
+        к полноточным master-весам; масштаб шага линейно гасится. Перенесено с numpy-шима аудита
+        (run_ef21_qat_q4). Возвращает потери CE до/после квантования (float и QAT)."""
+    arr = np.frombuffer(data, dtype=np.uint8).astype(np.int64)  # индексы
+    if len(arr) < 70:  # мало
+        arr = np.tile(arr, max(2, 128 // max(1, len(arr))))  # повторить
+    mats, vecs = model.matrix_and_vec_params()  # группы
+    opt = HybridMuonAdamW(mats, vecs, lr_muon=lr_muon, lr_adam=lr_adam, wd=0.0)  # оптимизатор без затухания
+    opt.names.update({id(p): n for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)})  # имена
+    rng = np.random.default_rng(77)  # выборка
+    master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # полноточные веса
+    for stp in range(int(steps)):  # шаги доводки
+        q, _ = quantize_model(model, bits=4)  # квантовать текущие
+        dequantize_into(model, q)  # веса → квантованные (прямник видит их)
+        starts = rng.integers(0, len(arr) - 65, size=16)  # старты
+        X = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long); y = t.as_tensor(np.stack([arr[s + 1: s + 65] for s in starts]))  # батч
+        loss = t.nn.functional.cross_entropy(model.forward_seq(X).reshape(-1, 256), y.reshape(-1))  # CE на квантованных
+        opt.zero_grad(); loss.backward()  # градиент
+        with t.no_grad():  # восстановить master
+            for n, w in master.items(): getattr(model, n).copy_(w)  # вернуть
+        opt.set_lr_scale(1.0 - stp / max(1, steps))  # линейное затухание масштаба
+        opt.step()  # шаг по master
+        master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # новый master
+    q, nbytes = quantize_model(model, bits=4)  # финальное квантование
+    return {"q": q, "bytes": nbytes}  # параметры и объём
