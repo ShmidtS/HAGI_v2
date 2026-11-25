@@ -1083,6 +1083,9 @@ class Unified:
         gpm = getattr(self.model, "gpm_left", None)  # базисы GPM (причинная модель)
         if gpm:  # есть
             st["gpm_left"] = {n: U.detach().cpu() for n, U in gpm.items()}  # имя параметра -> базис (столбцы)
+        gpm_r = getattr(self.model, "gpm_right", None)  # правые базисы GPM (softmax-голова emb)
+        if gpm_r:  # есть
+            st["gpm_right"] = {n: U.detach().cpu() for n, U in gpm_r.items()}  # имя параметра -> базис
         # Сохранить геометрию внимания (theta0/lam): без них load() молча
         # вернёт значения по умолчанию, и обученный профиль свежести
         # изменится после перезапуска.
@@ -1190,6 +1193,8 @@ class Unified:
                 u.fibers[dom] = fib  # добавить
         if "gpm_left" in st:  # восстановить базисы GPM
             u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()}  # имя -> базис
+        if "gpm_right" in st:  # правые базисы
+            u.model.gpm_right = {n: _t.as_tensor(U) for n, U in st["gpm_right"].items()}  # имя -> базис
         # Старые состояния rope хранят выращенные блоки отдельно
         for blk in st.get("blocks", []) or []:  # по сохранённым блокам (по умолчанию пусто)
             u.model.grow()  # добавить блок-тождество

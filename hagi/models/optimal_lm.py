@@ -61,28 +61,25 @@ def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta:
 
 
 def muon_orth(G: t.Tensor, iters: int = 5) -> t.Tensor:
-    """Ортогонализация полярным множителем: polar_express (3 квинтических шага, JointCost T2b) — быстрее NS5 в 1.3–1.7×
-        и держит σ_max ≤ 1.02; при недоступности — классический NS."""
-    from hagi.base.trunk_ops import polar_express  # трёхшаговый полярный приближатор
-    R = t.as_tensor(polar_express(G.detach().double().cpu().numpy()), dtype=G.dtype, device=G.device)  # полярный множитель
-    return R  # вернуть
-
-
-def _muon_ns(G: t.Tensor, iters: int = 5) -> t.Tensor:
-    """Классический Muon NS (запасной)."""
-    """Классический Muon NS: X ← aX + b(XXᵀ)X + c(XXᵀ)²X. Возвращает G·(GᵀG)^{−1/2}."""
-    a, b, c = 3.4445, -4.7750, 2.0315  # коэффициенты
-    X = G.float()  # рабочая копия
-    X = X / (X.norm() + 1e-7)  # нормировка
-    tr = X.size(0) > X.size(1)  # нужна ли транспонация
-    if tr:  # высокая
-        X = X.T  # сделать широкой
-    for _ in range(iters):  # итерации
-        A = X @ X.T  # произведение X на транспонированное X
-        X = a * X + b * (A @ X) + c * (A @ A @ X)  # полином пятой степени
-    if tr:  # вернуть форму
-        X = X.T  # назад
-    return X  # результат
+    """Ортогонализация полярным множителем: polar_express (3 квинтических шага,
+        полярная факторизация без SVD; «высокая» матрица
+        транспонируется в «широкую»). Считается на устройстве тензора в float64 — без
+        копирования GPU → CPU → GPU на каждом шаге."""
+    from hagi.base.trunk_ops import POLAR_EXPRESS  # тройки коэффициентов квинтических шагов
+    X = G.detach().to(t.float64)  # копия в float64 на том же устройстве
+    nrm = float(X.norm())  # норма Фробениуса ‖X‖ (один синхронный вызов)
+    if nrm < 1e-12:  # норма практически нулевая
+        return G.detach().clone()  # без изменений
+    X = X / nrm  # нормировка: X = X/‖X‖
+    transposed = X.shape[0] > X.shape[1]  # «высокая» матрица
+    if transposed:  # нужно транспонировать
+        X = X.T  # транспонирование
+    for a, b, c in POLAR_EXPRESS:  # по тройкам коэффициентов
+        X2 = X @ X.T  # произведение на транспонированную
+        X = a * X + b * (X2 @ X) + c * (X2 @ X2 @ X)  # квинтический шаг
+    if transposed:  # вернуть форму
+        X = X.T  # обратно
+    return X.to(G.dtype)  # в тип градиента
 
 
 class HybridMuonAdamW:
@@ -92,7 +89,7 @@ class HybridMuonAdamW:
                  lr_muon: float = 0.03, lr_adam: float = 5e-3, momentum: float = 0.9,  # шаги и момент
                  wd: float = 1e-4, ns_iters: int = 5) -> None:  # затухание и число итераций
         self.mats = [p for p in matrix_params if p.requires_grad]  # матрицы (Muon)
-        self.names: dict[int, str] = {}  # id веса -> имя (заполняется моделью; ключи GPM — имена, стабильны при save/load)
+        self.names: list[str] = []  # имена весов в порядке mats + vecs (заполняет модель: opt.names = model.param_names(); ключи GPM — имена, стабильны между перезапусками)  # прежльны при save/load)
         self.vecs = [p for p in vec_params if p.requires_grad]  # векторы и таблицы (AdamW)
         self.lr_muon, self.lr_adam = float(lr_muon), float(lr_adam)  # шаги
         self.momentum, self.wd, self.ns_iters = float(momentum), float(wd), int(ns_iters)  # прочее
@@ -100,8 +97,8 @@ class HybridMuonAdamW:
         self.v_m: list[t.Tensor] = [t.zeros_like(p) for p in self.vecs]  # первый момент AdamW
         self.v_v: list[t.Tensor] = [t.zeros_like(p) for p in self.vecs]  # второй момент AdamW
         self.step_count = 0  # счётчик шагов
-        self.gpm_left: dict[int, t.Tensor] = {}  # id веса -> базис левого подпространства (столбцы)
-        self.gpm_right: dict[int, t.Tensor] = {}  # id веса -> базис правого подпространства (столбцы)
+        self.gpm_left: dict[str, t.Tensor] = {}  # ИМЯ веса -> базис левого подпространства (столбцы)
+        self.gpm_right: dict[str, t.Tensor] = {}  # ИМЯ веса -> базис правого подпространства (столбцы)
         self._scale = 1.0  # множитель шага (косинусное расписание)
 
     def zero_grad(self) -> None:  # сбросить градиенты
@@ -127,7 +124,7 @@ class HybridMuonAdamW:
             for idx, p in enumerate(self.mats):  # матрицы
                 if p.grad is None:  # нет градиента
                     continue  # пропустить
-                Ul, Ur = self.gpm_left.get(self.names.get(id(p), id(p))), self.gpm_right.get(self.names.get(id(p), id(p)))  # подпространства веса (по имени)
+                Ul, Ur = self.gpm_left.get(self.names[idx]), self.gpm_right.get(self.names[idx])  # подпространства веса (по имени)
                 g = self._proj_out(p.grad.float(), Ul, Ur)  # градиент вне защищённого подпространства
                 buf = self.m_buf[idx]  # буфер момента
                 buf.mul_(self.momentum).add_(g)  # момент: затухание плюс новый градиент
@@ -144,7 +141,7 @@ class HybridMuonAdamW:
             for idx, p in enumerate(self.vecs):  # векторы и таблицы
                 if p.grad is None:  # нет градиента
                     continue  # пропустить
-                Ul, Ur = self.gpm_left.get(self.names.get(id(p), id(p))), self.gpm_right.get(self.names.get(id(p), id(p)))  # подпространства (по имени — те же ключи, что у базисов)
+                Ul, Ur = self.gpm_left.get(self.names[len(self.mats) + idx]), self.gpm_right.get(self.names[len(self.mats) + idx])  # подпространства (по имени — те же ключи, что у базисов)
                 g = self._proj_out(p.grad.float(), Ul, Ur)  # проекция градиента
                 if self.wd > 0 and p.ndim >= 2 and Ul is None and Ur is None:  # затухание только для незащищённых таблиц
                     p.mul_(1.0 - lr_a * self.wd)  # обычное затухание
@@ -399,8 +396,9 @@ class HagiOptimalLM:
             if capture is not None: capture[id(Wd)] = mid_b.detach().reshape(-1, mid_b.shape[-1])  # вход Wd
         return h  # форма: пакет, время, ширина
 
-    def forward_seq(self, x_seq: t.Tensor, state: dict | None = None) -> t.Tensor:  # логиты по всем позициям (B, T, 256); state — перенос состояния GDN между чанками
-        h_out = rms_norm(self.forward_hidden(x_seq, state=state), self.g_out)  # нормированный выход
+    def forward_seq(self, x_seq: t.Tensor, state: dict | None = None, capture: dict | None = None) -> t.Tensor:  # логиты по всем позициям (B, T, 256); state — перенос состояния GDN между чанками
+        h_out = rms_norm(self.forward_hidden(x_seq, capture=capture, state=state), self.g_out)  # нормированный выход (словарь захвата передаётся внутрь)
+        if capture is not None: capture[-1] = h_out.detach().reshape(-1, self.dim)  # вход softmax-головы emb (правое подпространство)
         lg = (h_out @ self.emb.T) * self.out_scale + self.b_out  # связанные эмбеддинги: выходная проекция = embᵀ
         if self.use_bigram_logit_skip:  # скип биграмм в логиты
             lg = lg + self.B_u[x_seq] @ self.B_v  # аддитивно
@@ -420,11 +418,12 @@ class HagiOptimalLM:
         steps_ep = min(max_steps_per_epoch, max(8, (len(tr_arr) - seq_len - 1) // (batch * 8)))  # шагов на эпоху
         total_steps = max(1, epochs * steps_ep)  # всего шагов
         opt = opt_override or HybridMuonAdamW(*self.matrix_and_vec_params(), lr_muon=lr_muon, lr_adam=lr_adam, wd=1e-4)  # оптимизатор
-        gpm = gpm_left if gpm_left is not None else getattr(self, "gpm_left", None)  # базисы: аргумент или атрибут модели
+        gpm = gpm_left if gpm_left is not None else getattr(self, "gpm_left", None)  # базисы: аргумент или атрибут модели (ключи — имена)
+        gpm_r = getattr(self, "gpm_right", None) or {}  # правые базисы модели (softmax-голова)
+        opt.gpm_right.update(gpm_r)  # передать
+        opt.names = self.param_names()  # имена весов по порядку mats + vecs: без них ключи GPM (имена) не находятся и защита молча не действует
         if gpm:  # заданы
             opt.gpm_left.update(gpm)  # градиент, шаг и затухание не заходят в защищённое подпространство
-        opt.names.update({id(p): n for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)})  # имена для ключей GPM
-        opt.names.update({id(p): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(self.blocks) for p, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))})  # блоки роста
         rng = np.random.default_rng(seed)  # выборка окон
         v_starts = np.arange(0, max(1, len(va_arr) - seq_len - 1), seq_len)[: min(32, max(1, len(va_arr) // seq_len))]  # старты контрольных окон
         vx = t.as_tensor(np.stack([va_arr[s: s + seq_len] for s in v_starts]), dtype=t.long)  # входы
@@ -551,7 +550,8 @@ def grow_depth(model: "HagiOptimalLM", seed: int = 0) -> int:
     return len(model.blocks)  # число блоков
 
 
-def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[int, t.Tensor],  # базисы защищённого подпространства
+def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[str, t.Tensor],  # базисы защищённого подпространства (ИМЯ веса -> базис; по id после перезапуска не совпадали)
+                     right_names: tuple[str, ...] | None = None,  # имена весов с правым базисом (softmax-голова: h_out @ emb.T); по умолчанию — из HAGI_GPM_RIGHT (замер: ранг 15 из 24 на emb душит новый домен — средний CE ствола 2.76 -> 3.34; включать осознанно)
                      energy_thresh: float = 0.90, max_rank_frac: float = 0.65) -> None:  # порог энергии и доля ранга
     """Обновить базисы GPM по активациям домена: для каждой матрицы — входы, SVD, 90% энергии,
     не более max_rank_frac·d_in столбцов; прежний базис сохраняется (объединение через QR)."""
@@ -561,9 +561,17 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[int, t.
     starts = np.linspace(0, len(arr) - 65, num=min(16, max(1, len(arr) // 64)), dtype=np.int64)  # старты окон
     bx = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long)  # форма: окна, 64
     acts: dict[int, t.Tensor] = {}  # входы матриц
+    acts_out: dict[int, t.Tensor] = {}  # выходные активации (для правых базисов)
     with t.no_grad():  # без графа
-        model.forward_hidden(bx, capture=acts)  # собрать
+        model.forward_seq(bx, capture=acts)  # собрать (forward_seq передаёт словарь в forward_hidden и добавляет h_out под ключом −1)
+        acts_out[id(model.emb)] = acts.pop(-1)  # h_out — вход читающей стороны emb
     names = {id(p): n for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # id -> имя
+    import os as _os  # переменные окружения
+    if right_names is None:  # не задано явно
+        right_names = ("emb",) if _os.environ.get("HAGI_GPM_RIGHT", "0") == "1" else ()  # по умолчанию выключено
+    gpm_right = getattr(model, "gpm_right", None)  # правые базисы модели (имя -> базис)
+    if gpm_right is None:  # ещё нет
+        gpm_right = model.gpm_right = {}  # создать
     names.update({id(p): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(getattr(model, "blocks", [])) for p, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))})  # блоки роста
     for k, A in acts.items():  # по матрицам
         k = names.get(k, k)  # ключ — имя параметра
@@ -585,6 +593,25 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[int, t.
         U_add = Vt[:k_new].T  # новые направления
         U_new = U_add if Uo is None else np.linalg.qr(np.concatenate([Uo, U_add], axis=1))[0][:, :max_k]  # объединить
         gpm_left[k] = t.as_tensor(U_new, dtype=t.float32)  # сохранить
+    for k, A in acts_out.items():  # правые подпространства (выходные активации)
+        nm = names.get(k)  # имя веса
+        if nm not in right_names:  # не защищается справа
+            continue  # дальше
+        X = A.double().cpu().numpy(); d_r = X.shape[1]  # активации (N·T, d_r)
+        Uo = gpm_right[nm].double().cpu().numpy() if nm in gpm_right and gpm_right[nm].shape[1] > 0 else None  # прежний базис
+        if Uo is not None:  # есть прежний
+            X = X - (X @ Uo) @ Uo.T  # убрать уже защищённое
+        _, S, Vt = np.linalg.svd(X, full_matrices=False)  # сингулярное разложение
+        e = S * S; cum = np.cumsum(e) / (float(np.sum(e)) + 1e-12)  # накопленная энергия
+        k_new = int(np.searchsorted(cum, energy_thresh) + 1)  # сколько новых направлений
+        cur_r = Uo.shape[1] if Uo is not None else 0  # текущий ранг
+        max_k = max(1, int(d_r * max_rank_frac))  # предел
+        k_new = max(0, min(k_new, max_k - cur_r))  # не больше предела
+        if k_new <= 0:  # нечего добавлять
+            continue  # дальше
+        U_add = Vt[:k_new].T  # новые направления
+        U_new = U_add if Uo is None else np.linalg.qr(np.concatenate([Uo, U_add], axis=1))[0][:, :max_k]  # объединить
+        gpm_right[nm] = t.as_tensor(U_new, dtype=t.float32)  # сохранить (по имени: emb — и вход, и голова)
 
 
 class CortexFiber:
