@@ -11,7 +11,7 @@
     save() из теста перезаписывал рабочие веса."""
 import pytest  # декораторы и проверка исключений
 
-from hagi import unified as U  # единая модель: пути, save, load
+from hagi.selfdev import unified as U  # единая модель: пути, save, load
 
 
 def _prod():
@@ -19,8 +19,8 @@ def _prod():
 
         hagi.util.__dict__["CKPT_DIR"] — значение на момент импорта; его же
         копия сохранена в U._PROD_CKPT."""
-    import hagi.util  # модуль путей
-    return hagi.util.__dict__["CKPT_DIR"]  # CKPT_DIR из словаря модуля hagi.util
+    import hagi.base.util  # модуль путей
+    return hagi.util.__dict__["CKPT_DIR"]  # CKPT_DIR из словаря модуля hagi.base.util
 
 
 def test_paths_follow_the_current_ckpt_dir(tmp_path, monkeypatch):

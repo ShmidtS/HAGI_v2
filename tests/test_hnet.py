@@ -17,7 +17,7 @@ import pytest  # инструменты тестирования
 
 def test_hnet_factory_shapes_and_params():
     """Фабрика hnet: ARCH, k, форма logits (1, 256), размеры d/h и число параметров 105 088 и 28 048."""
-    from hagi.lm import make_lm  # фабрика моделей по имени архитектуры
+    from hagi.models.lm import make_lm  # фабрика моделей по имени архитектуры
     m = make_lm("hnet", seed=1)  # модель hnet с размерами по умолчанию
     assert m.ARCH == "hnet" and m.k == 64  # имя архитектуры hnet, длина контекста 64
     out = m.logits(m.t.as_tensor([[0] * 64], dtype=m.t.long))  # logits для одного контекста из 64 нулевых байтов
@@ -32,7 +32,7 @@ def test_hnet_factory_shapes_and_params():
 
 def test_hnet_trains_and_beats_its_init_on_a_real_byte_stream():
     """После 2 эпох обучения best_holdout_ce < log(256) − 0,5: модель лучше своей случайной инициализации."""
-    from hagi.lm import make_lm  # фабрика моделей
+    from hagi.models.lm import make_lm  # фабрика моделей
     data = bytes(range(0, 256, 3)) * 60  # поток байтов 0,3,6,…,255, повторённый 60 раз
     m = make_lm("hnet", seed=1)  # модель hnet по умолчанию
     r = m.train_guarded(data, epochs=2)  # обучить 2 эпохи с гейтом
@@ -41,7 +41,7 @@ def test_hnet_trains_and_beats_its_init_on_a_real_byte_stream():
 
 def test_hnet_unified_roundtrip_save_load_and_ingest(tmp_path, monkeypatch):
     """Unified с ARCH = hnet: ingest даёт holdout_ce < log(256); после save/load веса совпадают точно (max |Δ| = 0)."""
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     monkeypatch.setattr(U.Unified, "ARCH", "hnet")  # архитектура по умолчанию := hnet
     u = U.Unified()  # новая единая модель
@@ -61,7 +61,7 @@ def test_hnet_unified_roundtrip_save_load_and_ingest(tmp_path, monkeypatch):
 def test_fresh_model_keeps_the_domain_book(tmp_path, monkeypatch):
     """Unified() на пустой контрольной точке читает книгу доменов из unified_ledger.json: домен x на месте."""
     import json  # разбор книги доменов
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     (tmp_path / "unified_ledger.json").write_text(json.dumps({"x": {"sha": "s", "bytes": 9, "ce": None}}), encoding="utf-8")  # книга: домен x с sha s, 9 байтов, CE не измерена
     u = U.Unified()  # новая единая модель (файла весов нет)

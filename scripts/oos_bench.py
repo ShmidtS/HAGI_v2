@@ -8,7 +8,7 @@ from pathlib import Path  # вычисление корня проекта
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # добавить корень проекта в путь импорта
 import numpy as np  # численные массивы
 import torch as t  # тензорная библиотека
-from hagi import unified  # объединённая модель Unified
+from hagi.selfdev import unified  # объединённая модель Unified
 
 OOS_TEXTS = {  # словарь: имя текста -> его байты
     "english_tech": (  # технический текст на английском

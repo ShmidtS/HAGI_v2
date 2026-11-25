@@ -16,7 +16,11 @@ import os, re, time  # os — путь и время изменения файл
 LOG = os.path.join(os.path.dirname(os.path.dirname(  # путь к журналу: <корень проекта>/checkpoints/cycle.log, корень = каталог над scripts/
     os.path.abspath(__file__))), "checkpoints", "cycle.log")  # __file__ → абсолютный путь, dirname дважды: файл → scripts → корень
 raw = open(LOG, "rb").read()  # байты журнала целиком (режим "rb" — двоичный, без перекодировки)
-txt = raw.decode("utf-16-le", errors="ignore")  # текст = декодирование UTF-16 LE; сбойные байты отбрасываются
+# журнал пишется либо PowerShell (UTF-16 LE, по 2 байта на символ), либо прямым
+# перенаправлением (UTF-8): различаем по доле нулевых байтов (в UTF-16 латиница даёт ~50 % нулей)
+head = raw[:4096]  # начало файла для оценки кодировки
+is_utf16 = head.count(0) > len(head) // 4  # много нулевых байтов → UTF-16
+txt = raw.decode("utf-16-le" if is_utf16 else "utf-8", errors="ignore")  # текст = декодирование в нужной кодировке; сбойные байты отбрасываются
 ns = re.findall(r"\[(ns_\d+)\] neural: .*?CE (\d+\.\d+) \((\d+\.\d)s\)", txt)  # все строки нейронного шага: (id чанка ns_N, CE, секунды); CE = cross-entropy на чанке
 secs = sorted(float(s) for _, _, s in ns)  # времена чанков по возрастанию: t_(1) ≤ … ≤ t_(n)
 sem = re.findall(r"semantic loss (\d+\.\d+)", txt)  # значения семантического лосса в порядке появления (строками)

@@ -15,7 +15,7 @@ from pathlib import Path  # пути
 ROOT = Path(__file__).resolve().parent.parent  # корень проекта
 sys.path.insert(0, str(ROOT))  # добавить корень проекта в путь импорта
 
-from hagi.unified import Unified  # объединённая модель
+from hagi.selfdev.unified import Unified  # объединённая модель
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
     t0 = time.perf_counter()  # начало отсчёта времени
     # возобновление: кусок, чей хеш уже есть в книге доменов с обученной CE,
     # считается выученным и пропускается (модель в памяти — накопитель, а не журнал).
-    from hagi.unified import _sha  # функция хеша байтов
+    from hagi.selfdev.unified import _sha  # функция хеша байтов
     skipped = 0  # число пропущенных кусков
     for i, p in enumerate(chunks, 1):  # по кускам, i — номер с 1
         blob = p.read_bytes()  # байты куска
@@ -49,7 +49,7 @@ def main() -> None:
         # (всегда включена: учитель -> языковая модель).
         if True:  # блок выполняется всегда
             try:  # сбой дистилляции не должен останавливать восстановление
-                from hagi.lm import SemanticDistillHead  # голова семантического выравнивания
+                from hagi.models.lm import SemanticDistillHead  # голова семантического выравнивания
                 bank = getattr(u, "sem_head", None)  # существующая голова или None
                 if bank is None:  # головы ещё нет
                     bank = u.sem_head = SemanticDistillHead(dim=0)  # создать голову и сохранить её в модели

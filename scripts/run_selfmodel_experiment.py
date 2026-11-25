@@ -38,7 +38,7 @@ def main() -> int:
     try:  # любой сбой записывается в результат вместо аварийного выхода
         import numpy as np  # численные массивы
         import hagi  # набор задач и синтез задач процессора
-        from hagi.selfmodel import (  # процессор со следом и вывод модели самого себя
+        from hagi.selfdev.selfmodel import (  # процессор со следом и вывод модели самого себя
             FEATURE_KEYS, TracedProcessorV9, describe_pipeline,  # имена признаков, процессор, описание конвейера
             derive_self_model, impossibility_certificate,  # вывод символической модели и свидетель невозможности
         )
@@ -68,7 +68,7 @@ def main() -> int:
         }
 
         # затем проверить политики распределения бюджета на независимых зернах.
-        from hagi.selfmodel import run_experiment  # сравнение политик бюджета на нескольких зернах
+        from hagi.selfdev.selfmodel import run_experiment  # сравнение политик бюджета на нескольких зернах
         selected_policies = ["baseline","online_exact_2holds_quarter","online_exact_1hold_quarter","online_exact_2holds_eighth"]  # сравниваемые политики: эталон и три более смелых
         result = run_experiment(  # сравнение политик
             seeds=20, policy_names=selected_policies, seed_start=30  # 20 зерен с 30 по 49, заданные политики

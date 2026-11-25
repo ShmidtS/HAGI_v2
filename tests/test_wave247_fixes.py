@@ -21,9 +21,9 @@
 import numpy as np  # массивы и случайные числа
 import pytest  # параметризация и approx
 
-from hagi.diagnosis import build_residual_profile, classify_hold  # профиль остатка и причина задержки
-from hagi.invention import basis_out_period  # базис-период y = (x + o) mod p
-from hagi.trunk_ops import merge_bound  # сертифицированная граница потери в средней точке
+from hagi.invent.diagnosis import build_residual_profile, classify_hold  # профиль остатка и причина задержки
+from hagi.invent.invention import basis_out_period  # базис-период y = (x + o) mod p
+from hagi.base.trunk_ops import merge_bound  # сертифицированная граница потери в средней точке
 
 
 def _hold(y):
@@ -167,7 +167,7 @@ def test_invent_multi_finds_laws_on_every_period_up_to_8(period):
     # (375 пар) слишком мал для почти инъективного закона — он всё равно НАХОДИТСЯ,
     # с поддержкой 0,744 и сырой точностью 0,971 (контракт PARTIAL_LAW сообщает именно это).
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     pairs = _stream(period, lambda a, b, c: a + 2 * b - c + 7, n=6000)  # поток периода period с законом y = a + 2b − c + 7, 6000 пар
     r = invent_multi(pairs, random.Random(0))  # результат синтеза с зерном 0
     assert r["status"] == "PARTIAL_LAW"  # статус — частичный закон
@@ -183,7 +183,7 @@ def test_invent_multi_best_law_wins_over_the_first_that_passes():
     # Более слабая подгонка на КРАТНОМ периода проходит все гейты на более раннем признаке;
     # поиск обязан вернуть истинный период.
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     pairs = _stream(4, lambda a, b, c: a + 2 * b - c + 7)  # поток периода 4 с законом y = a + 2b − c + 7
     r = invent_multi(pairs, random.Random(0))  # результат синтеза с зерном 0
     assert r["n_shifts"] == 4 and r["feature"] == "aff(1, 2, -1)+0"  # найден период 4 и чертёж — аффинный с коэффициентами (1, 2, −1) и сдвигом 0
@@ -192,7 +192,7 @@ def test_invent_multi_best_law_wins_over_the_first_that_passes():
 def test_invent_multi_never_invents_a_law_for_noise():
     """На чистом шуме (8 зёрен, по 3000 случайных пар) закон не изобретается: NO_LAW."""
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     for seed in range(8):  # по 8 зернам
         r0 = random.Random(100 + seed)  # генератор пар с зерном 100 + seed
         pairs = [(tuple(r0.randbytes(K)), r0.randbytes(1)[0])  # 3000 случайных пар: контекст из K случайных байтов и случайный байт
@@ -203,7 +203,7 @@ def test_invent_multi_never_invents_a_law_for_noise():
 def test_vectorised_features_are_bit_exact_with_the_callables():
     """Векторизованные значения признаков _vfeat совпадают с обычными функциями признаков
     для всех признаков enumerate_features при длине контекста k = 2, 3, 4 (2000 строк)."""
-    from hagi.invention_multi import _kind, _vfeat, enumerate_features  # вид признака, векторизованное значение и список признаков
+    from hagi.invent.invention_multi import _kind, _vfeat, enumerate_features  # вид признака, векторизованное значение и список признаков
     r = np.random.default_rng(0)  # генератор с зерном 0
     for k in (2, 3, 4):  # по длинам контекста k
         X = r.integers(0, 256, (2000, k), dtype=np.uint8)  # 2000 случайных строк из k байтов
@@ -249,7 +249,7 @@ def _mul2(x):
 def _exact(net, n, fn):
     """Схема net точна для fn от n входов: символическая проверка по АНФ и совпадение выхода
     на всех 2^n входах."""
-    import hagi.skill_engine as S  # движок схем
+    import hagi.data.skill_engine as S  # движок схем
     return S.symbolic_verify_general(net, _anf(n, fn)) and all(  # символическая проверка схемы по АНФ и
         S.eval_net(net, tuple((q >> i) & 1 for i in range(n)))  # совпадение выхода схемы с fn
         == fn(tuple((q >> i) & 1 for i in range(n))) for q in range(1 << n))  # на всех 2^n входах q
@@ -258,7 +258,7 @@ def _exact(net, n, fn):
 def test_compile_optimal_shrinks_the_2x2_multiplier():
     """compile_optimal уменьшает умножитель 2×2: не более 7 вентилей, глубина ≤ 3, ≤ 100 бит программы;
     схема точна."""
-    import hagi.skill_engine as S  # движок схем
+    import hagi.data.skill_engine as S  # движок схем
     net = S.ProofCarryingANFLearner.compile_optimal(4, _anf(4, _mul2))  # оптимальная компиляция АНФ умножителя по 4 входам
     m = net["metrics"]  # метрики схемы
     assert len(net["gates"]) <= 7 and m["depth"] <= 3 and m["program_bits"] <= 100  # не более 7 вентилей, глубина ≤ 3, не более 100 бит программы
@@ -268,7 +268,7 @@ def test_compile_optimal_shrinks_the_2x2_multiplier():
 def test_compile_optimal_keeps_the_adder_and_is_never_worse_than_before():
     """Для сумматора compile_optimal даёт 8 вентилей и точную схему; на случайных функциях 3–5 входов
     схема не хуже прежней по кортежу (число вентилей, глубина, биты программы)."""
-    import hagi.skill_engine as S  # движок схем
+    import hagi.data.skill_engine as S  # движок схем
     net = S.ProofCarryingANFLearner.compile_optimal(4, _anf(4, _adder2))  # оптимальная компиляция АНФ сумматора по 4 входам
     assert len(net["gates"]) == 8 and _exact(net, 4, _adder2)  # ровно 8 вентилей и схема точна
     r = np.random.default_rng(0)  # генератор с зерном 0
@@ -291,7 +291,7 @@ def test_compile_optimal_keeps_the_adder_and_is_never_worse_than_before():
 def test_polar_express_singular_spectrum_lies_in_the_lean_box():
     """Для диагональной матрицы с числами s ∈ [lo, 1] сингулярные числа результата лежат в интервале:
     [0,9075; 1,0212] при lo = 0,1 и [9/512; 1049/1024] при lo = 0,001 (допуск 1e-9)."""
-    from hagi.trunk_ops import polar_express  # приближение полярного множителя
+    from hagi.base.trunk_ops import polar_express  # приближение полярного множителя
     # Функция действует только на сингулярные числа; подаем её маленькой
     # диагональной матрицей (U = V = I, спектр = диагональ) партиями.
     # (Первая версия строила одну диагональную 20001×20001 — около 8e12 операций.)
@@ -305,7 +305,7 @@ def test_polar_express_singular_spectrum_lies_in_the_lean_box():
 def test_polar_express_handles_wide_rank_deficient_and_zero():
     """Широкая матрица ранга 2 сохраняет форму; наибольшее сингулярное число ≤ 1049/1024, остальные около 0;
     нулевая матрица переходит в нулевую."""
-    from hagi.trunk_ops import polar_express  # приближение полярного множителя
+    from hagi.base.trunk_ops import polar_express  # приближение полярного множителя
     r = np.random.default_rng(0)  # генератор с зерном 0
     G = r.normal(size=(8, 2)) @ r.normal(size=(2, 64))  # широкая матрица 8×64 ранга 2
     out = polar_express(G)  # результат
@@ -322,7 +322,7 @@ def test_invent_multi_survives_a_sampled_miss_list():
     # сдвигает нумерацию списка; закон всё равно должен находиться, когда пары
     # несут свою позицию в потоке.
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     r = random.Random(0)  # генератор с зерном 0
     raw = r.randbytes(9000 + K)  # 9000 + K случайных байтов
     data = bytearray(raw)  # изменяемая копия
@@ -341,7 +341,7 @@ def test_invent_multi_survives_a_sampled_miss_list():
 def test_invent_multi_without_positions_keeps_the_old_contract():
     """Пары без позиций сохраняют прежний договор: закон периода 4 находится (PARTIAL_LAW, n_shifts = 4)."""
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     pairs = _stream(4, lambda a, b, c: a + 2 * b - c + 7, n=6000)  # поток периода 4, 6000 пар
     r = invent_multi([(tuple(x), y) for x, y in pairs], random.Random(0))  # синтез пар без позиций, зерно 0
     assert r["status"] == "PARTIAL_LAW" and r["n_shifts"] == 4  # статус — частичный закон, период 4
@@ -354,8 +354,8 @@ def test_pipeline_multibyte_channel_runs_end_to_end(tmp_path, monkeypatch):
         Регрессия: канал отключался ошибкой имени внутри except, и кусок не сообщал
         ничего вместо NO_LAW / PARTIAL_LAW."""
     import random  # генератор случайных чисел
-    from hagi import unified as U  # единая модель
-    from hagi import pipeline as P  # конвейер символьного обучения
+    from hagi.selfdev import unified as U  # единая модель
+    from hagi.selfdev import pipeline as P  # конвейер символьного обучения
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
@@ -381,7 +381,7 @@ def test_invent_multi_rejects_a_mode_fit():
     # самый частый байт. На реальном куске такой «закон» набирал ровно базу
     # «предсказывать моду» на невиданных данных.
     import random  # генератор случайных чисел
-    from hagi.invention_multi import invent_multi  # синтез законов по слоям потока
+    from hagi.invent.invention_multi import invent_multi  # синтез законов по слоям потока
     r = random.Random(3)  # генератор с зерном 3
     data = bytearray(r.randbytes(9000 + K))  # 9000 + K случайных байтов
     for i in range(len(data)):  # по всем позициям: 55% нулей, остальные — редкий шум
@@ -403,7 +403,7 @@ def test_adaptive_step_curvature_is_kappa_times_var_and_never_overclaims():
     (поэтому в коде берётся предел 1/2)."""
     import math  # экспонента и математика
     import torch as t  # тензоры
-    from hagi.lm import CertifiedStepLM  # модель с сертифицированным шагом
+    from hagi.models.lm import CertifiedStepLM  # модель с сертифицированным шагом
     seen = {}  # словарь наблюдений (не используется)
     orig_jvp = t.autograd.functional.jvp  # исходная функция JVP (не используется)
     m = CertifiedStepLM(dim=32, hidden=64, seed=0)  # модель d = 32, h = 64, зерно 0
@@ -434,7 +434,7 @@ def test_adaptive_step_curvature_stays_positive_for_tiny_ranges():
     шаг не увеличивает потерю: после ≤ до + 1e-9."""
     import math  # экспонента и математика
     import torch as t  # тензоры
-    from hagi.lm import CertifiedStepLM  # модель с сертифицированным шагом
+    from hagi.models.lm import CertifiedStepLM  # модель с сертифицированным шагом
     m = CertifiedStepLM(dim=16, hidden=32, seed=0)  # модель d = 16, h = 32, зерно 0
     with t.no_grad():  # без записи градиентов
         for q in m.params():  # по всем параметрам

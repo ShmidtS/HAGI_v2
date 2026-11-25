@@ -16,7 +16,7 @@
 import numpy as np  # массивы байтов
 import pytest  # проверка исключений
 
-from hagi import unified as U  # единая модель
+from hagi.selfdev import unified as U  # единая модель
 
 
 def _unified(tmp_path, monkeypatch):
@@ -94,7 +94,7 @@ def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatc
     2 блока даёт GROW / ROLLBACK / HOLD; при GROW CE не выросло и блоков 2, при ROLLBACK блок 1;
     после save/load число блоков и веса Wo сохраняются (расхождение < 1e-6)."""
     import torch as t  # тензоры
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
@@ -110,7 +110,9 @@ def test_grow_preserves_logits_exactly_and_trains_the_block(tmp_path, monkeypatc
         assert float((u.model.logits(X) - l0).abs().max()) == 0.0  # точное тождество: логиты не изменились
     u.GROW_BLOCKS = 2  # лимит блоков := 2 (по умолчанию рост выключен: блоки вредят старым доменам)
     r = u._maybe_grow("d", data)  # попытка добавить блок роста на домене d
-    assert r["status"] in ("GROW", "ROLLBACK", "HOLD")  # статус — один из трёх
+    assert r["status"] in ("GROW", "ROLLBACK", "HOLD", "HOLD_UNCERTAIN")  # статус — рост, откат, удержание или «не перекрыл границу и цену памяти»
+    if r["status"] == "GROW":  # блок принят
+        assert r["gain"] > r["margin"] + r["mem_cost"]  # правило приёма: выигрыш больше границы и цены памяти
     if r["status"] == "GROW":  # если блок принят
         assert r["ce_after"] <= r["ce_before"] and len(u.model.blocks) == 2  # CE не выросло и блоков 2
     if r["status"] == "ROLLBACK":  # если блок откатан
@@ -130,7 +132,7 @@ def test_grow_rolls_back_a_block_that_gains_nothing(tmp_path, monkeypatch):
         Причина: блок с ce_before = ce_after (3,4673 → 3,4673) был принят как GROW;
         ничего не заработано — значит откат."""
     import torch as t  # тензоры
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
@@ -158,7 +160,7 @@ def test_repair_block_is_frozen_in_general_training_and_persisted(tmp_path, monk
         Причина: подвижный блок ремонта на реальной модели дал +2,62 к CE старых доменов против
         +0,55 без блоков — блок ремонта обязан быть заморожен."""
     import torch as t  # тензоры
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     u = U.Unified()  # новая единая модель
     u.domains["d"] = {}  # пустая запись домена d
@@ -183,7 +185,7 @@ def test_repair_retrains_old_domains_until_forgetting_is_gone(tmp_path, monkeypa
         Цикл: пока CE старых доменов выше значения до обучения — шаг переобучения на старых байтах;
         шаг без улучшения откатывается; стоп по достижении допуска либо по лимиту раундов."""
     import torch as t  # тензоры
-    from hagi import unified as U  # единая модель
+    from hagi.selfdev import unified as U  # единая модель
     monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
     u = U.Unified()  # новая единая модель
     u.domains.update({"a": {}, "b": {}})  # два старых домена a и b
@@ -202,3 +204,36 @@ def test_repair_retrains_old_domains_until_forgetting_is_gone(tmp_path, monkeypa
     # цикл монотонен по значению гейта
     ces = [x["ce"] for x in r["rounds"]]  # CE по раундам
     assert ces == sorted(ces, reverse=True)  # CE не возрастает от раунда к раунду
+
+
+def test_repair_continues_while_the_worst_domain_is_still_forgotten(tmp_path, monkeypatch):
+    """Среднее забывание уже в допуске (post <= pre), но один домен всё ещё забыт на 0.5 ната:
+    ремонт не останавливается — делает ещё раунды (каждый под гейтом), пока наихудший домен
+    не войдёт в допуск WORST_TOL. Замеры CE подменены детерминированными векторами
+    (домен a — в норме, домен b — забыт; каждый раунд снижает CE домена b на 0.3)."""
+    from hagi.selfdev import unified as U  # единая модель
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # контрольная точка := tmp_path
+    u = U.Unified()  # новая единая модель
+    u.domains.update({"a": {}, "b": {}})  # два старых домена a и b
+    old = bytes(range(0, 128, 2)) * 200  # старые байты: 0,2,4,…,126 ×200
+    u._domain_bytes = lambda s, e: old  # байты всех доменов := old
+    pre_vec = np.full(400, 1.0)  # вектор CE до: 400 окон по 1.0
+    rounds_done = {"n": 0}  # число выполненных раундов обучения (0 — сразу после роста)
+    def vec_after():  # вектор CE после последнего раунда по сценарию
+        b_ce = 1.6 - 0.3 * rounds_done["n"]  # CE домена b: 1.6, затем 1.3, 1.0, …
+        return np.concatenate([np.full(200, 1.0), np.full(200, b_ce)])  # домен a = 1.0, домен b = b_ce
+    def fake_vec(exclude, max_domains=8):  # подменённый замер вектора CE
+        u._vec_names = ["a", "b"]  # два домена по 200 окон
+        u._vec_bounds = [0, 200, 400]  # срезы доменов в склеенном векторе
+        return ["a", "b"], vec_after()  # имена и вектор
+    monkeypatch.setattr(u, "_old_domains_ce_vec", fake_vec)  # подменить замер вектора
+    monkeypatch.setattr(u, "_old_domains_ce", lambda exclude: float(vec_after().mean()))  # среднее CE по тому же сценарию
+    def fake_train(*a, **k):  # раунд обучения: веса не меняются, сценарий сдвигается на один раунд
+        rounds_done["n"] += 1  # выполнен ещё один раунд
+    monkeypatch.setattr(u.model, "train_certified", fake_train)  # обучение ствола заменено сценарием
+    r = u._repair_forgetting("c", pre=1.3, incumbent_state=[q.detach().clone() for q in u.model.params()], pre_vec=pre_vec)  # ремонт
+    assert r["mode"] == "replay"  # режим переучивания
+    # среднее после 1-го раунда: (200·1.0 + 200·1.3)/400 = 1.15 <= 1.3 — прежнее условие остановило бы;
+    # наихудший домен b: 1.3 − 1.0 = +0.3 > WORST_TOL = 0.25 — ремонт продолжается
+    assert len(r["rounds"]) >= 2  # минимум два раунда
+    assert all(x["status"] == "RETRAIN" for x in r["rounds"])  # все раунды приняты (CE домена b снижается каждый раунд)

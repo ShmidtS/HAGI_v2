@@ -15,8 +15,8 @@ import numpy as np  # генераторы случайных чисел, allclo
 import pytest  # проверка исключений
 import torch  # точное сравнение тензоров тела модели
 
-from hagi import unified as U  # единая модель с банком адаптеров
-from hagi.trunk_ops import LowRankAdapter, paired_gain  # адаптер низкого ранга и парный гейт
+from hagi.selfdev import unified as U  # единая модель с банком адаптеров
+from hagi.base.trunk_ops import LowRankAdapter, paired_gain  # адаптер низкого ранга и парный гейт
 
 
 def test_paired_gain_positive_only_when_clearly_better():

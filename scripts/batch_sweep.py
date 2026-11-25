@@ -15,7 +15,7 @@ cross-entropy на отложенной части данных по эпоха�
 import sys, os, time  # sys — путь импорта, os — файлы и окружение, time — замер времени
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # добавить корень проекта (каталог над scripts/) в начало пути импорта, чтобы был виден пакет hagi
 os.environ.setdefault("HAGI_DEVICE", "cpu")  # устройство по умолчанию cpu, если HAGI_DEVICE ещё не задано (установленное значение не меняется)
-from hagi.lm import RopeAttentionByteLM  # импорт класса байтовой языковой модели с Rope-вниманием
+from hagi.models.lm import RopeAttentionByteLM  # импорт класса байтовой языковой модели с Rope-вниманием
 data = (open('README.md', 'rb').read() * 3)[:400_000]  # данные: байты файла × 3 (повтор трижды), срез [0:400_000]
 print("batch   CE      s     CE/s-gain")  # заголовок таблицы: батч, CE, секунды, прирост CE за секунду
 for b in (8, 16, 24, 32, 48):  # перебор размера батча b по списку

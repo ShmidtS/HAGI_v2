@@ -9,7 +9,7 @@ import sys, os, math, time  # путь импорта, окружение, чи�
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # добавить корень проекта в путь импорта
 os.environ.setdefault("HAGI_DEVICE", "cpu")  # устройство по умолчанию — процессор (если переменная не задана)
 import numpy as np, torch  # численные массивы и тензоры
-from hagi.lm import RopeAttentionByteLM  # байтовая модель с вниманием
+from hagi.models.lm import RopeAttentionByteLM  # байтовая модель с вниманием
 
 K = 96  # длина контекста модели
 FRACS = [0.26, 0.28, 1 / math.pi, 0.32, 0.34, 0.368]  # проверяемые доли повторного обучения

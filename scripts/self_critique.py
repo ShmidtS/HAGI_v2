@@ -15,8 +15,8 @@
 Выход: код возврата 0.
 """
 import json  # вывод итога в формате JSON
-from hagi.unified import Unified  # единая обучающаяся модель (хранит реестр законов)
-from hagi.law_critique import run_law_self_critique  # служба самокритики законов
+from hagi.selfdev.unified import Unified  # единая обучающаяся модель (хранит реестр законов)
+from hagi.data.law_critique import run_law_self_critique  # служба самокритики законов
 
 
 def main() -> int:

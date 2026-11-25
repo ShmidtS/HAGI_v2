@@ -19,12 +19,12 @@ import numpy as np  # массивы и случайные байты
 import pytest  # проверка исключений
 import zlib  # сжатие zlib (импортирован, в тестах ниже не используется)
 
-from hagi import archiver as A  # архиватор
+from hagi.models import archiver as A  # архиватор
 
 
 def _model():
     """Модель RopeAttentionByteLM с d = 32, h = 64, зерно 1 (маленькая — ради скорости)."""
-    from hagi.lm import RopeAttentionByteLM  # модель с вращением RoPE
+    from hagi.models.lm import RopeAttentionByteLM  # модель с вращением RoPE
     return RopeAttentionByteLM(dim=32, hidden=64, seed=1)  # создать модель заданных размеров
 
 
@@ -125,7 +125,7 @@ def test_archiver_is_lossless_on_a_long_real_file_for_both_archs():
         Если реального файла нет — берётся периодический поток 0..63 ×300."""
     import glob  # поиск файлов по маске
     import os  # пути
-    from hagi.lm import make_lm  # фабрика моделей
+    from hagi.models.lm import make_lm  # фабрика моделей
     files = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "checkpoints", "domains", "ns_04*.bin")))  # реальные файлы доменов ns_04*.bin, по алфавиту
     data = open(files[0], "rb").read()[:20000] if files else bytes(range(64)) * 300  # первые 20 000 байтов реального файла, иначе периодика
     for arch in ("rope", "hnet"):  # обе архитектуры
@@ -175,8 +175,8 @@ def test_grow_width_preserves_logits_and_adapters(tmp_path, monkeypatch):
     размеры и число параметров растут; в Unified ширина банка адаптеров равна dim новой модели,
     logits с адаптером тоже сохраняются (< 1e-4)."""
     import torch as t  # тензоры
-    from hagi import unified as U  # единая модель
-    from hagi.hnet_lm import HNetByteLM  # модель hnet
+    from hagi.selfdev import unified as U  # единая модель
+    from hagi.models.hnet_lm import HNetByteLM  # модель hnet
     m = HNetByteLM(dim=16, hidden=32, seed=3)  # модель d = 16, h = 32
     m.train_guarded(bytes(range(0, 256, 7)) * 40, epochs=1)  # обучить на законе 0,7,14,…,252 ×40, одна эпоха
     X = t.randint(0, 256, (128, m.k), generator=t.Generator().manual_seed(1))  # 128 случайных контекстов длины k

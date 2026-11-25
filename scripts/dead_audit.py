@@ -81,39 +81,46 @@ def nodes(tree, lines):
     return out  # вернуть словарь узлов
 
 
-mod = sys.argv[1]  # имя модуля — первый аргумент командной строки
-path = f"hagi/{mod}.py"  # путь файла модуля
-src = read(path)  # текст модуля
-tree = ast.parse(src)  # синтаксическое дерево модуля
-lines = src.splitlines()  # строки текста модуля
-tops = nodes(tree, lines)  # словарь узлов: имя -> текст
-funcs = {n.name: (n.lineno, n.end_lineno) for n in tree.body  # имя функции или класса -> (номер первой строки, номер последней строки)
-         if isinstance(n, (ast.FunctionDef, ast.ClassDef))}  # только функции и классы верхнего уровня
-corpus = list(sources(path))  # список всех прочих исходников проекта
-assert os.path.normpath(path) not in {os.path.normpath(p) for p in corpus}, \
-    "module leaked into its own corpus"  # проверить, что модуль не попал в собственный корпус
-others = "\n".join(read(p) for p in corpus)  # весь текст прочих исходников, соединённый переводами строки
-docs = "\n".join(read(p) for p in markdown())  # весь текст файлов .md, соединённый переводами строки
-word = lambda n: r"\b%s\b" % re.escape(n)  # регулярное выражение: слово n целиком, спецсимволы экранированы
-deps = {n: {m for m in tops if m != n and re.search(word(m), b)}  # deps[n] = {m : m ≠ n и слово m встречается в тексте b узла n}
-        for n, b in tops.items()}  # по всем узлам (n — имя, b — текст)
-entry = {n for n in tops if re.search(word(n), others)} | {"main"}  # точки входа: имена, встречающиеся в прочих исходниках, плюс main
-entry.add("<module code>")          # операторы уровня модуля выполняются при импорте
-reach = {e for e in entry if e in tops}   # достижимые сначала — сами точки входа, имеющиеся среди узлов
-stack = list(reach)  # стек обхода в глубину
-while stack:  # пока стек не пуст
-    n = stack.pop()  # снять узел с вершины стека
-    for m in deps[n]:  # по зависимостям узла n
-        if m not in reach:  # зависимость ещё не достигнута
-            reach.add(m)  # добавить её к достижимым
-            stack.append(m)  # и положить в стек
-total = 0  # суммарное число строк недостижимых функций и классов
-for n in sorted(tops):  # по именам узлов в порядке сортировки
-    if n in reach or n not in funcs:  # узел достижим либо не является функцией или классом
-        continue  # не печатать
-    a, b = funcs[n]  # a — первая строка, b — последняя строка определения
-    total += b - a + 1  # total += число строк b − a + 1
-    print(f"{path}:{a}-{b}  {n:34} {b - a + 1:4} lines  "  # печать пути, диапазона строк, имени в 14 позициях и числа строк
-          f"code={'yes' if re.search(word(n), others) else 'no '} "  # code = yes, если имя встречается в прочих исходниках, иначе no
-          f"docs={'yes' if re.search(word(n), docs) else 'no'}")  # docs = yes, если имя встречается в файлах .md, иначе no
-print(f"{path}: unreachable {total} lines")  # печать суммарного числа недостижимых строк
+def main(argv: list[str]) -> int:  # точка входа: argv — аргументы командной строки
+    mod = argv[1]  # имя модуля — первый аргумент командной строки
+    path = f"hagi/{mod}.py"  # путь файла модуля
+    src = read(path)  # текст модуля
+    tree = ast.parse(src)  # синтаксическое дерево модуля
+    lines = src.splitlines()  # строки текста модуля
+    tops = nodes(tree, lines)  # словарь узлов: имя -> текст
+    funcs = {n.name: (n.lineno, n.end_lineno) for n in tree.body  # имя функции или класса -> (номер первой строки, номер последней строки)
+             if isinstance(n, (ast.FunctionDef, ast.ClassDef))}  # только функции и классы верхнего уровня
+    corpus = list(sources(path))  # список всех прочих исходников проекта
+    assert os.path.normpath(path) not in {os.path.normpath(p) for p in corpus}, \
+        "module leaked into its own corpus"  # проверить, что модуль не попал в собственный корпус
+    others = "\n".join(read(p) for p in corpus)  # весь текст прочих исходников, соединённый переводами строки
+    docs = "\n".join(read(p) for p in markdown())  # весь текст файлов .md, соединённый переводами строки
+    word = lambda n: r"\b%s\b" % re.escape(n)  # регулярное выражение: слово n целиком, спецсимволы экранированы
+    deps = {n: {m for m in tops if m != n and re.search(word(m), b)}  # deps[n] = {m : m ≠ n и слово m встречается в тексте b узла n}
+            for n, b in tops.items()}  # по всем узлам (n — имя, b — текст)
+    entry = {n for n in tops if re.search(word(n), others)} | {"main"}  # точки входа: имена, встречающиеся в прочих исходниках, плюс main
+    entry.add("<module code>")          # операторы уровня модуля выполняются при импорте
+    reach = {e for e in entry if e in tops}   # достижимые сначала — сами точки входа, имеющиеся среди узлов
+    stack = list(reach)  # стек обхода в глубину
+    while stack:  # пока стек не пуст
+        n = stack.pop()  # снять узел с вершины стека
+        for m in deps[n]:  # по зависимостям узла n
+            if m not in reach:  # зависимость ещё не достигнута
+                reach.add(m)  # добавить её к достижимым
+                stack.append(m)  # и положить в стек
+    total = 0  # суммарное число строк недостижимых функций и классов
+    for n in sorted(tops):  # по именам узлов в порядке сортировки
+        if n in reach or n not in funcs:  # узел достижим либо не является функцией или классом
+            continue  # не печатать
+        a, b = funcs[n]  # a — первая строка, b — последняя строка определения
+        total += b - a + 1  # total += число строк b − a + 1
+        print(f"{path}:{a}-{b}  {n:34} {b - a + 1:4} lines  "  # печать пути, диапазона строк, имени в 14 позициях и числа строк
+              f"code={'yes' if re.search(word(n), others) else 'no '} "  # code = yes, если имя встречается в прочих исходниках, иначе no
+              f"docs={'yes' if re.search(word(n), docs) else 'no'}")  # docs = yes, если имя встречается в файлах .md, иначе no
+    print(f"{path}: unreachable {total} lines")  # печать суммарного числа недостижимых строк
+    return 0  # код завершения: успех
+
+
+
+if __name__ == "__main__":  # запуск из командной строки
+    sys.exit(main(sys.argv))  # выполнить и вернуть код завершения

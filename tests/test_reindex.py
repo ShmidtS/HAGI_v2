@@ -5,7 +5,7 @@
     запись без CE получает sha = первые 10 знаков sha1(байтов), bytes = длина
     и ce = None. Файл короче 4096 байтов в книгу не попадает."""
 import hashlib  # sha1 для ожидаемого отпечатка
-from hagi import unified as U  # единая модель и её книга доменов
+from hagi.selfdev import unified as U  # единая модель и её книга доменов
 
 
 def test_reindex_rebuilds_the_book_from_bytes(tmp_path, monkeypatch):

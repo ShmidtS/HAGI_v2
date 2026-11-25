@@ -18,7 +18,7 @@
 import pytest  # инструменты тестирования
 import torch as t  # тензоры и оптимизаторы
 
-from hagi.selfmodel import guarded_optimizer_step, mgda_weights  # гейтируемый шаг и веса MGDA
+from hagi.selfdev.selfmodel import guarded_optimizer_step, mgda_weights  # гейтируемый шаг и веса MGDA
 
 
 def _two_task_setup(scale_ratio=1000.0):

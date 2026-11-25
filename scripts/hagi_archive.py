@@ -36,8 +36,8 @@ def main():
     ap.add_argument("--prefix", default=None, help="prefix file for decompress")  # файл с префиксом для распаковки
     a = ap.parse_args()  # разобрать аргументы командной строки
     import numpy as np  # численные массивы
-    from hagi import archiver as A  # кодек арифметического сжатия
-    from hagi.unified import Unified  # объединённая модель
+    from hagi.models import archiver as A  # кодек арифметического сжатия
+    from hagi.selfdev.unified import Unified  # объединённая модель
     u = Unified.load()  # загрузить модель с диска
     if a.cmd == "compress":  # команда — сжатие
         import pathlib  # работа с путями

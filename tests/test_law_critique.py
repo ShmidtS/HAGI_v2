@@ -25,7 +25,7 @@ from types import SimpleNamespace  # объект-заглушка вместо 
 import pytest  # сравнение с допуском (approx)
 import torch  # тензоры логитов
 
-from hagi.law_critique import run_law_self_critique  # самокритика законов
+from hagi.data.law_critique import run_law_self_critique  # самокритика законов
 
 
 class IdentityLaw:

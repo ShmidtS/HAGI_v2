@@ -26,7 +26,7 @@ import time  # предельное время работы
 from pathlib import Path  # пути
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # добавить корень проекта в путь импорта
-from hagi import unified  # noqa: E402  # объединённая модель; импорт после правки sys.path
+from hagi.selfdev import unified  # noqa: E402  # объединённая модель; импорт после правки sys.path
 
 ROOT = Path(__file__).resolve().parent.parent  # корень проекта
 SWEEP_STATE = ROOT / "checkpoints" / "sweep_state.json"  # файл состояния просмотра

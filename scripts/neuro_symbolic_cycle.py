@@ -26,14 +26,15 @@ import time  # предельное время работы
 from pathlib import Path  # пути
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # добавить корень проекта в путь импорта
-from hagi import fabric, unified  # noqa: E402  # сборка схем и объединённая модель
-from hagi.cycle import (compose_adder2, commit, derive_tasks,  # noqa: E402  # сборка двухбитного сумматора, фиксация, вывод задач
+from hagi.data import fabric  # эмуляция и проверка логических схем
+from hagi.selfdev import unified  # noqa: E402  # сборка схем и объединённая модель
+from hagi.selfdev.cycle import (compose_adder2, commit, derive_tasks,  # noqa: E402  # сборка двухбитного сумматора, фиксация, вывод задач
                         fusion_fastpath, weave_task)  # noqa: E402  # быстрый путь синтеза, сборка схемы
-from hagi.util import CKPT_DIR  # каталог контрольных точек
+from hagi.base.util import CKPT_DIR  # каталог контрольных точек
 from scripts.feed_all_c import (CHUNK_TARGET, SKIP_DIRS, iter_files,  # noqa: E402  # размер куска, пропускаемые каталоги, обход диска
                                 load_state, save_state, sample_bytes)  # noqa: E402  # состояние просмотра и выборка файла
 
-from hagi.util import CKPT_DIR  # повторный импорт каталога контрольных точек (импорт уже сделан выше)
+from hagi.base.util import CKPT_DIR  # повторный импорт каталога контрольных точек (импорт уже сделан выше)
 TAPEOUT = CKPT_DIR / "processor_netlist.json"  # путь списка схем процессора (в этом файле далее не используется)
 
 # ---------- ВЫВОД: задачи для схем ИЗ обученного тела ----------
@@ -98,15 +99,16 @@ def main() -> None:
         # шага языковой модели символьную половину: диагностика -> изобретение
         # закона -> проверка -> закрепление; по умолчанию цикл повтора остаётся быстрым.
         import os as _os  # переменные окружения
+        t_ingest = time.time()  # начало приёма куска (для отчёта о времени фаз)
         if _os.environ.get("HAGI_SYMBOLIC") == "1":  # символьная половина включена
-            from hagi.pipeline import unified_ingest  # единый приём: нейронная и символьная половины
+            from hagi.selfdev.pipeline import unified_ingest  # единый приём: нейронная и символьная половины
             r = unified_ingest(u, cid, blob, epochs=2, repeat=1,  # приём куска: 2 эпохи, 1 повтор,
                                replay_cap=None)  # без предела повтора
         else:  # обычный приём
             r = u.ingest(cid, blob, epochs=2, repeat=1, replay_cap=None)  # приём куска: 2 эпохи, 1 повтор, без предела повтора
             # перепроверить принятые законы и без изобретения законов на этом куске
             try:  # сбой критики не должен прерывать цикл
-                from hagi.law_critique import run_law_self_critique  # самокритика принятых законов
+                from hagi.data.law_critique import run_law_self_critique  # самокритика принятых законов
                 r["self_critique"] = run_law_self_critique(u)  # добавить её итог к результату приёма
             except Exception as _ce:  # ошибка самокритики
                 print("    [self-critique] skipped: " + repr(_ce),  # печать причины пропуска
@@ -182,7 +184,7 @@ def main() -> None:
         # тот же протокол, что в restore_domains: учитель -> косинусная
         # дистилляция скрытых признаков языковой модели на фрагментах куска
         try:  # сбой дистилляции не должен прерывать цикл
-            from hagi.lm import SemanticDistillHead  # голова семантического выравнивания
+            from hagi.models.lm import SemanticDistillHead  # голова семантического выравнивания
             bank = getattr(u, "sem_head", None)  # существующая голова или None
             if bank is None:  # головы ещё нет
                 bank = u.sem_head = SemanticDistillHead(dim=0)  # создать голову и сохранить её в модели
@@ -203,20 +205,23 @@ def main() -> None:
                     idx = _th.cat([pad, idx], dim=1)  # приклеить прокладку слева по оси 1: длина строки станет k
                 u.model.domain_adapter = None  # отключить адаптер домена
                 sl = bank.align_step(u.model, idx, frags)  # один шаг выравнивания; sl — потеря
-                print(f"    semantic loss {sl:.3f}", flush=True)  # печать потери с 3 знаками
+                print(f"    semantic loss {sl:.3f} ({time.time() - t_sem:.1f}s)", flush=True)  # печать потери с 3 знаками и длительности семантической дистилляции
         except Exception as _e:  # любая ошибка дистилляции
             print(f"    semantic skipped: {_e!r}", flush=True)  # печать причины пропуска
+        t_ingest = round(time.time() - t_ingest, 1)  # длительность приёма куска, с
         print(f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB "  # печать имени куска и прибавки в МБ
               f"({files_now} files) → CE {ce} "  # числа файлов и CE
-              f"({r.get('seconds', '?')}s)", flush=True)  # длительности приёма ('?', если ключа нет)
+              f"(нейро {r.get('phases', {}).get('neural', '?')}s + символ {r.get('phases', {}).get('symbolic', '?')}s = {t_ingest}s) "  # длительности половин приёма
+              f"фазы {r.get('phases')}", flush=True)  #, flush=True)  # длительности приёма ('?', если ключа нет)
         rp = r.get("repair") or {}  # итог ремонта забывания или пустой словарь
         if rp.get("rounds"):  # были раунды ремонта
-            print(f"    repair: forgot {rp.get('forgot')} blocks={len(u.model.blocks)} "  # печать числа забытых блоков и числа блоков модели
+            print(f"    repair: forgot {rp.get('forgot')} worst {rp.get('worst')} blocks={len(u.model.blocks)} "  # печать числа забытых блоков и числа блоков модели
                   f"rounds={[(x['status'], round(x['ce'], 3), round(x['after'], 3) if x['after'] else None) for x in rp['rounds']]}", flush=True)  # по раундам: статус, CE с 3 знаками, CE после ремонта или None
         gr = r.get("growth") or {}  # итог роста ёмкости или пустой словарь
         if gr.get("status") in ("GROW", "ROLLBACK"):  # статус — рост или откат
             print(f"    growth: {gr.get('status')} blocks={gr.get('blocks')} "  # печать статуса и числа блоков
                   f"signal={gr.get('signal')} CE {gr.get('ce_before')}->{gr.get('ce_after')}", flush=True)  # сигнала и CE до и после
+        t_sem = time.time()  # начало семантической дистилляции (для отчёта о времени)
         chunk, chunk_bytes, files_now = [], 0, 0  # обнулить накопитель куска
         # ---- 2+3. ВЫВОД + СБОРКА: самосборка схем ----
         model = u.model  # языковая модель
