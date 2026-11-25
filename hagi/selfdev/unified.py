@@ -311,6 +311,12 @@ class Unified:
                     prm.copy_(inc)  # prm := значение из снимка
         entry["ce"] = ce  # записать CE нового домена
         entry["old_ce"] = old_ce  # записать CE на старых доменах
+        if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): волокно домена — знания вне ствола
+            from hagi.models.optimal_lm import fit_domain_fiber  # обучение волокна на замороженных активациях
+            if getattr(self, "fibers", None) is None:  # банка ещё нет
+                self.fibers = {}  # пустой банк
+            if not regression:  # домен принят
+                self.fibers[source] = fit_domain_fiber(self.model, data[: int(len(data) * 0.8)], rank=8, seed=len(self.fibers))  # волокно домена (ствол не меняется — забытие 0)
         if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): защитить активации домена в GPM
             from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
             if getattr(self.model, "gpm_left", None) is None:  # базисов ещё нет
@@ -782,6 +788,54 @@ class Unified:
         from hagi.base.trunk_ops import paired_gain  # парный выигрыш и его нижняя граница
         return ad if paired_gain(base, after)[1] > ADAPTER_MIN_GAIN else None  # адаптер, если нижняя граница > 0.005, иначе None
 
+    def _live_fiber(self, domain: str | None):
+        """Волокно домена, если оно реально снижает CE на проверочных окнах (живой гейт); иначе None.
+
+            Выигрыш d_i = CE_без − CE_с по окнам; принят, если mean(d) > 2.4·SE(d) (та же граница, что у адаптеров)."""
+        if domain is None or not hasattr(self.model, "forward_seq"):  # не причинная модель
+            return None  # нет волокон
+        fib = getattr(self, "fibers", {}).get(domain)  # волокно домена
+        if fib is None:  # не обучено
+            return None  # нет
+        d = self._domain_bytes(domain, self.domains[domain]) if domain in self.domains else b""  # байты домена
+        if len(d) < self.model.k + 64:  # мало
+            return None  # нет
+        import numpy as _np2, torch as _t2  # массивы и тензоры
+        arr = _np2.frombuffer(d, dtype=_np2.uint8).astype(_np2.int64)  # индексы
+        pos = _np2.linspace(self.model.k, len(arr) - 66, 24).astype(_np2.int64)  # 24 окна
+        m = self.model; prev = m.active_fiber  # прежнее волокно
+        with _t2.no_grad():  # без графа
+            X = _t2.as_tensor(_np2.stack([arr[i: i + m.k] for i in pos]), dtype=_t2.long)  # окна
+            y = _t2.as_tensor(_np2.stack([arr[i + 1: i + 1 + m.k] for i in pos]))  # цели
+            m.active_fiber = None; ce0 = _t2.nn.functional.cross_entropy(m.forward_seq(X).reshape(-1, 256), y.reshape(-1), reduction="none").reshape(len(pos), -1).mean(dim=1)  # CE без волокна по окнам
+            m.active_fiber = fib; ce1 = _t2.nn.functional.cross_entropy(m.forward_seq(X).reshape(-1, 256), y.reshape(-1), reduction="none").reshape(len(pos), -1).mean(dim=1)  # CE с волокном по окнам
+            m.active_fiber = prev  # вернуть
+        diff = (ce0 - ce1).double().cpu().numpy()  # выигрыш по окнам
+        se = float(diff.std() / max(1, len(diff)) ** 0.5)  # стандартная ошибка
+        return fib if float(diff.mean()) > 2.4 * se and float(diff.mean()) > 0 else None  # живой гейт
+
+    def _route_fiber(self, context: bytes):
+        """Маршрутизатор БЕЗ метки домена: волокно с наименьшей средней лог-потерей на последних 128 байтах контекста."""
+        if not hasattr(self.model, "forward_seq") or not getattr(self, "fibers", None):  # нет волокон
+            return None  # нет
+        import numpy as _np2, torch as _t2  # массивы и тензоры
+        m = self.model; hist = list(context[-128:])  # последние 128 байтов
+        if len(hist) < m.k + 8:  # мало истории
+            return None  # нет
+        arr = _np2.asarray(hist, dtype=_np2.int64)  # индексы
+        x = _t2.as_tensor(arr[:-1], dtype=_t2.long)[None]; y = _t2.as_tensor(arr[1:], dtype=_t2.long)  # вход и цели
+        best, best_l = None, float("inf")  # лучшее волокно и его потеря
+        prev = m.active_fiber  # прежнее
+        with _t2.no_grad():  # без графа
+            h = m._rms(m.forward_hidden(x), m.g_out)  # скрытое
+            base = (h @ m.emb.T) * m.out_scale + m.b_out + m.B_u[x] @ m.B_v  # логиты ствола
+            for dom, fib in self.fibers.items():  # по волокнам
+                lg = base + fib.logits_delta(h, x)  # с волокном
+                loss = float(_t2.nn.functional.cross_entropy(lg.reshape(-1, 256), y.reshape(-1)))  # средняя лог-потеря
+                if loss < best_l: best, best_l = fib, loss  # лучше
+            m.active_fiber = prev  # вернуть
+        return best  # выбранное волокно
+
     class _DomainScope:
         """Контекстный менеджер: на время нейронного вызова ставит адаптер
         домена, прошедший живой гейт (`_live_adapter`); при выходе всегда
@@ -792,9 +846,12 @@ class Unified:
             self.ad = self.u._live_adapter(self.domain)  # адаптер по живому гейту (None — тождество)
             self.prev = getattr(self.u.model, "domain_adapter", None)  # прежний адаптер модели
             self.u.model.domain_adapter = self.ad        # поставить адаптер; None при провале гейта = тождество
+            self.prev_f = getattr(self.u.model, "active_fiber", None)  # прежнее волокно
+            self.u.model.active_fiber = self.u._live_fiber(self.domain) if hasattr(self.u, "_live_fiber") else None  # волокно домена по живому гейту
             return self.ad  # вернуть адаптер как значение `as`
         def __exit__(self, *exc):  # выход (исключения игнорируются)
             self.u.model.domain_adapter = self.prev  # вернуть прежний адаптер
+            if hasattr(self, "prev_f"): self.u.model.active_fiber = self.prev_f  # вернуть прежнее волокно
             return False  # не подавлять исключения
 
     def _repair_bytes(self, sample: list[str], post_vec, pre_vec, per_domain: dict[str, int]) -> bytes:
@@ -1007,6 +1064,8 @@ class Unified:
         )
         st["arch"] = getattr(self.model, "ARCH", "rope")  # имя архитектуры (по умолчанию rope)
         st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))  # номера замороженных блоков по возрастанию
+        if getattr(self, "fibers", None):  # волокна доменов
+            st["fibers"] = {dom: {n: p_.detach().cpu() for n, p_ in fib.__dict__.items() if isinstance(p_, _t.nn.Parameter)} for dom, fib in self.fibers.items()}  # домен -> параметры волокна
         gpm = getattr(self.model, "gpm_left", None)  # базисы GPM (причинная модель)
         if gpm:  # есть
             st["gpm_left"] = {n: U.detach().cpu() for n, U in gpm.items()}  # имя параметра -> базис (столбцы)
@@ -1108,6 +1167,13 @@ class Unified:
             for n, p_ in zip(u.model.param_names(), u.model.params()):  # по именам и параметрам модели
                 if n in st:  # параметр сохранён
                     p_.copy_(st[n].to(p_.device))  # скопировать значение на устройство параметра
+        if "fibers" in st:  # восстановить волокна
+            from hagi.models.optimal_lm import CortexFiber  # класс волокна
+            u.fibers = {}  # банк
+            for dom, pars in st["fibers"].items():  # по доменам
+                fib = CortexFiber.__new__(CortexFiber)  # без конструктора
+                for n, v in pars.items(): setattr(fib, n, _t.nn.Parameter(_t.as_tensor(v)))  # параметры
+                u.fibers[dom] = fib  # добавить
         if "gpm_left" in st:  # восстановить базисы GPM
             u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()}  # имя -> базис
         # Старые состояния rope хранят выращенные блоки отдельно
@@ -1179,6 +1245,8 @@ class Unified:
         ctx_list = list(context)[-self.model.k:]  # последние k байтов от СТАРОГО к НОВОМУ, как в _windows и train_guarded (раньше был обратный порядок — модель получала перевёрнутое окно)
         x = _t.as_tensor([ctx_list], dtype=_t.long, device=dev)  # тензор формы (1, k)
         with self._DomainScope(self, prefer_domain):  # с адаптером домена, если он проходит гейт
+            routed = self._route_fiber(context) if prefer_domain is None else None  # волокно без метки домена (по потерям на контексте)
+            if routed is not None: self.model.active_fiber = routed  # поставить выбранное волокно
             b = int(self.model.logits(x)[0].argmax())  # b = argmax логитов (байт с максимальным логитом)
             used = self.model.domain_adapter is not None  # применялся ли адаптер
         return {"byte": b, "status": "NEURAL_GUESS", "adapter": used,  # нейронная догадка: байт, применялся ли адаптер ...

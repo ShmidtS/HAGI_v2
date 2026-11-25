@@ -172,6 +172,7 @@ class HagiOptimalLM:
         self.adapter_dim = dim  # ширина, к которой применяется доменный адаптер
         self.rms_eps = 1e-6  # eps RMSNorm (масштабируется при росте ширины)
         self.domain_adapter = None  # доменный адаптер (пара A, B) — не задан
+        self.active_fiber = None  # активное доменное волокно (CortexFiber) — не задано
         g = t.Generator().manual_seed(seed)  # генератор инициализации
 
         def p(shape: tuple[int, ...], sc: float = 0.05) -> t.nn.Parameter:  # параметр N(0, sc²)
@@ -223,6 +224,9 @@ class HagiOptimalLM:
             mats.extend([Wg, Wu, Wd])  # все — матрицы
         return mats, vecs  # вернуть группы
 
+    def grow(self, seed: int = 0) -> int:  # рост глубины (интерфейс Unified): блок-тождество, W_down = 0
+        return grow_depth(self, seed)  # делегировать функции модуля
+
     def full_logits(self, ctx: t.Tensor) -> t.Tensor:
         """Логиты следующего байта для каждого префикса ctx[:, :i] (B, L, 256) — ОДНИМ причинным проходом.
         Позиция i даёт предсказание байта i+1 по ctx[:, :i+1]."""
@@ -269,6 +273,8 @@ class HagiOptimalLM:
         lg = (h_last @ self.emb.T) * self.out_scale + self.b_out  # связанные эмбеддинги
         if self.use_bigram_logit_skip:  # скип
             lg = lg + self.B_u[ctx[:, -1]] @ self.B_v  # по последнему байту
+        if getattr(self, "active_fiber", None) is not None:  # волокно домена
+            lg = lg + self.active_fiber.logits_delta(h_out, ctx)[:, -1, :]  # добавка волокна на последней позиции
         return lg  # логиты
 
     def logits_with(self, ctx: t.Tensor, At: t.Tensor, Bt: t.Tensor) -> t.Tensor:  # логиты с явной парой адаптера
@@ -301,14 +307,11 @@ class HagiOptimalLM:
 
     ARCH = "optimal"  # имя архитектуры (для Unified.save/load)
 
-    def param_names(self) -> list[str]:  # имена параметров в порядке params()
-        names = [n for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)]  # собственные имена
-        mats, vecs = self.matrix_and_vec_params()  # группы
-        base = {id(p): n for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)}  # id -> имя
-        out = [base.get(id(p)) for p in mats + vecs if id(p) in base]  # сначала матрицы, потом векторы — как params()
-        for i, (Wg, Wu, Wd) in enumerate(self.blocks):  # блоки роста
-            out.extend([f"blk{i}.Wg", f"blk{i}.Wu", f"blk{i}.Wd"])  # как у HNet
-        return out  # список
+    def param_names(self) -> list[str]:  # имена параметров строго в порядке params()
+        base = {id(p): n for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)}  # id -> имя атрибута
+        mats, vecs = self.matrix_and_vec_params()  # группы (в том же порядке, что params())
+        blk_names = {id(W): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(self.blocks) for W, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))}  # блоки роста
+        return [base.get(id(p), blk_names.get(id(p))) for p in mats + vecs]  # по порядку params()
 
     def state_dict(self) -> dict[str, t.Tensor]:  # снимок весов по именам атрибутов
         return {n: p.detach().clone() for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)}  # копии
@@ -814,6 +817,9 @@ class StreamState:
             lg = (h_out @ m.emb.T) * m.out_scale + m.b_out  # логиты
             if m.use_bigram_logit_skip:  # скип
                 lg = lg + m.B_u[b] @ m.B_v  # по текущему байту
+            fib = getattr(m, "active_fiber", None)  # волокно домена
+            if fib is not None:  # задано
+                lg = lg + fib.logits_delta(h_out[None], t.as_tensor([b]))[0, 0]  # добавка волокна (h_out — (d,))
         self.n += 1  # счётчик шагов
         return lg  # логиты следующего байта
 

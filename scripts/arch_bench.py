@@ -87,7 +87,7 @@ def train_budget(m, data: bytes, budget_s: float, gpm_flag: bool = False) -> dic
             if c < best:  # лучше
                 best = c; best_state = [p.detach().clone() for p in m.params()]  # снимок
     if best_state is not None:  # восстановить лучший
-        with t.no_grad():
+        with t.no_grad():  # без графа
             for p, s_ in zip(m.params(), best_state): p.copy_(s_)  # вернуть
     return {"holdout": best, "steps": steps, "sec": time.time() - t0}  # итог
 
@@ -113,7 +113,7 @@ def main() -> None:  # точка входа
         for name, data in doms:  # последовательное обучение
             r = train_budget(m, data, a.budget, a.gpm)  # обучение
             if a.gpm and hasattr(m, "forward_seq"):  # после домена — защитить его входы
-                from hagi.models.optimal_lm import update_gpm_bases
+                from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
                 update_gpm_bases(m, data[: int(len(data) * 0.8)], m.gpm_left)  # SVD входов
             row = [oos_ce(m, d) for _, d in doms]  # CE на всех доменах
             mat.append(row); ce.append(r["holdout"])  # записать
