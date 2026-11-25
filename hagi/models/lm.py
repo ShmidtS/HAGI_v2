@@ -35,6 +35,7 @@ from __future__ import annotations  # отложенное вычисление 
 import argparse  # разбор аргументов командной строки
 import time  # замер длительности шагов обучения и контрольных замеров
 import math  # математические функции
+import os  # переменные окружения
 import json  # чтение и запись JSON
 from pathlib import Path  # пути к файлам
 from typing import Any  # тип Any для аннотаций
@@ -1854,6 +1855,13 @@ def make_lm(arch: str, dim: int | None = None, hidden: int | None = None, **kw):
     после d = 64 выигрыш на параметр резко падает; RoPE (132 тыс.) даёт 1.81.
     Переменные окружения HAGI_DIM и HAGI_HIDDEN переопределяют dim и hidden.
     Для остальных имён — RopeAttentionByteLM с dim = 128, hidden = 256."""
+    if arch == "optimal":  # причинная модель: мульти-лаги + GDN + SwiGLU, Muon/AdamW, полная последовательность
+        from hagi.models.optimal_lm import HagiOptimalLM  # класс оптимальной модели
+        from hagi.base import config  # единое место настроек
+        d, h = config.model_dims(dim, hidden)  # d, h = аргумент, иначе HAGI_DIM / HAGI_HIDDEN
+        d = d if dim is not None else int(os.environ.get("HAGI_DIM", "24"))  # по умолчанию 24 (иначе model_dims даёт 64 для hnet)
+        h = h if hidden is not None else int(os.environ.get("HAGI_HIDDEN", "48"))  # по умолчанию 48
+        return HagiOptimalLM(dim=d, hidden=h, n_heads=int(os.environ.get("HAGI_HEADS", "2")), k=int(os.environ.get("HAGI_K", "64")))  # модель
     if arch == "hnet":  # выбрана архитектура hnet
         from hagi.models.hnet_lm import HNetByteLM  # класс модели hnet
         from hagi.base import config  # единое место настроек

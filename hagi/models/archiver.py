@@ -422,7 +422,7 @@ def decompress_stream(model, payload: bytes, prefix: bytes = b"") -> bytes:
     n, k, min_count, lam_q, plen = struct.unpack(">IBBHI", payload[5:17])  # n, k, min_count, λ_q, plen из байтов 5..16
     off = 17  # смещение после заголовка off = 17
     fp, ph, th = payload[off:off + 16], payload[off + 16:off + 48], payload[off + 48:off + 64]; off += 64  # отпечаток модели (16 б), sha256 префикса ph (32 б), sha256 данных th (16 б)
-    (crc,) = struct.unpack(">I", payload[off:off + 4]); off += 4  # crc32 потока из 4 байт; off += 4
+    (crc,) = struct.unpack(">I", payload[off:off + 4]); off += 4  # контрольная сумма потока из 4 байт; off += 4
     body = payload[off:]  # тело — весь оставшийся поток
     if k != model.k:  # k не совпадает с контекстом модели
         raise ValueError("model context length mismatch")  # ошибка: длина контекста модели не совпадает
@@ -446,3 +446,60 @@ def decompress_stream(model, payload: bytes, prefix: bytes = b"") -> bytes:
     if hashlib.sha256(bytes(out)).digest()[:16] != th:  # первые 16 байт sha256 результата ≠ th
         raise ValueError("decoded bytes do not match the archive checksum")  # ошибка: раскодированные байты не совпадают с контрольной суммой
     return bytes(out)  # вернуть исходные байты
+
+
+# ---- Архиватор v2: потоковый предиктор (модель + PPM 0..4, Mirror-Hedge) + арифметический кодек ----
+MAGIC6 = b"HAGI6"  # сигнатура потокового архива с хеджем и PPM 0..4
+
+
+def compress_stream_v2(model, data: bytes, eta: float = 0.25) -> bytes:
+    """Сжать data побайтно предиктором MirrorHedgeStreamPredictor (модель на окне + онлайн PPM 0..4).
+        Без потерь: обновления предиктора зависят только от уже закодированных байтов."""
+    import hashlib  # хеширование
+    import struct  # упаковка заголовка
+    import zlib  # контрольная сумма потока
+    from hagi.models.optimal_lm import MirrorHedgeStreamPredictor  # предиктор
+    eta_q = min(65534, int(round(eta * 65535)))  # η квантованный — кодер и декодер используют одно и то же значение
+    pr = MirrorHedgeStreamPredictor(model, eta=eta_q / 65535.0)  # предиктор с квантованным η
+    enc = ArithEncoder()  # арифметический кодер
+    for s in data:  # по байтам
+        q = pr.predict_probs().astype(np.float32)  # распределение следующего байта
+        q = np.maximum(q, 1e-9); q /= q.sum()  # полный носитель
+        enc.encode_step(np.asarray([s], dtype=np.int64), q[None, :])  # закодировать
+        pr.update(s)  # обновить предиктор фактическим байтом
+    payload = enc.finish()  # битовый поток
+    head = (MAGIC6 + struct.pack(">IBH", len(data), model.k, eta_q)  # число байтов, контекст, шаг хеджа
+            + model_fingerprint(model) + hashlib.sha256(data).digest()[:16]  # отпечаток модели, sha256 данных (16 байт)
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF))  # контрольная сумма потока
+    return head + payload  # архив
+
+
+def decompress_stream_v2(model, payload: bytes) -> bytes:
+    """Раскодировать архив HAGI6 (обратно к compress_stream_v2); проверяет crc и sha256."""
+    import hashlib  # хеширование
+    import struct  # распаковка заголовка
+    import zlib  # контрольная сумма потока
+    from hagi.models.optimal_lm import MirrorHedgeStreamPredictor  # предиктор
+    if payload[: len(MAGIC6)] != MAGIC6:  # не тот формат
+        raise ValueError("not a HAGI6 archive")  # ошибка
+    n, k, eta_q = struct.unpack(">IBH", payload[5:12])  # число байтов, контекст, шаг хеджа
+    off = 12; fp, th = payload[off: off + 16], payload[off + 16: off + 32]; off += 32  # отпечаток и sha256
+    (crc,) = struct.unpack(">I", payload[off: off + 4]); off += 4  # контрольная сумма потока
+    body = payload[off:]  # тело
+    if k != model.k:  # контекст другой
+        raise ValueError("model context length mismatch")  # ошибка
+    if fp != model_fingerprint(model):  # модель другая
+        raise ValueError("model fingerprint mismatch")  # ошибка
+    if (zlib.crc32(body) & 0xFFFFFFFF) != crc:  # поток повреждён
+        raise ValueError("payload corrupt")  # ошибка
+    pr = MirrorHedgeStreamPredictor(model, eta=eta_q / 65535.0)  # предиктор с тем же η
+    dec = ArithDecoder(body)  # декодер
+    out = bytearray()  # результат
+    for _ in range(n):  # n байтов
+        q = pr.predict_probs().astype(np.float32)  # распределение
+        q = np.maximum(q, 1e-9); q /= q.sum()  # полный носитель
+        s = int(dec.decode_step(q[None, :])[0])  # раскодировать байт
+        out.append(s); pr.update(s)  # добавить и обновить (та же история, что у кодера)
+    if hashlib.sha256(bytes(out)).digest()[:16] != th:  # контрольная сумма не сошлась
+        raise ValueError("decoded bytes do not match the archive checksum")  # ошибка
+    return bytes(out)  # исходные байты
