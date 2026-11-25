@@ -211,3 +211,10 @@ def test_model_files_round_trip_through_their_format_signatures(tmp_path):
         path.write_text(json.dumps(data), encoding="utf-8")  # записать
         with pytest.raises(ValueError):  # обязана быть ошибка
             loader(str(path))  # чужой файл отвергается
+
+
+def test_config_root_is_project_root() -> None:  # корень проекта — каталог с pyproject.toml
+    from hagi.base import config  # единое место настроек
+    from hagi.base import util  # каталог чекпойнтов строится от корня
+    assert (config.ROOT / "pyproject.toml").exists(), config.ROOT  # корень там, где pyproject.toml
+    assert util.CKPT_DIR.parent == config.ROOT and util.CKPT_DIR.name == "checkpoints"  # чекпойнты — <корень>/checkpoints (после группировки base/ путь считался на уровень выше — цикл писал в hagi/checkpoints)

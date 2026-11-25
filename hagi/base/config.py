@@ -24,7 +24,7 @@ from __future__ import annotations  # аннотации типов не выч�
 import os  # чтение переменных окружения
 from pathlib import Path  # пути к файлам
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта: каталог, в котором лежит пакет hagi
+ROOT = Path(__file__).resolve().parents[2]  # корень проекта: hagi/base/config.py → на три уровня вверх (после группировки base/ файл лежит глубже; родитель родителя давал hagi/ вместо корня)
 
 TOKEN_BITS = 6  # число битов на один токен выражения в префиксном коде (общий формат кодера и сертификатов)
 
