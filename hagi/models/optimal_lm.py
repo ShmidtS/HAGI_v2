@@ -60,6 +60,15 @@ def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta:
 
 
 def muon_orth(G: t.Tensor, iters: int = 5) -> t.Tensor:
+    """Ортогонализация полярным множителем: polar_express (3 квинтических шага, JointCost T2b) — быстрее NS5 в 1.3–1.7×
+        и держит σ_max ≤ 1.02; при недоступности — классический NS."""
+    from hagi.base.trunk_ops import polar_express  # трёхшаговый полярный приближатор
+    R = t.as_tensor(polar_express(G.detach().double().cpu().numpy()), dtype=G.dtype, device=G.device)  # полярный множитель
+    return R  # вернуть
+
+
+def _muon_ns(G: t.Tensor, iters: int = 5) -> t.Tensor:
+    """Классический Muon NS (запасной)."""
     """Классический Muon NS: X ← aX + b(XXᵀ)X + c(XXᵀ)²X. Возвращает G·(GᵀG)^{−1/2}."""
     a, b, c = 3.4445, -4.7750, 2.0315  # коэффициенты
     X = G.float()  # рабочая копия
@@ -134,7 +143,7 @@ class HybridMuonAdamW:
             for idx, p in enumerate(self.vecs):  # векторы и таблицы
                 if p.grad is None:  # нет градиента
                     continue  # пропустить
-                Ul, Ur = self.gpm_left.get(id(p)), self.gpm_right.get(id(p))  # подпространства
+                Ul, Ur = self.gpm_left.get(self.names.get(id(p), id(p))), self.gpm_right.get(self.names.get(id(p), id(p)))  # подпространства (по имени — те же ключи, что у базисов)
                 g = self._proj_out(p.grad.float(), Ul, Ur)  # проекция градиента
                 if self.wd > 0 and p.ndim >= 2 and Ul is None and Ur is None:  # затухание только для незащищённых таблиц
                     p.mul_(1.0 - lr_a * self.wd)  # обычное затухание
@@ -161,6 +170,7 @@ class HagiOptimalLM:
         self.seed, self.device = seed, "cpu"  # зерно и устройство
         self.t = t  # модуль torch (Unified._windows берёт torch из модели)
         self.adapter_dim = dim  # ширина, к которой применяется доменный адаптер
+        self.rms_eps = 1e-6  # eps RMSNorm (масштабируется при росте ширины)
         self.domain_adapter = None  # доменный адаптер (пара A, B) — не задан
         g = t.Generator().manual_seed(seed)  # генератор инициализации
 
@@ -312,6 +322,9 @@ class HagiOptimalLM:
         m, v = self.matrix_and_vec_params()  # группы
         return m + v  # одним списком
 
+    def _rms(self, x: t.Tensor, g: t.Tensor) -> t.Tensor:  # RMSNorm с eps модели
+        return rms_norm(x, g, getattr(self, "rms_eps", 1e-6))  # нормировка
+
     def forward_hidden(self, x_seq: t.Tensor, capture: dict[int, t.Tensor] | None = None) -> t.Tensor:  # скрытое состояние (B, T, d); capture — входы матриц (для GPM)
         B, T = x_seq.shape  # размеры
         d, H = self.dim, self.n_heads  # ширина и головы
@@ -322,10 +335,13 @@ class HagiOptimalLM:
         x0 = rms_norm(E + acc @ self.W_loc, self.g_loc)  # локальный признак
         x_m1 = t.cat([t.zeros((B, 1), dtype=t.long), x_seq[:, : T - 1]], dim=1)  # предыдущий байт (0 на позиции 0)
         bi_idx = ((x_m1 * 131) ^ x_seq) % 256  # хэш пары байтов
+        if capture is not None: capture[id(self.W_bi)] = self.E_bi[bi_idx].detach().reshape(-1, self.E_bi.shape[1])  # вход W_bi — вложения пары байтов
         h = x0 + self.E_bi[bi_idx] @ self.W_bi  # добавить биграммный признак
         h_in = causal_lags(h, self.w_sc, (0, 1, 2))  # короткая 3-tap свёртка
         if capture is not None:  # входы Q/K/V уровня 1 — один h_in
             for W in (self.W_gq, self.W_gk, self.W_gv): capture[id(W)] = h_in.detach().reshape(-1, d)  # записать
+        if capture is not None:  # вентили уровня 1 — тот же h_in
+            for W in (self.W_alpha, self.W_beta): capture[id(W)] = h_in.detach().reshape(-1, d)  # записать
 
         def qkv(W: t.Tensor, x: t.Tensor) -> t.Tensor:  # проекция в головы (B, H, T, hd)
             return (x @ W).reshape(B, T, H, hd).permute(0, 2, 1, 3)  # переставить оси
@@ -341,6 +357,7 @@ class HagiOptimalLM:
         h = h + y1 @ self.W_go  # остаточное соединение
         if self.use_hier_gdn:  # уровень 2
             h_prev = t.cat([t.zeros((B, 1, d)), h[:, : T - 1]], dim=1)  # предыдущее скрытое
+            if capture is not None: capture[id(self.w_bnd)] = t.cat([h, h_prev], dim=-1).detach().reshape(-1, 2 * d)  # вход гейта границ
             p_bnd = t.sigmoid(t.cat([h, h_prev], dim=-1) @ self.w_bnd + self.b_bnd)  # вероятность границы (B, T, 1)
             Q2 = t.nn.functional.normalize(qkv(self.W_hq, h), dim=-1)  # запросы уровня 2
             K2 = t.nn.functional.normalize(qkv(self.W_hk, h), dim=-1)  # ключи
@@ -358,9 +375,17 @@ class HagiOptimalLM:
         hn = rms_norm(h, self.g_mlp)  # перед MLP
         if capture is not None:  # входы W_gate и W_up
             for W in (self.W_gate, self.W_up): capture[id(W)] = hn.detach().reshape(-1, d)  # записать
-        h = h + swiglu(hn, self.W_gate, self.W_up, self.W_down)  # основной блок
+        g_pre = hn @ self.W_gate  # вентиль
+        mid = (g_pre * t.sigmoid(g_pre)) * (hn @ self.W_up)  # произведение внутри SwiGLU — вход W_down
+        h = h + mid @ self.W_down  # основной блок
+        if capture is not None: capture[id(self.W_down)] = mid.detach().reshape(-1, mid.shape[-1])  # вход W_down
         for Wg, Wu, Wd in self.blocks:  # дополнительные блоки (zero-init W_down ⇒ тождество)
-            h = h + swiglu(rms_norm(h, self.g_mlp), Wg, Wu, Wd)  # добавить
+            hnb = rms_norm(h, self.g_mlp)  # нормированный остаток
+            if capture is not None:  # входы блока
+                for W in (Wg, Wu): capture[id(W)] = hnb.detach().reshape(-1, d)  # записать
+            g_pre = hnb @ Wg; mid_b = (g_pre * t.sigmoid(g_pre)) * (hnb @ Wu)  # SwiGLU внутри блока
+            h = h + mid_b @ Wd  # добавить
+            if capture is not None: capture[id(Wd)] = mid_b.detach().reshape(-1, mid_b.shape[-1])  # вход Wd
         return h  # форма: пакет, время, ширина
 
     def forward_seq(self, x_seq: t.Tensor) -> t.Tensor:  # логиты по всем позициям (B, T, 256)
@@ -388,6 +413,7 @@ class HagiOptimalLM:
         if gpm:  # заданы
             opt.gpm_left.update(gpm)  # градиент, шаг и затухание не заходят в защищённое подпространство
         opt.names.update({id(p): n for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)})  # имена для ключей GPM
+        opt.names.update({id(p): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(self.blocks) for p, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))})  # блоки роста
         rng = np.random.default_rng(seed)  # выборка окон
         v_starts = np.arange(0, max(1, len(va_arr) - seq_len - 1), seq_len)[: min(32, max(1, len(va_arr) // seq_len))]  # старты контрольных окон
         vx = t.as_tensor(np.stack([va_arr[s: s + seq_len] for s in v_starts]), dtype=t.long)  # входы
@@ -475,6 +501,8 @@ def grow_width(model: "HagiOptimalLM", delta: int = 8) -> int:
         if model.active_adapter is not None:  # адаптер — нулями вниз
             A, B_adp, s_ = model.active_adapter; model.active_adapter = (e2(A, d1, A.shape[1]), B_adp, s_)  # расширить
         model.dim = d1  # новая ширина
+        model.adapter_dim = d1  # адаптеры применяются к новой ширине
+        model.rms_eps = getattr(model, "rms_eps", 1e-6) * (d0 / d1)  # eps нормировки масштабируется как d0/d1 (точное равенство при малых активациях)
     return d1  # вернуть
 
 
@@ -500,6 +528,7 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[int, t.
     with t.no_grad():  # без графа
         model.forward_hidden(bx, capture=acts)  # собрать
     names = {id(p): n for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # id -> имя
+    names.update({id(p): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(getattr(model, "blocks", [])) for p, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))})  # блоки роста
     for k, A in acts.items():  # по матрицам
         k = names.get(k, k)  # ключ — имя параметра
         X = A.double().cpu().numpy(); d_in = X.shape[1]  # активации (N·T, d_in)
@@ -670,9 +699,9 @@ def quant_per_row(W: np.ndarray, bits: int = 2, use_had: bool = True, rotate_row
     for i in range(r):  # по строкам
         row = R[i]  # строка
         if bits == 2:  # триты
-            ma = float(np.mean(np.abs(row))); thr = 0.7 * ma; pos = np.abs(row) > thr  # порог
-            sc = float(np.mean(np.abs(row[pos]))) if np.any(pos) else max(ma, 1e-6)  # шкала
-            Q[i] = np.where(row > thr, 1, np.where(row < -thr, -1, 0)).astype(np.int8)  # уровни
+            from hagi.models.quantized import _best_mse_scale  # точный масштаб по минимальной MSE
+            sc, levels, _err = _best_mse_scale(row)  # масштаб, уровни {−1,0,1}, ошибка
+            Q[i] = levels.astype(np.int8)  # уровни
         else:  # 4 бита
             m = float(np.max(np.abs(row))) or 1e-6; sc = m / 7.5  # шкала
             Q[i] = np.clip(np.round(row / sc), -7, 8).astype(np.int8)  # уровни
@@ -833,7 +862,7 @@ def certified_step(model, logits_fn, params: list[t.Tensor], X: t.Tensor, y: t.T
     pr = t.softmax(logits_fn(X), dim=-1)  # вероятности (B, V)
     r = pr - t.nn.functional.one_hot(y, pr.shape[-1]).to(pr.dtype)  # остаток (B, V)
     a_b = (r * JD).sum(dim=-1)  # dirAction по образцам: ⟨r_b, JD_b⟩, (B,)
-    R_b = 2.0 * JD.abs().sum(dim=-1)  # dirRange по образцам: 2·Σ_v |JD_bv|, (B,)
+    R_b = JD.max(dim=-1).values - JD.min(dim=-1).values  # dirLogitRange по образцам: sup_v JD − inf_v JD (острый диапазон; при V = 256 в ~72 раза меньше 2·Σ|JD|), (B,)
     a_sum = float(a_b.sum()); R2_sum = float((R_b ** 2).sum())  # Σ_b a_b и Σ_b R_b² (мажоризатор — сумма по пакету)
     if R2_sum <= 0.0 or a_sum >= 0.0:  # направление не уменьшает CE (сумма dirAction ≥ 0) или смещения нет
         return none  # шага нет
@@ -878,7 +907,7 @@ def derived_lipschitz(model, logits_fn, params: list[t.Tensor], X: t.Tensor, y: 
         pr = t.softmax(logits_fn(X), dim=-1)  # вероятности
         r = pr - t.nn.functional.one_hot(y, pr.shape[-1]).to(pr.dtype)  # остаток
         a_b = (r * JD).sum(dim=-1)  # dirAction по образцам
-        R_b = 2.0 * JD.abs().sum(dim=-1)  # dirRange по образцам
+    R_b = JD.max(dim=-1).values - JD.min(dim=-1).values  # dirLogitRange по образцам: sup_v JD − inf_v JD (острый диапазон), (B,)
     a_sum = float(a_b.sum()); R2_sum = float((R_b ** 2).sum())  # суммы по пакету
     if R2_sum <= 0.0 or a_sum >= 0.0:  # направления нет
         return {"L": float("inf"), "gamma": 0.0, "eta": 0.0, "drop": 0.0}  # шага нет

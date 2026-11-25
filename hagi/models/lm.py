@@ -921,12 +921,12 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
         for i, blk in enumerate(getattr(self, "blocks", [])):  # по дополнительным блокам
             if i in getattr(self, "frozen_blocks", ()):   # блок заморожен — не обучать
                 continue  # пропустить блок
-            live_params += [blk["W1"], blk["b1"], blk["Wo"]]  # добавить параметры блока
+            live_params += [v for v in (blk.values() if isinstance(blk, dict) else blk) if isinstance(v, t.Tensor) and not (hasattr(self, "params") and any(v is q for q in base))]  # добавить параметры блока (W1/b1/Wo у Rope; Wg/Wu/Wd у HNet — они уже в params(), дубль исключён)
         # дополнительные блоки обучаются вместе с основными параметрами (q по-прежнему исключён)
         for i, blk in enumerate(getattr(self, "blocks", [])):  # по дополнительным блокам (второй раз: параметры попадают в список повторно)
             if i in getattr(self, "frozen_blocks", ()):   # блок заморожен — не обучать
                 continue  # пропустить блок
-            live_params += [blk["W1"], blk["b1"], blk["Wo"]]  # добавить параметры блока
+            live_params += [v for v in (blk.values() if isinstance(blk, dict) else blk) if isinstance(v, t.Tensor) and not (hasattr(self, "params") and any(v is q for q in base))]  # добавить параметры блока (W1/b1/Wo у Rope; Wg/Wu/Wd у HNet — они уже в params(), дубль исключён)
         if derived_lr:  # шаг выводится из теории: γ* = 1/L, L — локальная липшицева константа градиента из мажоризатора
             from hagi.models.optimal_lm import derived_lipschitz  # вывод L по первому пакету
             probe = min(batch, len(train))  # размер пробного пакета
