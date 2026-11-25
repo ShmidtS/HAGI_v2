@@ -311,6 +311,12 @@ class Unified:
                     prm.copy_(inc)  # prm := значение из снимка
         entry["ce"] = ce  # записать CE нового домена
         entry["old_ce"] = old_ce  # записать CE на старых доменах
+        if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): защитить активации домена в GPM
+            from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
+            if getattr(self.model, "gpm_left", None) is None:  # базисов ещё нет
+                self.model.gpm_left = {}  # пустой словарь
+            if not regression:  # домен принят — его входы защищаются при следующих приёмах
+                update_gpm_bases(self.model, data, self.model.gpm_left)  # SVD входов матриц, 90% энергии
         entry["regression"] = bool(regression)  # записать флаг регрессии
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")  # записать время обучения
         if growth.get("status") == "GROW":  # вырос новый блок
@@ -1000,6 +1006,9 @@ class Unified:
         )
         st["arch"] = getattr(self.model, "ARCH", "rope")  # имя архитектуры (по умолчанию rope)
         st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))  # номера замороженных блоков по возрастанию
+        gpm = getattr(self.model, "gpm_left", None)  # базисы GPM (причинная модель)
+        if gpm:  # есть
+            st["gpm_left"] = {n: U.detach().cpu() for n, U in gpm.items()}  # имя параметра -> базис (столбцы)
         # Сохранить геометрию внимания (theta0/lam): без них load() молча
         # вернёт значения по умолчанию, и обученный профиль свежести
         # изменится после перезапуска.
@@ -1098,6 +1107,8 @@ class Unified:
             for n, p_ in zip(u.model.param_names(), u.model.params()):  # по именам и параметрам модели
                 if n in st:  # параметр сохранён
                     p_.copy_(st[n].to(p_.device))  # скопировать значение на устройство параметра
+        if "gpm_left" in st:  # восстановить базисы GPM
+            u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()}  # имя -> базис
         # Старые состояния rope хранят выращенные блоки отдельно
         for blk in st.get("blocks", []) or []:  # по сохранённым блокам (по умолчанию пусто)
             u.model.grow()  # добавить блок-тождество
@@ -1164,7 +1175,7 @@ class Unified:
             return {"byte": None, "status": "HOLD",  # без ответа: byte = None, HOLD ...
                     "source": "no-law", "certified": False}  # ... источник no-law, не заверено
         dev = self.model.device  # устройство модели
-        ctx_list = list(context)[-self.model.k:][::-1]  # последние k байтов в обратном порядке
+        ctx_list = list(context)[-self.model.k:]  # последние k байтов от СТАРОГО к НОВОМУ, как в _windows и train_guarded (раньше был обратный порядок — модель получала перевёрнутое окно)
         x = _t.as_tensor([ctx_list], dtype=_t.long, device=dev)  # тензор формы (1, k)
         with self._DomainScope(self, prefer_domain):  # с адаптером домена, если он проходит гейт
             b = int(self.model.logits(x)[0].argmax())  # b = argmax логитов (байт с максимальным логитом)
