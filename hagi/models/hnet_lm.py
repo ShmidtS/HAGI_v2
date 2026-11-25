@@ -231,8 +231,8 @@ class HNetByteLM:
         V = (C_n @ self.W_v).reshape(B, M, nh, hd)  # значение V = C_n·W_v, форма (B, M, nh, hd)
         Qr = self._rot(Q, self.cos_m[:, -1:], self.sin_m[:, -1:])  # запрос поворачивается на угол ПОСЛЕДНЕЙ позиции: cos_m[:, −1:], sin_m[:, −1:]
         Kr = self._rot(K, self.cos_m, self.sin_m)  # ключи поворачиваются на углы своих позиций m
-        sc = t.einsum("bmhd,bnhd->bhm", K, Qr) / math.sqrt(hd) + self.alibi      # формула:  (B,nh,M)
-        # оценка sc[b, h, m] = Σ_{j} K[b, m, h, j]·Qr[b, h, j] / sqrt(hd) + alibi[m]
+        sc = t.einsum("bmhd,bnhd->bhm", Kr, Qr) / math.sqrt(hd) + self.alibi     # формула:  (B,nh,M); ключ — повёрнутый Kr, иначе RoPE применялся только к запросу
+        # оценка sc[b, h, m] = Σ_{j} Kr[b, m, h, j]·Qr[b, h, j] / sqrt(hd) + alibi[m]: обе стороны повёрнуты, поэтому оценка зависит от разности позиций
         w = t.softmax(sc, dim=-1)  # w = softmax по m: w_m = exp(sc_m − max sc) / Σ_n exp(sc_n − max sc)
         attn = t.einsum("bhm,bmhd->bhd", w, V).reshape(B, d)  # attn[b, h, :] = Σ_m w[b, h, m]·V[b, m, h, :], затем (B, nh·hd) = (B, d)
         h1 = x0 + attn @ self.W_o  # остаток h1 = x0 + attn·W_o
