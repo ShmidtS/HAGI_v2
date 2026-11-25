@@ -49,6 +49,8 @@ def main() -> None:
     u = unified.Unified.load() if unified.Unified.exists() \
         else unified.Unified()  # ...иначе новая
     st = load_state()  # состояние просмотра диска
+    TEXT_ONLY = __import__("os").environ.get("HAGI_TEXT_ONLY", "0") == "1"  # текстовая диета: HAGI_TEXT_ONLY=1 — только печатные файлы без дублей
+    seen_contents = set((CKPT_DIR / "seen_contents.txt").read_text(encoding="utf-8").split(chr(10))) if (CKPT_DIR / "seen_contents.txt").exists() else set()  # хеши уже принятых текстов
     seen = st["seen"]  # словарь уже обработанных хешей путей
     chunk, chunk_bytes = [], 0  # выборки текущего куска и число его байтов
     files_now = 0  # число файлов текущего куска
@@ -74,6 +76,16 @@ def main() -> None:
             if h in seen:  # путь уже обработан
                 continue  # следующий файл
             data = sample_bytes(path, size)  # выборка байтов файла или None
+            if TEXT_ONLY and data is not None:  # текстовая диета: только печатное, без дублей
+                pr = sum(32 <= c < 127 or c in (9, 10, 13) or c >= 192 for c in data[:65536]) / max(1, min(len(data), 65536))  # доля печатных байтов в голове
+                if pr < 0.9:  # не текст
+                    seen[h] = "nontext"  # пометить: пропущен как нетекстовый
+                    continue  # следующий файл
+                dh = __import__("hashlib").sha1(data).hexdigest()[:16]  # хеш содержимого выборки
+                if dh in seen_contents:  # такой текст уже был
+                    seen[h] = "dup"  # пометить дубль
+                    continue  # следующий файл
+                seen_contents.add(dh)  # запомнить содержимое
             if data is None:  # файл прочитать не удалось
                 seen[h] = "locked"  # пометить путь как заблокированный
                 continue  # следующий файл
@@ -320,6 +332,8 @@ def main() -> None:
         # ---- сохранить состояние одной модели ----
         u.save()  # сохранить модель и книгу доменов
         save_state(st)  # сохранить состояние просмотра
+        if TEXT_ONLY:  # текстовая диета — сохранить хеши принятых текстов
+            (CKPT_DIR / "seen_contents.txt").write_text(chr(10).join(sorted(seen_contents)), encoding="utf-8")  # по одному хешу на строку
         it += 1  # итераций: +1
     print(f"cycle done: iterations={it} chunks={st['chunks']} "  # печать числа итераций и кусков
           f"ingested={st['bytes_ingested']/1e6:.0f}MB", flush=True)  # ...и принятых мегабайтов
