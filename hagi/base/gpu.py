@@ -23,7 +23,6 @@ GPU-путь совпадает с numpy по структуре, но не по
 (SVD-укрепление базиса) и GpuGpmMixin (примесь-ускоритель для ContinualGPMMemory)."""
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-import os  # чтение переменной окружения HAGI_NEURAL_DEVICE
 from typing import Any  # тип для аннотаций
 
 import numpy as np  # генератор случайных массивов для сравнения устройств
@@ -49,7 +48,8 @@ def resolve_device() -> str:
     global _DEVICE  # изменяется общая переменная модуля
     if _DEVICE is not None:  # устройство уже выбрано
         return _DEVICE  # вернуть запомненное значение
-    mode = os.environ.get("HAGI_NEURAL_DEVICE", "auto").lower()  # режим: значение переменной в нижнем регистре (по умолчанию "auto")
+    from hagi.base import config  # единое место настроек
+    mode = config.neural_device_mode()  # режим: HAGI_NEURAL_DEVICE в нижнем регистре (по умолчанию "auto")
     if mode == "cpu":  # явно задан процессор
         _DEVICE = "cpu"  # выбрать cpu
         return _DEVICE  # вернуть "cpu"

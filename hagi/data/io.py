@@ -1,7 +1,7 @@
 """Ввод и вывод данных: учиться на произвольных файлах и исполнять написанные моделью программы.
 
     Две половины файла.
-    1) УЧЁБА НА ДАННЫХ. Любой файл превращается в список точных задач hagi.TaskSpec
+    1) УЧЁБА НА ДАННЫХ. Любой файл превращается в список точных задач TaskSpec
        (функция учителя f: x -> y, заданная таблицей наблюдённых пар):
          * CSV/TSV/TAB: колонка — список целых чисел (нецелые ячейки пропускаются);
            для каждой упорядоченной пары разных колонок (X, Y) задача «X -> Y»;
@@ -27,9 +27,8 @@ import argparse  # разбор аргументов командной стро
 import csv  # чтение таблиц CSV/TSV
 import json  # чтение и запись JSON
 from pathlib import Path  # работа с путями файлов
-from typing import Any, Callable  # аннотации типов
-from hagi import *  # имена пакета hagi (TaskSpec, GrowingHagiProcessor) в пространстве имён модуля
-import hagi  # сам пакет hagi (обращение hagi.TaskSpec и т. п.)
+from typing import Any  # аннотации типов
+from hagi.core import GrowingHagiProcessor, TaskSpec  # ядро: процессор и описание задачи
 def _int_or_none(v: str) -> int | None:  # целое число из текста ячейки или None, если это не целое
     try:  # пробуем превратить текст в число
         return int(v.strip())  # убрать крайние пробелы и превратить в int
@@ -74,7 +73,7 @@ def _json_numbers(obj: Any) -> list[int]:  # все целые числа дер
                 walk(v)  # обойти каждый
     walk(obj)  # обход всего дерева
     return out  # список целых чисел
-def _pair_tasks(xs: list[int], ys: list[int], name: str) -> list[hagi.TaskSpec]:  # задача f(x) = y по парам (xs[i], ys[i]); [] , если функция неоднозначна или пар мало
+def _pair_tasks(xs: list[int], ys: list[int], name: str) -> list[TaskSpec]:  # задача f(x) = y по парам (xs[i], ys[i]); [] , если функция неоднозначна или пар мало
     """Тест на точную функцию: каждому x должен соответствовать только один y."""
     mapping: dict[int, int] = {}  # таблица учителя x -> y
     for x, y in zip(xs, ys):  # по парам (x, y)
@@ -90,9 +89,9 @@ def _pair_tasks(xs: list[int], ys: list[int], name: str) -> list[hagi.TaskSpec]:
         if v is None:  # x вне наблюдённых данных
             raise ValueError('outside ingested domain')  # ошибка: вне загруженной области
         return v  # табличный ответ
-    return [hagi.TaskSpec(name, 1, (dom,), teacher, family='ingest')]  # одна задача: арность 1, область dom, семейство ingest
-def tasks_from_numeric_file(path: Path, max_tasks: int=16) -> list[hagi.TaskSpec]:  # не более max_tasks числовых задач из файла
-    tasks: list[hagi.TaskSpec] = []  # накопитель задач
+    return [TaskSpec(name, 1, (dom,), teacher, family='ingest')]  # одна задача: арность 1, область dom, семейство ingest
+def tasks_from_numeric_file(path: Path, max_tasks: int=16) -> list[TaskSpec]:  # не более max_tasks числовых задач из файла
+    tasks: list[TaskSpec] = []  # накопитель задач
     if path.suffix.lower() == '.json':  # файл JSON
         nums = _json_numbers(json.loads(path.read_text(encoding='utf-8', errors='replace')))  # все целые числа файла
         if len(nums) >= 8:  # чисел достаточно
@@ -106,7 +105,7 @@ def tasks_from_numeric_file(path: Path, max_tasks: int=16) -> list[hagi.TaskSpec
                     continue  # пропустить
                 tasks += _pair_tasks(cols[names[i]], cols[names[j]], f'INGEST_{path.stem}_{names[i]}_to_{names[j]}')  # задача X -> Y; [] , если неоднозначно
     return tasks  # список задач
-def tasks_from_text_file(path: Path) -> list[hagi.TaskSpec]:  # задача «следующий байт» из файла
+def tasks_from_text_file(path: Path) -> list[TaskSpec]:  # задача «следующий байт» из файла
     data = path.read_bytes()  # сырые байты файла
     nxt: dict[int, int] = {}  # кандидат таблицы: байт a -> следующий за ним байт b
     conflict: set[int] = set()  # байты, за которыми встречались разные байты
@@ -126,8 +125,8 @@ def tasks_from_text_file(path: Path) -> list[hagi.TaskSpec]:  # задача «�
         if v is None:  # x вне определённого подмножества
             raise ValueError('outside deterministic subset')  # ошибка: вне однозначной части
         return v  # следующий байт
-    return [hagi.TaskSpec(f'INGEST_{path.stem}_nextbyte', 1, (dom,), teacher, family='ingest')]  # одна задача арности 1 с областью dom
-def ingest_file(path: Path) -> list[hagi.TaskSpec]:  # все задачи, извлекаемые из одного файла
+    return [TaskSpec(f'INGEST_{path.stem}_nextbyte', 1, (dom,), teacher, family='ingest')]  # одна задача арности 1 с областью dom
+def ingest_file(path: Path) -> list[TaskSpec]:  # все задачи, извлекаемые из одного файла
     if path.suffix.lower() == '.json':  # файл JSON
         return tasks_from_numeric_file(path)  # только числовые пары
     if path.suffix.lower() in ('.csv', '.tsv', '.tab'):  # табличный файл
@@ -136,7 +135,7 @@ def ingest_file(path: Path) -> list[hagi.TaskSpec]:  # все задачи, из
     numeric = tasks_from_numeric_file(path)  # и попытка прочитать его как таблицу
     return tasks + numeric  # объединение обоих списков
 def learn_from_data(paths: list[Path], budget: int=200000) -> dict[str, Any]:  # выучить задачи всех файлов; budget — бюджет узлов процессора
-    proc = hagi.GrowingHagiProcessor(node_budget=budget)  # процессор с заданным бюджетом узлов
+    proc = GrowingHagiProcessor(node_budget=budget)  # процессор с заданным бюджетом узлов
     report: dict[str, Any] = {'files': [], 'tasks': 0, 'committed': 0}  # отчёт: список файлов, число задач, число закреплённых
     for path in paths:  # по файлам
         try:  # извлечение может упасть на битом файле
@@ -175,10 +174,8 @@ def ingest_main() -> None:  # командная строка: выучить т
 # ИСПОЛНЕНИЕ: запуск написанных программ
 # ==============================================================================
 
-import argparse  # разбор аргументов командной строки (повторный импорт ничего не меняет)
 import importlib.util  # загрузка модуля Python из файла по пути
-from pathlib import Path  # работа с путями файлов (повторный импорт)
-from hagi.util import CKPT_DIR as _CKPT  # каталог чекпойнтов
+from hagi.base.util import CKPT_DIR as _CKPT  # каталог чекпойнтов
 DEFAULT_PROGRAMS = _CKPT / 'self' / 'generated_programs.py'  # файл с программами, которые написала модель
 _mod = None  # загруженный модуль программ (пока не загружен)
 _load_path: Path | None = None  # путь, из которого загружен модуль

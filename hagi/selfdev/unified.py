@@ -36,11 +36,10 @@ import numpy as np  # численные массивы
 from pathlib import Path  # пути к файлам
 from typing import Any  # тип значений словаря доменов
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта: каталог на два уровня выше этого файла
-# Каталог контрольных точек CKPT_DIR объявлен в hagi.util (единый источник):
+# Каталог контрольных точек CKPT_DIR объявлен в hagi.base.util (единый источник):
 # каждый модуль пишет контрольные точки только через него; HAGI_CKPT_DIR
 # перенаправляет все записи.
-from hagi.util import CKPT_DIR  # каталог контрольных точек
+from hagi.base.util import CKPT_DIR  # каталог контрольных точек
 # Раньше пути к файлам были константами модуля, вычисленными при импорте.
 # Тесты подменяют CKPT_DIR (и эксперименты переопределяют его), но
 # save()/load()/exists() продолжали писать в рабочие файлы — так вызов u.save()
@@ -78,16 +77,17 @@ def _sha(b: bytes) -> str:
 
 
 ADAPTER_MIN_GAIN = 0.005  # минимальный парный выигрыш адаптера: нижняя граница выигрыша должна превысить 0.005
+ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока роста: нат CE на единицу доли параметров (λ_M в правиле приёма; калибровка: полезный блок ≈ 0.57 ната при доле 0.30 → цена 0.30, слабый блок 0.1 ната отклоняется)
 
 class Unified:
     """ЕДИНАЯ развивающаяся модель: тело, книга доменов и банк адаптеров."""
     # HAGI_ARCH=hnet выбирает HNetByteLM (измерено: CE по целым файлам 1.54 против
     # 1.81 у Rope на 4 реальных файлах, параметров в 4.7 раза меньше). По
     # умолчанию остаётся rope: полный цикл на hnet ещё не пройден.
-    ARCH = os.environ.get("HAGI_ARCH", "rope")  # архитектура тела: HAGI_ARCH из окружения, иначе "rope"
+    ARCH = os.environ.get("HAGI_ARCH", "rope")  # архитектура тела: HAGI_ARCH из окружения, иначе "rope" (читается при импорте — атрибут класса)
 
     def __init__(self, k: int = 16, dim: int = 128, hidden: int = 256):  # создать модель: контекст k, ширина dim, скрытый слой hidden
-        from hagi import lm as lm_mod  # модуль языковой модели
+        from hagi.models import lm as lm_mod  # модуль языковой модели
 
         self.lm_mod = lm_mod  # запомнить модуль для load() и позднейших вызовов
         self.k, self.dim, self.hidden = k, dim, hidden  # запомнить k, dim, hidden
@@ -211,13 +211,20 @@ class Unified:
         t0 = time.perf_counter()  # начало замера времени
         import torch as _t  # библиотека torch (тензорные вычисления)        # Рост ёмкости ДО снимка текущих весов: выросший блок входит в обе
         # стороны парного гейта.
+        _ph = {}  # длительности фаз приёма, с (рост, замеры CE до, обучение, адаптеры, замеры CE после, ремонт)
+        _tp = time.perf_counter()  # начало фазы роста
         growth = self._maybe_grow(source, data)  # итог роста: словарь со статусом
         incumbent_state = [q.detach().clone()  # снимок текущих весов модели
                            for q in self.model.params()]  # по каждому параметру q
         # CE текущей модели на старых доменах обязана быть измерена ДО любого
         # обновления весов: иначе обе стороны гейта видели одну и ту же
         # обученную модель, и забывание было принципиально ненаблюдаемо.
+        _ph["grow"] = round(time.perf_counter() - _tp, 1)  # длительность фазы роста, с
+        _tp = time.perf_counter()  # начало замеров CE до обучения
         old_ce_pre_early = self._old_domains_ce(exclude=source)  # CE на старых доменах до обучения
+        old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
+        _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
+        _tp = time.perf_counter()  # начало обучения
         reps = []  # итоги повторов обучения
         for rep_i in range(max(1, repeat)):  # по повторам, минимум 1
             reps.append(  # добавить итог повтора
@@ -230,6 +237,8 @@ class Unified:
         # В применении находятся веса ПОСЛЕДНЕГО повтора — журналируется CE именно
         # его, а не минимум по повторам (минимум мог принадлежать другой модели,
         # не той, что сохранена). selection_ce остаётся для справки.
+        _ph["train"] = round(time.perf_counter() - _tp, 1)  # длительность обучения (все повторы), с
+        _tp = time.perf_counter()  # начало фазы адаптеров
         ce = reps[-1].get("best_holdout_ce", 99)  # CE последнего повтора на отложенных данных (99, если ключа нет)
         selection_ce = min(r.get("best_holdout_ce", 99)  # минимальная CE по повторам (справочно)
                            for r in reps)  # по каждому итогу r
@@ -238,7 +247,7 @@ class Unified:
         # Адаптеры включены ВСЕГДА (все функции по умолчанию; свежий адаптер —
         # тождество, путь не меняется).
         if True:  # блок выполняется всегда: адаптеры включены по умолчанию
-            from hagi.trunk_ops import AdapterBank  # банк доменных адаптеров
+            from hagi.base.trunk_ops import AdapterBank  # банк доменных адаптеров
             bank = getattr(self, "adapter_bank", None)  # банк адаптеров или None
             if bank is None:  # банка ещё нет
                 bank = self.adapter_bank = AdapterBank(  # создать и запомнить банк
@@ -256,7 +265,7 @@ class Unified:
                          and e.get("ce") <= 0.5]  # ... где CE <= 0.5
                 if cands:  # есть подходящий домен
                     best_src = min(cands, key=lambda kv: kv[1])[0]  # имя домена с наименьшей CE
-                    from hagi.trunk_ops import adapter_warm_start  # копирование весов адаптера
+                    from hagi.base.trunk_ops import adapter_warm_start  # копирование весов адаптера
                     adapter_warm_start(bank.get(best_src), ad)  # A, B := копия A, B адаптера лучшего домена (при совпадении форм)
             self.model.domain_adapter = None  # снять текущий адаптер с модели
             # Адаптер УСЛОВЕН, а не автоматичен. Ранги 1/2/4 обучаются от
@@ -280,12 +289,14 @@ class Unified:
         old_ce = old_ce_pre  # текущее значение old_ce (до измерения после)
         # CE после обучения измеряется ВСЕГДА: прежняя заглушка `> 0` делала гейт
         # зависящим только от порядка обучения.
+        _ph["adapters"] = round(time.perf_counter() - _tp, 1)  # длительность фазы адаптеров, с
+        _tp = time.perf_counter()  # начало ремонта забывания
         old_ce_post = self._old_domains_ce(exclude=source)  # CE на старых доменах после обучения
         regression = bool(  # регрессия есть, если ...
             old_ce_pre is not None and old_ce_post is not None  # ... обе CE измерены ...
             and old_ce_post > old_ce_pre * 1.25  # ... и CE_после > 1.25·CE_до
         )  # результат приведён к bool
-        repair = self._repair_forgetting(source, old_ce_pre, incumbent_state)  # ремонт забывания переучиванием старых байт
+        repair = self._repair_forgetting(source, old_ce_pre, incumbent_state, old_vec_pre)  # ремонт забывания переучиванием старых байт (со скаляром и вектором CE до обучения)
         if repair["rounds"]:  # были раунды ремонта
             old_ce_post = self._old_domains_ce(exclude=source)  # CE на старых доменах после ремонта
             regression = bool(  # регрессия пересчитывается по тому же правилу
@@ -318,6 +329,8 @@ class Unified:
             "growth": growth,  # итог роста ёмкости
             "repair": repair,  # итог ремонта забывания
             "regression": entry.get("regression", False),  # была ли регрессия
+            "phases": {**_ph, "repair": round(time.perf_counter() - _tp, 1)},  # длительности фаз приёма, с (рост, замеры до, обучение, адаптеры, ремонт)
+            "train_steps": {k: v for k, v in reps[-1].items() if k.startswith("sec_")},  # время шагов обучения и замеров CE внутри train_guarded, с
             "seconds": round(time.perf_counter() - t0, 1),  # длительность: round(t_конца − t0, 1)
         }
 
@@ -385,10 +398,10 @@ class Unified:
             ADAPTER_MIN_GAIN и его CE меньше, чем у лучшего из принятых.
             Возвращает словарь: status (GROW/HOLD), baseline_ce, attempts; при GROW
             ещё rank и ce."""
-        from hagi.trunk_ops import LowRankAdapter, paired_gain  # адаптер низкого ранга и парный выигрыш
+        from hagi.base.trunk_ops import LowRankAdapter, paired_gain  # адаптер низкого ранга и парный выигрыш
         bank = getattr(self, "adapter_bank", None)  # банк адаптеров или None
         if bank is None:  # банка ещё нет
-            from hagi.trunk_ops import AdapterBank  # банк доменных адаптеров
+            from hagi.base.trunk_ops import AdapterBank  # банк доменных адаптеров
             bank = self.adapter_bank = AdapterBank(d=self.model.hidden, r=2)  # создать и запомнить банк шириной hidden, ранг 2
         d = self._domain_bytes(source, self.domains[source])  # байты домена
         k = self.model.k  # длина контекста
@@ -457,11 +470,12 @@ class Unified:
     FORGET_TOL = 0.0  # допуск забывания: 0, то есть любое ухудшение CE старых доменов считается забыванием
     # Раунд принимается, когда парный выигрыш больше границы эмпирического Бернштейна.
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
+    WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
     REPAIR_BYTES = 400_000  # не более 400 000 байтов старых доменов на раунд
 
-    def _repair_forgetting(self, exclude: str, pre, incumbent_state) -> dict:
+    def _repair_forgetting(self, exclude: str, pre, incumbent_state, pre_vec=None) -> dict:
         """Переучить старые домена после роста, пока забывание не исчезнет.
 
             exclude: домен, только что проглоченный (его не меряем);
@@ -480,8 +494,15 @@ class Unified:
         names = [n for n in self.domains if n != exclude]  # имена всех доменов, кроме нового
         if pre is None or not names:  # нет базы для сравнения или нет старых доменов
             return {"rounds": [], "why": "no_old"}  # пустой результат: старого нет
+        # Домены для переучивания — ТЕ ЖЕ, что мерит парный гейт (иначе ремонт
+        # учил одни домены, а гейт смотрел другие). Байты между ними делятся
+        # по формуле оптимального распределения: n_i = sqrt(c_i) · N / Σ_j sqrt(c_j),
+        # где c_i — прирост CE домена i после роста (чем сильнее забыт, тем больше
+        # байтов ремонта); при отсутствии вектора — поровну.
         rng = _np.random.default_rng(23)  # свой генератор случайных чисел, зерно 23
-        sample = list(rng.choice(names, min(8, len(names)), replace=False))  # до 8 различных старых доменов
+        probe_names, probe_post = self._old_domains_ce_vec(exclude)  # домены и вектор CE после роста (те же окна, что у гейта)
+        sample = list(probe_names) if probe_names else list(names[:8])  # домены ремонта
+        per_domain = {n: len(self._domain_bytes(n, self.domains[n])) for n in sample if n in self.domains}  # длины доменов
         sets = []  # обучающие окна: список пар (X, y) по доменам
         for name in sample:  # по выбранным доменам
             d = self._domain_bytes(name, self.domains[name])  # байты домена
@@ -500,22 +521,32 @@ class Unified:
             # блоками +3.48, блоки роста +2.07. Блоки переобучаются на 8 выбранных
             # доменах и старую память не несут. Переучивание — обычный шаг
             # обучения на старых байтах с откатом, если парный гейт не улучшился.
+            def worst_drift(vec):  # забывание наихудшего домена: max_i (mean(post_i) − mean(pre_i))
+                b = getattr(self, "_vec_bounds", None)  # срезы окон доменов
+                if b is None or pre_vec is None or len(b) != len(self._vec_names) + 1:  # срезов нет
+                    return None  # не вычисляется
+                return max(float(vec[int(b[i]):int(b[i + 1])].mean() - pre_vec[int(b[i]):int(b[i + 1])].mean())  # прирост CE домена i
+                           for i in range(len(self._vec_names)) if int(b[i + 1]) > int(b[i]))  # максимум по доменам
+            worst = None  # забывание наихудшего домена (None — раундов не было либо срезов нет)
             for _ in range(self.REPAIR_ROUNDS):  # не более REPAIR_ROUNDS раундов
-                if post <= pre + self.FORGET_TOL:  # забывание уже не больше допуска: post <= pre + 0
+                worst = worst_drift(post_vec)  # забывание наихудшего домена
+                # Стоп — только когда и среднее, и наихудший домен в допуске: выравнивание
+                # ошибок по доменам (водонапорнение), а не по среднему — среднее может
+                # уйти в минус, пока один домен остаётся забытым
+                if post <= pre + self.FORGET_TOL and (worst is None or worst <= self.WORST_TOL):  # post <= pre + 0 и worst <= WORST_TOL
                     break  # стоп
                 snap = [q.detach().clone() for q in m.params()]  # снимок всех параметров для отката
-                old_bytes = b"".join(self._domain_bytes(n, self.domains[n])  # байты выбранных старых доменов ...
-                                     for n in sample if n in self.domains)[: self.REPAIR_BYTES]  # ... слитые подряд, срез [0:400000]
+                old_bytes = self._repair_bytes(sample, probe_post, pre_vec, per_domain)  # байты ремонта: доля каждого домена ∝ sqrt(прироста его CE), всего <= REPAIR_BYTES
                 if len(old_bytes) < m.k + 64:  # старых байтов слишком мало
                     break  # стоп
                 m.train_certified(old_bytes, epochs=2, holdout_seed=99,  # обучить ствол: 2 эпохи, зерно отложенной выборки 99 ...
-                                    lr=self.REPAIR_LR)  # ... скорость обучения REPAIR_LR
+                                    lr=self.REPAIR_LR, batch=64)  # ... скорость обучения REPAIR_LR; пакет 64 — ремонт мерился с этим пакетом, меняется отдельно
                 new_vec = self._old_domains_ce_vec(exclude)[1]  # CE по окнам после раунда (на тех же окнах)
                 new = None if new_vec is None else float(new_vec.mean())  # средняя CE после раунда
                 # Раунд принимается, только если парный выигрыш больше границы
                 # эмпирического Бернштейна. n_states = число уже сделанных
                 # раундов + текущий.
-                from hagi.trunk_ops import paired_margin_eb  # граница односторонней проверки парного выигрыша
+                from hagi.base.trunk_ops import paired_margin_eb  # граница односторонней проверки парного выигрыша
                 margin = (paired_margin_eb(post_vec - new_vec, n_states=len(rounds) + 1)  # margin = eps для d = post − new (> 0 = лучше): eps = √(2·sig2·L/n) + 2·b·L/n, L = ln(2·n_states/0.05) ...
                           if (new_vec is not None and post_vec is not None) else float("inf"))  # ... либо +inf, если вектора нет (раунд отклоняется)
                 gain = None if new is None else post - new  # выигрыш: post − new (> 0 — CE на старых упала)
@@ -531,7 +562,8 @@ class Unified:
                                "margin": round(margin, 4), "status": "RETRAIN"})  # ... граница с 4 знаками, статус RETRAIN
                 post, post_vec = new, new_vec  # новое состояние становится текущим: post = new
             return {"rounds": rounds, "mode": "replay", "why": "ran" if rounds else "none",  # итог: раунды, режим replay, "ran", если был хоть один раунд ...
-                    "forgot": None if post is None else round(post - pre, 4)}  # ... забывание post − pre с 4 знаками
+                    "forgot": None if post is None else round(post - pre, 4),  # ... забывание post − pre с 4 знаками
+                    "worst": None if worst is None else round(worst, 4)}  # ... забывание наихудшего домена после последнего раунда (нат); None — срезов по доменам нет
         why = ("no_post" if post is None else  # причина: нет замера после роста ...
                "cap" if len(getattr(m, "blocks", [])) >= self.MAX_BLOCKS else  # ... лимит блоков исчерпан: blocks >= MAX_BLOCKS ...
                "none" if post <= pre + self.FORGET_TOL else "ran")  # ... забывания нет (post <= pre + FORGET_TOL), иначе "ran"
@@ -637,6 +669,7 @@ class Unified:
         if signal <= c_add:  # сигнала мало: signal <= c_add
             return {"status": "HOLD", "signal": round(signal, 1), "c_add": round(c_add, 1)}  # без роста, сигнал и порог с 1 знаком
         n_before = len(m.blocks)  # число блоков до роста
+        n_before_params = sum(q.numel() for q in m.params())  # число параметров до роста (для доли нового блока)
         m.grow(seed=n_before + 1)  # добавить блок-тождество, зерно = n_before + 1
         blk = m.blocks[-1]  # свежий блок
         cut = int(n * 0.9)  # граница обучения: cut = ⌊0.9·n⌋, правее — отложенная выборка
@@ -689,17 +722,25 @@ class Unified:
         # по n_states состояниям блока, оценённых на этой же выборке (отбор
         # лучшего из K = объединение гипотез). Замер на 6 свежих доменах:
         # выигрыш 0.50..2.11 против границы 0.29..0.62 (k=512), 0.12..0.26 (k=2048).
-        from hagi.trunk_ops import paired_margin_eb  # граница односторонней проверки парного выигрыша
+        from hagi.base.trunk_ops import paired_margin_eb  # граница односторонней проверки парного выигрыша
         diff = base_before - hold_vec()                # d_i = CE_до_i − CE_после_i; d > 0 — блок помогает
         gain = float(diff.mean())  # выигрыш: gain = mean_i d_i
         margin = paired_margin_eb(diff, n_states=n_eval)  # граница: margin = √(2·sig2·L/n) + 2·b·L/n, L = ln(2·n_eval/0.05), b = max|d|
-        if not (gain > margin):  # блок не выиграл
+        # Правило приёма с ценой памяти: принять блок, только если
+        #   gain − margin − λ_M · mem > 0,   mem = numel(блока) / Σ numel(модели),
+        # т. е. измеренный выигрыш должен перекрыть и статистическую границу,
+        # и цену хранения блока (нат CE на единицу доли параметров).
+        n_now = sum(q.numel() for q in m.params())  # число параметров модели с блоком
+        blk_numel = n_now - n_before_params  # число параметров нового блока
+        mem = blk_numel / max(1, n_now)  # доля параметров блока: mem = numel(блок) / Σ numel
+        mem_cost = ADMIT_MEM_COST * mem  # цена памяти в натах: λ_M · mem
+        if not (gain > margin + mem_cost):  # блок не перекрыл границу и цену памяти
             m.blocks.pop()                    # не заработан — точный откат
             return {"status": "HOLD_UNCERTAIN", "ce_before": before, "ce_after": after,  # HOLD_UNCERTAIN: CE до и после ...
-                    "gain": round(gain, 4), "margin": round(margin, 4)}  # ... выигрыш и граница с 4 знаками
+                    "gain": round(gain, 4), "margin": round(margin, 4), "mem_cost": round(mem_cost, 4)}  # ... выигрыш, граница и цена памяти с 4 знаками
         return {"status": "GROW", "blocks": len(m.blocks), "signal": round(signal, 1),  # GROW: число блоков, сигнал с 1 знаком ...
                 "ce_before": round(before, 4), "ce_after": round(after, 4),  # ... CE до/после с 4 знаками ...
-                "gain": round(gain, 4), "margin": round(margin, 4),  # ... выигрыш и граница с 4 знаками ...
+                "gain": round(gain, 4), "margin": round(margin, 4), "mem_cost": round(mem_cost, 4),  # ... выигрыш, граница и цена памяти с 4 знаками ...
                 "params": sum(q.numel() for q in m.params())}  # ... и число параметров
 
     def _live_adapter(self, domain: str | None):
@@ -731,7 +772,7 @@ class Unified:
             base = _t.nn.functional.cross_entropy(  # базовая CE по окнам ...
                 self.model.logits(X), y, reduction="none").cpu().numpy()  # перекрёстная энтропия по строкам: ... CE_i = −log softmax(logit(X_i))[y_i]
         after = self._adapter_val_ce(ad, X, y)  # CE по окнам с адаптером
-        from hagi.trunk_ops import paired_gain  # парный выигрыш и его нижняя граница
+        from hagi.base.trunk_ops import paired_gain  # парный выигрыш и его нижняя граница
         return ad if paired_gain(base, after)[1] > ADAPTER_MIN_GAIN else None  # адаптер, если нижняя граница > 0.005, иначе None
 
     class _DomainScope:
@@ -748,6 +789,50 @@ class Unified:
         def __exit__(self, *exc):  # выход (исключения игнорируются)
             self.u.model.domain_adapter = self.prev  # вернуть прежний адаптер
             return False  # не подавлять исключения
+
+    def _repair_bytes(self, sample: list[str], post_vec, pre_vec, per_domain: dict[str, int]) -> bytes:
+        """Байты старых доменов для одного раунда ремонта, распределённые по стоимости забывания.
+
+        Формула оптимального распределения (минимум Σ c_i / n_i при Σ n_i = N):
+          n_i = sqrt(c_i) · N / Σ_j sqrt(c_j),  c_i = max(mean(post_i) − mean(pre_i), ε),
+        где post_i / pre_i — CE по окнам домена i после и до роста, ε — малый
+        порог, чтобы не забытые домена тоже получали немного байтов. Окна
+        домена берутся равномерно по его длине; из каждого домена — не больше,
+        чем у него есть. Без векторов — поровну."""
+        import numpy as _np  # локальный импорт numpy
+        m = self.model  # модель (нужна длина контекста k)
+        total = self.REPAIR_BYTES  # N — бюджет байтов раунда
+        lengths = [per_domain.get(n, 0) for n in sample]  # длины доменов
+        usable = [max(0, L - m.k - 64) for L in lengths]  # пригодные байты каждого (короче k+64 — не берём)
+        if post_vec is None or pre_vec is None or len(post_vec) != len(pre_vec):  # векторов нет — поровну
+            share = [1.0] * len(sample)  # равные веса
+        else:  # векторы есть
+            real_bounds = getattr(self, "_vec_bounds", None)  # границы, записанные последним замером вектора
+            bounds = _np.asarray(real_bounds) if (real_bounds is not None and len(real_bounds) == len(sample) + 1) else _np.cumsum([0] + [min(256, max(0, u)) for u in usable])  # реальные границы доменов в векторе (или оценка до 256 окон)
+            costs = []  # c_i по доменам
+            for i in range(len(sample)):  # по доменам
+                a, b = int(bounds[i]), int(bounds[i + 1])  # срез окон домена i
+                c = float(post_vec[a:b].mean() - pre_vec[a:b].mean()) if b > a else 0.0  # прирост CE: mean(post) − mean(pre)
+                costs.append(max(c, 1e-3))  # порог ε = 1e-3: не забытые тоже получают байты
+            share = _np.sqrt(costs)  # веса ∝ sqrt(c_i)
+        share = _np.asarray(share, dtype=float)  # вектор весов
+        quotas = (share / share.sum() * total).astype(int) if share.sum() > 0 else _np.zeros(len(sample), dtype=int)  # квоты байтов: n_i = sqrt(c_i)·N / Σ_j sqrt(c_j)
+        rng = _np.random.default_rng(23)  # генератор, зерно 23
+        out = []  # куски байтов
+        for n, q, u in zip(sample, quotas, usable):  # по доменам
+            if q <= 0 or u <= 0 or n not in self.domains:  # квота пуста или домен непригоден
+                continue  # пропустить
+            d = self._domain_bytes(n, self.domains[n])  # байты домена
+            if q >= u:  # квота покрывает весь домен
+                out.append(d)  # взять целиком
+                continue  # дальше
+            win = m.k + 64  # длина одного куска: контекст + 64 байта ответов
+            n_win = max(1, q // win)  # число кусков
+            last = max(1, len(d) - win)  # последняя возможная позиция начала куска
+            step = max(win, last // max(1, n_win - 1)) if n_win > 1 else 0  # шаг начал: равномерно по длине
+            starts = _np.arange(0, last, step)[:n_win] if step else _np.array([rng.integers(0, last)])  # начала кусков
+            out += [d[int(i):int(i) + win] for i in starts]  # куски байтов
+        return b"".join(out)[:total]  # склеить и обрезать до бюджета N
 
     def _old_domains_ce_vec(self, exclude: str, max_domains: int = 8):
         """CE по окнам на ФИКСИРОВАННЫХ окнах старых доменов (вектор).
@@ -776,6 +861,8 @@ class Unified:
             sample += list(rng.choice(rest, k_, replace=False))  # добавить k_ случайных необученных
         t = self.model.t  # torch: ссылка на библиотеку
         vec = []  # векторы CE по доменам
+        self._vec_bounds = [0]  # границы доменов в склеенном векторе: [0, n_1, n_1+n_2, ...]
+        self._vec_names = []  # имена доменов, реально вошедших в вектор
         with t.no_grad():  # без градиентов
             for name in sample:  # по выбранным доменам
                 d = self._domain_bytes(name, self.domains[name])  # байты домена
@@ -793,9 +880,11 @@ class Unified:
                     self.model.logits(t.as_tensor(X, dtype=t.long, device=dev)),  # ... логиты окна X ...
                     t.as_tensor(y, dtype=t.long, device=dev), reduction="none")  # ... против y, без усреднения: CE_i = −log softmax(logit(X_i))[y_i]
                 vec.append(ce.double().cpu().numpy())  # добавить вектор float64
+                self._vec_bounds.append(self._vec_bounds[-1] + len(ce))  # граница после этого домена
+                self._vec_names.append(name)  # имя вошедшего домена
         if not vec:  # ни одного домена не замерено
             return None, None  # пустой результат
-        return sample, np.concatenate(vec)  # имена доменов и склейка векторов
+        return list(self._vec_names), np.concatenate(vec)  # имена доменов (реально вошедших) и склейка векторов
 
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
@@ -865,7 +954,7 @@ class Unified:
     def memory(self):
         """Синглтон SemanticMemory (SQLite + FTS5 + архив gemma)."""
         from hagi.memory_store import SemanticMemory  # импорт класса памяти
-        import hagi.util as _u  # утилиты с путём CKPT_DIR
+        import hagi.base.util as _u  # утилиты с путём CKPT_DIR
         if getattr(self, "_mem", None) is None:  # память ещё не создана
             self._mem = SemanticMemory(str(_u.CKPT_DIR / "memory.db"))  # создать её в файле memory.db
         return self._mem  # вернуть синглтон
@@ -964,7 +1053,7 @@ class Unified:
     @classmethod  # метод класса
     def load(cls) -> "Unified":  # загрузить Unified из файла модели
         import torch as _t  # локальный импорт torch
-        from hagi import lm as lm_mod  # модуль создания моделей
+        from hagi.models import lm as lm_mod  # модуль создания моделей
 
         u = cls.__new__(cls)  # создать объект без вызова __init__
         u.lm_mod = lm_mod  # запомнить модуль моделей
@@ -973,7 +1062,7 @@ class Unified:
         u.model = lm_mod.make_lm(st.get("arch", "rope"), u.dim, u.hidden,  # создать модель архитектуры st["arch"] (по умолчанию rope) ...
                                  theta0=st.get("theta0", 1.0), lam=st.get("lam", 0.05))  # ... с theta0 (по умолчанию 1.0) и lam (по умолчанию 0.05)
         if "adapter_bank" in st:  # в состоянии есть адаптеры
-            from hagi.trunk_ops import AdapterBank  # класс банка адаптеров
+            from hagi.base.trunk_ops import AdapterBank  # класс банка адаптеров
             bank = u.adapter_bank = AdapterBank(  # создать банк ранга 2 размерности ...
                 d=getattr(u.model, "adapter_dim", u.model.hidden), r=2)  # ... adapter_dim (если есть) иначе hidden
             for dom, ab in st["adapter_bank"].items():  # по доменам и их весам
@@ -983,8 +1072,8 @@ class Unified:
                 ad.B = _t.as_tensor(ab["B"])  # веса B
         if "law_registry" in st:  # в состоянии есть реестр законов
             import numpy as _np  # локальный импорт numpy
-            from hagi.invention_multi import _affine_k  # сборка аффинной функции по (коэффициенты, смещение)
-            from hagi.invention import ConstructBlueprint  # класс чертежа конструкции
+            from hagi.invent.invention_multi import _affine_k  # сборка аффинной функции по (коэффициенты, смещение)
+            from hagi.invent.invention import ConstructBlueprint  # класс чертежа конструкции
             u.law_registry = {}  # пустой реестр
             for dom, laws in st["law_registry"].items():  # по доменам и спискам записей
                 entries = []  # восстановленные записи домена

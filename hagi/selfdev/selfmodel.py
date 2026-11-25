@@ -19,7 +19,7 @@ from dataclasses import dataclass, field  # dataclass, field — класс-за
 from typing import Any, Callable, Mapping, Optional, Sequence  # типы для аннотаций
 import torch  # библиотека torch — тензоры и оптимизаторы
 
-import hagi  # базовый класс GrowingHagiProcessor из корня пакета (без цикла импорта)
+from hagi.core import GrowingHagiProcessor, exact_piecewise_poly_fit, make_task_suite, propose_noncircular_task, synthesize_batched_mdl  # ядро: процессор, набор задач, предложение задач, точная полиномиальная аппроксимация, МДЛ-синтез
 @dataclass  # StepResult оформляется как класс данных (поля — аргументы конструктора)
 class StepResult:  # результат шага: действие, причина и измеренные величины
     action: str  # действие: 'COMMIT' (принять) или 'HOLD' (откатить)
@@ -268,7 +268,6 @@ import argparse  # модуль argparse — разбор аргументов �
 import json  # модуль json — чтение и запись JSON
 import sys  # модуль sys — интерпретатор и стандартные потоки
 import time  # модуль time — измерение времени
-from pathlib import Path  # класс Path для путей
 from typing import Any, Callable  # типы для аннотаций
 import numpy as np  # numpy — средние значения
 Policy = Callable[..., int]  # политика бюджета: функция, возвращающая целое число — бюджет узлов
@@ -298,11 +297,11 @@ def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int=8, budge
     rnd = np.random.default_rng(20260101 + seed)  # генератор случайных чисел с зерном 20260101 + seed
     seen: set = set()  # множество уже предложенных задач
     t0 = time.perf_counter()  # начало отсчёта времени
-    for sp in hagi.make_task_suite():  # по задачам базового набора
+    for sp in make_task_suite():  # по задачам базового набора
         m.learn(sp, seed=10000, train_neural=False)  # выучить задачу с зерном 10000 без нейронного обучения
     for r in range(n_proposal_rounds):  # по раундам предложений r
         for k in range(budget_per_round):  # по номеру предложения k в раунде
-            prop = hagi.propose_noncircular_task(m.experts, rnd, r, seen)  # предложить новую некруговую задачу на текущей библиотеке экспертов
+            prop = propose_noncircular_task(m.experts, rnd, r, seen)  # предложить новую некруговую задачу на текущей библиотеке экспертов
             if prop is None:  # если предложений нет
                 continue  # перейти к следующему
             sp, _ = prop  # разобрать пару (задача, прочее), второй элемент не нужен
@@ -372,10 +371,10 @@ def run_experiment(seeds: int=5, policy_names: list[str] | None=None, seed_start
     tracer = TracedProcessorV9(node_budget=2000)  # процессор со следом для разминки библиотеки
     rnd = np.random.default_rng(20260101)  # генератор с зерном 20260101
     seen: set = set()  # множество предложенных задач
-    for sp in hagi.make_task_suite():  # по базовому набору
+    for sp in make_task_suite():  # по базовому набору
         tracer.learn(sp, seed=10000, train_neural=False)  # выучить с зерном 10000 без нейронного обучения
     for k in range(10):  # 10 предложений
-        prop = hagi.propose_noncircular_task(tracer.experts, rnd, 0, seen)  # предложить некруговую задачу
+        prop = propose_noncircular_task(tracer.experts, rnd, 0, seen)  # предложить некруговую задачу
         if prop is None:  # если предложений нет
             continue  # перейти к следующему
         sp, _ = prop  # взять задачу из пары
@@ -386,7 +385,7 @@ def run_experiment(seeds: int=5, policy_names: list[str] | None=None, seed_start
     reasons = Counter((e['reason'] for e in tracer.growth_log))  # число причин COMMIT/HOLD по журналу роста: Counter(e["reason"])
     cert = impossibility_certificate(tracer.trace)  # сертификат невозможности точного предсказателя успеха на текущих признаках
     report['derived_algorithm'] = {'pipeline': ['REUSE(certified-library-coverage)', 'boolvenn-exact(16 masks)', 'anf-zhegalkin-butterfly(+full-support)', 'direct-template(+full-support)', 'exact-rational-poly(1D/ND,+full-support)', 'exact-piecewise-poly(+full-support)', 'batched-mdl-mitm-dag(+full-support)', 'HOLD(rollback+audit)'], 'commit_reason_counts': dict(reasons), 'success_feature_impossibility_certificate': cert, 'note': "success of the exhaustive synthesis stage is a function of the task's full teacher data, not of coarse features; the experiment therefore trials MEASURED policies instead of claiming a symbolic predictor"}  # описание выведенного алгоритма: стадии конвейера, счётчики причин, сертификат и оговорка
-    suite_names = frozenset((s.name for s in hagi.make_task_suite()))  # имена задач базового набора (не используется далее)
+    suite_names = frozenset((s.name for s in make_task_suite()))  # имена задач базового набора (не используется далее)
     trials: dict[str, list[dict[str, Any]]] = {p: [] for p in selected_policies}  # прогоны по политикам: имя -> список результатов
     for seed in range(seed_start, seed_start + seeds):  # по зернам от seed_start до seed_start + seeds − 1
         for pname, policy in selected_policies.items():  # по выбранным политикам
@@ -417,14 +416,9 @@ def run_experiment(seeds: int=5, policy_names: list[str] | None=None, seed_start
 # ЖУРНАЛ САМОПРАВОК С ГЕЙТОМ
 # ============================================================
 
-import json  # модуль json
 import subprocess  # модуль subprocess — запуск pytest
-import sys  # модуль sys — путь к интерпретатору
-import time  # модуль time
-from pathlib import Path  # класс Path
 from typing import Any  # тип Any
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта: каталог на два уровня выше этого файла
-from hagi.util import CKPT_DIR as _CKPT  # импорт каталога контрольных точек CKPT_DIR под именем _CKPT
+from hagi.base.util import CKPT_DIR as _CKPT  # импорт каталога контрольных точек CKPT_DIR под именем _CKPT
 EDIT_LOG = _CKPT / 'self' / 'self_edits.json'  # путь к журналу самоправок: подкаталог 'self', файл self_edits.json
 BASELINE_PATH = _CKPT / 'self' / 'edit_baseline.json'  # путь к кэшу эталонного замера: подкаталог 'self', файл edit_baseline.json
 KNOBS = {'floor_ladder': [[200, 50, 20], [200, 100, 50], [300, 100, 30], [200, 50, 20, 10]], 'batch_size': [8, 12, 16], 'proposals': [8, 10, 12]}  # допустимые значения параметров: 4 варианта лестницы нижних порогов, размер пакета [8, 12, 16], число предложений [8, 10, 12]
@@ -440,7 +434,7 @@ def run_benchmark(rounds: int=2, workers: int=8) -> dict[str, Any]:
 
     rounds: число раундов; workers: число исполнителей. Возвращает словарь: число
     принятых раундов, число экспертов и затраченные секунды."""
-    from hagi import loop as sl  # импорт цикла саморазвития под именем sl
+    from hagi.selfdev import loop as sl  # импорт цикла саморазвития под именем sl
     t0 = time.time()  # начало отсчёта времени
     rep = sl.run_self_development(max_rounds=rounds, workers=workers, proposals_per_round=6)  # запуск саморазвития: max_rounds = rounds, workers, по 6 предложений в раунде
     fin = rep['final']  # итоговая часть отчёта
@@ -452,7 +446,7 @@ def _gate_tests() -> bool:
 def current_settings() -> dict[str, Any]:
     """Текущие значения параметров цикла: значения по умолчанию из сигнатуры,
     перекрытые принятыми гейтом настройками (с ними работает рабочий цикл)."""
-    from hagi import loop as sl  # импорт цикла саморазвития под именем sl
+    from hagi.selfdev import loop as sl  # импорт цикла саморазвития под именем sl
     import inspect  # импорт модуля inspect для чтения сигнатуры
     sig = inspect.signature(sl.run_self_development)  # сигнатура функции run_self_development
     defaults = {k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty}  # значения по умолчанию параметров, у которых они есть
@@ -537,7 +531,7 @@ def self_edit_cycle(seed: int=0, dry: bool=False) -> dict[str, Any]:
     if dry:  # если пробный режим без прогона
         proposal['decision'] = 'dry'  # решение 'dry'
         return proposal  # вернуть предложение
-    from hagi import loop as sl  # импорт цикла саморазвития под именем sl
+    from hagi.selfdev import loop as sl  # импорт цикла саморазвития под именем sl
     kwargs = {}  # именованные аргументы прогона
     if patch['knob'] == 'batch_size':  # если параметр 'batch_size'
         kwargs['batch_size'] = patch['value']  # аргумент 'batch_size' = значение правки
@@ -564,13 +558,7 @@ def self_edit_cycle(seed: int=0, dry: bool=False) -> dict[str, Any]:
 # МОДЕЛЬ САМОГО СЕБЯ: СЛЕД -> ВЫВОД -> ОПТИМИЗАЦИЯ -> ГЕЙТ
 # ============================================================
 
-import argparse  # модуль argparse — разбор аргументов командной строки
-import json  # модуль json
-import sys  # модуль sys
-import time  # модуль time
-from pathlib import Path  # класс Path
 from typing import Any, Optional  # типы для аннотаций
-import numpy as np  # numpy — генератор и средние
 FAMILY_IDS = {'BoolVenn': 0, 'unary': 1, 'integer-binary': 2, 'composed-ternary': 3, 'auto-composed': 4, 'auto-bool3': 5}  # коды семейств задач: 0 BoolVenn, 1 unary, 2 integer-binary, 3 composed-ternary, 4 auto-composed, 5 auto-bool3
 FEATURE_KEYS = ('family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv')  # имена признаков задачи в следе: семейство, арность, размер области, размер библиотеки, размах меток, число разных меток, самовариативность
 def _self_inverse_flag(spec, seed: int = 13,  # признак самовариативности цели (f∘f = id) по обучающей выборке унарных входов
@@ -623,7 +611,7 @@ def _target_features(spec, seed: int, train_fraction: float) -> tuple[int, int]:
         n_train = max(1, min(len(domain) - 1, int(round(len(domain) * train_fraction))))  # иначе n_train = max(1, min(N − 1, round(N·train_fraction)))
     ys = [int(spec.teacher(*domain[int(i)])) for i in perm[:n_train]]  # метки y первых n_train входов перестановки по учителю
     return (max(ys) - min(ys), len(set(ys))) if ys else (0, 0)  # вернуть (max(y) − min(y), число разных y), если метки есть, иначе (0, 0)
-class TracedProcessorV9(hagi.GrowingHagiProcessor):  # процессор роста со следом своего обучения (описание ниже, после атрибутов)
+class TracedProcessorV9(GrowingHagiProcessor):  # процессор роста со следом своего обучения (описание ниже, после атрибутов)
     stream_names: list = None  # имена потоков (заполняется наследником)
     stream_actions: list = None  # действия потоков (заполняется наследником)
     """Процессор, ведущий след своего обучения: для каждого вызова learn запоминает
@@ -664,20 +652,20 @@ def derive_self_model(trace: list[dict[str, Any]]) -> dict[str, Any]:
     а также сами выражения _succ_expr и _cost_expr (None, если не найдены)."""
     rows = [tuple((t[k] for k in FEATURE_KEYS)) for t in trace]  # строки признаков: по кортежу FEATURE_KEYS на запись следа
     ys = [t['success'] for t in trace]  # метки успеха y по записям следа
-    succ_expr = hagi.exact_piecewise_poly_fit(rows, ys)  # точная кусочно-полиномиальная аппроксимация признаки -> успех
+    succ_expr = exact_piecewise_poly_fit(rows, ys)  # точная кусочно-полиномиальная аппроксимация признаки -> успех
     succ_prog = None  # программа успеха пока не найдена (переменная не используется далее)
     if succ_expr is not None:  # если аппроксимация найдена
         ok = all((int(succ_expr.eval(r)) == y for r, y in zip(rows, ys)))  # проверка точности: int(f(r)) = y на всех строках следа
         if not ok:  # если хоть одна строка не совпала
             succ_expr = None  # отбросить аппроксимацию
     if succ_expr is None:  # если точной аппроксимации нет
-        expr, _n = hagi.synthesize_batched_mdl(len(FEATURE_KEYS), rows, ys, rows, ys, max_evals=20000, max_bits=64)  # синтез программы по MDL на всём следе: выражение и число вычислений
+        expr, _n = synthesize_batched_mdl(len(FEATURE_KEYS), rows, ys, rows, ys, max_evals=20000, max_bits=64)  # синтез программы по MDL на всём следе: выражение и число вычислений
         if expr is not None and all((int(expr.eval(r, {})) == y for r, y in zip(rows, ys))):  # если выражение найдено и точно на всём следе
             succ_expr = expr  # взять его как программу успеха
     costs = [t['cost'] for t in trace]  # стоимости по записям следа
     cost_expr = None  # программа стоимости пока не найдена
     if len(set(costs)) > 1:  # если стоимости не все одинаковы
-        ce, _n = hagi.synthesize_batched_mdl(len(FEATURE_KEYS), rows, costs, rows, costs, max_evals=20000, max_bits=64)  # синтез программы по MDL: признаки -> стоимость
+        ce, _n = synthesize_batched_mdl(len(FEATURE_KEYS), rows, costs, rows, costs, max_evals=20000, max_bits=64)  # синтез программы по MDL: признаки -> стоимость
         if ce is not None and all((int(ce.eval(r, {})) == c for r, c in zip(rows, costs))):  # если выражение найдено и точно на всём следе
             cost_expr = ce  # взять его как программу стоимости
     model_desc = {'n_trace': len(trace), 'success_program': succ_expr.pretty() if succ_expr is not None else None, 'success_exact': succ_expr is not None, 'cost_program': cost_expr.pretty() if cost_expr is not None else None, 'cost_exact': cost_expr is not None, '_succ_expr': succ_expr, '_cost_expr': cost_expr}  # описание модели: размер следа, тексты программ (None, если нет), признаки точности и сами выражения
@@ -752,7 +740,7 @@ def run_self_optimization(rounds: int=2) -> dict[str, Any]:
     невозможности, пробная «наивная» политика (нижний бюджет для семейства с кодом 4) и HOLD.
     rounds — зарезервированный параметр (не используется). Возвращает словарь-отчёт."""
     report: dict[str, Any] = {}  # итоговый словарь-отчёт
-    suite = hagi.make_task_suite()  # базовый набор задач
+    suite = make_task_suite()  # базовый набор задач
     tracer = TracedProcessorV9(node_budget=2000)  # процессор со следом и бюджетом 2000
     rnd = np.random.default_rng(20260101)  # генератор с зерном 20260101
     seen: set = set()  # множество предложенных задач
@@ -761,7 +749,7 @@ def run_self_optimization(rounds: int=2) -> dict[str, Any]:
         tracer.learn(sp, seed=10000, train_neural=False)  # выучить с зерном 10000 без нейронного обучения
     n_prop = 0  # счётчик предложенных задач
     for k in range(10):  # 10 предложений
-        prop = hagi.propose_noncircular_task(tracer.experts, rnd, 0, seen)  # предложить некруговую задачу
+        prop = propose_noncircular_task(tracer.experts, rnd, 0, seen)  # предложить некруговую задачу
         if prop is None:  # если предложений нет
             continue  # перейти к следующему
         sp, _ = prop  # взять задачу из пары
@@ -786,7 +774,7 @@ def run_self_optimization(rounds: int=2) -> dict[str, Any]:
         for sp in suite:  # по базовому набору
             demo.learn(sp, seed=10000, train_neural=False)  # выучить с зерном 10000 без нейронного обучения
         for k in range(10):  # 10 предложений
-            prop = hagi.propose_noncircular_task(demo.experts, rnd2, 0, seen2)  # предложить задачу на библиотеке демонстрационного процессора
+            prop = propose_noncircular_task(demo.experts, rnd2, 0, seen2)  # предложить задачу на библиотеке демонстрационного процессора
             if prop is None:  # если предложений нет
                 continue  # перейти к следующему
             sp, _ = prop  # взять задачу из пары
@@ -809,7 +797,7 @@ def run_self_optimization(rounds: int=2) -> dict[str, Any]:
     for sp in suite:  # по базовому набору
         opt.learn(sp, seed=10000, train_neural=False)  # выучить с зерном 10000 без нейронного обучения
     for k in range(10):  # 10 предложений
-        prop = hagi.propose_noncircular_task(opt.experts, rnd2, 0, seen2)  # предложить некруговую задачу
+        prop = propose_noncircular_task(opt.experts, rnd2, 0, seen2)  # предложить некруговую задачу
         if prop is None:  # если предложений нет
             continue  # перейти к следующему
         sp, _ = prop  # взять задачу из пары
@@ -853,9 +841,6 @@ if __name__ == '__main__':  # запуск main при вызове файла �
 # ОТРЕЗКА ПО MDL: минимизация библиотеки при сертифицированном покрытии
 # ============================================================
 
-from pathlib import Path  # класс Path (повторный импорт)
-from typing import Any  # тип Any (повторный импорт)
-from hagi import *  # импорт всех открытых имён пакета hagi в текущее пространство имён
 def _expr_calls(expr) -> set[str]:
     """Имена экспертов, вызываемых этим выражением (узлы вызова)."""
     out: set[str] = set()  # множество найденных имён
@@ -993,4 +978,4 @@ def apply_prune(proc, keep: set[str]):
                 break  # прервать проверку этого эксперта
     if failures:  # если есть сбои
         raise RuntimeError(f'prune aborted: {failures} experts failed re-validation')  # ошибка: отрезка прервана, N экспертов не прошли повторную проверку
-    return (new, failures)  # вернуть копию процесса и число сбоев (0 при успехе)
+    return (new, failures)  # вернуть копию процесса и число сбоев (0 при успехе)

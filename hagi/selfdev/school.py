@@ -18,7 +18,7 @@ from __future__ import annotations  # отложенное вычисление 
 
 import json  # чтение книги уроков
 from pathlib import Path  # пути к файлам проекта
-from hagi.util import CKPT_DIR as _CKPT  # каталог контрольных точек
+from hagi.base.util import CKPT_DIR as _CKPT  # каталог контрольных точек
 BOOK = _CKPT / 'nadya_lessons.json'  # путь к книге уроков в каталоге контрольных точек
 def load_book() -> dict[str, str]:
     """Прочитать книгу уроков: словарь «имя урока -> текст»; если файла нет — пустой словарь."""
@@ -71,9 +71,8 @@ def certificate(state: dict[str, Any]) -> dict[str, Any]:
 import argparse  # разбор аргументов командной строки
 import re  # маршруты запросов по регулярным выражениям
 from typing import Any, Callable  # типы для аннотаций
-from pathlib import Path  # пути к файлам проекта
-from hagi.io import execute, execute_text  # вызов написанной моделью программы (числовой и текстовый)
-from hagi import lm  # байтовая языковая модель
+from hagi.data.io import execute, execute_text  # вызов написанной моделью программы (числовой и текстовый)
+from hagi.models import lm  # байтовая языковая модель
 # Фактический состав модулей после слияний (io поглотил execute и ingest; generated_programs лежит в scripts/, если есть)
 SELF_SOURCES = ['lm.py', 'io.py', 'loop.py', 'rewrite.py']  # собственные файлы, чей текст идёт в обучение модели
 _ROUTES: dict[str, tuple[str, Callable[..., tuple]]] = {'^(?:чему равен )?gcd (\\d+) (\\d+)$': ('GCD', lambda m: (int(m[1]), int(m[2]))), '^(?:чему равен )?нок (\\d+) (\\d+)$': ('LCM', lambda m: (int(m[1]), int(m[2]))), '^abs (-?\\d+)$': ('ABS', lambda m: (int(m[1]),)), '^square (-?\\d+)$': ('SQUARE', lambda m: (int(m[1]),)), '^cube (-?\\d+)$': ('CUBE', lambda m: (int(m[1]),)), '^mul (-?\\d+) (-?\\d+)$': ('MUL', lambda m: (int(m[1]), int(m[2]))), '^add (-?\\d+) (-?\\d+)$': ('ADD', lambda m: (int(m[1]), int(m[2]))), '^xor (.+) (-?\\d+)$': ('LANG8_XOR_CIPHER', lambda m: (m[1], int(m[2]))), '^caesar (.+)$': ('LANG8_CAESAR1', lambda m: (m[1],))}  # маршруты: шаблон запроса -> (имя программы, разбор групп совпадения в аргументы)
@@ -86,7 +85,7 @@ def _exact_answer(query: str) -> tuple[str, str] | None:
     с ключом или без, остальные — через execute. Возвращает (имя программы, текст ответа)
     либо None, если ни один маршрут не подошёл."""
     q = query.strip().lower()  # нормализованный запрос: без крайних пробелов, в нижнем регистре
-    from hagi.rewrite import _fn_hash  # устойчивое хеш-имя программы (локальный импорт)
+    from hagi.selfdev.rewrite import _fn_hash  # устойчивое хеш-имя программы (локальный импорт)
     for pat, (prog, parse) in _ROUTES.items():  # по маршрутам: шаблон, имя программы, разбор аргументов
         m = re.match(pat, q)  # совпадение запроса с шаблоном (с начала строки) или None
         if not m:  # шаблон не подошёл
@@ -123,7 +122,7 @@ def retrain() -> str:
     Модель ByteLM(k=10, dim=96, hidden=192), 90 эпох, журнал каждые 30; веса сохраняются."""
     root = Path(__file__).resolve().parent.parent  # корень проекта (каталог над hagi)
     pkg = root / 'hagi'  # каталог пакета
-    from hagi.util import CKPT_DIR  # каталог контрольных точек (локальный импорт)
+    from hagi.base.util import CKPT_DIR  # каталог контрольных точек (локальный импорт)
     base = CKPT_DIR / 'self'  # путь к контрольной точке «самого себя» (переменная далее не используется)
     gen_prog = root / 'scripts' / 'generated_programs.py'  # файл сгенерированных программ
     files = ([gen_prog] if gen_prog.exists() else []) + [root / f for f in SELF_SOURCES[1:]] + [root / 'README.md', root / 'THEORY_ALIGNMENT.md']  # файлы обучения: сгенерированные программы (если есть) + io.py, loop.py, rewrite.py + два корневых документа

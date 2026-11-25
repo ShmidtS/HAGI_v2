@@ -22,18 +22,17 @@
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
 import hashlib  # хеш sha256 для идентификатора принятого закона
-import os  # чтение переменной окружения HAGI_SYMBOLIC
+from hagi.base import config  # единое место настроек (флаг символьной фазы)
 import random  # генератор случайных чисел с зерном
 from dataclasses import dataclass, field  # класс данных и поле со значением по умолчанию
-from typing import Callable  # тип для аннотаций
 
 import numpy as np  # чтение байтов в массив целых, равномерная выборка номеров
 
-from hagi.diagnosis import (GapBuffer, GapRecord, HoldReason,  # из модуля диагноза: буфер пробелов, запись пробела, причина удержания
+from hagi.invent.diagnosis import (GapBuffer, GapRecord, HoldReason,  # из модуля диагноза: буфер пробелов, запись пробела, причина удержания
                             build_residual_profile, classify_hold)  # профиль остатка и классификация причины
-from hagi.invention import (cegis_invent, invent_blueprint,  # из модуля изобретения: активный синтез, изобретение чертежа
+from hagi.invent.invention import (cegis_invent, invent_blueprint,  # из модуля изобретения: активный синтез, изобретение чертежа
                             verify_blueprint)  # и проверка чертежа
-from hagi.representations import reify_construct  # превращение чертежа в оператор реестра
+from hagi.invent.representations import reify_construct  # превращение чертежа в оператор реестра
 
 
 @dataclass  # класс данных: методы сравнения и инициализации генерируются автоматически
@@ -212,8 +211,8 @@ def ingest_symbolic(u, source: str, data: bytes,  # модель, имя дом�
     # управление переходит к классическому унарному пути.
     if multi_ctx:  # есть ошибки канала многих байтов
         try:  # любая ошибка канала не должна прерывать приём
-            from hagi.invention_multi import invent_multi  # синтез законов по характеристикам контекста (локальный импорт)
-            from hagi.invention import verify_blueprint  # проверка чертежа (локальный импорт)
+            from hagi.invent.invention_multi import invent_multi  # синтез законов по характеристикам контекста (локальный импорт)
+            from hagi.invent.invention import verify_blueprint  # проверка чертежа (локальный импорт)
             mr = invent_multi(list(zip(multi_ctx, multi_y, multi_pos)),  # синтез по тройкам (характеристика, выход, позиция)
                               random.Random(7), max_attempts=8000)  # генератор с зерном 7, до 8000 попыток
             if mr and mr.get("status") != "INVENTED":  # есть результат, но не «изобретено»
@@ -313,14 +312,19 @@ def unified_ingest(u, source: str, data: bytes, epochs: int = 200,  # модел
     None. Иначе выполняется символьная половина; модель сохраняется, только если число
     законов в реестре изменилось; затем запускается самокритика законов (её ошибка
     записывается в результат, а не прерывает приём)."""
+    import time as _time  # замер длительности фаз
+    _t0 = _time.perf_counter()  # начало нейронной половины
     r = u.ingest(source, data, epochs=epochs, repeat=repeat,  # нейронная половина: обычный приём домена
                  replay_cap=replay_cap)  # с пределом повтора
-    if os.environ.get("HAGI_SYMBOLIC", "0") != "1":  # символьная фаза выключена (по умолчанию «0»)
+    r.setdefault("phases", {})["neural"] = round(_time.perf_counter() - _t0, 1)  # длительность нейронной половины, с
+    _t1 = _time.perf_counter()  # начало символьной половины
+    if not config.symbolic_enabled():  # символьная фаза выключена (по умолчанию «0»)
         r["symbolic"] = None  # символьной части нет
         return r  # вернуть результат приёма
     registry_before = sum(len(v) for v in  # число законов во всех доменах реестра до символьной фазы
                           (getattr(u, "law_registry", {}) or {}).values())  # по спискам реестра (нет реестра — пустой словарь)
     sym = ingest_symbolic(u, source, data, gap_buffer=gap_buffer)  # символьная половина
+    r["phases"]["symbolic"] = round(_time.perf_counter() - _t1, 1)  # длительность символьной половины, с
     r["symbolic"] = {"hold_reason": sym.hold_reason.name if sym.hold_reason else None,  # имя причины удержания или None
                      "invented": sym.invented,  # результат изобретения
                      "exact_points": sym.exact_points,  # число проверенных точек
@@ -333,7 +337,7 @@ def unified_ingest(u, source: str, data: bytes, epochs: int = 200,  # модел
     try:  # сохранение и самокритика не должны прерывать приём
         if registry_after != registry_before:  # число законов изменилось
             u.save()  # сохранить модель с реестром
-        from hagi.law_critique import run_law_self_critique  # самокритика законов (локальный импорт)
+        from hagi.data.law_critique import run_law_self_critique  # самокритика законов (локальный импорт)
         r["self_critique"] = run_law_self_critique(u)  # оценить недавно принятые законы и записать итог
     except Exception as _critique_error:  # сохранение или самокритика бросили ошибку
         r["self_critique"] = {"status": "ERROR",  # самокритика не выполнена

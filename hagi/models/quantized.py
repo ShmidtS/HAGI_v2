@@ -1,7 +1,7 @@
 """Детерминированный упакованный троичный экспорт малых байтовых моделей HAGI.
 
     Формат хранит по пять троичных уровней (−1, 0, 1) в одном байте (основание 3:
-    3^5 = 243 ≤ 256, упаковка и распаковка — в hagi.trunk_ops), по одному масштабу FP32 (или
+    3^5 = 243 ≤ 256, упаковка и распаковка — в hagi.base.trunk_ops), по одному масштабу FP32 (или
     FP16) на строку матрицы и сдвиги в FP32/FP16. Квантование строки w:
       q_i = clip(round(w_i / s), −1, 1);  восстановленное значение: w̃_i = q_i·s.
     Масштабы заморожены при экспорте; загрузка никогда не пересчитывает их из уже
@@ -19,7 +19,7 @@
     Тело: для каждой матрицы упакованные троичные уровни, затем массив масштабов; затем сдвиги.
     Заголовок: формат, класс модели, context, dim, hidden, режимы, описания матриц и сдвигов.
 
-    Для байтовой модели hagi.lm (атрибуты emb, W1, b1, W2, b2) есть адаптер: W1 и W2
+    Для байтовой модели hagi.models.lm (атрибуты emb, W1, b1, W2, b2) есть адаптер: W1 и W2
     квантуются в троичные, а эмбеддинг дописывается в конец тела в FP16 (длина emb_fp16_len
     записана в заголовок), сдвиги хранятся как есть.
 
@@ -27,7 +27,6 @@
     instantiate_ternary_payload, export_hagi_lm_payload, instantiate_hagi_lm_payload."""
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-import copy  # (импортирован, в коде ниже не используется)
 import json  # чтение и запись заголовка
 import struct  # упаковка целых чисел фиксированной длины
 from typing import Literal  # тип-перечисление строк
@@ -35,7 +34,7 @@ from typing import Literal  # тип-перечисление строк
 import numpy as np  # численные массивы
 import torch  # тензоры
 
-from hagi.trunk_ops import pack_trits5, unpack_trits5  # упаковка и распаковка пяти троичных уровней в байт
+from hagi.base.trunk_ops import pack_trits5, unpack_trits5  # упаковка и распаковка пяти троичных уровней в байт
 
 MAGIC = b"HAGITRN1"  # сигнатура формата
 ScaleMode = Literal["mean_abs", "mse_opt", "fisher_opt", "explicit"]  # имена способов выбора масштаба
@@ -329,7 +328,7 @@ def instantiate_ternary_payload(payload: bytes):
     if end > len(payload):  # заголовок выходит за пределы
         raise ValueError("truncated HAGI ternary header")  # ошибка
     header = json.loads(payload[start:end].decode("utf-8"))  # разобрать заголовок
-    from hagi.lm import ByteLM, TernaryAwareByteLM  # поддерживаемые классы моделей
+    from hagi.models.lm import ByteLM, TernaryAwareByteLM  # поддерживаемые классы моделей
     classes = {"ByteLM": ByteLM, "TernaryAwareByteLM": TernaryAwareByteLM}  # имя класса -> класс
     cls = classes.get(header.get("model"))  # класс из заголовка или None
     if cls is None:  # класс не поддерживается
@@ -341,7 +340,7 @@ def instantiate_ternary_payload(payload: bytes):
 
 def export_hagi_lm_payload(model, scale_dtype: str = "f16"  # тип хранения масштабов и сдвигов
                            ) -> tuple[bytes, dict]:  # возвращает (контейнер, метаданные)
-    """Адаптер: экспортировать байтовую модель hagi.lm (атрибуты emb, W1, b1, W2, b2 — простые
+    """Адаптер: экспортировать байтовую модель hagi.models.lm (атрибуты emb, W1, b1, W2, b2 — простые
     параметры, без nn.Linear) в упакованный контейнер HAGITRN1.
 
         W1 и W2 квантуются в троичные; эмбеддинг хранится в FP16 и дописывается в конец тела
@@ -420,8 +419,8 @@ def export_hagi_lm_payload(model, scale_dtype: str = "f16"  # тип хране�
     return payload, meta  # контейнер и метаданные
 
 
-def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):  # восстановить модель hagi.lm из контейнера
-    """Восстановить байтовую модель hagi.lm из контейнера: заголовок управляет шаблоном,
+def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):  # восстановить модель hagi.models.lm из контейнера
+    """Восстановить байтовую модель hagi.models.lm из контейнера: заголовок управляет шаблоном,
     эмбеддинг читается из хвоста FP16.
 
         payload — контейнер из export_hagi_lm_payload; meta — метаданные экспорта (запасной
@@ -439,7 +438,7 @@ def instantiate_hagi_lm_payload(payload: bytes, meta: dict | None = None):  # в
     header = json.loads(payload[start:start + header_len].decode("utf-8"))  # разобрать заголовок
     meta = meta or {}  # метаданные (пустой словарь, если None)
     body = payload[start + header_len:]  # тело
-    import hagi.lm as _lm  # модуль моделей
+    import hagi.models.lm as _lm  # модуль моделей
     cls_name = header.get("hagi_model_class", "CertifiedStepLM")  # имя класса из заголовка
     tpl_cls = getattr(_lm, cls_name, _lm.CertifiedStepLM)  # класс; если его нет — CertifiedStepLM
     if cls_name == "RopeAttentionByteLM":  # у этой модели нет аргумента k

@@ -24,7 +24,7 @@ def _forever_alive() -> bool:
     PS_DETECT.parent.mkdir(parents=True, exist_ok=True)
     PS_DETECT.write_text(
         "$c = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
-        "| Where-Object {$_.CommandLine -match 'hagi.rewrite'})\n"
+        "| Where-Object {$_.CommandLine -match 'hagi.selfdev.rewrite'})\n"
         "$c.Count\n"
     )
     out = subprocess.run(
@@ -61,7 +61,7 @@ def _dedup_forever() -> None:
     PS_DEDUP.parent.mkdir(parents=True, exist_ok=True)
     PS_DEDUP.write_text(
         "$f = @(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
-        "| Where-Object {$_.CommandLine -match 'hagi.rewrite'} "
+        "| Where-Object {$_.CommandLine -match 'hagi.selfdev.rewrite'} "
         "| Sort-Object CreationDate)\n"
         "if ($f.Count -gt 1) { $f | Select-Object -Skip 1 "
         "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }\n"
@@ -88,7 +88,7 @@ def _start_forever() -> int:
             "utf8",
             "-u",
             "-m",
-            "hagi.rewrite",
+            "hagi.selfdev.rewrite",
             "--forever",
             "--rounds",
             "10",

@@ -1,39 +1,55 @@
-"""HAGI — публичный API пакета: точка входа `import hagi`.
+"""HAGI — публичный интерфейс пакета: точка входа `import hagi`.
 
-Назначение файла: собрать в пространстве имён `hagi` всё, что
-считается внешним интерфейсом модели. Сам файл ничего не вычисляет.
+Назначение файла: собрать в пространстве имён `hagi` ЯВНЫЙ перечень
+того, что считается внешним интерфейсом символьного ядра. Сам файл ничего
+не вычисляет. Перечень задан списком `__all__` ниже; всё, чего в нём нет,
+нужно импортировать из конкретного модуля.
 
-HAGI — самообучающаяся модель, работающая с данными как с потоком
-байтов. Ядро модели — символьный процессор: программа представляется
-выражением (дерево операций над целыми числами по модулю степени
-двойки), а обучение — поиском такой программы, которая точно
-воспроизводит пары «вход → выход». Языковая модель по байтам
-оценивает распределение следующего байта p(b | контекст) и живёт в
-модуле `hagi.lm`; сюда она не попадает и импортируется явно.
+HAGI — самообучающаяся модель, работающая с данными как с потоком байтов.
+Ядро — символьный процессор: программа представляется выражением (дерево
+операций над целыми числами), обучение — поиском программы, точно
+воспроизводящей пары «вход → выход». Нейронная часть — языковая модель по
+байтам p(b | контекст) — живёт в `hagi.models.lm` / `hagi.models.hnet_lm`, единая модель —
+в `hagi.selfdev.unified`; сюда они не входят и импортируются явно.
 
-Что экспортирует пакет (две строки ниже):
-  1. `from .core import *` — всё публичное канонического ядра
-     `hagi.core`: классы процессоров (`GrowingHagiProcessor`,
-     `V5Processor`, `GrowingMathProcessor` и др.), безопасное
-     выражение DSL (`Expr`, `Program`), таблицы операций (`OPS`,
-     `BINARY_OPS`, `UNARY_OPS`, `CONSTS`, `COMMUTATIVE_OPS`),
-     процедуры роста и самопроверки (`grow_deep`, `grow_v8`,
-     `self_test_core`), майнеры теорем, версии (`V5_VERSION`,
-     `V7_VERSION`, `V8_VERSION`, `V9_VERSION`) и служебные имена,
-     которые `core` сам импортировал (`np`, `json`, `math`, `Path`).
-     Правило звезды без `__all__`: копируются ВСЕ имена модуля, не
-     начинающиеся с подчёркивания; `core` в свою очередь делает
-     звезду из `hagi.legacy_kernel`, так что замороженное тело V5–V8
-     тоже попадает сюда (при совпадении имён побеждает определение
-     из `core`).
-  2. `from . import genesis` — подпакет/модуль `hagi.genesis`
-     становится атрибутом `hagi.genesis` (генезис конфигураций
-     цикла обучения и геномов эллиптико-кривого процессора), чтобы
-     писать `hagi.genesis.evolve(...)` после `import hagi`.
+Слои пакета (направление зависимостей — только вниз):
+  интерфейс     hagi (этот файл), hagi.cli (импортируется явно), hagi.base.config
+  мета-цикл     loop, cycle, genesis, selfmodel, fabric, law_critique, pipeline
+  память/среды  memory_store/*, env_lut, env_temporal
+  модели        lm, hnet_lm, unified, trunk_ops, quantized, embeddings, archiver
+  символьное    core (+ legacy), representations, invention*, diagnosis,
+                skill_engine, certificates, rewrite, school
+  инфраструктура util, io, gpu
 
-Прагмы `# noqa` отключают линтер для этих строк: F401 — «импорт не
-используется в самом файле» (он здесь именно для перепродажи имён),
-F403 — «звёздный импорт».
+Группы интерфейса (что ниже в `__all__`):
+  выражения и задачи   Expr, Program, CallDagProgram, TaskSpec, StoredExpert, VAR_NAMES
+  таблицы операций     OPS, UNARY_OPS, BINARY_OPS, COMMUTATIVE_OPS, CONSTS,
+                       DYADIC_LEVELS, REIFIED_OPS, TOKEN_BITS, gamma_bits, zigzag
+  процессоры           GrowingMathProcessor(оптимальный), GrowingHagiProcessor(единый), базовый
+  нейро-адаптеры ядра  FactorizedAdapter, FactorizedSharedCore, NeuralFiber,
+                       HedgeRouter, newton_schulz_orthogonalize, batch_logit_safe_step_ce
+  рост и проверка      grow_deep, grow_from_suite, self_test*, run_experiment, main
+  синтез и аппроксимация synthesize_batched_mdl, exact_piecewise_poly_fit,
+                       make_task_suite, propose_noncircular_task, solve_coloring
+  служебные измерения  stutter_norm, boundary_chunks, boundary_heads,
+                       ram_available_bytes, venn_*, anf_*
 """
-from .core import *  # noqa: F401,F403  — скопировать в hagi все публичные имена ядра (без подчёркивания): процессоры, Expr/Program, OPS, grow_*, self_test_*
-from . import genesis  # noqa: F401  — сделать модуль hagi.genesis атрибутом пакета: доступно как hagi.genesis
+from hagi.core import DYADIC_LEVELS, OPS, UNARY_OPS, BINARY_OPS, COMMUTATIVE_OPS, CONSTS, REIFIED_OPS, TOKEN_BITS, VAR_NAMES, Expr, Program, CallDagProgram, TaskSpec, StoredExpert, GrowingMathProcessor, OptimalMathProcessor, GrowingHagiProcessor, GrowthProcessorBase, FactorizedAdapter, FactorizedSharedCore, NeuralFiber, HedgeRouter, newton_schulz_orthogonalize, batch_logit_safe_step_ce, gamma_bits, zigzag, grow_deep, grow_from_suite, self_test, self_test_optimal, self_test_unified, self_test_core, run_experiment, main, synthesize_batched_mdl, exact_piecewise_poly_fit, make_task_suite, propose_noncircular_task, solve_coloring, stutter_norm, boundary_chunks, boundary_heads, ram_available_bytes, venn_atoms, venn_head_eval, pack_venn_16_flat, unpack_venn_16_flat, anf_transform, anf_support_vars  # явные имена ядра — только то, что входит в интерфейс
+from hagi.data import genesis  # noqa: F401  — генезис доступен как атрибут: hagi.genesis
+from hagi import core  # noqa: F401  — ядро доступно как атрибут: hagi.core.Expr
+from hagi.base import config, util  # noqa: F401  — фундамент доступен как атрибуты: hagi.config.device, hagi.util.<имя>
+
+__all__ = [  # явный интерфейс пакета: только эти имена выносит `from hagi import *`
+    "Expr", "Program", "CallDagProgram", "TaskSpec", "StoredExpert", "VAR_NAMES",  # выражения и задачи
+    "OPS", "UNARY_OPS", "BINARY_OPS", "COMMUTATIVE_OPS", "CONSTS", "DYADIC_LEVELS",  # таблицы операций
+    "REIFIED_OPS", "TOKEN_BITS", "gamma_bits", "zigzag",  # реестр операций и кодирование длин
+    "GrowingMathProcessor", "OptimalMathProcessor", "GrowingHagiProcessor", "GrowthProcessorBase",  # процессоры
+    "FactorizedAdapter", "FactorizedSharedCore", "NeuralFiber", "HedgeRouter",  # нейро-адаптеры ядра
+    "newton_schulz_orthogonalize", "batch_logit_safe_step_ce",  # численные процедуры
+    "grow_deep", "grow_from_suite", "self_test", "self_test_optimal", "self_test_unified", "self_test_core", "run_experiment", "main",  # рост и проверка
+    "synthesize_batched_mdl", "exact_piecewise_poly_fit", "make_task_suite", "propose_noncircular_task", "solve_coloring",  # синтез и аппроксимация
+    "stutter_norm", "boundary_chunks", "boundary_heads", "ram_available_bytes",  # измерения
+    "venn_atoms", "venn_head_eval", "pack_venn_16_flat", "unpack_venn_16_flat",  # диаграммы Венна
+    "anf_transform", "anf_support_vars",  # алгебраическая нормальная форма
+        "core", "config", "util", "genesis",  # подпакеты (cli импортируется явно: python -m hagi.cli)
+]

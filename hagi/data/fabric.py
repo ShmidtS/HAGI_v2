@@ -27,11 +27,8 @@ from __future__ import annotations  # отложенное вычисление 
 import json  # чтение и запись журнала
 import random  # генератор случайных чисел
 import time  # метка времени результата
-from pathlib import Path  # работа с путями файлов
-from typing import Any  # аннотации типов
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта
-from hagi.util import CKPT_DIR as _CKPT  # каталог чекпойнтов
+from hagi.base.util import CKPT_DIR as _CKPT  # каталог чекпойнтов
 FABRIC_LOG = _CKPT / "self" / "fabric.json"  # журнал результатов эволюции
 
 # --- 16 кодов Венна как 4-битные маски; порядок комбинаций (++),(+-),(-+),(--) в битах

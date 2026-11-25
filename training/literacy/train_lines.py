@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))  # добавить корень проекта в
 os.environ.setdefault("HAGI_DEVICE", "cuda")  # устройство по умолчанию — cuda (если не задано иначе)
 import numpy as np  # массивы
 import torch  # тензоры
-from hagi.lm import RopeAttentionByteLM  # байтовая модель с RoPE-вниманием
+from hagi.models.lm import RopeAttentionByteLM  # байтовая модель с RoPE-вниманием
 
 CORPUS = ROOT / "training" / "literacy" / "bits_corpus.txt"  # файл корпуса
 CKPT = ROOT / "checkpoints" / "literacy_lines.pt"  # файл сохраняемой модели
@@ -119,7 +119,7 @@ def main():
                               "theta0": lm.theta0, "lam": lm.lam}, CKPT)  # продолжение: theta0, lam; сохранить в CKPT
     print(f"best CE {best:.4f}; saved {CKPT}")  # печать лучшей CE и пути сохранённой модели
     # проверка грамотности (argmax при низкой температуре)
-    from hagi.lm import load_rope  # загрузка модели rope
+    from hagi.models.lm import load_rope  # загрузка модели rope
     lm2 = load_rope(CKPT)  # загрузить сохранённую модель
     lm2.device = lm.device  # устройство загруженной модели := устройство обученной
     for nm in lm2.params():  # по параметрам загруженной модели

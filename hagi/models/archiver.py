@@ -167,19 +167,6 @@ def _probs(model, ctx_np: np.ndarray) -> np.ndarray:
         return (e / e.sum(dim=-1, keepdim=True)).float().cpu().numpy()  # вероятности p_i = e_i / Σ_j e_j -> float32 numpy
 
 
-def _uniform(nb: int) -> np.ndarray:
-    """Не используется. Равномерное распределение: (nb, 256), p_i = 1/256."""
-    return np.full((nb, 256), 1.0 / 256, np.float32)  # матрица nb×256, все элементы 1/256
-
-
-def _ctx(buf: np.ndarray, starts: np.ndarray, k: int) -> np.ndarray:
-    """Не используется. Контекст от старого к новому для байта в каждой позиции
-    `start`: k байтов ПЕРЕД ним в `buf` (поток с k нулями в начале, поэтому
-    позиции p отвечает срез buf[p : p+k]); короткий хвост дополняется нулём —
-    так же, как сборка контекстов при обучении."""
-    return np.stack([buf[p:p + k] for p in starts])  # стопка срезов buf[p : p+k−1]; форма (len(starts), k)
-
-
 def _groups(n_blk: int, group: int):
     """Не используется (старый вариант по числу блоков). Выдаёт пары
         (старт, размер) кусков не длиннее `group`: (0, g), (g, g), ..., последний короче."""
@@ -187,13 +174,6 @@ def _groups(n_blk: int, group: int):
     while s < n_blk:  # пока старт меньше числа блоков
         yield s, min(group, n_blk - s)  # пара (старт s, размер min(group, n_blk − s))
         s += group  # следующий старт s + group
-
-
-def _ctx_from(buf: np.ndarray, starts: np.ndarray, k: int) -> np.ndarray:
-    """Не используется. Контексты от старого к новому: `buf` — это k нулей и затем
-    поток, поэтому контекст позиции p потока равен buf[p : p+k] (k байтов ПЕРЕД
-    ним, с нулевым дополнением в начале — как сборка контекстов при обучении)."""
-    return np.stack([buf[p:p + k] for p in starts])  # стопка срезов buf[p : p+k−1]; форма (len(starts), k)
 
 
 def _groups(blocks: np.ndarray, group: int):

@@ -16,10 +16,10 @@ from __future__ import annotations  # отложенное вычисление 
 # ENV LUT: банк гипотез + OOD (чужеродная динамика)
 # ============================================================
 
-from hagi.util import sha  # хеш-функция sha для таблиц переходов
+from hagi.base.util import sha  # хеш-функция sha для таблиц переходов
 import argparse, itertools, json, math, random, statistics, time  # стандартные модули: аргументы командной строки, перестановки, json, math, случайность, статистика, время
 from collections import deque  # двусторонняя очередь для поиска в ширину
-from dataclasses import dataclass, asdict  # декоратор dataclass и преобразование в словарь
+from dataclasses import dataclass  # декоратор dataclass и преобразование в словарь
 from pathlib import Path  # класс Path для путей
 N_BITS = 4  # число скрытых бит состояния N_BITS = 4
 N_STATES = 1 << N_BITS  # число состояний N_STATES = 2^N_BITS = 16
@@ -760,7 +760,7 @@ if __name__ == '__main__':  # файл запущен напрямую — вы�
 # КОМПИЛЯТОР: таблица среды -> GF(2) (общий)
 # ============================================================
 
-from hagi import skill_engine as v40  # импорт skill_engine как v40 (преобразование Мёбиуса и компилятор АНФ)
+from hagi.data import skill_engine as v40  # импорт skill_engine как v40 (преобразование Мёбиуса и компилятор АНФ)
 def compile_transition_table(table, n_bits: int, n_act_bits: int) -> dict:
     """Скомпилировать таблицу переходов в сеть вентилей.
 
@@ -793,7 +793,7 @@ def compile_transition_table(table, n_bits: int, n_act_bits: int) -> dict:
 # СВЯЗКА ENV LUT: мир -> нетлист
 # ============================================================
 
-from hagi import env_lut as env  # импорт этого же модуля как env
+from hagi.data import env_lut as env  # импорт этого же модуля как env
 def env_model_to_netlist(seed: int=777, ood: bool=False) -> dict:
     """Активно обучиться миру, провести аудит кандидата или полный перебор и скомпилировать таблицу в нетлист."""
     w = env.make_world(seed, ood=ood)  # мир по зерну
@@ -817,10 +817,8 @@ def env_model_to_netlist(seed: int=777, ood: bool=False) -> dict:
 # ENV LUT VERIFY: независимое воспроизведение
 # ============================================================
 
-from hagi.util import sha  # хеш-функция sha
 import argparse, json, random  # стандартные модули: аргументы, json, случайность
-from collections import deque, Counter  # двусторонняя очередь и счётчик
-from pathlib import Path  # класс Path
+from collections import deque  # двусторонняя очередь и счётчик
 N = 16  # число состояний N = 16
 A = 4  # число действий A = 4
 def b(s, i):

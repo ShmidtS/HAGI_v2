@@ -22,7 +22,6 @@ certified_argmax (сертифицированный argmax) и band_drift_check
 интервал всё ещё накрывает настоящий softmax)."""
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-from fractions import Fraction  # точные рациональные числа
 
 DEFAULT_NM = 4  # параметр nm по умолчанию
 EVAL_NM_MAX = 1024  # наибольшее nm в цикле удвоения

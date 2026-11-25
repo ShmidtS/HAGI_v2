@@ -33,6 +33,7 @@
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
 import argparse  # разбор аргументов командной строки
+import time  # замер длительности шагов обучения и контрольных замеров
 import math  # математические функции
 import json  # чтение и запись JSON
 from pathlib import Path  # пути к файлам
@@ -49,8 +50,8 @@ def _resolve_device(t, dim: int = 0, hidden: int = 0) -> str:
         "auto" (по умолчанию) -> GPU, только если dim·hidden >= 8192:
         у малых тестовых моделей время инициализации CUDA больше самой
         работы, поэтому они остаются на процессоре."""
-    import os  # доступ к переменным окружения
-    pref = os.environ.get("HAGI_DEVICE", "auto")  # pref = HAGI_DEVICE из окружения, по умолчанию "auto"
+    from hagi.base import config  # единое место настроек
+    pref = config.device()  # pref = HAGI_DEVICE из окружения, по умолчанию "auto"
     if pref == "cpu":  # явно запрошен процессор
         return "cpu"  # считать на процессоре
     cuda_ok = t.cuda.is_available()  # cuda_ok = доступна ли CUDA
@@ -59,7 +60,7 @@ def _resolve_device(t, dim: int = 0, hidden: int = 0) -> str:
     return "cuda" if cuda_ok and dim * hidden >= 8192 else "cpu"  # "cuda", если CUDA доступна и dim·hidden >= 8192, иначе "cpu"
 
 
-from hagi.util import CKPT_DIR as _CKPT  # каталог для сохранения весов под именем _CKPT
+from hagi.base.util import CKPT_DIR as _CKPT  # каталог для сохранения весов под именем _CKPT
 CKPT = _CKPT / "lm_byte.pt"  # путь к файлу весов простой модели: _CKPT / "lm_byte.pt"
 
 
@@ -127,7 +128,7 @@ class SemanticDistillHead:
             loss."""
         import torch  # нейросетевая библиотека
         t = model.t  # библиотека, на которой работает модель
-        from hagi.embeddings import GemmaEmbedder  # учитель — эмбеддер Gemma
+        from hagi.base.embeddings import GemmaEmbedder  # учитель — эмбеддер Gemma
         gemma = GemmaEmbedder.get()  # общий экземпляр учителя
         tv = gemma.embed(texts).to(model.device)  # tv — векторы учителя для текстов, перенесённые на устройство модели
         # признаки модель отдаёт сама через features: у модели с вращательным
@@ -785,8 +786,8 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
         return self.t.nn.functional.cross_entropy(  # кросс-энтропия CE = mean_i (−log softmax(logits_i)[nxt_i])
             self.logits(ctx), nxt, reduction="mean")  # логиты и ответы, среднее
 
-    def train_guarded(self, data: bytes, epochs: int = 60, lr: float = 1e-3,  # обучение с гейтом: data — байты, epochs — эпохи, lr — шаг Adam
-                      holdout: float = 0.1, batch: int = 64,  # holdout — доля удержанных данных, batch — размер пакета
+    def train_guarded(self, data: bytes, epochs: int = 60, lr: float | None = None,  # обучение с гейтом: data — байты, epochs — эпохи, lr — шаг Adam (None — из config.TRAIN_LR)
+                      holdout: float = 0.1, batch: int | None = None,  # ... holdout — доля контрольных данных, batch — размер пакета (None — из config.TRAIN_BATCH); ... holdout — доля удержанных данных, batch — размер пакета
                       max_train_ctx: int = 96, log_every: int = 0,  # max_train_ctx — наибольшая длина контекста, log_every — период печати
                       holdout_seed: int | None = None,  # сид выбора удержанных данных (None -> 7)
                       holdout_mode: str = "stratified") -> dict:  # "tail" — удержание хвостом, иначе расслоённое; возврат — итоги
@@ -801,6 +802,11 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
             сохраняется, если CE удержанных данных не выросла; в конце
             разворачивается лучший снимок. Возвращает "epochs",
             "best_holdout_ce", "holdout_role" = "selection"."""
+        from hagi.base import config  # единое место настроек (размер пакета и шаг по умолчанию)
+        if lr is None:  # шаг не задан явно
+            lr = config.TRAIN_LR  # шаг Adam из настроек
+        if batch is None:  # размер пакета не задан явно
+            batch = config.TRAIN_BATCH  # размер пакета из настроек
         import numpy as np  # численные массивы
         t = self.t  # библиотека модели
         max_train_ctx = min(max_train_ctx, self.k)   # длина контекста не больше окна k
@@ -913,11 +919,13 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
                 continue  # пропустить блок
             live_params += [blk["W1"], blk["b1"], blk["Wo"]]  # добавить параметры блока
         opt = t.optim.Adam(live_params, lr=lr)  # оптимизатор Adam по живым параметрам
+        sec_train, sec_eval = 0.0, 0.0  # счётчики времени: шаги обучения и замеры CE на удержанных данных, с
         best = eval_ce(hold)  # лучшая CE до обучения
         best_state = [p.detach().clone() for p in self.params()]  # снимок всех параметров
         self._last_best_state = best_state  # сохранить снимок и в атрибуте
         for ep in range(epochs):  # по эпохам
             perm2 = rng.permutation(len(train))  # случайный порядок обучающих позиций
+            _t_ep = time.perf_counter()  # начало эпохи (замер времени шагов обучения)
             for bs in range(0, len(train), batch):  # по пакетам с шагом batch
                 sel = t.as_tensor(perm2[bs:bs + batch], dtype=t.long, device=dev)  # номера строк пакета
                 X = X_tr.index_select(0, sel)  # контексты пакета — строки sel
@@ -925,7 +933,10 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
                 opt.zero_grad()  # обнулить градиенты
                 self.ce(X, y).backward()  # градиенты CE пакета
                 opt.step()  # шаг Adam
+            sec_train += time.perf_counter() - _t_ep  # прибавить длительность шагов обучения этой эпохи, с
+            _t_ev = time.perf_counter()  # начало замера CE
             ce_va = eval_ce(hold)  # CE удержанных данных после эпохи
+            sec_eval += time.perf_counter() - _t_ev  # прибавить длительность замера CE, с
             if ce_va <= best:  # не хуже лучшей
                 best = ce_va  # новая лучшая CE
                 best_state = [q2.detach().clone() for q2 in self.params()]  # снять веса
@@ -943,6 +954,7 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
         # честно помечен флагом holdout_role.
         return {"epochs": epochs,  # число эпох
                 "best_holdout_ce": round(best, 4),  # лучшая CE удержанных данных, 4 знака
+                "sec_train": round(sec_train, 1), "sec_eval": round(sec_eval, 1),  # время шагов обучения и время замеров CE, с
                 "holdout_role": "selection"}  # роль: оценка для отбора весов
 
     def _rope_logits_from_params(self, ps, ctx):
@@ -1092,7 +1104,7 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
     k = 96  # контекст модели k = 96 (унифицированный интерфейс: модель.k)
 
     def train_certified(self, data: bytes, epochs: int = 60,  # epochs — число эпох
-                        holdout: float = 0.1, batch: int = 64,  # holdout — доля хвоста, batch — размер батча
+                        holdout: float = 0.1, batch: int | None = None,  # holdout — доля хвоста; batch — размер батча (None — из config.TRAIN_BATCH, согласован с config.TRAIN_LR)
                         log_every: int = 0,  # log_every — период печати (0 — не печатать)
                         holdout_seed: int | None = None,  # сид разбиения (None — сид 7)
                         lr: float | None = None) -> dict:  # скорость обучения (None — по умолчанию train_guarded)
@@ -1108,7 +1120,7 @@ class RopeAttentionByteLM:  # байтовая модель с RoPE-вниман
         r = self.train_guarded(data, epochs=epochs, holdout=holdout,  # фаза Adam
                                batch=batch, max_train_ctx=self.k,  # батч и длина контекста k
                                holdout_seed=holdout_seed,  # сид разбиения
-                               **({} if lr is None else {"lr": lr}))  # lr передаётся, только если задан (иначе значение train_guarded 1e-3)
+                               **({} if lr is None else {"lr": lr}))  # lr передаётся, только если задан (иначе config.TRAIN_LR)
         # Гибрид: после быстрой фазы Adam идёт дообучение шагами с конечным
         # сдвигом по окнам обучающей части — каждый принятый шаг несёт
         # доказанную границу снижения CE, которой у чистого Adam нет.
@@ -1835,10 +1847,9 @@ def make_lm(arch: str, dim: int | None = None, hidden: int | None = None, **kw):
     после d = 64 выигрыш на параметр резко падает; RoPE (132 тыс.) даёт 1.81.
     Переменные окружения HAGI_DIM и HAGI_HIDDEN переопределяют dim и hidden.
     Для остальных имён — RopeAttentionByteLM с dim = 128, hidden = 256."""
-    import os as _o  # доступ к переменным окружения
     if arch == "hnet":  # выбрана архитектура hnet
-        from hagi.hnet_lm import HNetByteLM  # класс модели hnet
-        d = int(_o.environ.get("HAGI_DIM", dim or 64) if _o.environ.get("HAGI_DIM") or dim is None else dim)  # d = HAGI_DIM, иначе dim, иначе 64
-        h = int(_o.environ.get("HAGI_HIDDEN", hidden or 128) if _o.environ.get("HAGI_HIDDEN") or hidden is None else hidden)  # h = HAGI_HIDDEN, иначе hidden, иначе 128
+        from hagi.models.hnet_lm import HNetByteLM  # класс модели hnet
+        from hagi.base import config  # единое место настроек
+        d, h = config.model_dims(dim, hidden)  # d, h = аргумент, иначе HAGI_DIM / HAGI_HIDDEN, иначе 64 / 128
         return HNetByteLM(dim=d, hidden=h, **kw)  # модель hnet
     return RopeAttentionByteLM(dim=dim or 128, hidden=hidden or 256, **kw)  # RoPE-модель: dim = 128, hidden = 256, если не заданы

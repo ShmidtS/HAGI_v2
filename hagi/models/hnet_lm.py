@@ -25,7 +25,7 @@ ALiBi: сдвиг оценки для позиции m равен −lam·(M −
   умножаются на sqrt(d0/d1), eps — на d0/d1, блок W_q — на sqrt(d1/d0).
 
 Тренировка train_guarded/eval_holdout_ce/generate заимствуются у класса
-  RopeAttentionByteLM из hagi.lm ( train_certified вызывает train_guarded и
+  RopeAttentionByteLM из hagi.models.lm ( train_certified вызывает train_guarded и
   помечает уточнение как отсутствующее). Сохранение/загрузка — по именам из
   param_names.
 """
@@ -102,7 +102,7 @@ class HNetByteLM:
     def _resolve_device(self):
         """Выбрать устройство (cpu или cuda) и перенести на него параметры и таблицы."""
         import os  # импорт os (не используется далее)
-        from hagi.lm import _resolve_device  # общий выбор устройства по torch, dim и hidden
+        from hagi.models.lm import _resolve_device  # общий выбор устройства по torch, dim и hidden
         self.device = _resolve_device(self.t, self.dim, self.hidden)  # имя устройства: "cpu" или "cuda"
         if self.device == "cuda":  # выбран cuda
             for p in self.params():  # по всем параметрам
@@ -268,7 +268,7 @@ class HNetByteLM:
         return t_stack_logits(self, ctx)  # собрать логиты всех префиксов
 
     def train_certified(self, data: bytes, epochs: int = 60,  # обучение; epochs — число эпох, ...
-                        holdout: float = 0.1, batch: int = 64,  # ...holdout — доля контрольных данных, batch — размер пакета, ...
+                        holdout: float = 0.1, batch: int | None = None,  # ...holdout — доля контрольных данных, batch — размер пакета (None — из config.TRAIN_BATCH); ...азмер пакета, ...
                         log_every: int = 0, holdout_seed: int | None = None,  # ...период печати (не используется), зерно разбиения, ...
                         lr: float | None = None) -> dict:  # ...скорость обучения (None — стандартная); возвращает словарь итогов
         """Обучение, совместимое с Unified: вызывает train_guarded.
@@ -333,7 +333,7 @@ def t_stack_logits(m, ctx):
 # -- тренировочный миксин: используется цикл обучения RopeAttentionByteLM ---------------
 def _install():
     """Приписать HNetByteLM методы обучения класса RopeAttentionByteLM, если их ещё нет."""
-    from hagi import lm as _lm  # модуль языковых моделей
+    from hagi.models import lm as _lm  # модуль языковых моделей
     R = _lm.RopeAttentionByteLM  # класс-донор
     for name in ("train_guarded", "eval_holdout_ce", "_read_all_windows",  # по именям: train_guarded, eval_holdout_ce, _read_all_windows, ...
                  "generate", "generate_auto"):  # формула:  ...generate, generate_auto

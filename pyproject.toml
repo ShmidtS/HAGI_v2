@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hagi"
 version = "4.2.0"
-description = "HAGI — ternary RD-channel causal language model (BitNet b1.58)"
+description = "HAGI — растущая саморазвивающаяся модель: байтовая нейросеть + символьное ядро точных программ"
 requires-python = ">=3.12"
-dependencies = ["numpy", "torch>=2.0", "pyyaml", "gigatoken", "cloudpickle"]
+dependencies = ["numpy", "torch>=2.0"]
 
 [project.optional-dependencies]
 dev = [
@@ -31,8 +31,8 @@ dev = [
 # and take the GPU with it. Bumping torch therefore has to be a deliberate
 # manual ROCm install, not a dependency resolve.
 
-[tool.setuptools]
-packages = ["hagi"]
+[tool.setuptools.packages.find]
+include = ["hagi", "hagi.*"]  # пакет с подпакетами base, models, invent, data, selfdev, core, memory_store
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

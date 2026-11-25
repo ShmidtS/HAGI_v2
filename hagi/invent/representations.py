@@ -22,7 +22,6 @@
 """
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
-from dataclasses import dataclass  # декоратор класса данных
 from typing import Any, Callable, Protocol, Sequence, runtime_checkable  # типы для аннотаций и проверяемые протоколы
 
 # --------------------------------------------------------------------------
@@ -103,144 +102,11 @@ def construct_bits(value: Any,  # значение узла construct
     return int(art.bits(expert_index))  # длина описания артефакта в битах
 
 
-def construct_pretty(value: Any) -> str:
-    """Текстовое имя узла construct: construct(<идентификатор представления>)."""
-    return f"construct({value.get('repr_id')})"  # строка «construct(id)»
-
-
-def construct_to_dict(value: Any) -> Any:
-    """Словарь узла construct для сериализации: идентификатор представления и словарь артефакта."""
-    return {"repr_id": value.get("repr_id"),  # идентификатор представления (None, если ключа нет)
-            "artifact": value["artifact"].to_dict()}  # артефакт в виде словаря
-
-
-# --------------------------------------------------------------------------
-# Проверка контракта (вся область + запись-чтение + отказ вне области)
-# --------------------------------------------------------------------------
-
-@dataclass  # класс данных: методы сравнения и инициализации генерируются автоматически
-class ContractResult:
-    """Результат проверки контракта артефакта."""
-
-    ok: bool  # контракт выполнен
-    reason: str = ""  # причина отказа (пустая строка, если всё в порядке)
-    checked_pairs: int = 0  # число пар (вход, ответ), проверенных до остановки
-    counterexample: tuple | None = None  # вход, на котором найдено нарушение (None, если нет)
-
-
-def verify_artifact_contract(artifact: Artifact, teacher: Callable[..., int],
-                             domain: Sequence[Sequence[int]]) -> ContractResult:  # область точек; возвращает результат проверки
-    """Проверка артефакта по всей области: 100% совпадение с учителем и отказ вне области.
-
-    Для каждой точки xs области: артефакт обязан её поддерживать, иначе это отказ
-    (ABSTAIN) внутри сертифицированной области; значение артефакта должно равняться
-    ответу учителя. Затем словарь артефакта записывается в JSON и читается обратно —
-    результат обязан совпасть. Поиск движется по контрпримеру: первое же нарушение
-    возвращается, а не проглатывается."""
-    checked = 0  # число проверенных точек
-    for xs in domain:  # по точкам области
-        xs_t = tuple(xs)  # точка как кортеж xs_t
-        want = int(teacher(*xs_t))  # ожидаемый ответ want = int(teacher(xs_t))
-        try:  # вычисление артефакта может бросить ошибку
-            if not artifact.supports(xs_t):  # артефакт не поддерживает точку области
-                return ContractResult(False, "ABSTAIN inside certified domain",  # отказ: отказ внутри сертифицированной области,
-                                      checked, xs_t)  # с числом проверенных и контрпримером xs_t
-            got = int(artifact.eval(xs_t))  # ответ артефакта got = int(артефакт(xs_t))
-        except ValueError as e:  # артефакт бросил ValueError
-            return ContractResult(False, f"raised: {e}", checked, xs_t)  # отказ: артефакт бросил ошибку e; контрпример xs_t
-        if got != want:  # ответ артефакта не совпал с ответом учителя
-            return ContractResult(False, "mismatch", checked, xs_t)  # отказ: несовпадение; контрпример xs_t
-        checked += 1  # проверено точек: checked + 1
-    # Запись в JSON и чтение обратно
-    try:  # сериализация может бросить любую ошибку
-        d = artifact.to_dict()  # словарь артефакта
-        import json  # работа с JSON (локальный импорт)
-        rt = json.loads(json.dumps(d))  # rt = json.loads(json.dumps(d)) — прочитанная обратно копия
-        if rt != d:  # копия отличается от исходного словаря
-            return ContractResult(False, "json round-trip mismatch", checked)  # отказ: несовпадение после записи-чтения
-    except Exception as e:  # to_dict или JSON бросили ошибку
-        return ContractResult(False, f"to_dict failed: {e}", checked)  # отказ: ошибка e при получении словаря
-    return ContractResult(True, "verified", checked)  # контракт выполнен: проверено checked точек
-
-
-# --------------------------------------------------------------------------
-# Встроенные представления (обёртки над существующей лестницей синтеза)
-# --------------------------------------------------------------------------
-
-@dataclass  # класс данных: методы сравнения и инициализации генерируются автоматически
-class BuiltinRepr:
-    """Встроенное представление: предикат семейства задач и функция синтеза.
-
-    id — идентификатор; family_pred — проверка профиля задачи; synthesize_fn —
-    синтез по словарю наблюдений; origin — по умолчанию "builtin"."""
-
-    id: str  # идентификатор представления
-    family_pred: Callable[[dict], bool]  # предикат профиля задачи
-    synthesize_fn: Callable[..., Any]  # функция синтеза
-    origin: str = "builtin"  # происхождение — встроенное
-
-    @property  # доступ как к атрибуту
-    def meta_bits(self) -> int:  # длина описания конструкции в битах
-        """Длина описания встроенного представления: один токен, 8 бит."""
-        return 8  # один токен на встроенное представление
-
-    def supports_task(self, profile: dict) -> bool:
-        """Годится ли представление для задачи: предикат семейства; при его ошибке — False."""
-        try:  # предикат может бросить ошибку на неполном профиле
-            return bool(self.family_pred(profile))  # результат предиката как булево значение
-        except Exception:  # предикат бросил любую ошибку
-            return False  # считать, что задача не подходит
-
-    def probe_potential(self, obs: dict) -> float:
-        """Оценка потенциальной пользы: всегда 0.0.
-
-        Встроенные представления упорядочивает существующая лестница синтеза,
-        поэтому оценка потенциала не используется."""
-        # встроенные представления упорядочивает лестница синтеза; потенциал не нужен
-        return 0.0  # вернуть 0.0
-
-    def synthesize(self, obs: dict, budget: float, ledger: Any) -> Any:
-        """Синтез по наблюдениям obs через synthesize_fn(obs); при любой ошибке — None."""
-        try:  # синтез может бросить ошибку
-            return self.synthesize_fn(obs)  # результат функции синтеза (budget и ledger не передаются)
-        except Exception:  # функция синтеза бросила любую ошибку
-            return None  # синтез не удался
-
-
-def register_builtins() -> None:
-    """Обернуть три ветви лестницы обучения во встроенные представления и внести их в реестр.
-
-    Функции синтеза всех трёх возвращают None: сами ветви (булевы диаграммы Венна,
-    АНФ, шаблоны) обрабатывает прежняя лестница обучения, так что поведение
-    обучения не меняется."""
-    register(BuiltinRepr(  # зарегистрировать представление
-        "boolvenn",  # идентификатор — булевы диаграммы Венна
-        lambda prof: prof.get("family") == "BoolVenn",  # подходит задаче, у которой семейство — BoolVenn
-        lambda obs: None,  # синтез не делает ничего: булевы задачи обрабатывает сама лестница
-    ))  # конец регистрации
-    register(BuiltinRepr(  # зарегистрировать представление
-        "anf",  # идентификатор — алгебраическая нормальная форма
-        lambda prof: prof.get("bool_domain", False) and prof.get("arity", 0) <= 6,  # подходит булевой задаче (по умолчанию False) с арностью не выше 6 (по умолчанию 0)
-        lambda obs: None,  # синтез возвращает None
-    ))  # конец регистрации
-    register(BuiltinRepr(  # зарегистрировать представление
-        "templates",  # идентификатор — прямые шаблоны
-        lambda prof: prof.get("family") in ("Arith", "Poly", "Mixed"),  # подходит задаче арифметики, многочленов или смешанной
-        lambda obs: None,  # синтез возвращает None
-    ))  # конец регистрации
-
-
 # --------------------------------------------------------------------------
 # Сериализация артефактов: восстановление через реестр фабрик
 # --------------------------------------------------------------------------
 
 ARTIFACT_FACTORIES: dict[str, Callable[[dict], Any]] = {}  # фабрики артефактов: идентификатор представления -> функция словарь -> артефакт
-
-
-def register_artifact_factory(repr_id: str,  # идентификатор представления
-                              factory: Callable[[dict], Any]) -> None:  # фабрика артефакта
-    """Связать идентификатор представления repr_id с фабрикой factory, восстанавливающей артефакт из словаря."""
-    ARTIFACT_FACTORIES[repr_id] = factory  # записать фабрику по идентификатору (повторная запись заменяет прежнюю)
 
 
 def artifact_to_payload(value: dict) -> dict:
@@ -279,7 +145,7 @@ def construct_from_dict_safe(payload: dict) -> dict:
 
 from typing import Any, Callable  # повторный импорт типов (имена уже импортированы выше)
 from hagi.core import REIFIED_OPS  # реестр макрооператоров выражений Expr
-from hagi.invention import ConstructBlueprint  # чертёж изобретённой конструкции
+from hagi.invent.invention import ConstructBlueprint  # чертёж изобретённой конструкции
 REIFIED_OP_COST_BITS = 12  # длина описания одного переифицированного оператора в битах
 def _normalize_domain(domain: Any, arity: int):
     """Сертифицированная область как неизменяемое множество кортежей с проверкой арности.
@@ -326,16 +192,6 @@ def reify_construct(bp: ConstructBlueprint, name: str, fn: Callable[..., int], a
     _wrapped.reified_meta = {'op': op_name, 'arity': arity, 'meta_bits': REIFIED_OP_COST_BITS, 'origin': bp.q_name if hasattr(bp, 'q_name') else 'invented', 'domain': sorted(domain) if domain is not None else None, 'source': _source}  # метаданные: имя, арность, 12 бит, происхождение (имя фактора q_name у чертежа, иначе 'invented'), отсортированная область (или None), исходный текст (или None)
     REIFIED_OPS[op_name] = _wrapped  # внести обёртку в реестр макрооператоров
     return op_name  # вернуть имя оператора
-def snapshot_reified() -> dict:
-    """Сериализуемый снимок реестра макрооператоров: имя -> копия его метаданных (для сохранения в rewrite.py)."""
-    out = {}  # пустой снимок
-    for op, fn in REIFIED_OPS.items():  # по парам (имя оператора, функция)
-        meta = getattr(fn, 'reified_meta', {})  # метаданные функции (пустой словарь, если атрибута нет)
-        out[op] = dict(meta)  # копия метаданных в снимок
-    return out  # вернуть снимок
-def clear_reified() -> None:
-    """Очистить реестр макрооператоров."""
-    REIFIED_OPS.clear()  # удалить все операторы
 def _state_sig_path(state_dir):
     """Путь к файлу контрольной метки сохранённых операторов: invented_reprs.sig внутри state_dir."""
     from pathlib import Path  # работа с путями (локальный импорт)

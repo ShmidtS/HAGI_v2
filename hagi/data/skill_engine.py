@@ -69,7 +69,7 @@ def deg(p: frozenset[int]) -> int:
             Возвращает max popcount(t) по мономам t из p; для пустого p — 0."""
     return max((t.bit_count() for t in p), default=0)  # max popcount(t) по всем мономам; пустое множество даёт 0
 
-from hagi.util import sha  # импорт хеш-функции из общего модуля проекта
+from hagi.base.util import sha  # импорт хеш-функции из общего модуля проекта
 
 digest = sha  # digest = sha: хеш содержимого, единый для всех объектов (ключ дедупликации)
 

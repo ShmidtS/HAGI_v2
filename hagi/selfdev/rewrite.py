@@ -19,8 +19,8 @@
        новые раунды дописывают сегменты, экспертов и программы, состояние переписывается снова.
 
     Командная строка:
-      python -m hagi.rewrite --rounds N [--state-dir d]
-      python -m hagi.rewrite --resume --rounds N [--state-dir d]
+      python -m hagi.selfdev.rewrite --rounds N [--state-dir d]
+      python -m hagi.selfdev.rewrite --resume --rounds N [--state-dir d]
 
     Экспортирует: transpile, export_programs, run, RUNTIME_HELPERS, VAR_NAMES."""
 from __future__ import annotations  # отложенное вычисление аннотаций типов
@@ -34,9 +34,7 @@ import pickle  # сохранение процессора
 from pathlib import Path  # работа с путями файлов
 from typing import Any  # аннотации типов
 
-import hagi  # сам пакет
-from hagi.selfmodel import TracedProcessorV9  # (импортирован, в коде ниже не используется)
-from hagi.loop import run_self_development  # главный цикл саморазвития
+from hagi.selfdev.loop import run_self_development  # главный цикл саморазвития
 
 VAR_NAMES = ("x", "y", "z", "u", "v", "w")  # имена аргументов экспортируемых функций
 
@@ -286,7 +284,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,  #
         prior = state  # прежнее состояние
         # овеществлённые операции переживают холодный перезапуск (замыкание «изобретение ->
         # овеществление»): вчерашние изобретения — завтрашние примитивы
-        from hagi.representations import restore_reified_ops_state  # восстановление овеществлённых операций
+        from hagi.invent.representations import restore_reified_ops_state  # восстановление овеществлённых операций
         n_reified = restore_reified_ops_state(state_dir)  # число восстановленных операций
         if n_reified:  # они есть
             booted_from += f" + {n_reified} reified ops"  # дописать их число к источнику
@@ -299,11 +297,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,  #
     # все ядра процессора (решение пользователя: максимум для машины)
     eff_workers = workers or (os.cpu_count() or 4)  # число потоков: заданное, иначе число ядер, иначе 4
     # принятое настройками петли: значения регуляторов, принятые сертифицированным порогом, ведут рабочий цикл
-    try:  # модуль может отсутствовать
-        from hagi import selfedit  # самонастройка
-        adopted_kwargs = selfedit.adopted_settings()  # принятые настройки
-    except Exception:  # любая ошибка
-        adopted_kwargs = {}  # без настроек
+    adopted_kwargs = {}  # принятые настройки регуляторов: модуль самонастройки из пакета удалён, поэтому всегда пусто
     if "floor_ladder" not in adopted_kwargs:  # лестница не задана настройками
         adopted_kwargs["floor_ladder"] = ladder  # передать лестницу
     total = run_self_development(  # главный цикл саморазвития
@@ -325,7 +319,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,  #
     inc_path.write_bytes(pickle.dumps(final_proc))  # действующий процессор в incumbent.pkl
     # овеществлённые операции тоже сохраняются (непрерывность саморасширения)
     try:  # их может не быть
-        from hagi.representations import save_reified_ops_state  # сохранение овеществлённых операций
+        from hagi.invent.representations import save_reified_ops_state  # сохранение овеществлённых операций
         save_reified_ops_state(state_dir)  # записать в каталог состояния
     except Exception:  # сохранять нечего
         pass  # овеществлённых операций ещё нет — сохранять нечего
@@ -333,7 +327,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,  #
     # псевдоаргументы, сохранив граф вызовов, заново проверить всё точно; полная
     # библиотека остаётся в incumbent_full.pkl
     try:  # оптимизация не должна ломать цикл
-        from hagi import selfmodel as _opt  # сокращение библиотеки
+        from hagi.selfdev import selfmodel as _opt  # сокращение библиотеки
         _res = _opt.prune_library(final_proc)  # план сокращения
         _new, _fails = _opt.apply_prune(final_proc, _res["keep"])  # новый процессор и число неудач проверки
         if _fails == 0 and len(_new.experts) < len(final_proc.experts):  # проверка чистая и библиотека меньше
@@ -355,7 +349,7 @@ def run(rounds: int, state_dir: Path, workers: int = 0, resume: bool = False,  #
         "wasted": total["final"]["wasted_candidates_on_holds"],  # потрачено на удержания
     }
     # учёт фаз учебной программы: сертификат учебной программы, порядок элементов не важен
-    from hagi.school import certificate as _certificate  # сертификат учебной программы
+    from hagi.selfdev.school import certificate as _certificate  # сертификат учебной программы
     adopted = total["final"]["adopted_rounds"] or 1  # принято раундов (0 считается как 1, чтобы не делить на ноль)
     relief = adopted / (adopted + total["final"]["wasted_candidates_on_holds"])  # облегчение: relief = adopted / (adopted + wasted)
     prior_curr = (prior or {}).get("curriculum", [])  # прежние записи учебной программы
@@ -375,13 +369,8 @@ def _self_edit_guarded(cycle: int) -> None:  # один цикл самонас�
     """Каждый цикл: модель предлагает патч к собственным регуляторам обучения; решение о
     принятии принимает сертифицированный порог (нет регрессии по контрольным задачам).
     Любая ошибка печатается и не останавливает цикл."""
-    try:  # самонастройка под защитой
-        from hagi import selfedit  # модуль самонастройки
-        res = selfedit.self_edit_cycle(seed=cycle)  # один цикл самонастройки с зерном cycle
-        print(f"[self-edit] {res.get('decision')}: {res.get('patch')}",  # решение и патч
-              flush=True)  # сразу вывести
-    except Exception as e:  # ошибка самонастройки не останавливает цикл
-        print(f"[self-edit] skipped: {e!r}", flush=True)  # напечатать пропуск
+    # модуль самонастройки из пакета удалён: цикл всегда печатает пропуск, как раньше в ветке ошибки
+    print(f"[self-edit] skipped: {ModuleNotFoundError('hagi.selfedit')!r}", flush=True)  # напечатать пропуск с той же причиной
 
 
 def _archgenesis_guarded(cycle: int) -> None:  # редко: генезис архитектуры под защитой
@@ -391,7 +380,7 @@ def _archgenesis_guarded(cycle: int) -> None:  # редко: генезис ар
     if cycle % 20 != 7:  # не тот цикл (сдвиг 7, чтобы не совпадать с самонастройкой)
         return  # выход
     try:  # генезис под защитой
-        from hagi import genesis  # модуль генезиса
+        from hagi.data import genesis  # модуль генезиса
         res = genesis.genesis_cycle(seed=cycle,  # один цикл генезиса с зерном cycle
                                              profile="throughput")  # профиль — быстродействие
         print(f"[archgenesis] {res.get('decision')}: "  # решение и мутация
@@ -408,7 +397,7 @@ def _ec_evolution_guarded(cycle: int) -> None:  # эволюция процес�
     if cycle % 30 != 13:  # не тот цикл
         return  # выход
     try:  # эволюция под защитой
-        from hagi import genesis as ec  # модуль генезиса
+        from hagi.data import genesis as ec  # модуль генезиса
         profile = "throughput" if cycle % 60 < 30 else "security"  # профиль: throughput, если cycle mod 60 < 30, иначе security
         res = ec.evolve(pop_size=8, generations=3, profile=profile,  # эволюция: 8 особей, 3 поколения
                         seed=cycle)  # с зерном cycle
@@ -422,7 +411,7 @@ def _retrain_lm_guarded(state_dir: Path) -> None:  # переобучение б
     """Каждый цикл бесконечного режима: байтовая языковая модель переобучается на
     собственных артефактах модели (самореференциальный нейронный рост, с защитой от ошибок)."""
     try:  # переобучение под защитой
-        from hagi import school as mind  # модуль «школы» (нейронная часть)
+        from hagi.selfdev import school as mind  # модуль «школы» (нейронная часть)
         print("[lm]", mind.retrain(), flush=True)  # переобучить и напечатать итог
     except Exception as e:  # ошибка нейронной части не останавливает цикл
         print(f"[lm] retrain skipped: {e!r}", flush=True)  # напечатать пропуск
@@ -444,7 +433,7 @@ def main() -> None:  # командная строка
                   default=None)  # по умолчанию берётся из hagi.util.CKPT_DIR
     a = p.parse_args()  # разобрать аргументы
     if a.state_dir is None:  # каталог не задан
-        from hagi.util import CKPT_DIR  # каталог чекпойнтов
+        from hagi.base.util import CKPT_DIR  # каталог чекпойнтов
         a.state_dir = CKPT_DIR / "self"  # подкаталог self
     if a.forever:  # бесконечный режим
         import time as _time  # пауза между циклами

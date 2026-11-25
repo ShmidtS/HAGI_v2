@@ -28,30 +28,30 @@
 Экспортирует все перечисленные функции, классы и константы.
 """
 from __future__ import annotations  # отложенное вычисление аннотаций типов
+from typing import Callable, Sequence  # типы для аннотаций
 
 
-# # ============================================================
-# # ПРЕОБРАЗОВАНИЕ АДАМАРА СИЛЬВЕСТЕРА
-# # ============================================================
+# ---- ПРЕОБРАЗОВАНИЕ АДАМАРА СИЛЬВЕСТЕРА ----
 
-from typing import Callable  # тип «вызываемый объект»
 import numpy as np  # численные массивы
+
+
 def sylvester_mul(w: np.ndarray, n: int) -> np.ndarray:  # w — вектор, n — его длина (степень двойки)
     """Умножить вектор w на целочисленную матрицу Адамара Сильвестра размера n: H @ w."""
     return sylvester(int(np.log2(n))).astype(float) @ w  # H = матрица размера 2^k при k = log2(n); итог: H @ w в float
 
-# # ============================================================
-# # СЕРТИФИЦИРОВАННОЕ СЛИЯНИЕ ДВУХ СОСТОЯНИЙ
-# # ============================================================
+# ---- СЕРТИФИЦИРОВАННОЕ СЛИЯНИЕ ДВУХ СОСТОЯНИЙ ----
 
-from typing import Callable, Sequence  # типы «вызываемый объект» и «последовательность» (повторный импорт безвреден)
-import numpy as np  # численные массивы (повторный импорт безвреден)
+
+
 def lin_at(g: Sequence[float], w1: Sequence[float], w2: Sequence[float], t: float) -> float:  # градиент g, точки w1 и w2, параметр t вдоль отрезка
     """Приращение первого порядка функции L в точке w1 вдоль (w2 − w1): g·(w2 − w1)·t."""
     g = np.asarray(g)  # g в массив
     w1 = np.asarray(w1)  # w1 в массив
     w2 = np.asarray(w2)  # w2 в массив
     return float(g @ (w2 - w1)) * t  # приращение: (g · (w2 − w1))·t
+
+
 def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequence[float], w2: Sequence[float]) -> dict:  # L — функция потери, g — градиент в w1, w1 и w2 — сливаемые точки
     """Измерить невязки δ (в середине) и δ₂ (в конце) и вернуть сертифицированную
     границу L(mid) <= (L1 + L2)/2 + δ + δ₂/2.
@@ -74,11 +74,8 @@ def merge_bound(L: Callable[[np.ndarray], float], g: Sequence[float], w1: Sequen
     bound = (L1 + L2) / 2.0 + delta_mid + delta_end / 2.0  # граница: bound = (L1 + L2)/2 + δ + δ₂/2
     return {'L_mid': float(L(mid)), 'bound': bound, 'delta_mid': delta_mid, 'delta_end': delta_end, 'certified': float(L(mid)) <= bound + 1e-12}  # словарь: L_mid, граница, обе невязки, флаг certified = L_mid <= bound + 1e-12
 
-# # ============================================================
-# # ФИЛЬТР КОГЕРЕНТНОСТИ АДАМАРА
-# # ============================================================
+# ---- ФИЛЬТР КОГЕРЕНТНОСТИ АДАМАРА ----
 
-import numpy as np  # численные массивы (повторный импорт безвреден)
 def sylvester(k: int) -> np.ndarray:  # k — показатель степени; размер матрицы 2^k
     """Целочисленная ±1 матрица Адамара Сильвестра размера 2^k (рекурсивное кронекерово произведение)."""
     if k < 0:  # k отрицательно
@@ -87,6 +84,8 @@ def sylvester(k: int) -> np.ndarray:  # k — показатель степен�
     for _ in range(k):  # k раз
         H = np.block([[H, H], [H, -H]])  # рекурсия: H_{j+1} = [[H_j, H_j], [H_j, −H_j]]
     return H  # матрица размера 2^k
+
+
 def coh_sq(w: np.ndarray) -> float:  # w — вектор
     """Когерентность: cohSq = ‖w‖∞² / ‖w‖₂² (0 для нулевого вектора — измерять нечего)."""
     w = np.asarray(w, dtype=float).ravel()  # w в плоский вещественный вектор
@@ -94,6 +93,8 @@ def coh_sq(w: np.ndarray) -> float:  # w — вектор
     if l2 <= 0:  # нулевая энергия
         return 0.0  # нет данных — 0
     return float(w.max() ** 2 if w.max() >= 0 else (-w).max() ** 2) / l2 if False else float(np.abs(w).max()) ** 2 / l2  # итог: ‖w‖∞² / ‖w‖₂², где ‖w‖∞ = max_i |w_i| (левая ветка «if False» не вычисляется)
+
+
 def rotate_gate(w: np.ndarray) -> dict:  # w — вектор длины 2^k
     """Сравнить cohSq(w) и cohSq(H w) и принять решение. Длина w должна быть
     степенью двойки.
@@ -109,11 +110,8 @@ def rotate_gate(w: np.ndarray) -> dict:  # w — вектор длины 2^k
     before, after = (coh_sq(w), coh_sq(hw))  # когерентности до и после: (cohSq(w), cohSq(H w))
     return {'cohSq_before': before, 'cohSq_after': after, 'rotate': after < before, 'energy_ratio': float((hw * hw).sum() / (w * w).sum()) if (w * w).sum() > 0 else 1.0}  # словарь: обе когерентности, решение rotate = after < before и отношение энергий ‖H w‖²/‖w‖² (1 при нулевой энергии)
 
-# # ============================================================
-# # РОСТ СТВОЛА ОСТАТОЧНЫМИ БЛОКАМИ
-# # ============================================================
+# ---- РОСТ СТВОЛА ОСТАТОЧНЫМИ БЛОКАМИ ----
 
-from typing import Callable, Sequence  # типы (повторный импорт безвреден)
 class ResidualBlock:  # остаточный блок: y = x + γ·h(x)
     """Остаточный блок: y = x + γ·h(x); при γ = 0 — точное тождество."""
 
@@ -128,21 +126,6 @@ class ResidualBlock:  # остаточный блок: y = x + γ·h(x)
 
     def set_gamma(self, gamma: float) -> None:  # новое значение веса
         self.gamma = float(gamma)  # установить γ
-def grow_trunk(trunk: Sequence[Callable], h: Callable) -> list[Callable]:  # ствол и новая ветвь h
-    """Дописать блок с нулевым γ: функция ствола сохраняется ТОЧНО. Возвращает
-    новый ствол. При повторных дописываниях блоки компонуются: только
-    свежий блок может получить γ != 0, все прежние блоки по договорённости
-    заморожены (их γ не меняется; обучается только новый блок)."""
-    return list(trunk) + [ResidualBlock(h, gamma=0.0)]  # новый ствол: прежние блоки + ResidualBlock(h, γ = 0)
-def run_trunk(trunk: Sequence[Callable], x):  # ствол и вход x
-    """Применить блоки слева направо: x <- b(x) для каждого b. Возврат — итог."""
-    for b in trunk:  # по блокам
-        x = b(x)  # применить блок: x = b(x)
-    return x  # итог
-def obj_invariant_check(trunk_old: Sequence[Callable], trunk_new: Sequence[Callable], xs, obj: Callable) -> bool:  # старый и новый ствол, точки xs, целевая функция obj
-    """Проверка инварианта: значение obj на выходе ствола не изменилось после
-    дописывания блока — для всех точек xs (точное равенство float)."""
-    return all((obj(run_trunk(trunk_old, x)) == obj(run_trunk(trunk_new, x)) for x in xs))  # True, если для всех x: obj(старый(x)) == obj(новый(x))
 
 # # ==================================================================
 # # ОКРУГЛЕНИЕ ПРИ РОСТЕ: привязка к сетке q/2^k на границах роста.
@@ -157,14 +140,6 @@ def snap_rational(value, k: int) -> _Fr:  # значение, точность k
     scaled = f * (1 << k)  # масштаб: scaled = f·2^k
     q = (scaled.numerator * 2 + scaled.denominator) // (2 * scaled.denominator)  # q = floor((2·num + den)/(2·den)) — округление к ближайшему чётному
     return _Fr(q, 1 << k)  # результат: Fraction(q, 2^k)
-
-
-def snap_denominator_reset(x, k: int):  # x — число или последовательность, k — точность
-    """Округлить значения (скаляр или последовательность) так, чтобы каждый
-    знаменатель был <= 2^k."""
-    if isinstance(x, (list, tuple)):  # x — список или кортеж
-        return type(x)(snap_rational(v, k) for v in x)  # тот же тип из округлённых элементов
-    return snap_rational(x, k)  # скаляр — округлить одно значение
 
 
 def snap_obj_bound(s_err: float, ds: float) -> float:  # ошибка s_err = s − y, сдвиг признака ds
@@ -294,15 +269,6 @@ def polar_express(G) -> "np.ndarray":  # G — матрица
         X = a * X + b * (X2 @ X) + c * (X2 @ X2 @ X)  # шаг: X = a·X + b·(X2 @ X) + c·(X2 @ X2 @ X)
     return X.T if transposed else X  # вернуть X, при транспонировании — обратно Xᵀ
 
-def adapter_param_count(d: int, r: int, full_block_d: int | None = None) -> dict:  # d и r — размерности адаптера, full_block_d — размер полного блока
-    """Подсчёт параметров: адаптер 2·r·d против полного блока d·d
-    (адаптер не больше полного блока при r <= d/2)."""
-    out = {"adapter": 2 * r * d}  # словарь: число параметров адаптера 2·r·d
-    if full_block_d is not None:  # задан размер полного блока
-        out["full_block"] = full_block_d * full_block_d  # число параметров: full_block = full_block_d²
-        out["ratio"] = out["adapter"] / out["full_block"]  # доля параметров: ratio = adapter/full_block
-    return out  # итог
-
 
 class AdapterBank:  # банк адаптеров по доменам
     """Независимые адаптеры по доменам: один общий ствол и голова плюс
@@ -341,9 +307,7 @@ class AdapterBank:  # банк адаптеров по доменам
         return sum(a.n_params for a in self._adapters.values())  # сумма n_params по всем адаптерам
 
 
-# # ==================================================================
-# # Проекционный весовой спад и точный вклад покрытия.
-# # ==================================================================
+# ---- Проекционный весовой спад и точный вклад покрытия. ----
 
 def projected_weight_decay(W, P, c: float, complement_update=None):  # W — веса, P — проектор, c — скорость спада, complement_update — обновление в дополнении
     """Спад весов с защитой: W' = W − dC − c·(W − W P); предполагается
@@ -354,19 +318,6 @@ def projected_weight_decay(W, P, c: float, complement_update=None):  # W — в�
     d = (np.zeros_like(W) if complement_update is None  # dC = нули, если обновление не задано,
          else np.asarray(complement_update, dtype=np.float64))  # иначе complement_update в float64
     return W - d - c * (W - W @ P)  # итог: W' = W − dC − c·(W − W @ P)
-
-
-def exact_ce_contribution(p_true: float) -> float:  # p_true — вероятность истинного байта
-    """Точный вклад кросс-энтропии: ноль только при p == 1; p <= 0 отвергается
-    вместо вычисления −log(0)."""
-    import math  # математические функции
-    p = float(p_true)  # p как float
-    if p == 1.0:  # p = 1 — вклад нулевой
-        return 0.0  # вернуть 0.0
-    if p <= 0.0:  # p <= 0 — логарифм не определён
-        raise ValueError(  # ошибка значения
-            "invalid exact coverage: true-byte probability must be > 0")  # текст ошибки
-    return -math.log(p)  # вклад: −ln(p)
 
 
 # # Кодек: пять троичных уровней в одном байте (3^5 = 243 <= 2^8).

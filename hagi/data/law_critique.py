@@ -235,7 +235,7 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:  # path — пут
 
 def _default_paths() -> tuple[Path, Path, Path]:  # возврат — пути inbox, файла состояния и журнала
     try:  # попытка импорта
-        from hagi.util import CKPT_DIR  # каталог сохранённых состояний
+        from hagi.base.util import CKPT_DIR  # каталог сохранённых состояний
         root = Path(CKPT_DIR)  # корень — этот каталог
     except Exception:  # импорт не удался
         root = Path(os.environ.get("HAGI_CKPT_DIR", "checkpoints"))  # корень — из переменной окружения HAGI_CKPT_DIR или "checkpoints"

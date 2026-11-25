@@ -117,7 +117,6 @@ def rollback(registry_remove: Callable[[str], None], repr_id: str, restore_snaps
 # ============================================================
 
 from dataclasses import dataclass  # класс-запись (повторный импорт безвреден)
-from typing import Callable  # тип «вызываемый объект» (повторный импорт безвреден)
 @dataclass  # класс-запись
 class CapabilitySnapshot:  # снимок способности модели в одной версии
     """Снимок способности модели в одной версии: версия, биты описания, доля
@@ -179,7 +178,6 @@ def fisher_tolerances(col_curv: Sequence[float], B: float, w: Sequence[float] | 
 # ============================================================
 
 from collections import Counter  # счётчик по ключам
-from dataclasses import dataclass  # класс-запись
 from typing import Callable, Iterable  # типы «вызываемый объект» и «итерируемый»
 class OracleQueryBudgetExceeded(RuntimeError):  # ошибка времени выполнения
     """Возникает, когда новый вызов учителя превысил бы бюджет разных запросов."""
@@ -258,9 +256,6 @@ class CachedOracle:  # кэширующая обёртка над учителе
 # ЗАПРОС ПО КОМИТЕТУ
 # ============================================================
 
-import math  # математические функции (повторный импорт безвреден)
-from collections import defaultdict  # словарь со значением по умолчанию
-from dataclasses import dataclass  # класс-запись (повторный импорт безвреден)
 from typing import Callable, Hashable, Sequence, TypeVar  # типы и переменная типа
 H = TypeVar('H')  # переменная типа для гипотез
 X = TypeVar('X')  # переменная типа для точек

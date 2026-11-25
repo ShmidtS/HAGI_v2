@@ -17,8 +17,8 @@ from __future__ import annotations  # отложенное вычисление 
 # ENV TEMPORAL: 5-битный мир, активное отождествление
 # ============================================================
 
-from hagi.util import sha  # хеш-функция sha
-import argparse, itertools, json, math, random, statistics, time  # стандартные модули: аргументы командной строки, перестановки, json, math, случайность, статистика, время
+from hagi.base.util import sha  # хеш-функция sha
+import argparse, itertools, json, math, random, statistics  # стандартные модули: аргументы командной строки, перестановки, json, math, случайность, статистика, время
 from collections import deque  # двусторонняя очередь для поиска в ширину
 from dataclasses import dataclass, field  # декоратор dataclass и фабрика полей по умолчанию
 from pathlib import Path  # класс Path для путей
@@ -756,7 +756,7 @@ if __name__ == '__main__':  # файл запущен напрямую — вы�
 # ============================================================
 
 import random  # модуль случайности
-from hagi import env_temporal as env  # импорт этого же модуля как env
+from hagi.data import env_temporal as env  # импорт этого же модуля как env
 def env_model_to_netlist(model_id: int, clock_action: int | None=None, seed: int=4242, context: str='core', goal: int=5) -> dict:
     """Активно обучиться миру и скомпилировать его таблицу в сеть вентилей."""
     bank = env.generate_bank()  # банк моделей
@@ -765,7 +765,7 @@ def env_model_to_netlist(model_id: int, clock_action: int | None=None, seed: int
     res = agent.run_task(w, random.Random(1))  # решить задачу
     cand = env.candidate_records(res['clock_action'])[res['model_id']]  # кандидат по найденным модели и часам
     table = env.build_candidate_table(cand, res['clock_action'], bank)  # таблица кандидата
-    from hagi.env_lut import compile_transition_table  # импорт компилятора таблиц в сеть
+    from hagi.data.env_lut import compile_transition_table  # импорт компилятора таблиц в сеть
     compiled = compile_transition_table(table, n_bits=5, n_act_bits=2)  # скомпилировать (5 бит состояния, 2 бита действия)
     net = compiled['net']  # сеть вентилей
     return {'net': net, 'table': table, 'model_id': res['model_id'], 'learn_mode': res['mode'], 'anf': compiled['anf'], 'gates': compiled['gates'], 'depth': compiled['depth'], 'behavioral_exact': compiled['behavioral_exact']}  # вернуть сеть, таблицу, модель, режим обучения, АНФ, число вентилей, глубину, признак точности
@@ -775,12 +775,9 @@ def env_model_to_netlist(model_id: int, clock_action: int | None=None, seed: int
 # ============================================================
 
 import argparse, json  # стандартные модули: аргументы, json
-from collections import deque  # двусторонняя очередь
-from pathlib import Path  # класс Path
 N = 32  # число состояний N = 32
 A = 4  # число действий A = 4
 MODEL_BANK = []  # банк моделей для верификатора (заполняется извне)
-from hagi.util import sha  # хеш-функция sha
 digest = sha  # синоним digest для sha
 def next_state(role, s, p):
     """Независимая реализация перехода роли (clock, xor, guard, delay)."""

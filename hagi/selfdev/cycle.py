@@ -23,14 +23,11 @@ prev_gates, prev_netlist, commit, TAPEOUT, ROOT.
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
 import json  # чтение и запись JSON
-import sys  # системные параметры (импортирован без использования)
 import time  # отметка времени закрепления
-from pathlib import Path  # пути к файлам
 
-from hagi import fabric, unified  # работа с логическими схемами; unified импортирован без использования
-from hagi.util import CKPT_DIR  # каталог сохранённых состояний
+from hagi.data import fabric  # работа с логическими схемами; unified импортирован без использования
+from hagi.base.util import CKPT_DIR  # каталог сохранённых состояний
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта: каталог над hagi
 TAPEOUT = CKPT_DIR / "processor_netlist.json"  # файл списка схем процессора
 
 # ---------- ВЫВОД: задачи для схем ----------
@@ -112,7 +109,7 @@ def compose_adder2() -> dict:  # собрать двухразрядный су�
         a0 + b0 + cin -> (s0, c1); вторая: a1 + b1 + c1 -> (s1, c2). Схема
         проверяется по полной таблице из 32 строк. Возврат: словарь результата
         или None, если хотя бы одна строка неверна."""
-    from hagi import fabric  # эмуляция и проверка схем (повторный импорт безвреден)
+    from hagi.data import fabric  # эмуляция и проверка схем (повторный импорт безвреден)
     def adder_cell(srcA, srcB, srcC, base):  # входы A, B, перенос C; base — номер первого свободного провода
         g = [  # вентили ячейки; выход вентиля с индексом i имеет номер base + i
             {"a": srcA, "b": srcB, "mask": fabric.MASKS["XOR"]},  # вентиль: base+0: t = A ⊕ B
@@ -158,7 +155,7 @@ def fusion_fastpath(task: dict) -> dict | None:  # быстрый путь: мн
         4) Схема многочлена превращается в геном и проверяется по полной таблице
            истинности задачи; при ошибке или несовпадении — None.
         Возврат: словарь с геномом, стоимостью в битах и сведениями о способе."""
-    from hagi.skill_engine import (ProofCarryingANFLearner,  # подбор многочлена с доказательством
+    from hagi.data.skill_engine import (ProofCarryingANFLearner,  # подбор многочлена с доказательством
                                    ExactMDLLibrary)  # библиотека точных описаний (импортирована без использования)
     n = task["n_inputs"]  # число входов
     if n < 1 or n > 14:  # число входов вне поддерживаемого диапазона
@@ -228,7 +225,7 @@ def weave_task(task: dict, pop_size: int = 100, generations: int = 3000,  # за
     # класс конструкции по наблюдениям (честный отказ, если класс вне
     # параметрического пространства). Печатается, на закрепление не влияет.
     try:  # открытие представлений не должно ломать цикл
-        from hagi import invention as _rdl  # модуль открытия классов переходов
+        from hagi.invent import invention as _rdl  # модуль открытия классов переходов
 
         class _TaskWorld:  # среда для открытия классов (в коде ниже не используется)
             clock_action = 0  # действие «ждать» — номер 0

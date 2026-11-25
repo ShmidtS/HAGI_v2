@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Цикл саморазвития HAGI: многократный вывод модели самого себя и её принятие.
 
-Надстройка над hagi.selfmodel (однократный цикл СЛЕД -> ВЫВОД -> ОПТИМИЗАЦИЯ -> ГЕЙТ):
+Надстройка над hagi.selfdev.selfmodel (однократный цикл СЛЕД -> ВЫВОД -> ОПТИМИЗАЦИЯ -> ГЕЙТ):
 
   1. Точная модель самого себя в виде решающего списка: таблица с ключом из всех
      признаков следа; неизвестный ключ -> осторожный базовый бюджет. На следе она
@@ -22,7 +22,7 @@
     torch. Все слияния идут в порядке потока, поэтому оба прогона (рост и
     оптимизированный повтор) детерминированы и сравнимы.
 
-Запуск: python -m hagi.loop [--max-rounds N] [--workers N] [--json]
+Запуск: python -m hagi.selfdev.loop [--max-rounds N] [--workers N] [--json]
 """
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
@@ -40,8 +40,8 @@ from typing import Any, Optional  # типы для аннотаций
 
 import numpy as np  # численные массивы и генератор случайных чисел
 
-import hagi  # ядро системы: набор задач, предложения задач, процессоры
-from hagi.selfmodel import (  # из модуля модели самого себя:
+from hagi.core import make_task_suite, propose_noncircular_task  # ядро: учебный набор задач и предложение новых задач
+from hagi.selfdev.selfmodel import (  # из модуля модели самого себя:
     FEATURE_KEYS,  # имена семи признаков задачи в следе
     SelfOptimizingProcessorV9,  # процессор с бюджетом от модели самого себя
     TracedProcessorV9,  # процессор, ведущий след своего обучения
@@ -161,7 +161,7 @@ class SelfModelPolicyProcessor(SelfOptimizingProcessorV9):
         (1 или неизвестный ключ) -> base_budget. Остальные аргументы kw передаются
         в learn базового класса с пропуском политики по программе; возвращает
         событие обучения."""
-        from hagi.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
+        from hagi.selfdev.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
         feats: dict[str, Any] = dict(zip(  # словарь признаков: имя признака -> значение
             FEATURE_KEYS,  # имена семи признаков
             _features(spec, self, seed,  # вектор признаков задачи spec для этого процессора с зерном seed
@@ -339,7 +339,7 @@ def _assign_budget(proc, spec, seed: int, train_fraction: float = 0.70) -> int:
     (предсказанный неуспех -> floor_budget, иначе base_budget; счётчик уменьшений
     увеличивается). Иначе — текущий node_budget процессора."""
     if hasattr(proc, "dl"):  # у процессора есть атрибут dl (решающий список)
-        from hagi.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
+        from hagi.selfdev.selfmodel import _features  # функция вектора признаков задачи (локальный импорт)
         feats = dict(zip(FEATURE_KEYS, _features(spec, proc, seed, train_fraction)))  # словарь признаков: имя -> значение вектора признаков
         feats["seed"] = int(seed)  # добавить зерно как целое
         pred = proc.dl.predict_success(feats)  # предсказание успеха: 0, 1 или None
@@ -379,7 +379,7 @@ def run_stream(proc, segments: list[tuple[int, int]],  # запустить де
     (suite, имя) и (seg, имя, действие) в порядке потока."""
     names = getattr(proc, "stream_names", None)  # список имён задач потока, если процессор его ведёт
     actions = getattr(proc, "stream_actions", None)  # список действий потока, если процессор его ведёт
-    for sp in (suite if suite is not None else hagi.make_task_suite()):  # по задачам базового набора (при None — полный учебный набор)
+    for sp in (suite if suite is not None else make_task_suite()):  # по задачам базового набора (при None — полный учебный набор)
         if names is not None:  # имена записываются
             names.append(("suite", sp.name))  # дописать ("suite", имя задачи)
         ev = proc.learn(sp, seed=10_000, train_neural=train_neural)  # выучить задачу с зерном 10000; ev — событие обучения
@@ -393,7 +393,7 @@ def run_stream(proc, segments: list[tuple[int, int]],  # запустить де
             # собрать один пакет предложений по текущему снимку библиотеки
             batch: list[tuple[Any, int]] = []  # пакет пар (задача, зерно)
             while k < n_prop and len(batch) < batch_size:  # пока есть лимит и пакет не полон
-                prop = hagi.propose_noncircular_task(proc.experts, rng, 0, seen)  # предложить новую некруговую задачу по текущим экспертам; None — предложений нет
+                prop = propose_noncircular_task(proc.experts, rng, 0, seen)  # предложить новую некруговую задачу по текущим экспертам; None — предложений нет
                 if prop is None:  # подходящей задачи не нашлось
                     k = n_prop  # сегмент исчерпан: счётчик равен лимиту
                     break  # прервать набор пакета
@@ -505,7 +505,7 @@ def run_self_development(max_rounds: int = 4,  # саморазвитие: не 
     ladder = list(floor_ladder) if floor_ladder else [floor_budget]  # расписание нижнего бюджета: копия floor_ladder либо [floor_budget]
     report: dict[str, Any] = {"rounds": [], "base_budget": base_budget,  # отчёт: пустой список раундов и базовый бюджет
                               "floor_ladder": ladder, "workers": workers}  # расписание нижнего бюджета и число исполнителей
-    suite = hagi.make_task_suite()  # базовый учебный набор задач
+    suite = make_task_suite()  # базовый учебный набор задач
     segments: list[tuple[int, int]] = [tuple(s) for s in (initial_segments or [])]  # поток предложений: копия initial_segments (пустой список, если None)
     round_offset = len(segments)  # смещение нумерации раундов = числу уже записанных сегментов
     cache = ReplayCache()  # пустой кэш повторного прогона

@@ -24,11 +24,9 @@ from __future__ import annotations  # отложенное вычисление 
 import random  # генератор случайных чисел
 
 import numpy as np  # численные массивы
-from collections import Counter  # счётчик (импортирован без использования)
 from typing import Callable  # тип «вызываемый объект»
 
-from hagi.invention import (BASES, ConstructBlueprint,  # меню базисов и чертёж «характеристика + базис»
-                            _payload_bits, verify_blueprint)  # стоимость нагрузки в битах; проверка чертежа (импортирована без использования)
+from hagi.invent.invention import BASES, ConstructBlueprint, _payload_bits  # меню базисов и чертёж «характеристика + базис»
 
 # ---- характеристические функции от кортежей контекста ----------------------------
 

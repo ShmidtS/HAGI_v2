@@ -43,5 +43,5 @@ from pathlib import Path as _Path  # работа с путями (под кор
 # через CKPT_DIR, чтобы весь проект лежал в одном месте.
 # Тесты задают переменную окружения HAGI_CKPT_DIR и указывают ей
 # временную папку, поэтому рабочие чекпойнты не затрагиваются.
-ROOT = _Path(__file__).resolve().parents[1]  # корень проекта: полный путь к этому файлу, подняться на один уровень выше папки hagi
+from hagi.base.config import ROOT  # корень проекта (единое место — hagi.base.config)
 CKPT_DIR = _Path(_os.environ.get("HAGI_CKPT_DIR", str(ROOT / "checkpoints")))  # каталог чекпойнтов: путь из HAGI_CKPT_DIR, если задан, иначе ROOT/checkpoints

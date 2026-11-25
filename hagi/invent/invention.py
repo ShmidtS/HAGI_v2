@@ -670,10 +670,7 @@ def register_derived_masks(pairs: list[tuple[int, int]]) -> int:
 # АКТИВНЫЙ СИНТЕЗ ПОД ВОЗДЕЙСТВИЕМ КОНТРИМЕРОВ
 # ============================================================
 
-import random  # повторный импорт random
 from dataclasses import dataclass, field  # dataclass, field — классы-записи и значения по умолчанию
-from typing import Callable  # тип Callable
-from hagi.invention import ConstructBlueprint, synthesize_blueprint  # импорт чертежа и синтеза из этого же модуля
 @dataclass  # класс данных
 class CounterexampleMemory:  # память контрпримеров
     """Память известных трудных точек: каждый новый кандидат проверяется по ней первым."""
@@ -765,14 +762,13 @@ def cegis_invent(train_x: list[int], query: Callable[[int], int | None], cegis_p
             train[ce[0]] = ce[1]  # добавить контрпример из пула в train
             best = bp  # лучший — этот чертёж
     return CegisResult('HOLD_CEGIS_EXHAUSTED', best, max_rounds, queries, len(train))  # HOLD_CEGIS_EXHAUSTED: раунды исчерпаны
-from hagi.invention import verify_blueprint  # импорт verify_blueprint из этого же модуля
 
 # ============================================================
 # НЕЙРОННЫЙ АПРИОР ПРЕДЛОЖЕНИЙ
 # ============================================================
 
 import numpy as np  # numpy — массивы и экспонента
-from hagi.diagnosis import ResidualProfile  # импорт профиля остатков
+from hagi.invent.diagnosis import ResidualProfile  # импорт профиля остатков
 FAMILIES = ('mod', 'xor', 'reflect', 'mask', 'shift')  # имена семейств
 def profile_features(p: ResidualProfile) -> np.ndarray:  # профиль остатков -> 10-мерный вектор структурных признаков
     """Вектор из 10 структурных признаков профиля остатков ResidualProfile."""
@@ -818,8 +814,7 @@ DEFAULT_PRIOR = NeuralProposalPrior()  # априор по умолчанию
 # ПОИСК ЦИКЛОВ WHILE (Беллман / орбиты)
 # ============================================================
 
-from dataclasses import dataclass  # импорт dataclass (повторно)
-from typing import Callable, Sequence  # типы Callable и Sequence
+from typing import Callable  # типы Callable и Sequence
 def _digit_sum10(x: int) -> int:
     """Сумма десятичных цифр числа x."""
     x = abs(int(x))  # модуль и целочисленность x

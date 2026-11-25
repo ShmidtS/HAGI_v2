@@ -26,11 +26,9 @@ fitness, random_genome, mutate, crossover, tournament, evolve, main, а в ко�
 
 import json  # чтение и запись журналов в JSON
 import time  # замеры времени и отметки времени
-from pathlib import Path  # пути к файлам
 from typing import Any  # произвольный тип значений
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта: каталог над hagi
-from hagi.util import CKPT_DIR as _CKPT  # каталог контрольных точек, под именем _CKPT
+from hagi.base.util import CKPT_DIR as _CKPT  # каталог контрольных точек, под именем _CKPT
 GENESIS_LOG = _CKPT / "self" / "archgenesis.json"  # журнал принятых и отклонённых изменений настроек
 
 # --- Объявленное пространство архитектур (только безопасные регуляторы) ---
@@ -86,7 +84,7 @@ def current_config() -> dict[str, Any]:
 
         Возвращает словарь {workers, batch_size, proposals_per_round,
         max_rounds}."""
-    from hagi import selfmodel as se  # модуль само-редактирования (импортируется здесь, под именем se)
+    from hagi.selfdev import selfmodel as se  # модуль само-редактирования (импортируется здесь, под именем se)
 
     cur = {"workers": 8, "batch_size": 8, "proposals_per_round": 10, "max_rounds": 4}  # умолчания: workers 8, batch_size 8, proposals_per_round 10, max_rounds 4
     try:  # чтение принятых настроек может отказать — это не должно ломать цикл
@@ -105,7 +103,7 @@ def benchmark_config(cfg: dict[str, Any]) -> dict[str, float]:
         relief = A / (A + W), где A = max(1, fin.adopted_rounds),
         W = fin.wasted_candidates_on_holds; economy = A / max(dt, 1e−9);
         seconds = dt — время прогона в секундах."""
-    from hagi import loop as sl  # модуль цикла самообучения, под именем sl
+    from hagi.selfdev import loop as sl  # модуль цикла самообучения, под именем sl
 
     workers = min(  # workers = min(cfg.workers, предел), предел зависит от размера _seg_est
         int(cfg.get("workers", 8)),  # число веток из cfg (умолчание 8) как целое
@@ -248,13 +246,8 @@ def genesis_cycle(
 # Эволюция: турнирный отбор + одноточечное скрещивание + мутация.
 # Честный журнал: checkpoints/self/ec_evolution.json.
 
-import json  # повторный импорт json (имя уже есть)
 import random  # генератор случайных чисел для эволюции
-import time  # повторный импорт time (имя уже есть)
-from pathlib import Path  # повторный импорт Path (имя уже есть)
-from typing import Any  # повторный импорт Any (имя уже есть)
 
-ROOT = Path(__file__).resolve().parent.parent  # корень проекта (присваивается заново тому же значению)
 EVO_LOG = _CKPT / "self" / "ec_evolution.json"  # журнал эволюции геномов
 
 # --- Сертифицированная задача: фиксированная короткая кривая Вейерштрасса ---

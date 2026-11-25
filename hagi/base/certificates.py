@@ -39,7 +39,7 @@ FORMAT = "HAGI-PORTABLE-CERT-V2"  # имя формата сертификата
 FORMAT_VERSION = 2  # номер текущей версии формата
 AST_SCHEMA = "hagi.expr.v1"  # имя схемы выражений
 VERIFIER_PROFILE = "hagi.portable-verifier.v2"  # имя профиля проверяющего
-TOKEN_BITS = 6  # число битов на токен выражения
+from hagi.base.config import TOKEN_BITS  # число битов на токен выражения — общий формат кодера и сертификатов
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024  # максимальный размер артефакта: 64·2^20 байтов
 MAX_SIGNATURE_BYTES = 128 * 1024  # максимальный размер файла подписи или ключа: 128·2^10 байтов
 MAX_DOMAIN_ROWS = 250_000  # максимальное число строк области одной задачи
