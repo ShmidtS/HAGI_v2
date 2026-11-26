@@ -29,7 +29,6 @@ import time  # статистика, системные функции, заме
 from pathlib import Path  # пути к файлам
 from typing import Any, Optional, Sequence  # типы для аннотаций
 import numpy as np  # численные массивы и генератор случайных чисел
-from typing import Any, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.synthesis.venn import (  # из модуля диаграмм Венна импортировать:
     anf_to_call_dag,  # преобразование поляризованной полиномиальной формы в выражение
     anf_transform,  # преобразование таблицы истинности в полиномиальную форму

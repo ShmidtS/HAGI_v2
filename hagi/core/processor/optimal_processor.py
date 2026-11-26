@@ -26,12 +26,6 @@ from hagi.core.processor.experts import (  # импорт из модуля expe
     GrowthEvent  # GrowthEvent — импортируемое имя
 )  # конец импорта
 from hagi.core.synthesis.prefilter import DEFAULT_NODE_BUDGET, DEFAULT_POP_BUDGET, SIEVE_SIZE, LegacyProcessor, VALIDATION_CHUNK  # имена из «prefilter» (модуль, где они определены)
-from hagi.core.processor.experts import Expert, GrowthEvent  # имена из «experts» (модуль, где они определены)
-from hagi.core.neural.fiber import NeuralFiber  # имена из «fiber» (модуль, где они определены)
-from typing import Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
-from hagi.core.language.expr_dsl import Program  # имена из «expr_dsl» (модуль, где они определены)
-from hagi.core.tasks.stored_tasks import TaskSpec  # имена из «stored_tasks» (модуль, где они определены)
-from hagi.core.tasks.candidates import candidate_programs  # имена из «candidates» (модуль, где они определены)
 from hagi.core.language.code_length import (  # импорт из модуля code_length
     _TOKEN_BITS,  # _TOKEN_BITS — импортируемое имя
     _gamma_bits,  # _gamma_bits — импортируемое имя

@@ -32,7 +32,6 @@ from hagi.selfdev.cycle import ( compose_adder2, commit, derive_tasks, fusion_fa
 from hagi.base.util import CKPT_DIR  # каталог контрольных точек
 from scripts.feed_all_c import ( CHUNK_TARGET, SKIP_DIRS, iter_files, load_state, save_state, sample_bytes, )  # загрузчик потока данных и его настройки
 
-from hagi.base.util import ( CKPT_DIR, )  # повторный импорт каталога контрольных точек (импорт уже сделан выше)
 
 TAPEOUT = ( CKPT_DIR / "processor_netlist.json" )  # путь списка схем процессора (в этом файле далее не используется)
 

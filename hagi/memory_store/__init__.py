@@ -66,7 +66,6 @@ class SemanticMemory:
         """Псевдоним query для совместимости с memory_agent: вернуть до limit
         объектов с атрибутами page_id и text."""
         res = self.query(q, top_k=limit)  # список кортежей (близость, page_id, текст)
-        from hagi.memory_store.streaming import MemoryHit  # класс попадания (импортирован, но ниже используется локальный)
 
         class _Hit:  # облегчённое попадание поиска
             def __init__(self, pid, text):  # номер страницы pid и её текст

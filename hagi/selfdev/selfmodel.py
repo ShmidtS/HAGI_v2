@@ -268,7 +268,6 @@ import argparse  # модуль argparse — разбор аргументов �
 import json  # модуль json — чтение и запись JSON
 import sys  # модуль sys — интерпретатор и стандартные потоки
 import time  # модуль time — измерение времени
-from typing import Any, Callable  # типы для аннотаций
 import numpy as np  # numpy — средние значения
 Policy = Callable[..., int]  # политика бюджета: функция, возвращающая целое число — бюджет узлов
 def run_growth(policy: Policy | None, seed: int, n_proposal_rounds: int=8, budget_per_round: int=8, base_budget: int=2000) -> dict[str, Any]:
@@ -417,7 +416,6 @@ def run_experiment(seeds: int=5, policy_names: list[str] | None=None, seed_start
 # ============================================================
 
 import subprocess  # модуль subprocess — запуск pytest
-from typing import Any  # тип Any
 from hagi.base.util import CKPT_DIR as _CKPT  # импорт каталога контрольных точек CKPT_DIR под именем _CKPT
 EDIT_LOG = _CKPT / 'self' / 'self_edits.json'  # путь к журналу самоправок: подкаталог 'self', файл self_edits.json
 BASELINE_PATH = _CKPT / 'self' / 'edit_baseline.json'  # путь к кэшу эталонного замера: подкаталог 'self', файл edit_baseline.json
@@ -558,7 +556,6 @@ def self_edit_cycle(seed: int=0, dry: bool=False) -> dict[str, Any]:
 # МОДЕЛЬ САМОГО СЕБЯ: СЛЕД -> ВЫВОД -> ОПТИМИЗАЦИЯ -> ГЕЙТ
 # ============================================================
 
-from typing import Any, Optional  # типы для аннотаций
 FAMILY_IDS = {'BoolVenn': 0, 'unary': 1, 'integer-binary': 2, 'composed-ternary': 3, 'auto-composed': 4, 'auto-bool3': 5}  # коды семейств задач: 0 BoolVenn, 1 unary, 2 integer-binary, 3 composed-ternary, 4 auto-composed, 5 auto-bool3
 FEATURE_KEYS = ('family', 'arity', 'domain', 'library', 'target_range', 'target_unique', 'self_inv')  # имена признаков задачи в следе: семейство, арность, размер области, размер библиотеки, размах меток, число разных меток, самовариативность
 def _self_inverse_flag(spec, seed: int = 13,  # признак самовариативности цели (f∘f = id) по обучающей выборке унарных входов

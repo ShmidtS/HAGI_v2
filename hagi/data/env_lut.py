@@ -817,8 +817,6 @@ def env_model_to_netlist(seed: int=777, ood: bool=False) -> dict:
 # ENV LUT VERIFY: независимое воспроизведение
 # ============================================================
 
-import argparse, json, random  # стандартные модули: аргументы, json, случайность
-from collections import deque  # двусторонняя очередь и счётчик
 N = 16  # число состояний N = 16
 A = 4  # число действий A = 4
 def b(s, i):

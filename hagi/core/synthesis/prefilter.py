@@ -90,7 +90,7 @@ candidate_programs = candidate_programs  # candidate_programs — перечен
 """
 
 from concurrent.futures import ProcessPoolExecutor  # пул процессов для параллельных вычислений
-from typing import Any, Iterator, Optional, Sequence  # типы для аннотаций
+from typing import Iterator  # типы для аннотаций
 
 
 SIEVE_SIZE = 5  # число пробных точек для быстрой отбраковки

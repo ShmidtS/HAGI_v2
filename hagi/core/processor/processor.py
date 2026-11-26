@@ -24,7 +24,6 @@ from hagi.core.memory.audit import AuditLedger  # имена из модуля �
 from hagi.core.memory.audit import AuditStream, CertStepGen  # имена из «audit» (модуль, где они определены)
 from hagi.core.memory.audit import HedgeRouter  # имена из модуля ядра «audit» (как до слияния)
 from hagi.core.synthesis.synthesis import _CURRENT_FAMILY, _FULL_CAND, _mod_affine_expr, _sparse_membership, synthesize_batched_mdl  # имена из «synthesis» (модуль, где они определены)
-from hagi.core.synthesis.synthesis import _exact_multivariate_poly_fit, _exact_poly_fit  # имена из модуля ядра «synthesis» (как до слияния)
 from hagi.core.synthesis.synthesis import exact_piecewise_poly_fit  # имена из модуля ядра «synthesis» (как до слияния)
 from hagi.base.config import MODEL_FILE_FORMAT, LEGACY_FILE_FORMATS, STATE_FORMAT  # единая метка формата состояния и перечень прежних меток
 

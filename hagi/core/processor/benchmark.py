@@ -26,9 +26,7 @@ from hagi.core.tasks.stored_tasks import (  # импорт из модуля о�
     TaskSpec,  # описание задачи: имя, арность, области, учитель
     make_task_suite  # построение полного набора задач
 )  # конец импорта
-from typing import Any, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from concurrent.futures import ProcessPoolExecutor  # имена из «futures» (модуль, где они определены)
-from hagi.core.tasks.stored_tasks import TaskSpec  # имена из «stored_tasks» (модуль, где они определены)
 from hagi.core.synthesis.prefilter import _sys  # имена из «prefilter» (модуль, где они определены)
 from hagi.core.language.code_length import (  # импорт из модуля оценки длины кода
     _program_description_bits  # длина описания программы в битах

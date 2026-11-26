@@ -178,7 +178,7 @@ def fisher_tolerances(col_curv: Sequence[float], B: float, w: Sequence[float] | 
 # ============================================================
 
 from collections import Counter  # счётчик по ключам
-from typing import Callable, Iterable  # типы «вызываемый объект» и «итерируемый»
+from typing import Iterable  # типы «вызываемый объект» и «итерируемый»
 class OracleQueryBudgetExceeded(RuntimeError):  # ошибка времени выполнения
     """Возникает, когда новый вызов учителя превысил бы бюджет разных запросов."""
 @dataclass(frozen=True)  # неизменяемая класс-запись
@@ -256,7 +256,7 @@ class CachedOracle:  # кэширующая обёртка над учителе
 # ЗАПРОС ПО КОМИТЕТУ
 # ============================================================
 
-from typing import Callable, Hashable, Sequence, TypeVar  # типы и переменная типа
+from typing import Hashable, TypeVar  # типы и переменная типа
 H = TypeVar('H')  # переменная типа для гипотез
 X = TypeVar('X')  # переменная типа для точек
 Y = TypeVar('Y', bound=Hashable)  # переменная типа для хешируемых меток

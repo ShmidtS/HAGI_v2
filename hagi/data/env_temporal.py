@@ -755,7 +755,6 @@ if __name__ == '__main__':  # файл запущен напрямую — вы�
 # СВЯЗКА ENV TEMPORAL: мир -> нетлист
 # ============================================================
 
-import random  # модуль случайности
 from hagi.data import env_temporal as env  # импорт этого же модуля как env
 def env_model_to_netlist(model_id: int, clock_action: int | None=None, seed: int=4242, context: str='core', goal: int=5) -> dict:
     """Активно обучиться миру и скомпилировать его таблицу в сеть вентилей."""
@@ -774,7 +773,6 @@ def env_model_to_netlist(model_id: int, clock_action: int | None=None, seed: int
 # ПРОВЕРКА ENV TEMPORAL: независимое воспроизведение
 # ============================================================
 
-import argparse, json  # стандартные модули: аргументы, json
 N = 32  # число состояний N = 32
 A = 4  # число действий A = 4
 MODEL_BANK = []  # банк моделей для верификатора (заполняется извне)

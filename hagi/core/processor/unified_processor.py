@@ -28,7 +28,6 @@ from dataclasses import dataclass  # декоратор класса-запис�
 from pathlib import Path  # объектный путь к файлу
 from typing import Any, Optional, Sequence  # типы аннотаций: произвольный, вызываемый, перечислимый, необязательный, последовательность
 import numpy as np  # численные массивы
-from typing import Any, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.language.call_dag import CallDagExpr, CallDagProgram  # имена из «call_dag» (модуль, где они определены)
 from hagi.core.memory.aliases import TOKEN_BITS, gamma_bits  # имена из «aliases» (модуль, где они определены)
 from hagi.core.synthesis.venn import anf_to_call_dag, anf_transform  # выражение по коэффициентам Жегалкина и само преобразование

@@ -70,7 +70,7 @@ def certificate(state: dict[str, Any]) -> dict[str, Any]:
 
 import argparse  # разбор аргументов командной строки
 import re  # маршруты запросов по регулярным выражениям
-from typing import Any, Callable  # типы для аннотаций
+from typing import Callable  # типы для аннотаций
 from hagi.data.io import execute, execute_text  # вызов написанной моделью программы (числовой и текстовый)
 from hagi.models import lm  # байтовая языковая модель
 # Фактический состав модулей после слияний (io поглотил execute и ingest; generated_programs лежит в scripts/, если есть)

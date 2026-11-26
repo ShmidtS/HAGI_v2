@@ -143,7 +143,6 @@ def construct_from_dict_safe(payload: dict) -> dict:
 # ПЕРЕИФИКАЦИЯ: регистрация изобретённых операций
 # ============================================================
 
-from typing import Any, Callable  # повторный импорт типов (имена уже импортированы выше)
 from hagi.core import REIFIED_OPS  # реестр макрооператоров выражений Expr
 from hagi.invent.invention import ConstructBlueprint  # чертёж изобретённой конструкции
 REIFIED_OP_COST_BITS = 12  # длина описания одного переифицированного оператора в битах

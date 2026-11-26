@@ -25,11 +25,8 @@ from hagi.core.tasks.stored_tasks import (  # имена из модуля за�
 from hagi.core.processor.experts import (  # имена из модуля экспертов
     Expert  # эксперт: программа с арностью
 )  # конец импорта
-from hagi.core.synthesis.prefilter import DEFAULT_NODE_BUDGET, MAX_REUSE_EXPANSIONS, OPS  # имена из «prefilter» (модуль, где они определены)
-from hagi.core.processor.experts import Expert  # имена из «experts» (модуль, где они определены)
-from hagi.core.language.expr_dsl import Expr, Program  # имена из «expr_dsl» (модуль, где они определены)
-from typing import Iterator, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
-from hagi.core.tasks.stored_tasks import TaskSpec  # имена из «stored_tasks» (модуль, где они определены)
+from hagi.core.synthesis.prefilter import DEFAULT_NODE_BUDGET, MAX_REUSE_EXPANSIONS  # имена из «prefilter» (модуль, где они определены)
+from typing import Iterator  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.language.code_length import (  # функции длины кода
     _expr_description_bits,  # длина описания выражения L(expr)
     _program_description_bits  # длина описания программы

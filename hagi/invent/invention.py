@@ -824,7 +824,6 @@ DEFAULT_PRIOR = NeuralProposalPrior()  # априор по умолчанию
 # ПОИСК ЦИКЛОВ WHILE (Беллман / орбиты)
 # ============================================================
 
-from typing import Callable  # типы Callable и Sequence
 def _digit_sum10(x: int) -> int:
     """Сумма десятичных цифр числа x."""
     x = abs(int(x))  # модуль и целочисленность x

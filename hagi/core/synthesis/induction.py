@@ -12,8 +12,6 @@ import numpy as np  # численные массивы numpy
 from hagi.core.language.expr_dsl import (  # импорт из модуля выражений expr_dsl
     Expr  # Expr — дерево выражения программы
 )  # конец импорта
-from typing import Any, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
-from hagi.core.language.expr_dsl import Expr  # имена из «expr_dsl» (модуль, где они определены)
 if TYPE_CHECKING:  # только для проверки типов аннотаций (анализатор видит имя, импорта во время выполнения нет — нет цикла)
     from hagi.core.processor.benchmark import OptimalMathProcessor  # процессор из части «benchmark»: имя нужно лишь в строковых аннотациях
 

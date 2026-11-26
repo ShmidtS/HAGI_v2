@@ -23,7 +23,6 @@ import math  # модули стандартной библиотеки: арг�
 from dataclasses import dataclass  # декоратор неизменяемой записи данных и описатель поля
 from typing import TYPE_CHECKING, Any, Optional, Sequence  # аннотации типов
 import numpy as np  # числовые массивы
-from typing import Any, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.language.expr_dsl import Expr  # имена из модуля «expr_dsl» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.memory.aliases import OPS  # имена из модуля «aliases» (прямой импорт вместо обращения через псевдоним пакета)
 if TYPE_CHECKING:  # только для проверки типов аннотаций (анализатор видит имя, импорта во время выполнения нет — нет цикла)

@@ -17,8 +17,6 @@ from hagi.core.language.expr_dsl import (  # имена из модуля язы
     Expr,  # узел выражения
     Program  # программа: выражение и маска
 )  # конец импорта
-from hagi.core.language.expr_dsl import Expr, Program  # имена из «expr_dsl» (модуль, где они определены)
-from typing import Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.synthesis.prefilter import _batch_fits_unchecked  # имена из «prefilter» (модуль, где они определены)
 
 # ---- длина кода и контракт безопасного фильтра ----

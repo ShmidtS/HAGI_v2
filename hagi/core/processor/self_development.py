@@ -30,9 +30,7 @@ import numpy as np  # импорт стандартной библиотеки, 
 from hagi.core.tasks.stored_tasks import (  # открыть явный импорт из предыдущей части: имена tasks
     TaskSpec  # TaskSpec — имя из предыдущей части
 )  # конец импорта из предыдущей части
-from typing import Any, Optional, Sequence  # имена из «stdlib:typing» (модуль, где они определены)
 from hagi.core.synthesis.prefilter import DEFAULT_NODE_BUDGET, DEFAULT_POP_BUDGET, VALIDATION_CHUNK, _ensure_torch, _torch  # имена из «prefilter» (модуль, где они определены)
-from hagi.core.tasks.stored_tasks import TaskSpec  # имена из «stored_tasks» (модуль, где они определены)
 from hagi.core.synthesis.best_first import (  # открыть явный импорт из предыдущей части: имена best_first
     _composition_hint  # _composition_hint — имя из предыдущей части
 )  # конец импорта из предыдущей части
