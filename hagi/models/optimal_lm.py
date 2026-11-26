@@ -340,6 +340,8 @@ class HagiOptimalLM:
         h_out = self._apply_adapter(h_out)  # адаптер домена
         h_last = h_out[:, -1, :]  # последняя позиция
         lg = (h_last @ self.emb.T) * self.out_scale + self.b_out  # связанные эмбеддинги
+        if self.bypass_boost > 0:  # точный обход — та же функция, что при обучении и в forward_seq (гейты видят модель целиком)
+            lg = lg + self.bypass_apply(ctx[:, -5:], t.zeros((ctx.shape[0], min(5, ctx.shape[1]), self.VOCAB), dtype=lg.dtype, device=lg.device))[:, -1]  # прибавка по последним 5 байтам (ответ последней позиции окна)
         if self.use_bigram_logit_skip:  # скип
             lg = lg + self.B_u[ctx[:, -1]] @ self.B_v  # по последнему байту
         if getattr(self, "active_fiber", None) is not None:  # волокно домена

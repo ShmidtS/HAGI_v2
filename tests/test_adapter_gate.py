@@ -54,22 +54,19 @@ def test_adapter_rejects_noise_holds_identity(tmp_path, monkeypatch):
     assert r["status"] == "HOLD" and not u.adapter_bank.get("d").B.any()  # отклонено; в B нет ни одного ненулевого элемента
 
 
-def test_adapter_grows_on_structure(tmp_path, monkeypatch):
-    """На законе «байты 0..255 по кругу» адаптер принят (GROW, ранг 1/2/4), у него 2·r·d параметров,
-    set_params(params()) возвращает те же веса, тело модели не изменилось."""
+def test_adapter_is_redundant_when_body_knows_the_law(tmp_path, monkeypatch):
+    """Тело выучило закон «байты 0..255 по кругу»: цель idx[p] уже предсказывается, добавка адаптера
+    избыточна — HOLD и B = 0. (Прежняя цель окон idx[p + k] делала «выигрыш» адаптера ложным.)
+    Тело подгонкой не тронуто; параметры адаптера проходят круг set_params(params())."""
     u = _unified(tmp_path, monkeypatch)  # модель с доменом d
-    # При уменьшенном шаге 1e-3 нужен тот же бюджет смещения, что давали 3 эпохи
-    # при шаге 3e-3 (измерено: при lr=1e-3 3 эпохи дают HOLD, 6 эпох — GROW).
-    # Проверяется структура, а не число эпох.
     u.model.train_guarded(bytes(range(256)) * 8, epochs=9)  # обучить тело на законе домена, 9 эпох
     trunk = [q.detach().clone() for q in u.model.params()]  # снимок параметров тела
     r = u._fit_domain_adapter("d")  # подогнать адаптер домена d
-    assert r["status"] == "GROW" and r["rank"] in (1, 2, 4)  # принят с рангом 1, 2 или 4
-    ad = u.adapter_bank.get("d")  # адаптер домена d из банка
-    assert ad.n_params == 2 * ad.r * ad.d  # число параметров = 2·r·d
-    flat = ad.params().copy()  # вектор параметров: A развёрнут, затем B развёрнут
-    ad.set_params(flat)  # записать вектор обратно: A = flat[:r·d] формы (r, d), B = flat[r·d:] формы (d, r)
-    assert np.allclose(ad.params(), flat)  # после записи обратно вектор параметров тот же
-    # тело модели не тронуто подгонкой адаптера
+    assert r["status"] == "HOLD" and not u.adapter_bank.get("d").B.any()  # отклонено: добавлять нечего
+    assert r["baseline_ce"] < 1.0  # база — НАСТОЯЩАЯ потеря обученного тела (не 9+ нат случайной модели)
     for q, q0 in zip(u.model.params(), trunk):  # по парам (параметр тела, снимок)
         assert torch.equal(q.detach(), q0)  # параметр тела совпадает со снимком точно
+    ad = LowRankAdapter(u.adapter_bank.d, 2, 0)  # адаптер ранга 2 той же ширины, что банк
+    flat = ad.params().copy()  # вектор параметров: A развёрнут, затем B развёрнут
+    ad.set_params(flat)  # записать вектор обратно
+    assert np.allclose(ad.params(), flat) and ad.n_params == 2 * ad.r * ad.d  # круг без потерь; 2·r·d параметров

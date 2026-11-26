@@ -77,6 +77,7 @@ def _sha(b: bytes) -> str:
 
 
 ADAPTER_MIN_GAIN = 0.005  # минимальный парный выигрыш адаптера: нижняя граница выигрыша должна превысить 0.005
+ADAPTER_VAL_WINDOWS = int(os.environ.get("HAGI_ADAPTER_VAL", "4096"))  # не более стольких проверочных окон на оценку адаптера (0 — все)
 ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока роста: нат CE на единицу доли параметров (λ_M в правиле приёма; калибровка: полезный блок ≈ 0.57 ната при доле 0.30 → цена 0.30, слабый блок 0.1 ната отклоняется)
 
 FIBER_MIN_GAIN = 0.01  # минимальный выигрыш волокна на отложенной части домена, ноль и меньше — отказ
@@ -413,7 +414,10 @@ class Unified:
             Такое же построение, как в gather_all train_guarded: для позиции p
             окно X_i = idx[p−n .. p−1], n = min(k, p), длиной k; при n < k слева
             дополнение нулями; последний элемент окна — самый новый байт (запрос).
-            Цель: y_i = idx[p + k]. Окно строится именно «старые первыми»: если
+            Цель: y_i = idx[p] — следующий за окном байт. (Прежде было idx[p + k]: байт на k=64
+            позиции вперёд от контекста; на обученной модели такая цель даёт CE 9.45 вместо 0.52,
+            то есть все гейты на _windows — адаптеры, рост блоков, ремонт забывания — оценивали
+            модель как почти случайную.) Окно строится именно «старые первыми»: если
             развернуть его «новые первыми», CE на рабочей модели по 3 кускам
             3.51/4.36/3.67 против 6.03/6.41/6.09 нат — все гейты на _windows
             (адаптер, рост, ремонт) оценивали модель на перевёрнутом входе.
@@ -427,7 +431,7 @@ class Unified:
         X = np.zeros((len(pos), k), dtype=np.int64)  # матрица окон (len(pos), k), изначально нули
         for i, (p, n_) in enumerate(zip(pos, lens)):  # по парам (номер, (позиция p, длина n))
             X[i, k - n_:] = idx[p - n_:p]  # X[i, k−n .. k−1] = idx[p−n .. p−1] — старые первыми
-        y = idx[pos + k]  # цели: y_i = idx[p_i + k]
+        y = idx[pos]  # цели: y_i = idx[p_i] — байт, СЛЕДУЮЩИЙ за окном idx[p_i−k..p_i−1]
         t = self.model.t  # torch из модели
         dev = getattr(self.model, "device", "cpu")  # устройство модели (по умолчанию cpu)
         return (t.as_tensor(X, dtype=t.long, device=dev),  # X — тензор long на устройстве модели
@@ -468,7 +472,7 @@ class Unified:
         bank = getattr(self, "adapter_bank", None)  # банк адаптеров или None
         if bank is None:  # банка ещё нет
             from hagi.base.trunk_ops import AdapterBank  # банк доменных адаптеров
-            bank = self.adapter_bank = AdapterBank(d=self.model.hidden, r=2)  # создать и запомнить банк шириной hidden, ранг 2
+            bank = self.adapter_bank = AdapterBank(d=(self.model.dim if hasattr(self.model, "forward_seq") else self.model.hidden), r=2)  # создать банк шириной выходного скрытого (optimal: dim; hnet/rope: hidden), ранг 2
         d = self._domain_bytes(source, self.domains[source])  # байты домена
         k = self.model.k  # длина контекста
         n = len(d) - k - 1  # число позиций: n = len(d) − k − 1
@@ -487,7 +491,12 @@ class Unified:
                 if base.r == r:  # ранг совпадает с текущим
                     c.A, c.B = np.array(base.A), np.array(base.B)  # взять веса текущего адаптера
                 cands.append(c)  # добавить кандидата
-        val = self._windows(source, np.arange(cut, n))  # проверочные окна для позиций cut..n−1
+        # Проверка адаптера — на равномерной выборке не более ADAPTER_VAL_WINDOWS окон, а не на всех
+        # позициях cut..n−1 (их десятки тысяч: это была самая дорогая фаза приёма — 32–61 с из ~85).
+        # Гейт считается по парным разностям с границей 2.4·SE: выборка 4096 даёт SE ≈ 0.016 ната
+        # при типичном разбросе ~1 нат — граница по-прежнему много меньше типичного выигрыша.
+        _vi = np.arange(cut, n)  # все проверочные позиции
+        val = self._windows(source, _vi if (ADAPTER_VAL_WINDOWS <= 0 or len(_vi) <= ADAPTER_VAL_WINDOWS) else _vi[np.linspace(0, len(_vi) - 1, ADAPTER_VAL_WINDOWS, dtype=int)])  # равномерная выборка проверочных окон
         before = self._adapter_val_ce(LowRankAdapter(bank.d, 1), *val)  # базовая CE: адаптер ранга 1 без обучения (B = 0, тождество)
         best, report = None, {"status": "HOLD", "baseline_ce": float(before.mean()),  # лучший кандидат и итог: статус HOLD, средняя базовая CE ...
                               "attempts": []}  # ... и пустой список попыток
