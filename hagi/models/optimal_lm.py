@@ -87,7 +87,8 @@ class HybridMuonAdamW:
 
     def __init__(self, matrix_params: list[t.Tensor], vec_params: list[t.Tensor],  # параметры по группам
                  lr_muon: float = 0.03, lr_adam: float = 5e-3, momentum: float = 0.9,  # шаги и момент
-                 wd: float = 1e-4, ns_iters: int = 5) -> None:  # затухание и число итераций
+                 wd: float = 1e-4, ns_iters: int = 5, beta2: float = 0.999) -> None:  # затухание, число итераций и второй момент AdamW
+        self.beta2 = float(beta2)  # второй момент AdamW
         self.mats = [p for p in matrix_params if p.requires_grad]  # матрицы (Muon)
         self.names: list[str] = []  # имена весов в порядке mats + vecs (заполняет модель: opt.names = model.param_names(); ключи GPM — имена, стабильны между перезапусками)  # прежльны при save/load)
         self.vecs = [p for p in vec_params if p.requires_grad]  # векторы и таблицы (AdamW)
@@ -136,7 +137,7 @@ class HybridMuonAdamW:
                 if self.wd > 0:  # затухание — проецированное (WeightDecay: не трогает защищённое)
                     W = W - (lr_m * self.wd) * self._proj_out(W, Ul, Ur)  # проецированное затухание: вне защищённого подпространства
                 p.copy_((W - lr_m * upd).to(p.dtype))  # записать
-            b1, b2, eps = 0.9, 0.999, 1e-8  # коэффициенты AdamW
+            b1, b2, eps = 0.9, self.beta2, 1e-8  # коэффициенты AdamW (второй момент — задаваемый)
             ts = self.step_count  # номер шага
             for idx, p in enumerate(self.vecs):  # векторы и таблицы
                 if p.grad is None:  # нет градиента
@@ -256,7 +257,10 @@ class HagiOptimalLM:
     def train_certified(self, data: bytes, epochs: int = 60, holdout: float = 0.15, batch: int | None = None,  # обучение, совместимое с Unified
                         log_every: int = 0, holdout_seed: int | None = None, lr: float | None = None) -> dict:  # (имена аргументов как у HNetByteLM)
         """Сертифицированное обучение: train_optimal + лучшее по контролю; GPM-базисы берутся из self.gpm_left, если заданы."""
-        r = self.train_optimal(data, epochs=max(1, epochs // 10), batch=batch or 16, seq_len=self.k, seed=holdout_seed or 7, log_every=log_every)  # обучить (GPM — из self.gpm_left)
+        if batch is None:  # пакет не задан
+            from hagi.selfdev.evolve import current as _evb  # принятые эволюцией параметры
+            batch = int(_evb()["batch"])  # пакет из эволюции (batch=0 тоже значит «не задан»)
+        r = self.train_optimal(data, epochs=max(1, epochs // 10), batch=batch, seq_len=self.k, seed=holdout_seed or 7, log_every=log_every)  # обучить (GPM — из self.gpm_left)
         return {"best_holdout_ce": r["val_ce_after"], "holdout_ce": r["val_ce_after"], "val_ce_before": r["val_ce_before"], "steps": r["steps"]}  # как у HNet
 
     # ---- доменный адаптер в стиле HNet: h_out ← h_out + (h_out @ Aᵀ) @ Bᵀ, A (r, d), B (d, r) ----
@@ -408,16 +412,22 @@ class HagiOptimalLM:
         return lg  # логиты
 
     def train_optimal(self, data: bytes, epochs: int = 5, batch: int = 16, seq_len: int = 64,  # обучение
-                      lr_muon: float = 0.03, lr_adam: float = 5e-3, max_steps_per_epoch: int = 25,  # шаги
+                      lr_muon: float | None = None, lr_adam: float | None = None, momentum: float | None = None, wd: float | None = None,  # шаги, момент, затухание: None — из эволюции (selfdev.evolve.current), иначе заданное значение
+                      warmup_frac: float | None = None, min_scale: float | None = None, beta2: float | None = None, max_steps_per_epoch: int | None = None,  # предел масштаба и beta2 — из эволюции при None; потолок шагов на эпоху: None — выводится из данных (один проход потока), иначе внешний бюджет
                       holdout: float = 0.15, seed: int = 7, opt_override: Any = None, gpm_left: dict | None = None, state_carry: bool = True,  # контроль, оптимизатор, базисы GPM, перенос состояния между чанками
                       log_every: int = 0) -> dict:  # печать
         import numpy as np  # численные массивы
         n = len(data); cut = int(n * (1.0 - holdout))  # граница обучение/контроль
         tr_arr = np.frombuffer(data[:cut], dtype=np.uint8).astype(np.int64)  # обучение
         va_arr = np.frombuffer(data[cut:], dtype=np.uint8).astype(np.int64)  # контроль
-        steps_ep = min(max_steps_per_epoch, max(8, (len(tr_arr) - seq_len - 1) // (batch * 8)))  # шагов на эпоху
+        steps_data = max(1, (len(tr_arr) - seq_len - 1) // (batch * seq_len))  # шагов на один проход данных: batch потоков идут подряд, каждый шаг сдвигает на seq_len
+        steps_ep = steps_data if max_steps_per_epoch is None else min(max_steps_per_epoch, max(8, steps_data))  # без потолка — из данных; с потолком — не больше бюджета
         total_steps = max(1, epochs * steps_ep)  # всего шагов
-        opt = opt_override or HybridMuonAdamW(*self.matrix_and_vec_params(), lr_muon=lr_muon, lr_adam=lr_adam, wd=1e-4)  # оптимизатор
+        from hagi.selfdev.evolve import current as _evolved  # принятые эволюцией параметры
+        _ev = _evolved() if any(v is None for v in (lr_muon, lr_adam, momentum, wd, warmup_frac, min_scale, beta2)) else {}  # читать только если что-то не задано явно
+        _lm = float(lr_muon if lr_muon is not None else _ev["lr_muon"]); _la = float(lr_adam if lr_adam is not None else _ev["lr_adam"]); _mo = float(momentum if momentum is not None else _ev["momentum"])  # разрешить значения
+        _wd = float(wd if wd is not None else _ev["wd"]); _wf = float(warmup_frac if warmup_frac is not None else _ev["warmup_frac"]); _ms = float(min_scale if min_scale is not None else _ev["min_scale"]); _b2 = float(beta2 if beta2 is not None else _ev["beta2"])  # разрешить значения
+        opt = opt_override or HybridMuonAdamW(*self.matrix_and_vec_params(), lr_muon=_lm, lr_adam=_la, momentum=_mo, wd=_wd, beta2=_b2)  # оптимизатор
         gpm = gpm_left if gpm_left is not None else getattr(self, "gpm_left", None)  # базисы: аргумент или атрибут модели (ключи — имена)
         gpm_r = getattr(self, "gpm_right", None) or {}  # правые базисы модели (softmax-голова)
         opt.gpm_right.update(gpm_r)  # передать
@@ -434,12 +444,12 @@ class HagiOptimalLM:
                 return float(t.nn.functional.cross_entropy(self.forward_seq(vx).reshape(-1, self.VOCAB), vy.reshape(-1)))  # по всем позициям
         h0 = val_ce(); best_val = h0; best_snap = [p.detach().clone() for p in self.params()]  # до обучения
         max_start = max(1, len(tr_arr) - seq_len - 1)  # число стартов
-        warmup = max(6, total_steps // 15)  # число шагов разогрева масштаба
+        warmup = max(1, int(round(_wf * total_steps)))  # число шагов разогрева масштаба шага (доля — из эволюции)
         stride = max(1, max_start // batch)  # шаг потока: batch потоков равномерно по домену
         stream_pos = np.array([(i * stride) % max_start for i in range(batch)], dtype=np.int64)  # позиции потоков
         carry: dict = {}  # переносимое состояние GDN (state-carry BPTT: длинный контекст без удлинения T)
         for step in range(total_steps):  # по шагам
-            opt.set_lr_scale((0.2 + 0.8 * (step + 1) / warmup) if step < warmup else (0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))))  # разогрев, затем косинусный отжиг
+            opt.set_lr_scale((0.2 + 0.8 * (step + 1) / warmup) if step < warmup else (_ms + (1.0 - _ms) * 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))))  # разогрев, затем косинусный отжиг
             if state_carry:  # поток: подряд идущие чанки, состояние переносится
                 starts = stream_pos  # старты потоков
                 state = {k: v for k, v in carry.items()}  # состояние с предыдущего шага

@@ -12,4 +12,13 @@ Start-Process python -ArgumentList '-X','utf8','scripts/neuro_symbolic_cycle.py'
 - `HAGI_TEXT_ONLY=1`: только печатные файлы без дублей (прежний цикл: 1295/1420 доменов — куски диска);
 - знания домена — в волокнах CortexFiber с Hedge-смесью (забывание ствола ≈ 0);
 - рост — сертифицированными шагами (dirLogitRange), приём по admissionMargin.
+Саморазвитие в цикле (включено по умолчанию):
+- `evolve` (фаза 5, раз в `HAGI_EVOLVE_EVERY=8` чанков): эволюция алгоритма обучения — популяция
+  геномов {lr_muon, lr_adam, batch, momentum, wd, warmup_frac, min_scale, beta2}, непрерывное
+  пространство, адаптивная мутация, BLX-скрещивание; гейт — парный по контрольной CE на последних
+  чанках; состояние `checkpoints/evolve_state.json`, принятый геном читает `train_optimal`.
+- `arch-evolve` (раз в `HAGI_ARCH_EVERY=24`): точное расширение ширины ствола, приём при
+  выигрыше CE больше цены параметров (`HAGI_ARCH_LAMBDA`), предел `HAGI_ARCH_MAX`.
+- `programs` (символическая половина): изобретённые операторы -> файл программ -> исполнение
+  через белый список операций (`hagi/data/safe_exec.py`) -> сертификат равенства.
 Монитор: `python -X utf8 scripts/monitor_cycle.py`.

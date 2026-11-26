@@ -222,6 +222,7 @@ class Unified:
         _ph["grow"] = round(time.perf_counter() - _tp, 1)  # длительность фазы роста, с
         _tp = time.perf_counter()  # начало замеров CE до обучения
         old_ce_pre_early = self._old_domains_ce(exclude=source)  # CE на старых доменах до обучения
+        new_ce_before = self._tail_ce(data)  # CE на хвосте НОВЫХ данных до обучения: мера переноса (знает ли модель уже что-то о новом домене)
         old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
         _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
         _tp = time.perf_counter()  # начало обучения
@@ -338,6 +339,8 @@ class Unified:
             "replay_bytes": len(combined),  # длина обучающей выборки
             "holdout_ce": ce,  # CE последнего повтора на отложенных данных
             "old_ce": entry.get("old_ce"),  # CE на старых доменах
+            "old_ce_pre": old_ce_pre,  # CE на старых доменах ДО приёма (накопление знаний: должна снижаться от чанка к чанку)
+            "new_ce_before": new_ce_before,  # CE нового домена до обучения (перенос)
             "growth": growth,  # итог роста ёмкости
             "repair": repair,  # итог ремонта забывания
             "regression": entry.get("regression", False),  # была ли регрессия
@@ -615,6 +618,32 @@ class Unified:
         return {"rounds": rounds, "why": why,  # итог: раунды и причина ...
                 "forgot": None if post is None else round(post - pre, 4)}  # ... забывание post − pre
 
+
+    def grow_width_optimal(self, delta: int) -> dict:
+        """Точное расширение ширины ствола (архитектура optimal) на delta вместе с волокнами и базисами GPM.
+            Логиты не меняются (модель: hagi.models.optimal_lm.grow_width); волокна получают нулевые
+            строки/столбцы (h + (h @ Aᵀ) @ Bᵀ не меняется), базисы GPM расширяются блоком diag(I, 0) —
+            новые координаты не защищены (их ещё никто не занимал). Возвращает старую и новую ширину."""
+        import torch as _t  # тензоры
+        from hagi.models.optimal_lm import grow_width as _gw  # расширение модели
+        m = self.model; d0 = m.dim  # прежняя ширина
+        assert (d0 + delta) % m.n_heads == 0, "ширина головы должна остаться целой"  # условие роста
+        _gw(m, delta)  # расширить модель (функция сохранена)
+        for fib in getattr(self, "fibers", {}).values():  # волокна: входы (d, r) — нулевые строки, выходы (r, d) — нулевые столбцы
+            for nm in ("A_h", "U_o", "B_h"):  # зависящие от ширины
+                q = getattr(fib, nm); out = _t.zeros((q.shape[0] + (delta if nm != "B_h" else 0), q.shape[1] + (delta if nm == "B_h" else 0)), dtype=q.dtype)  # новая форма
+                out[: q.shape[0], : q.shape[1]] = q.detach()  # старые значения на места
+                setattr(fib, nm, _t.nn.Parameter(out))  # заменить
+        for key in ("gpm_left", "gpm_right"):  # базисы GPM: столбцы в пространстве входов/выходов ширины d0
+            d = getattr(m, key, None)  # словарь
+            if not d:  # нет
+                continue  # дальше
+            for nm, U in list(d.items()):  # по базисам
+                if U.shape[0] != d0:  # не этой ширины (например, базис b_out или emb по выходу 256)
+                    continue  # не трогать
+                out = _t.zeros((d0 + delta, U.shape[1]), dtype=U.dtype); out[:d0] = U  # расширить нулями: новые координаты вне защиты
+                d[nm] = out  # заменить
+        return {"d": [d0, m.dim], "params": sum(q.numel() for q in m.params())}  # отчёт
 
     def grow_width(self, d_new: int, h_new: int) -> dict:
         """Точное расширение ШИРИНЫ ствола (модель HNetByteLM.grow_width,
@@ -964,6 +993,24 @@ class Unified:
             return None, None  # пустой результат
         return list(self._vec_names), np.concatenate(vec)  # имена доменов (реально вошедших) и склейка векторов
 
+    def _tail_ce(self, data: bytes, n: int = 8192) -> float | None:  # CE на хвосте байтов (последние n)
+        """Кросс-энтропия модели на окнах из последних n байтов потока (без обучения; через
+        model.logits — работает для любой архитектуры). Мера переноса: знает ли модель уже
+        что-то о новом домене до его обучения."""
+        import numpy as _np  # массивы
+        import torch as _t  # тензоры
+        if getattr(self.model, "ARCH", "") != "optimal":  # метрика определена для причинной модели optimal
+            return None  # прочие архитектуры — без неё
+        k = self.k  # длина контекста
+        b = data[-n:]  # хвост
+        if len(b) < k + 64:  # мало
+            return None  # нет
+        a = _np.frombuffer(b, dtype=_np.uint8).astype(_np.int64)  # индексы
+        pos = _np.arange(0, len(a) - k, max(1, k // 2))  # начала окон с перекрытием
+        X = _np.stack([a[p: p + k] for p in pos]); y = a[pos + k]  # окна и ответы
+        dev = getattr(self.model, "device", "cpu")  # устройство
+        with _t.no_grad():  # без графа
+            return round(float(_t.nn.functional.cross_entropy(self.model.logits(_t.as_tensor(X, dtype=_t.long, device=dev)), _t.as_tensor(y, dtype=_t.long, device=dev))), 4)  # средняя CE
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
         претендент/действующий). None, если старых доменов нет.
