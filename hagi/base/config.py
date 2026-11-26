@@ -61,12 +61,6 @@ def cpu_threads() -> int | None:
     return int(v) if v and v.strip() else None  # целое число или None
 
 
-def cpu_threads() -> int | None:
-    """Число потоков torch на процессоре: HAGI_THREADS, иначе None (тогда модель ставит 1)."""
-    v = os.environ.get("HAGI_THREADS")  # прочитать в момент вызова
-    return int(v) if v and v.strip() else None  # целое число или None
-
-
 def neural_device_mode() -> str:
     """Режим выбора устройства нейронной части: HAGI_NEURAL_DEVICE в нижнем регистре, иначе "auto"."""
     return os.environ.get("HAGI_NEURAL_DEVICE", "auto").lower()  # читать и привести к нижнему регистру

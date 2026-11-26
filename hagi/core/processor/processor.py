@@ -68,16 +68,7 @@ class Expert:
         """Словарь с полями эксперта для сериализации: имени, семейства, программы, областей, правила, длины кода, адаптера (словарь или None) и родителей.
         
                     Области и родители записываются списками."""
-        return {  # словарь с полями эксперта
-            "name": self.name,  # имя
-            "family": self.family,  # семейство
-            "program": self.program.to_dict(),  # программа как словарь
-            "domains": [list(d) for d in self.domains],  # области — списки значений: [list(d) для каждого d]
-            "valid_rule": self.valid_rule,  # правило корректности
-            "code_length": self.code_length,  # длина кода
-            "adapter": self.adapter.to_dict() if self.adapter else None,  # адаптер как словарь, если он есть, иначе None
-            "parents": list(self.parents),  # родители — список
-        }
+        return _expert_to_dict(self)  # собрать словарь с полями эксперта
 
     @staticmethod  # статический метод — создаётся без экземпляра
     def from_dict(d: dict[str, Any], core: "FactorizedSharedCore") -> "Expert":
@@ -111,6 +102,40 @@ class Theorem:
     statement: str  # текст утверждения
     domain_points: int  # число проверенных точек области
     verified: bool = True  # признак проверки (по умолчанию истина)
+
+
+
+
+def _expert_to_dict(obj) -> dict[str, Any]:  # собрать словарь с полями эксперта: имя, семейство, программа, области, правило, длина кода, адаптер, родители
+    """Словарь с полями эксперта для сериализации: имени, семейства, программы, областей, правила, длины кода, адаптера (словарь или None) и родителей.
+    
+                Области и родители записываются списками."""
+    return {  # словарь с полями эксперта
+        "name": obj.name,  # имя
+        "family": obj.family,  # семейство
+        "program": obj.program.to_dict(),  # программа как словарь
+        "domains": [list(d) for d in obj.domains],  # области — списки значений: [list(d) для каждого d]
+        "valid_rule": obj.valid_rule,  # правило корректности
+        "code_length": obj.code_length,  # длина кода
+        "adapter": obj.adapter.to_dict() if obj.adapter else None,  # адаптер как словарь, если он есть, иначе None
+        "parents": list(obj.parents),  # родители — список
+    }
+
+
+def _expert_total_neural_bytes(obj) -> int:  # посчитать суммарный размер нейронной части: общий блок весов + голова Венна + адаптеры
+    """Суммарное число байт нейросетевой части: общий блок весов + голова функции Венна + адаптеры.
+    
+            Голова функции Венна занимает 13 байт, если есть хоть один эксперт семейства «BoolVenn».
+            Возвращает целое число байт."""
+    venn_bytes = (  # байты головы функции Венна
+        13 if any(e.family == "BoolVenn" for e in obj.experts.values()) else 0  # 13, если есть эксперт «BoolVenn», иначе 0
+    )  # закрытие скобки
+    adapter_bytes = sum(  # байты всех адаптеров
+        e.adapter.compressed_bytes  # размер сжатого адаптера
+        for e in obj.experts.values()  # по всем экспертам
+        if e.adapter is not None  # у которых есть адаптер
+    )
+    return obj.core.core_bytes + venn_bytes + adapter_bytes  # общий блок + голова + адаптеры
 
 
 class TheoremMiner:
@@ -904,15 +929,7 @@ class GrowingHagiProcessor:
         
                 Голова функции Венна занимает 13 байт, если есть хоть один эксперт семейства «BoolVenn».
                 Возвращает целое число байт."""
-        venn_bytes = (  # байты головы функции Венна
-            13 if any(e.family == "BoolVenn" for e in self.experts.values()) else 0  # 13, если есть эксперт «BoolVenn», иначе 0
-        )  # закрытие скобки
-        adapter_bytes = sum(  # байты всех адаптеров
-            e.adapter.compressed_bytes  # размер сжатого адаптера
-            for e in self.experts.values()  # по всем экспертам
-            if e.adapter is not None  # у которых есть адаптер
-        )
-        return self.core.core_bytes + venn_bytes + adapter_bytes  # общий блок + голова + адаптеры
+        return _expert_total_neural_bytes(self)  # посчитать суммарный размер нейронной части в байтах
 
     def neural_quality_summary(self) -> dict[str, float]:
         """Сводка качества нейросетевых адаптеров: число адаптеров, средняя точность и средняя ошибка на val, суммарный размер.

@@ -52,6 +52,7 @@ from hagi.core.synthesis.fast_mdl import (  # импорт из модуля п�
 from hagi.base.config import STATE_FILE_FORMAT, LEGACY_FILE_FORMATS, STATE_FORMAT  # единая метка формата состояния и перечень прежних меток
 from hagi.core.synthesis.best_first import SynthesisStats  # имена из модуля «best_first» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.synthesis.induction import Theorem, _exact_multivariate_poly_fit, _exact_poly_fit  # имена из модуля «induction» (прямой импорт вместо обращения через псевдоним пакета)
+from hagi.core.processor.processor import _expert_to_dict, _expert_total_neural_bytes  # импорт общих функций сериализации эксперта и подсчёта размера нейронной части
 from hagi.core.processor.experts import GrowthEvent  # имена из модуля «experts» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.tasks.stored_tasks import TaskSpec  # имена из модуля «stored_tasks» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.tasks.candidates import candidate_programs  # имена из модуля «candidates» (прямой импорт вместо обращения через псевдоним пакета)
@@ -106,16 +107,7 @@ class StoredExpert:
 
     def to_dict(self) -> dict[str, Any]:
         """Сериализация записи в словарь JSON-совместимых значений (кортежи -> списки)."""
-        return {  # словарь со всеми полями записи
-            "name": self.name,  # имя операции
-            "family": self.family,  # семейство
-            "program": self.program.to_dict(),  # программа как словарь
-            "domains": [list(d) for d in self.domains],  # области значений: список списков
-            "valid_rule": self.valid_rule,  # правило области
-            "code_length": self.code_length,  # длина кода
-            "adapter": self.adapter.to_dict() if self.adapter else None,  # адаптер как словарь или None
-            "parents": list(self.parents),  # родители списком
-        }
+        return _expert_to_dict(self)  # собрать словарь с полями эксперта
 
     @staticmethod  # метод без доступа к экземпляру — конструктор из словаря
     def from_dict(d: dict[str, Any]) -> "StoredExpert":  # d — словарь из to_dict
@@ -963,15 +955,7 @@ class GrowthProcessorBase:
             total = core_bytes + venn_bytes + Σ adapter.compressed_bytes,
             где venn_bytes = 13, если есть хоть один эксперт семейства
             "BoolVenn", иначе 0."""
-        venn_bytes = (  # байты булевой диаграммы
-            13 if any(e.family == "BoolVenn" for e in self.experts.values()) else 0  # 13, если есть эксперт BoolVenn, иначе 0
-        )
-        adapter_bytes = sum(  # сумма размеров адаптеров
-            e.adapter.compressed_bytes  # сжатый размер адаптера
-            for e in self.experts.values()  # по экспертам
-            if e.adapter is not None  # только с адаптером
-        )
-        return self.core.core_bytes + venn_bytes + adapter_bytes  # сумма: core_bytes + venn_bytes + Σ adapter_bytes
+        return _expert_total_neural_bytes(self)  # посчитать суммарный размер нейронной части в байтах
 
 __all__ = [  # публичные имена модуля: только определённые здесь (импортированные не выносит `from <модуль> import *`)
     'StoredExpert', 'StoredTheoremMiner', 'verify_call_dag', 'verify_growth_lineage', 'GrowthProcessorBase',  # имя интерфейса

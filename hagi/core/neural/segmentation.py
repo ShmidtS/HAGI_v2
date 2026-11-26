@@ -29,22 +29,7 @@ def stutter_norm(seq: Sequence[Any]) -> list[Any]:  # убрать подряд 
     return out  # вернуть
 
 
-def boundary_chunks(  # разбить последовательность на сегменты по границе
-    boundary: Callable[[Any], bool], xs: Sequence[Any]  # предикат границы и элементы
-) -> list[list[Any]]:  # возвращает список сегментов
-    """Разбить xs на сегменты: элемент, для которого boundary(x) истинно, начинает новый сегмент.
-    
-        boundary: предикат границы; xs: элементы. Первый элемент всегда начинает первый сегмент.
-        Возвращает список сегментов (пустой список для пустых xs)."""
-    if not xs:  # пустая последовательность
-        return []  # пустой список
-    chunks = [[xs[0]]]  # первый сегмент из первого элемента
-    for tok in xs[1:]:  # по остальным элементам
-        if boundary(tok):  # токен — граница
-            chunks.append([tok])  # начать новый сегмент
-        else:  # иначе
-            chunks[-1].append(tok)  # добавить в текущий сегмент
-    return chunks  # вернуть сегменты
+from hagi.core.neural.chunking import boundary_chunks  # импорт разбиения последовательности на сегменты из модуля чанков
 
 
 def boundary_heads(boundary: Callable[[Any], bool], xs: Sequence[Any]) -> list[Any]:  # первые элементы сегментов

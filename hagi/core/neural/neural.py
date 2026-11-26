@@ -8,6 +8,7 @@ from dataclasses import dataclass  # импорт стандартной биб�
 from typing import TYPE_CHECKING, Any, Optional, Sequence  # импорт стандартной библиотеки, нужный этой части
 import numpy as np  # импорт стандартной библиотеки, нужный этой части
 from hagi.base.gpu import GpuGpmMixin  # примесь диспетчеризации на графический ускоритель: база ContinualGPMMemory
+from hagi.core.neural.certified_ce import newton_schulz_orthogonalize  # импорт ортогонализации Ньютона–Шульца из модуля сертифицированной кросс-энтропии
 from hagi.core.synthesis.venv_anf import (  # открыть явный импорт из предыдущей части: имена venv_anf
     block_hadamard_rotate,  # block_hadamard_rotate — имя из предыдущей части
     block_hadamard_unrotate,  # block_hadamard_unrotate — имя из предыдущей части
@@ -133,26 +134,6 @@ def batch_logit_safe_step_ce(
         "accepted_steps": accepted,  # число принятых шагов
         "hold_steps": held,  # число удержанных шагов
     }
-
-
-def newton_schulz_orthogonalize(G: np.ndarray, iters: int = 4) -> np.ndarray:
-    """Ортогонализация Ньютона–Шульца: за iters итераций X ← X·(3E − X^T·X)/2 приближает матрицу к ортогональной.
-
-    Матрица предварительно делится на норму Фробениуса и при необходимости
-    транспонируется (строк не больше, чем столбцов); в конце вид восстанавливается."""
-    X = G.astype(np.float64).copy()  # рабочая копия в float64
-    norm = float(np.linalg.norm(X))  # норма Фробениуса
-    if norm < 1e-12:  # норма практически нулевая
-        return X  # вернуть как есть
-    X /= norm  # нормировать: X = X / ‖X‖
-    transposed = False  # признак транспонирования
-    if X.shape[0] > X.shape[1]:  # строк больше, чем столбцов
-        X = X.T  # транспонировать
-        transposed = True  # запомнить
-    I_m = np.eye(X.shape[0], dtype=np.float64)  # единичная матрица размера число строк
-    for _ in range(iters):  # iters раз
-        X = 0.5 * (3.0 * I_m - X @ X.T) @ X  # итог: X = ½·(3E − X·X^T)·X
-    return X.T if transposed else X  # вернуть X^T, если транспонировали, иначе X
 
 
 class ContinualGPMMemory(GpuGpmMixin):
