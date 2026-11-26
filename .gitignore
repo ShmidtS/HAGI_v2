@@ -8,7 +8,6 @@ packages/*/dist/
 *.db
 package-lock.json
 gh-cli-cache/
-tasks/
 AGENTS.md
 .claude/worktrees/
 .claude-worktrees/
@@ -93,7 +92,6 @@ eval/
 glm5_gguf/
 glm5_pod/
 glm5_kvp/
-models/
 reports/
 .pi/
 artifacts/
