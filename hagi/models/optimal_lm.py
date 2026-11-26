@@ -39,25 +39,56 @@ def swiglu(x: t.Tensor, W_gate: t.Tensor, W_up: t.Tensor, W_down: t.Tensor) -> t
     return (g_act * (x @ W_up)) @ W_down  # произведение и проекция назад
 
 
-def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta: t.Tensor, S_init: t.Tensor | None = None) -> tuple[t.Tensor, t.Tensor]:
-    """Gated DeltaNet по времени: S_t = α_t S_{t−1} + β_t (v_t − S_{t−1} k_t) k_tᵀ; y_t = S_t q_t.
+def gated_deltanet(Q: t.Tensor, K: t.Tensor, V: t.Tensor, alpha: t.Tensor, beta: t.Tensor, S_init: t.Tensor | None = None,  # запросы, ключи, значения, затухание, запись, состояние
+                   chunk: int = 16) -> tuple[t.Tensor, t.Tensor]:  # размер чанка; выходы и финальное состояние
+    """Канонический Gated DeltaNet: S_t = α_t S_{t−1} + β_t (v_t − α_t S_{t−1} k_t) k_tᵀ; y_t = S_t q_t.
 
         Q, K, V: (B, H, T, D); alpha, beta: (B, H, T); S_init — начальное состояние (B, H, D, D) или None.
-        Возвращает (y: (B, H, T, D), S_final: (B, H, D, D)) — финальное состояние для переноса между чанками
-        (state-carry: градиент через границу не течёт, вызывающий передаёт S_final.detach())."""
+        Формула — gdnUpdate из GDNBridge: остаток считается от ЗАТУХШЕГО состояния α_t S_{t−1}.
+        Прежняя запись брала остаток от незатухшего S_{t−1}, и при жёстком сбросе (α = 0)
+        старое состояние просачивалось в память (замер: невязка 4.76 вместо 0).
+        Два вида вычисления — математически одна и та же рекурсия:
+          - T кратно chunk и T >= 2·chunk: блочно-параллельная WY-форма. Внутри блока
+            неизвестные u_t = β_t (v_t − α_t S_{t−1} k_t) связаны треугольной системой
+            (I + strict_lower(β_t · decay · K Kᵀ)) u = β (v − g S₀ k), где
+            g_t = Π_{i<=t} α_i, decay[t, j] = Π_{j<i<=t} α_i; она решается одним
+            batched solve_triangular, внешний цикл — T / chunk шагов вместо T;
+          - иначе: пошаговая рекурсия (любая длина)."""
     B, H, T, D = Q.shape  # размеры
     S = t.zeros((B, H, D, D), dtype=Q.dtype, device=Q.device) if S_init is None else S_init.to(Q.dtype)  # состояние: нулевое или перенесённое
-    outs = []  # выходы по шагам
-    for i in range(T):  # по времени
-        k = K[:, :, i]  # форма: пакет, головы, ширина головы
-        v = V[:, :, i]  # форма: пакет, головы, ширина головы
-        q = Q[:, :, i]  # форма: пакет, головы, ширина головы
-        a = alpha[:, :, i][..., None, None]  # форма: пакет, головы, 1, 1
-        b = beta[:, :, i][..., None, None]  # форма: пакет, головы, 1, 1
-        Sk = (S @ k.unsqueeze(-1)).squeeze(-1)  # произведение состояния на ключ
-        S = a * S + b * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # обновление состояния (правило Δ)
-        outs.append((S @ q.unsqueeze(-1)).squeeze(-1))  # выход: состояние на запрос
-    return t.stack(outs, dim=2), S  # выходы и финальное состояние
+    if T % chunk != 0 or T < 2 * chunk:  # длина не делится на чанк или короткая
+        outs = []  # выходы по шагам
+        for i in range(T):  # по времени
+            k, v, q = K[:, :, i], V[:, :, i], Q[:, :, i]  # ключ, значение, запрос шага
+            a, b = alpha[:, :, i][..., None, None], beta[:, :, i][..., None, None]  # затухание и скорость записи
+            aS = a * S  # затухшее состояние α_t S_{t−1}
+            S = aS + b * ((v - (aS @ k.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1) @ k.unsqueeze(-2))  # запись: S_t = aS + β (v − aS k) kᵀ
+            outs.append((S @ q.unsqueeze(-1)).squeeze(-1))  # выход: y_t = S_t q_t
+        return t.stack(outs, dim=2), S  # выходы и финальное состояние
+    C, N = chunk, T // chunk  # длина чанка и число чанков
+    Qc, Kc, Vc = (x.reshape(B, H, N, C, D) for x in (Q, K, V))  # те же тензоры по чанкам
+    ac, bc = alpha.reshape(B, H, N, C), beta.reshape(B, H, N, C)  # гейты по чанкам
+    g = t.cumprod(ac, dim=-1)  # g_t = Π_{i<=t} α_i внутри чанка
+    # decay[t, j] = Π_{j<i<=t} α_i (единица при t = j): строка t = e_t + α_t · строка t−1
+    eye = t.eye(C, dtype=Q.dtype, device=Q.device)  # единичная матрица C×C
+    decay = t.zeros((B, H, N, C, C), dtype=Q.dtype, device=Q.device)  # накопитель матрицы затухания
+    prev = t.zeros((B, H, N, C), dtype=Q.dtype, device=Q.device)  # предыдущая строка (строка t−1)
+    for i in range(C):  # по строкам
+        prev = ac[..., i:i + 1] * prev + eye[i]  # строка i: α_i · (строка i−1) + e_i
+        decay[..., i, :] = prev  # записать строку
+    lower = t.tril(t.ones((C, C), dtype=Q.dtype, device=Q.device), diagonal=-1)  # строго нижняя треугольная маска
+    L = eye + lower * (bc[..., None] * decay * (Kc @ Kc.transpose(-1, -2)))  # треугольная система: I + strict_lower(β_t · decay · K Kᵀ)
+    W_attn = t.tril(Qc @ Kc.transpose(-1, -2)) * decay  # вклад внутричанковых записей в выход: tril(Q Kᵀ) · decay
+    outs = []  # выходы по чанкам
+    for n in range(N):  # по чанкам — T / chunk итераций
+        Kn, Qn, Vn = Kc[:, :, n], Qc[:, :, n], Vc[:, :, n]  # чанк ключей, запросов, значений
+        SK = (S @ Kn.transpose(-1, -2)).transpose(-1, -2)  # S₀ k_j по чанку: (B, H, C, D)
+        SQ = (S @ Qn.transpose(-1, -2)).transpose(-1, -2)  # S₀ q_t по чанку
+        rhs = bc[:, :, n][..., None] * (Vn - g[:, :, n][..., None] * SK)  # правая часть: β (v − g S₀ k)
+        u = t.linalg.solve_triangular(L[:, :, n], rhs, upper=False, unitriangular=True)  # решения u_t треугольной системы
+        outs.append(g[:, :, n][..., None] * SQ + W_attn[:, :, n] @ u)  # выходы чанка: g S₀ q + Σ_j decay (qᵀk_j) u_j
+        S = g[:, :, n, -1][..., None, None] * S + (u * decay[:, :, n, -1][..., None]).transpose(-1, -2) @ Kn  # состояние после чанка
+    return t.cat(outs, dim=2), S  # выходы и финальное состояние
 
 
 def muon_orth(G: t.Tensor, iters: int = 5) -> t.Tensor:
