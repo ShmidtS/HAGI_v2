@@ -57,39 +57,23 @@ def oos_ce(m, data: bytes, tail: float = 0.2, stride: int = 3) -> float:
         return tot / max(1.0, cnt)  # средняя
 
 
-def train_budget(m, data: bytes, budget_s: float, gpm_flag: bool = False) -> dict:
-    """Обучать m на data[:80%] до бюджета времени; вернуть лучший holdout (последние 10% обучающей части)."""
-    k = m.k  # контекст
-    cut = int(len(data) * 0.8)  # обучающая часть
-    tr = data[:cut]  # обучение
-    va = data[cut - k: cut + int(len(data) * 0.1)] if cut + int(len(data) * 0.1) <= len(data) else data[cut - k:]  # контроль (10%)
-    best = float("inf"); best_state = None  # лучший holdout и снимок
-    t0 = time.time(); steps = 0  # старт и счётчик
-    arr = np.frombuffer(tr, dtype=np.uint8).astype(np.int64)  # индексы
-    rng = np.random.default_rng(0)  # выборка
-    gpm = None  # базисы GPM (None — обычный Adam)
-    if gpm_flag and hasattr(m, "forward_seq"):  # optimal с GPM: оптимизатор модели с проекцией
-        from hagi.models.optimal_lm import HybridMuonAdamW  # оптимизатор с проекцией
-        gpm = getattr(m, "gpm_left", {}); m.gpm_left = gpm  # базисы хранятся на модели
-        opt = HybridMuonAdamW(*m.matrix_and_vec_params(), lr_muon=0.03, lr_adam=5e-3, wd=1e-4); opt.gpm_left.update(gpm); opt.names.update({id(p): n for n, p in m.__dict__.items() if isinstance(p, t.nn.Parameter)})  # создать
-    else:  # обычный Адам
-        opt = t.optim.Adam(m.params(), lr=1e-3)  # Адам с явным шагом (одинаков для всех архитектур)
-    while time.time() - t0 < budget_s:  # до бюджета
-        if hasattr(m, "forward_seq"):  # причинная: окна T=64, потеря по всем позициям
-            s = rng.integers(0, len(arr) - k - 1, 16); X = t.as_tensor(np.stack([arr[i: i + k] for i in s]), dtype=t.long, device=m.device); y = t.as_tensor(np.stack([arr[i + 1: i + 1 + k] for i in s]), device=m.device)  # батч
-            loss = t.nn.functional.cross_entropy(m.forward_seq(X).reshape(-1, 256), y.reshape(-1))  # кросс-энтропия
-        else:  # одна цель на окно
-            s = rng.integers(k, len(arr) - 1, 64); X = t.as_tensor(np.stack([arr[i - k: i] for i in s]), dtype=t.long, device=m.device); y = t.as_tensor(arr[s + 1], dtype=t.long, device=m.device)  # батч
-            loss = t.nn.functional.cross_entropy(m.logits(X), y)  # кросс-энтропия
-        opt.zero_grad(); loss.backward(); opt.step(); steps += 1  # шаг
-        if steps % 50 == 0:  # контроль
-            c = oos_ce(m, va, tail=0.0 if False else 0.5, stride=4)  # CE на контрольном отрезке (его вторая половина — вне обучения)
-            if c < best:  # лучше
-                best = c; best_state = [p.detach().clone() for p in m.params()]  # снимок
-    if best_state is not None:  # восстановить лучший
-        with t.no_grad():  # без графа
-            for p, s_ in zip(m.params(), best_state): p.copy_(s_)  # вернуть
-    return {"holdout": best, "steps": steps, "sec": time.time() - t0}  # итог
+def train_budget(m, data: bytes, budget_s: float, gpm_flag: bool = False, replay: bytes = b"") -> dict:
+    """Обучать m на data[:80%] до бюджета времени; вернуть лучший holdout (последние 10% обучающей части).
+
+        Для причинной модели (optimal) используется ЕЁ рабочий алгоритм — train_optimal (Muon/AdamW,
+        перенос состояния, расписание шага), а не посторонний Adam: бенчмарк измеряет то, чем
+        учится цикл. replay — байты прежних доменов; они чередуются с новыми (_interleave_replay)."""
+    if hasattr(m, "forward_seq"):  # рабочая причинная модель
+        from hagi.selfdev.unified import _interleave_replay  # чередование повтора с новым доменом
+        cut = int(len(data) * 0.8)  # обучающая часть нового домена
+        combined = _interleave_replay(data[:cut], replay)  # новый домен вперемешку с повтором; хвост — чисто новый (контроль)
+        steps = max(30, int(budget_s * 35))  # число шагов из бюджета времени (замер: ~35 шагов/с на GPU)
+        with t.no_grad():  # снимок на случай отката
+            snap = [p.detach().clone() for p in m.params()]  # копии параметров
+        per_epoch = max(1, (len(combined) - m.k - 1) // (16 * m.k))  # шагов на один проход данных (как в train_optimal)
+        r = m.train_optimal(combined, epochs=max(1, -(-steps // per_epoch)), batch=16, seq_len=m.k, seed=0, gpm_left=(getattr(m, "gpm_left", None) if gpm_flag else {}))  # рабочий шаг обучения
+        return {"holdout": float(r["val_ce_after"]), "steps": int(r["steps"]), "sec": budget_s}  # лучший контроль и число шагов
+    raise RuntimeError('arch_bench: не-causal модель без train_optimal больше не поддерживается')  # прочие архитектуры: вне этого бенчмарка
 
 
 def main() -> None:  # точка входа
@@ -97,6 +81,7 @@ def main() -> None:  # точка входа
     ap.add_argument("--budget", type=float, default=60.0)  # секунды на домен
     ap.add_argument("--archs", default="rope,hnet,optimal")  # архитектуры
     ap.add_argument("--gpm", action="store_true")  # GPM-проекция + Muon/AdamW для optimal
+    ap.add_argument("--replay", action="store_true")  # повтор прежних доменов вперемешку с новым (30%)
     a = ap.parse_args()  # аргументы
     doms = pick_domains(4)  # домены
     print("домены:", [(n, len(b)) for n, b in doms], flush=True)  # отчёт
@@ -109,12 +94,15 @@ def main() -> None:  # точка входа
         npar = sum(p.numel() for p in m.params())  # параметры
         qb = quantize_model(m, bits=4)[1] if hasattr(m, "forward_seq") else None  # байты Q4 (для optimal)
         ce = []  # CE по доменам после обучения на каждом
+        seen: list[bytes] = []  # уже пройденные домены (для повтора)
         mat = []  # матрица CE: строка — после шага i, столбец — домен j
         for name, data in doms:  # последовательное обучение
-            r = train_budget(m, data, a.budget, a.gpm)  # обучение
+            rep_b = b"".join(d[: int(float(os.environ.get("HAGI_REPLAY_FRAC", "0.3")) * len(data) / max(1, len(seen)))] for d in seen) if (a.replay and seen) else b""  # повтор: 30% объёма нового, поровну из прежних доменов
+            r = train_budget(m, data, a.budget, a.gpm, rep_b)  # обучение (с повтором, если задано)
             if a.gpm and hasattr(m, "forward_seq"):  # после домена — защитить его входы
                 from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
                 update_gpm_bases(m, data[: int(len(data) * 0.8)], m.gpm_left)  # SVD входов
+            seen.append(data)  # домен стал прежним
             row = [oos_ce(m, d) for _, d in doms]  # CE на всех доменах
             mat.append(row); ce.append(r["holdout"])  # записать
             print(f"[{arch:8s}] {name:14s} holdout {r['holdout']:.3f} | шагов {r['steps']:5d} | CE по доменам {np.round(row, 2).tolist()}", flush=True)  # отчёт
