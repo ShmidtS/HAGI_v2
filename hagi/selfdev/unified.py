@@ -306,7 +306,7 @@ class Unified:
             if not ad.B.any():  # B = 0: адаптер свежий (тождество живёт в нейтральности B, A при инициализации случайна)
                 cands = [(s, e.get("ce")) for s, e in self.domains.items()  # кандидаты (домен, CE) по всем доменам ...
                          if s != source and e.get("ce") is not None  # ... кроме нового и с измеренной CE ...
-                         and e.get("ce") <= 0.5]  # ... где CE <= 0.5
+                         and e.get("tail_ce", e.get("ce")) <= 0.5]  # ... где CE на хвосте домена <= 0.5 (tail_ce; в старых записях — ce)
                 if cands:  # есть подходящий домен
                     best_src = min(cands, key=lambda kv: kv[1])[0]  # имя домена с наименьшей CE
                     from hagi.base.trunk_ops import adapter_warm_start  # копирование весов адаптера
@@ -354,6 +354,10 @@ class Unified:
                 for prm, inc in zip(self.model.params(), incumbent_state):  # по парам (параметр, снимок)
                     prm.copy_(inc)  # prm := значение из снимка
         entry["ce"] = ce  # записать CE нового домена
+        # Честная мера переноса: CE на хвосте САМОГО домена (последние 8192 байтов, вне
+        # обучения). Поле ce — CE на хвосте склеенного потока повторов всех доменов; оно
+        # не измеряет перенос: в рабочей книге ce 0.78..1.63 при tail_ce 3.2..4.9.
+        entry["tail_ce"] = self._tail_ce(data)  # CE на хвосте нового домена после обучения
         entry["old_ce"] = old_ce  # записать CE на старых доменах
         if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): волокно домена — знания вне ствола
             from hagi.models.optimal_lm import fit_domain_fiber  # обучение волокна на замороженных активациях
@@ -390,6 +394,7 @@ class Unified:
             "replay_domains": len(self.domains),  # число доменов в книге
             "replay_bytes": len(combined),  # длина обучающей выборки
             "holdout_ce": ce,  # CE последнего повтора на отложенных данных
+            "tail_ce": entry.get("tail_ce"),  # CE на хвосте самого нового домена после обучения (перенос)
             "old_ce": entry.get("old_ce"),  # CE на старых доменах
             "old_ce_pre": old_ce_pre,  # CE на старых доменах ДО приёма (накопление знаний: должна снижаться от чанка к чанку)
             "new_ce_before": new_ce_before,  # CE нового домена до обучения (перенос)
