@@ -79,6 +79,8 @@ def _sha(b: bytes) -> str:
 ADAPTER_MIN_GAIN = 0.005  # минимальный парный выигрыш адаптера: нижняя граница выигрыша должна превысить 0.005
 ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока роста: нат CE на единицу доли параметров (λ_M в правиле приёма; калибровка: полезный блок ≈ 0.57 ната при доле 0.30 → цена 0.30, слабый блок 0.1 ната отклоняется)
 
+FIBER_MIN_GAIN = 0.01  # минимальный выигрыш волокна на отложенной части домена, ноль и меньше — отказ
+
 class Unified:
     """ЕДИНАЯ развивающаяся модель: тело, книга доменов и банк адаптеров."""
     # HAGI_ARCH=hnet выбирает HNetByteLM (измерено: CE по целым файлам 1.54 против
@@ -317,7 +319,16 @@ class Unified:
             if getattr(self, "fibers", None) is None:  # банка ещё нет
                 self.fibers = {}  # пустой банк
             if not regression:  # домен принят
-                self.fibers[source] = fit_domain_fiber(self.model, data[: int(len(data) * 0.8)], rank=8, seed=len(self.fibers))  # волокно домена (ствол не меняется — забывание 0)
+                from hagi.models.optimal_lm import eval_with_fiber  # кросс-энтропия ствола с волокном и без него
+                cut_f = int(len(data) * 0.8)  # граница: 80% — обучение волокна, 20% — проверка
+                fib = fit_domain_fiber(self.model, data[:cut_f], rank=8, seed=len(self.fibers))  # кандидат в волокна (ствол не меняется)
+                # Гейт приёма: волокно хранится, только если на ОТЛОЖЕННОЙ части домена оно лучше
+                # ствола без него. Замер: без гейта волокно ухудшало отложенную кросс-энтропию
+                # (код 1.974 -> 2.080, текст 1.637 -> 1.724), т.е. было балластом в 4 928 параметров.
+                ce_wo = eval_with_fiber(self.model, data[cut_f:])  # ствол без волокна
+                ce_w = eval_with_fiber(self.model, data[cut_f:], fib)  # ствол с волокном
+                if ce_w < ce_wo - FIBER_MIN_GAIN:  # волокно полезно на невиденных байтах
+                    self.fibers[source] = fib  # принять в банк
         if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): защитить активации домена в GPM
             from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
             if getattr(self.model, "gpm_left", None) is None:  # базисов ещё нет
