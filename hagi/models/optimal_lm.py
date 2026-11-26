@@ -965,6 +965,7 @@ class StreamState:
         self.h_buf = f(2, d)  # скрытые для короткой свёртки: [-2], [-1]
         self.h_prev = f(d)  # скрытое предыдущего шага (гейт границ)
         self.x_prev = 0  # предыдущий байт (для хэша биграмм)
+        self.hist = bytearray()  # последние 5 байтов истории (для словарей точного обхода)
         self.S1 = f(H, hd, hd)  # состояние GDN уровня 1
         self.S2 = f(H, hd, hd)  # состояние GDN уровня 2
         self.n = 0  # число шагов
@@ -973,6 +974,7 @@ class StreamState:
         """Обработать байт b и вернуть логиты следующего байта (256). Равен forward_seq(ctx + [b])[:, -1]."""
         m = self.m; d, H, hd = self.d, self.H, self.hd  # размеры
         with t.no_grad():  # без графа
+            self.hist.append(b); del self.hist[:-5]  # история: последние 5 байтов, включая текущий (как в forward_seq)
             e = m.emb[b]  # вложение байта, (d)
             acc = t.zeros(d)  # взвешенная сумма лагов
             for li, lag in enumerate(m.LAGS):  # по лагам
@@ -990,8 +992,9 @@ class StreamState:
             v = (h_in @ m.W_gv).reshape(H, hd)  # значения
             a = t.sigmoid(h_in @ m.W_alpha + m.b_alpha) * 0.96  # удержание, (H)
             bb = t.sigmoid(h_in @ m.W_beta + m.b_beta)  # запись, (H)
-            Sk = (self.S1 @ k.unsqueeze(-1)).squeeze(-1)  # S k по головам, (H, hd)
-            self.S1 = a[:, None, None] * self.S1 + bb[:, None, None] * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # правило Δ
+            aS = a[:, None, None] * self.S1  # затухшее состояние α·S (каноническая формула GDNBridge)
+            Sk = (aS @ k.unsqueeze(-1)).squeeze(-1)  # (α·S) k по головам, (H, hd)
+            self.S1 = aS + bb[:, None, None] * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # запись: aS + β (v − aS k) kᵀ
             y1 = (self.S1 @ q.unsqueeze(-1)).squeeze(-1).reshape(d)  # выход уровня 1
             if m.use_gdn_norm:  # нормировка
                 y1 = rms_norm(y1, m.g_gdn1)  # стабилизация
@@ -1004,17 +1007,18 @@ class StreamState:
                 v2 = (h @ m.W_hv).reshape(H, hd)  # значения
                 a2 = (1.0 - p_bnd * (1.0 - t.sigmoid(m.a_slow))) * 0.985  # удержание, (H)
                 b2 = p_bnd * t.sigmoid(m.b_slow)  # запись, (H)
-                Sk2 = (self.S2 @ k2.unsqueeze(-1)).squeeze(-1)  # произведение состояния на ключ
-                self.S2 = a2[:, None, None] * self.S2 + b2[:, None, None] * ((v2 - Sk2).unsqueeze(-1) @ k2.unsqueeze(-2))  # правило Δ
+                aS2 = a2[:, None, None] * self.S2  # затухшее состояние уровня 2
+                Sk2 = (aS2 @ k2.unsqueeze(-1)).squeeze(-1)  # произведение затухшего состояния на ключ
+                self.S2 = aS2 + b2[:, None, None] * ((v2 - Sk2).unsqueeze(-1) @ k2.unsqueeze(-2))  # каноническая запись
                 y2 = (self.S2 @ q2.unsqueeze(-1)).squeeze(-1).reshape(d)  # выход
                 if m.use_gdn_norm:  # нормировка
                     y2 = rms_norm(y2, m.g_gdn2)  # стабилизация
                 h = h + y2 @ m.W_ho  # остаток
                 self.h_prev = h_before  # h_prev следующего шага — скрытое ДО уровня 2 (как в forward_hidden: cat([h, h_prev]) с h_prev = h_t−1 после уровня 1)
-            hn = rms_norm(h, m.g_mlp)  # перед MLP
+            hn = m._spike(rms_norm(h, m.g_mlp))  # перед MLP (со спайкингом, если включён — как в forward_hidden)
             h = h + swiglu(hn, m.W_gate, m.W_up, m.W_down)  # основной блок
             for Wg, Wu, Wd in m.blocks:  # дополнительные блоки
-                h = h + swiglu(rms_norm(h, m.g_mlp), Wg, Wu, Wd)  # добавить
+                h = h + swiglu(m._spike(rms_norm(h, m.g_mlp)), Wg, Wu, Wd)  # добавить
             h_out = rms_norm(h, m.g_out)  # выходное скрытое
             h_out = m._apply_adapter(h_out[None])[0]  # доменный адаптер, если задан
             lg = (h_out @ m.emb.T) * m.out_scale + m.b_out  # логиты
@@ -1023,6 +1027,8 @@ class StreamState:
             fib = getattr(m, "active_fiber", None)  # волокно домена
             if fib is not None:  # задано
                 lg = lg + fib.logits_delta(h_out[None], t.as_tensor([b]))[0, 0]  # добавка волокна (h_out — (d,))
+            if m.bypass_boost > 0:  # точный обход включён — как в forward_seq (по последним 5 байтам истории)
+                lg = lg + m.bypass_apply(t.as_tensor(list(self.hist), dtype=t.long)[None], t.zeros((1, len(self.hist), 256)))[0, -1]  # прибавка словарей: история как окно (1, n), логит как позиция (1, 1, 256)
         self.n += 1  # счётчик шагов
         return lg  # логиты следующего байта
 
