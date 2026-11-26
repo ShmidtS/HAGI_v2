@@ -1166,6 +1166,7 @@ class Unified:
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}  # длину контекста, dim и hidden
         )
         st["arch"] = getattr(self.model, "ARCH", "rope")  # имя архитектуры (по умолчанию rope)
+        st["spike_k"] = getattr(self.model, "spike_k", None)  # порог спайкинга (None — выключен): режим переживает перезапуск
         st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))  # номера замороженных блоков по возрастанию
         if getattr(self, "fibers", None):  # волокна доменов
             st["fibers"] = {dom: {n: p_.detach().cpu() for n, p_ in fib.__dict__.items() if isinstance(p_, _t.nn.Parameter)} for dom, fib in self.fibers.items()}  # домен -> параметры волокна
@@ -1295,6 +1296,8 @@ class Unified:
             with _t.no_grad():  # без градиентов
                 for k in live:  # по тензорам блока
                     live[k].copy_(blk[k].to(live[k].device))  # скопировать тензор сохранённого блока
+        if "spike_k" in st:  # в состоянии сохранён режим спайкинга
+            u.model.spike_k = st["spike_k"]  # восстановить его
         u.model.frozen_blocks = set(st.get("frozen_blocks", []))  # замороженные блоки: множество номеров (по умолчанию пустое)
         u.domains = (  # книга доменов ...
             json.loads(_ledger_js().read_text(encoding="utf-8")) if _ledger_js().exists() else {}  # ... из JSON-файла в utf-8, иначе пустой словарь
