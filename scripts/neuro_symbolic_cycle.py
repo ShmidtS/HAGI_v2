@@ -115,8 +115,12 @@ def main() -> None:
             print( "no more files — disk fully swept", flush=True )  # диск просмотрен полностью
             break  # закончить цикл
         blob = b"\n\x00FILE\x00\n".join( chunk )  # склеить выборки через метку конца файла
-        cid = f"ns_{st['chunks']:04d}"  # имя куска ns_НННН по его номеру
         (CKPT_DIR / "domains").mkdir( parents=True, exist_ok=True )  # создать каталог доменов
+        # номер куска не должен занимать имя уже принятого домена: после утери sweep_state.json
+        # счётчик начинался с 0 и новый кусок перезаписывал байты ns_0000.. книги
+        while (CKPT_DIR / "domains" / f"ns_{st['chunks']:04d}.bin").exists() or (f"ns_{st['chunks']:04d}" in u.domains):  # имя занято файлом или записью книги
+            st["chunks"] += 1  # взять следующий номер
+        cid = f"ns_{st['chunks']:04d}"  # имя куска ns_НННН по свободному номеру
         (CKPT_DIR / "domains" / f"{cid}.bin").write_bytes( blob )  # сохранить кусок в файл
   # ---- нейронное обучение на накопленном корпусе ----
   # предел повтора снят: при каждом приёме повторяются ВСЕ прежние домены

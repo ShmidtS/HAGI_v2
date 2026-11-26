@@ -15,7 +15,7 @@
 import os, re, time  # os — путь и время изменения файла, re — поиск по журналу, time — текущее время
 LOG = os.path.join(os.path.dirname(os.path.dirname(  # путь к журналу: <корень проекта>/checkpoints/cycle.log, корень = каталог над scripts/
     os.path.abspath(__file__))), "checkpoints", "cycle.log")  # __file__ → абсолютный путь, dirname дважды: файл → scripts → корень
-raw = open(LOG, "rb").read()  # байты журнала целиком (режим "rb" — двоичный, без перекодировки)
+raw = open(LOG, "rb").read() if os.path.exists(LOG) else b""  # прочитать журнал целиком в двоичном виде; нет файла — пустые байты (до первого запуска цикла журнала ещё нет)
 # журнал пишется либо PowerShell (UTF-16 LE, по 2 байта на символ), либо прямым
 # перенаправлением (UTF-8): различаем по доле нулевых байтов (в UTF-16 латиница даёт ~50 % нулей)
 head = raw[:4096]  # начало файла для оценки кодировки
@@ -24,7 +24,7 @@ txt = raw.decode("utf-16-le" if is_utf16 else "utf-8", errors="ignore")  # те�
 ns = re.findall(r"\[(ns_\d+)\] neural: .*?CE (\d+\.\d+) \((\d+\.\d)s\)", txt)  # все строки нейронного шага: (id чанка ns_N, CE, секунды); CE = cross-entropy на чанке
 secs = sorted(float(s) for _, _, s in ns)  # времена чанков по возрастанию: t_(1) ≤ … ≤ t_(n)
 sem = re.findall(r"semantic loss (\d+\.\d+)", txt)  # значения семантического лосса в порядке появления (строками)
-fresh = int(time.time() - os.path.getmtime(LOG))  # давность журнала в целых секундах: int(текущее время − время изменения файла)
+fresh = int(time.time() - os.path.getmtime(LOG)) if os.path.exists(LOG) else -1  # давность журнала в секундах: время − время изменения файла; нет файла — −1 (журнал ещё не создан)
 print(f"fresh {fresh}s | chunks {len(ns)} last {ns[-1] if ns else None} | "  # печать: давность | число чанков n | последний чанк (кортеж id, CE, секунды) или None, если чанков нет
       f"median {secs[len(secs) // 2] if secs else 0:.0f}s | "  # медиана времени чанка = secs[n // 2] (верхняя медиана), 0 при пустом списке, формат без дробной части
       f"chat {txt.count('[chat]')} crit {txt.count('critique stream')} | "  # число вхождений подстроки "[chat]" и "critique stream" в тексте

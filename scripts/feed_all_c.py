@@ -10,7 +10,7 @@
 Каждые CHUNK_TARGET = 200000 байтов выборки склеиваются в кусок и проходят приём с
 EPOCHS_PER_CHUNK = 8 эпохами на накопленном корпусе (полный повтор — без забывания).
 Возобновление: состояние (посещено, прочитано, хеши, курсор) лежит в файле
-checkpoints/sweep_state.json.
+checkpoints/sweep_state.json (точнее, <CKPT_DIR>/sweep_state.json).
 В конце файла — отбор разнообразных фрагментов: score(i | S) = H(p_i) · min_{j∈S} JS(p_i, p_j),
 то есть предпочтение информативным фрагментам с НОВЫМ распределением байтов относительно
 уже выбранных представителей; расстояния считаются только до представителей.
@@ -29,7 +29,17 @@ sys.path.insert( 0, str(Path(__file__).resolve().parent.parent) )  # добав�
 from hagi.selfdev import ( unified, )  # объединённая модель; импорт после правки sys.path
 
 ROOT = Path(__file__).resolve().parent.parent  # корень проекта
-SWEEP_STATE = ROOT / "checkpoints" / "sweep_state.json"  # файл состояния просмотра
+from hagi.base.util import CKPT_DIR  # каталог контрольных точек (HAGI_CKPT_DIR перенаправляет записи)
+
+
+def sweep_state_path() -> Path:
+    """Путь к файлу состояния просмотра: <CKPT_DIR>/sweep_state.json.
+
+        Путь строится при каждом вызове от ТЕКУЩЕГО каталога контрольных точек:
+        константа, вычисленная при импорте, писала состояние в рабочий checkpoints/
+        даже когда HAGI_CKPT_DIR указывал на изолированную копию, и состояние копии
+        подменяло состояние рабочей модели."""
+    return CKPT_DIR / "sweep_state.json"  # соединить текущий каталог и имя файла
 
   # пределы (честные: весь диск не поместится; посещается каждый ФАЙЛ)
 MAX_FILE_BYTES = 1 << 20  # не больше 1 МБ на файл = 2^20
@@ -101,14 +111,15 @@ def sample_bytes(p: str, size: int) -> bytes | None:
 
 def load_state() -> dict:
     """Прочитать состояние просмотра из файла; если файла нет — начальное состояние с нулями."""
-    if SWEEP_STATE.exists():  # файл состояния существует
-        return json.loads( SWEEP_STATE.read_text(encoding="utf-8") )  # разобрать JSON файла
+    p = sweep_state_path()  # путь к файлу состояния
+    if p.exists():  # файл состояния существует
+        return json.loads( p.read_text(encoding="utf-8") )  # разобрать JSON файла
     return { "seen": {}, "visited": 0, "sampled": 0, "skipped_locked": 0, "bytes_ingested": 0, "chunks": 0, "cursor": None, }  # начальное состояние: хешей нет, все счётчики 0 # принято байтов 0, кусков 0, курсора нет
 
 
 def save_state(st: dict) -> None:
     """Записать состояние просмотра st в файл JSON."""
-    SWEEP_STATE.write_text( json.dumps(st, ensure_ascii=False), encoding="utf-8", )  # текст JSON без экранирования не-ASCII # в кодировке UTF-8
+    sweep_state_path().write_text( json.dumps(st, ensure_ascii=False), encoding="utf-8", )  # текст JSON без экранирования не-ASCII # в кодировке UTF-8
 
 
 def main() -> None:
