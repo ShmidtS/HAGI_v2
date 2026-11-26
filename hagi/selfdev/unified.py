@@ -317,7 +317,7 @@ class Unified:
             if getattr(self, "fibers", None) is None:  # банка ещё нет
                 self.fibers = {}  # пустой банк
             if not regression:  # домен принят
-                self.fibers[source] = fit_domain_fiber(self.model, data[: int(len(data) * 0.8)], rank=8, seed=len(self.fibers))  # волокно домена (ствол не меняется — забытие 0)
+                self.fibers[source] = fit_domain_fiber(self.model, data[: int(len(data) * 0.8)], rank=8, seed=len(self.fibers))  # волокно домена (ствол не меняется — забывание 0)
         if hasattr(self.model, "forward_seq"):  # причинная модель (optimal): защитить активации домена в GPM
             from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
             if getattr(self.model, "gpm_left", None) is None:  # базисов ещё нет
@@ -1153,8 +1153,8 @@ class Unified:
                 dom: [{"feature": e["feature"],  # имя признака ...
                        "verify": e["verify"],  # ... статус проверки ...
                        "support": e.get("support"),  # ... носитель ...
-                       "coefs": e["bp"].q_param[0],  # ... коэффициенты q_param[0] ...
-                       "bias": e["bp"].q_param[1],  # ... смещение q_param[1] ...
+                       # параметр характеристики целиком: реестр хранит и не аффинные законы
+                       "q_param": repr(e["bp"].q_param),  # ... параметр q_param в виде текста Python ...
                        "basis": e["bp"].basis,  # ... базис ...
                        "payload": e["bp"].payload,  # ... полезная нагрузка ...
                        "accepted_to_registry": e.get(  # ... принят ли в реестр ...
@@ -1205,15 +1205,19 @@ class Unified:
                 ad.B = _t.as_tensor(ab["B"])  # веса B
         if "law_registry" in st:  # в состоянии есть реестр законов
             import numpy as _np  # локальный импорт numpy
-            from hagi.invent.invention_multi import _affine_k  # сборка аффинной функции по (коэффициенты, смещение)
+            from hagi.invent.invention_multi import feature_fn  # сборка функции характеристики по (имя, параметр)
+            import ast as _ast  # разбор текста Python (параметр характеристики)
             from hagi.invent.invention import ConstructBlueprint  # класс чертежа конструкции
             u.law_registry = {}  # пустой реестр
             for dom, laws in st["law_registry"].items():  # по доменам и спискам записей
                 entries = []  # восстановленные записи домена
                 for e in laws:  # по сохранённым записям
-                    ffn = _affine_k(tuple(e["coefs"]), e["bias"])  # аффинная функция ffn(x) = Σ coef_i·x_i + bias
+                    # старые состояния хранили только аффинные законы двумя полями coefs/bias
+                    q_param = (_ast.literal_eval(e["q_param"]) if "q_param" in e  # параметр из текста, если он сохранён ...
+                               else (tuple(e["coefs"]), e["bias"]))  # ... иначе (коэффициенты, смещение) старого формата
+                    ffn = feature_fn(e["feature"], q_param)  # функция характеристики ffn(x) — та же, что при синтезе
                     bp = ConstructBlueprint(  # чертёж: признак, параметры, функция, базис, нагрузка, 9
-                        e["feature"], (tuple(e["coefs"]), e["bias"]),  # аргументы чертежа: признак, кортеж (коэффициенты, смещение)
+                        e["feature"], q_param,  # аргументы чертежа: признак, его параметр
                         ffn, e["basis"], e["payload"], 9)  # продолжение: функция, базис, нагрузка, число 9
                     entries.append({"feature": e["feature"],  # запись: признак ...
                                     "bp": bp,  # ... чертёж ...

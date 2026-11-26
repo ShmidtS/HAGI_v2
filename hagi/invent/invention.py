@@ -209,6 +209,12 @@ def basis_poly_lin(core_pairs: list[tuple[int, int]]) -> dict | None:
 
 
 
+def basis_dict(core_pairs: list[tuple[int, int]]) -> dict:  # пары (значение характеристики, байт)
+    """Словарный базис DICT: таблица «значение характеристики -> байт». Отличие от
+    FULL: вне таблицы закон не отвечает (ошибка, а не молчаливый ноль)."""
+    return {"kind": "DICT", "table": dict(core_pairs)}  # описание: тип DICT и словарь пар
+
+
 BASES: list[tuple[str, Callable]] = [  # меню базисов: (имя, функция построения)
     ("FULL", basis_full),  # FULL — таблица
     ("OUT_PERIOD", basis_out_period),  # OUT_PERIOD — периодический счётчик
@@ -239,6 +245,8 @@ class ConstructBlueprint:  # чертёж: фактор + базис + нагр�
         """Применить чертёж к входу x: c = q(x), затем базис(c)."""
         c = self.q_fn(x)  # ядро c = q(x)
         kind = self.payload["kind"]  # тип базиса из нагрузки
+        if kind == "DICT":  # если DICT
+            return self.payload["table"][c]  # вернуть table[c]; вне таблицы — ошибка: закон не отвечает
         if kind == "FULL":  # если FULL
             return self.payload["table"].get(c, 0)  # возврат table[c], для отсутствующих ядер 0
         if kind == "SPARSE":  # если SPARSE
@@ -294,6 +302,8 @@ def _payload_bits(basis_name: str, payload: dict, core_size: int) -> int:
     k = payload.get("kind")  # тип базиса из нагрузки
     if k == "OUT_PERIOD":  # если OUT_PERIOD
         return 8  # вернуть 8 бит
+    if k == "DICT":  # если DICT
+        return len(payload["table"]) * 24  # по 24 бита на запись: 16 бит ключа-хеша + 8 бит байта
     if k == "FULL":  # если FULL
         return core_size * 4  # вернуть core_size·4 бита — по 4 бита на точку
     if k == "SPARSE":  # если SPARSE

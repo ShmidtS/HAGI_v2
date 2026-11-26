@@ -6,7 +6,9 @@
       diff  — c = (x[i] − x[j]) mod 256;
       xorm  — c = XOR_i (m_i & x_i) по битовой маске m;
       xfull — c = XOR_{i из I} x_i по подмножеству индексов I;
-      pos   — c = x[i].
+      pos   — c = x[i];
+      id    — c = хеш последних ln байтов контекста (ln = 2..k), базис DICT:
+                таблица «контекст -> байт»; вне таблицы закон не отвечает.
   - Поток разделён на слои по позиции: слой (P, s) — пары с pos mod P = s.
     В слое для каждого значения c берётся мажоритарный ответ y (доля >= 0.6,
     не менее 2 голосов). Базис POLY_LIN (y = k·c + c0) или OUT_PERIOD
@@ -16,8 +18,8 @@
   - Кандидаты сравниваются по ключу (support, −total_bits); лучший
     возвращается со статусом PARTIAL_LAW, иначе {"status": "NO_LAW"}.
 
-Экспортирует: _affine_k, _xor_mask, _diff_pair, _position, enumerate_features,
-_vfeat, _kind, _majVotes, _mode_share, invent_multi.
+Экспортирует: _affine_k, _xor_mask, _diff_pair, _position, _dict_id, enumerate_features,
+_vfeat, _kind, _majVotes, _mode_share, feature_fn, _dict_candidate, invent_multi.
 """
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
@@ -26,7 +28,7 @@ import random  # генератор случайных чисел
 import numpy as np  # численные массивы
 from typing import Callable  # тип «вызываемый объект»
 
-from hagi.invent.invention import BASES, ConstructBlueprint, _payload_bits  # меню базисов и чертёж «характеристика + базис»
+from hagi.invent.invention import BASES, ConstructBlueprint, _payload_bits, basis_dict  # меню базисов и чертёж «характеристика + базис»
 
 # ---- характеристические функции от кортежей контекста ----------------------------
 
@@ -65,6 +67,34 @@ def _position(i: int):  # номер позиции в контексте
     return f  # готовая функция
 
 
+def _xor_full(idxs):  # индексы байтов контекста
+    """Вернуть функцию c = XOR_{i из idxs} x_i — XOR целых байтов по списку индексов."""
+    def f(x):  # x — кортеж байтов контекста
+        s = 0  # накопитель
+        for i in idxs:  # по индексам
+            s ^= x[i]  # накопитель: s = s XOR x_i
+        return s  # c = XOR_{i из idxs} x_i
+    return f  # готовая функция
+
+
+DICT_MOD = 65521  # модуль словарного хеша: наибольшее простое число, меньшее 65536
+
+
+def _dict_id(ln: int, mod: int = DICT_MOD):  # длина суффикса контекста; модуль хеша
+    """Вернуть характеристику словарного закона: c = (…((x0·256 + x1)·256 + x2)…) mod mod
+    по последним ln байтам контекста (схема Горнера). Это n-граммный закон «контекст ->
+    байт» (Шеннон, 1951): без обобщения по соседним контекстам, зато точно там, где
+    арифметические признаки бессильны. Модуль — большое простое число: хеш сворачивает
+    до 256^ln значений в таблицу приемлемого размера; редкие столкновения отсекаются
+    мажоритарным голосованием."""
+    def f(x: tuple[int, ...]) -> int:  # x — кортеж байтов контекста
+        s = 0  # накопитель: s = 0
+        for v in x[-ln:]:  # по последним ln байтам контекста
+            s = (s * 256 + int(v)) % mod  # схема Горнера: s = (s·256 + v) mod mod
+        return s  # значение: c = s
+    return f  # готовая функция
+
+
 def enumerate_features(k: int, max_features: int = 4000):  # арность контекста, предел числа характеристик
     """Перечислить комбинаторное семейство характеристик для контекста из k байтов.
 
@@ -76,6 +106,11 @@ def enumerate_features(k: int, max_features: int = 4000):  # арность ко
         отдельные позиции. Возвращаются первые max_features.
         Элемент: (имя, параметр, функция)."""
     feats: list[tuple[str, object, Callable]] = []  # накопитель (имя, параметр, функция)
+    # словарные характеристики — ПЕРВЫМИ: аффинное семейство одно больше max_features,
+    # в хвосте списка их обрезал бы срез feats[:max_features]. Длины — от полной к
+    # короткой (шаг назад по длине контекста, как в n-граммных моделях с откатом)
+    for ln in range(k, 1, -1):  # по длинам суффикса k, k−1, …, 2
+        feats.append((f"id{ln}", (ln, DICT_MOD), _dict_id(ln)))  # словарный закон «суффикс контекста -> байт»
     from itertools import product as _prod  # декартово произведение
     # порядок по разреженности: законы с малым числом ненулевых коэффициентов
     # вероятнее и дешевле в проверке
@@ -97,13 +132,6 @@ def enumerate_features(k: int, max_features: int = 4000):  # арность ко
     for bits in range(1, 1 << k):  # по всем непустым наборам битов
         mask = tuple((bits >> i) & 1 for i in range(k))  # маска: m_i = (bits >> i) & 1
         feats.append((f"xor{mask}", mask, _xor_mask(mask)))  # XOR величин (m_i & x_i)
-    def _xor_full(idxs):  # XOR целых байтов по списку индексов
-        def f(x):  # x — кортеж байтов контекста
-            s = 0  # накопитель
-            for i in idxs:  # по индексам
-                s ^= x[i]  # накопитель: s = s XOR x_i
-            return s  # c = XOR_{i из idxs} x_i
-        return f  # готовая функция
     for bits in range(1, 1 << k):  # по всем непустым наборам битов
         idxs = [i for i in range(k) if (bits >> i) & 1]  # индексы, у которых бит bits равен 1
         feats.append((f"fxor{idxs}", tuple(idxs), _xor_full(idxs)))  # XOR байтов с этими индексами
@@ -130,16 +158,70 @@ def _vfeat(kind: str, param, X) -> "np.ndarray":  # тип характерис�
         return np.bitwise_xor.reduce(X[:, list(param)], axis=1)  # XOR столбцов с индексами из param
     if kind == "pos":  # позиция: c = x[i]
         return X[:, param[0]]  # столбец с индексом param[0]
+    if kind == "id":  # словарная: c = (…) mod mod по последним ln байтам
+        ln, mod = param  # длина суффикса и модуль
+        c = np.zeros(X.shape[0], dtype=np.int64)  # накопитель: c = 0 для всех строк
+        for j in range(X.shape[1] - ln, X.shape[1]):  # по последним ln столбцам
+            c = (c * 256 + X[:, j]) % mod  # схема Горнера: c = (c·256 + x_j) mod mod
+        return c  # значения словарного хеша
     raise KeyError(kind)  # неизвестный тип — ошибка
 
 
 def _kind(name: str) -> str:  # имя характеристики
     """Вернуть тип характеристики по префиксу её имени."""
-    for pre, kind in (("aff", "aff"), ("diff", "diff"), ("fxor", "xfull"),  # по парам (префикс имени, тип)
+    for pre, kind in (("id", "id"), ("aff", "aff"), ("diff", "diff"), ("fxor", "xfull"),  # по парам (префикс имени, тип)
                       ("xor", "xorm"), ("pos", "pos")):  # продолжение списка пар
         if name.startswith(pre):  # имя начинается с префикса
             return kind  # соответствующий тип
     raise KeyError(name)  # неизвестное имя — ошибка
+
+
+def feature_fn(name: str, param):  # имя характеристики, её параметр
+    """Вернуть функцию характеристики по имени и параметру — ту же, что выдаёт
+    enumerate_features. Нужна при загрузке реестра законов из сохранённого состояния."""
+    builders = {"id": _dict_id, "aff": _affine_k, "diff": _diff_pair,  # тип -> конструктор: id, aff, diff
+                "xorm": _xor_mask, "xfull": _xor_full, "pos": _position}  # продолжение: xorm, xfull, pos
+    return builders[_kind(name)](*param)  # функция характеристики с данным параметром
+
+
+def _dict_candidate(c, y, idx, fname, fparam, ffn,  # значения хеша, ответы, номера пар слоя, характеристика
+                    min_edge: float, min_support: float  # минимальный выигрыш над модой; минимальная опора (треть — для словаря)
+                    ) -> tuple[ConstructBlueprint, float] | None:  # чертёж и опора или None
+    """Словарный закон слоя «контекст -> байт» с проверкой на отложенных ПАРАХ.
+
+        Разделение по значениям хеша (как у арифметических базисов) здесь не годится:
+        таблица подгонки не содержит отложенных значений, и закон на них лишь
+        отказывает. Поэтому пары слоя делятся по порядку потока: первые 60% —
+        таблица (значения с мажоритарным голосом: >= 2 голосов, доля >= 0.6),
+        остальные — проверка. На отложенных парах считаются лишь те, чей контекст
+        есть в таблице. Словарь в тексте ВЕРОЯТНОСТНЫЙ (за контекстом бывает
+        разные байты), поэтому порог детерминированных законов 0.9 к нему не
+        применим: закон проходит, если точность >= 0.6 и ВЫИГРЫШ над модой
+        (точность − доля моды)·доля отвеченных пар слоя >= min_edge. На реальном
+        коде это 0.79 против моды 0.37; на остатке ошибок модели — 0.5 и отказ.
+        Возврат: (чертёж с базисом DICT, опора = доля верных ответов слоя) или None."""
+    cut = max(1, int(0.6 * len(idx)))  # граница: первые 60% пар слоя
+    fit, oos = idx[:cut], idx[cut:]  # пары подгонки и пары проверки
+    rows, _sup = _majVotes(c, y, fit)  # мажоритарные голоса по парам подгонки
+    if len(rows) < 24 or not len(oos):  # таблица мала или проверять не на чем
+        return None  # кандидат не построен
+    table = dict(rows)  # таблица «значение хеша -> байт»
+    ans = oos[np.isin(c[oos], list(table))]  # отложенные пары, на которых таблица отвечает
+    if not len(ans):  # таблица ни на чём не отвечает
+        return None  # кандидат не построен
+    pred = np.asarray([table[int(v)] for v in c[ans]])  # ответы таблицы на отложенных парах
+    hits = int((pred == y[ans]).sum())  # число верных ответов
+    acc = hits / len(ans)  # точность на отвеченных парах
+    support = hits / len(idx)  # опора: доля ВЕРНЫХ ответов среди всех пар слоя
+    gain = (acc - _mode_share(y[ans])) * len(ans) / len(idx)  # выигрыш над модой: (точность − мода)·доля отвеченных пар слоя
+    if acc < 0.6 or gain < min_edge or support < min_support / 3:  # точность мала, выигрыш над модой мал или закон отвечает слишком редко
+        return None  # кандидат не проходит
+    rows_oos, _s2 = _majVotes(c, y, oos)  # голоса отложенных пар — чтобы таблица охватила и их
+    table.update(rows_oos)  # дополнить таблицу (конфликт перезаписывает более позднее голосование)
+    payload = basis_dict(list(table.items()))  # нагрузка: словарная таблица
+    bp = ConstructBlueprint(fname, fparam, ffn, "DICT", payload, 9,  # чертёж: характеристика + базис DICT, мета-биты 9
+                            total_bits=_payload_bits("DICT", payload, 0) + 9)  # полная стоимость = 24 бита на запись + 9
+    return bp, support  # готовый кандидат
 
 
 def _majVotes(c: "np.ndarray", y: "np.ndarray", idx: "np.ndarray"):  # значения характеристики, ответы, номера пар слоя
@@ -151,6 +233,11 @@ def _majVotes(c: "np.ndarray", y: "np.ndarray", idx: "np.ndarray"):  # знач�
         Возврат: (rows, support), rows = [(v, top[v])],
         support = Σ top_n по прошедшим / max(|idx|, 1)."""
     cc, yy = c[idx], y[idx]  # значения характеристики и ответы пар слоя
+    # плотная перенумерация встретившихся значений: словарный хеш даёт до 65521
+    # значения, таблица H по всему диапазону была бы в сотни мегабайт на слой
+    if len(cc):  # слой не пуст
+        uniq, inv = np.unique(cc, return_inverse=True)  # uniq — разные значения по возрастанию; inv[n] — номер значения cc[n] в uniq
+        cc = inv  # работать с номерами 0..len(uniq)−1 вместо самих значений
     m = int(cc.max()) + 1 if len(cc) else 0  # число возможных значений: max(c) + 1 или 0
     if m == 0:  # слой пуст
         return [], 0.0  # нет строк, опора 0
@@ -160,7 +247,7 @@ def _majVotes(c: "np.ndarray", y: "np.ndarray", idx: "np.ndarray"):  # знач�
     top_n = H[np.arange(m), top]  # число голосов: top_n[v] = H[v, top[v]]
     ok = (top_n >= 2) & (top_n / np.maximum(tot, 1) >= 0.6)  # условие: top_n >= 2 и top_n / max(tot, 1) >= 0.6
     vals = np.nonzero(ok)[0]  # значения, прошедшие условие
-    rows = [(int(v), int(top[v])) for v in vals]  # строки (значение, мажоритарный ответ)
+    rows = [(int(uniq[v]), int(top[v])) for v in vals]  # строки (значение, мажоритарный ответ)
     return rows, float(top_n[ok].sum() / max(len(idx), 1))  # строки и опора = Σ top_n прошедших / max(|idx|, 1)
 
 
@@ -197,6 +284,7 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
         каждого — все фазы s. Оставляются периоды с n // P >= 80.
         Позиция пары берётся из третьего элемента (ctx, y, pos), иначе —
         индекс в списке (верно только для непрерывного потока).
+        Словарный закон (id) проверяется на отложенных ПАРАХ слоя (_dict_candidate).
         Кандидаты сравниваются по ключу (support, −total_bits); досрочный выход
         только при support >= 0.999. Нет прошедшего — {"status": "NO_LAW",
         "attempts": attempts}."""
@@ -241,6 +329,21 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
                 idx = np.nonzero(pos % P == shift)[0]  # номера пар слоя: pos mod P = s
                 if len(idx) < 80:  # в слое меньше 80 пар
                     continue  # пропустить слой
+                if fname.startswith("id"):  # характеристика словарная — свой путь проверки
+                    d = _dict_candidate(c, y, idx, fname, fparam, _ffn, min_edge, min_support)  # словарный кандидат слоя
+                    if d is not None:  # кандидат прошёл отложенные пары
+                        cand = {"status": "PARTIAL_LAW",  # кандидат: статус частичного закона
+                                "blueprints": [d[0]],  # его чертёж (базис DICT)
+                                "feature": fname, "shift": shift,  # характеристика и фаза
+                                "n_shifts": P,  # период
+                                "support": round(d[1], 3),  # опора: доля верных ответов слоя
+                                "attempts": attempts}  # число попыток на этот момент
+                        key = (cand["support"], -d[0].total_bits)  # ключ сравнения: (опора, −стоимость в битах)
+                        if winner is None or key > winner_key:  # лучшего ещё нет или ключ больше
+                            winner, winner_key = cand, key  # новый лучший кандидат
+                        if cand["support"] >= 0.999:  # опора почти полная — точный закон
+                            return winner  # досрочный выход
+                    continue  # арифметические базисы к словарному хешу не применяются
                 rows, support = _majVotes(c, y, idx)  # мажоритарные голоса и опора слоя
                 if len(rows) < 24 or support < min_support:  # меньше 24 значений или опора мала
                     continue  # пропустить слой
