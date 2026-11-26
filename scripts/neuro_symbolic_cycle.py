@@ -146,7 +146,7 @@ def main() -> None:
                 print( "    [self-critique] skipped: " + repr(_ce), flush=True, )  # печать причины пропуска # сразу сбросить вывод
         st["chunks"] += 1  # кусков: +1
         if r.get("new_ce_before") is not None:  # измерен перенос
-            print( f"  перенос: новый домен до обучения {r['new_ce_before']:.3f} -> после {r.get('holdout_ce', float('nan')):.3f}" + ( f" | старые домены до приёма {r['old_ce_pre']:.3f}" if r.get("old_ce_pre") is not None else "" ), flush=True, )  # CE нового до/после # и CE старых (накопление)
+            print( f"  перенос: новый домен до обучения {r['new_ce_before']:.3f} -> после {r.get('holdout_ce', float('nan')):.3f}" + ( f" | хвост домена {r['tail_ce']:.3f}" if r.get("tail_ce") is not None else "" ) + ( f" | старые домены до приёма {r['old_ce_pre']:.3f}" if r.get("old_ce_pre") is not None else "" ), flush=True, )  # CE нового до/после # и CE старых (накопление)
         if isinstance(r.get("programs"), dict):  # модель писала программы в этом приёме
             pg = r["programs"]  # итог выгрузки и исполнения
             print( f"  programs: функций {pg.get('functions', 0)} | исполнено {pg.get('executed', 0)} | " f"провалов {pg.get('failures', 0)} | отказано {pg.get('refused', 0)}" + ( f" | ошибка {pg.get('error')}" if pg.get("status") == "ERROR" else "" ), flush=True, )  # сколько написано и исполнено # сколько провалило сертификат и сколько вне белого списка # с текстом ошибки, если была
@@ -229,7 +229,7 @@ def main() -> None:
         except Exception as _e:  # любая ошибка дистилляции
             print( f"    semantic skipped: {_e!r}", flush=True )  # печать причины пропуска
         t_ingest = round(time.time() - t_ingest, 1)  # длительность приёма куска, с
-        print( f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB " f"({files_now} files) → CE {ce} " f"(нейро {r.get('phases', {}).get('neural', '?')}s + символ {r.get('phases', {}).get('symbolic', '?')}s = {t_ingest}s) " f"фазы {r.get('phases')}", flush=True, )  # печать имени куска и прибавки в МБ # числа файлов и CE # длительности половин приёма # , flush=True)  # длительности приёма ('?', если ключа нет)
+        print( f"[{cid}] neural: +{chunk_bytes/1e6:.1f}MB " f"({files_now} files) → CE {ce}" + ( f" | хвост {r['tail_ce']:.3f}" if r.get("tail_ce") is not None else "" ) + f" " f"(нейро {r.get('phases', {}).get('neural', '?')}s + символ {r.get('phases', {}).get('symbolic', '?')}s = {t_ingest}s) " f"фазы {r.get('phases')}", flush=True, )  # печать имени куска и прибавки в МБ # числа файлов и CE # длительности половин приёма # , flush=True)  # длительности приёма ('?', если ключа нет)
         rp = r.get("repair") or {}  # итог ремонта забывания или пустой словарь
         if rp.get("rounds"):  # были раунды ремонта
             print( f"    repair: forgot {rp.get('forgot')} worst {rp.get('worst')} blocks={len(u.model.blocks)} " f"rounds={[(x['status'], round(x['ce'], 3), round(x['after'], 3) if x['after'] else None) for x in rp['rounds']]}", flush=True, )  # печать числа забытых блоков и числа блоков модели # по раундам: статус, CE с 3 знаками, CE после ремонта или None
