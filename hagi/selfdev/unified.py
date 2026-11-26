@@ -80,6 +80,7 @@ ADAPTER_MIN_GAIN = 0.005  # минимальный парный выигрыш �
 ADAPTER_VAL_WINDOWS = int(os.environ.get("HAGI_ADAPTER_VAL", "4096"))  # не более стольких проверочных окон на оценку адаптера (0 — все)
 ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока роста: нат CE на единицу доли параметров (λ_M в правиле приёма; калибровка: полезный блок ≈ 0.57 ната при доле 0.30 → цена 0.30, слабый блок 0.1 ната отклоняется)
 
+TAIL_MEAN_SLACK = float(os.environ.get("HAGI_TAIL_SLACK", "0.02"))  # допуск роста средней CE на хвостах книги (в натах); 0.02 — в пределах шума замера
 FIBER_MIN_GAIN = 0.01  # минимальный выигрыш волокна на отложенной части домена, ноль и меньше — отказ
 
 def _interleave_replay(fresh: bytes, replay: bytes, block: int = 4096) -> bytes:
@@ -256,15 +257,19 @@ class Unified:
         # стороны парного гейта.
         _ph = {}  # длительности фаз приёма, с (рост, замеры CE до, обучение, адаптеры, замеры CE после, ремонт)
         _tp = time.perf_counter()  # начало фазы роста
-        growth = self._maybe_grow(source, data)  # итог роста: словарь со статусом
-        incumbent_state = [q.detach().clone()  # снимок текущих весов модели
+        incumbent_state = [q.detach().clone()  # снимок текущих весов модели ДО роста и обучения
                            for q in self.model.params()]  # по каждому параметру q
+        incumbent_nblocks = len(getattr(self.model, "blocks", []))  # число блоков роста до приёма (откат снимает и блоки, добавленные за приём)
+        incumbent_frozen = set(getattr(self.model, "frozen_blocks", set()))  # номера замороженных блоков до приёма
+        growth = self._maybe_grow(source, data)  # итог роста: словарь со статусом
+        incumbent_bypass = (dict(getattr(self.model, "bypass_t5", {}) or {}), dict(getattr(self.model, "bypass_t3", {}) or {}))  # снимок словарей точного обхода (они меняются при обучении и не входят в параметры)
         # CE текущей модели на старых доменах обязана быть измерена ДО любого
         # обновления весов: иначе обе стороны гейта видели одну и ту же
         # обученную модель, и забывание было принципиально ненаблюдаемо.
         _ph["grow"] = round(time.perf_counter() - _tp, 1)  # длительность фазы роста, с
         _tp = time.perf_counter()  # начало замеров CE до обучения
         old_ce_pre_early = self._old_domains_ce(exclude=source)  # CE на старых доменах до обучения
+        tail_mean_pre = self._tail_mean()  # средняя CE на хвостах всех доменов до обучения
         new_ce_before = self._tail_ce(data)  # CE на хвосте НОВЫХ данных до обучения: мера переноса (знает ли модель уже что-то о новом домене)
         old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
         _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
@@ -353,7 +358,29 @@ class Unified:
             with _t.no_grad():  # без вычисления градиентов
                 for prm, inc in zip(self.model.params(), incumbent_state):  # по парам (параметр, снимок)
                     prm.copy_(inc)  # prm := значение из снимка
+                self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
+        # Гейт по хвостам: приём полезен, только если средняя CE на хвостах ВСЕХ доменов
+        # не ухудшилась. Прежний гейт смотрел лишь на старые домены и допускал рост до 25%;
+        # замер на книге из 4 доменов: при повторных приёмах хвосты отдельных доменов
+        # гуляли на +-0.1..0.26 (1.56 -> 1.85 на трудном домене), среднее 0.768 -> 0.896.
+        tail_mean_post = self._tail_mean()  # средняя CE на хвостах после обучения и ремонта
+        tail_gate = bool(  # откат нужен, если ...
+            tail_mean_pre is not None and tail_mean_post is not None  # ... оба средних измерены ...
+            and tail_mean_post > tail_mean_pre + TAIL_MEAN_SLACK  # ... и среднее выросло больше допуска
+        )  # результат
+        if tail_gate:  # приём в среднем ухудшил книгу
+            with _t.no_grad():  # без вычисления градиентов
+                for prm, inc in zip(self.model.params(), incumbent_state):  # по парам (параметр, снимок)
+                    prm.copy_(inc)  # prm := значение из снимка
+                self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
+                if hasattr(self.model, "bypass_t5"):  # у модели есть точный обход
+                    self.model.bypass_t5, self.model.bypass_t3 = incumbent_bypass  # вернуть словари обхода из снимка
+                self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
+            tail_mean_post = self._tail_mean()  # среднее после отката (контроль)
         entry["ce"] = ce  # записать CE нового домена
+        entry["tail_gate"] = tail_gate  # признак отката по хвостам
+        entry["tail_mean_pre"] = tail_mean_pre  # среднее по хвостам до приёма
+        entry["tail_mean_post"] = tail_mean_post  # среднее по хвостам после
         # Честная мера переноса: CE на хвосте САМОГО домена (последние 8192 байтов, вне
         # обучения). Поле ce — CE на хвосте склеенного потока повторов всех доменов; оно
         # не измеряет перенос: в рабочей книге ce 0.78..1.63 при tail_ce 3.2..4.9.
@@ -1076,6 +1103,33 @@ class Unified:
         dev = getattr(self.model, "device", "cpu")  # устройство
         with _t.no_grad():  # без графа
             return round(float(_t.nn.functional.cross_entropy(self.model.logits(_t.as_tensor(X, dtype=_t.long, device=dev)), _t.as_tensor(y, dtype=_t.long, device=dev))), 4)  # средняя CE
+    def _restore_blocks(self, nblocks: int, frozen: set) -> None:  # вернуть число блоков роста и набор замороженных к значениям до приёма
+        """Снять блоки, добавленные за приём (рост или ремонт), и восстановить набор замороженных.
+
+            Откат весов копирует параметры из снимка, но блоки роста в params() не входят;
+            прежде блок, добавленный за приём, оставался в модели после отката — откат
+            возвращал не то состояние (замер: среднее по хвостам 0.804 до приёма, 1.067 после отката)."""
+        bl = getattr(self.model, "blocks", None)  # список блоков модели
+        if bl is not None and len(bl) > nblocks:  # блоков стало больше, чем до приёма
+            del bl[nblocks:]  # убрать добавленные
+        fb = getattr(self.model, "frozen_blocks", None)  # номера замороженных блоков
+        if fb is not None:  # атрибут есть
+            fb.clear(); fb.update(frozen)  # восстановить набор
+
+    def _tail_mean(self) -> float | None:  # средняя CE на хвостах всех доменов книги (или None, если нет ни одного)
+        """Средняя CE на хвостах (последние 8192 байтов) всех доменов книги с байтами на диске.
+
+            Каждая CE считается на хвосте САМОГО домена, а не склеенного потока. Мера
+            «книга — одна модель»: приём полезен, только если среднее по всем доменам
+            не ухудшилось. У доменов короче 8256 байтов хвост не меряется — они пропускаются."""
+        vals = []  # CE по доменам
+        for name, e in self.domains.items():  # по записям книги
+            d = self._domain_bytes(name, e)  # байты домена
+            c = self._tail_ce(d) if len(d) >= 8256 else None  # CE хвоста (None — короткий домен)
+            if c is not None:  # измерено
+                vals.append(c)  # добавить
+        return float(sum(vals) / len(vals)) if vals else None  # среднее либо None
+
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
         претендент/действующий). None, если старых доменов нет.
@@ -1189,6 +1243,10 @@ class Unified:
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}  # длину контекста, dim и hidden
         )
         st["arch"] = getattr(self.model, "ARCH", "rope")  # имя архитектуры (по умолчанию rope)
+        if getattr(self.model, "ARCH", "rope") == "optimal":  # причинная модель: блоки роста — кортежи (Wg, Wu, Wd)
+            # Прежде блоки optimal не сохранялись: принятый по гейту блок (выигрыш до 0.5 нат) жил
+            # только до перезапуска; после load модель теряла его (хвосты 0.66 -> 1.21).
+            st["blocks"] = [[p_.detach().cpu() for p_ in blk] for blk in getattr(self.model, "blocks", [])]  # список блоков — списки тензоров
         if hasattr(self.model, "bypass_t5"):  # у модели есть точный обход
             st["bypass"] = {"boost": self.model.bypass_boost,  # прибавка к логиту
                             "t5": [[k.hex(), v[0], v[1], v[2]] for k, v in self.model.bypass_t5.items()],  # 5-байтовый словарь: ключ в hex, предсказание, счёт, сбой
@@ -1318,7 +1376,12 @@ class Unified:
             u.model.gpm_right = {n: _t.as_tensor(U) for n, U in st["gpm_right"].items()}  # имя -> базис
         # Старые состояния rope хранят выращенные блоки отдельно
         for blk in st.get("blocks", []) or []:  # по сохранённым блокам (по умолчанию пусто)
-            u.model.grow()  # добавить блок-тождество
+            if isinstance(blk, (list, tuple)):  # блок optimal — последовательность тензоров
+                g = _t.Generator().manual_seed(u.model.seed + 500 + len(u.model.blocks))  # зерно роста (форма блока)
+                d_, h_ = u.model.dim, u.model.hidden  # ширина и скрытый слой
+                u.model.blocks.append(tuple(_t.nn.Parameter(q.to(u.model.device) if hasattr(q, "to") else _t.as_tensor(q)) for q in blk))  # восстановить кортеж параметров
+                continue  # следующий блок
+            u.model.grow()  # добавить блок-тождество (rope)
             live = u.model.blocks[-1]  # живой блок модели
             with _t.no_grad():  # без градиентов
                 for k in live:  # по тензорам блока
