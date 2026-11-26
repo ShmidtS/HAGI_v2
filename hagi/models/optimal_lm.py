@@ -196,7 +196,11 @@ class HybridMuonAdamW:
                 Ul, Ur = self.gpm_left.get(self.names[len(self.mats) + idx]), self.gpm_right.get(self.names[len(self.mats) + idx])  # подпространства (по имени — те же ключи, что у базисов)
                 g = self._proj_out(p.grad.float(), Ul, Ur)  # проекция градиента
                 if self.wd > 0 and p.ndim >= 2 and Ul is None and Ur is None:  # затухание только для незащищённых таблиц
-                    p.mul_(1.0 - lr_a * self.wd)  # обычное затухание
+                    # ленивое затухание (LazyAdam: lazyDecay_exact): таблица — это строки по байтам/токенам;
+                    # строка, которой не было в батче (нулевой градиент), не затухает — иначе редкие байты
+                    # сжимаются к нулю, сколько бы их ни видели
+                    act = (p.grad != 0).any(dim=-1, keepdim=True)  # (rows, 1): строка участвовала в батче
+                    p.mul_(t.where(act, t.as_tensor(1.0 - lr_a * self.wd, device=p.device), t.as_tensor(1.0, device=p.device)))  # затухание только активных строк
                 self.v_m[idx].mul_(b1).add_((1.0 - b1) * g)  # первый момент
                 self.v_v[idx].mul_(b2).add_((1.0 - b2) * g * g)  # второй момент
                 mh = self.v_m[idx] / (1.0 - b1 ** ts)  # коррекция смещения
