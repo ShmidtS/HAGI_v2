@@ -333,7 +333,7 @@ class HagiOptimalLM:
         if batch is None:  # пакет не задан
             from hagi.selfdev.evolve import current as _evb  # принятые эволюцией параметры
             batch = int(_evb()["batch"])  # пакет из эволюции (batch=0 тоже значит «не задан»)
-        r = self.train_optimal(data, epochs=max(1, epochs // 10), batch=batch, seq_len=self.k, seed=holdout_seed or 7, log_every=log_every)  # обучить (GPM — из self.gpm_left)
+        r = self.train_optimal(data, epochs=max(1, epochs), batch=batch, seq_len=self.k, seed=holdout_seed or 7, log_every=log_every)  # обучить (GPM — из self.gpm_left)
         return {"best_holdout_ce": r["val_ce_after"], "holdout_ce": r["val_ce_after"], "val_ce_before": r["val_ce_before"], "steps": r["steps"],  # CE до и число шагов
                 "spike_k": r.get("spike_k"), "spike_zero_frac": r.get("spike_zero_frac")}  # порог спайкинга и доля нулей  # как у HNet
 
