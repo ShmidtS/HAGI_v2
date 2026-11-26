@@ -19,6 +19,7 @@ from hagi.core.synthesis.venv_anf import anf_to_expr  # имена из «venv_a
 from hagi.core.synthesis.venv_anf import anf_transform, venn_head_eval  # имена из модуля ядра «venv_anf» (как до слияния)
 from hagi.core.neural.neural import FactorizedAdapter, FactorizedSharedCore  # имена из модуля ядра «neural» (как до слияния)
 from hagi.core.neural.segmentation import GDNRAM, boundary_chunks, boundary_heads  # имена из модуля ядра «segmentation» (как до слияния)
+from hagi.core.processor.experts import expert_supports  # импорт общей проверки применимости эксперта к аргументам
 from hagi.core.memory.audit import AuditLedger  # имена из модуля ядра «audit» (как до слияния)
 from hagi.core.memory.audit import AuditStream, CertStepGen  # имена из «audit» (модуль, где они определены)
 from hagi.core.memory.audit import HedgeRouter  # имена из модуля ядра «audit» (как до слияния)
@@ -54,15 +55,7 @@ class Expert:
         """Проверить, допустим ли вход xs: True, если каждый аргумент в своей области и правило valid_rule выполнено.
         
                     xs — кортеж целых аргументов."""
-        if len(xs) != len(self.domains):  # число аргументов не равно числу областей — вход не допустим
-            return False  # вернуть «не поддерживается»
-        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):  # если хотя бы один аргумент вне своей области: x_i ∉ domains[i]
-            return False  # вернуть «не поддерживается»
-        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило «второй аргумент не 0»: xs[1] = 0
-            return False  # вернуть «не поддерживается»
-        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило «второй аргумент не больше третьего»: xs[1] > xs[2]
-            return False  # вернуть «не поддерживается»
-        return True  # вернуть «поддерживается»
+        return expert_supports(self, xs)  # проверить применимость эксперта к аргументам
 
     def to_dict(self) -> dict[str, Any]:
         """Словарь с полями эксперта для сериализации: имени, семейства, программы, областей, правила, длины кода, адаптера (словарь или None) и родителей.

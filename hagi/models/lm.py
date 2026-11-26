@@ -290,6 +290,27 @@ def ternary_quant(module) -> dict[str, Any]:
     return report  # отклонения по всем матрицам
 
 
+
+
+def _init_mlp_lm(self, k: int, dim: int, hidden: int, seed: int) -> None:  # создать и инициализировать параметры языковой модели: вложения байт, два полносвязных слоя и смещения
+    """Создать параметры emb, W1, b1, W2, b2 с сидом seed, запомнить k, dim, hidden и перенести параметры на выбранное устройство."""
+    import torch  # нейросетевая библиотека
+    t = torch  # короткое имя библиотеки
+    self.t = t  # библиотека, на которой работает модель
+    self.k, self.dim, self.hidden = k, dim, hidden  # запомнить окно k, размерность dim и скрытый слой hidden
+    g = t.Generator().manual_seed(seed)  # генератор с сидом seed
+    self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)  # вложения байт 256 x dim: N(0, 1)·0.08
+    self.W1 = t.nn.Parameter(t.randn(k * dim, hidden, generator=g) * 0.08)  # первая матрица (k·dim) x hidden: N(0, 1)·0.08
+    self.b1 = t.nn.Parameter(t.zeros(hidden))  # смещение скрытого слоя из нулей
+    self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)  # вторая матрица hidden x 256: N(0, 1)·0.08
+    self.b2 = t.nn.Parameter(t.zeros(256))  # смещение логитов из нулей
+    self._ef21_s: float | None = None  # фиксированный масштаб, закрепляется на шаге 1 (пока не задан)
+    self.device = _resolve_device(t, self.dim, self.hidden)  # устройство по правилу выбора
+    if self.device == "cuda":  # модель размещается на GPU
+        for prm in self.params():  # по всем параметрам
+            prm.data = prm.data.to(self.device)  # перенести данные параметра на устройство
+
+
 class ByteLM:
     """Простая языковая модель: контекст из k байт -> логиты следующего
     байта.
@@ -299,23 +320,8 @@ class ByteLM:
         логиты = h·W2 + b2, форма (B, 256). Веса emb, W1, W2 поддаются
         тернарному квантованию."""
 
-    def __init__(self, k: int = 8, dim: int = 64, hidden: int = 128,  # создать модель: k — окно, dim — размер вложения, hidden — скрытый слой
-                 seed: int = 7):  # seed — сид инициализации весов
-        import torch  # нейросетевая библиотека
-        t = torch  # короткое имя библиотеки
-        self.t = t  # библиотека, на которой работает модель
-        self.k, self.dim, self.hidden = k, dim, hidden  # запомнить окно k, размерность dim и скрытый слой hidden
-        g = t.Generator().manual_seed(seed)  # генератор с сидом seed
-        self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)  # вложения байт 256 x dim: N(0, 1)·0.08
-        self.W1 = t.nn.Parameter(t.randn(k * dim, hidden, generator=g) * 0.08)  # первая матрица (k·dim) x hidden: N(0, 1)·0.08
-        self.b1 = t.nn.Parameter(t.zeros(hidden))  # смещение скрытого слоя из нулей
-        self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)  # вторая матрица hidden x 256: N(0, 1)·0.08
-        self.b2 = t.nn.Parameter(t.zeros(256))  # смещение логитов из нулей
-        self._ef21_s: float | None = None  # фиксированный масштаб, закрепляется на шаге 1 (пока не задан)
-        self.device = _resolve_device(t, self.dim, self.hidden)  # устройство по правилу выбора
-        if self.device == "cuda":  # модель размещается на GPU
-            for prm in self.params():  # по всем параметрам
-                prm.data = prm.data.to(self.device)  # перенести данные параметра на устройство
+    def __init__(self, k: int = 8, dim: int = 64, hidden: int = 128, seed: int = 7):  # создать модель с окном k, размерностью dim, скрытым слоем hidden и сидом seed
+        _init_mlp_lm(self, k, dim, hidden, seed)  # создать и инициализировать параметры модели
 
     def params(self):
         """Список всех обучаемых параметров модели."""
@@ -1333,23 +1339,8 @@ class CertifiedStepLM:
     Каждый шаг снижает CE на доказанную величину (шаг безопасен по построению).
     Развёртывание лучшего снимка по удержанным данным остаётся как страховка."""
 
-    def __init__(self, k: int = 10, dim: int = 96, hidden: int = 192,  # создать модель: k — длина контекста, dim — размер вложения, hidden — скрытый слой
-                 seed: int = 7):  # seed — сид начальных весов
-        import torch  # нейросетевая библиотека
-        t = torch  # короткое имя
-        self.t = t  # библиотека модели
-        self.k, self.dim, self.hidden = k, dim, hidden  # запомнить k, dim, hidden
-        g = t.Generator().manual_seed(seed)  # генератор с сидом
-        self.emb = t.nn.Parameter(t.randn(256, dim, generator=g) * 0.08)  # вложения emb (256, dim) ~ N(0,1)·0.08
-        self.W1 = t.nn.Parameter(t.randn(k * dim, hidden, generator=g) * 0.08)  # матрица W1 (k·dim, hidden) ~ N(0,1)·0.08
-        self.b1 = t.nn.Parameter(t.zeros(hidden))  # смещение b1 = 0
-        self.W2 = t.nn.Parameter(t.randn(hidden, 256, generator=g) * 0.08)  # матрица W2 (hidden, 256) ~ N(0,1)·0.08
-        self.b2 = t.nn.Parameter(t.zeros(256))  # смещение b2 = 0
-        self._ef21_s: float | None = None  # фиксированный масштаб тернарного квантования (замораживается на первом шаге)
-        self.device = _resolve_device(t, self.dim, self.hidden)  # устройство вычислений
-        if self.device == "cuda":  # модель на GPU
-            for prm in self.params():  # по всем параметрам
-                prm.data = prm.data.to(self.device)  # перенести на устройство
+    def __init__(self, k: int = 10, dim: int = 96, hidden: int = 192, seed: int = 7):  # создать модель с окном k, размерностью dim, скрытым слоем hidden и сидом seed
+        _init_mlp_lm(self, k, dim, hidden, seed)  # создать и инициализировать параметры модели
 
     def params(self):
         """Список обучаемых параметров [emb, W1, b1, W2, b2]."""

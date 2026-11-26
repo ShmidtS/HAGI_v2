@@ -73,15 +73,7 @@ class Expert:
 
             True, если len(xs) = числу аргументов, каждый xs[i] лежит в
             domains[i] и выполнено правило valid_rule; иначе False."""
-        if len(xs) != len(self.domains):  # число аргументов не совпадает
-            return False  # вход вне области
-        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):  # хотя бы один x_i ∉ domains[i]
-            return False  # вход вне области
-        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило «y не ноль» и y = 0
-            return False  # вход недопустим
-        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило «y ≤ z» и y > z
-            return False  # вход недопустим
-        return True  # все условия выполнены
+        return expert_supports(self, xs)  # проверить применимость эксперта к аргументам
 
     def to_dict(self) -> dict[str, Any]:
         """Словарь для JSON-сериализации: те же поля; кортежи становятся списками."""
@@ -621,3 +613,20 @@ class GrowingMathProcessor:
 __all__ = [  # публичные имена модуля: только определённые здесь (импортированные не выносит `from <модуль> import *`)
     'Expert', 'GrowthEvent', 'SafeExpression', 'GrowingMathProcessor',  # имя интерфейса
 ]  # конец перечня
+
+
+
+def expert_supports(obj, xs: Sequence[int]) -> bool:  # проверить, применим ли эксперт к набору аргументов xs
+    """Входит ли кортеж аргументов xs в область эксперта.
+
+        True, если len(xs) = числу аргументов, каждый xs[i] лежит в
+        domains[i] и выполнено правило valid_rule; иначе False."""
+    if len(xs) != len(obj.domains):  # число аргументов не совпадает
+        return False  # вход вне области
+    if any(int(x) not in obj.domains[i] for i, x in enumerate(xs)):  # хотя бы один x_i ∉ domains[i]
+        return False  # вход вне области
+    if obj.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило «y не ноль» и y = 0
+        return False  # вход недопустим
+    if obj.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило «y ≤ z» и y > z
+        return False  # вход недопустим
+    return True  # все условия выполнены

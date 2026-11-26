@@ -53,7 +53,7 @@ from hagi.base.config import STATE_FILE_FORMAT, LEGACY_FILE_FORMATS, STATE_FORMA
 from hagi.core.synthesis.best_first import SynthesisStats  # имена из модуля «best_first» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.synthesis.induction import Theorem, _exact_multivariate_poly_fit, _exact_poly_fit  # имена из модуля «induction» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.processor.processor import _expert_to_dict, _expert_total_neural_bytes  # импорт общих функций сериализации эксперта и подсчёта размера нейронной части
-from hagi.core.processor.experts import GrowthEvent  # имена из модуля «experts» (прямой импорт вместо обращения через псевдоним пакета)
+from hagi.core.processor.experts import GrowthEvent, expert_supports  # импорт GrowthEvent и общей проверки применимости эксперта
 from hagi.core.tasks.stored_tasks import TaskSpec  # имена из модуля «stored_tasks» (прямой импорт вместо обращения через псевдоним пакета)
 from hagi.core.tasks.candidates import candidate_programs  # имена из модуля «candidates» (прямой импорт вместо обращения через псевдоним пакета)
 
@@ -95,15 +95,7 @@ class StoredExpert:
             xs — кортеж целых аргументов. Возвращает True, когда
             len(xs) == len(domains), xs[i] ∈ domains[i] для всех i и выполнено
             правило valid_rule; иначе False."""
-        if len(xs) != len(self.domains):  # число аргументов не совпадает с числом областей
-            return False  # неприменимо
-        if any(int(x) not in self.domains[i] for i, x in enumerate(xs)):  # есть аргумент вне своей области: ∃ i: xs[i] ∉ domains[i]
-            return False  # неприменимо
-        if self.valid_rule == "nonzero_y" and int(xs[1]) == 0:  # правило «второй аргумент ненулевой» нарушено
-            return False  # неприменимо
-        if self.valid_rule == "ordered_yz" and int(xs[1]) > int(xs[2]):  # правило упорядоченности нарушено: xs[1] > xs[2]
-            return False  # неприменимо
-        return True  # все условия выполнены
+        return expert_supports(self, xs)  # проверить применимость эксперта к аргументам
 
     def to_dict(self) -> dict[str, Any]:
         """Сериализация записи в словарь JSON-совместимых значений (кортежи -> списки)."""
