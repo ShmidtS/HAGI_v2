@@ -40,6 +40,16 @@ def swiglu(x: t.Tensor, W_gate: t.Tensor, W_up: t.Tensor, W_down: t.Tensor) -> t
     return (g_act * (x @ W_up)) @ W_down  # произведение и проекция назад
 
 
+def _bypass_boost_default() -> float:
+    """Прибавка к логиту точного словаря по умолчанию: HAGI_BYPASS_BOOST (по умолчанию 8); «0» — выключено."""
+    return float(os.environ.get("HAGI_BYPASS_BOOST", "8").strip() or 0.0)  # число; пусто — 0
+
+
+BYPASS_T5_MIN = 3  # словарь 5 байтов отвечает после стольких одинаковых наблюдений
+BYPASS_T3_MIN = 6  # словарь 3 байтов — после стольких
+BYPASS_T5_W, BYPASS_T3_W = 0.85, 0.65  # доли прибавки для 5- и 3-байтового словаря
+
+
 def _spike_k_default() -> float | None:  # настройка спайкинга из окружения
     """Порог спайкинга по умолчанию: HAGI_SPIKE_K (по умолчанию 3); «0» или пусто — выключено."""
     v = os.environ.get("HAGI_SPIKE_K", "3").strip()  # значение окружения
@@ -250,6 +260,9 @@ class HagiOptimalLM:
         self.spike_zeros = 0  # счётчик нулевых компонент прокинутое входа (для доли нулей)
         self.spike_total = 0  # счётчик всех компонент
         self.spike_width = self.dim  # ширина, на которую делится сумма модулей порога: при росте ширины не меняется — новые нулевые каналы не сдвигают порог, функция сохраняется
+        self.bypass_boost = _bypass_boost_default()  # прибавка к логиту точного словаря (0 — выключен)
+        self.bypass_t5: dict[bytes, list] = {}  # 5-байтовый словарь: контекст -> [предсказание, счёт, сбой]
+        self.bypass_t3: dict[bytes, list] = {}  # 3-байтовый словарь: контекст -> [предсказание, счёт, сбой]
 
     def matrix_and_vec_params(self) -> tuple[list[t.nn.Parameter], list[t.nn.Parameter]]:  # группы параметров
         mats = [self.W_loc, self.W_bi, self.W_gq, self.W_gk, self.W_gv, self.W_go,  # матрицы
@@ -380,6 +393,53 @@ class HagiOptimalLM:
     def _rms(self, x: t.Tensor, g: t.Tensor) -> t.Tensor:  # RMSNorm с eps модели
         return rms_norm(x, g, getattr(self, "rms_eps", 1e-6))  # нормировка
 
+    @staticmethod  # статический метод (без self)
+    def _trie_put(d: dict, key: bytes, nxt: int) -> None:
+        """Записать в словарь наблюдение «за key идёт nxt»: первый раз — новая запись,
+        повтор того же — счёт +1, противоречие — запись навсегда помечается сбойной."""
+        e = d.get(key)  # запись контекста
+        if e is None:  # контекст новый
+            d[key] = [nxt, 1, False]  # предсказание, один голос, без сбоя
+        elif not e[2]:  # запись живая
+            if e[0] == nxt:  # тот же следующий байт
+                e[1] = min(e[1] + 1, 60000)  # счёт +1
+            else:  # другой следующий байт
+                e[2] = True  # контекст неоднозначен — больше не отвечает
+
+    def bypass_fit(self, data: bytes) -> None:
+        """Обучить точные словари причинно по потоку: за 5 и 3 предыдущими байтами — следующий.
+        Записи накапливаются между доменами (старые контексты остаются в силе)."""
+        if self.bypass_boost <= 0:  # обход выключен
+            return  # ничего не делать
+        t5, t3, put = self.bypass_t5, self.bypass_t3, self._trie_put  # словари и запись
+        for i in range(5, len(data)):  # по позициям следующего байта
+            put(t5, data[i - 5:i], data[i])  # голос 5-байтового контекста
+            put(t3, data[i - 3:i], data[i])  # голос 3-байтового контекста
+
+    def bypass_apply(self, x_seq: t.Tensor, lg: t.Tensor) -> t.Tensor:
+        """Прибавить к логитам уверенные ответы словарей: позиция t отвечает по байтам t−4..t
+        (5-байтовый словарь), иначе по t−2..t (3-байтовый). Строго причинно; вне словаря — 0."""
+        if self.bypass_boost <= 0 or not (self.bypass_t5 or self.bypass_t3):  # выключен или пуст
+            return lg  # без изменений
+        xs = x_seq.detach().to("cpu").numpy().astype(np.uint8)  # байты (B, T) как массив по одному байту на символ
+        boost, t5, t3 = self.bypass_boost, self.bypass_t5, self.bypass_t3  # прибавка и словари
+        rows, cols, preds, vals = [], [], [], []  # индексы и значения прибавки
+        for b in range(xs.shape[0]):  # по строкам пакета
+            row = xs[b].tobytes()  # байты строки подряд
+            for i in range(4, xs.shape[1]):  # по позициям, где есть 5-байтовый контекст
+                e = t5.get(row[i - 4:i + 1])  # запись 5-байтового словаря
+                if e is not None and not e[2] and e[1] >= BYPASS_T5_MIN:  # словарь уверен
+                    rows.append(b); cols.append(i); preds.append(e[0]); vals.append(boost * BYPASS_T5_W)  # прибавка
+                    continue  # 3-байтовый не спрашивается
+                e = t3.get(row[i - 2:i + 1])  # запись 3-байтового словаря
+                if e is not None and not e[2] and e[1] >= BYPASS_T3_MIN:  # словарь уверен
+                    rows.append(b); cols.append(i); preds.append(e[0]); vals.append(boost * BYPASS_T3_W)  # прибавка 3-байтового
+        if not rows:  # словари нигде не ответили
+            return lg  # без изменений
+        delta = t.zeros_like(lg)  # прибавка — тензор той же формы
+        delta[rows, cols, preds] = t.as_tensor(vals, dtype=lg.dtype, device=lg.device)  # записать прибавки
+        return lg + delta  # логиты с обходом
+
     def _spike(self, hn: t.Tensor) -> t.Tensor:  # нормированный вход SwiGLU (B, T, d)
         """Спайкинг входа SwiGLU: hn -> round(hn / V_th)·V_th, градиент — напрямую (STE).
 
@@ -471,6 +531,8 @@ class HagiOptimalLM:
         lg = (h_out @ self.emb.T) * self.out_scale + self.b_out  # связанные эмбеддинги: выходная проекция = embᵀ
         if self.use_bigram_logit_skip:  # скип биграмм в логиты
             lg = lg + self.B_u[x_seq] @ self.B_v  # аддитивно
+        if self.bypass_boost > 0:  # точный обход включён
+            lg = self.bypass_apply(x_seq, lg)  # прибавить ответы словарей (и при обучении, и при выводе)
         if self.active_adapter is not None:  # доменный адаптер
             A, B_adp, sc = self.active_adapter  # (d, r), (r, 256), масштаб
             lg = lg + ((h_out @ A) @ B_adp) * sc  # низкоранговая добавка
@@ -513,6 +575,7 @@ class HagiOptimalLM:
         stride = max(1, max_start // batch)  # шаг потока: batch потоков равномерно по домену
         stream_pos = np.array([(i * stride) % max_start for i in range(batch)], dtype=np.int64)  # позиции потоков
         carry: dict = {}  # переносимое состояние GDN (state-carry BPTT: длинный контекст без удлинения T)
+        self.bypass_fit(data[:cut])  # словари точного обхода — только по ОБУЧАЮЩЕЙ части (контроль остаётся невидимым)
         self.spike_off, self.spike_zeros, self.spike_total = True, 0, 0  # спайкинг выключен до последних 20% шагов; счётчики нулей
         for step in range(total_steps):  # по шагам
             self.spike_off = step < SPIKE_START * total_steps  # последние 20% шагов — со спайкингом (доводка STE)

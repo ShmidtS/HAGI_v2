@@ -1166,6 +1166,10 @@ class Unified:
             {"k": self.model.k, "dim": self.model.dim, "hidden": self.model.hidden}  # длину контекста, dim и hidden
         )
         st["arch"] = getattr(self.model, "ARCH", "rope")  # имя архитектуры (по умолчанию rope)
+        if hasattr(self.model, "bypass_t5"):  # у модели есть точный обход
+            st["bypass"] = {"boost": self.model.bypass_boost,  # прибавка к логиту
+                            "t5": [[k.hex(), v[0], v[1], v[2]] for k, v in self.model.bypass_t5.items()],  # 5-байтовый словарь: ключ в hex, предсказание, счёт, сбой
+                            "t3": [[k.hex(), v[0], v[1], v[2]] for k, v in self.model.bypass_t3.items()]}  # 3-байтовый словарь
         st["spike_k"] = getattr(self.model, "spike_k", None)  # порог спайкинга (None — выключен): режим переживает перезапуск
         st["frozen_blocks"] = sorted(getattr(self.model, "frozen_blocks", ()))  # номера замороженных блоков по возрастанию
         if getattr(self, "fibers", None):  # волокна доменов
@@ -1297,7 +1301,11 @@ class Unified:
                 for k in live:  # по тензорам блока
                     live[k].copy_(blk[k].to(live[k].device))  # скопировать тензор сохранённого блока
         if "spike_k" in st:  # в состоянии сохранён режим спайкинга
-            u.model.spike_k = st["spike_k"]  # восстановить его
+            u.model.spike_k = st["spike_k"]  # восстановить порог спайкинга
+        if "bypass" in st and hasattr(u.model, "bypass_t5"):  # в состоянии сохранён точный обход
+            u.model.bypass_boost = st["bypass"]["boost"]  # прибавка
+            u.model.bypass_t5 = {bytes.fromhex(k): [p, c, b] for k, p, c, b in st["bypass"]["t5"]}  # восстановить 5-байтовый словарь
+            u.model.bypass_t3 = {bytes.fromhex(k): [p, c, b] for k, p, c, b in st["bypass"]["t3"]}  # и 3-байтовый  # восстановить его
         u.model.frozen_blocks = set(st.get("frozen_blocks", []))  # замороженные блоки: множество номеров (по умолчанию пустое)
         u.domains = (  # книга доменов ...
             json.loads(_ledger_js().read_text(encoding="utf-8")) if _ledger_js().exists() else {}  # ... из JSON-файла в utf-8, иначе пустой словарь
