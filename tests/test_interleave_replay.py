@@ -20,3 +20,17 @@ def test_short_inputs_are_simply_joined():
     """Без повтора или на коротком домене выборка — простое соединение."""
     assert _interleave_replay(b"ab", b"cd") == b"abcd"  # короткий новый домен
     assert _interleave_replay(b"x" * 50000, b"") == b"x" * 50000  # пустой повтор
+
+
+def test_holdout_fraction_covers_pure_fresh_tail():
+    """Доля контроля, вычисляемая в ingest, должна накрывать ровно чистый хвост нового домена.
+
+    При доле повтора 1.0 повтор длиннее нового домена: прежние 15% склейки захватывали
+    и старые домены (доля нового в контроле 19..31%), сертификат приёма мерил старое."""
+    fresh = bytes([1]) * 200000  # новый домен
+    replay = bytes([2]) * 1000000  # повтор старых — вдвое длиннее
+    out = _interleave_replay(fresh, replay)  # склейка
+    frac = (len(fresh) - int(0.8 * len(fresh))) / len(out)  # та же формула, что в Unified.ingest
+    control = out[int(len(out) * (1 - frac)):]  # контроль = конец склейки длиной frac·len(out)
+    assert control.count(1) == len(control)  # контроль — только новый домен
+    assert len(control) == len(fresh) - int(0.8 * len(fresh))  # и ровно его чистый хвост
