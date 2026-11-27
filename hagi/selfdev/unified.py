@@ -80,6 +80,12 @@ ADAPTER_MIN_GAIN = 0.005  # минимальный парный выигрыш �
 ADAPTER_VAL_WINDOWS = int(os.environ.get("HAGI_ADAPTER_VAL", "4096"))  # не более стольких проверочных окон на оценку адаптера (0 — все)
 ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока роста: нат CE на единицу доли параметров (λ_M в правиле приёма; калибровка: полезный блок ≈ 0.57 ната при доле 0.30 → цена 0.30, слабый блок 0.1 ната отклоняется)
 
+# Защита подпространства GPM выключена по умолчанию. Замер на книге из 4 доменов (9 приёмов,
+# одинаковый порядок, CE на хвостах после загрузки): с GPM лучший итог 0.47/0.40/0.33/1.82
+# (среднее 0.754), без GPM 0.49/0.39/0.18/1.34 (среднее 0.598) — лучше на всех доменах,
+# включая трудный; регрессия срабатывала 1 раз из 9. Базисы на 90% энергии накрывают почти
+# всё 24-мерное пространство (15 столбцов) и блокируют обучение, а не только забывание.
+USE_GPM = os.environ.get("HAGI_GPM", "0") == "1"  # True — обновлять базисы GPM (защита включена)
 TAIL_MEAN_SLACK = float(os.environ.get("HAGI_TAIL_SLACK", "inf"))  # допуск роста средней CE на хвостах книги (в натах); inf — гейт выключен. Замер на книге 4 доменов: со срабатыванием (0.02) лучший итог 0.804, без него 0.766 — гейт не принят
 FIBER_MIN_GAIN = 0.01  # минимальный выигрыш волокна на отложенной части домена, ноль и меньше — отказ
 
@@ -405,7 +411,7 @@ class Unified:
             from hagi.models.optimal_lm import update_gpm_bases  # обновление базисов
             if getattr(self.model, "gpm_left", None) is None:  # базисов ещё нет
                 self.model.gpm_left = {}  # пустой словарь
-            if not regression:  # домен принят — его входы защищаются при следующих приёмах
+            if not regression and USE_GPM:  # домен принят и защита GPM включена (HAGI_GPM=1) — его входы защищаются при следующих приёмах
                 update_gpm_bases(self.model, data, self.model.gpm_left)  # SVD входов матриц, 90% энергии
         entry["regression"] = bool(regression)  # записать флаг регрессии
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")  # записать время обучения
@@ -1371,9 +1377,11 @@ class Unified:
                 for n, v in pars.items(): setattr(fib, n, _t.nn.Parameter(_t.as_tensor(v)))  # параметры
                 u.fibers[dom] = fib  # добавить
         if "gpm_left" in st:  # восстановить базисы GPM
-            u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()}  # имя -> базис
+            # Сохранённые базисы действуют при обучении (train_optimal читает model.gpm_left),
+            # поэтому при выключенной защите (HAGI_GPM != 1) они не загружаются
+            u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()} if USE_GPM else {}  # имя -> базис; пусто, если защита выключена
         if "gpm_right" in st:  # правые базисы
-            u.model.gpm_right = {n: _t.as_tensor(U) for n, U in st["gpm_right"].items()}  # имя -> базис
+            u.model.gpm_right = {n: _t.as_tensor(U) for n, U in st["gpm_right"].items()} if USE_GPM else {}  # имя -> базис; пусто, если защита выключена
         # Старые состояния rope хранят выращенные блоки отдельно
         for blk in st.get("blocks", []) or []:  # по сохранённым блокам (по умолчанию пусто)
             if isinstance(blk, (list, tuple)):  # блок optimal — последовательность тензоров
