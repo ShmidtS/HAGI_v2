@@ -59,7 +59,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 
 # Предел числа контрольных окон при обучении (равномерно по хвосту контроля). Выбор лучшего снимка
 # по контрольной CE — «подглядывание» среди N оцененных состояний; двусторонняя гарантия
-# (двусторонняя дельта гейта контрольной выборки) при N = 10, δ = 0.05, ε = 0.05·B
+# (holdout_gate_two_way_delta, HoldoutGateTwoWay.lean:109) при N = 10, δ = 0.05, ε = 0.05·B
 # требует k ≥ ln(2N/δ)/(2(ε/B)²) = 1199 окон. Замер (3 новых домена, 4 эпохи): 256 — выигрыш новых
 # 4.46, потеря старых 0.114, 557 с; 2048 — 4.47 / 0.108, 651 с: качество то же, +17% времени.
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
@@ -213,21 +213,12 @@ class HybridMuonAdamW:
                     # сжимаются к нулю, сколько бы их ни видели
                     act = (p.grad != 0).any(dim=-1, keepdim=True)  # (rows, 1): строка участвовала в батче
                     p.mul_(t.where(act, t.as_tensor(1.0 - lr_a * self.wd, device=p.device), t.as_tensor(1.0, device=p.device)))  # затухание только активных строк
-                # Ленивые моменты (LazyAdam): строка таблицы, которой не было в батче, НЕ обновляет
-                # v_m/v_v и НЕ шагает — иначе редкий байт после исчезновения дрейфует по инерции
-                # убывающего старого момента (замер: сдвиг 0.095 при весе 0.51 за 50 шагов).
-                act = (p.grad != 0).any(dim=-1, keepdim=True) if p.ndim >= 2 else None  # активные строки (1D — все)
-                if act is None:  # вектор (одномерный)
-                    self.v_m[idx].mul_(b1).add_((1.0 - b1) * g)  # первый момент
-                    self.v_v[idx].mul_(b2).add_((1.0 - b2) * g * g)  # второй момент
-                else:  # таблица (двумерная): моменты только активных строк
-                    self.v_m[idx].copy_(t.where(act, b1 * self.v_m[idx] + (1.0 - b1) * g, self.v_m[idx]))  # первый момент активных
-                    self.v_v[idx].copy_(t.where(act, b2 * self.v_v[idx] + (1.0 - b2) * g * g, self.v_v[idx]))  # второй момент активных
+                self.v_m[idx].mul_(b1).add_((1.0 - b1) * g)  # первый момент
+                self.v_v[idx].mul_(b2).add_((1.0 - b2) * g * g)  # второй момент
                 mh = self.v_m[idx] / (1.0 - b1 ** ts)  # коррекция смещения
                 vh = self.v_v[idx] / (1.0 - b2 ** ts)  # коррекция смещения
                 upd_v = self._proj_out(lr_a * mh / (vh.sqrt() + eps), Ul, Ur)  # шаг AdamW с проекцией
-                new_p = (t.where(act, p.float() - upd_v, p.float()) if act is not None else p.float() - upd_v)  # шаг только активных строк таблицы
-                p.copy_(new_p.to(p.dtype))  # записать
+                p.copy_((p.float() - upd_v).to(p.dtype))  # записать
             if self.ema is not None:  # EMA включён
                 d = min(0.99, (1.0 + self.step_count) / (10.0 + self.step_count))  # скорость среднего: растёт от ~0.09 к 0.99
                 with t.no_grad():  # без графа
@@ -961,7 +952,7 @@ class MirrorHedgeStreamPredictor:
         else:  # нет повторения
             p_lz = p_ctx  # эксперт нейтрален
         if self.model is None:  # без модели
-            self._last = (p_ctx, p_lz); return self.weights[0] * p_ctx + self.weights[1] * p_lz  # смесь контекстной и LZP-оценок
+            self._last = (p_ctx, p_lz); return self.weights[0] * p_ctx + self.weights[1] * p_lz  # PPM + LZP
         if self.st.n == 0:  # истории нет
             p_neu = np.full(256, 1.0 / 256.0)  # равномерно
         else:  # логиты уже посчитаны состоянием на предыдущем байте
@@ -1078,16 +1069,15 @@ def gauge_balance(model: "HagiOptimalLM") -> dict[str, float]:
     return {"max_log_shift_swiglu": max_sw, "max_log_shift_bigram": max_bg}  # итог
 
 
-def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, stages: int = 1) -> tuple[dict, int]:
+def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) -> tuple[dict, int]:
     """Квантовать все 2D-веса per-row; таблицу emb (256 строк — словарь) — без поворота строк.
-        bits=2 — триты {−1, 0, +1}, иначе — 16 уровней; stages — число остаточных стадий на вес.
         Возвращает (параметры по именам, число байт уровней)."""
     out: dict[str, dict] = {}; nbytes = 0  # результат и объём
     for name, p in model.__dict__.items():  # по атрибутам
         if not isinstance(p, t.nn.Parameter) or p.ndim != 2:  # только 2D
             continue  # дальше
         W = p.detach().cpu().numpy()  # в numpy
-        par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"), stages=stages)  # emb — по словарю не вращать
+        par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
         par["Q"] = Q; par["dtype"] = str(p.dtype); out[name] = par; nbytes += Q.size * (2 if bits == 2 else 4) // 8 + par["scales"].nbytes  # объём
     return out, nbytes  # вернуть
 
@@ -1292,7 +1282,7 @@ def derived_probe_size(N: int, delta: float, eps: float, B: float) -> int:
     return int(_m.ceil(_m.log(2.0 * N / delta) / (2.0 * (eps / B) ** 2)))  # минимальный размер пробы
 
 
-def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: float = 0.01, lr_adam: float = 1.5e-3, bits: int = 4) -> dict:
+def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: float = 0.01, lr_adam: float = 1.5e-3) -> dict:
     """Квантование с обучением (EF21-QAT): градиент берётся на КВАНТОВАННЫХ весах, шаг применяется
         к полноточным master-весам; масштаб шага линейно гасится. Перенесено с numpy-шима аудита
         (run_ef21_qat_q4). Возвращает потери CE до/после квантования (float и QAT)."""
@@ -1301,11 +1291,11 @@ def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: floa
         arr = np.tile(arr, max(2, 128 // max(1, len(arr))))  # повторить
     mats, vecs = model.matrix_and_vec_params()  # группы
     opt = HybridMuonAdamW(mats, vecs, lr_muon=lr_muon, lr_adam=lr_adam, wd=0.0)  # оптимизатор без затухания
-    opt.names = model.param_names()  # имена весов по порядку mats + vecs (тот же способ, что в train_optimal)
+    opt.names.update({id(p): n for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)})  # имена
     rng = np.random.default_rng(77)  # выборка
     master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # полноточные веса
-    for stp in range(int(steps)):  # шаги  # шаги доводки
-        q, _ = quantize_model(model, bits=bits)  # квантовать текущие
+    for stp in range(int(steps)):  # шаги доводки
+        q, _ = quantize_model(model, bits=4)  # квантовать текущие
         dequantize_into(model, q)  # веса → квантованные (прямник видит их)
         starts = rng.integers(0, len(arr) - 65, size=16)  # старты
         X = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long); y = t.as_tensor(np.stack([arr[s + 1: s + 65] for s in starts]))  # батч
@@ -1316,5 +1306,5 @@ def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: floa
         opt.set_lr_scale(1.0 - stp / max(1, steps))  # линейное затухание масштаба
         opt.step()  # шаг по master
         master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # новый master
-    q, nbytes = quantize_model(model, bits=bits)  # финальное квантование
+    q, nbytes = quantize_model(model, bits=4)  # финальное квантование
     return {"q": q, "bytes": nbytes}  # параметры и объём
