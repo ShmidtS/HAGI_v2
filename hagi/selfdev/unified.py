@@ -130,6 +130,14 @@ def _interleave_replay(fresh: bytes, replay: bytes, block: int = 4096) -> bytes:
 REPLAY_FRAC = float(os.environ.get("HAGI_REPLAY_FRAC", "1.0"))  # доля повтора
 
 
+def _param_name(model, q) -> str:  # имя параметра q модели по его объекту (id), иначе позиционный запасной вариант
+    """Вернуть имя тензора q в param_names() модели; если объект не найден — «blk?» (не должно случаться)."""
+    for n, p_ in zip(model.param_names(), model.params()):  # по именам и параметрам
+        if p_ is q:  # тот же объект
+            return n  # имя
+    return "blk?"  # не найден
+
+
 class Unified:
     """ЕДИНАЯ развивающаяся модель: тело, книга доменов и банк адаптеров."""
     # HAGI_ARCH=hnet выбирает HNetByteLM (измерено: CE по целым файлам 1.54 против
@@ -268,12 +276,17 @@ class Unified:
         # стороны парного гейта.
         _ph = {}  # длительности фаз приёма, с (рост, замеры CE до, обучение, адаптеры, замеры CE после, ремонт)
         _tp = time.perf_counter()  # начало фазы роста
-        incumbent_state = [q.detach().clone()  # снимок текущих весов модели ДО роста и обучения
-                           for q in self.model.params()]  # по каждому параметру q
+        # Снимок весов ДО роста и обучения — по ИМЕНАМ параметров. Позиционный список ломался:
+        # рост добавлял блок (params() удлинялся), обучение мог заменить объекты параметров (EMA),
+        # и откат копировал чужие тензоры (RuntimeError 48 vs 24) либо не те веса.
+        incumbent_state = {n: q.detach().clone() for n, q in zip(self.model.param_names(), self.model.params())}  # имя -> копия веса
         incumbent_nblocks = len(getattr(self.model, "blocks", []))  # число блоков роста до приёма (откат снимает и блоки, добавленные за приём)
         incumbent_frozen = set(getattr(self.model, "frozen_blocks", set()))  # номера замороженных блоков до приёма
         growth = self._maybe_grow(source, data)  # итог роста: словарь со статусом
-        incumbent_bypass = (dict(getattr(self.model, "bypass_t5", {}) or {}), dict(getattr(self.model, "bypass_t3", {}) or {}))  # снимок словарей точного обхода (они меняются при обучении и не входят в параметры)
+        # Снимок словарей обхода — ПОБАЙТОВО: записи — изменяемые списки [прогноз, счёт, сбой], и обучение
+        # правит их на месте; поверхностная копия словаря делила записи, и откат возвращал испорченные
+        # старые домены при побитово тех же весах (хвосты 0.485 -> 0.628, 0.180 -> 0.369).
+        incumbent_bypass = ({k: list(v) for k, v in (getattr(self.model, "bypass_t5", {}) or {}).items()}, {k: list(v) for k, v in (getattr(self.model, "bypass_t3", {}) or {}).items()})  # имя-ключ -> копия записи
         # CE текущей модели на старых доменах обязана быть измерена ДО любого
         # обновления весов: иначе обе стороны гейта видели одну и ту же
         # обученную модель, и забывание было принципиально ненаблюдаемо.
@@ -368,9 +381,15 @@ class Unified:
             # откат на месте: Unified.load() создал бы новый объект модели и потерял
             # состояние адаптеров и замыкание оптимизатора
             with _t.no_grad():  # без вычисления градиентов
-                for prm, inc in zip(self.model.params(), incumbent_state):  # по парам (параметр, снимок)
-                    prm.copy_(inc)  # prm := значение из снимка
+                for n, prm in zip(self.model.param_names(), self.model.params()):  # по текущим параметрам и их именам
+                    if n in incumbent_state:  # параметр был до приёма (блоки роста — не были: они снимаются ниже)
+                        prm.copy_(incumbent_state[n].to(prm.device))  # prm := значение из снимка
                 self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
+                if hasattr(self.model, "bypass_t5"):  # у модели есть точный обход
+                    # словари обхода пополняются при обучении; после отката они должны быть прежними:
+                    # пополненный словарь менял хвосты старых доменов при побитово тех же весах
+                    # (0.485 -> 0.569, 0.180 -> 0.369)
+                    self.model.bypass_t5, self.model.bypass_t3 = incumbent_bypass  # вернуть словари обхода из снимка
         # Гейт по хвостам: приём полезен, только если средняя CE на хвостах ВСЕХ доменов
         # не ухудшилась. Прежний гейт смотрел лишь на старые домены и допускал рост до 25%;
         # замер на книге из 4 доменов: при повторных приёмах хвосты отдельных доменов
@@ -382,14 +401,17 @@ class Unified:
         )  # результат
         if tail_gate:  # приём в среднем ухудшил книгу
             with _t.no_grad():  # без вычисления градиентов
-                for prm, inc in zip(self.model.params(), incumbent_state):  # по парам (параметр, снимок)
-                    prm.copy_(inc)  # prm := значение из снимка
+                for n, prm in zip(self.model.param_names(), self.model.params()):  # по текущим параметрам и их именам
+                    if n in incumbent_state:  # параметр был до приёма (блоки роста — не были: они снимаются ниже)
+                        prm.copy_(incumbent_state[n].to(prm.device))  # prm := значение из снимка
                 self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
                 if hasattr(self.model, "bypass_t5"):  # у модели есть точный обход
                     self.model.bypass_t5, self.model.bypass_t3 = incumbent_bypass  # вернуть словари обхода из снимка
                 self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
             tail_mean_post = self._tail_mean()  # среднее после отката (контроль)
-        entry["ce"] = ce  # записать CE нового домена
+        rolled_back = bool(regression or tail_gate)  # приём откатан целиком (регрессия старых или рост средней CE хвостов): в модели веса ДО приёма
+        entry["rolled_back"] = rolled_back  # признак: домен записан в книге, но модель его не обучала
+        entry["ce"] = (self._tail_ce(data) if rolled_back else ce)  # CE нового домена для УСТАНОВЛЕННОЙ модели: после отката — измеренная на хвосте, иначе сертификат кандидата
         entry["tail_gate"] = tail_gate  # признак отката по хвостам
         entry["tail_mean_pre"] = tail_mean_pre  # среднее по хвостам до приёма
         entry["tail_mean_post"] = tail_mean_post  # среднее по хвостам после
@@ -599,7 +621,7 @@ class Unified:
 
             exclude: домен, только что проглоченный (его не меряем);
             pre: CE на старых доменах ДО роста (None — нет базы);
-            incumbent_state: список тензоров, к нему добавляются тензоры
+            incumbent_state: словарь имя -> тензор (снимок весов до приёма), к нему добавляются тензоры
             принятого блока (режим "block").
             Режим "replay": до REPAIR_ROUNDS раз обучить ствол на <= REPAIR_BYTES
             старых байтов (2 эпохи, lr = REPAIR_LR). Раунд принимается, только
@@ -712,7 +734,8 @@ class Unified:
                 m.frozen_blocks.discard(len(m.blocks))  # убрать его номер из замороженных
                 rounds.append({"ce": post, "after": new, "status": "ROLLBACK"})  # записать откат
                 break  # стоп
-            incumbent_state.extend(q.detach().clone() for q in blk.values())  # добавить тензоры блока к состоянию претендента
+            for q in (blk.values() if isinstance(blk, dict) else blk):  # по тензорам блока (rope — словарь, optimal — кортеж)
+                incumbent_state.setdefault(_param_name(self.model, q), q.detach().clone())  # добавить тензор блока к состоянию претендента (только если его нет в снимке)
             m.frozen_blocks.add(len(m.blocks) - 1)  # заморозить блок: номер = blocks − 1
             # Замер: если общий train_certified продолжает двигать блок починки,
             # старые домены приходят к +2.62 (хуже, чем без блоков, +0.55).
