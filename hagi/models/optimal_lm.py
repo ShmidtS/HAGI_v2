@@ -1078,15 +1078,16 @@ def gauge_balance(model: "HagiOptimalLM") -> dict[str, float]:
     return {"max_log_shift_swiglu": max_sw, "max_log_shift_bigram": max_bg}  # итог
 
 
-def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) -> tuple[dict, int]:
+def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, stages: int = 1) -> tuple[dict, int]:
     """Квантовать все 2D-веса per-row; таблицу emb (256 строк — словарь) — без поворота строк.
+        bits=2 — триты {−1, 0, +1}, иначе — 16 уровней; stages — число остаточных стадий на вес.
         Возвращает (параметры по именам, число байт уровней)."""
     out: dict[str, dict] = {}; nbytes = 0  # результат и объём
     for name, p in model.__dict__.items():  # по атрибутам
         if not isinstance(p, t.nn.Parameter) or p.ndim != 2:  # только 2D
             continue  # дальше
         W = p.detach().cpu().numpy()  # в numpy
-        par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
+        par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"), stages=stages)  # emb — по словарю не вращать
         par["Q"] = Q; par["dtype"] = str(p.dtype); out[name] = par; nbytes += Q.size * (2 if bits == 2 else 4) // 8 + par["scales"].nbytes  # объём
     return out, nbytes  # вернуть
 
@@ -1291,7 +1292,7 @@ def derived_probe_size(N: int, delta: float, eps: float, B: float) -> int:
     return int(_m.ceil(_m.log(2.0 * N / delta) / (2.0 * (eps / B) ** 2)))  # минимальный размер пробы
 
 
-def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: float = 0.01, lr_adam: float = 1.5e-3) -> dict:
+def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: float = 0.01, lr_adam: float = 1.5e-3, bits: int = 4) -> dict:
     """Квантование с обучением (EF21-QAT): градиент берётся на КВАНТОВАННЫХ весах, шаг применяется
         к полноточным master-весам; масштаб шага линейно гасится. Перенесено с numpy-шима аудита
         (run_ef21_qat_q4). Возвращает потери CE до/после квантования (float и QAT)."""
@@ -1300,11 +1301,11 @@ def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: floa
         arr = np.tile(arr, max(2, 128 // max(1, len(arr))))  # повторить
     mats, vecs = model.matrix_and_vec_params()  # группы
     opt = HybridMuonAdamW(mats, vecs, lr_muon=lr_muon, lr_adam=lr_adam, wd=0.0)  # оптимизатор без затухания
-    opt.names.update({id(p): n for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)})  # имена
+    opt.names = model.param_names()  # имена весов по порядку mats + vecs (тот же способ, что в train_optimal)
     rng = np.random.default_rng(77)  # выборка
     master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # полноточные веса
-    for stp in range(int(steps)):  # шаги доводки
-        q, _ = quantize_model(model, bits=4)  # квантовать текущие
+    for stp in range(int(steps)):  # шаги  # шаги доводки
+        q, _ = quantize_model(model, bits=bits)  # квантовать текущие
         dequantize_into(model, q)  # веса → квантованные (прямник видит их)
         starts = rng.integers(0, len(arr) - 65, size=16)  # старты
         X = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long); y = t.as_tensor(np.stack([arr[s + 1: s + 65] for s in starts]))  # батч
@@ -1315,5 +1316,5 @@ def ef21_qat(model: "HagiOptimalLM", data: bytes, steps: int = 35, lr_muon: floa
         opt.set_lr_scale(1.0 - stp / max(1, steps))  # линейное затухание масштаба
         opt.step()  # шаг по master
         master = {n: p.detach().clone() for n, p in model.__dict__.items() if isinstance(p, t.nn.Parameter)}  # новый master
-    q, nbytes = quantize_model(model, bits=4)  # финальное квантование
+    q, nbytes = quantize_model(model, bits=bits)  # финальное квантование
     return {"q": q, "bytes": nbytes}  # параметры и объём
