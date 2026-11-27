@@ -1,7 +1,7 @@
 """Тест переноса состояния GDN между чанками (state-carry BPTT).
 
-Теория: primes Hagi/Theory/GDNBridge.lean — gdnScan_append (перенос состояния между
-чанками даёт тот же результат, что один длинный прогон), carry_without_wrap_leaks (если
+Свойство переноса состояния — gdnScan_append (перенос состояния между
+чанками даёт тот же результат, что один длинный прогон), перенос без обёрнутых строк (если
 поток ушёл на новый старт, а состояние не обнулено, оно несёт контекст прежнего места —
 утечка). Проверяется на настоящем train_optimal: состояние, переданное в следующий
 чанк для обернувшейся строки, нулевое; для необернувшейся — нет.
@@ -15,7 +15,7 @@ import torch as t  # тензоры
 from hagi.models import optimal_lm as M  # рабочая модель
 
 
-def test_wrapped_stream_rows_resume_from_zero_state():
+def test_wrapped_stream_rows_resume_from_zero_state():  # обёрнутая строка продолжает с нулевого состояния
     t.manual_seed(0)  # зерно
     m = M.HagiOptimalLM()  # модель
     m.spike_k = None  # без спайкинга

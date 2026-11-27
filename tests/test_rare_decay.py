@@ -1,7 +1,7 @@
 """Тест связанного затухания весов (rare decay).
 
-Теория: primes Hagi/Step/RareDecay.lean (Pinto, Galanti, Balestriero,
-«The Fair Language Model Paradox», arXiv:2410.11985):
+Идея (Pinto, Galanti, Balestriero,
+«The Fair Language Model Paradox»):
   - dense_decay_fixed_point: затухание на КАЖДОМ шаге даёт равновесие w* = f·η·g/λ —
     масштаб редкого признака (частота f) подавляется пропорционально f;
   - coupled_decay_fixed_point: затухание только на шагах обновления
@@ -26,7 +26,7 @@ def _table_step(opt, table, row_grads: dict[int, float], steps: int) -> None:
         opt.step()  # шаг оптимизатора
 
 
-def test_coupled_decay_keeps_rare_row_scale():
+def test_coupled_decay_keeps_rare_row_scale():  # связанное затухание сохраняет масштаб редкой строки
     t.manual_seed(0)  # зерно
     table = t.nn.Parameter(t.zeros(8, 2))  # таблица 8 строк × 2
     vec = t.nn.Parameter(t.zeros(2))  # вектор (не участвует)
@@ -42,4 +42,4 @@ def test_coupled_decay_keeps_rare_row_scale():
         opt.step()  # шаг
     ratio = float(table[rare].abs().sum() / table[common].abs().sum())  # отношение масштабов
     # Связанное затухание: отношение ~1 (не зависит от f). Плотное дало бы ~f = 0.2.
-    assert ratio > 0.6, f"редкая строка потеряла масштаб: отношение {ratio:.3f} (ожидалось ~1, плотное затухание дало бы ~{f})"
+    assert ratio > 0.6, f"редкая строка потеряла масштаб: отношение {ratio:.3f} (ожидалось ~1, плотное затухание дало бы ~{f})"  # отношение масштабов редкой строки: плотное затухание даёт 0.44
