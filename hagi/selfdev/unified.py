@@ -85,6 +85,7 @@ ADMIT_MEM_COST = 1.0  # цена памяти при приёме блока р�
 # (среднее 0.754), без GPM 0.49/0.39/0.18/1.34 (среднее 0.598) — лучше на всех доменах,
 # включая трудный; регрессия срабатывала 1 раз из 9. Базисы на 90% энергии накрывают почти
 # всё 24-мерное пространство (15 столбцов) и блокируют обучение, а не только забывание.
+REPAIR_SHARE = os.environ.get("HAGI_REPAIR", "wf")  # распределение байтов ремонта: wf (выравнивающее, по умолчанию) или sqrt (вес ∝ √Δ)
 USE_GPM = os.environ.get("HAGI_GPM", "0") == "1"  # True — обновлять базисы GPM (защита включена)
 TAIL_MEAN_SLACK = float(os.environ.get("HAGI_TAIL_SLACK", "inf"))  # допуск роста средней CE на хвостах книги (в натах); inf — гейт выключен. Замер на книге 4 доменов: со срабатыванием (0.02) лучший итог 0.804, без него 0.766 — гейт не принят
 FIBER_MIN_GAIN = 0.01  # минимальный выигрыш волокна на отложенной части домена, ноль и меньше — отказ
@@ -1067,6 +1068,15 @@ class Unified:
                 c = float(post_vec[a:b].mean() - pre_vec[a:b].mean()) if b > a else 0.0  # прирост CE: mean(post) − mean(pre)
                 costs.append(max(c, 1e-3))  # порог ε = 1e-3: не забытые тоже получают байты
             share = _np.sqrt(costs)  # веса ∝ sqrt(c_i)
+            # Режим wf (выравнивание: вес домена ∝ (1 − r/Δ_i)², r подобран бисекцией так, что сумма весов = 1):
+            # в A/B на 6 доменах и 4 порядках итог нового домена совпал до 4 знаков, старые — 5 лучше / 1 хуже (±0.04 ната);
+            # включён по умолчанию; домены с Δ ниже уровня r байтов ремонта не получают.
+            if REPAIR_SHARE == "wf":  # выравнивающее распределение — вес домена ∝ (1 − r/Δ_i)², r подобран так, что сумма весов = 1
+                dl = _np.asarray(costs, dtype=float); lo, hi = 0.0, float(dl.max())  # бисекция по уровню r в [0, max Δ]
+                for _ in range(60):  # 60 итераций бисекции
+                    mid = 0.5 * (lo + hi); s = float(_np.sum(_np.maximum(0.0, 1.0 - mid / dl) ** 2))  # сумма весов при r = mid
+                    lo, hi = (mid, hi) if s > 1.0 else (lo, mid)  # сумма велика — поднять r, иначе снизить
+                share = _np.maximum(0.0, 1.0 - (0.5 * (lo + hi)) / dl) ** 2; share = share / share.sum() if share.sum() > 0 else _np.sqrt(dl)  # нормированные веса
         share = _np.asarray(share, dtype=float)  # вектор весов
         quotas = (share / share.sum() * total).astype(int) if share.sum() > 0 else _np.zeros(len(sample), dtype=int)  # квоты байтов: n_i = sqrt(c_i)·N / Σ_j sqrt(c_j)
         rng = _np.random.default_rng(23)  # генератор, зерно 23
