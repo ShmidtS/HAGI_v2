@@ -23,6 +23,7 @@ _vfeat, _kind, _majVotes, _mode_share, feature_fn, _dict_candidate, invent_multi
 """
 from __future__ import annotations  # отложенное вычисление аннотаций типов
 
+import hashlib  # отпечаток разбиения пар на группы
 import random  # генератор случайных чисел
 
 import numpy as np  # численные массивы
@@ -251,6 +252,22 @@ def _majVotes(c: "np.ndarray", y: "np.ndarray", idx: "np.ndarray"):  # знач�
     return rows, float(top_n[ok].sum() / max(len(idx), 1))  # строки и опора = Σ top_n прошедших / max(|idx|, 1)
 
 
+def _partition_key(c: np.ndarray, rep: np.ndarray) -> bytes:  # подпись разбиения пар по значению характеристики
+    """Подпись разбиения пар на группы с одинаковым значением характеристики c.
+
+        Две характеристики с одним разбиением (значения одной получаются из значений
+        другой взаимно однозначной заменой — сдвигом по модулю 256, умножением на
+        нечётное число, сменой знака) дают одну подпись. Группы нумеруются в порядке
+        первого вхождения, поэтому подпись не зависит от самих значений. Число значимых
+        значений и опора слоя в _majVotes зависят только от разбиения, поэтому решение
+        «слой отброшен» у таких характеристик одно и то же. rep[v] — номер первой пары
+        со значением v (−1, если значения нет среди пар)."""
+    present = np.nonzero(rep >= 0)[0]  # значения, которые встречаются среди пар
+    rank = np.empty(len(rep), dtype=np.int64)  # метка группы для каждого значения
+    rank[present[np.argsort(rep[present], kind="stable")]] = np.arange(len(present))  # метки по порядку первого вхождения
+    return hashlib.blake2b(rank[c].astype(np.int32).tobytes(), digest_size=16).digest()  # 128-битный отпечаток разбиения
+
+
 def _mode_share(ys) -> float:  # список ответов
     """Доля самого частого ответа: столько набрал бы совет «всегда предсказывай
     моду» — базовый уровень, который закон обязан превзойти."""
@@ -310,6 +327,9 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
                      dtype=np.int64) if all(len(pr) > 2 for pr in pairs) else np.arange(n)  # если есть у всех пар, иначе 0..n−1
     periods = [P for P in range(1, max(1, max_period) + 1)  # периоды P = 1..max(1, max_period)
                if n // P >= 80]  # только если n // P >= 80
+    layers = {(P, s): np.nonzero(pos % P == s)[0]  # номера пар каждого слоя (период P, фаза s)
+              for P in periods for s in range(P)}  # слои не зависят от характеристики — считаются один раз
+    rejected: dict[bytes, set] = {}  # подпись разбиения -> слои (P, s), уже отброшенные по числу значений и опоре
     attempts = 0  # число рассмотренных характеристик
     winner, winner_key = None, None  # лучший кандидат и его ключ
     for fname, fparam, _ffn in enumerate_features(k):  # по тройкам (имя, параметр, функция)
@@ -324,9 +344,10 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
         # то есть против бессмысленного контекста.
         rep = np.full(int(c.max()) + 1, -1, dtype=np.int64)  # rep[v] = −1 для v = 0..max(c)
         rep[c[::-1]] = np.arange(n)[::-1]  # запись в обратном порядке: останется ПЕРВОЕ вхождение каждого значения
+        dead = None if fname.startswith("id") else rejected.setdefault(_partition_key(c, rep), set())  # слои, отброшенные для такого же разбиения
         for P in periods:  # по периодам
             for shift in range(P):  # по фазам s = 0..P−1
-                idx = np.nonzero(pos % P == shift)[0]  # номера пар слоя: pos mod P = s
+                idx = layers[(P, shift)]  # номера пар слоя: pos mod P = s (посчитаны заранее)
                 if len(idx) < 80:  # в слое меньше 80 пар
                     continue  # пропустить слой
                 if fname.startswith("id"):  # характеристика словарная — свой путь проверки
@@ -344,8 +365,12 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
                         if cand["support"] >= 0.999:  # опора почти полная — точный закон
                             return winner  # досрочный выход
                     continue  # арифметические базисы к словарному хешу не применяются
+                if dead is not None and (P, shift) in dead:  # слой уже отброшен для такого же разбиения
+                    continue  # пропустить слой: результат проверки тот же
                 rows, support = _majVotes(c, y, idx)  # мажоритарные голоса и опора слоя
                 if len(rows) < 24 or support < min_support:  # меньше 24 значений или опора мала
+                    if dead is not None:  # характеристика не словарная
+                        dead.add((P, shift))  # запомнить отброшенный слой для этого разбиения
                     continue  # пропустить слой
                 order = list(range(len(rows)))  # порядок 0..len(rows)−1
                 rng.shuffle(order)  # случайно перемешать
@@ -384,7 +409,7 @@ def invent_multi(pairs, rng: "random.Random | None" = None,  # пары; ген�
                     for other in range(P):  # по всем фазам периода
                         if other == shift:  # та же фаза
                             continue  # пропустить
-                        idx2 = np.nonzero(pos % P == other)[0]  # номера пар другой фазы
+                        idx2 = layers[(P, other)]  # номера пар другой фазы (посчитаны заранее)
                         rows2, sup2 = _majVotes(c, y, idx2)  # её мажоритарные голоса и опора
                         if sup2 < min_support:  # опора мала (шумовая фаза)
                             continue  # не блокирует
