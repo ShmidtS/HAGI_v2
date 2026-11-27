@@ -296,7 +296,8 @@ class Unified:
         tail_mean_pre = self._tail_mean()  # средняя CE на хвостах всех доменов до обучения
         new_ce_before = self._tail_ce(data)  # CE на хвосте НОВЫХ данных до обучения: мера переноса (знает ли модель уже что-то о новом домене)
         old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
-        pre_layout = (old_vec_pre, list(self._vec_bounds), list(self._vec_names)) if self.WORST_GATE else None  # раскладка «до» для гейта по наихудшему домену
+        pre_layout = (old_vec_pre, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))) if (self.WORST_GATE and old_vec_pre is not None) else None  # раскладка «до» для гейта по наихудшему домену
+        pre_layout_diag = (old_vec_pre, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))) if old_vec_pre is not None else None  # раскладка «до» для диагностики (всегда)
         _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
         _tp = time.perf_counter()  # начало обучения
         reps = []  # итоги повторов обучения
@@ -379,6 +380,11 @@ class Unified:
                 and (old_ce_post > old_ce_pre * 1.25  # CE_после > 1.25·CE_до
                      or self._worst_exceeds(pre_layout, source)))  # либо наихудший домен выше допуска
         old_ce = old_ce_post if old_ce_post is not None else old_ce_pre  # итоговая old_ce: после, если измерена, иначе до
+        worst_info: dict = {"worst_growth": None, "worst_name": None, "mean_gate_blind": False}  # диагностика наихудшего домена
+        if pre_layout_diag is not None:  # раскладка «до» есть
+            _n_, v_diag = self._old_domains_ce_vec(exclude=source)  # вектор «после» (та же выборка: rng(11))
+            w_g, w_n = self._worst_domain_growth(pre_layout_diag, (v_diag, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))))  # наихудший прирост
+            worst_info = {"worst_growth": w_g, "worst_name": w_n, "mean_gate_blind": bool(w_g is not None and w_g > self.WORST_TOL_ROLLBACK and not regression)}  # средний гейт пропустил, домен просел
         if regression:  # регрессия на старых доменах недопустима
             # откат на месте: Unified.load() создал бы новый объект модели и потерял
             # состояние адаптеров и замыкание оптимизатора
@@ -412,6 +418,7 @@ class Unified:
                 self._restore_blocks(incumbent_nblocks, incumbent_frozen)  # снять блоки, добавленные за приём
             tail_mean_post = self._tail_mean()  # среднее после отката (контроль)
         rolled_back = bool(regression or tail_gate)  # приём откатан целиком (регрессия старых или рост средней CE хвостов): в модели веса ДО приёма
+
         entry["rolled_back"] = rolled_back  # признак: домен записан в книге, но модель его не обучала
         entry["ce"] = (self._tail_ce(data) if rolled_back else ce)  # CE нового домена для УСТАНОВЛЕННОЙ модели: после отката — измеренная на хвосте, иначе сертификат кандидата
         entry["tail_gate"] = tail_gate  # признак отката по хвостам
@@ -464,6 +471,7 @@ class Unified:
             "growth": growth,  # итог роста ёмкости
             "repair": repair,  # итог ремонта забывания
             "regression": entry.get("regression", False),  # была ли регрессия
+            **worst_info,  # наихудший прирост CE старого домена, его имя, пропустил ли средний гейт
             "phases": {**_ph, "repair": round(time.perf_counter() - _tp, 1)},  # длительности фаз приёма, с (рост, замеры до, обучение, адаптеры, ремонт)
             "train_steps": {k: v for k, v in reps[-1].items() if k.startswith("sec_")},  # время шагов обучения и замеров CE внутри train_guarded, с
             "seconds": round(time.perf_counter() - t0, 1),  # длительность: round(t_конца − t0, 1)
@@ -619,7 +627,7 @@ class Unified:
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
     WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
     WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
-    WORST_GATE = os.environ.get("HAGI_WORST_GATE", "0") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le)
+    WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
     REPAIR_BYTES = 400_000  # не более 400 000 байтов старых доменов на раунд
@@ -1205,7 +1213,7 @@ class Unified:
         if not self.WORST_GATE or pre_layout is None:  # выключен или нет раскладки «до»
             return False  # не блокирует
         _n, v_post = self._old_domains_ce_vec(exclude=source)  # вектор «после» (та же выборка: rng(11))
-        grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(self._vec_bounds), list(self._vec_names)))  # наихудший прирост
+        grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))))  # наихудший прирост
         return grow is not None and grow > self.WORST_TOL_ROLLBACK  # превышен допуск
 
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
