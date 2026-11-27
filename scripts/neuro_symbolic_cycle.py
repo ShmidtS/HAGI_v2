@@ -33,6 +33,11 @@ from hagi.base.util import CKPT_DIR  # каталог контрольных т�
 from scripts.feed_all_c import ( CHUNK_TARGET, SKIP_DIRS, iter_files, load_state, save_state, sample_bytes, )  # загрузчик потока данных и его настройки
 
 
+# Число эпох обучения на приём куска. Замер на копии рабочей модели, три одинаковых новых домена:
+# 2 эпохи — выигрыш на новых 4.53 нат, потеря старых 0.183 (средняя CE хвостов 0.598 -> 0.781), 403 с;
+# 4 эпохи — выигрыш 4.50, потеря старых 0.097 (-> 0.695), 677 с. Новое домены выучены одинаково,
+# забывание вдвое меньше; цена — +68% времени. HAGI_CYCLE_EPOCHS переопределяет.
+CYCLE_EPOCHS = int(__import__("os").environ.get("HAGI_CYCLE_EPOCHS", "4"))  # эпох на приём куска в цикле
 TAPEOUT = ( CKPT_DIR / "processor_netlist.json" )  # путь списка схем процессора (в этом файле далее не используется)
 
   # ---------- ВЫВОД: задачи для схем ИЗ обученного тела ----------
@@ -133,9 +138,9 @@ def main() -> None:
         if _os.environ.get("HAGI_SYMBOLIC") == "1":  # символьная половина включена
             from hagi.selfdev.pipeline import ( unified_ingest, )  # единый приём: нейронная и символьная половины
 
-            r = unified_ingest( u, cid, blob, epochs=2, repeat=1, replay_cap=None, )  # приём куска: 2 эпохи, 1 повтор, # без предела повтора
+            r = unified_ingest( u, cid, blob, epochs=CYCLE_EPOCHS, repeat=1, replay_cap=None, )  # приём куска: CYCLE_EPOCHS эпох, 1 повтор, # без предела повтора
         else:  # обычный приём
-            r = u.ingest( cid, blob, epochs=2, repeat=1, replay_cap=None )  # приём куска: 2 эпохи, 1 повтор, без предела повтора
+            r = u.ingest( cid, blob, epochs=CYCLE_EPOCHS, repeat=1, replay_cap=None )  # приём куска: CYCLE_EPOCHS эпох, 1 повтор, без предела повтора
   # перепроверить принятые законы и без изобретения законов на этом куске
             try:  # сбой критики не должен прерывать цикл
                 from hagi.data.law_critique import ( run_law_self_critique, )  # самокритика принятых законов
