@@ -1037,6 +1037,38 @@ def dequant_per_row(par: dict, Q: np.ndarray) -> np.ndarray:
     return R  # восстановленная матрица
 
 
+def gauge_balance(model: "HagiOptimalLM") -> dict[str, float]:
+    """Калибровка некомпактных симметрий масштабирования: функция модели НЕ меняется (сдвиг логитов
+    ~1e-6), а нормы сомножителей выравниваются.
+
+    Симметрии:
+      - SwiGLU (основная и блоки роста): столбец j матрицы up × c_j, строка j матрицы down / c_j;
+        баланс c_j = sqrt(||down_j|| / ||up_j||) — норма строки и столбца становится средней
+        геометрической (arXiv:2611.27889, Sec. 5);
+      - скип биграмм B_u @ B_v: перенос масштаба между сомножителями, чтобы нормы столбцов B_u
+        и строк B_v совпали (диагональная балансировка ранга 8).
+    Зачем: при затухании весов, стремящемся к 0, параметры уходят по этим слоям на бесконечность,
+    раздувая динамический диапазон строк — а он напрямую портит построчное троичное/4-битное
+    квантование. Калибровка возвращает параметры в сбалансированные координаты перед экспортом.
+
+    model — модель. Возвращает словарь: максимальный |log(c_j)| по SwiGLU-парам и по биграммам."""
+    with t.no_grad():  # без графа
+        max_sw = 0.0  # наибольший сдвиг масштаба в SwiGLU
+        for W_up, W_down in [(model.W_up, model.W_down)] + [(b[1], b[2]) for b in model.blocks]:  # все SwiGLU
+            cu = t.linalg.norm(W_up.detach(), dim=0).clamp_min(1e-12); cd = t.linalg.norm(W_down.detach(), dim=1).clamp_min(1e-12)  # нормы столбцов up и строк down
+            c = t.sqrt(cd / cu)  # баланс: c_j = sqrt(||down_j|| / ||up_j||)
+            max_sw = max(max_sw, float(c.log().abs().max()))  # учесть сдвиг
+            W_up.mul_(c[None, :]); W_down.mul_(1.0 / c[:, None])  # применить: up · c, down / c (функция та же)
+        Bu, Bv = getattr(model, "B_u", None), getattr(model, "B_v", None)  # скип биграмм
+        max_bg = 0.0  # наибольший сдвиг в биграммах
+        if Bu is not None and Bv is not None:  # скип есть
+            nu = t.linalg.norm(Bu.detach(), dim=0).clamp_min(1e-12); nv = t.linalg.norm(Bv.detach(), dim=1).clamp_min(1e-12)  # нормы
+            c = t.sqrt(nv / nu)  # перенос масштаба
+            Bu.mul_(c[None, :]); Bv.mul_(1.0 / c[:, None])  # применить
+            max_bg = float(c.log().abs().max())  # сдвиг
+    return {"max_log_shift_swiglu": max_sw, "max_log_shift_bigram": max_bg}  # итог
+
+
 def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) -> tuple[dict, int]:
     """Квантовать все 2D-веса per-row; таблицу emb (256 строк — словарь) — без поворота строк.
         Возвращает (параметры по именам, число байт уровней)."""
