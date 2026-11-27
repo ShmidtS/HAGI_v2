@@ -34,9 +34,6 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["hagi", "hagi.*"]  # пакет с подпакетами base, models, invent, data, selfdev, core, memory_store
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
 [tool.ruff]
 line-length = 120
 target-version = "py312"
