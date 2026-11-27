@@ -534,7 +534,7 @@ class Unified:
             ADAPTER_MIN_GAIN и его CE меньше, чем у лучшего из принятых.
             Возвращает словарь: status (GROW/HOLD), baseline_ce, attempts; при GROW
             ещё rank и ce."""
-        from hagi.base.trunk_ops import LowRankAdapter, paired_gain  # адаптер низкого ранга и парный выигрыш
+        from hagi.base.trunk_ops import LowRankAdapter, paired_gain, paired_margin_eb  # адаптер низкого ранга и парный выигрыш
         bank = getattr(self, "adapter_bank", None)  # банк адаптеров или None
         if bank is None:  # банка ещё нет
             from hagi.base.trunk_ops import AdapterBank  # банк доменных адаптеров
@@ -573,7 +573,11 @@ class Unified:
                     source, rng.integers(0, cut, 128)))  # ... 128 случайных позиций из [0, cut)
             self.model.domain_adapter = None  # снять кандидата с модели
             after = self._adapter_val_ce(c, *val)  # CE кандидата на тех же проверочных окнах
-            gain, lower = paired_gain(before, after)  # выигрыш = mean(before − after); нижняя граница = выигрыш − 2.4·SE
+            # Граница — эмпирический Бернштейн (paired_margin_eb), а не нормальная эвристика mean − 2.4·SE:
+            # последняя не даёт конечной гарантии и при n = 1 даёт SE = 0; здесь K = len(cands) кандидатов
+            # оценены на одних окнах — объединение по K (admit_false_union_le, PairedGain.lean; primes PROPOSAL-paired-gain-eb).
+            gain, lower = paired_gain(before, after)  # выигрыш = mean(before − after) (для журнала); нормальная нижняя граница — тоже для журнала
+            lower = gain - paired_margin_eb(before - after, n_states=len(cands), delta=0.01)  # сертифицированная нижняя граница: выигрыш − радиус EB
             report["attempts"].append({"rank": c.r, "ce": float(after.mean()),  # записать попытку: ранг и средняя CE после ...
                                         "gain": gain, "lower_bound": lower})  # ... выигрыш и нижняя граница
             # Нижняя граница обязана превысить минимальный выигрыш (0.005): на
@@ -941,8 +945,9 @@ class Unified:
             base = _t.nn.functional.cross_entropy(  # базовая CE по окнам ...
                 self.model.logits(X), y, reduction="none").cpu().numpy()  # перекрёстная энтропия по строкам: ... CE_i = −log softmax(logit(X_i))[y_i]
         after = self._adapter_val_ce(ad, X, y)  # CE по окнам с адаптером
-        from hagi.base.trunk_ops import paired_gain  # парный выигрыш и его нижняя граница
-        return ad if paired_gain(base, after)[1] > ADAPTER_MIN_GAIN else None  # адаптер, если нижняя граница > 0.005, иначе None
+        from hagi.base.trunk_ops import paired_margin_eb  # доказуемая граница парного выигрыша (эмпирический Бернштейн)
+        # Один кандидат (n_states = 1); нижняя граница = mean(base − after) − радиус EB (вместо нормальной эвристики mean − 2.4·SE)
+        return ad if float(np.asarray(base).mean() - np.asarray(after).mean()) - paired_margin_eb(np.asarray(base) - np.asarray(after), n_states=1, delta=0.01) > ADAPTER_MIN_GAIN else None  # адаптер, если сертифицированная нижняя граница > 0.005, иначе None
 
     def _live_fiber(self, domain: str | None):
         """Волокно домена, если оно реально снижает CE на проверочных окнах (живой гейт); иначе None.
