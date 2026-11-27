@@ -451,6 +451,7 @@ class Unified:
             if not regression and USE_GPM:  # домен принят и защита GPM включена (HAGI_GPM=1) — его входы защищаются при следующих приёмах
                 update_gpm_bases(self.model, data, self.model.gpm_left)  # SVD входов матриц, 90% энергии
         entry["regression"] = bool(regression)  # записать флаг регрессии
+        entry.update(worst_info)  # наихудший прирост CE старого домена, его имя, пропустил ли средний гейт — в книгу
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")  # записать время обучения
         if growth.get("status") == "GROW":  # вырос новый блок
             entry["growth"] = growth  # записать итог роста
