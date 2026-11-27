@@ -991,9 +991,12 @@ def hadamard_mat(n: int) -> np.ndarray:
     return H / math.sqrt(n)  # нормировать
 
 
-def quant_per_row(W: np.ndarray, bits: int = 2, use_had: bool = True, rotate_rows: bool = True) -> tuple[dict, np.ndarray]:
+def quant_per_row(W: np.ndarray, bits: int = 2, use_had: bool = True, rotate_rows: bool = True, stages: int = 1) -> tuple[dict, np.ndarray]:
     """Построчное квантование W: (опционально) поворот Адамара по блокам, порог/шкала на строку.
         bits=2 — триты {−1, 0, +1}; bits=4 — 16 уровней. Таблицы поиска (emb) — без rotate_rows.
+        stages > 1 — остаточное квантование: каждая следующая стадия кодирует остаток
+        (W − сумма предыдущих стадий) тем же способом; уровни стадий конкатенируются по строкам
+        (Q формы (stages·r, c), шкалы (stages·r,)). Ошибка убывает, объём растёт пропорционально.
         Возвращает (параметры, уровни int8)."""
     R = W.astype(np.float64, copy=True)  # копия
     r, c = R.shape  # размеры
@@ -1002,24 +1005,29 @@ def quant_per_row(W: np.ndarray, bits: int = 2, use_had: bool = True, rotate_row
         if br > 1: R = np.einsum("ij,ajb->aib", hadamard_mat(br), R.reshape(r // br, br, c)).reshape(r, c)  # по строкам
         bc = max((b for b in (64, 32, 16, 8, 4, 2) if c % b == 0), default=1)  # блок столбцов
         if bc > 1: R = (R.reshape(r, c // bc, bc) @ hadamard_mat(bc)).reshape(r, c)  # по столбцам
-    scs = np.empty(r, dtype=np.float32); Q = np.zeros((r, c), dtype=np.int8)  # шкалы и уровни
-    for i in range(r):  # по строкам
-        row = R[i]  # строка
-        if bits == 2:  # триты
-            from hagi.models.quantized import _best_mse_scale  # точный масштаб по минимальной MSE
-            sc, levels, _err = _best_mse_scale(row)  # масштаб, уровни {−1,0,1}, ошибка
-            Q[i] = levels.astype(np.int8)  # уровни
-        else:  # 4 бита
-            m = float(np.max(np.abs(row))) or 1e-6; sc = m / 7.5  # шкала
-            Q[i] = np.clip(np.round(row / sc), -7, 8).astype(np.int8)  # уровни
-        scs[i] = sc  # сохранить
-    return {"bits": int(bits), "use_had": bool(use_had), "rotate_rows": bool(rotate_rows), "shape": (r, c), "scales": scs}, Q  # вернуть
+    n_st = max(1, int(stages))  # число стадий
+    scs = np.empty(n_st * r, dtype=np.float32); Q = np.zeros((n_st * r, c), dtype=np.int8)  # шкалы и уровни всех стадий
+    recon = np.zeros((r, c), dtype=np.float64)  # накопленная reconstruction Σ стадий
+    for st_ in range(n_st):  # по стадиям
+        for i in range(r):  # по строкам
+            row = R[i] - recon[i] if st_ > 0 else R[i]  # строка (на стадиях > 1 — остаток)
+            if bits == 2:  # триты
+                from hagi.models.quantized import _best_mse_scale  # точный масштаб по минимальной MSE
+                sc, levels, _err = _best_mse_scale(row)  # масштаб, уровни {−1,0,1}, ошибка
+                Q[st_ * r + i] = levels.astype(np.int8)  # уровни стадии
+                recon[i] += levels.astype(np.float64) * sc  # добавить вклад стадии
+            else:  # 4 бита
+                m = float(np.max(np.abs(row))) or 1e-6; sc = m / 7.5  # шкала
+                Q[st_ * r + i] = np.clip(np.round(row / sc), -7, 8).astype(np.int8)  # уровни стадии
+                recon[i] += Q[st_ * r + i].astype(np.float64) * sc  # вклад стадии
+            scs[st_ * r + i] = sc  # сохранить шкалу стадии
+    return {"bits": int(bits), "use_had": bool(use_had), "rotate_rows": bool(rotate_rows), "shape": (r, c), "scales": scs, "stages": n_st}, Q  # вернуть
 
 
 def dequant_per_row(par: dict, Q: np.ndarray) -> np.ndarray:
     """Обратно к quant_per_row: уровни · шкала и обратный поворот Адамара (H симметрична, H·H = I)."""
-    r, c = par["shape"]  # размеры
-    R = Q.astype(np.float64) * par["scales"][:, None].astype(np.float64)  # расшкалить
+    r, c = par["shape"]; n_st = int(par.get("stages", 1))  # размеры и число стадий
+    R = (Q.astype(np.float64) * par["scales"][:, None].astype(np.float64)).reshape(n_st, r, c).sum(axis=0)  # сумма стадий: Σ_k Q_k·s_k
     if par["use_had"]:  # повернуть обратно
         bc = max((b for b in (64, 32, 16, 8, 4, 2) if c % b == 0), default=1)  # блок столбцов
         if bc > 1: R = (R.reshape(r, c // bc, bc) @ hadamard_mat(bc)).reshape(r, c)  # обратно
