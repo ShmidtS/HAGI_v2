@@ -28,7 +28,7 @@ def test_bypass_lowers_ce_on_unseen_repetition_and_is_causal():
     tail = b"def f(x):\n    return x\n" * 20  # отложенный кусок: только повтор
     m.bypass_fit(head)  # словари по обучающей части
     x = t.as_tensor(list(tail[:-1]))[None]  # вход
-    y = t.as_tensor(list(tail[1:]))[None]  # цели
+    y = t.as_tensor(list(tail[1:]), device=m.device)[None]  # цели (на устройстве модели)
     with t.no_grad():  # без градиентов
         on = float(t.nn.functional.cross_entropy(m.forward_seq(x).reshape(-1, 256), y.reshape(-1)))  # с обходом
         m.bypass_boost = 0.0  # выключить

@@ -14,6 +14,7 @@ from typing import Any  # произвольный тип
 
 import numpy as np  # численные массивы
 import torch as t  # тензоры и автоградиент
+from hagi.base import config  # чтение HAGI_DEVICE (cpu / cuda / auto)
 
 
 def rms_norm(x: t.Tensor, g: t.Tensor, eps: float = 1e-6) -> t.Tensor:
@@ -237,7 +238,14 @@ class HagiOptimalLM:
         assert dim % n_heads == 0  # ширина делится на головы
         self.dim, self.hidden, self.n_heads, self.k, self.d_bi = dim, hidden, n_heads, k, d_bi  # сохранить
         self.use_hier_gdn, self.use_bigram_logit_skip, self.use_gdn_norm = use_hier_gdn, use_bigram_logit_skip, use_gdn_norm  # сохранить
-        self.seed, self.device = seed, "cpu"  # зерно и устройство
+        self.seed = seed  # зерно инициализации
+        # Устройство модели: HAGI_DEVICE=cpu -> процессор; иначе GPU, если доступен (у рабочей модели цикл
+        # на GPU в ~2.7 раза быстрее: замер 3 доменов 193 с против 519 с). Порог dim·hidden >= 8192 общего
+        # правила auto здесь не применяется: он защищает крошечные тестовые модели, а не рабочую.
+        if config.device() == "cpu" or not t.cuda.is_available():  # процессор запрошен или GPU нет
+            self.device = "cpu"  # процессор
+        else:  # GPU доступен
+            self.device = "cuda"  # видеокарта
         self.t = t  # модуль torch (Unified._windows берёт torch из модели)
         self.adapter_dim = dim  # ширина, к которой применяется доменный адаптер
         self.rms_eps = 1e-6  # eps RMSNorm (масштабируется при росте ширины)
@@ -283,6 +291,8 @@ class HagiOptimalLM:
         self.bypass_boost = _bypass_boost_default()  # прибавка к логиту точного словаря (0 — выключен)
         self.bypass_t5: dict[bytes, list] = {}  # 5-байтовый словарь: контекст -> [предсказание, счёт, сбой]
         self.bypass_t3: dict[bytes, list] = {}  # 3-байтовый словарь: контекст -> [предсказание, счёт, сбой]
+        self.sync_device()  # параметры — на устройство модели
+
 
     def matrix_and_vec_params(self) -> tuple[list[t.nn.Parameter], list[t.nn.Parameter]]:  # группы параметров
         mats = [self.W_loc, self.W_bi, self.W_gq, self.W_gk, self.W_gv, self.W_go,  # матрицы
@@ -352,6 +362,7 @@ class HagiOptimalLM:
         return h_out + (h_out @ At.T) @ Bt.T  # добавка того же вида, что у HNet
 
     def logits(self, ctx: t.Tensor) -> t.Tensor:  # логиты следующего байта (B, 256) с адаптером, если задан
+        ctx = ctx.to(self.device)  # контекст — на устройство модели (вход может прийти с процессора)
         h_out = rms_norm(self.forward_hidden(ctx), self.g_out)  # скрытое последней позиции
         h_out = self._apply_adapter(h_out)  # адаптер домена
         h_last = h_out[:, -1, :]  # последняя позиция
@@ -399,6 +410,16 @@ class HagiOptimalLM:
         mats, vecs = self.matrix_and_vec_params()  # группы (в том же порядке, что params())
         blk_names = {id(W): f"blk{i}.{nm}" for i, (Wg, Wu, Wd) in enumerate(self.blocks) for W, nm in ((Wg, "Wg"), (Wu, "Wu"), (Wd, "Wd"))}  # блоки роста
         return [base.get(id(p), blk_names.get(id(p))) for p in mats + vecs]  # по порядку params()
+
+    def sync_device(self) -> None:
+        """Перенести данные всех параметров (включая блоки роста) на self.device.
+        Без переноса параметр остаётся на процессоре, а входы строятся на GPU — устройства расходятся."""
+        with t.no_grad():  # без графа
+            for q in self.params():  # по всем параметрам
+                q.data = q.data.to(self.device)  # перенести данные параметра
+            if self.active_adapter is not None:  # адаптер активен
+                A, B_adp, sc = self.active_adapter  # распаковать
+                self.active_adapter = (A.to(self.device), B_adp.to(self.device), sc)  # адаптер на устройстве
 
     def state_dict(self) -> dict[str, t.Tensor]:  # снимок весов по именам атрибутов
         return {n: p.detach().clone() for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)}  # копии
@@ -481,6 +502,7 @@ class HagiOptimalLM:
         return q * vth  # обратно в исходном масштабе
 
     def forward_hidden(self, x_seq: t.Tensor, capture: dict[int, t.Tensor] | None = None, state: dict | None = None) -> t.Tensor:  # скрытое состояние (B, T, d); capture — входы матриц (для GPM)
+        x_seq = x_seq.to(self.device)  # порт входа: байты — на устройство модели
         B, T = x_seq.shape  # размеры
         d, H = self.dim, self.n_heads  # ширина и головы
         hd = d // H  # ширина головы
@@ -488,7 +510,7 @@ class HagiOptimalLM:
         acc = causal_lags(E, self.w_lag, self.LAGS)  # взвешенная сумма лагов
         if capture is not None: capture[id(self.W_loc)] = (E + acc).detach().reshape(-1, d)  # вход W_loc
         x0 = rms_norm(E + acc @ self.W_loc, self.g_loc)  # локальный признак
-        x_m1 = t.cat([t.zeros((B, 1), dtype=t.long), x_seq[:, : T - 1]], dim=1)  # предыдущий байт (0 на позиции 0)
+        x_m1 = t.cat([t.zeros((B, 1), dtype=t.long, device=x_seq.device), x_seq[:, : T - 1]], dim=1)  # предыдущий байт (0 на позиции 0)
         bi_idx = ((x_m1 * 131) ^ x_seq) % 256  # хэш пары байтов
         if capture is not None: capture[id(self.W_bi)] = self.E_bi[bi_idx].detach().reshape(-1, self.E_bi.shape[1])  # вход W_bi — вложения пары байтов
         h = x0 + self.E_bi[bi_idx] @ self.W_bi  # добавить биграммный признак
@@ -513,7 +535,7 @@ class HagiOptimalLM:
         if capture is not None: capture[id(self.W_go)] = y1.detach().reshape(-1, d)  # вход W_go
         h = h + y1 @ self.W_go  # остаточное соединение
         if self.use_hier_gdn:  # уровень 2
-            h_prev = t.cat([t.zeros((B, 1, d)), h[:, : T - 1]], dim=1)  # предыдущее скрытое
+            h_prev = t.cat([t.zeros((B, 1, d), device=h.device), h[:, : T - 1]], dim=1)  # предыдущее скрытое
             if capture is not None: capture[id(self.w_bnd)] = t.cat([h, h_prev], dim=-1).detach().reshape(-1, 2 * d)  # вход гейта границ
             p_bnd = t.sigmoid(t.cat([h, h_prev], dim=-1) @ self.w_bnd + self.b_bnd)  # вероятность границы (B, T, 1)
             Q2 = t.nn.functional.normalize(qkv(self.W_hq, h), dim=-1)  # запросы уровня 2
@@ -589,8 +611,8 @@ class HagiOptimalLM:
         # контроля была шумной (замер в цикле: контроль 0.82 при CE всего хвоста 0.41).
         _n_val = min(VAL_WINDOWS, max(1, len(va_arr) // seq_len))  # число контрольных окон (VAL_WINDOWS из среды HAGI_VAL_WINDOWS)
         v_starts = (np.arange(0, max(1, len(va_arr) - seq_len - 1), seq_len)[:_n_val] if len(va_arr) // seq_len <= VAL_WINDOWS else (np.linspace(0, len(va_arr) - seq_len - 1, _n_val)).astype(np.int64))  # старты: подряд, если окон не больше лимита, иначе равномерно по хвосту
-        vx = t.as_tensor(np.stack([va_arr[s: s + seq_len] for s in v_starts]), dtype=t.long)  # входы
-        vy = t.as_tensor(np.stack([va_arr[s + 1: s + 1 + seq_len] for s in v_starts]), dtype=t.long)  # цели
+        vx = t.as_tensor(np.stack([va_arr[s: s + seq_len] for s in v_starts]), dtype=t.long, device=self.device)  # входы
+        vy = t.as_tensor(np.stack([va_arr[s + 1: s + 1 + seq_len] for s in v_starts]), dtype=t.long, device=self.device)  # цели
 
         def val_ce() -> float:  # контрольная кросс-энтропия на контроле
             with t.no_grad():  # без графа
@@ -609,8 +631,8 @@ class HagiOptimalLM:
             if state_carry:  # поток: подряд идущие чанки, состояние переносится
                 starts = stream_pos  # старты потоков
                 state = {k: v for k, v in carry.items()}  # состояние с предыдущего шага
-                bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long)  # входы
-                by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long)  # цели
+                bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long, device=self.device)  # входы
+                by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long, device=self.device)  # цели
                 opt.zero_grad()  # сброс
                 loss = t.nn.functional.cross_entropy(self.forward_seq(bx, state=state).reshape(-1, self.VOCAB), by.reshape(-1))  # потеря по всем T позициям
                 carry = {"S1": state["S1"], "S2": state.get("S2")}  # новое состояние (detached)
@@ -628,8 +650,8 @@ class HagiOptimalLM:
                     if log_every and (step + 1) % log_every == 0: print(f"  шаг {step + 1}/{total_steps}: потеря {float(loss):.4f}, контроль {hv:.4f}", flush=True)  # прогресс
                 continue  # следующий шаг
             starts = rng.integers(0, max_start, size=batch)  # случайные старты
-            bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long)  # входы
-            by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long)  # цели
+            bx = t.as_tensor(np.stack([tr_arr[s: s + seq_len] for s in starts]), dtype=t.long, device=self.device)  # входы
+            by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long, device=self.device)  # цели
             opt.zero_grad()  # сброс
             loss = t.nn.functional.cross_entropy(self.forward_seq(bx).reshape(-1, self.VOCAB), by.reshape(-1))  # потеря по всем T позициям
             loss.backward()  # градиент
@@ -672,8 +694,8 @@ def eval_oos_exact(model: HagiOptimalLM, raw: bytes, stride: int = 4) -> float: 
     with t.no_grad():  # без графа
         for i in range(0, len(pos), 128):  # пакетами
             p = pos[i:i + 128]  # пакет позиций
-            X = t.as_tensor(idx[p[:, None] - k + np.arange(k)[None, :]], dtype=t.long)  # окна
-            y = t.as_tensor(idx[p], dtype=t.long)  # цели
+            X = t.as_tensor(idx[p[:, None] - k + np.arange(k)[None, :]], dtype=t.long, device=model.device)  # окна
+            y = t.as_tensor(idx[p], dtype=t.long, device=model.device)  # цели
             tot += float(t.nn.functional.cross_entropy(model.logits(X), y, reduction="sum")); cnt += len(p)  # накопить
     return tot / max(1.0, cnt)  # средняя CE
 
@@ -720,6 +742,7 @@ def grow_width(model: "HagiOptimalLM", delta: int = 8) -> int:
         model.dim = d1  # новая ширина
         model.adapter_dim = d1  # адаптеры применяются к новой ширине
         model.rms_eps = getattr(model, "rms_eps", 1e-6) * (d0 / d1)  # eps нормировки масштабируется как d0/d1 (точное равенство при малых активациях)
+    model.sync_device()  # расширенные параметры — на устройство модели
     return d1  # вернуть
 
 
@@ -729,6 +752,7 @@ def grow_depth(model: "HagiOptimalLM", seed: int = 0) -> int:
     model.blocks.append((t.nn.Parameter(t.randn((model.dim, model.hidden), generator=g) * 0.06),  # вентиль
                          t.nn.Parameter(t.randn((model.dim, model.hidden), generator=g) * 0.06),  # подъём
                          t.nn.Parameter(t.zeros((model.hidden, model.dim)))))  # нулевой выход — тождество
+    model.sync_device()  # новые параметры блока — на устройство модели
     return len(model.blocks)  # число блоков
 
 
@@ -741,7 +765,7 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[str, t.
     if len(arr) < 66:  # слишком коротко
         return  # ничего
     starts = np.linspace(0, len(arr) - 65, num=min(16, max(1, len(arr) // 64)), dtype=np.int64)  # старты окон
-    bx = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long)  # форма: окна, 64
+    bx = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long, device=model.device)  # форма: окна, 64
     acts: dict[int, t.Tensor] = {}  # входы матриц
     acts_out: dict[int, t.Tensor] = {}  # выходные активации (для правых базисов)
     with t.no_grad():  # без графа
@@ -810,6 +834,9 @@ class CortexFiber:
         self.b_f = t.nn.Parameter(t.zeros(256))  # смещение
         self.Bu_f = t.nn.Parameter(t.randn((256, 4), generator=g) * 0.04)  # биграммный вход
         self.Bv_f = t.nn.Parameter(t.zeros((4, 256)))  # биграммный выход
+        with t.no_grad():  # без графа
+            for q in self.params():  # по всем параметрам волокна
+                q.data = q.data.to(model.device)  # параметр — на устройство модели
 
     def params(self) -> list[t.nn.Parameter]:  # все параметры
         return [self.A_h, self.B_h, self.U_o, self.V_o, self.b_f, self.Bu_f, self.Bv_f]  # списком
@@ -828,8 +855,8 @@ def fit_domain_fiber(model: "HagiOptimalLM", tr: bytes, rank: int = 8, steps: in
     arr = np.frombuffer(tr, dtype=np.uint8).astype(np.int64)  # байты
     max_s = max(1, len(arr) - 65)  # число стартов
     starts = np.arange(0, max_s, max(1, max_s // 64))[:64]  # до 64 перекрывающихся окон
-    bx = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long)  # входы
-    by = t.as_tensor(np.stack([arr[s + 1: s + 65] for s in starts]), dtype=t.long)  # цели
+    bx = t.as_tensor(np.stack([arr[s: s + 64] for s in starts]), dtype=t.long, device=model.device)  # входы
+    by = t.as_tensor(np.stack([arr[s + 1: s + 65] for s in starts]), dtype=t.long, device=model.device)  # цели
     with t.no_grad():  # ствол заморожен
         h_all = rms_norm(model.forward_hidden(bx), model.g_out)  # форма: окна, 64, ширина
         lg_base = (h_all @ model.emb.T) * model.out_scale + model.b_out  # логиты ствола
@@ -853,7 +880,7 @@ def eval_with_fiber(model: "HagiOptimalLM", raw: bytes, fib: "CortexFiber | None
     arr = np.frombuffer(raw, dtype=np.uint8).astype(np.int64)  # байты
     if len(arr) < model.k + 2:  # коротко
         return float("nan")  # не определено
-    x = t.as_tensor(arr[:-1], dtype=t.long)[None]; y = t.as_tensor(arr[1:], dtype=t.long)  # вход и цели
+    x = t.as_tensor(arr[:-1], dtype=t.long, device=model.device)[None]; y = t.as_tensor(arr[1:], dtype=t.long, device=model.device)  # вход и цели
     with t.no_grad():  # без графа
         h = rms_norm(model.forward_hidden(x), model.g_out)  # скрытое
         lg = (h @ model.emb.T) * model.out_scale + model.b_out  # логиты ствола
@@ -997,7 +1024,7 @@ class StreamState:
     def __init__(self, model: "HagiOptimalLM") -> None:  # создать по модели
         m = model; d, H, hd = m.dim, m.n_heads, m.dim // m.n_heads  # размеры
         self.m = m; self.d, self.H, self.hd = d, H, hd  # запомнить
-        dev = "cpu"  # состояние на процессоре (побайтный шаг мал; GPU-переключение дороже)
+        dev = m.W_loc.device  # устройство состояния = устройство параметров модели (иначе устройства расходятся)
         f = lambda *shape: t.zeros(*shape, dtype=t.float32, device=dev)  # нулевой тензор
         self.max_lag = max(m.LAGS)  # наибольший лаг
         self.e_buf = f(self.max_lag, d)  # вложения последних байтов (старые — первые)
@@ -1015,7 +1042,7 @@ class StreamState:
         with t.no_grad():  # без графа
             self.hist.append(b); del self.hist[:-5]  # история: последние 5 байтов, включая текущий (как в forward_seq)
             e = m.emb[b]  # вложение байта, (d)
-            acc = t.zeros(d)  # взвешенная сумма лагов
+            acc = t.zeros(d, device=self.e_buf.device)  # взвешенная сумма лагов
             for li, lag in enumerate(m.LAGS):  # по лагам
                 if self.n >= lag:  # лаг уже есть в истории (до текущего байта)
                     acc = acc + self.e_buf[-lag] * m.w_lag[li]  # вклад
@@ -1065,9 +1092,9 @@ class StreamState:
                 lg = lg + m.B_u[b] @ m.B_v  # по текущему байту
             fib = getattr(m, "active_fiber", None)  # волокно домена
             if fib is not None:  # задано
-                lg = lg + fib.logits_delta(h_out[None], t.as_tensor([b]))[0, 0]  # добавка волокна (h_out — (d,))
+                lg = lg + fib.logits_delta(h_out[None], t.as_tensor([b], device=h_out.device))[0, 0]  # добавка волокна (h_out — (d,))
             if m.bypass_boost > 0:  # точный обход включён — как в forward_seq (по последним 5 байтам истории)
-                lg = lg + m.bypass_apply(t.as_tensor(list(self.hist), dtype=t.long)[None], t.zeros((1, len(self.hist), 256)))[0, -1]  # прибавка словарей: история как окно (1, n), логит как позиция (1, 1, 256)
+                lg = lg + m.bypass_apply(t.as_tensor(list(self.hist), dtype=t.long, device=h_out.device)[None], t.zeros((1, len(self.hist), 256), device=h_out.device))[0, -1]  # прибавка словарей: история как окно (1, n), логит как позиция (1, 1, 256)
         self.n += 1  # счётчик шагов
         return lg  # логиты следующего байта
 
