@@ -144,12 +144,14 @@ def main() -> None:
             except Exception as _ce:  # ошибка самокритики
                 print( "    [self-critique] skipped: " + repr(_ce), flush=True, )  # печать причины пропуска # сразу сбросить вывод
         st["chunks"] += 1  # кусков: +1
-        if r.get("new_ce_before") is not None:  # измерен перенос
+        if r.get("new_ce_before") is not None and not r.get("skipped"):  # измерен перенос и приём выполнен (пропущенный кусок короче 4096 байт возвращает только skipped)
             print( f"  перенос: новый домен до обучения {r['new_ce_before']:.3f} -> после {r.get('holdout_ce', float('nan')):.3f}" + ( f" | хвост домена {r['tail_ce']:.3f}" if r.get("tail_ce") is not None else "" ) + ( f" | старые домены до приёма {r['old_ce_pre']:.3f}" if r.get("old_ce_pre") is not None else "" ), flush=True, )  # CE нового до/после # и CE старых (накопление)
         if isinstance(r.get("programs"), dict):  # модель писала программы в этом приёме
             pg = r["programs"]  # итог выгрузки и исполнения
             print( f"  programs: функций {pg.get('functions', 0)} | исполнено {pg.get('executed', 0)} | " f"провалов {pg.get('failures', 0)} | отказано {pg.get('refused', 0)}" + ( f" | ошибка {pg.get('error')}" if pg.get("status") == "ERROR" else "" ), flush=True, )  # сколько написано и исполнено # сколько провалило сертификат и сколько вне белого списка # с текстом ошибки, если была
         ce = r.get("holdout_ce", -1)  # CE на отложенных данных, −1, если ключа нет
+        if r.get("skipped"):  # приём пропущен (кусок короче 4096 байт)
+            print(f"  пропуск: кусок {chunk_bytes} байтов короче 4096 — приём не выполнялся", flush=True)  # явная строка вместо молчаливого «CE -1»
   # живой диалог во время обучения: файл .chat кладётся в каталог inbox;
   # его изучает САМ процесс обучения (веса пишет только он, без гонок
   # с сохранением), ответ попадает в файл .reply
