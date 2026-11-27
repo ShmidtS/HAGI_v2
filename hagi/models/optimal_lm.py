@@ -56,6 +56,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
     return float(v) if v not in ("", "0") else None  # число или None (выключено)
 
 
+VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "256"))  # предел числа контрольных окон при обучении (равномерно по хвосту контроля)
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
 
@@ -578,7 +579,11 @@ class HagiOptimalLM:
         if gpm:  # заданы
             opt.gpm_left.update(gpm)  # градиент, шаг и затухание не заходят в защищённое подпространство
         rng = np.random.default_rng(seed)  # выборка окон
-        v_starts = np.arange(0, max(1, len(va_arr) - seq_len - 1), seq_len)[: min(32, max(1, len(va_arr) // seq_len))]  # старты контрольных окон
+        # Контрольные окна расставлены РАВНОМЕРНО по всему хвосту (до 256 окон, а не первые 32):
+        # прежние 32 первых окна покрывали лишь 2 КБ из десятков КБ хвоста нового домена, и оценка
+        # контроля была шумной (замер в цикле: контроль 0.82 при CE всего хвоста 0.41).
+        _n_val = min(VAL_WINDOWS, max(1, len(va_arr) // seq_len))  # число контрольных окон (VAL_WINDOWS из среды HAGI_VAL_WINDOWS)
+        v_starts = (np.arange(0, max(1, len(va_arr) - seq_len - 1), seq_len)[:_n_val] if len(va_arr) // seq_len <= VAL_WINDOWS else (np.linspace(0, len(va_arr) - seq_len - 1, _n_val)).astype(np.int64))  # старты: подряд, если окон не больше лимита, иначе равномерно по хвосту
         vx = t.as_tensor(np.stack([va_arr[s: s + seq_len] for s in v_starts]), dtype=t.long)  # входы
         vy = t.as_tensor(np.stack([va_arr[s + 1: s + 1 + seq_len] for s in v_starts]), dtype=t.long)  # цели
 
