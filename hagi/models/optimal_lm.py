@@ -890,18 +890,43 @@ def eval_with_fiber(model: "HagiOptimalLM", raw: bytes, fib: "CortexFiber | None
 
 
 class MirrorHedgeStreamPredictor:
-    """Потоковый предиктор: модель на окне k + онлайн PPM порядков 0..4; смешивание Mirror-Hedge MWU
-    с полом 0.01 (эксперт не умирает). Обновления зависят только от уже данных байтов ⇒ без потерь."""
+    """Потоковый предиктор: модель на окне k + онлайн PPM порядков 0..4 + эксперт LZP (длинное
+    повторное совпадение контекста); смешивание Mirror-Hedge MWU с полом 0.01 (эксперт не умирает).
+    Обновления зависят только от уже данных байтов ⇒ без потерь (декодер повторяет кодер).
+
+    LZP-эксперт: ищет самое длинное повторение предыдущих 6/4/3 байтов в якорной таблице; при
+    совпадении ≥ 3 байт ставит массу min(0.94, 0.30 + 0.08·len) на следующий за ним байт. Ловит
+    дальние копии (имена, повторы строк), которые PPM ≤ 4 не различает."""
 
     def __init__(self, model: "HagiOptimalLM | None" = None, eta: float = 0.25) -> None:  # создать
         self.model, self.eta = model, float(eta)  # модель и шаг
-        self.weights = np.array([0.65, 0.35], dtype=np.float64) if model is not None else np.array([1.0])  # веса
+        # веса: [модель, PPM, LZP] (без модели — [PPM, LZP])
+        self.weights = np.array([0.60, 0.30, 0.10], dtype=np.float64) if model is not None else np.array([0.8, 0.2])  # веса
         self.uni = np.ones(256, dtype=np.float64)  # счётчик порядка 0
         self.ctx: list[dict[int, dict[int, int]]] = [{}, {}, {}, {}]  # таблицы порядков 1..4
         self.hist: list[int] = []  # история ≤ 16 байтов
+        self.long_hist: bytearray = bytearray()  # полная история (для LZP: байты и позиции совпадений)
+        self.lz_anchors: dict[bytes, list[int]] = {}  # контекст 3..6 байтов -> позиции его концов (≤ 12 последних)
         self.st = StreamState(model) if model is not None else None  # побайтовое состояние модели (O(1) на байт)
         self._lg = np.zeros(256)  # последние логиты состояния
-        self._last: tuple[np.ndarray, np.ndarray] | None = None  # последние предсказания
+    def _lzp_probs(self) -> tuple[np.ndarray, int]:  # распределение LZP и длина совпадения
+        n = len(self.long_hist)  # длина истории
+        best_len, best_byte = 0, -1  # лучшее совпадение
+        for kl in (6, 4, 3):  # длины ключа от длинного к короткому
+            if n >= kl:  # ключ помещается
+                key = bytes(self.long_hist[-kl:])  # ключ
+                for pos in reversed(self.lz_anchors.get(key, ())[-8:]):  # последние ≤ 8 позиций конца ключа
+                    if pos < n:  # позиция короче истории
+                        ml = kl  # длина совпадения (считая от конца)
+                        while ml < 32 and ml < pos and self.long_hist[pos - ml - 1] == self.long_hist[n - ml - 1]:  # расширяем влево
+                            ml += 1  # ещё один байт совпал
+                        if ml > best_len:  # лучше
+                            best_len, best_byte = ml, self.long_hist[pos]  # запомнить
+                if best_len >= 10:  # достаточно длинное совпадение
+                    break  # короткие ключи не спрашиваются
+        if best_byte < 0 or best_len < 3:  # совпадения нет
+            return None, 0  # эксперт молчит
+        return best_byte, best_len  # что предсказано и насколько уверенно
 
     def _ctx_probs(self) -> np.ndarray:  # PPM 0..4 с интерполяцией
         p = self.uni / self.uni.sum()  # порядок 0
@@ -921,21 +946,26 @@ class MirrorHedgeStreamPredictor:
 
     def predict_probs(self) -> np.ndarray:  # распределение следующего байта
         p_ctx = self._ctx_probs()  # контекстная модель
+        b_lz, ml = self._lzp_probs()  # кандидат LZP и длина совпадения
+        if b_lz is not None:  # LZP нашёл повтор
+            cf = min(0.94, 0.30 + 0.08 * ml); p_lz = p_ctx * (1.0 - cf); p_lz[b_lz] += cf  # распределение LZP
+        else:  # нет повторения
+            p_lz = p_ctx  # эксперт нейтрален
         if self.model is None:  # без модели
-            self._last = (p_ctx, p_ctx); return p_ctx  # только PPM
+            self._last = (p_ctx, p_lz); return self.weights[0] * p_ctx + self.weights[1] * p_lz  # PPM + LZP
         if self.st.n == 0:  # истории нет
             p_neu = np.full(256, 1.0 / 256.0)  # равномерно
         else:  # логиты уже посчитаны состоянием на предыдущем байте
             lg = self._lg  # логиты следующего байта
             e = np.exp(lg.double().numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
-        self._last = (p_neu, p_ctx)  # запомнить
-        return self.weights[0] * p_neu + self.weights[1] * p_ctx  # смесь
+        self._last = (p_neu, p_ctx, p_lz)  # запомнить
+        return self.weights[0] * p_neu + self.weights[1] * p_ctx + self.weights[2] * p_lz  # смесь
 
     def update(self, s: int) -> None:  # после фактического байта s
-        if self.model is not None and self._last is not None:  # обновление весов экспертов
-            l0 = -math.log(max(1e-12, float(self._last[0][s]))); l1 = -math.log(max(1e-12, float(self._last[1][s])))  # потери
-            w0 = self.weights[0] * math.exp(-self.eta * min(10.0, l0)); w1 = self.weights[1] * math.exp(-self.eta * min(10.0, l1))  # экспоненты
-            z = w0 + w1; self.weights[0] = 0.98 * (w0 / z) + 0.01; self.weights[1] = 0.98 * (w1 / z) + 0.01  # нормировка с полом
+        if self._last is not None:  # обновление весов экспертов (Mirror-Hedge по потерям)
+            exps = self._last  # предсказания экспертов
+            w = np.array([w_ * math.exp(-self.eta * min(10.0, -math.log(max(1e-12, float(e[s]))))) for w_, e in zip(self.weights, exps)])  # взвешенные потери
+            z = float(w.sum()); self.weights = 0.98 * (w / z) + 0.01  # нормировка с полом
         self.uni[s] += 1.0  # порядок 0
         n = len(self.hist)  # история
         for order in range(1, 5):  # порядки
@@ -944,6 +974,11 @@ class MirrorHedgeStreamPredictor:
             for b in self.hist[-order:]: h = (h * 257 + b) & 0xFFFFFFFFFFFFFFFF  # хэш
             row = self.ctx[order - 1].setdefault(h, {}); row[s] = row.get(s, 0) + 1  # счётчик
         self.hist.append(s); self.hist = self.hist[-16:]  # обрезать
+        n_l = len(self.long_hist)  # позиция нового байта в длинной истории
+        for kl in (6, 4, 3):  # якоря LZP: ключ = последние kl байтов ДО нового байта
+            if n_l >= kl:  # ключ помещается
+                lst = self.lz_anchors.setdefault(bytes(self.long_hist[-kl:]), []); lst.append(n_l); del lst[:-12]  # ≤ 12 позиций
+        self.long_hist.append(s)  # добавить байт
         if self.st is not None:  # модель есть
             self._lg = self.st.step(int(s))  # один шаг состояния O(1): логиты следующего байта
 
