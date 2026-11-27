@@ -1392,6 +1392,35 @@ class Unified:
             json.dumps(self.domains, ensure_ascii=False, indent=1),  # ... как JSON с отступом 1, неанглийские буквы как есть
             encoding="utf-8")  # ... в utf-8
         _os.replace(tmp_l, _ledger_js())  # атомарно заменить файл книги
+        self._live_backup()  # резервная копия вне checkpoints/
+
+    def _live_backup(self) -> None:
+        """Скопировать модель и книгу в <проект>/.omc/backup_live/ (два поколения: prev/ и текущее).
+
+        Только для рабочего каталога: в тестах и экспериментах HAGI_CKPT_DIR указывает на
+        песочницу — её копировать не нужно. Копия лежит ВНЕ checkpoints/, потому что сам
+        Ошибки копирования не прерывают save(): резервная
+        копия — лучшее усилие, основная запись уже сделана."""
+        import shutil as _sh  # локальный импорт shutil
+        ck = _unified_pt().parent.resolve()  # каталог контрольных точек
+        if ck != (Path(__file__).resolve().parents[2] / "checkpoints").resolve():  # не рабочий каталог
+            return  # песочница — не копировать
+        try:  # лучшее усилие
+            root = ck.parent / ".omc" / "backup_live"  # корень резервных копий
+            prev = root / "prev"  # предыдущее поколение
+            if (root / "unified.pt").exists():  # текущая копия есть
+                prev.mkdir(parents=True, exist_ok=True)  # создать каталог предыдущего
+                _sh.copy2(root / "unified.pt", prev / "unified.pt")  # сдвинуть модель в предыдущее
+                if (root / "unified_ledger.json").exists():  # книга есть
+                    _sh.copy2(root / "unified_ledger.json", prev / "unified_ledger.json")  # сдвинуть книгу
+            root.mkdir(parents=True, exist_ok=True)  # создать корень
+            _sh.copy2(_unified_pt(), root / "unified.pt")  # текущая копия модели
+            _sh.copy2(_ledger_js(), root / "unified_ledger.json")  # текущая копия книги
+            dom_src, dom_dst = ck / "domains", root / "domains"  # каталоги доменов
+            if dom_src.is_dir():  # домена есть
+                _sh.copytree(dom_src, dom_dst, dirs_exist_ok=True)  # скопировать поверх (домены только добавляются)
+        except OSError:  # ошибка файловой системы
+            pass  # резервная копия не удалась — основная запись уже сделана
 
     @staticmethod  # статический метод (без self и cls)
     def exists() -> bool:  # True, если файл модели существует
