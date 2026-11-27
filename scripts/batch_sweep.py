@@ -16,10 +16,18 @@ import sys, os, time  # sys — путь импорта, os — файлы и о
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # добавить корень проекта (каталог над scripts/) в начало пути импорта, чтобы был виден пакет hagi
 os.environ.setdefault("HAGI_DEVICE", "cpu")  # устройство по умолчанию cpu, если HAGI_DEVICE ещё не задано (установленное значение не меняется)
 from hagi.models.lm import RopeAttentionByteLM  # импорт класса байтовой языковой модели с Rope-вниманием
-data = (open('README.md', 'rb').read() * 3)[:400_000]  # данные: байты файла × 3 (повтор трижды), срез [0:400_000]
-print("batch   CE      s     CE/s-gain")  # заголовок таблицы: батч, CE, секунды, прирост CE за секунду
-for b in (8, 16, 24, 32, 48):  # перебор размера батча b по списку
-    m = RopeAttentionByteLM(dim=64, hidden=128, seed=int(os.environ.get("SW_SEED","7")))  # новая модель: размерность 64, скрытый слой 128, зерно = int(SW_SEED), по умолчанию 7
-    t = time.perf_counter(); r = m.train_guarded(data, epochs=2, batch=b)  # t — старт отсчёта; обучить 2 эпохи с батчем b, r — словарь итогов
-    s = time.perf_counter() - t  # время обучения в секундах: perf_counter после − до
-    print(f"{b:5}  {r['best_holdout_ce']:6.3f}  {s:6.1f}")  # строка: b в 5 позиций | лучший CE в 6 позиций, 3 знака | секунды в 6 позиций, 1 знак
+
+
+def main() -> None:  # перебор размеров батча: обучение, замер времени и качества, печать таблицы
+    """Обучить модель при каждом размере батча и напечатать строки таблицы: батч, лучший CE, секунды."""
+    data = (open('README.md', 'rb').read() * 3)[:400_000]  # данные: байты файла × 3 (повтор трижды), срез [0:400_000]
+    print("batch   CE      s     CE/s-gain")  # заголовок таблицы: батч, CE, секунды, прирост CE за секунду
+    for b in (8, 16, 24, 32, 48):  # перебор размера батча b по списку
+        m = RopeAttentionByteLM(dim=64, hidden=128, seed=int(os.environ.get("SW_SEED","7")))  # новая модель: размерность 64, скрытый слой 128, зерно = int(SW_SEED), по умолчанию 7
+        t = time.perf_counter(); r = m.train_guarded(data, epochs=2, batch=b)  # t — старт отсчёта; обучить 2 эпохи с батчем b, r — словарь итогов
+        s = time.perf_counter() - t  # время обучения в секундах: perf_counter после − до
+        print(f"{b:5}  {r['best_holdout_ce']:6.3f}  {s:6.1f}")  # строка: b в 5 позиций | лучший CE в 6 позиций, 3 знака | секунды в 6 позиций, 1 знак
+
+
+if __name__ == "__main__":  # запуск как скрипта; при импорте модуля перебор не стартует
+    main()  # выполнить перебор размеров батча
