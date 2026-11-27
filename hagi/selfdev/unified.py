@@ -296,6 +296,7 @@ class Unified:
         tail_mean_pre = self._tail_mean()  # средняя CE на хвостах всех доменов до обучения
         new_ce_before = self._tail_ce(data)  # CE на хвосте НОВЫХ данных до обучения: мера переноса (знает ли модель уже что-то о новом домене)
         old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
+        pre_layout = (old_vec_pre, list(self._vec_bounds), list(self._vec_names)) if self.WORST_GATE else None  # раскладка «до» для гейта по наихудшему домену
         _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
         _tp = time.perf_counter()  # начало обучения
         reps = []  # итоги повторов обучения
@@ -368,14 +369,15 @@ class Unified:
         old_ce_post = self._old_domains_ce(exclude=source)  # CE на старых доменах после обучения
         regression = bool(  # регрессия есть, если ...
             old_ce_pre is not None and old_ce_post is not None  # ... обе CE измерены ...
-            and old_ce_post > old_ce_pre * 1.25  # ... и CE_после > 1.25·CE_до
-        )  # результат приведён к bool
+            and (old_ce_post > old_ce_pre * 1.25  # ... и CE_после > 1.25·CE_до (среднее) ...
+                 or self._worst_exceeds(pre_layout, source)))  # ... либо один старый домен вырос больше WORST_TOL_ROLLBACK
         repair = self._repair_forgetting(source, old_ce_pre, incumbent_state, old_vec_pre)  # ремонт забывания переучиванием старых байт (со скаляром и вектором CE до обучения)
         if repair["rounds"]:  # были раунды ремонта
             old_ce_post = self._old_domains_ce(exclude=source)  # CE на старых доменах после ремонта
             regression = bool(  # регрессия пересчитывается по тому же правилу
                 old_ce_pre is not None and old_ce_post is not None  # обе CE измерены
-                and old_ce_post > old_ce_pre * 1.25)  # CE_после > 1.25·CE_до
+                and (old_ce_post > old_ce_pre * 1.25  # CE_после > 1.25·CE_до
+                     or self._worst_exceeds(pre_layout, source)))  # либо наихудший домен выше допуска
         old_ce = old_ce_post if old_ce_post is not None else old_ce_pre  # итоговая old_ce: после, если измерена, иначе до
         if regression:  # регрессия на старых доменах недопустима
             # откат на месте: Unified.load() создал бы новый объект модели и потерял
@@ -616,6 +618,8 @@ class Unified:
     # Раунд принимается, когда парный выигрыш больше границы эмпирического Бернштейна.
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
     WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
+    WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
+    WORST_GATE = os.environ.get("HAGI_WORST_GATE", "0") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le)
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
     REPAIR_BYTES = 400_000  # не более 400 000 байтов старых доменов на раунд
@@ -1172,6 +1176,37 @@ class Unified:
             if c is not None:  # измерено
                 vals.append(c)  # добавить
         return float(sum(vals) / len(vals)) if vals else None  # среднее либо None
+
+    def _worst_domain_growth(self, pre: tuple, post: tuple) -> tuple[float | None, str | None]:
+        """Наихудший прирост CE среди старых доменов: (прирост, имя домена).
+
+        Гейт по средней CE не гарантирует, что ни один домен не деградировал: средняя может
+        не вырасти, пока один домен вырос сильно (mean_le_not_imp_max_le, TailGate.lean).
+        Гейт по наихудшему влечёт гейт по среднему (max_le_imp_mean_le) — он строгий.
+
+        pre, post — кортежи (вектор CE по окнам, границы доменов, имена) до и после;
+        домены должны совпадать по именам, иначе (None, None)."""
+        if pre is None or post is None:  # нет замера
+            return None, None  # нечего оценивать
+        v_pre, b_pre, n_pre = pre; v_post, _b_post, n_post = post  # распаковать
+        if list(n_pre) != list(n_post) or len(v_pre) != len(v_post):  # раскладка изменилась
+            return None, None  # честный отказ (сравнивать нельзя)
+        worst, worst_name = float("-inf"), None  # наихудший прирост и его домен
+        for i, nm in enumerate(n_pre):  # по доменам
+            a, b = int(b_pre[i]), int(b_pre[i + 1])  # границы окон домена
+            grow = float(np.asarray(v_post[a:b], dtype=float).mean() - np.asarray(v_pre[a:b], dtype=float).mean())  # прирост CE домена
+            if grow > worst:  # хуже
+                worst, worst_name = grow, nm  # запомнить
+        return (None, None) if worst_name is None else (worst, str(worst_name))  # итог
+
+    def _worst_exceeds(self, pre_layout, source: str) -> bool:
+        """True, если гейт по наихудшему домену включён и какой-то старый домен вырос
+        больше WORST_TOL_ROLLBACK. Гейт выключен либо замера нет — False (решает среднее)."""
+        if not self.WORST_GATE or pre_layout is None:  # выключен или нет раскладки «до»
+            return False  # не блокирует
+        _n, v_post = self._old_domains_ce_vec(exclude=source)  # вектор «после» (та же выборка: rng(11))
+        grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(self._vec_bounds), list(self._vec_names)))  # наихудший прирост
+        return grow is not None and grow > self.WORST_TOL_ROLLBACK  # превышен допуск
 
     def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
