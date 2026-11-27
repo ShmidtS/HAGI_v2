@@ -1380,6 +1380,8 @@ class Unified:
             # Сохранённые базисы действуют при обучении (train_optimal читает model.gpm_left),
             # поэтому при выключенной защите (HAGI_GPM != 1) они не загружаются
             u.model.gpm_left = {n: _t.as_tensor(U) for n, U in st["gpm_left"].items()} if USE_GPM else {}  # имя -> базис; пусто, если защита выключена
+        if not USE_GPM:  # защита выключена — атрибуты заданы явно пустыми (код читает model.gpm_left напрямую)
+            u.model.gpm_left = {}; u.model.gpm_right = {}  # пустые базисы: обучение не ограничено подпространством
         if "gpm_right" in st:  # правые базисы
             u.model.gpm_right = {n: _t.as_tensor(U) for n, U in st["gpm_right"].items()} if USE_GPM else {}  # имя -> базис; пусто, если защита выключена
         # Старые состояния rope хранят выращенные блоки отдельно
