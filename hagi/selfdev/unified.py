@@ -628,6 +628,8 @@ class Unified:
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
     WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
     WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
+    WORST_GATE_MARGIN = os.environ.get("HAGI_WORST_GATE_MARGIN", "1") == "1"  # гейт по наихудшему домену сравнивает сертифицированный прирост (прирост − радиус шума разности), а не точечный; включён по умолчанию
+    WORST_GATE_BONF = 16  # число доменов в поправке Бонферрони радиуса (ограничено, чтобы радиус оставался применимым)
     OLD_GATE_DOMAINS = int(os.environ.get("HAGI_OLD_GATE_DOMAINS", "0"))  # сколько старых доменов мерят гейт и ремонт: 0 — все
     OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "32768"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
     WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
@@ -1225,7 +1227,16 @@ class Unified:
             return False  # не блокирует
         _n, v_post = self._old_domains_ce_vec(exclude=source)  # вектор «после» (та же выборка: rng(11))
         grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))))  # наихудший прирост
-        return grow is not None and grow > self.WORST_TOL_ROLLBACK  # превышен допуск
+        if grow is None:  # наихудшего домена нет (раскладка изменилась)
+            return False  # не блокирует
+        if not self.WORST_GATE_MARGIN:  # точечное сравнение (как прежде)
+            return grow > self.WORST_TOL_ROLLBACK  # превышен допуск
+        from hagi.base.trunk_ops import paired_margin_eb  # радиус: эмпирический Бернстайн
+        v_pre, b_pre, n_pre = pre_layout  # вектор «до», границы и имена доменов
+        a, b = int(b_pre[n_pre.index(_nm)]), int(b_pre[n_pre.index(_nm) + 1])  # срез окон наихудшего домена
+        radius = paired_margin_eb(v_pre[a:b] - v_post[a:b], n_states=min(len(n_pre), self.WORST_GATE_BONF), delta=0.05)  # радиус шума разности на его окнах
+        self._worst_radius = float(radius)  # диагностика: радиус наихудшего домена
+        return grow - radius > self.WORST_TOL_ROLLBACK  # сертифицированное превышение: прирост за вычетом шума
 
     def _old_domains_ce(self, exclude: str, max_domains: int | None = None) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
