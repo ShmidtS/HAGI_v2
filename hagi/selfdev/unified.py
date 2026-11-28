@@ -1297,13 +1297,16 @@ class Unified:
             X.append(_np.stack([d[i:i + k_] for i in st])); Y.append(d[st + k_])  # накопить
         X = _t.as_tensor(_np.concatenate(X), dtype=_t.long, device=dev); Y = _t.as_tensor(_np.concatenate(Y), dtype=_t.long, device=dev)  # пакеты
         score = {"emb": self.emb_row_weight()}  # частотный вес строк
+        cap: dict = {}  # входы матриц (для второй стадии прочих матриц)
+        with _t.no_grad(): m.forward_seq(X, capture=cap)  # собрать входы на тех же окнах
+        inputs = {n: cap[id(q)].detach().cpu().numpy() for n, q in zip(m.param_names(), m.params()) if id(q) in cap}  # входы по именам матриц
         orig = {n: q.detach().clone() for n, q in zip(m.param_names(), m.params())}  # копия весов
         old = _QM.EMB_ROWS2; curve = []  # прежняя настройка и кривая
         try:  # с восстановлением
             for kk in range(0, 257, step):  # по числу строк
                 _QM.EMB_ROWS2 = str(kk)  # настроить число строк
                 for n, q in zip(m.param_names(), m.params()): q.data.copy_(orig[n])  # сброс
-                qd, nb = _QM.quantize_model(m, bits=bits, use_had=False, row_score=score); _QM.dequantize_into(m, qd)  # квантовать и записать
+                qd, nb = _QM.quantize_model(m, bits=bits, use_had=False, row_score=score, inputs=inputs); _QM.dequantize_into(m, qd)  # квантовать и записать
                 with _t.no_grad(): ce = float(_t.nn.functional.cross_entropy(m.logits(X), Y))  # кросс-энтропия на оценочных окнах
                 curve.append((kk, ce, nb))  # точка
         finally:  # всегда

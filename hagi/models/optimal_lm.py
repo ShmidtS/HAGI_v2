@@ -64,6 +64,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 # 4.46, потеря старых 0.114, 557 с; 2048 — 4.47 / 0.108, 651 с: качество то же, +17% времени.
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
 EMB_ROWS2 = os.environ.get("HAGI_EMB_ROWS2", "0").strip().lower()  # строк словаря со второй стадией квантования при выгрузке: число, "auto" (по предельному вкладу) или 0 (выключено)
+STAGE2_ROWS = int(os.environ.get("HAGI_STAGE2_ROWS", "4"))  # строк второй стадии квантования на каждую матрицу, кроме словаря (PROPOSAL 29d; на книге: штраф 4 бит 0.61 -> 0.52 ната за +6% байт); 0 — выключена
 EMB_ROWS2_MIN_FRAC = 0.10  # для auto: строка берётся, пока её вклад в остаточную ошибку не меньше этой доли вклада первой строки
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
@@ -915,6 +916,18 @@ class MirrorHedgeStreamPredictor:
         self.lz_anchors: dict[bytes, list[int]] = {}  # контекст 3..6 байтов -> позиции его концов (≤ 12 последних)
         self.st = StreamState(model) if model is not None else None  # побайтовое состояние модели (O(1) на байт)
         self._lg = np.zeros(256)  # последние логиты состояния
+        # Семантическая память (по мотивам SEMCACHE из cmix-neif-2.0 и PROPOSAL 36 формализации): пары
+        # «выходное скрытое, следующий байт» уже закодированных позиций. На новой позиции K ближайших
+        # по косинусу состояний голосуют своим байтом; доля голоса калибруется по потоку — она положительна
+        # только пока соседи угадывают чаще модели (похожесть сама по себе это не гарантирует).
+        self.sem_k = int(os.environ.get("HAGI_SEM_K", "8"))  # число соседей; 0 — память выключена (измерено на шести доменах: K = 8 не хуже выключенной ни на одном)
+        self.sem_lam = float(os.environ.get("HAGI_SEM_LAM", "0.3"))  # наибольшая доля голоса соседей
+        self.sem_cap = int(os.environ.get("HAGI_SEM_CAP", "262144"))  # ёмкость памяти (позиций): поиск линейный по памяти, потому она ограничена
+        self.sem_n = int(os.environ.get("HAGI_SEM_N", "16"))  # окно калибровки: столько последних позиций сверяются
+        self.sem_mem: list[tuple[np.ndarray, int]] = []  # память: нормированное скрытое и байт после него
+        self.sem_hist: list[tuple[bool, bool]] = []  # последние исходы: (соседи угадали, модель угадала)
+        self.sem_last = 0.0  # доля голоса соседей на текущей позиции
+        self._sem_h = None; self._sem_ok = None; self._sem_model_top = None; self._sem_gap = 0.01  # скрытое позиции, выбор соседей, выбор модели
     def _lzp_probs(self) -> tuple[np.ndarray, int]:  # распределение LZP и длина совпадения
         n = len(self.long_hist)  # длина истории
         best_len, best_byte = 0, -1  # лучшее совпадение
@@ -950,6 +963,28 @@ class MirrorHedgeStreamPredictor:
                 p = p_ord  # следующий порядок опирается на этот
         return p  # распределение
 
+    def _sem_probs(self) -> np.ndarray | None:  # распределение голоса соседей
+        """K ближайших прошлых скрытых состояний голосуют следующим байтом; доля зависит от того,
+        кто чаще угадывал за последние sem_n позиций: соседи или модель."""
+        self._sem_h = None; self._sem_ok = None  # сброс состояния позиции
+        if self.sem_k <= 0:  # память выключена
+            return None  # молчит
+        h = self.st.h_out.detach().cpu().numpy().astype(np.float64); hn = h / (np.linalg.norm(h) + 1e-9)  # нормированное скрытое позиции
+        hn = np.clip(np.rint(hn * 64.0), -127, 127) / 64.0  # ключ в фиксированной точке (шаг 1/64): расхождение устройств ~1e-7 не должно менять выбор соседей
+        self._sem_h = hn  # пара с фактическим байтом запишется в update
+        mem = self.sem_mem  # память
+        if len(mem) < self.sem_k:  # соседей мало
+            return None  # молчит
+        sims = np.array([float(hn @ m_) for m_, _ in mem])  # косинус со всеми прошлыми состояниями
+        idx = np.argpartition(-sims, self.sem_k - 1)[:self.sem_k]  # K ближайших
+        w = np.exp((sims[idx] - sims[idx].max()) / 0.02); w /= w.sum()  # веса по температуре 0.02
+        q = np.zeros(256); np.add.at(q, [mem[j][1] for j in idx], w)  # голосование байтами соседей
+        hist = self.sem_hist[-self.sem_n:]  # исходы окна калибровки
+        acc = lambda v: float(np.mean(v)) if len(v) else 0.0  # доля верных
+        self.sem_last = self.sem_lam * max(acc([a for a, _ in hist]) - acc([b for _, b in hist]), 0.0) * float(sims[idx].max())  # калиброванная доля
+        top2 = np.sort(q)[-2:]; self._sem_ok = int(q.argmax()) if float(top2[1] - top2[0]) >= self._sem_gap else -1  # выбор соседей (при ничьей в пределах зазора — не считается угаданным)
+        return q  # голос соседей
+
     def predict_probs(self) -> np.ndarray:  # распределение следующего байта
         p_ctx = self._ctx_probs()  # контекстная модель
         b_lz, ml = self._lzp_probs()  # кандидат LZP и длина совпадения
@@ -965,9 +1000,17 @@ class MirrorHedgeStreamPredictor:
             lg = self._lg  # логиты следующего байта
             lg = lg.double().cpu(); e = np.exp(lg.numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
         self._last = (p_neu, p_ctx, p_lz)  # запомнить
-        return self.weights[0] * p_neu + self.weights[1] * p_ctx + self.weights[2] * p_lz  # смесь
+        mix = self.weights[0] * p_neu + self.weights[1] * p_ctx + self.weights[2] * p_lz  # смесь экспертов
+        q = self._sem_probs()  # голос соседей (None — памяти нет или соседей мало)
+        self._sem_model_top = None  # выбор нейромодели (для калибровки)
+        if q is not None:  # позиция предсказана с голосом
+            srt = np.sort(p_neu)[-2:]; self._sem_model_top = int(p_neu.argmax()) if float(srt[1] - srt[0]) >= self._sem_gap else -1  # при ничьей — не считается угаданным
+        return mix if q is None else (1.0 - self.sem_last) * mix + self.sem_last * q  # смесь с калиброванной долей голоса
 
     def update(self, s: int) -> None:  # после фактического байта s
+        if self.sem_k > 0 and self.st.n > 0 and self._sem_h is not None:  # память включена и позиция была предсказана
+            self.sem_hist.append((self._sem_ok == s, self._sem_model_top == s)); del self.sem_hist[:-64]  # исход: кто угадал (None != s — не угадал)
+            self.sem_mem.append((self._sem_h, s)); self._sem_h = None; del self.sem_mem[:-self.sem_cap]  # пара «скрытое, фактический байт»; память ограничена последними sem_cap позициями
         if self._last is not None:  # обновление весов экспертов (Mirror-Hedge по потерям)
             exps = self._last  # предсказания экспертов
             w = np.array([w_ * math.exp(-self.eta * min(10.0, -math.log(max(1e-12, float(e[s]))))) for w_, e in zip(self.weights, exps)])  # взвешенные потери
@@ -1077,11 +1120,12 @@ def gauge_balance(model: "HagiOptimalLM") -> dict[str, float]:
     return {"max_log_shift_swiglu": max_sw, "max_log_shift_bigram": max_bg}  # итог
 
 
-def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, row_score: dict[str, np.ndarray] | None = None) -> tuple[dict, int]:
+def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, row_score: dict[str, np.ndarray] | None = None, inputs: dict[str, np.ndarray] | None = None) -> tuple[dict, int]:
     """Квантовать все 2D-веса per-row; таблицу emb (256 строк — словарь) — без поворота строк.
         row_score — необязательные веса строк по имени матрицы: выбор строк второй стадии идёт
         по вес·‖остаток‖² (для CE вес строки — среднее p·(1−p) на позициях, где она метка),
-        без весов — по ‖остаток‖². Возвращает (параметры по именам, число байт уровней)."""
+        без весов — по ‖остаток‖². inputs — входы матриц по имени (для второй стадии прочих матриц:
+        строки ранжируются по среднему (R·x)² — эмпирическому вкладу в логит). Возвращает (параметры, байты)."""
     out: dict[str, dict] = {}; nbytes = 0  # результат и объём
     for name, p in model.__dict__.items():  # по атрибутам
         if not isinstance(p, t.nn.Parameter) or p.ndim != 2:  # только 2D
@@ -1095,8 +1139,16 @@ def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, 
             n_rows = (int(sum(1 for i in order if contrib[i] >= EMB_ROWS2_MIN_FRAC * contrib[order[0]])) if EMB_ROWS2 == "auto" else int(EMB_ROWS2)); rows2 = order[:min(n_rows, W.shape[0])]  # auto — пока предельный вклад не ниже доли от наибольшего; иначе — заданное число
             par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=False)  # вторая стадия: квантование остатка (чего первая стадия не восстановила)
             par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2; nbytes_extra = Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # вторая стадия отдельно (основная Q не меняется); её объём
+        n2 = STAGE2_ROWS if name != "emb" and inputs is not None and inputs.get(name) is not None else 0  # строк второй стадии для этой матрицы
+        if n2 > 0:  # вторая стадия прочих матриц по эмпирическому вкладу в логит
+            res = W - dequant_per_row(par, Q); X = np.asarray(inputs[name], dtype=np.float64)  # остаток и входы (N, in)
+            contrib = (X ** 2).mean(axis=0) * (res ** 2).mean(axis=1); rows2 = np.argsort(-contrib)[:min(n2, W.shape[0])]  # строки с наибольшим средним квадратом вклада (вес хранится как вход×выход: строка — вход, вклад строки i = средний квадрат x_i · средний квадрат R[i, :])
+            par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # вторая стадия: квантование остатка
+            par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2  # сохранить
+            nbytes += Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # её объём
         par["Q"] = Q; par["dtype"] = str(p.dtype); out[name] = par; nbytes += Q.size * (2 if bits == 2 else 4) // 8 + par["scales"].nbytes  # объём
-        if "Q2" in par:  # у словаря есть вторая стадия
+        if name == "emb" and "Q2" in par:  # у словаря есть вторая стадия
+            nbytes += nbytes_extra  # прибавить её объём        if name == "emb" and "Q2" in par:  # у словаря есть вторая стадия
             nbytes += nbytes_extra  # прибавить её объём
     return out, nbytes  # вернуть
 
@@ -1129,6 +1181,7 @@ class StreamState:
         self.S1 = f(H, hd, hd)  # состояние GDN уровня 1
         self.S2 = f(H, hd, hd)  # состояние GDN уровня 2
         self.n = 0  # число шагов
+        self.h_out = f(d)  # выходное скрытое последней позиции (до первого шага — нули)
 
     def step(self, b: int) -> t.Tensor:
         """Обработать байт b и вернуть логиты следующего байта (256). Равен forward_seq(ctx + [b])[:, -1]."""
@@ -1180,6 +1233,7 @@ class StreamState:
             for Wg, Wu, Wd in m.blocks:  # дополнительные блоки
                 h = h + swiglu(m._spike(rms_norm(h, m.g_mlp)), Wg, Wu, Wd)  # добавить
             h_out = rms_norm(h, m.g_out)  # выходное скрытое
+            self.h_out = h_out.detach().float().cpu()  # выходное скрытое позиции (ключ семантической памяти)
             h_out = m._apply_adapter(h_out[None])[0]  # доменный адаптер, если задан
             lg = (h_out @ m.emb.T) * m.out_scale + m.b_out  # логиты
             if m.use_bigram_logit_skip:  # скип
