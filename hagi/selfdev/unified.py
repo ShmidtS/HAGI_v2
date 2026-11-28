@@ -424,6 +424,10 @@ class Unified:
         entry["tail_gate"] = tail_gate  # признак отката по хвостам
         entry["tail_mean_pre"] = tail_mean_pre  # среднее по хвостам до приёма
         entry["tail_mean_post"] = tail_mean_post  # среднее по хвостам после
+        if self.ANCHOR_GATE and not rolled_back:  # домен принят: запомнить опору — его CE на равномерной сетке окон (сопоставимо с замером гейта)
+            entry["gate_anchor"] = self._domain_gate_ce(source)  # опора CE домена при приёме
+        elif self.ANCHOR_GATE:  # домен откатован: опоры нет (знания не установлены)
+            entry.pop("gate_anchor", None)  # убрать опору, если была
         # Честная мера переноса: CE на хвосте САМОГО домена (последние 8192 байтов, вне
         # обучения). Поле ce — CE на хвосте склеенного потока повторов всех доменов; оно
         # не измеряет перенос: в рабочей книге ce 0.78..1.63 при tail_ce 3.2..4.9.
@@ -631,6 +635,9 @@ class Unified:
     WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
     WORST_GATE_MARGIN = os.environ.get("HAGI_WORST_GATE_MARGIN", "1") == "1"  # гейт по наихудшему домену сравнивает сертифицированный прирост (прирост − радиус шума разности), а не точечный; включён по умолчанию
     WORST_GATE_BONF = 16  # число доменов в поправке Бонферрони радиуса (ограничено, чтобы радиус оставался применимым)
+    ANCHOR_GATE = os.environ.get("HAGI_ANCHOR_GATE", "1") == "1"  # гейт по опоре (включён): прирост CE старого домена считается от его CE при приёме (gate_anchor), а не от «до этого приёма» — видит накопление за много приёмов; только домены с опорой
+    ANCHOR_SE_MULT = 4.0  # запас на шум в ошибках среднего (одна константа для условия и величины)
+    ANCHOR_MIN_WINDOWS = 32  # минимальное число окон домена для проверки по опоре (меньше — слишком шумно)
     OLD_GATE_DOMAINS = int(os.environ.get("HAGI_OLD_GATE_DOMAINS", "0"))  # сколько старых доменов мерят гейт и ремонт: 0 — все
     OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "32768"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
     WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
@@ -1221,6 +1228,41 @@ class Unified:
                 worst, worst_name = grow, nm  # запомнить
         return (None, None) if worst_name is None else (worst, str(worst_name))  # итог
 
+    def _domain_gate_ce(self, name: str, windows: int = 237) -> float | None:  # средняя CE домена на равномерной сетке окон
+        """Средняя CE домена на равномерно распределённых неперекрывающихся окнах (та же конструкция, что у гейта старых доменов)."""
+        import torch as _t  # тензоры
+        import numpy as _np  # массивы
+        d = self._domain_bytes(name, self.domains.get(name, {}))  # байты домена
+        k_ = self.model.k  # длина контекста
+        if len(d) < k_ + 64:  # короче контекста
+            return None  # не мерить
+        idx = _np.frombuffer(d, dtype=_np.uint8).astype(_np.int64)  # индексы
+        n = len(idx) - k_; step = max(k_, n // windows); sel = _np.arange(0, n, step)[:windows]  # равномерные начала окон
+        dev = getattr(self.model, "device", "cpu")  # устройство модели
+        X = _np.stack([idx[i:i + k_] for i in sel]); y = idx[sel + k_]  # окна и ответы
+        with _t.no_grad():  # без графа
+            ce = _t.nn.functional.cross_entropy(self.model.logits(_t.as_tensor(X, dtype=_t.long, device=dev)), _t.as_tensor(y, dtype=_t.long, device=dev), reduction="none")  # CE по окнам
+        return float(ce.double().mean())  # средняя CE
+
+    def _anchor_exceeds(self, v_post) -> tuple[bool, float | None, str | None]:  # превышение опоры каким-либо старым доменом
+        """True, если у какого-то старого домена с опорой текущая CE превышает опору больше допуска. Запас на шум — четыре ошибки среднего
+        по его окнам. Домены с числом окон меньше ANCHOR_MIN_WINDOWS не проверяются: при 10 окнах запас 4·SE
+        всё равно даёт ~3% ложных срабатываний (замер, шум окна 1.6), при 64 и более — ноль."""
+        names = list(getattr(self, "_vec_names", [])); bounds = list(getattr(self, "_vec_bounds", []))  # раскладка вектора
+        worst, worst_name = float("-inf"), None  # наихудший прирост от опоры
+        for i, nm in enumerate(names):  # по доменам вектора
+            anchor = (self.domains.get(nm) or {}).get("gate_anchor")  # опора домена
+            if anchor is None or i + 1 >= len(bounds):  # опоры нет
+                continue  # пропустить
+            seg = v_post[int(bounds[i]):int(bounds[i + 1])]  # окна домена
+            if len(seg) < self.ANCHOR_MIN_WINDOWS:  # мало окон: одновыборочная проверка без парности при <32 окнах даёт проценты ложных откатов
+                continue  # пропустить
+            drift = float(seg.mean() - anchor); se = float(seg.std() / len(seg) ** 0.5)  # прирост от опоры и ошибка среднего
+            scored = drift - self.ANCHOR_SE_MULT * se  # прирост от опоры за вычетом запаса на шум
+            if scored > worst:  # хуже
+                worst, worst_name = scored, nm  # запомнить
+        return (worst > self.WORST_TOL_ROLLBACK), (None if worst_name is None else worst), worst_name  # превышение, величина, домен
+
     def _worst_exceeds(self, pre_layout, source: str) -> bool:
         """True, если гейт по наихудшему домену включён и какой-то старый домен вырос
         больше WORST_TOL_ROLLBACK. Гейт выключен либо замера нет — False (решает среднее)."""
@@ -1230,6 +1272,11 @@ class Unified:
         grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))))  # наихудший прирост
         if grow is None:  # наихудшего домена нет (раскладка изменилась)
             return False  # не блокирует
+        if self.ANCHOR_GATE:  # гейт по опоре включён: накопленный дрейф от CE при приёме
+            hit, drift, nm_a = self._anchor_exceeds(v_post)  # превышение опоры
+            self._anchor_worst = (drift, nm_a)  # диагностика: наихудший дрейф от опоры и домен
+            if hit:  # какой-то домен ушёл от опоры больше допуска
+                return True  # откат (накопление недопустимо)
         if not self.WORST_GATE_MARGIN:  # точечное сравнение (как прежде)
             return grow > self.WORST_TOL_ROLLBACK  # превышен допуск
         from hagi.base.trunk_ops import paired_margin_eb  # радиус: эмпирический Бернстайн
