@@ -1534,6 +1534,8 @@ class Unified:
             u.model.bypass_t5 = {bytes.fromhex(k): [p, c, b] for k, p, c, b in st["bypass"]["t5"]}  # восстановить 5-байтовый словарь
             u.model.bypass_t3 = {bytes.fromhex(k): [p, c, b] for k, p, c, b in st["bypass"]["t3"]}  # и 3-байтовый  # восстановить его
         u.model.frozen_blocks = set(st.get("frozen_blocks", []))  # замороженные блоки: множество номеров (по умолчанию пустое)
+        if hasattr(u.model, "sync_device"):  # у причинной модели есть единый перенос на устройство (у hnet его нет)
+            u.model.sync_device()  # все тензоры модели (параметры, адаптер, базисы GPM) — на устройство модели: базисы загружены на процессоре, а градиент на GPU
         u.domains = (  # книга доменов ...
             json.loads(_ledger_js().read_text(encoding="utf-8")) if _ledger_js().exists() else {}  # ... из JSON-файла в utf-8, иначе пустой словарь
         )

@@ -420,6 +420,10 @@ class HagiOptimalLM:
             if self.active_adapter is not None:  # адаптер активен
                 A, B_adp, sc = self.active_adapter  # распаковать
                 self.active_adapter = (A.to(self.device), B_adp.to(self.device), sc)  # адаптер на устройстве
+            for attr in ("gpm_left", "gpm_right"):  # базисы защиты GPM (левые и правые): создаются и загружаются на процессоре
+                bases = getattr(self, attr, None)  # словарь имя -> базис (или None)
+                if bases:  # базисы есть
+                    setattr(self, attr, {n: U.to(self.device) for n, U in bases.items()})  # перенести каждый базис на устройство модели
 
     def state_dict(self) -> dict[str, t.Tensor]:  # снимок весов по именам атрибутов
         return {n: p.detach().clone() for n, p in self.__dict__.items() if isinstance(p, t.nn.Parameter)}  # копии
