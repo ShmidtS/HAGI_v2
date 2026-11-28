@@ -65,6 +65,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
 EMB_ROWS2 = os.environ.get("HAGI_EMB_ROWS2", "0").strip().lower()  # строк словаря со второй стадией квантования при выгрузке: число, "auto" (по предельному вкладу) или 0 (выключено)
 STAGE2_ROWS = int(os.environ.get("HAGI_STAGE2_ROWS", "4"))  # строк второй стадии квантования на каждую матрицу, кроме словаря (PROPOSAL 29d; на книге: штраф 4 бит 0.61 -> 0.52 ната за +6% байт); 0 — выключена
+GDN_BETA2 = os.environ.get("HAGI_GDN_BETA2", "0") == "1"  # запись GDN в полном диапазоне (0, 2): β = 2σ — обобщённое отражение Хаусхолдера (GDNBridge.gdn_beta_readout); выключено: меняет функцию обученной книги
 EMB_ROWS2_MIN_FRAC = 0.10  # для auto: строка берётся, пока её вклад в остаточную ошибку не меньше этой доли вклада первой строки
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
@@ -534,6 +535,8 @@ class HagiOptimalLM:
         V1 = qkv(self.W_gv, h_in)  # значения
         a1 = t.sigmoid(h_in @ self.W_alpha + self.b_alpha).permute(0, 2, 1) * 0.96  # удержание < 1
         b1 = t.sigmoid(h_in @ self.W_beta + self.b_beta).permute(0, 2, 1)  # запись
+        if GDN_BETA2: b1 = 2.0 * b1  # полный диапазон (0, 2)
+
         y1, S1 = gated_deltanet(Q1, K1, V1, a1, b1, S_init=(state.get("S1") if state else None))  # уровень 1 (с перенесённым состоянием)
         if state is not None: state["S1"] = S1.detach().clone()  # финальное состояние (копия: in-place сброс строк не должен трогать граф)
         y1 = y1.permute(0, 2, 1, 3).reshape(B, T, d)  # в раскладку (B, T, d)
@@ -1205,6 +1208,7 @@ class StreamState:
             v = (h_in @ m.W_gv).reshape(H, hd)  # значения
             a = t.sigmoid(h_in @ m.W_alpha + m.b_alpha) * 0.96  # удержание, (H)
             bb = t.sigmoid(h_in @ m.W_beta + m.b_beta)  # запись, (H)
+            if GDN_BETA2: bb = 2.0 * bb  # полный диапазон (0, 2) — как в пакетном пути
             aS = a[:, None, None] * self.S1  # затухшее состояние α·S (каноническая формула GDNBridge)
             Sk = (aS @ k.unsqueeze(-1)).squeeze(-1)  # (α·S) k по головам, (H, hd)
             self.S1 = aS + bb[:, None, None] * ((v - Sk).unsqueeze(-1) @ k.unsqueeze(-2))  # запись: aS + β (v − aS k) kᵀ
