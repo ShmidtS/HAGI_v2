@@ -10,6 +10,7 @@ import numpy as np  # массивы
 import torch as t  # тензоры
 
 import hagi.models.optimal_lm as OM  # модель и квантование
+import hagi.selfdev.unified as U  # цикл (веса строк словаря)
 from hagi.models.optimal_lm import HagiOptimalLM  # модель
 
 
@@ -61,3 +62,16 @@ def test_row_score_changes_row_choice():  # веса строк меняют в�
     victim = max(rows_n); score0 = np.ones(256); score0[victim] = 0.0  # обнуляем вес строки, выбранной по норме
     OM.EMB_ROWS2 = "255"; q_z, _ = OM.quantize_model(m, bits=2, use_had=False, row_score={"emb": score0}); OM.EMB_ROWS2 = "0"  # 255 из 256 строк
     assert victim not in q_z["emb"]["rows2"], "строка с нулевым весом выбрана раньше строк с положительным весом"  # исключена
+
+
+def test_emb_row_weight_is_byte_frequency(tmp_path, monkeypatch):  # вес строки — частота байта по доменам книги
+    monkeypatch.setattr(U, "CKPT_DIR", tmp_path)  # изолированный каталог
+    u = U.Unified()  # пустой цикл
+    assert u.emb_row_weight() is None, "без доменов веса быть не должно"  # нет доменов
+    data = bytes(([7] * 3 + [9]) * 2000)  # 3:1 — два байта, достаточно длинно
+    src = tmp_path / "w_dom.bin"; src.write_bytes(data)  # файл домена
+    u.ingest_file(src, epochs=1)  # приём файла (пишет байты домена на диск, как в цикле)
+    w = u.emb_row_weight()  # веса
+    assert w is not None and abs(float(w.sum()) - 1.0) < 1e-6, "веса не нормированы"  # сумма 1
+    assert abs(float(w[7]) / float(w[9]) - 3.0) < 0.2, f"вес не пропорционален частоте: {w[7] / w[9]:.2f}"  # пропорция (домен хранится с байтами куска)
+    assert float(w[200]) < 1e-3, "отсутствующий байт получил заметный вес"  # отсутствующий — ноль
