@@ -802,7 +802,7 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[str, t.
             continue  # дальше
         U_add = Vt[:k_new].T  # новые направления
         U_new = U_add if Uo is None else np.linalg.qr(np.concatenate([Uo, U_add], axis=1))[0][:, :max_k]  # объединить
-        gpm_left[k] = t.as_tensor(U_new, dtype=t.float32)  # сохранить
+        gpm_left[k] = t.as_tensor(U_new, dtype=t.float32, device=getattr(model, "device", "cpu"))  # сохранить сразу на устройстве модели
     for k, A in acts_out.items():  # правые подпространства (выходные активации)
         nm = names.get(k)  # имя веса
         if nm not in right_names:  # не защищается справа
@@ -821,7 +821,7 @@ def update_gpm_bases(model: "HagiOptimalLM", data: bytes, gpm_left: dict[str, t.
             continue  # дальше
         U_add = Vt[:k_new].T  # новые направления
         U_new = U_add if Uo is None else np.linalg.qr(np.concatenate([Uo, U_add], axis=1))[0][:, :max_k]  # объединить
-        gpm_right[nm] = t.as_tensor(U_new, dtype=t.float32)  # сохранить (по имени: emb — и вход, и голова)
+        gpm_right[nm] = t.as_tensor(U_new, dtype=t.float32, device=getattr(model, "device", "cpu"))  # сохранить на устройстве модели (по имени: emb — и вход, и голова)
 
 
 class CortexFiber:

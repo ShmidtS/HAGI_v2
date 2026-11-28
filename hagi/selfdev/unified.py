@@ -450,6 +450,7 @@ class Unified:
                 self.model.gpm_left = {}  # пустой словарь
             if not regression and USE_GPM:  # домен принят и защита GPM включена (HAGI_GPM=1) — его входы защищаются при следующих приёмах
                 update_gpm_bases(self.model, data, self.model.gpm_left)  # SVD входов матриц, 90% энергии
+                self.model.sync_device()  # новые базисы созданы на процессоре — перенести на устройство модели (иначе следующий шаг падает на GPU)
         entry["regression"] = bool(regression)  # записать флаг регрессии
         entry.update(worst_info)  # наихудший прирост CE старого домена, его имя, пропустил ли средний гейт — в книгу
         entry["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")  # записать время обучения
