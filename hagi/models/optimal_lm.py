@@ -65,6 +65,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
 EMB_ROWS2 = os.environ.get("HAGI_EMB_ROWS2", "0").strip().lower()  # строк словаря со второй стадией квантования при выгрузке: число, "auto" (по предельному вкладу) или 0 (выключено)
 STAGE2_ROWS = int(os.environ.get("HAGI_STAGE2_ROWS", "4"))  # строк второй стадии квантования на каждую матрицу, кроме словаря (PROPOSAL 29d; на книге: штраф 4 бит 0.61 -> 0.52 ната за +6% байт); 0 — выключена
+F16_SCALES = os.environ.get("HAGI_F16_SCALES", "1") == "1"  # построчные шкалы квантования в половинной точности (PROPOSAL 41): в узкой модели (24 веса в строке) шкалы float32 — 47% экспорта; f16 даёт -24% объёма за +0.0001 ната (10 мантиссных бит: относительная ошибка оптимальной шкалы <= 5e-4 против ошибки уровней ~ шаг/sqrt(12))
 GDN_BETA2 = os.environ.get("HAGI_GDN_BETA2", "0") == "1"  # запись GDN в полном диапазоне (0, 2): β = 2σ — обобщённое отражение Хаусхолдера (GDNBridge.gdn_beta_readout); выключено: меняет функцию обученной книги
 QAT_CODED_LAM = float(os.environ.get("HAGI_QAT_CODED_LAM", "0"))  # вес слагаемого объёма кода на доводке (PROPOSAL 37): байты не меньше энтропии гистограммы уровней; 1e-2 — включено, 0 — выключено
 QAT_CODED_COOL = int(os.environ.get("HAGI_QAT_CODED_COOL", "20"))  # число последних шагов обучения с этим слагаемым
@@ -1078,7 +1079,8 @@ def quant_per_row(W: np.ndarray, bits: int = 2, use_had: bool = True, rotate_row
         bc = max((b for b in (64, 32, 16, 8, 4, 2) if c % b == 0), default=1)  # блок столбцов
         if bc > 1: R = (R.reshape(r, c // bc, bc) @ hadamard_mat(bc)).reshape(r, c)  # по столбцам
     n_st = max(1, int(stages))  # число стадий
-    scs = np.empty(n_st * r, dtype=np.float32); Q = np.zeros((n_st * r, c), dtype=np.int8)  # шкалы и уровни всех стадий
+    sc_dtype = np.float16 if F16_SCALES else np.float32  # тип шкал: половинная точность или одинарная
+    scs = np.empty(n_st * r, dtype=sc_dtype); Q = np.zeros((n_st * r, c), dtype=np.int8)  # шкалы и уровни всех стадий
     recon = np.zeros((r, c), dtype=np.float64)  # накопленная reconstruction Σ стадий
     for st_ in range(n_st):  # по стадиям
         for i in range(r):  # по строкам
