@@ -63,6 +63,7 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 # требует k ≥ ln(2N/δ)/(2(ε/B)²) = 1199 окон. Замер (3 новых домена, 4 эпохи): 256 — выигрыш новых
 # 4.46, потеря старых 0.114, 557 с; 2048 — 4.47 / 0.108, 651 с: качество то же, +17% времени.
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
+EMB_ROWS2 = int(os.environ.get("HAGI_EMB_ROWS2", "0"))  # число строк emb со второй стадией квантования при выгрузке (0 — выключено)
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
 
@@ -1038,6 +1039,8 @@ def dequant_per_row(par: dict, Q: np.ndarray) -> np.ndarray:
         if par["rotate_rows"]:  # по строкам
             br = max((b for b in (64, 32, 16, 8, 4, 2) if r % b == 0), default=1)  # блок
             if br > 1: R = np.einsum("ij,ajb->aib", hadamard_mat(br), R.reshape(r // br, br, c)).reshape(r, c)  # обратно
+    if "rows2" in par:  # есть вторая стадия отдельных строк
+        R[par["rows2"]] += dequant_per_row(par["par2"], par["Q2"])  # прибавить их остаточное квантование
     return R  # восстановленная матрица
 
 
@@ -1082,7 +1085,13 @@ def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) 
             continue  # дальше
         W = p.detach().cpu().numpy()  # в numpy
         par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
+        if name == "emb" and EMB_ROWS2 > 0:  # вторая стадия для строк словаря с наибольшей ошибкой (только при выгрузке)
+            res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1); rows2 = np.argsort(-contrib)[:min(EMB_ROWS2, W.shape[0])]  # остаток первой стадии и строки-лидеры по нему
+            par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=False)  # вторая стадия: квантование остатка (чего первая стадия не восстановила)
+            par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2; nbytes_extra = Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # вторая стадия отдельно (основная Q не меняется); её объём
         par["Q"] = Q; par["dtype"] = str(p.dtype); out[name] = par; nbytes += Q.size * (2 if bits == 2 else 4) // 8 + par["scales"].nbytes  # объём
+        if "Q2" in par:  # у словаря есть вторая стадия
+            nbytes += nbytes_extra  # прибавить её объём
     return out, nbytes  # вернуть
 
 
