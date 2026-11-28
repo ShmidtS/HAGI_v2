@@ -649,7 +649,7 @@ class Unified:
     WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
     WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
     WORST_GATE_MARGIN = os.environ.get("HAGI_WORST_GATE_MARGIN", "1") == "1"  # гейт по наихудшему домену сравнивает сертифицированный прирост (прирост − радиус шума разности), а не точечный; включён по умолчанию
-    WORST_GATE_BONF = 16  # число доменов в поправке Бонферрони радиуса (ограничено, чтобы радиус оставался применимым)
+    WORST_GATE_BONF = int(os.environ.get("HAGI_WORST_GATE_BONF", "16"))  # число доменов в поправке Бонферрони радиуса; 0 — все проверяемые (формальный сертификат на всю книгу). Осознанный компромисс: при 201 домене доля ложных откатов на книгу m·альфа/16 = 0.63, а не 0.05; полный Бонферрони при 2776 окнах стоит по чувствительности дорого (модель шума книги: урон 0.5 ната ловят 3% доменов против 41%, урон 0.6 — 68% против 98%, урон 0.8 — оба 100%), а защита от реального ущерба важнее полноты сертификата
     ANCHOR_GATE = os.environ.get("HAGI_ANCHOR_GATE", "1") == "1"  # гейт по опоре (включён): прирост CE старого домена считается от его CE при приёме (gate_anchor), а не от «до этого приёма» — видит накопление за много приёмов; только домены с опорой
     ANCHOR_SE_MULT = 4.0  # запас на шум в ошибках среднего (одна константа для условия и величины)
     ANCHOR_RADIUS = os.environ.get("HAGI_ANCHOR_RADIUS", "1") == "1"  # запас по опоре — односторонний радиус Бернстайна вместо 4·SE (PROPOSAL 38)
@@ -1298,7 +1298,7 @@ class Unified:
             drift = float(seg.mean() - anchor); se = float(seg.std() / len(seg) ** 0.5)  # прирост от опоры и ошибка среднего
             if self.ANCHOR_RADIUS:  # запас: eps = √(2·sig2·L/n) + b·L/n, L = ln(Bonf/alpha); b — наибольший встретившийся разброс окон (хвост тяжёлый: на книге до 24,5 ната, 0,6% окон дальше 6 — априорной границы нет)
                 from hagi.base.trunk_ops import paired_margin_eb  # радиус эмпирического Бернстайна
-                scored = drift - paired_margin_eb(seg - anchor, n_states=self.WORST_GATE_BONF, delta=self.ANCHOR_ALPHA)  # прирост минус радиус (b — по выборке, как в парном гейте)
+                scored = drift - paired_margin_eb(seg - anchor, n_states=(self.WORST_GATE_BONF or sum(1 for j, n_j in enumerate(names) if (self.domains.get(n_j) or {}).get("gate_anchor") is not None and j + 1 < len(bounds) and int(bounds[j + 1]) - int(bounds[j]) >= self.ANCHOR_MIN_WINDOWS)), delta=self.ANCHOR_ALPHA)  # прирост минус радиус (b — по выборке, как в парном гейте)
             else:  # прежний запас
                 scored = drift - self.ANCHOR_SE_MULT * se  # прирост от опоры за вычетом запаса на шум
             if scored > worst:  # хуже
@@ -1378,7 +1378,7 @@ class Unified:
         from hagi.base.trunk_ops import paired_margin_eb  # радиус: эмпирический Бернстайн
         v_pre, b_pre, n_pre = pre_layout  # вектор «до», границы и имена доменов
         a, b = int(b_pre[n_pre.index(_nm)]), int(b_pre[n_pre.index(_nm) + 1])  # срез окон наихудшего домена
-        radius = paired_margin_eb(v_pre[a:b] - v_post[a:b], n_states=min(len(n_pre), self.WORST_GATE_BONF), delta=0.05)  # радиус шума разности на его окнах
+        radius = paired_margin_eb(v_pre[a:b] - v_post[a:b], n_states=(min(len(n_pre), self.WORST_GATE_BONF) if self.WORST_GATE_BONF else len(n_pre)), delta=0.05)  # радиус шума разности на его окнах
         self._worst_radius = float(radius)  # диагностика: радиус наихудшего домена
         return grow - radius > self.WORST_TOL_ROLLBACK  # сертифицированное превышение: прирост за вычетом шума
 
