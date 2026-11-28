@@ -33,3 +33,17 @@ def test_emb_rows2_improves_and_counts_bytes():  # вторая стадия у�
     m.emb.data.copy_(emb); OM.dequantize_into(m, q1); e1 = float((m.emb.detach() - emb).pow(2).sum())  # ошибка с ней
     assert e1 < e0, f"вторая стадия не уменьшила ошибку словаря: {e1:.4f} против {e0:.4f}"  # точнее
     assert q1["emb"]["Q"].shape == q0["emb"]["Q"].shape, "основная раскладка уровней изменилась"  # форма сохранена
+
+
+def test_emb_rows2_auto_picks_rows_by_marginal_contribution():  # auto: строки — top-k по вкладу, k — по предельному вкладу
+    m = _toy_model()  # модель
+    OM.EMB_ROWS2 = "0"; q0, nb0 = OM.quantize_model(m, bits=2, use_had=False)  # без второй стадии: остаток первой
+    W = m.emb.detach().float().cpu().numpy(); par, Q = OM.quant_per_row(W, bits=2, use_had=False, rotate_rows=False)  # первая стадия словаря
+    contrib = ((W - OM.dequant_per_row(par, Q)) ** 2).sum(axis=1); order = list(np.argsort(-contrib))  # вклад строк по убыванию
+    k_expect = sum(1 for i in order if contrib[i] >= OM.EMB_ROWS2_MIN_FRAC * contrib[order[0]])  # ожидаемое число строк по правилу
+    OM.EMB_ROWS2 = "auto"; qa, nba = OM.quantize_model(m, bits=2, use_had=False)  # авто
+    OM.EMB_ROWS2 = "0"  # вернуть настройку
+    rows = qa["emb"]["rows2"]  # выбранные строки
+    assert 1 <= len(rows) <= 256 and len(rows) == k_expect, f"auto выбрал {len(rows)} строк, правило даёт {k_expect}"  # число строк по правилу
+    assert sorted(rows) == sorted(order[:k_expect]), "auto выбрал не top-k строк по вкладу"  # ровно top-k
+    assert len(set(rows)) == len(rows) and nba > nb0, "строки повторяются или объём не учтён"  # без повторов, объём учтён

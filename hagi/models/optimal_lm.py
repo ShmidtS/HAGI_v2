@@ -63,7 +63,8 @@ def _spike_k_default() -> float | None:  # настройка спайкинга
 # требует k ≥ ln(2N/δ)/(2(ε/B)²) = 1199 окон. Замер (3 новых домена, 4 эпохи): 256 — выигрыш новых
 # 4.46, потеря старых 0.114, 557 с; 2048 — 4.47 / 0.108, 651 с: качество то же, +17% времени.
 VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел числа контрольных окон
-EMB_ROWS2 = int(os.environ.get("HAGI_EMB_ROWS2", "0"))  # число строк emb со второй стадией квантования при выгрузке (0 — выключено)
+EMB_ROWS2 = os.environ.get("HAGI_EMB_ROWS2", "0").strip().lower()  # строк словаря со второй стадией квантования при выгрузке: число, "auto" (по предельному вкладу) или 0 (выключено)
+EMB_ROWS2_MIN_FRAC = 0.10  # для auto: строка берётся, пока её вклад в остаточную ошибку не меньше этой доли вклада первой строки
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
 
@@ -1085,8 +1086,9 @@ def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) 
             continue  # дальше
         W = p.detach().cpu().numpy()  # в numpy
         par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
-        if name == "emb" and EMB_ROWS2 > 0:  # вторая стадия для строк словаря с наибольшей ошибкой (только при выгрузке)
-            res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1); rows2 = np.argsort(-contrib)[:min(EMB_ROWS2, W.shape[0])]  # остаток первой стадии и строки-лидеры по нему
+        if name == "emb" and EMB_ROWS2 not in ("0", 0, False):  # вторая стадия для строк словаря с наибольшей ошибкой (только при выгрузке)
+            res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1); order = np.argsort(-contrib)  # остаток первой стадии и строки по убыванию вклада
+            n_rows = (int(sum(1 for i in order if contrib[i] >= EMB_ROWS2_MIN_FRAC * contrib[order[0]])) if EMB_ROWS2 == "auto" else int(EMB_ROWS2)); rows2 = order[:min(n_rows, W.shape[0])]  # auto — пока предельный вклад не ниже доли от наибольшего; иначе — заданное число
             par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=False)  # вторая стадия: квантование остатка (чего первая стадия не восстановила)
             par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2; nbytes_extra = Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # вторая стадия отдельно (основная Q не меняется); её объём
         par["Q"] = Q; par["dtype"] = str(p.dtype); out[name] = par; nbytes += Q.size * (2 if bits == 2 else 4) // 8 + par["scales"].nbytes  # объём
