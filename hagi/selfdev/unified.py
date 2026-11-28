@@ -723,7 +723,8 @@ class Unified:
                 if post <= pre + self.FORGET_TOL and (worst is None or worst <= self.WORST_TOL):  # post <= pre + 0 и worst <= WORST_TOL
                     break  # стоп
                 snap = [q.detach().clone() for q in m.params()]  # снимок всех параметров для отката
-                old_bytes = self._repair_bytes(sample, probe_post, pre_vec, per_domain)  # байты ремонта: доля каждого домена ∝ sqrt(прироста его CE), всего <= REPAIR_BYTES
+                quotas: list = []  # квоты байтов по доменам (диагностика отдачи ремонта)
+                old_bytes = self._repair_bytes(sample, probe_post, pre_vec, per_domain, quotas)  # байты ремонта: доля каждого домена ∝ sqrt(прироста его CE), всего <= REPAIR_BYTES
                 if len(old_bytes) < m.k + 64:  # старых байтов слишком мало
                     break  # стоп
                 m.train_certified(old_bytes, epochs=2, holdout_seed=99,  # обучить ствол: 2 эпохи, зерно отложенной выборки 99 ...
@@ -747,6 +748,7 @@ class Unified:
                     break  # стоп после отката
                 rounds.append({"ce": post, "after": new, "gain": round(gain, 4),  # раунд принят: CE до/после, выигрыш с 4 знаками ...
                                "margin": round(margin, 4), "status": "RETRAIN"})  # ... граница с 4 знаками, статус RETRAIN
+                rounds[-1]["per_domain"] = self._repair_yield(sample, post_vec, new_vec, pre_vec, quotas)  # отдача по доменам: прирост до/после раунда и квота (для решения по водонапорнению, RepairShare)
                 post, post_vec = new, new_vec  # новое состояние становится текущим: post = new
             return {"rounds": rounds, "mode": "replay", "why": "ran" if rounds else "none",  # итог: раунды, режим replay, "ran", если был хоть один раунд ...
                     "forgot": None if post is None else round(post - pre, 4),  # ... забывание post − pre с 4 знаками
@@ -1071,7 +1073,30 @@ class Unified:
             if hasattr(self, "prev_f"): self.u.model.active_fiber = self.prev_f  # вернуть прежнее волокно
             return False  # не подавлять исключения
 
-    def _repair_bytes(self, sample: list[str], post_vec, pre_vec, per_domain: dict[str, int]) -> bytes:
+    def _repair_yield(self, sample: list[str], post_vec, new_vec, pre_vec, quotas: list) -> list:  # отдача ремонта по доменам (диагностика)
+        """Для каждого домена раунда: прирост CE до ремонта, квота байтов, прирост после.
+        Числа нужны для условия переприёма водонапорнения (RepairShare: минимакс только при
+        одинаковой отдаче по доменам — а её никто не измерял). Только запись, поведения не меняет.
+        Возвращаются восемь худших по приросту доменов: [имя, прирост до, квота байтов, прирост после]."""
+        import numpy as _np  # массивы
+        b = getattr(self, "_vec_bounds", None)  # границы доменов в векторе
+        if post_vec is None or new_vec is None or pre_vec is None or b is None or len(b) != len(sample) + 1:  # раскладки нет
+            return []  # пусто
+        if len(post_vec) != len(new_vec) or len(post_vec) != len(pre_vec) or int(b[-1]) != len(post_vec):  # длины векторов не согласованы с границами
+            return []  # отказаться, а не считать по чужой раскладке
+        out = []  # строки по доменам
+        for i, n in enumerate(sample):  # по доменам
+            a, e = int(b[i]), int(b[i + 1])  # срез окон
+            if e <= a:  # окон нет
+                continue  # пропустить
+            before = float(post_vec[a:e].mean() - pre_vec[a:e].mean()); after = float(new_vec[a:e].mean() - pre_vec[a:e].mean())  # прирост от опоры до и после раунда
+            q = int(quotas[i]) if i < len(quotas) else 0  # квота байтов
+            out.append([n, round(before, 4), q, round(after, 4)])  # имя, прирост до, квота, прирост после
+        out.sort(key=lambda row: -row[1])  # сначала сильнее забытые
+        return out[:8]  # восемь худших по приросту: полная запись (~290 строк на раунд) утроила бы гроссбух
+
+
+    def _repair_bytes(self, sample: list[str], post_vec, pre_vec, per_domain: dict[str, int], share_out: list | None = None) -> bytes:
         """Байты старых доменов для одного раунда ремонта, распределённые по стоимости забывания.
 
         Формула оптимального распределения (минимум Σ c_i / n_i при Σ n_i = N):
@@ -1098,6 +1123,7 @@ class Unified:
             share = _np.sqrt(costs)  # веса ∝ sqrt(c_i)
         share = _np.asarray(share, dtype=float)  # вектор весов
         quotas = (share / share.sum() * total).astype(int) if share.sum() > 0 else _np.zeros(len(sample), dtype=int)  # квоты байтов: n_i = sqrt(c_i)·N / Σ_j sqrt(c_j)
+        if share_out is not None: share_out[:] = [int(q) for q in quotas]  # отдать квоты по доменам (для диагностики отдачи ремонта; на выбор байтов не влияет)
         rng = _np.random.default_rng(23)  # генератор, зерно 23
         out = []  # куски байтов
         for n, q, u in zip(sample, quotas, usable):  # по доменам
