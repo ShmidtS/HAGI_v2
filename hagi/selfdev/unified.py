@@ -628,6 +628,8 @@ class Unified:
     REPAIR_MODE = "replay"   # "replay" (переучивать старые байты) | "block"
     WORST_TOL = 0.25       # допуск забывания наихудшего домена (нат): ремонт продолжается, пока max_i (post_i − pre_i) > WORST_TOL
     WORST_TOL_ROLLBACK = float(os.environ.get("HAGI_WORST_TOL_ROLLBACK", "0.25"))  # прирост CE одного старого домена, при котором приём откатывается (нат)
+    OLD_GATE_DOMAINS = int(os.environ.get("HAGI_OLD_GATE_DOMAINS", "0"))  # сколько старых доменов мерят гейт и ремонт: 0 — все
+    OLD_GATE_WINDOWS = 2048  # общий бюджет контрольных окон на все старые домены
     WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
@@ -1086,13 +1088,16 @@ class Unified:
             out += [d[int(i):int(i) + win] for i in starts]  # куски байтов
         return b"".join(out)[:total]  # склеить и обрезать до бюджета N
 
-    def _old_domains_ce_vec(self, exclude: str, max_domains: int = 8):
+    def _old_domains_ce_vec(self, exclude: str, max_domains: int | None = None):
         """CE по окнам на ФИКСИРОВАННЫХ окнах старых доменов (вектор).
 
             exclude: домен, который не меряем; max_domains: не более стольких
-            доменов. Сначала идут обученные домена (с измеренной ce), остаток
-            добирается случайными необученными; rng(11). В каждом домене
-            до 256 равномерно распределённых неперекрывающихся окон: step = max(k, n // 256),
+            доменов (None — настройка OLD_GATE_DOMAINS, 0 — все домены). Если доменов
+            больше лимита — сначала обученные (с измеренной ce), остаток случайными
+            необученными; rng(11). Число окон на домен = OLD_GATE_WINDOWS / число доменов
+            (от 16 до 256), поэтому полный охват стоит примерно столько же, сколько и 8 доменов
+            с 256 окнами. В каждом домене равномерно распределённые неперекрывающиеся окна:
+            step = max(k, n // w),
             начала 0, step, 2·step, ...; окно i — байты [i, i+k), ответ idx[i+k].
             Возвращает (имена, конкатенация векторов CE) либо (None, None).
             Вектор нужен парному гейту: граница эмпирического Бернштейна
@@ -1107,9 +1112,11 @@ class Unified:
         # обученные домена всё равно уплыли на +1.8 ната). Сначала обученные.
         trained = [n for n in names if self.domains[n].get("ce") is not None]  # домены с измеренной CE
         rest = [n for n in names if self.domains[n].get("ce") is None]  # домены без измеренной CE
-        sample = list(trained) if len(trained) <= max_domains else             list(rng.choice(trained, max_domains, replace=False))  # все обученные, если их <= max_domains, иначе max_domains случайных
-        if len(sample) < max_domains and rest:  # есть место и есть необученные
-            k_ = min(max_domains - len(sample), len(rest))  # сколько добавить: min(свободно, len(rest))
+        max_domains = self.OLD_GATE_DOMAINS if max_domains is None else int(max_domains)  # None — взять настройку
+        limit = len(names) if max_domains <= 0 else max_domains  # лимит доменов: 0 — без лимита
+        sample = list(trained) if len(trained) <= limit else list(rng.choice(trained, limit, replace=False))  # обученные домены: все или случайные до лимита
+        if len(sample) < limit and rest:  # есть место до лимита и есть необученные
+            k_ = min(limit - len(sample), len(rest))  # сколько добавить: min(свободно, len(rest))
             sample += list(rng.choice(rest, k_, replace=False))  # добавить k_ случайных необученных
         t = self.model.t  # torch: ссылка на библиотеку
         vec = []  # векторы CE по доменам
@@ -1126,8 +1133,9 @@ class Unified:
                 # Шаг начал не меньше длины окна k: иначе соседние окна делят байты, парные разности
                 # положительно зависимы, и граница эмпирического Бернштейна занижена (гейт принимает
                 # ложный выигрыш). Условие независимости: шаг не меньше длины окна.
-                step = max(k, n // 256)  # шаг начал: max(k, ⌊n/256⌋) — окна не перекрываются
-                sel = np.arange(0, n, step)[:256]  # начала 0, step, 2·step, ..., не более 256
+                w = int(min(256, max(16, self.OLD_GATE_WINDOWS // max(1, len(sample)))))  # окон на домен: бюджет делится поровну, не меньше 16 и не больше 256
+                step = max(k, n // w)  # шаг начал: max(k, ⌊n/w⌋) — окна не перекрываются
+                sel = np.arange(0, n, step)[:w]  # начала 0, step, 2·step, ..., не более w
                 X = np.stack([idx[i:i + k] for i in sel])  # окна X_i = idx[i..i+k−1]
                 y = idx[sel + k]  # ответы y_i = idx[i + k]
                 dev = getattr(self.model, "device", "cpu")  # устройство модели
@@ -1217,7 +1225,7 @@ class Unified:
         grow, _nm = self._worst_domain_growth(pre_layout, (v_post, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))))  # наихудший прирост
         return grow is not None and grow > self.WORST_TOL_ROLLBACK  # превышен допуск
 
-    def _old_domains_ce(self, exclude: str, max_domains: int = 8) -> float | None:
+    def _old_domains_ce(self, exclude: str, max_domains: int | None = None) -> float | None:
         """Средняя CE на выборке старых доменов (значение для сравнения
         претендент/действующий). None, если старых доменов нет.
 
