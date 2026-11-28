@@ -296,6 +296,7 @@ class Unified:
         tail_mean_pre = self._tail_mean()  # средняя CE на хвостах всех доменов до обучения
         new_ce_before = self._tail_ce(data)  # CE на хвосте НОВЫХ данных до обучения: мера переноса (знает ли модель уже что-то о новом домене)
         old_vec_pre = self._old_domains_ce_vec(exclude=source)[1]  # вектор CE по окнам тех же доменов до обучения (для распределения байтов ремонта)
+        self._backfill_gate_anchors(old_vec_pre)  # опора доменам, принятым до включения защиты: их CE на тех же окнах гейта сейчас
         pre_layout = (old_vec_pre, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))) if (self.WORST_GATE and old_vec_pre is not None) else None  # раскладка «до» для гейта по наихудшему домену
         pre_layout_diag = (old_vec_pre, list(getattr(self, "_vec_bounds", [])), list(getattr(self, "_vec_names", []))) if old_vec_pre is not None else None  # раскладка «до» для диагностики (всегда)
         _ph["pre_ce"] = round(time.perf_counter() - _tp, 1)  # длительность замеров CE старых доменов до обучения, с
@@ -637,9 +638,12 @@ class Unified:
     WORST_GATE_BONF = 16  # число доменов в поправке Бонферрони радиуса (ограничено, чтобы радиус оставался применимым)
     ANCHOR_GATE = os.environ.get("HAGI_ANCHOR_GATE", "1") == "1"  # гейт по опоре (включён): прирост CE старого домена считается от его CE при приёме (gate_anchor), а не от «до этого приёма» — видит накопление за много приёмов; только домены с опорой
     ANCHOR_SE_MULT = 4.0  # запас на шум в ошибках среднего (одна константа для условия и величины)
+    ANCHOR_RADIUS = os.environ.get("HAGI_ANCHOR_RADIUS", "1") == "1"  # запас по опоре — односторонний радиус Бернстайна вместо 4·SE (PROPOSAL 38)
+    ANCHOR_CE_RANGE = 6.0  # размах ошибки окна (нат): сумма логарифмов 256, ограничивает член b·L/n
+    ANCHOR_ALPHA = 0.05  # доля ложных срабатываний гейта по опоре на один домен
     ANCHOR_MIN_WINDOWS = 32  # минимальное число окон домена для проверки по опоре (меньше — слишком шумно)
     OLD_GATE_DOMAINS = int(os.environ.get("HAGI_OLD_GATE_DOMAINS", "0"))  # сколько старых доменов мерят гейт и ремонт: 0 — все
-    OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "32768"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
+    OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "275000"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
     WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
@@ -1145,7 +1149,8 @@ class Unified:
                 # Шаг начал не меньше длины окна k: иначе соседние окна делят байты, парные разности
                 # положительно зависимы, и граница эмпирического Бернштейна занижена (гейт принимает
                 # ложный выигрыш). Условие независимости: шаг не меньше длины окна.
-                w = int(min(256, max(16, self.OLD_GATE_WINDOWS // max(1, len(sample)))))  # окон на домен: бюджет делится поровну, не меньше 16 и не больше 256 (при 32768 и 138 доменах — 237)
+                budget = self.OLD_GATE_WINDOWS; cap = 978  # бюджет и потолок окон на домен: радиус ≤ допуска 0.25 требует n*(0.25) = 978 окон
+                w = int(min(cap, max(16, budget // max(1, len(sample)))))  # окон на домен: бюджет делится поровну, не меньше 16 и не больше потолка  # окон на домен: бюджет делится поровну, не меньше 16 и не больше 256 (при 32768 и 138 доменах — 237)
                 step = max(k, n // w)  # шаг начал: max(k, ⌊n/w⌋) — окна не перекрываются
                 sel = np.arange(0, n, step)[:w]  # начала 0, step, 2·step, ..., не более w
                 X = np.stack([idx[i:i + k] for i in sel])  # окна X_i = idx[i..i+k−1]
@@ -1244,9 +1249,29 @@ class Unified:
             ce = _t.nn.functional.cross_entropy(self.model.logits(_t.as_tensor(X, dtype=_t.long, device=dev)), _t.as_tensor(y, dtype=_t.long, device=dev), reduction="none")  # CE по окнам
         return float(ce.double().mean())  # средняя CE
 
+    def _backfill_gate_anchors(self, v_pre) -> int:  # достроить опоры доменам без них
+        """Домены, принятые до включения гейта по опоре, опоры не имеют, и гейт их не видит.
+        Опора — средняя CE сегмента домена в векторе гейта ДО обучения (те же окна, что и проверка,
+        поэтому сравнение парное по окнам). Опора фиксирует текущее состояние: накопленный дрейф
+        остаётся, дальнейший прирост останавливается. Возвращает число достроенных опор."""
+        names = list(getattr(self, "_vec_names", [])); bounds = list(getattr(self, "_vec_bounds", []))  # раскладка вектора
+        made = 0  # счётчик
+        for i, nm in enumerate(names):  # по доменам вектора
+            entry = self.domains.get(nm) or {}  # запись книги
+            if entry.get("gate_anchor") is not None or entry.get("rolled_back") or i + 1 >= len(bounds):  # опора есть, домен откатан или раскладка оборвалась
+                continue  # пропустить
+            seg = v_pre[int(bounds[i]):int(bounds[i + 1])]  # окна домена
+            if len(seg) < self.ANCHOR_MIN_WINDOWS:  # мало окон: проверка по нему всё равно слепа
+                continue  # пропустить
+            entry["gate_anchor"] = float(seg.mean()); entry["gate_anchor_backfilled"] = True; made += 1  # опора на текущем состоянии
+        return made  # итог
+
+
     def _anchor_exceeds(self, v_post) -> tuple[bool, float | None, str | None]:  # превышение опоры каким-либо старым доменом
         """True, если у какого-то старого домена с опорой текущая CE превышает опору больше допуска. Запас на шум — четыре ошибки среднего
-        по его окнам. Домены с числом окон меньше ANCHOR_MIN_WINDOWS не проверяются: при 10 окнах запас 4·SE
+        Запас на шум — односторонний радиус Бернстайна √(2σ²L/n) + b·L/n (PROPOSAL 38): он честно больше
+        допуска 0.25 при n < ~978 окон, поэтому в бюджете 32768 окон на ~280 доменов (~117 на домен)
+        гейт слеп к дрейфу и видит только разрушение ≥ ~1 ната.
         всё равно даёт ~3% ложных срабатываний (замер, шум окна 1.6), при 64 и более — ноль."""
         names = list(getattr(self, "_vec_names", [])); bounds = list(getattr(self, "_vec_bounds", []))  # раскладка вектора
         worst, worst_name = float("-inf"), None  # наихудший прирост от опоры
@@ -1255,10 +1280,14 @@ class Unified:
             if anchor is None or i + 1 >= len(bounds):  # опоры нет
                 continue  # пропустить
             seg = v_post[int(bounds[i]):int(bounds[i + 1])]  # окна домена
-            if len(seg) < self.ANCHOR_MIN_WINDOWS:  # мало окон: одновыборочная проверка без парности при <32 окнах даёт проценты ложных откатов
+            if len(seg) < self.ANCHOR_MIN_WINDOWS:  # мало окон: радиус больше допуска — проверка слепа, пропустить (честнее, чем ложные откат)
                 continue  # пропустить
             drift = float(seg.mean() - anchor); se = float(seg.std() / len(seg) ** 0.5)  # прирост от опоры и ошибка среднего
-            scored = drift - self.ANCHOR_SE_MULT * se  # прирост от опоры за вычетом запаса на шум
+            if self.ANCHOR_RADIUS:  # сертифицированный запас: eps = √(2·sig2·L/n) + b·L/n, L = ln(Bonf/alpha) (по всем доменам с Бонферрони)
+                from hagi.base.trunk_ops import paired_margin_eb  # радиус эмпирического Бернстайна
+                scored = drift - paired_margin_eb(seg - anchor, n_states=self.WORST_GATE_BONF, delta=self.ANCHOR_ALPHA)  # прирост минус радиус (b — по выборке, как в парном гейте)
+            else:  # прежний запас
+                scored = drift - self.ANCHOR_SE_MULT * se  # прирост от опоры за вычетом запаса на шум
             if scored > worst:  # хуже
                 worst, worst_name = scored, nm  # запомнить
         return (worst > self.WORST_TOL_ROLLBACK), (None if worst_name is None else worst), worst_name  # превышение, величина, домен
@@ -1277,7 +1306,7 @@ class Unified:
         total = float(cnt.sum())  # всего байтов
         return None if total <= 0 else cnt / total  # частоты байтов
 
-    def choose_emb_rows2(self, lam: float = 5e-4, step: int = 32, bits: int = 2) -> dict:  # оптимальное число строк второй стадии словаря
+    def choose_emb_rows2(self, lam: float | None = None, step: int = 32, bits: int = 2) -> dict:  # оптимальное число строк второй стадии словаря
         """Перебор числа строк второй стадии квантования словаря по цене CE + lam·байты.
 
             Кривая CE по числу строк немонотонна (замер: предельная цена 1.3e-3 при 32 строках, 3.5e-4
@@ -1288,6 +1317,8 @@ class Unified:
         import torch as _t  # тензоры
         import hagi.models.optimal_lm as _QM  # модуль квантования (настройка EMB_ROWS2 — его атрибут)
         m = self.model; dev = getattr(m, "device", "cpu"); k_ = m.k  # модель, устройство, контекст
+        if lam is None:  # цена байта по MDL: lam = 8·ln2/N, N — объём книги (PROPOSAL 38; прежние 5e-4 отвечали N ≈ 11 КБ)
+            lam = float(8 * _np.log(2) / max(1, sum(len(self._domain_bytes(n, d)) for n, d in self.domains.items())))  # по умолчанию — формула
         names = [n for n in self.domains if len(self._domain_bytes(n, self.domains[n])) >= k_ + 4096]  # пригодные домены
         if not names:  # нет данных для оценки
             return {"k": 0, "bytes": 0, "ce": None, "curve": []}  # пустой итог

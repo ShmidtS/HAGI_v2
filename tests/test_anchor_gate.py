@@ -16,6 +16,7 @@ class _Book:  # заглушка цикла: только книга домен�
     def __init__(self) -> None:  # пустая книга
         self.domains: dict = {}  # домены
         self.WORST_TOL_ROLLBACK = 0.25; self.ANCHOR_MIN_WINDOWS = 32; self.ANCHOR_SE_MULT = U.Unified.ANCHOR_SE_MULT  # допуск дрейфа, минимальное число окон, запас на шум (как в цикле)
+        self.ANCHOR_RADIUS = U.Unified.ANCHOR_RADIUS; self.WORST_GATE_BONF = U.Unified.WORST_GATE_BONF; self.ANCHOR_ALPHA = U.Unified.ANCHOR_ALPHA  # запас шума и его параметры — как у реального цикла (радиус Бернстайна или 4·SE)
         self._vec_names = ["d_new", "d_a", "d_b"]; self._vec_bounds = [0, 64, 128, 192]  # раскладка вектора: новый, два старых
     _anchor_exceeds = U.Unified._anchor_exceeds  # проверяемый метод (берётся у реального цикла)
 
