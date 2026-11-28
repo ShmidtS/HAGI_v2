@@ -75,3 +75,16 @@ def test_emb_row_weight_is_byte_frequency(tmp_path, monkeypatch):  # вес ст
     assert w is not None and abs(float(w.sum()) - 1.0) < 1e-6, "веса не нормированы"  # сумма 1
     assert abs(float(w[7]) / float(w[9]) - 3.0) < 0.2, f"вес не пропорционален частоте: {w[7] / w[9]:.2f}"  # пропорция (домен хранится с байтами куска)
     assert float(w[200]) < 1e-3, "отсутствующий байт получил заметный вес"  # отсутствующий — ноль
+
+
+def test_auto_rejects_row_score():  # auto с весами строк — явный отказ (порог дал бы 0-1 строку)
+    m = _toy_model()  # модель
+    OM.EMB_ROWS2 = "auto"  # авто
+    try:  # ожидается отказ
+        OM.quantize_model(m, bits=2, use_had=False, row_score={"emb": np.ones(256)})  # с весами
+        raised = False  # не поднялось
+    except ValueError:  # отказ
+        raised = True  # поднялось
+    finally:  # всегда
+        OM.EMB_ROWS2 = "0"  # вернуть настройку
+    assert raised, "auto с row_score должен отказывать, а не выбирать 0-1 строку"  # отказ

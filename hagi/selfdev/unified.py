@@ -1277,6 +1277,41 @@ class Unified:
         total = float(cnt.sum())  # всего байтов
         return None if total <= 0 else cnt / total  # частоты байтов
 
+    def choose_emb_rows2(self, lam: float = 5e-4, step: int = 32, bits: int = 2) -> dict:  # оптимальное число строк второй стадии словаря
+        """Перебор числа строк второй стадии квантования словаря по цене CE + lam·байты.
+
+            Кривая CE по числу строк немонотонна (замер: предельная цена 1.3e-3 при 32 строках, 3.5e-4
+            при 64, 4.9e-4 при 128, отрицательная при 256), поэтому точечное правило «первый k, где
+            предельный вклад ниже порога» неприменимо — выбирается минимум реальной кривой.
+            Возвращает {"k": ..., "bytes": ..., "ce": ..., "curve": [(k, ce, bytes), ...]}."""
+        import numpy as _np  # массивы
+        import torch as _t  # тензоры
+        import hagi.models.optimal_lm as _QM  # модуль квантования (настройка EMB_ROWS2 — его атрибут)
+        m = self.model; dev = getattr(m, "device", "cpu"); k_ = m.k  # модель, устройство, контекст
+        names = [n for n in self.domains if len(self._domain_bytes(n, self.domains[n])) >= k_ + 4096]  # пригодные домены
+        if not names:  # нет данных для оценки
+            return {"k": 0, "bytes": 0, "ce": None, "curve": []}  # пустой итог
+        sel = names[::max(1, len(names) // 6)][:6]; X, Y = [], []  # оценочные окна (хвосты 6 доменов)
+        for name in sel:  # по доменам
+            d = _np.frombuffer(self._domain_bytes(name, self.domains[name]), dtype=_np.uint8).astype(_np.int64)[-8192:]; st = _np.arange(0, len(d) - k_ - 1, max(1, (len(d) - k_ - 1) // 64))[:64]  # окна хвоста
+            X.append(_np.stack([d[i:i + k_] for i in st])); Y.append(d[st + k_])  # накопить
+        X = _t.as_tensor(_np.concatenate(X), dtype=_t.long, device=dev); Y = _t.as_tensor(_np.concatenate(Y), dtype=_t.long, device=dev)  # пакеты
+        score = {"emb": self.emb_row_weight()}  # частотный вес строк
+        orig = {n: q.detach().clone() for n, q in zip(m.param_names(), m.params())}  # копия весов
+        old = _QM.EMB_ROWS2; curve = []  # прежняя настройка и кривая
+        try:  # с восстановлением
+            for kk in range(0, 257, step):  # по числу строк
+                _QM.EMB_ROWS2 = str(kk)  # настроить число строк
+                for n, q in zip(m.param_names(), m.params()): q.data.copy_(orig[n])  # сброс
+                qd, nb = _QM.quantize_model(m, bits=bits, use_had=False, row_score=score); _QM.dequantize_into(m, qd)  # квантовать и записать
+                with _t.no_grad(): ce = float(_t.nn.functional.cross_entropy(m.logits(X), Y))  # кросс-энтропия на оценочных окнах
+                curve.append((kk, ce, nb))  # точка
+        finally:  # всегда
+            _QM.EMB_ROWS2 = old  # вернуть настройку
+            for n, q in zip(m.param_names(), m.params()): q.data.copy_(orig[n])  # вернуть веса
+        best = min(curve, key=lambda r: r[1] + lam * r[2])  # минимум CE + lam·байты
+        return {"k": best[0], "bytes": best[2], "ce": best[1], "curve": curve}  # итог
+
     def _worst_exceeds(self, pre_layout, source: str) -> bool:
         """True, если гейт по наихудшему домену включён и какой-то старый домен вырос
         больше WORST_TOL_ROLLBACK. Гейт выключен либо замера нет — False (решает среднее)."""

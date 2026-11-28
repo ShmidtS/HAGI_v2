@@ -1090,6 +1090,8 @@ def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, 
         par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
         if name == "emb" and EMB_ROWS2 not in ("0", 0, False):  # вторая стадия для строк словаря с наибольшей ошибкой (только при выгрузке)
             res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1) * ((row_score or {}).get(name) if (row_score or {}).get(name) is not None else 1.0); order = np.argsort(-contrib)  # остаток первой стадии, умноженный на вес строки (если задан); строки по убыванию
+            if EMB_ROWS2 == "auto" and (row_score or {}).get(name) is not None:  # auto с весами строк: вклады спадают круто (c_31/c_0 = 0.018 при частотном весе), относительный порог даёт 0-1 строку
+                raise ValueError("EMB_ROWS2=auto несовместим с row_score: задайте число строк или выберите k по цене (Unified.choose_emb_rows2)")  # явный отказ вместо молчаливого 0 строк
             n_rows = (int(sum(1 for i in order if contrib[i] >= EMB_ROWS2_MIN_FRAC * contrib[order[0]])) if EMB_ROWS2 == "auto" else int(EMB_ROWS2)); rows2 = order[:min(n_rows, W.shape[0])]  # auto — пока предельный вклад не ниже доли от наибольшего; иначе — заданное число
             par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=False)  # вторая стадия: квантование остатка (чего первая стадия не восстановила)
             par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2; nbytes_extra = Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # вторая стадия отдельно (основная Q не меняется); её объём
