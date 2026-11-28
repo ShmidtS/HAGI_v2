@@ -66,6 +66,24 @@ VAL_WINDOWS = int(os.environ.get("HAGI_VAL_WINDOWS", "2048"))  # предел ч
 EMB_ROWS2 = os.environ.get("HAGI_EMB_ROWS2", "0").strip().lower()  # строк словаря со второй стадией квантования при выгрузке: число, "auto" (по предельному вкладу) или 0 (выключено)
 STAGE2_ROWS = int(os.environ.get("HAGI_STAGE2_ROWS", "4"))  # строк второй стадии квантования на каждую матрицу, кроме словаря (PROPOSAL 29d; на книге: штраф 4 бит 0.61 -> 0.52 ната за +6% байт); 0 — выключена
 GDN_BETA2 = os.environ.get("HAGI_GDN_BETA2", "0") == "1"  # запись GDN в полном диапазоне (0, 2): β = 2σ — обобщённое отражение Хаусхолдера (GDNBridge.gdn_beta_readout); выключено: меняет функцию обученной книги
+QAT_CODED_LAM = float(os.environ.get("HAGI_QAT_CODED_LAM", "0"))  # вес слагаемого объёма кода на доводке (PROPOSAL 37): байты не меньше энтропии гистограммы уровней; 1e-2 — включено, 0 — выключено
+QAT_CODED_COOL = int(os.environ.get("HAGI_QAT_CODED_COOL", "20"))  # число последних шагов обучения с этим слагаемым
+_QAT_LEVELS = (-3.0, -1.0, 1.0, 3.0)  # уровни квантования с шагом 2 (по построчной шкале max|w|/3)
+
+
+def coded_entropy(W: t.Tensor, tau: float = 0.25) -> t.Tensor:  # энтропия гистограммы уровней матрицы (сумма по строкам, наты)
+    """Мягкие доли уровней p = softmax(−|w/s − уровень|/tau) при построчной шкале s = max|w|/3.
+    Возвращает Σ H(среднего по строке p): код длинами не меньше энтропии (Крафт + Йенсен)."""
+    sc = W.abs().amax(1, keepdim=True).clamp_min(1e-8) / 3.0  # построчная шкала
+    p = t.softmax(-((W / sc).unsqueeze(-1) - t.tensor(_QAT_LEVELS, device=W.device)).abs() / tau, -1)  # мягкие доли уровней
+    m = p.mean(1)  # средняя гистограмма строки
+    return -(m * (m + 1e-12).log()).sum()  # энтропия гистограммы
+
+
+def coded_size_term(model: "HagiOptimalLM") -> t.Tensor:  # суммарная энтропия уровней всех двумерных матриц модели
+    return sum(coded_entropy(q) for q in model.__dict__.values() if isinstance(q, t.nn.Parameter) and q.ndim == 2)  # сумма по матрицам
+
+
 EMB_ROWS2_MIN_FRAC = 0.10  # для auto: строка берётся, пока её вклад в остаточную ошибку не меньше этой доли вклада первой строки
 SPIKE_START = 0.8  # спайкинг включается с этой доли шагов обучения (последние 20%)
 
@@ -645,6 +663,7 @@ class HagiOptimalLM:
                 by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long, device=self.device)  # цели
                 opt.zero_grad()  # сброс
                 loss = t.nn.functional.cross_entropy(self.forward_seq(bx, state=state).reshape(-1, self.VOCAB), by.reshape(-1))  # потеря по всем T позициям
+                if QAT_CODED_LAM > 0 and step >= total_steps - QAT_CODED_COOL: loss = loss + QAT_CODED_LAM * coded_size_term(self)  # доводка: веса, которые дешевле кодируются
                 carry = {"S1": state["S1"], "S2": state.get("S2")}  # новое состояние (detached)
                 stream_pos = stream_pos + seq_len  # сдвинуть потоки
                 wrap = stream_pos >= max_start  # поток дошёл до конца
@@ -664,6 +683,7 @@ class HagiOptimalLM:
             by = t.as_tensor(np.stack([tr_arr[s + 1: s + 1 + seq_len] for s in starts]), dtype=t.long, device=self.device)  # цели
             opt.zero_grad()  # сброс
             loss = t.nn.functional.cross_entropy(self.forward_seq(bx).reshape(-1, self.VOCAB), by.reshape(-1))  # потеря по всем T позициям
+            if QAT_CODED_LAM > 0 and step >= total_steps - QAT_CODED_COOL: loss = loss + QAT_CODED_LAM * coded_size_term(self)  # доводка: веса, которые дешевле кодируются
             loss.backward()  # градиент
             opt.step()  # шаг
             if (step + 1) % max(1, steps_ep // 2) == 0 or step == total_steps - 1:  # контроль
