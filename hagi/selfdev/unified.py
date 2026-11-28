@@ -54,6 +54,20 @@ def _unified_pt():
     return CKPT_DIR / "unified.pt"  # соединить каталог и имя файла весов
 
 
+def _replace_with_retry(src, dst, attempts: int = 60, pause: float = 0.25) -> None:  # атомарно заменить файл, переживая кратковременную занятость
+    """На Windows заменить файл нельзя, пока он открыт другим процессом (читатель, антивирус, тест).
+    Цикл терял приём из-за одного такого отказа (22:05 28.11): книга оставалась целой (замена
+    атомарная), но принятый домен пропадал. Повторяет замену до attempts раз с паузой pause."""
+    import os as _os  # локальный импорт
+    import time as _time  # пауза
+    for i in range(attempts):  # попытки
+        try:  # попытка
+            _os.replace(src, dst); return  # удалось
+        except PermissionError:  # файл занят
+            if i == attempts - 1: raise  # исчерпаны — сообщить
+            _time.sleep(pause)  # подождать и повторить
+
+
 def _ledger_js():
     """Путь к книге доменов: <CKPT_DIR>/unified_ledger.json (от текущего CKPT_DIR)."""
     return CKPT_DIR / "unified_ledger.json"  # соединить каталог и имя файла книги
@@ -639,11 +653,10 @@ class Unified:
     ANCHOR_GATE = os.environ.get("HAGI_ANCHOR_GATE", "1") == "1"  # гейт по опоре (включён): прирост CE старого домена считается от его CE при приёме (gate_anchor), а не от «до этого приёма» — видит накопление за много приёмов; только домены с опорой
     ANCHOR_SE_MULT = 4.0  # запас на шум в ошибках среднего (одна константа для условия и величины)
     ANCHOR_RADIUS = os.environ.get("HAGI_ANCHOR_RADIUS", "1") == "1"  # запас по опоре — односторонний радиус Бернстайна вместо 4·SE (PROPOSAL 38)
-    ANCHOR_CE_RANGE = 6.0  # размах ошибки окна (нат): сумма логарифмов 256, ограничивает член b·L/n
     ANCHOR_ALPHA = 0.05  # доля ложных срабатываний гейта по опоре на один домен
     ANCHOR_MIN_WINDOWS = 32  # минимальное число окон домена для проверки по опоре (меньше — слишком шумно)
     OLD_GATE_DOMAINS = int(os.environ.get("HAGI_OLD_GATE_DOMAINS", "0"))  # сколько старых доменов мерят гейт и ремонт: 0 — все
-    OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "275000"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
+    OLD_GATE_WINDOWS = int(os.environ.get("HAGI_OLD_GATE_WINDOWS", "819200"))  # общий бюджет контрольных окон на все старые домены: при 2048 (16 окон на домен из 138) ошибка разности 0.16 ната — все превышения порога 0.25 были шумом; при 32768 ошибка 0.044
     WORST_GATE = os.environ.get("HAGI_WORST_GATE", "1") == "1"  # гейт отката по наихудшему домену (mean_le_not_imp_max_le; включён)
     REPAIR_ROUNDS = 6       # замер: rounds=3/lr=1e-3 -> +0.343; rounds=6/lr=3e-4 -> +0.036 (без починки: +0.553)
     REPAIR_LR = 3e-4  # скорость обучения раунда переучивания: 3·10^−4
@@ -1149,7 +1162,7 @@ class Unified:
                 # Шаг начал не меньше длины окна k: иначе соседние окна делят байты, парные разности
                 # положительно зависимы, и граница эмпирического Бернштейна занижена (гейт принимает
                 # ложный выигрыш). Условие независимости: шаг не меньше длины окна.
-                budget = self.OLD_GATE_WINDOWS; cap = 978  # бюджет и потолок окон на домен: радиус ≤ допуска 0.25 требует n*(0.25) = 978 окон
+                budget = self.OLD_GATE_WINDOWS; cap = 4096  # бюджет и потолок окон на домен (на книге радиус запаса: 975 окон -> 0.54, 4000 -> 0.18 ната)
                 w = int(min(cap, max(16, budget // max(1, len(sample)))))  # окон на домен: бюджет делится поровну, не меньше 16 и не больше потолка  # окон на домен: бюджет делится поровну, не меньше 16 и не больше 256 (при 32768 и 138 доменах — 237)
                 step = max(k, n // w)  # шаг начал: max(k, ⌊n/w⌋) — окна не перекрываются
                 sel = np.arange(0, n, step)[:w]  # начала 0, step, 2·step, ..., не более w
@@ -1283,7 +1296,7 @@ class Unified:
             if len(seg) < self.ANCHOR_MIN_WINDOWS:  # мало окон: радиус больше допуска — проверка слепа, пропустить (честнее, чем ложные откат)
                 continue  # пропустить
             drift = float(seg.mean() - anchor); se = float(seg.std() / len(seg) ** 0.5)  # прирост от опоры и ошибка среднего
-            if self.ANCHOR_RADIUS:  # сертифицированный запас: eps = √(2·sig2·L/n) + b·L/n, L = ln(Bonf/alpha) (по всем доменам с Бонферрони)
+            if self.ANCHOR_RADIUS:  # запас: eps = √(2·sig2·L/n) + b·L/n, L = ln(Bonf/alpha); b — наибольший встретившийся разброс окон (хвост тяжёлый: на книге до 24,5 ната, 0,6% окон дальше 6 — априорной границы нет)
                 from hagi.base.trunk_ops import paired_margin_eb  # радиус эмпирического Бернстайна
                 scored = drift - paired_margin_eb(seg - anchor, n_states=self.WORST_GATE_BONF, delta=self.ANCHOR_ALPHA)  # прирост минус радиус (b — по выборке, как в парном гейте)
             else:  # прежний запас
@@ -1539,12 +1552,12 @@ class Unified:
         import os as _os  # локальный импорт os
         tmp = _unified_pt().with_suffix(".pt.tmp")  # временный файл <имя>.pt.tmp
         _t.save(st, tmp)  # сохранить состояние во временный файл
-        _os.replace(tmp, _unified_pt())  # атомарно заменить файл модели
+        _replace_with_retry(tmp, _unified_pt())  # атомарно заменить файл модели (с повторами, если файл ненадолго занят)
         tmp_l = _ledger_js().with_suffix(".json.tmp")  # временный файл книги <имя>.json.tmp
         tmp_l.write_text(  # записать книгу доменов ...
             json.dumps(self.domains, ensure_ascii=False, indent=1),  # ... как JSON с отступом 1, неанглийские буквы как есть
             encoding="utf-8")  # ... в utf-8
-        _os.replace(tmp_l, _ledger_js())  # атомарно заменить файл книги
+        _replace_with_retry(tmp_l, _ledger_js())  # атомарно заменить файл книги (с повторами)
         self._live_backup()  # резервная копия вне checkpoints/
 
     def _live_backup(self) -> None:
