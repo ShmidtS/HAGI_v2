@@ -963,7 +963,7 @@ class MirrorHedgeStreamPredictor:
             p_neu = np.full(256, 1.0 / 256.0)  # равномерно
         else:  # логиты уже посчитаны состоянием на предыдущем байте
             lg = self._lg  # логиты следующего байта
-            e = np.exp(lg.double().numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
+            lg = lg.double().cpu(); e = np.exp(lg.numpy() - lg.max().item()); p_neu = e / e.sum()  # вероятности
         self._last = (p_neu, p_ctx, p_lz)  # запомнить
         return self.weights[0] * p_neu + self.weights[1] * p_ctx + self.weights[2] * p_lz  # смесь
 
