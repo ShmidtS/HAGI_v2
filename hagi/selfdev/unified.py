@@ -1263,6 +1263,24 @@ class Unified:
                 worst, worst_name = scored, nm  # запомнить
         return (worst > self.WORST_TOL_ROLLBACK), (None if worst_name is None else worst), worst_name  # превышение, величина, домен
 
+    def emb_row_fisher(self, windows_per_domain: int = 64, max_domains: int = 24) -> "np.ndarray | None":  # веса строк словаря для квантования
+        """Фишер-вес каждой строки emb: среднее по окнам, где строка была меткой, выражения p·(1−p) —
+        во сколько раз возмущение этой строки сдвигает CE (второй порядок). Строки, ни разу не бывшие
+        меткой, получают вес 0: их остаток не влияет на CE. None — нет доменов."""
+        import numpy as _np  # массивы
+        import torch as _t  # тензоры
+        m = self.model; k = m.k; num = _np.zeros(256); den = _np.zeros(256)  # накопители по классам
+        names = [n for n in self.domains if len(self._domain_bytes(n, self.domains[n])) >= k + 64]  # пригодные домены
+        step = max(1, len(names) // max_domains); dev = getattr(m, "device", "cpu")  # шаг выборки и устройство
+        with _t.no_grad():  # без графа
+            for name in names[::step][:max_domains]:  # по выборке доменов
+                d = _np.frombuffer(self._domain_bytes(name, self.domains[name]), dtype=_np.uint8).astype(_np.int64)  # байты
+                n = len(d) - k; st = _np.arange(0, n, max(k, n // windows_per_domain))[:windows_per_domain]  # равномерные окна
+                X = _t.as_tensor(_np.stack([d[i:i + k] for i in st]), dtype=_t.long, device=dev); y = d[st + k]  # окна и метки
+                pr = _t.softmax(m.logits(X).float(), -1)[_np.arange(len(y)), _t.as_tensor(y, device=dev)].detach().cpu().numpy()  # вероятность метки
+                _np.add.at(num, y, pr * (1.0 - pr)); _np.add.at(den, y, 1.0)  # накопить p·(1−p) по меткам
+        return _np.where(den > 0, num / _np.maximum(den, 1.0), 0.0) if den.sum() > 0 else None  # средний вес (0 у неиспользуемых строк)
+
     def _worst_exceeds(self, pre_layout, source: str) -> bool:
         """True, если гейт по наихудшему домену включён и какой-то старый домен вырос
         больше WORST_TOL_ROLLBACK. Гейт выключен либо замера нет — False (решает среднее)."""

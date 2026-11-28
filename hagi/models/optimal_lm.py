@@ -1077,9 +1077,11 @@ def gauge_balance(model: "HagiOptimalLM") -> dict[str, float]:
     return {"max_log_shift_swiglu": max_sw, "max_log_shift_bigram": max_bg}  # итог
 
 
-def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) -> tuple[dict, int]:
+def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True, row_score: dict[str, np.ndarray] | None = None) -> tuple[dict, int]:
     """Квантовать все 2D-веса per-row; таблицу emb (256 строк — словарь) — без поворота строк.
-        Возвращает (параметры по именам, число байт уровней)."""
+        row_score — необязательные веса строк по имени матрицы: выбор строк второй стадии идёт
+        по вес·‖остаток‖² (для CE вес строки — среднее p·(1−p) на позициях, где она метка),
+        без весов — по ‖остаток‖². Возвращает (параметры по именам, число байт уровней)."""
     out: dict[str, dict] = {}; nbytes = 0  # результат и объём
     for name, p in model.__dict__.items():  # по атрибутам
         if not isinstance(p, t.nn.Parameter) or p.ndim != 2:  # только 2D
@@ -1087,7 +1089,7 @@ def quantize_model(model: "HagiOptimalLM", bits: int = 4, use_had: bool = True) 
         W = p.detach().cpu().numpy()  # в numpy
         par, Q = quant_per_row(W, bits=bits, use_had=use_had, rotate_rows=(name != "emb"))  # emb — по словарю не вращать
         if name == "emb" and EMB_ROWS2 not in ("0", 0, False):  # вторая стадия для строк словаря с наибольшей ошибкой (только при выгрузке)
-            res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1); order = np.argsort(-contrib)  # остаток первой стадии и строки по убыванию вклада
+            res = W - dequant_per_row(par, Q); contrib = (res.astype(np.float64) ** 2).sum(axis=1) * ((row_score or {}).get(name) if (row_score or {}).get(name) is not None else 1.0); order = np.argsort(-contrib)  # остаток первой стадии, умноженный на вес строки (если задан); строки по убыванию
             n_rows = (int(sum(1 for i in order if contrib[i] >= EMB_ROWS2_MIN_FRAC * contrib[order[0]])) if EMB_ROWS2 == "auto" else int(EMB_ROWS2)); rows2 = order[:min(n_rows, W.shape[0])]  # auto — пока предельный вклад не ниже доли от наибольшего; иначе — заданное число
             par2, Q2 = quant_per_row(res[rows2], bits=bits, use_had=use_had, rotate_rows=False)  # вторая стадия: квантование остатка (чего первая стадия не восстановила)
             par["rows2"] = [int(i) for i in rows2]; par["par2"] = par2; par["Q2"] = Q2; nbytes_extra = Q2.size * (2 if bits == 2 else 4) // 8 + par2["scales"].nbytes  # вторая стадия отдельно (основная Q не меняется); её объём

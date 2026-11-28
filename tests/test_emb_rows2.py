@@ -47,3 +47,17 @@ def test_emb_rows2_auto_picks_rows_by_marginal_contribution():  # auto: стро
     assert 1 <= len(rows) <= 256 and len(rows) == k_expect, f"auto выбрал {len(rows)} строк, правило даёт {k_expect}"  # число строк по правилу
     assert sorted(rows) == sorted(order[:k_expect]), "auto выбрал не top-k строк по вкладу"  # ровно top-k
     assert len(set(rows)) == len(rows) and nba > nb0, "строки повторяются или объём не учтён"  # без повторов, объём учтён
+
+
+def test_row_score_changes_row_choice():  # веса строк меняют выбор строк второй стадии
+    m = _toy_model()  # модель
+    OM.EMB_ROWS2 = "32"; q_n, _ = OM.quantize_model(m, bits=2, use_had=False); OM.EMB_ROWS2 = "0"  # выбор по норме
+    score = np.zeros(256); score[:8] = 1.0  # вес только у первых 8 строк
+    OM.EMB_ROWS2 = "32"; q_s, _ = OM.quantize_model(m, bits=2, use_had=False, row_score={"emb": score}); OM.EMB_ROWS2 = "0"  # выбор с весами
+    rows_n = set(q_n["emb"]["rows2"]); rows_s = q_s["emb"]["rows2"]  # выбранные строки
+    assert set(range(8)) <= set(rows_s), "строки с наибольшим весом не выбраны"  # взвешенные строки обязаны войти
+    assert rows_s != sorted(rows_n), "веса не изменили выбор строк"  # выбор изменился
+    # строка с нулевым весом идёт после всех строк с положительным весом
+    victim = max(rows_n); score0 = np.ones(256); score0[victim] = 0.0  # обнуляем вес строки, выбранной по норме
+    OM.EMB_ROWS2 = "255"; q_z, _ = OM.quantize_model(m, bits=2, use_had=False, row_score={"emb": score0}); OM.EMB_ROWS2 = "0"  # 255 из 256 строк
+    assert victim not in q_z["emb"]["rows2"], "строка с нулевым весом выбрана раньше строк с положительным весом"  # исключена
